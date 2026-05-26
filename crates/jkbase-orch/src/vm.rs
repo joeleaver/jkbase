@@ -14,6 +14,8 @@ pub struct VmConfig {
     pub mem_size_mib: u32,
     pub tap_device: Option<String>,
     pub guest_mac: Option<String>,
+    pub guest_ip: Option<String>,
+    pub gateway_ip: Option<String>,
     pub vsock_cid: Option<u32>,
 }
 
@@ -74,10 +76,18 @@ impl VmInstance {
             })
             .await?;
 
+        let mut boot_args = "console=ttyS0 reboot=k panic=1 pci=off ro".to_string();
+        if let (Some(guest_ip), Some(gateway_ip)) = (&config.guest_ip, &config.gateway_ip) {
+            // Kernel IP autoconfiguration: ip=guest::gateway:netmask::iface:off
+            boot_args.push_str(&format!(
+                " ip={guest_ip}::{gateway_ip}:255.255.255.0::eth0:off"
+            ));
+        }
+
         client
             .set_boot_source(&BootSource {
                 kernel_image_path: config.kernel_path.to_string_lossy().to_string(),
-                boot_args: "console=ttyS0 reboot=k panic=1 pci=off ro".to_string(),
+                boot_args,
             })
             .await?;
 

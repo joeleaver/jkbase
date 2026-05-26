@@ -15,11 +15,13 @@ async fn main() -> anyhow::Result<()> {
     let config = VmConfig {
         firecracker_bin: base.join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
         kernel_path: base.join("vmlinux.bin"),
-        rootfs_path: base.join("test-rootfs.ext4"),
+        rootfs_path: base.join("jkbase-rootfs.ext4"),
         vcpu_count: 1,
         mem_size_mib: 128,
-        tap_device: None,
-        guest_mac: None,
+        tap_device: Some("tap0".to_string()),
+        guest_mac: Some("AA:FC:00:00:00:01".to_string()),
+        guest_ip: Some("172.16.0.2".to_string()),
+        gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
     };
 
@@ -28,6 +30,9 @@ async fn main() -> anyhow::Result<()> {
     println!("Booting VM...");
     let mut vm = VmInstance::start("test-vm", &config, &runtime_dir).await?;
     println!("VM booted! Socket at: {}", vm.socket_path().display());
+    println!();
+    println!("Try: curl http://172.16.0.2/");
+    println!();
     println!("Press Ctrl+C to stop...");
 
     tokio::signal::ctrl_c().await?;
