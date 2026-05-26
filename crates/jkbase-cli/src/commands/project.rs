@@ -57,7 +57,9 @@ struct ErrorResponse {
 }
 
 pub async fn run(command: ProjectCommand) -> Result<()> {
-    let client = reqwest::Client::new();
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated — run `jkbase init` or `jkbase login` first"))?;
+    let client = crate::credentials::authenticated_client(&token);
 
     match command {
         ProjectCommand::Create { name, api } => {

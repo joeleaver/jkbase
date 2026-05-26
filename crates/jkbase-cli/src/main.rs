@@ -1,4 +1,5 @@
 mod commands;
+pub mod credentials;
 
 use clap::Parser;
 

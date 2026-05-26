@@ -1,6 +1,7 @@
 mod deploy;
 mod project;
 
+use anyhow::Context;
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -19,10 +20,20 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Initialize the platform (admin)
-    Init,
+    /// Initialize the platform and create the first admin account
+    Init {
+        /// Your email address
+        email: String,
+        /// Platform API URL
+        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        api: String,
+    },
     /// Authenticate with the platform
-    Login,
+    Login {
+        /// API token (if not provided, reads from stdin)
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// View logs
     Logs {
         /// Follow log output
@@ -84,12 +95,48 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Init => {
-            println!("Initializing jkbase platform...");
+        Command::Init { email, api } => {
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!("{api}/init"))
+                .json(&serde_json::json!({ "email": email }))
+                .send()
+                .await
+                .context("failed to connect to platform API")?;
+
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await?;
+                let token = body["token"].as_str().unwrap_or("");
+                let tenant_id = body["tenant_id"].as_str().unwrap_or("");
+
+                crate::credentials::save_token(token)?;
+                println!("Platform initialized!");
+                println!("  Tenant ID: {tenant_id}");
+                println!("  Token saved to ~/.jkbase/credentials");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("init failed: {err}");
+            }
             Ok(())
         }
-        Command::Login => {
-            println!("Authenticating...");
+        Command::Login { token } => {
+            let token = match token {
+                Some(t) => t,
+                None => {
+                    println!("Enter your API token:");
+                    let mut input = String::new();
+                    std::io::stdin().read_line(&mut input)?;
+                    input.trim().to_string()
+                }
+            };
+
+            if token.is_empty() {
+                anyhow::bail!("no token provided");
+            }
+
+            crate::credentials::save_token(&token)?;
+            println!("Token saved to ~/.jkbase/credentials");
             Ok(())
         }
         Command::Logs {

@@ -17,3 +17,4 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+dirs = "6"

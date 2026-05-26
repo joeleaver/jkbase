@@ -67,7 +67,9 @@ pub async fn run(args: DeployArgs) -> Result<()> {
     let url = format!("{}/projects/{}/deploy", args.api, project_id);
 
     println!("Deploying '{project_name}'...");
-    let client = reqwest::Client::new();
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated — run `jkbase init` or `jkbase login` first"))?;
+    let client = crate::credentials::authenticated_client(&token);
     let resp = client
         .post(&url)
         .header("Content-Type", "application/gzip")

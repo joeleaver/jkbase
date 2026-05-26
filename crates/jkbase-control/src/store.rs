@@ -1,3 +1,4 @@
+use crate::auth::{self, ApiToken, Tenant};
 use anyhow::{Context, Result};
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,8 @@ use std::sync::Arc;
 
 const PROJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("projects");
 const VM_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("vm_allocations");
+const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
+const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -35,6 +38,8 @@ impl Store {
         let txn = db.begin_write()?;
         let _ = txn.open_table(PROJECTS)?;
         let _ = txn.open_table(VM_ALLOCATIONS)?;
+        let _ = txn.open_table(TENANTS)?;
+        let _ = txn.open_table(API_TOKENS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -129,5 +134,67 @@ impl Store {
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    pub fn create_tenant(&self, tenant: &Tenant) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(TENANTS)?;
+            let data = serde_json::to_vec(tenant)?;
+            table.insert(tenant.id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_tenant(&self, id: &str) -> Result<Option<Tenant>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TENANTS)?;
+        match table.get(id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_tenants(&self) -> Result<Vec<Tenant>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TENANTS)?;
+        let mut tenants = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let tenant: Tenant = serde_json::from_slice(value.value())?;
+            tenants.push(tenant);
+        }
+        Ok(tenants)
+    }
+
+    pub fn save_api_token(&self, token: &ApiToken) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(API_TOKENS)?;
+            let data = serde_json::to_vec(token)?;
+            table.insert(token.id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn authenticate(&self, raw_token: &str) -> Result<Option<Tenant>> {
+        let txn = self.db.begin_read()?;
+        let tokens_table = txn.open_table(API_TOKENS)?;
+        let tenants_table = txn.open_table(TENANTS)?;
+
+        for entry in tokens_table.iter()? {
+            let (_key, value) = entry?;
+            let api_token: ApiToken = serde_json::from_slice(value.value())?;
+            if auth::verify_token(raw_token, &api_token.token_hash) {
+                if let Some(tenant_data) = tenants_table.get(api_token.tenant_id.as_str())? {
+                    let tenant: Tenant = serde_json::from_slice(tenant_data.value())?;
+                    return Ok(Some(tenant));
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
