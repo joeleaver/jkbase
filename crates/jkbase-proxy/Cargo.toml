@@ -7,3 +7,7 @@ edition = "2024"
 jkbase-common = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+hyper = { workspace = true, features = ["client", "server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio", "client-legacy", "server-auto"] }
+http-body-util = { workspace = true }
+tracing = { workspace = true }

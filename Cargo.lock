@@ -686,12 +686,14 @@ name = "jkbase-orch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",
  "jkbase-common",
  "serde",
  "serde_json",
+ "tar",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -702,8 +704,12 @@ name = "jkbase-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "jkbase-common",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -712,6 +718,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "clap",
  "jkbase-common",
  "jkbase-control",
  "jkbase-orch",
