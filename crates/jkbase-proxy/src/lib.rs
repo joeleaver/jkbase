@@ -139,10 +139,10 @@ mod tests {
 
     #[test]
     fn subdomain_extraction() {
-        assert_eq!(extract_project_id("my-app.jkbase.dev", "jkbase.dev"), "my-app");
-        assert_eq!(extract_project_id("www.my-app.jkbase.dev", "jkbase.dev"), "my-app");
-        assert_eq!(extract_project_id("my-app", "jkbase.dev"), "my-app");
-        assert_eq!(extract_project_id("custom.example.com", "jkbase.dev"), "custom.example.com");
+        assert_eq!(extract_project_id("my-app.jkbase.app", "jkbase.app"), "my-app");
+        assert_eq!(extract_project_id("www.my-app.jkbase.app", "jkbase.app"), "my-app");
+        assert_eq!(extract_project_id("my-app", "jkbase.app"), "my-app");
+        assert_eq!(extract_project_id("custom.example.com", "jkbase.app"), "custom.example.com");
         assert_eq!(extract_project_id("my-app.localhost", "localhost"), "my-app");
     }
 }

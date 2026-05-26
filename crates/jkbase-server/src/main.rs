@@ -35,8 +35,8 @@ struct Args {
     #[arg(long, default_value = "8080")]
     proxy_port: u16,
 
-    /// Platform domain for subdomain routing (e.g. jkbase.dev)
-    #[arg(long, default_value = "jkbase.dev")]
+    /// Platform domain for subdomain routing
+    #[arg(long, default_value = "jkbase.app")]
     domain: String,
 }
 

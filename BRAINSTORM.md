@@ -58,7 +58,7 @@ Built on Pingora + rustls-acme. Thin and fast.
 
 **Responsibilities:**
 1. TLS termination (ACME-managed certs)
-2. Host lookup → resolve project (subdomain `project.jkbase.dev` or custom domain)
+2. Host lookup → resolve project (subdomain `project.jkbase.app` or custom domain)
 3. Fetch project's routing rules
 4. Forward to correct backend (static server, WASM function runner, container)
 
@@ -310,7 +310,7 @@ to event-loop style later if needed.
 - No persistent state — use a server or database for that
 
 **Cross-project calls:** just HTTP. Project A calls project B's function
-via `project-b.jkbase.dev/my-function`. Proxy routes it. Can optimize
+via `project-b.jkbase.app/my-function`. Proxy routes it. Can optimize
 with internal routing later (skip TLS for co-located projects).
 
 ## Servers
@@ -423,14 +423,14 @@ container-based fallback (future problem).
 Both UIs are regular jkbase projects (static sites + functions).
 Bootstrap with CLI, then the platform hosts its own management interfaces.
 
-**Tenant dashboard** (`console.jkbase.dev`):
+**Tenant dashboard** (`console.jkbase.app`):
 - Project list, create/delete
 - Per-project: deployments, rollback, logs, domains, secrets, routes
 - Service status and health
 - Usage/metering overview
 - Calls the same control plane API as the CLI
 
-**Platform admin** (`admin.jkbase.dev`):
+**Platform admin** (`admin.jkbase.app`):
 - All tenants and projects
 - Global resource usage and capacity
 - VM status across all projects
@@ -445,7 +445,7 @@ Bootstrap with CLI, then the platform hosts its own management interfaces.
 3. jkbase admin create-tenant — create yourself
 4. jkbase project create admin-ui
 5. jkbase deploy — admin UI is live
-6. Manage everything from admin.jkbase.dev
+6. Manage everything from admin.jkbase.app
 ```
 
 CLI is always the escape hatch — if the UI breaks, CLI still works.
