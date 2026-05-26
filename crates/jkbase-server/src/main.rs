@@ -128,6 +128,9 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Clean up orphaned state from a previous crash
+    cleanup_orphans(&platform).await;
+
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(
@@ -136,9 +139,63 @@ async fn main() -> Result<()> {
         "jkbase-server listening"
     );
 
-    axum::serve(listener, router).await?;
+    let platform_for_shutdown = platform.clone();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal(platform_for_shutdown))
+        .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal(platform: Arc<Mutex<PlatformState>>) {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to listen for ctrl-c");
+    info!("shutdown signal received, stopping VMs...");
+
+    let mut plat = platform.lock().await;
+    let project_ids: Vec<String> = plat.vms.keys().cloned().collect();
+
+    for project_id in &project_ids {
+        if let Some(mut vm) = plat.vms.remove(project_id) {
+            info!(project = %project_id, "stopping VM");
+            if let Err(e) = vm.stop().await {
+                tracing::error!(project = %project_id, error = %e, "failed to stop VM");
+            }
+        }
+
+        if let Ok(Some(alloc)) = plat.store.get_vm_allocation(project_id) {
+            let _ = teardown_tap(&alloc.tap_device).await;
+            let _ = plat.store.remove_vm_allocation(project_id);
+        }
+    }
+
+    info!("all VMs stopped, shutdown complete");
+}
+
+async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
+    let plat = platform.lock().await;
+    let allocs = match plat.store.list_vm_allocations() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    for alloc in &allocs {
+        // Check if the VM's agent is actually reachable
+        let reachable = tokio::net::TcpStream::connect(format!("{}:80", alloc.ip))
+            .await
+            .is_ok();
+
+        if !reachable {
+            info!(
+                project = %alloc.project_id,
+                ip = %alloc.ip,
+                "cleaning up orphaned allocation (VM not reachable)"
+            );
+            let _ = teardown_tap(&alloc.tap_device).await;
+            let _ = plat.store.remove_vm_allocation(&alloc.project_id);
+        }
+    }
 }
 
 async fn handle_deploy(
@@ -239,6 +296,23 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
         run_cmd("ip", &["link", "set", tap_name, "master", "jkbr0"]).await?;
         run_cmd("ip", &["link", "set", tap_name, "up"]).await?;
         info!(tap_name, "tap device created");
+    }
+
+    Ok(())
+}
+
+async fn teardown_tap(tap_name: &str) -> Result<()> {
+    let exists = tokio::process::Command::new("ip")
+        .args(["link", "show", tap_name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await?
+        .success();
+
+    if exists {
+        run_cmd("ip", &["link", "delete", tap_name]).await?;
+        info!(tap_name, "tap device removed");
     }
 
     Ok(())
