@@ -4,7 +4,7 @@ use jkbase_control::api::{self, AppState};
 use jkbase_control::store::{Store, VmAllocation};
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
-use jkbase_proxy::{self, new_routing_table};
+use jkbase_proxy::{self, new_routing_table, ProxyConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,6 +34,10 @@ struct Args {
     /// Port for the proxy
     #[arg(long, default_value = "8080")]
     proxy_port: u16,
+
+    /// Platform domain for subdomain routing (e.g. jkbase.dev)
+    #[arg(long, default_value = "jkbase.dev")]
+    domain: String,
 }
 
 struct PlatformState {
@@ -123,10 +127,14 @@ async fn main() -> Result<()> {
     let state = Arc::new(state);
     let router = api::router(state);
 
-    let proxy_port = args.proxy_port;
+    let proxy_config = ProxyConfig {
+        port: args.proxy_port,
+        platform_domain: args.domain,
+    };
+    let proxy_port = proxy_config.port;
     let proxy_routes = routing_table.clone();
     tokio::spawn(async move {
-        if let Err(e) = jkbase_proxy::serve(proxy_port, proxy_routes).await {
+        if let Err(e) = jkbase_proxy::serve(proxy_config, proxy_routes).await {
             tracing::error!(error = %e, "proxy error");
         }
     });

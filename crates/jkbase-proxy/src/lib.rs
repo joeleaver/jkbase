@@ -18,17 +18,24 @@ pub fn new_routing_table() -> RoutingTable {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-pub async fn serve(port: u16, routes: RoutingTable) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+pub struct ProxyConfig {
+    pub port: u16,
+    pub platform_domain: String,
+}
+
+pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "proxy listening");
+    let platform_domain = Arc::new(config.platform_domain);
+    info!(%addr, domain = %platform_domain, "proxy listening");
 
     loop {
         let (stream, _peer) = listener.accept().await?;
         let routes = routes.clone();
+        let domain = platform_domain.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| proxy_request(routes.clone(), req));
+            let svc = service_fn(move |req| proxy_request(routes.clone(), domain.clone(), req));
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 error!(error = %e, "proxy connection error");
             }
@@ -38,18 +45,19 @@ pub async fn serve(port: u16, routes: RoutingTable) -> Result<()> {
 
 async fn proxy_request(
     routes: RoutingTable,
+    platform_domain: Arc<String>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let host = req
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .split(':')
-        .next()
         .unwrap_or("");
 
-    let project_id = extract_project_id(host);
+    // Strip port number if present
+    let hostname = host.split(':').next().unwrap_or("");
+
+    let project_id = extract_project_id(hostname, &platform_domain);
 
     let backend_ip = {
         let table = routes.read().await;
@@ -59,8 +67,9 @@ async fn proxy_request(
     let Some(ip) = backend_ip else {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "text/plain")
             .body(Full::new(Bytes::from(format!(
-                "no project found for host '{host}'"
+                "project not found: '{project_id}'"
             ))))
             .unwrap());
     };
@@ -71,6 +80,7 @@ async fn proxy_request(
             error!(project = %project_id, error = %e, "backend request failed");
             Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "text/plain")
                 .body(Full::new(Bytes::from("bad gateway")))
                 .unwrap())
         }
@@ -106,12 +116,33 @@ async fn forward_request(
     Ok(builder.body(Full::new(body)).unwrap())
 }
 
-fn extract_project_id(host: &str) -> String {
-    // For Phase 1: treat the full hostname as the project ID,
-    // or extract subdomain from *.jkbase.dev
-    if let Some(subdomain) = host.strip_suffix(".jkbase.dev") {
-        subdomain.to_string()
+fn extract_project_id(hostname: &str, platform_domain: &str) -> String {
+    // project.platform.tld → project
+    // www.project.platform.tld → project (strip leading www)
+    // bare hostname (no dots, or not matching platform domain) → use as-is
+    let suffix = format!(".{platform_domain}");
+
+    if let Some(subdomain) = hostname.strip_suffix(&suffix) {
+        // Strip leading "www." if present
+        subdomain
+            .strip_prefix("www.")
+            .unwrap_or(subdomain)
+            .to_string()
     } else {
-        host.to_string()
+        hostname.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subdomain_extraction() {
+        assert_eq!(extract_project_id("my-app.jkbase.dev", "jkbase.dev"), "my-app");
+        assert_eq!(extract_project_id("www.my-app.jkbase.dev", "jkbase.dev"), "my-app");
+        assert_eq!(extract_project_id("my-app", "jkbase.dev"), "my-app");
+        assert_eq!(extract_project_id("custom.example.com", "jkbase.dev"), "custom.example.com");
+        assert_eq!(extract_project_id("my-app.localhost", "localhost"), "my-app");
     }
 }
