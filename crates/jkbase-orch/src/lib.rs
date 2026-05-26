@@ -1,1 +1,2 @@
-pub use jkbase_common as common;
+pub mod firecracker;
+pub mod vm;
