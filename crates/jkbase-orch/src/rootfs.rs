@@ -3,20 +3,22 @@ use std::path::Path;
 use tokio::process::Command;
 use tracing::info;
 
-pub async fn build_rootfs(
-    agent_bin: &Path,
-    content_dir: &Path,
-    output: &Path,
-    size_mb: u32,
-) -> Result<()> {
-    info!(output = %output.display(), "building rootfs");
+/// Build the base rootfs image containing only the guest agent.
+/// This is built once and reused across all projects.
+pub async fn build_base_rootfs(agent_bin: &Path, output: &Path) -> Result<()> {
+    if output.exists() {
+        info!(output = %output.display(), "base rootfs already exists, skipping build");
+        return Ok(());
+    }
+
+    info!(output = %output.display(), "building base rootfs");
 
     let script = format!(
         r#"
 set -euo pipefail
 ROOTFS="{output}"
 MOUNT_DIR=$(mktemp -d)
-dd if=/dev/zero of="$ROOTFS" bs=1M count={size_mb} status=none
+dd if=/dev/zero of="$ROOTFS" bs=1M count=32 status=none
 mkfs.ext4 -F -q "$ROOTFS"
 mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
@@ -25,29 +27,66 @@ mkdir -p "$MOUNT_DIR"/{{sbin,dev,proc,sys,tmp,srv/www}}
 cp "{agent}" "$MOUNT_DIR/sbin/init"
 chmod +x "$MOUNT_DIR/sbin/init"
 
-cp -r "{content}"/. "$MOUNT_DIR/srv/www/"
+umount "$MOUNT_DIR"
+rmdir "$MOUNT_DIR"
+"#,
+        output = output.display(),
+        agent = agent_bin.display(),
+    );
+
+    run_sudo_script(&script).await?;
+
+    info!(output = %output.display(), "base rootfs built");
+    Ok(())
+}
+
+/// Build a content image containing only the static files for a project.
+/// Small and fast to create — just the deployed files.
+pub async fn build_content_image(content_dir: &Path, output: &Path) -> Result<()> {
+    info!(output = %output.display(), "building content image");
+
+    let script = format!(
+        r#"
+set -euo pipefail
+IMAGE="{output}"
+MOUNT_DIR=$(mktemp -d)
+
+# Size the image to fit the content (minimum 4MB)
+CONTENT_SIZE_KB=$(du -sk "{content}" | cut -f1)
+SIZE_KB=$(( CONTENT_SIZE_KB + 2048 ))
+if [ "$SIZE_KB" -lt 4096 ]; then SIZE_KB=4096; fi
+
+dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
+mkfs.ext4 -F -q "$IMAGE"
+mount -o loop "$IMAGE" "$MOUNT_DIR"
+
+cp -r "{content}"/. "$MOUNT_DIR/"
 
 umount "$MOUNT_DIR"
 rmdir "$MOUNT_DIR"
 "#,
         output = output.display(),
-        size_mb = size_mb,
-        agent = agent_bin.display(),
         content = content_dir.display(),
     );
 
+    run_sudo_script(&script).await?;
+
+    info!(output = %output.display(), "content image built");
+    Ok(())
+}
+
+async fn run_sudo_script(script: &str) -> Result<()> {
     let status = Command::new("sudo")
         .arg("bash")
         .arg("-c")
-        .arg(&script)
+        .arg(script)
         .status()
         .await
-        .context("failed to run rootfs build script")?;
+        .context("failed to run build script")?;
 
     if !status.success() {
-        anyhow::bail!("rootfs build failed with status {status}");
+        anyhow::bail!("build script failed with status {status}");
     }
 
-    info!(output = %output.display(), "rootfs built");
     Ok(())
 }

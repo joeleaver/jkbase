@@ -10,6 +10,7 @@ pub struct VmConfig {
     pub firecracker_bin: PathBuf,
     pub kernel_path: PathBuf,
     pub rootfs_path: PathBuf,
+    pub content_image_path: Option<PathBuf>,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
     pub tap_device: Option<String>,
@@ -96,9 +97,20 @@ impl VmInstance {
                 drive_id: "rootfs".to_string(),
                 path_on_host: config.rootfs_path.to_string_lossy().to_string(),
                 is_root_device: true,
-                is_read_only: false,
+                is_read_only: true,
             })
             .await?;
+
+        if let Some(content_path) = &config.content_image_path {
+            client
+                .set_drive(&Drive {
+                    drive_id: "content".to_string(),
+                    path_on_host: content_path.to_string_lossy().to_string(),
+                    is_root_device: false,
+                    is_read_only: true,
+                })
+                .await?;
+        }
 
         if let (Some(tap), Some(mac)) = (&config.tap_device, &config.guest_mac) {
             client

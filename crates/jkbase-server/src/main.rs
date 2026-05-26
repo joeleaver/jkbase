@@ -41,7 +41,7 @@ struct PlatformState {
     store: Store,
     firecracker_bin: PathBuf,
     kernel_path: PathBuf,
-    agent_bin: PathBuf,
+    base_rootfs_path: PathBuf,
     data_dir: PathBuf,
 }
 
@@ -96,6 +96,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    let base_rootfs_path = args.data_dir.join("base-rootfs.ext4");
+    rootfs::build_base_rootfs(&args.agent_bin, &base_rootfs_path).await?;
+
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         store: store.clone(),
@@ -103,7 +106,7 @@ async fn main() -> Result<()> {
             .fc_dir
             .join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
         kernel_path: args.fc_dir.join("vmlinux.bin"),
-        agent_bin: args.agent_bin,
+        base_rootfs_path,
         data_dir: args.data_dir,
     }));
 
@@ -148,9 +151,15 @@ async fn main() -> Result<()> {
 }
 
 async fn shutdown_signal(platform: Arc<Mutex<PlatformState>>) {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl-c");
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = sigterm.recv() => {},
+    }
     info!("shutdown signal received, stopping VMs...");
 
     let mut plat = platform.lock().await;
@@ -215,11 +224,11 @@ async fn handle_deploy(
         anyhow::bail!("no deployed content for project {project_id}");
     }
 
-    let rootfs_dir = plat.data_dir.join("rootfs");
-    tokio::fs::create_dir_all(&rootfs_dir).await?;
-    let rootfs_path = rootfs_dir.join(format!("{project_id}.ext4"));
+    let content_images_dir = plat.data_dir.join("content-images");
+    tokio::fs::create_dir_all(&content_images_dir).await?;
+    let content_image_path = content_images_dir.join(format!("{project_id}.ext4"));
 
-    rootfs::build_rootfs(&plat.agent_bin, &content_dir, &rootfs_path, 64).await?;
+    rootfs::build_content_image(&content_dir, &content_image_path).await?;
 
     // Reuse existing allocation or create a new one
     let alloc = match plat.store.get_vm_allocation(project_id)? {
@@ -255,7 +264,8 @@ async fn handle_deploy(
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
-        rootfs_path,
+        rootfs_path: plat.base_rootfs_path.clone(),
+        content_image_path: Some(content_image_path),
         vcpu_count: 1,
         mem_size_mib: 128,
         tap_device: Some(alloc.tap_device.clone()),

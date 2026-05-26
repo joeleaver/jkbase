@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
         firecracker_bin: base.join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
         kernel_path: base.join("vmlinux.bin"),
         rootfs_path: base.join("jkbase-rootfs.ext4"),
+        content_image_path: None,
         vcpu_count: 1,
         mem_size_mib: 128,
         tap_device: Some("tap0".to_string()),

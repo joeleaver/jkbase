@@ -31,6 +31,31 @@ fn mount_filesystems() {
     }
 }
 
+fn mount_content_drive(target: &str) {
+    use std::ffi::CString;
+    use std::ptr;
+
+    // The content drive is the second virtio block device: /dev/vdb
+    let device = "/dev/vdb";
+    if !std::path::Path::new(device).exists() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(target);
+    let src = CString::new(device).unwrap();
+    let tgt = CString::new(target).unwrap();
+    let fst = CString::new("ext4").unwrap();
+
+    let flags = libc::MS_RDONLY;
+    let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), flags, ptr::null()) };
+    if ret != 0 {
+        eprintln!(
+            "failed to mount {device} at {target}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn is_pid1() -> bool {
     std::process::id() == 1
 }
@@ -46,6 +71,11 @@ async fn main() -> Result<()> {
     let serve_dir = PathBuf::from(
         std::env::var("JKBASE_SERVE_DIR").unwrap_or_else(|_| "/srv/www".to_string()),
     );
+
+    if is_pid1() {
+        mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
+    }
+
     let port: u16 = std::env::var("JKBASE_PORT")
         .unwrap_or_else(|_| "80".to_string())
         .parse()?;
