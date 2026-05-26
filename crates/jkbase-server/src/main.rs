@@ -111,15 +111,10 @@ async fn main() -> Result<()> {
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();
-    state.deploy_callback = Some(Box::new(move |project_id: &str, _version: u64| {
-        let project_id = project_id.to_string();
+    state.deploy_callback = Some(Box::new(move |project_id: String, _version: u64| {
         let platform = platform_for_cb.clone();
         let routing = routing_for_cb.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_deploy(&project_id, platform, routing).await {
-                tracing::error!(project = %project_id, error = %e, "deploy VM setup failed");
-            }
-        });
+        Box::pin(async move { handle_deploy(&project_id, platform, routing).await })
     }));
 
     let state = Arc::new(state);

@@ -6,15 +6,23 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
+pub type DeployCallback = Box<
+    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct AppState {
     pub store: Store,
     pub deploy_dir: PathBuf,
-    pub deploy_callback: Option<Box<dyn Fn(&str, u64) + Send + Sync>>,
+    pub deploy_callback: Option<DeployCallback>,
     deploy_locks: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -267,7 +275,7 @@ async fn do_deploy(
     );
 
     if let Some(cb) = &state.deploy_callback {
-        cb(&project.id, version);
+        cb(project.id.clone(), version).await?;
     }
 
     Ok(version)
