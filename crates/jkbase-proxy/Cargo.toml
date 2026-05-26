@@ -1,0 +1,9 @@
+[package]
+name = "jkbase-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jkbase-common = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

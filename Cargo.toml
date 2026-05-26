@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jkbase-server",
+    "crates/jkbase-cli",
+    "crates/jkbase-agent",
+    "crates/jkbase-proxy",
+    "crates/jkbase-control",
+    "crates/jkbase-orch",
+    "crates/jkbase-common",
+]
+
+[workspace.dependencies]
+jkbase-common = { path = "crates/jkbase-common" }
+jkbase-proxy = { path = "crates/jkbase-proxy" }
+jkbase-control = { path = "crates/jkbase-control" }
+jkbase-orch = { path = "crates/jkbase-orch" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

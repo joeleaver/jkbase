@@ -1,0 +1,15 @@
+[project]
+name = "my-app"
+
+[hosting]
+public = "./dist"
+spa = true
+
+[servers.api]
+dockerfile = "./Dockerfile"
+port = 8080
+health_check = { path = "/health", interval = "10s", timeout = "5s" }
+volumes = [{ name = "data", mount = "/app/data" }]
+
+[routes]
+"/api/*" = { service = "server", name = "api" }

@@ -1,0 +1,12 @@
+[package]
+name = "jkbase-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jkbase-common = { workspace = true }
+jkbase-proxy = { workspace = true }
+jkbase-control = { workspace = true }
+jkbase-orch = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
