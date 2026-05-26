@@ -3,6 +3,10 @@ name = "jkbase-server"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "jkbase-server"
+path = "src/main.rs"
+
 [dependencies]
 jkbase-common = { workspace = true }
 jkbase-proxy = { workspace = true }
@@ -10,3 +14,6 @@ jkbase-control = { workspace = true }
 jkbase-orch = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
