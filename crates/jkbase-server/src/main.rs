@@ -1,11 +1,11 @@
 use anyhow::Result;
 use clap::Parser;
 use jkbase_control::api::{self, AppState};
-use jkbase_control::store::Store;
+use jkbase_control::store::{Store, VmAllocation};
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
 use jkbase_proxy::{self, new_routing_table};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,20 +38,32 @@ struct Args {
 
 struct PlatformState {
     vms: HashMap<String, VmInstance>,
+    store: Store,
     firecracker_bin: PathBuf,
     kernel_path: PathBuf,
     agent_bin: PathBuf,
     data_dir: PathBuf,
-    next_ip_octet: u8,
 }
 
 impl PlatformState {
-    fn next_vm_ip(&mut self) -> (String, String) {
-        let octet = self.next_ip_octet;
-        self.next_ip_octet += 1;
-        let guest_ip = format!("172.16.0.{octet}");
-        let tap_name = format!("tap{}", octet - 2);
-        (guest_ip, tap_name)
+    fn allocate_ip(&self) -> Result<(String, String, String)> {
+        let existing = self.store.list_vm_allocations()?;
+        let used_octets: HashSet<u8> = existing
+            .iter()
+            .filter_map(|a| a.ip.split('.').last()?.parse::<u8>().ok())
+            .collect();
+
+        // Allocate from 172.16.0.2 through 172.16.0.254
+        for octet in 2..=254u8 {
+            if !used_octets.contains(&octet) {
+                let ip = format!("172.16.0.{octet}");
+                let tap = format!("tap{}", octet - 2);
+                let mac = format!("AA:FC:00:00:00:{octet:02X}");
+                return Ok((ip, tap, mac));
+            }
+        }
+
+        anyhow::bail!("no available IP addresses in 172.16.0.0/24");
     }
 }
 
@@ -70,15 +82,29 @@ async fn main() -> Result<()> {
     let store = Store::open(&db_path)?;
     let routing_table = new_routing_table();
 
+    // Restore routing table from persisted allocations
+    let existing_allocs = store.list_vm_allocations()?;
+    if !existing_allocs.is_empty() {
+        let mut table = routing_table.write().await;
+        for alloc in &existing_allocs {
+            info!(
+                project = %alloc.project_id,
+                ip = %alloc.ip,
+                "restoring route from persisted allocation"
+            );
+            table.insert(alloc.project_id.clone(), alloc.ip.clone());
+        }
+    }
+
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
+        store: store.clone(),
         firecracker_bin: args
             .fc_dir
             .join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
         kernel_path: args.fc_dir.join("vmlinux.bin"),
         agent_bin: args.agent_bin,
         data_dir: args.data_dir,
-        next_ip_octet: 2,
     }));
 
     let mut state = AppState::new(store, deploy_dir);
@@ -143,8 +169,36 @@ async fn handle_deploy(
 
     rootfs::build_rootfs(&plat.agent_bin, &content_dir, &rootfs_path, 64).await?;
 
-    let (guest_ip, tap_name) = plat.next_vm_ip();
-    setup_tap(&tap_name).await?;
+    // Reuse existing allocation or create a new one
+    let alloc = match plat.store.get_vm_allocation(project_id)? {
+        Some(existing) => {
+            info!(
+                project = %project_id,
+                ip = %existing.ip,
+                "reusing persisted IP allocation"
+            );
+            existing
+        }
+        None => {
+            let (ip, tap, mac) = plat.allocate_ip()?;
+            let alloc = VmAllocation {
+                project_id: project_id.to_string(),
+                ip,
+                tap_device: tap,
+                mac,
+            };
+            plat.store.save_vm_allocation(&alloc)?;
+            info!(
+                project = %project_id,
+                ip = %alloc.ip,
+                tap = %alloc.tap_device,
+                "allocated new IP"
+            );
+            alloc
+        }
+    };
+
+    setup_tap(&alloc.tap_device).await?;
 
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
@@ -152,9 +206,9 @@ async fn handle_deploy(
         rootfs_path,
         vcpu_count: 1,
         mem_size_mib: 128,
-        tap_device: Some(tap_name),
-        guest_mac: Some(format!("AA:FC:00:00:00:{:02X}", plat.next_ip_octet - 1)),
-        guest_ip: Some(guest_ip.clone()),
+        tap_device: Some(alloc.tap_device.clone()),
+        guest_mac: Some(alloc.mac.clone()),
+        guest_ip: Some(alloc.ip.clone()),
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
     };
@@ -165,14 +219,14 @@ async fn handle_deploy(
     plat.vms.insert(project_id.to_string(), vm);
     drop(plat);
 
-    wait_for_agent(&guest_ip).await?;
+    wait_for_agent(&alloc.ip).await?;
 
     {
         let mut table = routing.write().await;
-        table.insert(project_id.to_string(), guest_ip.clone());
+        table.insert(project_id.to_string(), alloc.ip.clone());
     }
 
-    info!(project = %project_id, ip = %guest_ip, "VM ready, routing active");
+    info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");
     Ok(())
 }
 

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const PROJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("projects");
+const VM_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("vm_allocations");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -12,6 +13,14 @@ pub struct Project {
     pub name: String,
     pub current_version: Option<u64>,
     pub vm_ip: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmAllocation {
+    pub project_id: String,
+    pub ip: String,
+    pub tap_device: String,
+    pub mac: String,
 }
 
 #[derive(Clone)]
@@ -25,6 +34,7 @@ impl Store {
 
         let txn = db.begin_write()?;
         let _ = txn.open_table(PROJECTS)?;
+        let _ = txn.open_table(VM_ALLOCATIONS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -74,6 +84,48 @@ impl Store {
         let existed = {
             let mut table = txn.open_table(PROJECTS)?;
             table.remove(id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    pub fn save_vm_allocation(&self, alloc: &VmAllocation) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(VM_ALLOCATIONS)?;
+            let data = serde_json::to_vec(alloc)?;
+            table.insert(alloc.project_id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_vm_allocation(&self, project_id: &str) -> Result<Option<VmAllocation>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(VM_ALLOCATIONS)?;
+        match table.get(project_id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_vm_allocations(&self) -> Result<Vec<VmAllocation>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(VM_ALLOCATIONS)?;
+        let mut allocs = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let alloc: VmAllocation = serde_json::from_slice(value.value())?;
+            allocs.push(alloc);
+        }
+        Ok(allocs)
+    }
+
+    pub fn remove_vm_allocation(&self, project_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(VM_ALLOCATIONS)?;
+            table.remove(project_id)?.is_some()
         };
         txn.commit()?;
         Ok(existed)
