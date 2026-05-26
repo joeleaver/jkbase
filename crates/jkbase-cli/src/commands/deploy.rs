@@ -96,14 +96,41 @@ pub async fn run(args: DeployArgs) -> Result<()> {
     Ok(())
 }
 
+const EXCLUDED_FILES: &[&str] = &["jkbase.toml"];
+
 fn create_tarball(dir: &Path) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let enc = GzEncoder::new(buf, Compression::fast());
     let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all(".", dir)?;
+    append_dir_filtered(&mut tar, dir, dir)?;
     let enc = tar.into_inner()?;
     let compressed = enc.finish()?;
     Ok(compressed)
+}
+
+fn append_dir_filtered(
+    tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
+    root: &Path,
+    dir: &Path,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root)?;
+        let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if EXCLUDED_FILES.contains(&name) {
+            continue;
+        }
+
+        if path.is_dir() {
+            tar.append_dir(rel, &path)?;
+            append_dir_filtered(tar, root, &path)?;
+        } else {
+            tar.append_path_with_name(&path, rel)?;
+        }
+    }
+    Ok(())
 }
 
 fn slug(name: &str) -> String {
