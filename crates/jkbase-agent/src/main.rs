@@ -95,7 +95,7 @@ fn mount_content_drive(target: &str) {
     let tgt = CString::new(target).unwrap();
     let fst = CString::new("ext4").unwrap();
 
-    let flags = libc::MS_RDONLY;
+    let flags = 0;
     let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), flags, ptr::null()) };
     if ret != 0 {
         eprintln!(

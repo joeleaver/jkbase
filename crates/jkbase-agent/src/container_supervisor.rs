@@ -109,16 +109,21 @@ impl ContainerSupervisor {
             let manifest: ServerManifest = serde_json::from_str(&manifest_content)
                 .with_context(|| format!("failed to parse manifest for server '{name}'"))?;
 
+            // Prefer pre-extracted rootfs in content image (no tmpfs pressure)
+            let pre_extracted = self.servers_dir.join(&name);
             let tarball = self.servers_dir.join(format!("{name}.tar.gz"));
-            let rootfs_dir = self.extract_dir.join(&name);
-
-            if tarball.exists() {
-                info!(server = %name, "extracting server rootfs");
-                extract_tarball(&tarball, &rootfs_dir)?;
-            } else if !rootfs_dir.exists() {
-                warn!(server = %name, "no tarball and no extracted rootfs, skipping");
+            let rootfs_dir = if pre_extracted.is_dir() {
+                info!(server = %name, "using pre-extracted rootfs");
+                pre_extracted
+            } else if tarball.exists() {
+                let extract_to = self.extract_dir.join(&name);
+                info!(server = %name, "extracting server rootfs to tmpfs");
+                extract_tarball(&tarball, &extract_to)?;
+                extract_to
+            } else {
+                warn!(server = %name, "no rootfs found, skipping");
                 continue;
-            }
+            };
 
             info!(server = %name, port = manifest.port, "starting server");
             let process = spawn_server(&name, &manifest, &rootfs_dir, &self.log_buffer)?;

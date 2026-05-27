@@ -665,6 +665,31 @@ async fn do_deploy(
     let mut archive = tar::Archive::new(tar);
     archive.unpack(&deploy_path)?;
 
+    // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM)
+    let servers_dir = deploy_path.join("_servers");
+    if servers_dir.exists() {
+        for entry in std::fs::read_dir(&servers_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "gz") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.strip_suffix(".tar"))
+                    .unwrap_or("unknown");
+                let extract_dir = servers_dir.join(name);
+                info!(server = %name, "extracting server rootfs on host");
+                std::fs::create_dir_all(&extract_dir)?;
+                let file = std::fs::File::open(&path)?;
+                let gz = flate2::read::GzDecoder::new(file);
+                let mut archive = tar::Archive::new(gz);
+                archive.set_preserve_permissions(true);
+                archive.unpack(&extract_dir)?;
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+
     let live_link = state.deploy_dir.join(&project.id).join("live");
     let _ = tokio::fs::remove_file(&live_link).await;
     tokio::fs::symlink(&deploy_path, &live_link).await?;
