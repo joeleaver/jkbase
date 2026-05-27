@@ -1,35 +1,11 @@
 use anyhow::Result;
 use http_body_util::Full;
 use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use std::path::Path;
 
-pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "listening");
-
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let root = root.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| handle_request(root.clone(), req));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                error!(%peer, error = %e, "connection error");
-            }
-        });
-    }
-}
-
-async fn handle_request(
-    root: PathBuf,
+pub async fn handle_static(
+    root: &Path,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
@@ -41,16 +17,12 @@ async fn handle_request(
         root.join(request_path)
     };
 
-    // Canonicalize and verify the path is within the root
-    match serve_file(&root, &file_path).await {
+    match serve_file(root, &file_path).await {
         Ok(resp) => Ok(resp),
-        Err(_) => {
-            // Try index.html for SPA fallback
-            match serve_file(&root, &root.join("index.html")).await {
-                Ok(resp) => Ok(resp),
-                Err(_) => Ok(not_found()),
-            }
-        }
+        Err(_) => match serve_file(root, &root.join("index.html")).await {
+            Ok(resp) => Ok(resp),
+            Err(_) => Ok(not_found()),
+        },
     }
 }
 

@@ -1,0 +1,22 @@
+package jkbase:functions;
+
+interface types {
+    record http-request {
+        method: string,
+        path: string,
+        query: string,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    record http-response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+}
+
+world function {
+    use types.{http-request, http-response};
+    export handle: func(req: http-request) -> http-response;
+}
