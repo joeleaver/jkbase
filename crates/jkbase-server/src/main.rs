@@ -366,6 +366,13 @@ async fn handle_deploy(
     let vm = VmInstance::start(project_id, &config, &runtime_dir).await?;
 
     plat.vms.insert(project_id.to_string(), vm);
+    let domains = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .map(|p| p.domains)
+        .unwrap_or_default();
     drop(plat);
 
     wait_for_agent(&alloc.ip).await?;
@@ -373,6 +380,10 @@ async fn handle_deploy(
     {
         let mut table = routing.write().await;
         table.insert(project_id.to_string(), alloc.ip.clone());
+        for domain in &domains {
+            table.insert(domain.clone(), alloc.ip.clone());
+            info!(project = %project_id, alias = %domain, "domain alias registered");
+        }
     }
 
     info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");

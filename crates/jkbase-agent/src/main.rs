@@ -115,11 +115,19 @@ struct AgentState {
     functions: FunctionRuntime,
     containers: Arc<ContainerSupervisor>,
     route_config: Vec<RouteEntry>,
+    sites: Vec<SiteEntry>,
 }
 
 struct RouteEntry {
     prefix: String,
     server_name: String,
+}
+
+struct SiteEntry {
+    name: String,
+    root: PathBuf,
+    prefix: String,
+    spa: bool,
 }
 
 #[tokio::main]
@@ -160,6 +168,19 @@ async fn main() -> Result<()> {
     }
 
     let route_config = load_route_config(&serve_dir);
+    let sites = load_sites_config(&serve_dir);
+
+    if !sites.is_empty() {
+        for site in &sites {
+            info!(
+                site = %site.name,
+                prefix = %site.prefix,
+                root = %site.root.display(),
+                spa = site.spa,
+                "loaded site"
+            );
+        }
+    }
 
     if containers.has_servers() {
         let containers_for_health = containers.clone();
@@ -181,6 +202,7 @@ async fn main() -> Result<()> {
         functions,
         containers,
         route_config,
+        sites,
     });
 
     info!("jkbase-agent starting (pid {})", std::process::id());
@@ -200,6 +222,38 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
+
+fn load_sites_config(serve_dir: &PathBuf) -> Vec<SiteEntry> {
+    let sites_path = serve_dir.join("_sites.json");
+    if !sites_path.exists() {
+        return Vec::new();
+    }
+
+    let content = match std::fs::read_to_string(&sites_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let sites: Vec<jkbase_common::config::ResolvedSite> = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    // Sites are already sorted by prefix length (longest first) from the CLI
+    sites
+        .into_iter()
+        .map(|s| {
+            let root = serve_dir.join(format!("_site_{}", s.name));
+            SiteEntry {
+                name: s.name,
+                root,
+                prefix: s.prefix,
+                spa: s.spa,
+            }
+        })
+        .filter(|s| s.root.exists())
+        .collect()
 }
 
 fn load_route_config(serve_dir: &PathBuf) -> Vec<RouteEntry> {
@@ -261,7 +315,23 @@ async fn handle_request(
         }
     }
 
-    // Fall through to static file serving
+    // Multi-site routing: find the best matching site by prefix
+    if !state.sites.is_empty() {
+        for site in &state.sites {
+            let prefix = site.prefix.trim_end_matches('/');
+            if prefix.is_empty() || path.starts_with(prefix) {
+                let sub_path = if prefix.is_empty() {
+                    path.to_string()
+                } else {
+                    path.strip_prefix(prefix).unwrap_or(&path).to_string()
+                };
+                return static_server::handle_static_with_path(&site.root, &sub_path, site.spa)
+                    .await;
+            }
+        }
+    }
+
+    // Fall through to default static file serving
     static_server::handle_static(&state.serve_dir, req).await
 }
 

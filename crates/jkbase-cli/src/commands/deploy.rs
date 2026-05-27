@@ -45,13 +45,7 @@ pub async fn run(args: DeployArgs) -> Result<()> {
             )
         })?;
 
-    let public_dir = config
-        .hosting
-        .as_ref()
-        .and_then(|h| h.public.as_deref())
-        .unwrap_or(".");
-
-    let serve_dir = project_dir.join(public_dir);
+    let resolved_sites = config.resolved_sites();
 
     // Build WASM functions
     let mut wasm_files: Vec<(String, std::path::PathBuf)> = Vec::new();
@@ -77,10 +71,31 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         None
     };
 
+    // Serialize sites config for multi-site routing
+    let sites_json = if config.sites.len() > 0 {
+        Some(serde_json::to_string_pretty(&resolved_sites)?)
+    } else {
+        None
+    };
+
+    // Serialize domain aliases
+    let domains_json = if !config.domains.is_empty() {
+        Some(serde_json::to_string_pretty(&config.domains)?)
+    } else {
+        None
+    };
+
     println!("Packaging...");
-    let tarball =
-        create_tarball(&serve_dir, &wasm_files, &server_artifacts, route_config.as_deref())
-            .context("failed to create tarball")?;
+    let tarball = create_tarball(
+        project_dir,
+        &resolved_sites,
+        &wasm_files,
+        &server_artifacts,
+        route_config.as_deref(),
+        sites_json.as_deref(),
+        domains_json.as_deref(),
+    )
+    .context("failed to create tarball")?;
     println!("  {} bytes compressed", tarball.len());
 
     let project_id = slug(&project_name);
@@ -133,7 +148,6 @@ fn build_server(
     let image_tag = format!("jkbase-server-{name}:build");
     let dockerfile_dir = dockerfile.parent().unwrap_or(context_dir);
 
-    // docker build
     let status = std::process::Command::new("docker")
         .args(["build", "-t", &image_tag, "-f"])
         .arg(dockerfile)
@@ -145,7 +159,6 @@ fn build_server(
         anyhow::bail!("docker build failed for server '{name}'");
     }
 
-    // docker create + docker export to get the filesystem
     let output = std::process::Command::new("docker")
         .args(["create", &image_tag])
         .output()
@@ -157,7 +170,6 @@ fn build_server(
 
     let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // Get the CMD/ENTRYPOINT from the image
     let inspect_output = std::process::Command::new("docker")
         .args(["inspect", "--format", "{{json .Config}}", &image_tag])
         .output()
@@ -190,7 +202,6 @@ fn build_server(
         .unwrap_or("/")
         .to_string();
 
-    // Export filesystem
     let tarball_path = std::env::temp_dir().join(format!("jkbase-server-{name}.tar.gz"));
     let export_status = std::process::Command::new("sh")
         .arg("-c")
@@ -202,7 +213,6 @@ fn build_server(
         .status()
         .context("failed to export container filesystem")?;
 
-    // Clean up container
     let _ = std::process::Command::new("docker")
         .args(["rm", &container_id])
         .status();
@@ -223,8 +233,12 @@ fn build_server(
         })),
     });
 
-    println!("  Server '{name}': image exported ({} bytes)",
-        std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0));
+    println!(
+        "  Server '{name}': image exported ({} bytes)",
+        std::fs::metadata(&tarball_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    );
 
     Ok(ServerArtifact {
         name: name.to_string(),
@@ -298,23 +312,46 @@ fn read_crate_name(cargo_toml: &Path) -> Result<String> {
     parsed["package"]["name"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("could not read package name from {}", cargo_toml.display()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not read package name from {}",
+                cargo_toml.display()
+            )
+        })
 }
 
-const EXCLUDED_FILES: &[&str] = &["jkbase.toml"];
+const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
+const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
 
 fn create_tarball(
-    dir: &Path,
+    project_dir: &Path,
+    sites: &[jkbase_common::config::ResolvedSite],
     wasm_files: &[(String, std::path::PathBuf)],
     server_artifacts: &[ServerArtifact],
     route_config_json: Option<&str>,
+    sites_json: Option<&str>,
+    domains_json: Option<&str>,
 ) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let enc = GzEncoder::new(buf, Compression::fast());
     let mut tar = tar::Builder::new(enc);
 
-    if dir.is_dir() {
-        append_dir_filtered(&mut tar, dir, dir)?;
+    let multi_site = sites.len() > 1 || sites.first().is_some_and(|s| s.name != "default");
+
+    if multi_site {
+        for site in sites {
+            let site_dir = project_dir.join(&site.public);
+            let tar_prefix = format!("_site_{}", site.name);
+            if site_dir.is_dir() {
+                println!("  Site '{}': {} -> /{}", site.name, site.public, site.prefix);
+                append_dir_prefixed(&mut tar, &site_dir, &site_dir, &tar_prefix)?;
+            }
+        }
+    } else if let Some(site) = sites.first() {
+        let site_dir = project_dir.join(&site.public);
+        if site_dir.is_dir() {
+            append_dir_filtered(&mut tar, &site_dir, &site_dir)?;
+        }
     }
 
     if !wasm_files.is_empty() {
@@ -338,17 +375,34 @@ fn create_tarball(
     }
 
     if let Some(routes_json) = route_config_json {
-        let routes_bytes = routes_json.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(routes_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, "_routes.json", routes_bytes)?;
+        append_json_file(&mut tar, "_routes.json", routes_json)?;
+    }
+
+    if let Some(sites_json) = sites_json {
+        append_json_file(&mut tar, "_sites.json", sites_json)?;
+    }
+
+    if let Some(domains_json) = domains_json {
+        append_json_file(&mut tar, "_domains.json", domains_json)?;
     }
 
     let enc = tar.into_inner()?;
     let compressed = enc.finish()?;
     Ok(compressed)
+}
+
+fn append_json_file(
+    tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
+    name: &str,
+    content: &str,
+) -> Result<()> {
+    let bytes = content.as_bytes();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, name, bytes)?;
+    Ok(())
 }
 
 fn append_dir_filtered(
@@ -360,17 +414,57 @@ fn append_dir_filtered(
         let entry = entry?;
         let path = entry.path();
         let rel = path.strip_prefix(root)?;
-        let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let name = rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
 
         if EXCLUDED_FILES.contains(&name) {
             continue;
         }
 
         if path.is_dir() {
+            if EXCLUDED_DIRS.contains(&name) {
+                continue;
+            }
             tar.append_dir(rel, &path)?;
             append_dir_filtered(tar, root, &path)?;
         } else {
             tar.append_path_with_name(&path, rel)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_dir_prefixed(
+    tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root)?;
+        let name = rel
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if EXCLUDED_FILES.contains(&name) {
+            continue;
+        }
+
+        let tar_path = Path::new(prefix).join(rel);
+
+        if path.is_dir() {
+            if EXCLUDED_DIRS.contains(&name) {
+                continue;
+            }
+            tar.append_dir(&tar_path, &path)?;
+            append_dir_prefixed(tar, root, &path, prefix)?;
+        } else {
+            tar.append_path_with_name(&path, &tar_path)?;
         }
     }
     Ok(())

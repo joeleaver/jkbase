@@ -27,6 +27,8 @@ pub struct Project {
     #[serde(default = "default_state")]
     pub state: ProjectState,
     pub vm_ip: Option<String>,
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,6 +9,14 @@ pub async fn handle_static(
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path();
+    handle_static_with_path(root, path, true).await
+}
+
+pub async fn handle_static_with_path(
+    root: &Path,
+    path: &str,
+    spa: bool,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let request_path = path.trim_start_matches('/');
 
     let file_path = if request_path.is_empty() {
@@ -19,10 +27,11 @@ pub async fn handle_static(
 
     match serve_file(root, &file_path).await {
         Ok(resp) => Ok(resp),
-        Err(_) => match serve_file(root, &root.join("index.html")).await {
+        Err(_) if spa => match serve_file(root, &root.join("index.html")).await {
             Ok(resp) => Ok(resp),
             Err(_) => Ok(not_found()),
         },
+        Err(_) => Ok(not_found()),
     }
 }
 

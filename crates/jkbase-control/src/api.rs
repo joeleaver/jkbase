@@ -472,6 +472,7 @@ async fn create_project(
         current_version: None,
         vm_ip: None,
         state: crate::store::ProjectState::Stopped,
+        domains: Vec::new(),
     };
 
     if let Err(e) = state.store.create_project(&project) {
@@ -693,6 +694,16 @@ async fn do_deploy(
     let live_link = state.deploy_dir.join(&project.id).join("live");
     let _ = tokio::fs::remove_file(&live_link).await;
     tokio::fs::symlink(&deploy_path, &live_link).await?;
+
+    // Read domain aliases from deploy
+    let domains_path = deploy_path.join("_domains.json");
+    if domains_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&domains_path) {
+            if let Ok(domains) = serde_json::from_str::<Vec<String>>(&content) {
+                project.domains = domains;
+            }
+        }
+    }
 
     project.current_version = Some(version);
     project.state = crate::store::ProjectState::Active;
