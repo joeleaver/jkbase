@@ -1,7 +1,7 @@
 use crate::auth::{self, ApiToken, Tenant};
 use crate::store::{Project, Store};
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, State, Request};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
@@ -23,10 +23,13 @@ pub type DeployCallback = Box<
         + Sync,
 >;
 
+pub type RoutingTable = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
+
 pub struct AppState {
     pub store: Store,
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
+    pub routing_table: Option<RoutingTable>,
     deploy_locks: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -60,6 +63,7 @@ impl AppState {
             store,
             deploy_dir,
             deploy_callback: None,
+            routing_table: None,
             deploy_locks: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -104,7 +108,10 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(list_secrets).post(set_secret),
         )
         .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
+        .route("/projects/{id}/logs", get(get_project_logs))
         .route("/me", get(get_me))
+        .route("/me/token", post(generate_new_token))
+        .route("/me/password", post(change_password))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_auth,
@@ -686,6 +693,177 @@ fn slug(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+async fn get_project_logs(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    req: Request,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+
+    let Some(ref routing_table) = state.routing_table else {
+        return Json(serde_json::json!([])).into_response();
+    };
+
+    let backend_ip = {
+        let table = routing_table.read().await;
+        table.get(&id).cloned()
+    };
+
+    let Some(ip) = backend_ip else {
+        return Json(serde_json::json!([])).into_response();
+    };
+
+    let query = req.uri().query().unwrap_or("");
+    let url = format!("http://{}:80/_jkbase/logs?{}", ip, query);
+
+    match proxy_to_vm(&ip, &url).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(hyper::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(_) => Json(serde_json::json!([])).into_response(),
+    }
+}
+
+async fn proxy_to_vm(ip: &str, url: &str) -> anyhow::Result<String> {
+    let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::spawn(conn);
+
+    let req = hyper::Request::builder()
+        .uri(url)
+        .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
+
+    let resp = sender.send_request(req).await?;
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await?
+        .to_bytes();
+    Ok(String::from_utf8_lossy(&body).to_string())
+}
+
+async fn generate_new_token(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+) -> impl IntoResponse {
+    let raw_token = auth::generate_token();
+    let token_hash = match auth::hash_token(&raw_token) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let api_token = auth::ApiToken {
+        id: auth::generate_id(),
+        tenant_id: tenant.id.clone(),
+        name: "generated".to_string(),
+        token_hash,
+        created_at: auth::timestamp(),
+    };
+
+    if let Err(e) = state.store.save_api_token(&api_token) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({ "token": raw_token })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Json(req): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    let Some(ref current_hash) = tenant.password_hash else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "account has no password set".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if !auth::verify_password(&req.current_password, current_hash) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "current password is incorrect".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if req.new_password.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "new password must be at least 8 characters".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let new_hash = match auth::hash_password(&req.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let mut updated_tenant = tenant.clone();
+    updated_tenant.password_hash = Some(new_hash);
+    if let Err(e) = state.store.create_tenant(&updated_tenant) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 #[derive(Deserialize)]

@@ -1,11 +1,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
+
+const MAX_LOG_LINES: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerManifest {
@@ -31,10 +35,19 @@ struct ManagedServer {
     healthy: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LogLine {
+    pub server: String,
+    pub stream: String,
+    pub line: String,
+    pub timestamp: u64,
+}
+
 pub struct ContainerSupervisor {
     servers: RwLock<Vec<ManagedServer>>,
     servers_dir: PathBuf,
     extract_dir: PathBuf,
+    log_buffer: Arc<Mutex<VecDeque<LogLine>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +58,13 @@ pub struct ServerStatus {
     pub healthy: bool,
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 impl ContainerSupervisor {
     pub fn new(servers_dir: PathBuf) -> Self {
         let extract_dir = PathBuf::from("/tmp/jkbase-servers");
@@ -52,6 +72,7 @@ impl ContainerSupervisor {
             servers: RwLock::new(Vec::new()),
             servers_dir,
             extract_dir,
+            log_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))),
         }
     }
 
@@ -100,7 +121,7 @@ impl ContainerSupervisor {
             }
 
             info!(server = %name, port = manifest.port, "starting server");
-            let process = spawn_server(&name, &manifest, &rootfs_dir)?;
+            let process = spawn_server(&name, &manifest, &rootfs_dir, &self.log_buffer)?;
 
             servers.push(ManagedServer {
                 name,
@@ -146,7 +167,12 @@ impl ContainerSupervisor {
                             "server process exited, restarting"
                         );
                         server.healthy = false;
-                        match spawn_server(&server.name, &server.manifest, &server.rootfs_dir) {
+                        match spawn_server(
+                            &server.name,
+                            &server.manifest,
+                            &server.rootfs_dir,
+                            &self.log_buffer,
+                        ) {
                             Ok(new_process) => {
                                 server.process = Some(new_process);
                             }
@@ -199,6 +225,16 @@ impl ContainerSupervisor {
             .map(|s| s.manifest.port)
     }
 
+    pub async fn get_logs(&self, limit: usize) -> Vec<LogLine> {
+        let buf = self.log_buffer.lock().await;
+        let start = if buf.len() > limit {
+            buf.len() - limit
+        } else {
+            0
+        };
+        buf.iter().skip(start).cloned().collect()
+    }
+
     pub async fn stop_all(&self) {
         let mut servers = self.servers.write().await;
         for server in servers.iter_mut() {
@@ -226,7 +262,12 @@ fn extract_tarball(tarball: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn spawn_server(name: &str, manifest: &ServerManifest, rootfs_dir: &Path) -> Result<Child> {
+fn spawn_server(
+    name: &str,
+    manifest: &ServerManifest,
+    rootfs_dir: &Path,
+    log_buffer: &Arc<Mutex<VecDeque<LogLine>>>,
+) -> Result<Child> {
     use std::os::unix::process::CommandExt;
 
     if manifest.cmd.is_empty() {
@@ -247,7 +288,10 @@ fn spawn_server(name: &str, manifest: &ServerManifest, rootfs_dir: &Path) -> Res
     std_cmd.env_clear();
     std_cmd.env("PORT", manifest.port.to_string());
     std_cmd.env("HOME", "/root");
-    std_cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    std_cmd.env(
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     for (key, value) in &manifest.env {
         std_cmd.env(key, value);
     }
@@ -273,9 +317,52 @@ fn spawn_server(name: &str, manifest: &ServerManifest, rootfs_dir: &Path) -> Res
         });
     }
 
-    let child = Command::from(std_cmd)
+    let mut child = Command::from(std_cmd)
         .spawn()
         .with_context(|| format!("failed to spawn server '{name}': {:?}", manifest.cmd))?;
+
+    // Spawn log readers for stdout and stderr
+    let server_name = name.to_string();
+    if let Some(stdout) = child.stdout.take() {
+        let buf = log_buffer.clone();
+        let sname = server_name.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut buffer = buf.lock().await;
+                if buffer.len() >= MAX_LOG_LINES {
+                    buffer.pop_front();
+                }
+                buffer.push_back(LogLine {
+                    server: sname.clone(),
+                    stream: "stdout".to_string(),
+                    line,
+                    timestamp: now_secs(),
+                });
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let buf = log_buffer.clone();
+        let sname = server_name.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut buffer = buf.lock().await;
+                if buffer.len() >= MAX_LOG_LINES {
+                    buffer.pop_front();
+                }
+                buffer.push_back(LogLine {
+                    server: sname.clone(),
+                    stream: "stderr".to_string(),
+                    line,
+                    timestamp: now_secs(),
+                });
+            }
+        });
+    }
 
     info!(server = %name, pid = ?child.id(), cmd = ?manifest.cmd, "server process started (chroot: {})", rootfs_dir.display());
     Ok(child)

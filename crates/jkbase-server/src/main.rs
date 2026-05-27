@@ -126,6 +126,7 @@ async fn main() -> Result<()> {
     }));
 
     let mut state = AppState::new(store, deploy_dir);
+    state.routing_table = Some(routing_table.clone());
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();

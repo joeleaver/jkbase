@@ -239,6 +239,10 @@ async fn handle_request(
         return Ok(health_response(&state).await);
     }
 
+    if path == "/_jkbase/logs" || path.starts_with("/_jkbase/logs?") {
+        return Ok(logs_response(&state, &req).await);
+    }
+
     // Check route config for server routing
     for route in &state.route_config {
         let prefix = route.prefix.trim_end_matches('*');
@@ -279,6 +283,26 @@ async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
         .body(Full::new(Bytes::from(
             serde_json::to_vec_pretty(&body).unwrap(),
         )))
+        .unwrap()
+}
+
+async fn logs_response(
+    state: &AgentState,
+    req: &Request<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    let query = req.uri().query().unwrap_or("");
+    let limit: usize = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("limit="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+
+    let logs = state.containers.get_logs(limit).await;
+    let body = serde_json::to_vec(&logs).unwrap_or_default();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body)))
         .unwrap()
 }
 

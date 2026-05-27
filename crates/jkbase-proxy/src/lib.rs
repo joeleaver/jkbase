@@ -262,18 +262,21 @@ async fn forward_request(
     backend_ip: &str,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
-    let uri = format!("http://{}:{}{}", backend_ip, 80, req.uri().path());
+    let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let uri = format!("http://{}:{}{}", backend_ip, 80, path_and_query);
 
     let stream = tokio::net::TcpStream::connect(format!("{backend_ip}:80")).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::spawn(conn);
 
-    let proxy_req = Request::builder()
+    let mut builder = Request::builder()
         .method(req.method())
-        .uri(&uri)
-        .body(req.into_body())
-        .unwrap();
+        .uri(&uri);
+    for (key, value) in req.headers() {
+        builder = builder.header(key, value);
+    }
+    let proxy_req = builder.body(req.into_body()).unwrap();
 
     let resp = sender.send_request(proxy_req).await?;
     let status = resp.status();
