@@ -51,10 +51,11 @@ set -euo pipefail
 IMAGE="{output}"
 MOUNT_DIR=$(mktemp -d)
 
-# Size the image to fit the content (minimum 4MB)
+# Size the image to fit the content with ext4 overhead (minimum 4MB)
 CONTENT_SIZE_KB=$(du -sk "{content}" | cut -f1)
-SIZE_KB=$(( CONTENT_SIZE_KB + 2048 ))
-if [ "$SIZE_KB" -lt 4096 ]; then SIZE_KB=4096; fi
+OVERHEAD=$(( CONTENT_SIZE_KB / 4 ))
+if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
+SIZE_KB=$(( CONTENT_SIZE_KB + OVERHEAD ))
 
 dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
 mkfs.ext4 -F -q "$IMAGE"
