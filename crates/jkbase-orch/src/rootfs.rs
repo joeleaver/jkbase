@@ -22,7 +22,7 @@ dd if=/dev/zero of="$ROOTFS" bs=1M count=32 status=none
 mkfs.ext4 -F -q "$ROOTFS"
 mount -o loop "$ROOTFS" "$MOUNT_DIR"
 
-mkdir -p "$MOUNT_DIR"/{{sbin,dev,proc,sys,tmp,srv/www}}
+mkdir -p "$MOUNT_DIR"/{{sbin,dev,proc,sys,tmp,srv/www,mnt/data}}
 
 cp "{agent}" "$MOUNT_DIR/sbin/init"
 chmod +x "$MOUNT_DIR/sbin/init"
@@ -59,52 +59,19 @@ if losetup -j "$IMAGE" 2>/dev/null | grep -q .; then
     losetup -d $(losetup -j "$IMAGE" -O NAME -n 2>/dev/null) 2>/dev/null || true
 fi
 
-# Preserve _data directory from old content image (persistent volumes)
-DATA_BACKUP=""
-if [ -f "$IMAGE" ]; then
-    OLD_MOUNT=$(mktemp -d)
-    mount -o loop "$IMAGE" "$OLD_MOUNT" 2>/dev/null
-    if [ -d "$OLD_MOUNT/_data" ] && [ "$(ls -A "$OLD_MOUNT/_data" 2>/dev/null)" ]; then
-        DATA_BACKUP=$(mktemp -d)
-        cp -a "$OLD_MOUNT/_data" "$DATA_BACKUP/_data"
-    fi
-    umount "$OLD_MOUNT" 2>/dev/null || true
-    rmdir "$OLD_MOUNT"
-fi
-
 MOUNT_DIR=$(mktemp -d)
 
-# Size: content + preserved data + volume headroom + overhead
+# Size the image to fit the content (minimum 4MB, 10% overhead for ext4 metadata)
 CONTENT_SIZE_KB=$(du -sk "{content}/" | cut -f1)
-DATA_SIZE_KB=0
-if [ -n "$DATA_BACKUP" ]; then
-    DATA_SIZE_KB=$(du -sk "$DATA_BACKUP/" | cut -f1)
-fi
-# Add 256MB headroom for volume data if server manifests declare volumes
-HAS_VOLUMES=0
-if ls "{content}"/_servers/*.json 2>/dev/null | xargs grep -l '"volumes"' 2>/dev/null | grep -q .; then
-    HAS_VOLUMES=1
-fi
-VOLUME_HEADROOM_KB=0
-if [ "$HAS_VOLUMES" -eq 1 ]; then
-    VOLUME_HEADROOM_KB=262144
-fi
-TOTAL_KB=$(( CONTENT_SIZE_KB + DATA_SIZE_KB + VOLUME_HEADROOM_KB ))
-OVERHEAD=$(( TOTAL_KB / 10 ))
+OVERHEAD=$(( CONTENT_SIZE_KB / 10 ))
 if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
-SIZE_KB=$(( TOTAL_KB + OVERHEAD ))
+SIZE_KB=$(( CONTENT_SIZE_KB + OVERHEAD ))
 
 dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
-mkfs.ext4 -F -q -m 1 "$IMAGE"
+mkfs.ext4 -F -q -m 0 -O ^has_journal "$IMAGE"
 mount -o loop "$IMAGE" "$MOUNT_DIR"
 
 cp -a "{content}"/. "$MOUNT_DIR/"
-
-# Restore preserved data
-if [ -n "$DATA_BACKUP" ] && [ -d "$DATA_BACKUP/_data" ]; then
-    cp -a "$DATA_BACKUP/_data" "$MOUNT_DIR/_data"
-    rm -rf "$DATA_BACKUP"
-fi
 
 umount "$MOUNT_DIR"
 rmdir "$MOUNT_DIR"

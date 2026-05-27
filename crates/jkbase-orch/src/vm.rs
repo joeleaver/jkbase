@@ -116,7 +116,7 @@ impl VmInstance {
                     drive_id: "content".to_string(),
                     path_on_host: content_path.to_string_lossy().to_string(),
                     is_root_device: false,
-                    is_read_only: false,
+                    is_read_only: true,
                 })
                 .await?;
         }

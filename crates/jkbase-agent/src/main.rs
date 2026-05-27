@@ -95,7 +95,7 @@ fn mount_content_drive(target: &str) {
     let tgt = CString::new(target).unwrap();
     let fst = CString::new("ext4").unwrap();
 
-    let flags = 0;
+    let flags = libc::MS_RDONLY;
     let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), flags, ptr::null()) };
     if ret != 0 {
         eprintln!(
@@ -111,16 +111,6 @@ fn mount_data_disk() {
 
     let device = "/dev/vdc";
     let target = "/mnt/data";
-
-    // The kernel may not create /dev/vdc automatically — create it manually
-    // virtio block devices: major 254, minor 0=vda, 16=vdb, 32=vdc
-    if !std::path::Path::new(device).exists() {
-        let dev_path = CString::new(device).unwrap();
-        let dev_num = libc::makedev(254, 32);
-        unsafe {
-            libc::mknod(dev_path.as_ptr(), libc::S_IFBLK | 0o660, dev_num);
-        }
-    }
 
     if !std::path::Path::new(device).exists() {
         return;
@@ -187,6 +177,7 @@ async fn main() -> Result<()> {
 
     if is_pid1() {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
+        mount_data_disk();
     }
 
     let mut functions = FunctionRuntime::new();

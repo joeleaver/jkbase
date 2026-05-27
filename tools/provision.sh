@@ -119,9 +119,9 @@ else
 fi
 
 if [ ! -f "\$FC_DIR/vmlinux.bin" ]; then
-    echo "Downloading kernel image..."
+    echo "Downloading kernel image (6.1)..."
     cd "\$FC_DIR"
-    curl -sLO "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/${FC_ARCH}/kernels/vmlinux.bin"
+    curl -sLo vmlinux.bin "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/${FC_ARCH}/vmlinux-6.1.155"
     echo "Kernel image downloaded."
 else
     echo "Kernel image already present."
