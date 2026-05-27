@@ -63,7 +63,7 @@ fi
 DATA_BACKUP=""
 if [ -f "$IMAGE" ]; then
     OLD_MOUNT=$(mktemp -d)
-    mount -o loop,ro "$IMAGE" "$OLD_MOUNT" 2>/dev/null
+    mount -o loop "$IMAGE" "$OLD_MOUNT" 2>/dev/null
     if [ -d "$OLD_MOUNT/_data" ] && [ "$(ls -A "$OLD_MOUNT/_data" 2>/dev/null)" ]; then
         DATA_BACKUP=$(mktemp -d)
         cp -a "$OLD_MOUNT/_data" "$DATA_BACKUP/_data"
