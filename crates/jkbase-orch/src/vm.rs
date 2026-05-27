@@ -24,6 +24,7 @@ pub struct VmInstance {
     pub id: String,
     socket_path: PathBuf,
     vsock_path: Option<PathBuf>,
+    log_path: PathBuf,
     process: Child,
     client: FirecrackerClient,
 }
@@ -47,12 +48,19 @@ impl VmInstance {
             }
         }
 
-        info!(id, "starting Firecracker process");
+        let log_path = vm_dir.join("console.log");
+        let log_file = std::fs::File::create(&log_path)
+            .context("failed to create VM console log")?;
+        let stderr_log = log_file
+            .try_clone()
+            .context("failed to clone log file handle")?;
+
+        info!(id, log = %log_path.display(), "starting Firecracker process");
         let process = Command::new(&config.firecracker_bin)
             .arg("--api-sock")
             .arg(&socket_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(stderr_log))
             .spawn()
             .context("failed to spawn Firecracker process")?;
 
@@ -139,6 +147,7 @@ impl VmInstance {
             id: id.to_string(),
             socket_path,
             vsock_path,
+            log_path,
             process,
             client,
         })
@@ -150,6 +159,10 @@ impl VmInstance {
 
     pub fn vsock_path(&self) -> Option<&Path> {
         self.vsock_path.as_deref()
+    }
+
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
     }
 
     pub async fn stop(&mut self) -> Result<()> {

@@ -42,6 +42,46 @@ fn mount_filesystems() {
     }
 }
 
+fn seed_entropy() {
+    use std::io::Write;
+    // Firecracker VMs have no hardware RNG, so /dev/urandom blocks until
+    // the entropy pool is initialized. Seed it from the CPU timestamp counter.
+    let mut seed = [0u8; 512];
+    for chunk in seed.chunks_mut(8) {
+        let tsc: u64;
+        unsafe {
+            std::arch::x86_64::_mm_lfence();
+            tsc = std::arch::x86_64::_rdtsc();
+        }
+        let bytes = tsc.to_ne_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/urandom") {
+        let _ = f.write_all(&seed);
+    }
+
+    // Also use RNDADDENTROPY ioctl to credit the entropy
+    if let Ok(f) = std::fs::OpenOptions::new().write(true).open("/dev/random") {
+        use std::os::unix::io::AsRawFd;
+        #[repr(C)]
+        struct RandPoolInfo {
+            entropy_count: i32,
+            buf_size: i32,
+            buf: [u8; 512],
+        }
+        let mut info = RandPoolInfo {
+            entropy_count: 512 * 8,
+            buf_size: 512,
+            buf: seed,
+        };
+        unsafe {
+            // RNDADDENTROPY = 0x40085203
+            libc::ioctl(f.as_raw_fd(), 0x40085203, &mut info as *mut _);
+        }
+    }
+}
+
 fn mount_content_drive(target: &str) {
     use std::ffi::CString;
     use std::ptr;
@@ -72,6 +112,7 @@ fn is_pid1() -> bool {
 
 struct AgentState {
     serve_dir: PathBuf,
+    functions_dir: PathBuf,
     functions: FunctionRuntime,
 }
 
@@ -79,6 +120,7 @@ struct AgentState {
 async fn main() -> Result<()> {
     if is_pid1() {
         mount_filesystems();
+        seed_entropy();
     }
 
     tracing_subscriber::fmt::init();
@@ -111,6 +153,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AgentState {
         serve_dir,
+        functions_dir,
         functions,
     });
 
@@ -139,15 +182,37 @@ async fn handle_request(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path().to_string();
 
+    if path == "/_jkbase/health" {
+        return Ok(health_response(&state));
+    }
+
     // Check if this is a function call: /functions/{name} or /functions/{name}/...
     if let Some(func_name) = extract_function_name(&path) {
         if state.functions.has_function(&func_name) {
+            info!(function = %func_name, path = %path, "routing to function");
             return Ok(invoke_function(state, &func_name, req).await);
         }
     }
 
     // Fall through to static file serving
     static_server::handle_static(&state.serve_dir, req).await
+}
+
+fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
+    let functions = state.functions.list_functions();
+    let body = serde_json::json!({
+        "status": "ok",
+        "pid": std::process::id(),
+        "serve_dir": state.serve_dir.display().to_string(),
+        "functions_loaded": functions,
+        "functions_dir_exists": state.functions_dir.exists(),
+        "functions_dir": state.functions_dir.display().to_string(),
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec_pretty(&body).unwrap())))
+        .unwrap()
 }
 
 fn extract_function_name(path: &str) -> Option<String> {

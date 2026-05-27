@@ -146,7 +146,7 @@ impl FunctionRuntime {
         let output = stdout_clone.contents();
         let err_output = stderr_clone.contents();
 
-        tracing::debug!(
+        info!(
             function = name,
             stdout_len = output.len(),
             stderr_len = err_output.len(),
