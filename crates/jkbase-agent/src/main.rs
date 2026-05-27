@@ -112,6 +112,16 @@ fn mount_data_disk() {
     let device = "/dev/vdc";
     let target = "/mnt/data";
 
+    // The kernel may not create /dev/vdc automatically — create it manually
+    // virtio block devices: major 254, minor 0=vda, 16=vdb, 32=vdc
+    if !std::path::Path::new(device).exists() {
+        let dev_path = CString::new(device).unwrap();
+        let dev_num = libc::makedev(254, 32);
+        unsafe {
+            libc::mknod(dev_path.as_ptr(), libc::S_IFBLK | 0o660, dev_num);
+        }
+    }
+
     if !std::path::Path::new(device).exists() {
         return;
     }

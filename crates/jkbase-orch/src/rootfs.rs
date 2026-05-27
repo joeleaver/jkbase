@@ -100,7 +100,7 @@ pub async fn create_data_disk(output: &Path, size_mib: u32) -> Result<()> {
         r#"
 set -euo pipefail
 IMAGE="{output}"
-dd if=/dev/zero of="$IMAGE" bs=1M count=0 seek={size} status=none
+truncate -s {size}M "$IMAGE"
 mkfs.ext4 -F -q -m 1 "$IMAGE"
 "#,
         output = output.display(),
