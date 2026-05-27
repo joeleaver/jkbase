@@ -52,7 +52,7 @@ IMAGE="{output}"
 MOUNT_DIR=$(mktemp -d)
 
 # Size the image to fit the content with ext4 overhead (minimum 4MB)
-CONTENT_SIZE_KB=$(du -sk "{content}" | cut -f1)
+CONTENT_SIZE_KB=$(du -skL "{content}" | cut -f1)
 OVERHEAD=$(( CONTENT_SIZE_KB / 4 ))
 if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
 SIZE_KB=$(( CONTENT_SIZE_KB + OVERHEAD ))
