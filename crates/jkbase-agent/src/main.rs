@@ -293,10 +293,7 @@ fn extract_function_name(path: &str) -> Option<String> {
 
 async fn proxy_to_server(port: u16, req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
     let addr = format!("127.0.0.1:{port}");
-    let uri = format!(
-        "http://{addr}{}",
-        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
-    );
+    let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     let stream = match tokio::net::TcpStream::connect(&addr).await {
         Ok(s) => s,
@@ -324,7 +321,7 @@ async fn proxy_to_server(port: u16, req: Request<hyper::body::Incoming>) -> Resp
 
     let proxy_req = Request::builder()
         .method(req.method())
-        .uri(&uri)
+        .uri(path)
         .body(req.into_body())
         .unwrap();
 
