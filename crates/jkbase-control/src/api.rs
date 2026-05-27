@@ -44,6 +44,7 @@ pub struct ProjectResponse {
     pub name: String,
     pub current_version: Option<u64>,
     pub url: Option<String>,
+    pub domains: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +110,8 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
         .route("/projects/{id}/logs", get(get_project_logs))
+        .route("/projects/{id}/domains", get(list_domains).post(add_domain))
+        .route("/projects/{id}/domains/{domain}", axum::routing::delete(remove_domain))
         .route("/me", get(get_me))
         .route("/me/token", post(generate_new_token))
         .route("/me/password", post(change_password))
@@ -1025,6 +1028,125 @@ async fn delete_secret(
     }
 }
 
+async fn list_domains(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {
+            Json(p.domains).into_response()
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AddDomainRequest {
+    pub domain: String,
+}
+
+async fn add_domain(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<AddDomainRequest>,
+) -> impl IntoResponse {
+    let mut project = match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let domain = req.domain.to_lowercase().trim().to_string();
+    if domain.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "domain cannot be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if !project.domains.contains(&domain) {
+        project.domains.push(domain.clone());
+        if let Err(e) = state.store.update_project(&project) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+
+        // Register in routing table if project is deployed
+        if let Some(ref rt) = state.routing_table {
+            if let Ok(Some(alloc)) = state.store.get_vm_allocation(&id) {
+                let mut table = rt.write().await;
+                table.insert(domain.clone(), alloc.ip.clone());
+            }
+        }
+
+        info!(project = %id, domain = %domain, "domain alias added");
+    }
+
+    Json(project.domains).into_response()
+}
+
+async fn remove_domain(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path((id, domain)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let mut project = match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    project.domains.retain(|d| d != &domain);
+    if let Err(e) = state.store.update_project(&project) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Remove from routing table
+    if let Some(ref rt) = state.routing_table {
+        let mut table = rt.write().await;
+        table.remove(&domain);
+    }
+
+    info!(project = %id, domain = %domain, "domain alias removed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
 fn to_response(p: &Project) -> ProjectResponse {
     ProjectResponse {
         id: p.id.clone(),
@@ -1035,5 +1157,6 @@ fn to_response(p: &Project) -> ProjectResponse {
         } else {
             None
         },
+        domains: p.domains.clone(),
     }
 }

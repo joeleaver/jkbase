@@ -172,6 +172,12 @@ body {
   width: 100%;
 }
 
+.input.input-sm {
+  padding: 6px 10px;
+  font-size: 12px;
+  width: auto;
+}
+
 .input:focus {
   border-color: var(--border-hover);
 }
@@ -734,6 +740,62 @@ body {
   width: 40px;
 }
 
+.hosting-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.hosting-row:last-of-type {
+  border-bottom: none;
+}
+
+.hosting-row.dim {
+  color: var(--text-dim);
+}
+
+.hosting-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  min-width: 60px;
+  letter-spacing: 0.5px;
+}
+
+.hosting-url {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.hosting-url:hover {
+  text-decoration: underline;
+}
+
+.btn-danger-text {
+  color: var(--danger) !important;
+}
+
+.domain-add-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  align-items: center;
+}
+
+.domain-add-form .input {
+  width: 180px;
+  flex: none;
+}
+
+.domain-suffix {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+
 .secret-add-form {
   display: flex;
   gap: 8px;
@@ -1179,8 +1241,12 @@ body {
     accountSuccess: null,
     // sidebar mobile
     sidebarOpen: false,
+    // domains
+    domains: [],
+    domainsLoading: false,
+    showAddDomain: false,
     // collapsible sections
-    sectionsOpen: { deploy: true, secrets: true, logs: true },
+    sectionsOpen: { deploy: true, hosting: true, secrets: true, logs: true },
   };
 
   // --- API helpers ---
@@ -1340,14 +1406,17 @@ body {
     state.view = "project-detail";
     state.secrets = [];
     state.logs = [];
+    state.domains = project.domains || [];
     state.error = null;
     state.success = null;
     state.showAddSecret = false;
+    state.showAddDomain = false;
     state.deleteSecretConfirm = null;
     state.deleteConfirm = false;
-    state.sectionsOpen = { deploy: true, secrets: true, logs: true };
+    state.sectionsOpen = { deploy: true, hosting: true, secrets: true, logs: true };
     render();
     loadSecrets(project.id);
+    loadDomains(project.id);
     loadLogs(project.id);
   }
 
@@ -1410,6 +1479,45 @@ body {
       }
     }).catch(function(e) {
       state.logsLoading = false;
+      state.error = e.message;
+      render();
+    });
+  }
+
+  // --- Domains ---
+
+  function loadDomains(projectId) {
+    state.domainsLoading = true;
+    render();
+    api("GET", "/projects/" + projectId + "/domains").then(function(domains) {
+      state.domains = domains;
+      state.domainsLoading = false;
+      render();
+    }).catch(function(e) {
+      state.domainsLoading = false;
+      state.error = e.message;
+      render();
+    });
+  }
+
+  function addDomain(projectId, domain) {
+    state.error = null;
+    api("POST", "/projects/" + projectId + "/domains", { domain: domain }).then(function(domains) {
+      state.domains = domains;
+      state.showAddDomain = false;
+      render();
+    }).catch(function(e) {
+      state.error = e.message;
+      render();
+    });
+  }
+
+  function removeDomain(projectId, domain) {
+    state.error = null;
+    api("DELETE", "/projects/" + projectId + "/domains/" + encodeURIComponent(domain)).then(function() {
+      state.domains = state.domains.filter(function(d) { return d !== domain; });
+      render();
+    }).catch(function(e) {
       state.error = e.message;
       render();
     });
@@ -1945,6 +2053,85 @@ body {
     });
   }
 
+  function renderHostingSection(project) {
+    var headerBtn = h("button", {
+      className: "btn btn-secondary btn-sm",
+      onClick: function(e) {
+        e.stopPropagation();
+        state.showAddDomain = true;
+        state.sectionsOpen.hosting = true;
+        render();
+      },
+    }, "Add Domain");
+
+    return renderCollapsibleCard("hosting", "Hosting", headerBtn, function() {
+      var primaryUrl = project.url
+        ? h("div", { className: "hosting-row" },
+            h("span", { className: "hosting-label" }, "Primary"),
+            h("a", {
+              className: "hosting-url",
+              href: project.url,
+              target: "_blank",
+              rel: "noopener",
+            }, project.url.replace("https://", ""))
+          )
+        : h("div", { className: "hosting-row dim" },
+            h("span", { className: "hosting-label" }, "Primary"),
+            h("span", null, project.id + ".jkbase.app (not deployed)")
+          );
+
+      var aliasRows = state.domains.map(function(domain) {
+        var url = "https://" + domain + ".jkbase.app";
+        return h("div", { className: "hosting-row" },
+          h("span", { className: "hosting-label" }, "Alias"),
+          h("a", {
+            className: "hosting-url",
+            href: url,
+            target: "_blank",
+            rel: "noopener",
+          }, domain + ".jkbase.app"),
+          h("button", {
+            className: "btn btn-ghost btn-sm btn-danger-text",
+            onClick: function() { removeDomain(project.id, domain); },
+          }, "Remove")
+        );
+      });
+
+      var addForm = state.showAddDomain
+        ? h("form", { className: "domain-add-form", onSubmit: function(e) {
+            e.preventDefault();
+            var input = e.target.querySelector("input");
+            var domain = input.value.trim().toLowerCase();
+            if (domain) addDomain(project.id, domain);
+          }},
+            h("input", {
+              className: "input input-sm",
+              type: "text",
+              placeholder: "subdomain name",
+              required: "required",
+              autocomplete: "off",
+              pattern: "[a-zA-Z0-9][a-zA-Z0-9-]*",
+              title: "Letters, numbers, and hyphens",
+            }),
+            h("span", { className: "domain-suffix" }, ".jkbase.app"),
+            h("button", { className: "btn btn-primary btn-sm", type: "submit" }, "Add"),
+            h("button", {
+              className: "btn btn-secondary btn-sm",
+              type: "button",
+              onClick: function() { state.showAddDomain = false; render(); },
+            }, "Cancel")
+          )
+        : null;
+
+      return h("div", null,
+        primaryUrl,
+        aliasRows,
+        addForm,
+        state.domainsLoading ? h("div", { className: "dim" }, "Loading domains...") : null
+      );
+    });
+  }
+
   function renderSecretsSection(project) {
     var headerBtn = h("button", {
       className: "btn btn-secondary btn-sm",
@@ -2157,6 +2344,7 @@ body {
           state.error ? h("div", { className: "error-banner" }, state.error) : null,
           state.success ? h("div", { className: "success-banner" }, state.success) : null,
           renderDeploySection(project),
+          renderHostingSection(project),
           renderSecretsSection(project),
           renderLogsSection(project),
           renderDangerZone(project)
