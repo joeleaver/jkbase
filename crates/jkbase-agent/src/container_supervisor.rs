@@ -134,17 +134,14 @@ impl ContainerSupervisor {
             };
 
             // Bind-mount persistent volumes into the container rootfs
+            let data_dir = PathBuf::from("/srv/www/_data/volumes");
             for vol in &manifest.volumes {
-                let src = PathBuf::from("/mnt/data/volumes").join(&vol.name);
+                let src = data_dir.join(&vol.name);
                 let dst = rootfs_dir.join(vol.mount.trim_start_matches('/'));
-                if std::path::Path::new("/mnt/data").exists() {
-                    let _ = std::fs::create_dir_all(&src);
-                    let _ = std::fs::create_dir_all(&dst);
-                    bind_mount(&src, &dst);
-                    info!(server = %name, volume = %vol.name, mount = %vol.mount, "volume mounted");
-                } else {
-                    warn!(server = %name, volume = %vol.name, "no data disk, skipping volume mount");
-                }
+                let _ = std::fs::create_dir_all(&src);
+                let _ = std::fs::create_dir_all(&dst);
+                bind_mount(&src, &dst);
+                info!(server = %name, volume = %vol.name, mount = %vol.mount, "volume mounted");
             }
 
             info!(server = %name, port = manifest.port, "starting server");

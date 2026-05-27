@@ -386,28 +386,12 @@ async fn handle_deploy(
 
     setup_tap(&alloc.tap_device).await?;
 
-    // Create data disk for persistent volumes if any servers declare volumes
-    let data_disk_path = {
-        let data_disks_dir = plat.data_dir.join("data-disks");
-        let disk_path = data_disks_dir.join(format!("{project_id}.ext4"));
-        let has_volumes = check_project_has_volumes(&plat.data_dir, project_id);
-        if has_volumes {
-            tokio::fs::create_dir_all(&data_disks_dir).await?;
-            rootfs::create_data_disk(&disk_path, 1024).await?;
-            Some(disk_path)
-        } else if disk_path.exists() {
-            Some(disk_path)
-        } else {
-            None
-        }
-    };
-
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
-        data_disk_path,
+        data_disk_path: None,
         vcpu_count: 1,
         mem_size_mib: 1024,
         tap_device: Some(alloc.tap_device.clone()),
@@ -593,24 +577,12 @@ async fn wake_project(
         .join("content-images")
         .join(format!("{project_id}.ext4"));
 
-    let data_disk_path = {
-        let disk = plat
-            .data_dir
-            .join("data-disks")
-            .join(format!("{project_id}.ext4"));
-        if disk.exists() {
-            Some(disk)
-        } else {
-            None
-        }
-    };
-
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
-        data_disk_path,
+        data_disk_path: None,
         vcpu_count: 1,
         mem_size_mib: 1024,
         tap_device: Some(alloc.tap_device.clone()),

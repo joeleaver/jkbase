@@ -59,19 +59,43 @@ if losetup -j "$IMAGE" 2>/dev/null | grep -q .; then
     losetup -d $(losetup -j "$IMAGE" -O NAME -n 2>/dev/null) 2>/dev/null || true
 fi
 
+# Preserve _data directory from old content image (persistent volumes)
+DATA_BACKUP=""
+if [ -f "$IMAGE" ]; then
+    OLD_MOUNT=$(mktemp -d)
+    mount -o loop,ro "$IMAGE" "$OLD_MOUNT" 2>/dev/null
+    if [ -d "$OLD_MOUNT/_data" ] && [ "$(ls -A "$OLD_MOUNT/_data" 2>/dev/null)" ]; then
+        DATA_BACKUP=$(mktemp -d)
+        cp -a "$OLD_MOUNT/_data" "$DATA_BACKUP/_data"
+    fi
+    umount "$OLD_MOUNT" 2>/dev/null || true
+    rmdir "$OLD_MOUNT"
+fi
+
 MOUNT_DIR=$(mktemp -d)
 
-# Size the image to fit the content (minimum 4MB, 10% overhead for ext4 metadata)
+# Size: content + preserved data + overhead (minimum 4MB)
 CONTENT_SIZE_KB=$(du -sk "{content}/" | cut -f1)
-OVERHEAD=$(( CONTENT_SIZE_KB / 10 ))
+DATA_SIZE_KB=0
+if [ -n "$DATA_BACKUP" ]; then
+    DATA_SIZE_KB=$(du -sk "$DATA_BACKUP/" | cut -f1)
+fi
+TOTAL_KB=$(( CONTENT_SIZE_KB + DATA_SIZE_KB ))
+OVERHEAD=$(( TOTAL_KB / 10 ))
 if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
-SIZE_KB=$(( CONTENT_SIZE_KB + OVERHEAD ))
+SIZE_KB=$(( TOTAL_KB + OVERHEAD ))
 
 dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
 mkfs.ext4 -F -q -m 0 -O ^has_journal "$IMAGE"
 mount -o loop "$IMAGE" "$MOUNT_DIR"
 
 cp -a "{content}"/. "$MOUNT_DIR/"
+
+# Restore preserved data
+if [ -n "$DATA_BACKUP" ] && [ -d "$DATA_BACKUP/_data" ]; then
+    cp -a "$DATA_BACKUP/_data" "$MOUNT_DIR/_data"
+    rm -rf "$DATA_BACKUP"
+fi
 
 umount "$MOUNT_DIR"
 rmdir "$MOUNT_DIR"

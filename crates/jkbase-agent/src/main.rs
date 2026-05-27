@@ -187,7 +187,6 @@ async fn main() -> Result<()> {
 
     if is_pid1() {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
-        mount_data_disk();
     }
 
     let mut functions = FunctionRuntime::new();
