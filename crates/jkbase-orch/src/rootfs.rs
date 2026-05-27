@@ -49,6 +49,16 @@ pub async fn build_content_image(content_dir: &Path, output: &Path) -> Result<()
         r#"
 set -euo pipefail
 IMAGE="{output}"
+
+# Unmount stale loop mounts from a previous failed build
+if losetup -j "$IMAGE" 2>/dev/null | grep -q .; then
+    for mp in $(findmnt -rn -S "$IMAGE" -o TARGET 2>/dev/null); do
+        umount "$mp" 2>/dev/null || true
+        rmdir "$mp" 2>/dev/null || true
+    done
+    losetup -d $(losetup -j "$IMAGE" -O NAME -n 2>/dev/null) 2>/dev/null || true
+fi
+
 MOUNT_DIR=$(mktemp -d)
 
 # Size the image to fit the content with ext4 overhead (minimum 4MB)
