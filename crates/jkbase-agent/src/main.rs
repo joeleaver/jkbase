@@ -87,7 +87,8 @@ async fn main() -> Result<()> {
         std::env::var("JKBASE_SERVE_DIR").unwrap_or_else(|_| "/srv/www".to_string()),
     );
     let functions_dir = PathBuf::from(
-        std::env::var("JKBASE_FUNCTIONS_DIR").unwrap_or_else(|_| "/srv/functions".to_string()),
+        std::env::var("JKBASE_FUNCTIONS_DIR")
+            .unwrap_or_else(|_| serve_dir.join("_functions").to_string_lossy().to_string()),
     );
 
     if is_pid1() {
