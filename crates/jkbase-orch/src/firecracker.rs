@@ -187,21 +187,18 @@ impl FirecrackerClient {
     }
 
     pub async fn load_snapshot(&self, snapshot_path: &str, mem_file_path: &str) -> Result<()> {
-        #[derive(Serialize)]
-        struct SnapshotLoad {
-            snapshot_path: String,
-            mem_file_path: String,
-            resume_vm: bool,
-        }
-        self.put(
-            "/snapshot/load",
-            &SnapshotLoad {
-                snapshot_path: snapshot_path.to_string(),
-                mem_file_path: mem_file_path.to_string(),
-                resume_vm: true,
+        let body = serde_json::json!({
+            "snapshot_path": snapshot_path,
+            "mem_backend": {
+                "backend_type": "File",
+                "backend_path": mem_file_path
             },
-        )
-        .await
-        .context("failed to load snapshot")
+            "resume_vm": true
+        });
+        let json = serde_json::to_string(&body)?;
+        self.request("PUT", "/snapshot/load", Some(json))
+            .await
+            .context("failed to load snapshot")?;
+        Ok(())
     }
 }
