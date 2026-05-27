@@ -25,7 +25,7 @@ pub enum Command {
         /// Your email address
         email: String,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
     /// Authenticate with the platform
@@ -66,7 +66,7 @@ pub enum SecretCommand {
         #[arg(long)]
         project: Option<String>,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
     /// List secrets
@@ -75,7 +75,7 @@ pub enum SecretCommand {
         #[arg(long)]
         project: Option<String>,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
     /// Remove a secret
@@ -86,7 +86,7 @@ pub enum SecretCommand {
         #[arg(long)]
         project: Option<String>,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
 }

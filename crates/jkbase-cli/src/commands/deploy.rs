@@ -13,7 +13,7 @@ pub struct DeployArgs {
     project: Option<String>,
 
     /// Platform API URL
-    #[arg(long, default_value = "http://127.0.0.1:9090")]
+    #[arg(long, default_value = "https://api.jkbase.app")]
     api: String,
 
     /// Output as JSON

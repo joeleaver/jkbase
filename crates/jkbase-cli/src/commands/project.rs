@@ -9,13 +9,13 @@ pub enum ProjectCommand {
         /// Project name
         name: String,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
     /// List all projects
     List {
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
     /// Delete a project
@@ -26,7 +26,7 @@ pub enum ProjectCommand {
         #[arg(long)]
         force: bool,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
     /// Show project info
@@ -34,7 +34,7 @@ pub enum ProjectCommand {
         /// Project name (inferred from jkbase.toml if not specified)
         name: Option<String>,
         /// Platform API URL
-        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
 }
