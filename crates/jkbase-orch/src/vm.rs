@@ -253,36 +253,8 @@ impl VmInstance {
 
         let client = FirecrackerClient::new(&socket_path);
 
-        client
-            .set_drive(&Drive {
-                drive_id: "rootfs".to_string(),
-                path_on_host: config.rootfs_path.to_string_lossy().to_string(),
-                is_root_device: true,
-                is_read_only: true,
-            })
-            .await?;
-
-        if let Some(content_path) = &config.content_image_path {
-            client
-                .set_drive(&Drive {
-                    drive_id: "content".to_string(),
-                    path_on_host: content_path.to_string_lossy().to_string(),
-                    is_root_device: false,
-                    is_read_only: false,
-                })
-                .await?;
-        }
-
-        if let (Some(tap), Some(mac)) = (&config.tap_device, &config.guest_mac) {
-            client
-                .set_network_interface(&NetworkInterface {
-                    iface_id: "eth0".to_string(),
-                    guest_mac: mac.clone(),
-                    host_dev_name: tap.clone(),
-                })
-                .await?;
-        }
-
+        // Firecracker v1.15.1: snapshot must be loaded BEFORE any boot-specific
+        // resources (drives, network). The snapshot contains the device config.
         info!(id, "loading snapshot");
         client
             .load_snapshot(
