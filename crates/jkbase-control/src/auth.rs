@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct Tenant {
     pub id: String,
     pub email: String,
+    pub password_hash: Option<String>,
     pub created_at: u64,
 }
 
@@ -51,6 +52,14 @@ pub fn verify_token(token: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(token.as_bytes(), &parsed)
         .is_ok()
+}
+
+pub fn hash_password(password: &str) -> Result<String> {
+    hash_token(password)
+}
+
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    verify_token(password, hash)
 }
 
 pub fn timestamp() -> u64 {

@@ -113,6 +113,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
     let public = Router::new()
         .route("/init", post(init_platform))
         .route("/register", post(register))
+        .route("/login", post(login))
         .route("/health", get(api_health));
 
     Router::new()
@@ -136,10 +137,23 @@ pub struct InitResponse {
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub email: String,
+    pub password: String,
 }
 
 #[derive(Serialize)]
 pub struct RegisterResponse {
+    pub tenant_id: String,
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
     pub tenant_id: String,
     pub token: String,
 }
@@ -175,7 +189,7 @@ async fn init_platform(
             .into_response();
     }
 
-    match create_tenant_and_token(&state.store, &req.email) {
+    match create_tenant_and_token(&state.store, &req.email, None) {
         Ok((tenant_id, raw_token)) => {
             info!(tenant_id = %tenant_id, email = %req.email, "platform initialized");
             (
@@ -211,6 +225,16 @@ async fn register(
             .into_response();
     }
 
+    if req.password.len() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "password must be at least 8 characters".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     if let Ok(Some(_)) = state.store.find_tenant_by_email(&req.email) {
         return (
             StatusCode::CONFLICT,
@@ -221,7 +245,20 @@ async fn register(
             .into_response();
     }
 
-    match create_tenant_and_token(&state.store, &req.email) {
+    let password_hash = match auth::hash_password(&req.password) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    match create_tenant_and_token(&state.store, &req.email, Some(&password_hash)) {
         Ok((tenant_id, raw_token)) => {
             info!(tenant_id = %tenant_id, email = %req.email, "new tenant registered");
             (
@@ -243,11 +280,105 @@ async fn register(
     }
 }
 
-fn create_tenant_and_token(store: &Store, email: &str) -> anyhow::Result<(String, String)> {
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let tenant = match state.store.find_tenant_by_email(&req.email) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "invalid email or password".to_string(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let Some(ref password_hash) = tenant.password_hash else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "this account does not have a password — use token auth".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    if !auth::verify_password(&req.password, password_hash) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid email or password".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let raw_token = auth::generate_token();
+    let token_hash = match auth::hash_token(&raw_token) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let api_token = auth::ApiToken {
+        id: auth::generate_id(),
+        tenant_id: tenant.id.clone(),
+        name: "web-login".to_string(),
+        token_hash,
+        created_at: auth::timestamp(),
+    };
+
+    if let Err(e) = state.store.save_api_token(&api_token) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    info!(tenant_id = %tenant.id, email = %req.email, "tenant logged in");
+    (
+        StatusCode::OK,
+        Json(LoginResponse {
+            tenant_id: tenant.id,
+            token: raw_token,
+        }),
+    )
+        .into_response()
+}
+
+fn create_tenant_and_token(
+    store: &Store,
+    email: &str,
+    password_hash: Option<&str>,
+) -> anyhow::Result<(String, String)> {
     let tenant_id = auth::generate_id();
     let tenant = Tenant {
         id: tenant_id.clone(),
         email: email.to_string(),
+        password_hash: password_hash.map(|h| h.to_string()),
         created_at: auth::timestamp(),
     };
     store.create_tenant(&tenant)?;

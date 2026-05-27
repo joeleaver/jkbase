@@ -242,6 +242,40 @@ body {
   text-align: center;
 }
 
+.token-reveal {
+  margin: 16px 0;
+  padding: 16px;
+  background: #0d0d12;
+  border: 1px solid #1a1a22;
+  border-radius: 6px;
+}
+
+.token-label {
+  font-size: 12px;
+  color: #8888a0;
+  margin-bottom: 8px;
+}
+
+.token-value {
+  display: block;
+  padding: 10px 12px;
+  background: #000;
+  border: 1px solid #222;
+  border-radius: 4px;
+  font-size: 13px;
+  color: #00d4ff;
+  word-break: break-all;
+  margin-bottom: 8px;
+  user-select: all;
+}
+
+.token-warning {
+  font-size: 12px;
+  color: #8888a0;
+  margin-top: 10px;
+  line-height: 1.5;
+}
+
 /* --- Console Layout --- */
 
 .console {
@@ -474,7 +508,8 @@ body {
     error: null,
     view: "loading", // loading, auth, auth-signin, console
     showNewProjectModal: false,
-    deleteConfirm: null, // project object or null
+    deleteConfirm: null,
+    revealedToken: null,
   };
 
   // --- API helpers ---
@@ -532,12 +567,33 @@ body {
     }
   }
 
-  async function register(email) {
+  async function register(email, password) {
     state.error = null;
     state.loading = true;
     render();
     try {
-      const data = await api("POST", "/register", { email: email });
+      const data = await api("POST", "/register", { email: email, password: password });
+      state.token = data.token;
+      state.email = email;
+      localStorage.setItem(TOKEN_KEY, data.token);
+      localStorage.setItem(EMAIL_KEY, email);
+      state.loading = false;
+      state.view = "token-reveal";
+      state.revealedToken = data.token;
+      render();
+    } catch (e) {
+      state.loading = false;
+      state.error = e.message;
+      render();
+    }
+  }
+
+  async function login(email, password) {
+    state.error = null;
+    state.loading = true;
+    render();
+    try {
+      const data = await api("POST", "/login", { email: email, password: password });
       state.token = data.token;
       state.email = email;
       localStorage.setItem(TOKEN_KEY, data.token);
@@ -549,30 +605,6 @@ body {
     } catch (e) {
       state.loading = false;
       state.error = e.message;
-      render();
-    }
-  }
-
-  async function signInWithToken(token) {
-    state.error = null;
-    state.loading = true;
-    state.token = token;
-    localStorage.setItem(TOKEN_KEY, token);
-    render();
-    try {
-      const me = await api("GET", "/me");
-      state.email = me.email;
-      localStorage.setItem(EMAIL_KEY, me.email);
-      state.loading = false;
-      state.view = "console";
-      render();
-      loadProjects();
-    } catch (e) {
-      state.token = null;
-      localStorage.removeItem(TOKEN_KEY);
-      state.loading = false;
-      state.error = "Invalid token. Please check and try again.";
-      state.view = "auth-signin";
       render();
     }
   }
@@ -662,12 +694,14 @@ body {
     return h("div", { className: "auth-screen" },
       h("div", { className: "auth-card" },
         h("div", { className: "auth-title" }, "jkbase"),
-        h("div", { className: "auth-subtitle" }, "management console"),
+        h("div", { className: "auth-subtitle" }, "create your account"),
         state.error ? h("div", { className: "error-banner" }, state.error) : null,
         h("form", { className: "auth-form", onSubmit: function(e) {
           e.preventDefault();
-          var email = e.target.querySelector("input").value.trim();
-          if (email) register(email);
+          var inputs = e.target.querySelectorAll("input");
+          var email = inputs[0].value.trim();
+          var password = inputs[1].value;
+          if (email && password) register(email, password);
         }},
           h("input", {
             className: "input",
@@ -675,6 +709,15 @@ body {
             placeholder: "you@example.com",
             required: "required",
             autocomplete: "email",
+            disabled: state.loading ? "disabled" : null,
+          }),
+          h("input", {
+            className: "input",
+            type: "password",
+            placeholder: "password (8+ characters)",
+            required: "required",
+            minlength: "8",
+            autocomplete: "new-password",
             disabled: state.loading ? "disabled" : null,
           }),
           h("div", { className: "auth-actions" },
@@ -703,20 +746,29 @@ body {
     return h("div", { className: "auth-screen" },
       h("div", { className: "auth-card" },
         h("div", { className: "auth-title" }, "jkbase"),
-        h("div", { className: "auth-subtitle" }, "sign in with your API token"),
+        h("div", { className: "auth-subtitle" }, "sign in to your account"),
         state.error ? h("div", { className: "error-banner" }, state.error) : null,
         h("form", { className: "auth-form", onSubmit: function(e) {
           e.preventDefault();
-          var token = e.target.querySelector("input").value.trim();
-          if (token) signInWithToken(token);
+          var inputs = e.target.querySelectorAll("input");
+          var email = inputs[0].value.trim();
+          var password = inputs[1].value;
+          if (email && password) login(email, password);
         }},
           h("input", {
             className: "input",
-            type: "text",
-            placeholder: "paste your API token",
+            type: "email",
+            placeholder: "you@example.com",
             required: "required",
-            autocomplete: "off",
-            spellcheck: "false",
+            autocomplete: "email",
+            disabled: state.loading ? "disabled" : null,
+          }),
+          h("input", {
+            className: "input",
+            type: "password",
+            placeholder: "password",
+            required: "required",
+            autocomplete: "current-password",
             disabled: state.loading ? "disabled" : null,
           }),
           h("div", { className: "auth-actions" },
@@ -724,7 +776,7 @@ body {
               className: "btn btn-primary",
               type: "submit",
               disabled: state.loading ? "disabled" : null,
-            }, state.loading ? "Verifying..." : "Sign In")
+            }, state.loading ? "Signing in..." : "Sign In")
           )
         ),
         h("div", { className: "auth-back" },
@@ -735,7 +787,38 @@ body {
               state.view = "auth";
               render();
             },
-          }, "Back to registration")
+          }, "Create an account")
+        )
+      )
+    );
+  }
+
+  function renderTokenReveal() {
+    return h("div", { className: "auth-screen" },
+      h("div", { className: "auth-card" },
+        h("div", { className: "auth-title" }, "Account created"),
+        h("div", { className: "auth-subtitle" }, "Save your API token for CLI access"),
+        h("div", { className: "token-reveal" },
+          h("div", { className: "token-label" }, "Your API token:"),
+          h("code", { className: "token-value" }, state.revealedToken),
+          h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
+            navigator.clipboard.writeText(state.revealedToken);
+            this.textContent = "Copied";
+          }}, "Copy"),
+          h("div", { className: "token-warning" },
+            "Save this token somewhere safe. You will need it to authenticate the CLI. You can always sign in to the console with your email and password."
+          )
+        ),
+        h("div", { className: "auth-actions" },
+          h("button", {
+            className: "btn btn-primary",
+            onClick: function() {
+              state.revealedToken = null;
+              state.view = "console";
+              render();
+              loadProjects();
+            },
+          }, "Continue to Console")
         )
       )
     );
@@ -901,6 +984,9 @@ body {
         break;
       case "auth-signin":
         view = renderSignInScreen();
+        break;
+      case "token-reveal":
+        view = renderTokenReveal();
         break;
       case "console":
         view = renderConsole();
