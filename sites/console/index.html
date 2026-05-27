@@ -640,7 +640,7 @@ body {
           el.className = v;
         } else if (k === "htmlFor") {
           el.setAttribute("for", v);
-        } else {
+        } else if (v != null && v !== false) {
           el.setAttribute(k, v);
         }
       }
