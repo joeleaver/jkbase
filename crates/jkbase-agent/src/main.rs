@@ -26,6 +26,7 @@ fn mount_filesystems() {
         ("/proc", "proc", "proc"),
         ("/sys", "sysfs", "sysfs"),
         ("/dev", "devtmpfs", "devtmpfs"),
+        ("/tmp", "tmpfs", "tmpfs"),
     ];
 
     for (target, fstype, source) in &mounts {
