@@ -354,7 +354,7 @@ async fn handle_deploy(
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
         vcpu_count: 1,
-        mem_size_mib: 128,
+        mem_size_mib: 1024,
         tap_device: Some(alloc.tap_device.clone()),
         guest_mac: Some(alloc.mac.clone()),
         guest_ip: Some(alloc.ip.clone()),
