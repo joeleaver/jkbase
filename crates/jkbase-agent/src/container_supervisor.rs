@@ -227,33 +227,57 @@ fn extract_tarball(tarball: &Path, target: &Path) -> Result<()> {
 }
 
 fn spawn_server(name: &str, manifest: &ServerManifest, rootfs_dir: &Path) -> Result<Child> {
+    use std::os::unix::process::CommandExt;
+
     if manifest.cmd.is_empty() {
         anyhow::bail!("server '{name}' has empty cmd");
     }
 
-    let work_dir = manifest
+    let chroot_dir = rootfs_dir.to_path_buf();
+    let working_dir = manifest
         .working_dir
-        .as_ref()
-        .map(|d| rootfs_dir.join(d.trim_start_matches('/')))
-        .unwrap_or_else(|| rootfs_dir.to_path_buf());
+        .clone()
+        .unwrap_or_else(|| "/".to_string());
 
-    let mut cmd = Command::new(&manifest.cmd[0]);
+    let mut std_cmd = std::process::Command::new(&manifest.cmd[0]);
     if manifest.cmd.len() > 1 {
-        cmd.args(&manifest.cmd[1..]);
+        std_cmd.args(&manifest.cmd[1..]);
     }
-    cmd.current_dir(&work_dir);
-    cmd.env("PORT", manifest.port.to_string());
-    for (key, value) in &manifest.env {
-        cmd.env(key, value);
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
 
-    let child = cmd
+    std_cmd.env_clear();
+    std_cmd.env("PORT", manifest.port.to_string());
+    std_cmd.env("HOME", "/root");
+    std_cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    for (key, value) in &manifest.env {
+        std_cmd.env(key, value);
+    }
+    std_cmd.stdout(Stdio::piped());
+    std_cmd.stderr(Stdio::piped());
+
+    unsafe {
+        std_cmd.pre_exec(move || {
+            if libc::chroot(
+                std::ffi::CString::new(chroot_dir.to_string_lossy().as_bytes())
+                    .map_err(|_| std::io::Error::other("invalid chroot path"))?
+                    .as_ptr(),
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let wd = std::ffi::CString::new(working_dir.as_bytes())
+                .map_err(|_| std::io::Error::other("invalid working dir"))?;
+            if libc::chdir(wd.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = Command::from(std_cmd)
         .spawn()
         .with_context(|| format!("failed to spawn server '{name}': {:?}", manifest.cmd))?;
 
-    info!(server = %name, pid = ?child.id(), cmd = ?manifest.cmd, "server process started");
+    info!(server = %name, pid = ?child.id(), cmd = ?manifest.cmd, "server process started (chroot: {})", rootfs_dir.display());
     Ok(child)
 }
 
