@@ -11,7 +11,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use jkbase_common::config::ProjectConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -204,18 +203,23 @@ async fn main() -> Result<()> {
 }
 
 fn load_route_config(serve_dir: &PathBuf) -> Vec<RouteEntry> {
-    let config_path = serve_dir.join("jkbase.toml");
-    if !config_path.exists() {
+    let routes_path = serve_dir.join("_routes.json");
+    if !routes_path.exists() {
         return Vec::new();
     }
 
-    let config = match ProjectConfig::load(&config_path) {
+    let content = match std::fs::read_to_string(&routes_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
 
-    config
-        .routes
+    let routes: std::collections::HashMap<String, jkbase_common::config::RouteTarget> =
+        match serde_json::from_str(&content) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+    routes
         .iter()
         .filter(|(_, target)| target.service == "server")
         .map(|(prefix, target)| RouteEntry {

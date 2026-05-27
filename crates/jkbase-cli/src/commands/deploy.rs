@@ -70,9 +70,17 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         server_artifacts.push(artifact);
     }
 
+    // Serialize route config for the agent
+    let route_config = if !config.routes.is_empty() {
+        Some(serde_json::to_string_pretty(&config.routes)?)
+    } else {
+        None
+    };
+
     println!("Packaging...");
     let tarball =
-        create_tarball(&serve_dir, &wasm_files, &server_artifacts).context("failed to create tarball")?;
+        create_tarball(&serve_dir, &wasm_files, &server_artifacts, route_config.as_deref())
+            .context("failed to create tarball")?;
     println!("  {} bytes compressed", tarball.len());
 
     let project_id = slug(&project_name);
@@ -299,6 +307,7 @@ fn create_tarball(
     dir: &Path,
     wasm_files: &[(String, std::path::PathBuf)],
     server_artifacts: &[ServerArtifact],
+    route_config_json: Option<&str>,
 ) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let enc = GzEncoder::new(buf, Compression::fast());
@@ -316,11 +325,9 @@ fn create_tarball(
     }
 
     for artifact in server_artifacts {
-        // Add the rootfs tarball
         let tar_path = Path::new("_servers").join(format!("{}.tar.gz", artifact.name));
         tar.append_path_with_name(&artifact.rootfs_tarball, &tar_path)?;
 
-        // Add the manifest JSON
         let manifest_path = Path::new("_servers").join(format!("{}.json", artifact.name));
         let manifest_bytes = artifact.manifest_json.as_bytes();
         let mut header = tar::Header::new_gnu();
@@ -328,6 +335,15 @@ fn create_tarball(
         header.set_mode(0o644);
         header.set_cksum();
         tar.append_data(&mut header, &manifest_path, manifest_bytes)?;
+    }
+
+    if let Some(routes_json) = route_config_json {
+        let routes_bytes = routes_json.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(routes_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "_routes.json", routes_bytes)?;
     }
 
     let enc = tar.into_inner()?;
