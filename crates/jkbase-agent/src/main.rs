@@ -105,6 +105,33 @@ fn mount_content_drive(target: &str) {
     }
 }
 
+fn mount_data_disk() {
+    use std::ffi::CString;
+    use std::ptr;
+
+    let device = "/dev/vdc";
+    let target = "/mnt/data";
+
+    if !std::path::Path::new(device).exists() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(target);
+    let src = CString::new(device).unwrap();
+    let tgt = CString::new(target).unwrap();
+    let fst = CString::new("ext4").unwrap();
+
+    let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, ptr::null()) };
+    if ret == 0 {
+        let _ = std::fs::create_dir_all("/mnt/data/volumes");
+    } else {
+        eprintln!(
+            "failed to mount {device} at {target}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn is_pid1() -> bool {
     std::process::id() == 1
 }
@@ -150,6 +177,7 @@ async fn main() -> Result<()> {
 
     if is_pid1() {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
+        mount_data_disk();
     }
 
     let mut functions = FunctionRuntime::new();

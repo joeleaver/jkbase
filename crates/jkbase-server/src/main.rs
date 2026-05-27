@@ -7,7 +7,7 @@ use jkbase_orch::vm::{VmConfig, VmInstance};
 use jkbase_proxy::{self, new_routing_table, ActivityTracker, KnownProjects, ProxyConfig};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -386,11 +386,28 @@ async fn handle_deploy(
 
     setup_tap(&alloc.tap_device).await?;
 
+    // Create data disk for persistent volumes if any servers declare volumes
+    let data_disk_path = {
+        let data_disks_dir = plat.data_dir.join("data-disks");
+        let disk_path = data_disks_dir.join(format!("{project_id}.ext4"));
+        let has_volumes = check_project_has_volumes(&plat.data_dir, project_id);
+        if has_volumes {
+            tokio::fs::create_dir_all(&data_disks_dir).await?;
+            rootfs::create_data_disk(&disk_path, 1024).await?;
+            Some(disk_path)
+        } else if disk_path.exists() {
+            Some(disk_path)
+        } else {
+            None
+        }
+    };
+
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
+        data_disk_path,
         vcpu_count: 1,
         mem_size_mib: 1024,
         tap_device: Some(alloc.tap_device.clone()),
@@ -576,11 +593,24 @@ async fn wake_project(
         .join("content-images")
         .join(format!("{project_id}.ext4"));
 
+    let data_disk_path = {
+        let disk = plat
+            .data_dir
+            .join("data-disks")
+            .join(format!("{project_id}.ext4"));
+        if disk.exists() {
+            Some(disk)
+        } else {
+            None
+        }
+    };
+
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
+        data_disk_path,
         vcpu_count: 1,
         mem_size_mib: 1024,
         tap_device: Some(alloc.tap_device.clone()),
@@ -767,6 +797,29 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
         anyhow::bail!("{} {:?} failed with {}", cmd, args, status);
     }
     Ok(())
+}
+
+fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
+    let servers_dir = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_servers");
+    if !servers_dir.exists() {
+        return false;
+    }
+    for entry in std::fs::read_dir(&servers_dir).into_iter().flatten() {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "json") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if content.contains("\"volumes\"") && content.contains("\"mount\"") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 async fn wait_for_agent(ip: &str) -> Result<()> {

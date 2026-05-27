@@ -221,6 +221,12 @@ fn build_server(
         anyhow::bail!("docker export failed for server '{name}'");
     }
 
+    let volumes: Vec<serde_json::Value> = config
+        .volumes
+        .iter()
+        .map(|v| serde_json::json!({"name": v.name, "mount": v.mount}))
+        .collect();
+
     let manifest = serde_json::json!({
         "port": config.port,
         "cmd": cmd,
@@ -231,6 +237,7 @@ fn build_server(
             "interval_secs": parse_duration_secs(h.interval.as_deref().unwrap_or("10s")),
             "timeout_secs": parse_duration_secs(h.timeout.as_deref().unwrap_or("5s")),
         })),
+        "volumes": volumes,
     });
 
     println!(

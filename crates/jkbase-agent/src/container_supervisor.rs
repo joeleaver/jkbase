@@ -12,12 +12,20 @@ use tracing::{error, info, warn};
 const MAX_LOG_LINES: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeMount {
+    pub name: String,
+    pub mount: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerManifest {
     pub port: u16,
     pub cmd: Vec<String>,
     pub env: HashMap<String, String>,
     pub working_dir: Option<String>,
     pub health_check: Option<HealthCheck>,
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +132,20 @@ impl ContainerSupervisor {
                 warn!(server = %name, "no rootfs found, skipping");
                 continue;
             };
+
+            // Bind-mount persistent volumes into the container rootfs
+            for vol in &manifest.volumes {
+                let src = PathBuf::from("/mnt/data/volumes").join(&vol.name);
+                let dst = rootfs_dir.join(vol.mount.trim_start_matches('/'));
+                if std::path::Path::new("/mnt/data").exists() {
+                    let _ = std::fs::create_dir_all(&src);
+                    let _ = std::fs::create_dir_all(&dst);
+                    bind_mount(&src, &dst);
+                    info!(server = %name, volume = %vol.name, mount = %vol.mount, "volume mounted");
+                } else {
+                    warn!(server = %name, volume = %vol.name, "no data disk, skipping volume mount");
+                }
+            }
 
             info!(server = %name, port = manifest.port, "starting server");
             let process = spawn_server(&name, &manifest, &rootfs_dir, &self.log_buffer)?;
@@ -371,6 +393,32 @@ fn spawn_server(
 
     info!(server = %name, pid = ?child.id(), cmd = ?manifest.cmd, "server process started (chroot: {})", rootfs_dir.display());
     Ok(child)
+}
+
+fn bind_mount(src: &Path, dst: &Path) {
+    use std::ffi::CString;
+    use std::ptr;
+
+    let src_c = CString::new(src.to_string_lossy().as_bytes()).unwrap();
+    let dst_c = CString::new(dst.to_string_lossy().as_bytes()).unwrap();
+
+    let ret = unsafe {
+        libc::mount(
+            src_c.as_ptr(),
+            dst_c.as_ptr(),
+            ptr::null(),
+            libc::MS_BIND,
+            ptr::null(),
+        )
+    };
+    if ret != 0 {
+        tracing::error!(
+            src = %src.display(),
+            dst = %dst.display(),
+            error = %std::io::Error::last_os_error(),
+            "bind mount failed"
+        );
+    }
 }
 
 async fn tcp_health_check(addr: &str) -> bool {
