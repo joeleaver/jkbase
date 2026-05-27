@@ -93,6 +93,10 @@ impl PlatformState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
