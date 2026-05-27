@@ -47,7 +47,17 @@ sudo apt-get install -y -qq \
     curl \
     ufw \
     fail2ban \
-    jq
+    jq \
+    iptables
+
+echo "[2b/7] Installing Docker..."
+if ! command -v docker &>/dev/null; then
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo usermod -aG docker "$(whoami)"
+    echo "Docker installed: $(docker --version)"
+else
+    echo "Docker already installed: $(docker --version)"
+fi
 
 echo "[3/7] Configuring firewall..."
 sudo ufw default deny incoming
@@ -169,12 +179,16 @@ if ! ip link show "$BRIDGE" &>/dev/null; then
     ip link add name "$BRIDGE" type bridge
     ip addr add 172.16.0.1/24 dev "$BRIDGE"
     ip link set "$BRIDGE" up
-    echo 1 > /proc/sys/net/ipv4/ip_forward
 fi
 
-# NAT for VM internet access
-if ! iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o eno1 -j MASQUERADE 2>/dev/null; then
-    iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o eno1 -j MASQUERADE
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# NAT for VM internet access — detect the default route interface
+PUB_IFACE=$(ip route show default | awk '{print $5; exit}')
+if [ -n "$PUB_IFACE" ]; then
+    if ! iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PUB_IFACE" -j MASQUERADE
+    fi
 fi
 BRIDGE
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
