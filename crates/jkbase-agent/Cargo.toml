@@ -18,3 +18,5 @@ serde_json = { workspace = true }
 wasmtime = "33"
 wasmtime-wasi = "33"
 bytes = "1"
+flate2 = { workspace = true }
+tar = { workspace = true }

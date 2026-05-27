@@ -1,14 +1,17 @@
+mod container_supervisor;
 mod function_runtime;
 mod static_server;
 
 use anyhow::Result;
+use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use jkbase_common::config::ProjectConfig;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,8 +47,6 @@ fn mount_filesystems() {
 
 fn seed_entropy() {
     use std::io::Write;
-    // Firecracker VMs have no hardware RNG, so /dev/urandom blocks until
-    // the entropy pool is initialized. Seed it from the CPU timestamp counter.
     let mut seed = [0u8; 512];
     for chunk in seed.chunks_mut(8) {
         let tsc: u64;
@@ -61,7 +62,6 @@ fn seed_entropy() {
         let _ = f.write_all(&seed);
     }
 
-    // Also use RNDADDENTROPY ioctl to credit the entropy
     if let Ok(f) = std::fs::OpenOptions::new().write(true).open("/dev/random") {
         use std::os::unix::io::AsRawFd;
         #[repr(C)]
@@ -76,7 +76,6 @@ fn seed_entropy() {
             buf: seed,
         };
         unsafe {
-            // RNDADDENTROPY = 0x40085203
             libc::ioctl(f.as_raw_fd(), 0x40085203, &mut info as *mut _);
         }
     }
@@ -114,6 +113,13 @@ struct AgentState {
     serve_dir: PathBuf,
     functions_dir: PathBuf,
     functions: FunctionRuntime,
+    containers: Arc<ContainerSupervisor>,
+    route_config: Vec<RouteEntry>,
+}
+
+struct RouteEntry {
+    prefix: String,
+    server_name: String,
 }
 
 #[tokio::main]
@@ -132,6 +138,7 @@ async fn main() -> Result<()> {
         std::env::var("JKBASE_FUNCTIONS_DIR")
             .unwrap_or_else(|_| serve_dir.join("_functions").to_string_lossy().to_string()),
     );
+    let servers_dir = serve_dir.join("_servers");
 
     if is_pid1() {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
@@ -147,6 +154,23 @@ async fn main() -> Result<()> {
         info!(functions = ?func_names, "loaded WASM functions");
     }
 
+    let containers = Arc::new(ContainerSupervisor::new(servers_dir));
+    if let Err(e) = containers.start_all().await {
+        error!(error = %e, "failed to start server containers");
+    }
+
+    let route_config = load_route_config(&serve_dir);
+
+    if containers.has_servers() {
+        let containers_for_health = containers.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                containers_for_health.run_health_checks().await;
+            }
+        });
+    }
+
     let port: u16 = std::env::var("JKBASE_PORT")
         .unwrap_or_else(|_| "80".to_string())
         .parse()?;
@@ -155,6 +179,8 @@ async fn main() -> Result<()> {
         serve_dir,
         functions_dir,
         functions,
+        containers,
+        route_config,
     });
 
     info!("jkbase-agent starting (pid {})", std::process::id());
@@ -176,6 +202,28 @@ async fn main() -> Result<()> {
     }
 }
 
+fn load_route_config(serve_dir: &PathBuf) -> Vec<RouteEntry> {
+    let config_path = serve_dir.join("jkbase.toml");
+    if !config_path.exists() {
+        return Vec::new();
+    }
+
+    let config = match ProjectConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    config
+        .routes
+        .iter()
+        .filter(|(_, target)| target.service == "server")
+        .map(|(prefix, target)| RouteEntry {
+            prefix: prefix.clone(),
+            server_name: target.name.clone(),
+        })
+        .collect()
+}
+
 async fn handle_request(
     state: Arc<AgentState>,
     req: Request<hyper::body::Incoming>,
@@ -183,10 +231,20 @@ async fn handle_request(
     let path = req.uri().path().to_string();
 
     if path == "/_jkbase/health" {
-        return Ok(health_response(&state));
+        return Ok(health_response(&state).await);
     }
 
-    // Check if this is a function call: /functions/{name} or /functions/{name}/...
+    // Check route config for server routing
+    for route in &state.route_config {
+        let prefix = route.prefix.trim_end_matches('*');
+        if path.starts_with(prefix) {
+            if let Some(port) = state.containers.get_server_for_route(&route.server_name).await {
+                return Ok(proxy_to_server(port, req).await);
+            }
+        }
+    }
+
+    // Check if this is a function call
     if let Some(func_name) = extract_function_name(&path) {
         if state.functions.has_function(&func_name) {
             info!(function = %func_name, path = %path, "routing to function");
@@ -198,8 +256,9 @@ async fn handle_request(
     static_server::handle_static(&state.serve_dir, req).await
 }
 
-fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
+async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
     let functions = state.functions.list_functions();
+    let servers = state.containers.status().await;
     let body = serde_json::json!({
         "status": "ok",
         "pid": std::process::id(),
@@ -207,11 +266,14 @@ fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
         "functions_loaded": functions,
         "functions_dir_exists": state.functions_dir.exists(),
         "functions_dir": state.functions_dir.display().to_string(),
+        "servers": servers,
     });
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
-        .body(Full::new(Bytes::from(serde_json::to_vec_pretty(&body).unwrap())))
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )))
         .unwrap()
 }
 
@@ -224,13 +286,72 @@ fn extract_function_name(path: &str) -> Option<String> {
     }
 }
 
+async fn proxy_to_server(port: u16, req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+    let addr = format!("127.0.0.1:{port}");
+    let uri = format!(
+        "http://{addr}{}",
+        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
+    );
+
+    let stream = match tokio::net::TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(port, error = %e, "failed to connect to server");
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Full::new(Bytes::from("server not available")))
+                .unwrap();
+        }
+    };
+
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!(port, error = %e, "server handshake failed");
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Full::new(Bytes::from("server handshake failed")))
+                .unwrap();
+        }
+    };
+    tokio::spawn(conn);
+
+    let proxy_req = Request::builder()
+        .method(req.method())
+        .uri(&uri)
+        .body(req.into_body())
+        .unwrap();
+
+    match sender.send_request(proxy_req).await {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = match resp.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(_) => Bytes::new(),
+            };
+            let mut builder = Response::builder().status(status);
+            for (key, value) in &headers {
+                builder = builder.header(key, value);
+            }
+            builder.body(Full::new(body)).unwrap()
+        }
+        Err(e) => {
+            error!(port, error = %e, "server request failed");
+            Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Full::new(Bytes::from("server request failed")))
+                .unwrap()
+        }
+    }
+}
+
 async fn invoke_function(
     state: Arc<AgentState>,
     name: &str,
     req: Request<hyper::body::Incoming>,
 ) -> Response<Full<Bytes>> {
-    use http_body_util::BodyExt;
-
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();

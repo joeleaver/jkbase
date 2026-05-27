@@ -61,8 +61,18 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         wasm_files.push((name.clone(), wasm_path));
     }
 
+    // Build server containers
+    let mut server_artifacts: Vec<ServerArtifact> = Vec::new();
+    for (name, server_config) in &config.servers {
+        let dockerfile_path = project_dir.join(&server_config.dockerfile);
+        println!("  Server '{name}': building {}...", dockerfile_path.display());
+        let artifact = build_server(name, &dockerfile_path, project_dir, server_config)?;
+        server_artifacts.push(artifact);
+    }
+
     println!("Packaging...");
-    let tarball = create_tarball(&serve_dir, &wasm_files).context("failed to create tarball")?;
+    let tarball =
+        create_tarball(&serve_dir, &wasm_files, &server_artifacts).context("failed to create tarball")?;
     println!("  {} bytes compressed", tarball.len());
 
     let project_id = slug(&project_name);
@@ -98,6 +108,132 @@ pub async fn run(args: DeployArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct ServerArtifact {
+    name: String,
+    rootfs_tarball: std::path::PathBuf,
+    manifest_json: String,
+}
+
+fn build_server(
+    name: &str,
+    dockerfile: &Path,
+    context_dir: &Path,
+    config: &jkbase_common::config::ServerConfig,
+) -> Result<ServerArtifact> {
+    let image_tag = format!("jkbase-server-{name}:build");
+    let dockerfile_dir = dockerfile.parent().unwrap_or(context_dir);
+
+    // docker build
+    let status = std::process::Command::new("docker")
+        .args(["build", "-t", &image_tag, "-f"])
+        .arg(dockerfile)
+        .arg(dockerfile_dir)
+        .status()
+        .context("failed to run docker build — is Docker installed?")?;
+
+    if !status.success() {
+        anyhow::bail!("docker build failed for server '{name}'");
+    }
+
+    // docker create + docker export to get the filesystem
+    let output = std::process::Command::new("docker")
+        .args(["create", &image_tag])
+        .output()
+        .context("failed to create container for export")?;
+
+    if !output.status.success() {
+        anyhow::bail!("docker create failed for server '{name}'");
+    }
+
+    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Get the CMD/ENTRYPOINT from the image
+    let inspect_output = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{json .Config}}", &image_tag])
+        .output()
+        .context("failed to inspect image")?;
+
+    let inspect_json: serde_json::Value =
+        serde_json::from_slice(&inspect_output.stdout).unwrap_or_default();
+
+    let mut cmd: Vec<String> = Vec::new();
+    if let Some(entrypoint) = inspect_json["Entrypoint"].as_array() {
+        for v in entrypoint {
+            if let Some(s) = v.as_str() {
+                cmd.push(s.to_string());
+            }
+        }
+    }
+    if let Some(docker_cmd) = inspect_json["Cmd"].as_array() {
+        for v in docker_cmd {
+            if let Some(s) = v.as_str() {
+                cmd.push(s.to_string());
+            }
+        }
+    }
+    if cmd.is_empty() {
+        cmd = vec!["/bin/sh".to_string()];
+    }
+
+    let working_dir = inspect_json["WorkingDir"]
+        .as_str()
+        .unwrap_or("/")
+        .to_string();
+
+    // Export filesystem
+    let tarball_path = std::env::temp_dir().join(format!("jkbase-server-{name}.tar.gz"));
+    let export_status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "docker export {} | gzip > {}",
+            container_id,
+            tarball_path.display()
+        ))
+        .status()
+        .context("failed to export container filesystem")?;
+
+    // Clean up container
+    let _ = std::process::Command::new("docker")
+        .args(["rm", &container_id])
+        .status();
+
+    if !export_status.success() {
+        anyhow::bail!("docker export failed for server '{name}'");
+    }
+
+    let manifest = serde_json::json!({
+        "port": config.port,
+        "cmd": cmd,
+        "env": {},
+        "working_dir": working_dir,
+        "health_check": config.health_check.as_ref().map(|h| serde_json::json!({
+            "path": h.path.as_deref().unwrap_or("/"),
+            "interval_secs": parse_duration_secs(h.interval.as_deref().unwrap_or("10s")),
+            "timeout_secs": parse_duration_secs(h.timeout.as_deref().unwrap_or("5s")),
+        })),
+    });
+
+    println!("  Server '{name}': image exported ({} bytes)",
+        std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0));
+
+    Ok(ServerArtifact {
+        name: name.to_string(),
+        rootfs_tarball: tarball_path,
+        manifest_json: serde_json::to_string_pretty(&manifest)?,
+    })
+}
+
+fn parse_duration_secs(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix('s') {
+        num.parse().unwrap_or(10)
+    } else if let Some(num) = s.strip_suffix('m') {
+        num.parse::<u64>().unwrap_or(1) * 60
+    } else {
+        s.parse().unwrap_or(10)
+    }
 }
 
 fn build_function(name: &str, source: &Path) -> Result<std::path::PathBuf> {
@@ -162,6 +298,7 @@ const EXCLUDED_FILES: &[&str] = &["jkbase.toml"];
 fn create_tarball(
     dir: &Path,
     wasm_files: &[(String, std::path::PathBuf)],
+    server_artifacts: &[ServerArtifact],
 ) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let enc = GzEncoder::new(buf, Compression::fast());
@@ -176,6 +313,21 @@ fn create_tarball(
             let tar_path = Path::new("_functions").join(format!("{name}.wasm"));
             tar.append_path_with_name(wasm_path, &tar_path)?;
         }
+    }
+
+    for artifact in server_artifacts {
+        // Add the rootfs tarball
+        let tar_path = Path::new("_servers").join(format!("{}.tar.gz", artifact.name));
+        tar.append_path_with_name(&artifact.rootfs_tarball, &tar_path)?;
+
+        // Add the manifest JSON
+        let manifest_path = Path::new("_servers").join(format!("{}.json", artifact.name));
+        let manifest_bytes = artifact.manifest_json.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, &manifest_path, manifest_bytes)?;
     }
 
     let enc = tar.into_inner()?;

@@ -80,7 +80,6 @@ rustup target add x86_64-unknown-linux-musl
 rustup target add wasm32-wasip1
 
 echo "[7/7] Configuring system limits..."
-# Allow many open files for VM management
 if ! grep -q "jkbase" /etc/security/limits.d/jkbase.conf 2>/dev/null; then
     echo "* soft nofile 65536" | sudo tee /etc/security/limits.d/jkbase.conf
     echo "* hard nofile 65536" | sudo tee -a /etc/security/limits.d/jkbase.conf
@@ -172,10 +171,23 @@ if ! ip link show "$BRIDGE" &>/dev/null; then
     ip link set "$BRIDGE" up
     echo 1 > /proc/sys/net/ipv4/ip_forward
 fi
+
+# NAT for VM internet access
+if ! iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o eno1 -j MASQUERADE 2>/dev/null; then
+    iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o eno1 -j MASQUERADE
+fi
 BRIDGE
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
 
-# Create systemd service
+# Create .env file for secrets if it doesn't exist
+if [ ! -f /var/jkbase/.env ]; then
+    echo "# jkbase environment" | sudo tee /var/jkbase/.env > /dev/null
+    echo "# CLOUDFLARE_API_TOKEN=" | sudo tee -a /var/jkbase/.env > /dev/null
+    echo "# CLOUDFLARE_ZONE_ID=" | sudo tee -a /var/jkbase/.env > /dev/null
+    echo "# ACME_EMAIL=" | sudo tee -a /var/jkbase/.env > /dev/null
+fi
+
+# Create systemd service with TLS
 sudo tee /etc/systemd/system/jkbase.service > /dev/null << SERVICE
 [Unit]
 Description=jkbase platform server
@@ -185,6 +197,7 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
+EnvironmentFile=/var/jkbase/.env
 ExecStartPre=/usr/local/bin/jkbase-bridge.sh
 ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --data-dir /var/jkbase \
@@ -192,7 +205,9 @@ ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --agent-bin $JKBASE_DIR/target/x86_64-unknown-linux-musl/release/jkbase-agent \
     --api-port 9090 \
     --proxy-port 80 \
-    --domain jkbase.app
+    --domain jkbase.app \
+    --tls \
+    --https-port 443
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -212,7 +227,8 @@ echo ""
 echo "=== Provisioning complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Start the service:  ssh $TARGET 'sudo systemctl start jkbase'"
-echo "  2. Init the platform:  jkbase init <email> --api http://<server-ip>:9090"
-echo "  3. Point DNS:          *.jkbase.app → <server-ip>"
+echo "  1. Set env vars in /var/jkbase/.env (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, ACME_EMAIL)"
+echo "  2. Start the service:  ssh $TARGET 'sudo systemctl start jkbase'"
+echo "  3. Init the platform:  jkbase init <email> --api http://<server-ip>:9090"
+echo "  4. Point DNS:          *.jkbase.app → <server-ip>"
 echo ""

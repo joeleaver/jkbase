@@ -1,0 +1,6 @@
+[project]
+name = "www"
+
+[hosting]
+public = "."
+spa = false

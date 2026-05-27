@@ -9,6 +9,7 @@ const PROJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("projects");
 const VM_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("vm_allocations");
 const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
+const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,6 +22,7 @@ pub enum ProjectState {
 pub struct Project {
     pub id: String,
     pub name: String,
+    pub tenant_id: Option<String>,
     pub current_version: Option<u64>,
     #[serde(default = "default_state")]
     pub state: ProjectState,
@@ -33,6 +35,13 @@ pub struct VmAllocation {
     pub ip: String,
     pub tap_device: String,
     pub mac: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Secret {
+    pub project_id: String,
+    pub key: String,
+    pub value: String,
 }
 
 fn default_state() -> ProjectState {
@@ -53,6 +62,7 @@ impl Store {
         let _ = txn.open_table(VM_ALLOCATIONS)?;
         let _ = txn.open_table(TENANTS)?;
         let _ = txn.open_table(API_TOKENS)?;
+        let _ = txn.open_table(SECRETS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -190,6 +200,78 @@ impl Store {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub fn find_tenant_by_email(&self, email: &str) -> Result<Option<Tenant>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TENANTS)?;
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let tenant: Tenant = serde_json::from_slice(value.value())?;
+            if tenant.email == email {
+                return Ok(Some(tenant));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn list_projects_for_tenant(&self, tenant_id: &str) -> Result<Vec<Project>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PROJECTS)?;
+        let mut projects = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let project: Project = serde_json::from_slice(value.value())?;
+            if project.tenant_id.as_deref() == Some(tenant_id) {
+                projects.push(project);
+            }
+        }
+        Ok(projects)
+    }
+
+    // -- Secrets --
+
+    pub fn set_secret(&self, project_id: &str, key: &str, value: &str) -> Result<()> {
+        let compound_key = format!("{project_id}:{key}");
+        let secret = Secret {
+            project_id: project_id.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SECRETS)?;
+            let data = serde_json::to_vec(&secret)?;
+            table.insert(compound_key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_secrets(&self, project_id: &str) -> Result<Vec<Secret>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SECRETS)?;
+        let prefix = format!("{project_id}:");
+        let mut secrets = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if key.value().starts_with(&prefix) {
+                let secret: Secret = serde_json::from_slice(value.value())?;
+                secrets.push(secret);
+            }
+        }
+        Ok(secrets)
+    }
+
+    pub fn delete_secret(&self, project_id: &str, key: &str) -> Result<bool> {
+        let compound_key = format!("{project_id}:{key}");
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(SECRETS)?;
+            table.remove(compound_key.as_str())?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
     }
 
     pub fn authenticate(&self, raw_token: &str) -> Result<Option<Tenant>> {

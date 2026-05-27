@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jkbase -- the self-hostable Firebase alternative</title>
+<meta name="description" content="Self-hostable Firebase alternative built in Rust. Static hosting, WASM functions, server containers, Firecracker isolation, automatic TLS. Deploy in seconds.">
+<style>
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #0a0a0b;
+  --bg-raised: #111113;
+  --bg-subtle: #161619;
+  --border: #222228;
+  --border-light: #2a2a32;
+  --text: #e8e8ed;
+  --text-dim: #8888a0;
+  --text-muted: #55556a;
+  --accent: #38bdf8;
+  --accent-dim: #1d6f9a;
+  --accent-glow: rgba(56, 189, 248, 0.08);
+  --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", ui-monospace, "Menlo", "Consolas", "DejaVu Sans Mono", monospace;
+  --measure: 72rem;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--mono);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+a:hover {
+  color: #7dd3fc;
+}
+
+/* -- GRID BACKGROUND -- */
+.grid-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--border) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border) 1px, transparent 1px);
+  background-size: 60px 60px;
+  opacity: 0.25;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 20%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 20%, transparent 70%);
+}
+
+/* -- GLOW ORB -- */
+.glow-orb {
+  position: fixed;
+  top: -20vh;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 80vw;
+  height: 60vh;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at center, rgba(56, 189, 248, 0.06) 0%, transparent 70%);
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* -- LAYOUT -- */
+.wrapper {
+  position: relative;
+  z-index: 1;
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 0 2rem;
+}
+
+/* -- NAV -- */
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.5rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-logo {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.02em;
+}
+.nav-logo span {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.nav-links {
+  display: flex;
+  gap: 2rem;
+  list-style: none;
+  font-size: 0.85rem;
+}
+.nav-links a {
+  color: var(--text-dim);
+  transition: color 0.15s;
+}
+.nav-links a:hover {
+  color: var(--text);
+}
+
+/* -- HERO -- */
+.hero {
+  padding: 8rem 0 6rem;
+  text-align: center;
+}
+
+.hero-label {
+  display: inline-block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+  padding: 0.35rem 1rem;
+  margin-bottom: 2.5rem;
+  background: var(--accent-glow);
+}
+
+.hero h1 {
+  font-size: clamp(3rem, 8vw, 5.5rem);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+  margin-bottom: 1.5rem;
+  color: var(--text);
+}
+
+.hero h1 .dot {
+  color: var(--accent);
+}
+
+.hero-sub {
+  font-size: clamp(1rem, 2.5vw, 1.25rem);
+  color: var(--text-dim);
+  max-width: 38rem;
+  margin: 0 auto 3rem;
+  line-height: 1.65;
+  font-weight: 400;
+}
+
+.hero-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  background: var(--accent);
+  color: var(--bg);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 0.85rem 2rem;
+  border: none;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background 0.2s, transform 0.15s;
+  letter-spacing: -0.01em;
+}
+.hero-cta:hover {
+  background: #7dd3fc;
+  color: var(--bg);
+  transform: translateY(-1px);
+}
+.hero-cta .arrow {
+  font-size: 1.1rem;
+  transition: transform 0.2s;
+}
+.hero-cta:hover .arrow {
+  transform: translateX(3px);
+}
+
+/* -- SECTION COMMON -- */
+section {
+  padding: 5rem 0;
+}
+
+.section-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+}
+
+.section-title {
+  font-size: clamp(1.5rem, 4vw, 2.2rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  margin-bottom: 1rem;
+  line-height: 1.2;
+}
+
+.section-desc {
+  color: var(--text-dim);
+  max-width: 36rem;
+  font-size: 0.95rem;
+  line-height: 1.65;
+  margin-bottom: 3rem;
+}
+
+/* -- FEATURES -- */
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+
+.feature-card {
+  background: var(--bg);
+  padding: 2.5rem 2rem;
+  position: relative;
+  transition: background 0.25s;
+}
+.feature-card:hover {
+  background: var(--bg-raised);
+}
+
+.feature-icon {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  margin-bottom: 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.feature-icon::before {
+  content: "";
+  display: block;
+  width: 6px;
+  height: 6px;
+  background: var(--accent);
+}
+
+.feature-card h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.75rem;
+  color: var(--text);
+}
+
+.feature-card p {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  line-height: 1.7;
+}
+
+/* -- HOW IT WORKS -- */
+.how-section {
+  border-top: 1px solid var(--border);
+}
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2rem;
+  position: relative;
+}
+
+.steps::before {
+  content: "";
+  position: absolute;
+  top: 2.15rem;
+  left: calc(33.33% / 2);
+  right: calc(33.33% / 2);
+  height: 1px;
+  background: var(--border-light);
+}
+
+.step {
+  text-align: center;
+  position: relative;
+}
+
+.step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  border: 1px solid var(--border-light);
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin-bottom: 1.5rem;
+  position: relative;
+  z-index: 1;
+}
+
+.step-cmd {
+  display: block;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 0.6rem;
+  letter-spacing: -0.01em;
+}
+
+.step p {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+/* -- TERMINAL DEMO -- */
+.terminal-section {
+  border-top: 1px solid var(--border);
+}
+
+.terminal {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  max-width: 44rem;
+  overflow: hidden;
+}
+
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+
+.terminal-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--border-light);
+}
+
+.terminal-body {
+  padding: 1.5rem;
+  font-size: 0.85rem;
+  line-height: 2;
+}
+
+.terminal-body .prompt {
+  color: var(--text-dim);
+  user-select: none;
+}
+
+.terminal-body .cmd {
+  color: var(--text);
+}
+
+.terminal-body .output {
+  color: var(--text-muted);
+}
+
+.terminal-body .output-accent {
+  color: var(--accent);
+}
+
+/* -- BOTTOM CTA -- */
+.bottom-cta {
+  border-top: 1px solid var(--border);
+  text-align: center;
+  padding: 6rem 0;
+}
+
+.bottom-cta .section-title {
+  margin-bottom: 1.5rem;
+}
+
+.bottom-cta .section-desc {
+  margin: 0 auto 2.5rem;
+}
+
+/* -- FOOTER -- */
+footer {
+  border-top: 1px solid var(--border);
+  padding: 2.5rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.footer-links {
+  display: flex;
+  gap: 2rem;
+  list-style: none;
+}
+.footer-links a {
+  color: var(--text-muted);
+  transition: color 0.15s;
+}
+.footer-links a:hover {
+  color: var(--text-dim);
+}
+
+/* -- RESPONSIVE -- */
+@media (max-width: 768px) {
+  .wrapper {
+    padding: 0 1.25rem;
+  }
+
+  .hero {
+    padding: 5rem 0 4rem;
+  }
+
+  .features-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .steps {
+    grid-template-columns: 1fr;
+    gap: 2.5rem;
+  }
+
+  .steps::before {
+    display: none;
+  }
+
+  .nav-links {
+    gap: 1.25rem;
+  }
+
+  footer {
+    flex-direction: column;
+    gap: 1.25rem;
+    text-align: center;
+  }
+}
+
+@media (max-width: 1024px) and (min-width: 769px) {
+  .features-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* -- ANIMATIONS -- */
+@media (prefers-reduced-motion: no-preference) {
+  .hero-label,
+  .hero h1,
+  .hero-sub,
+  .hero-cta {
+    animation: fadeUp 0.6s ease both;
+  }
+  .hero-label { animation-delay: 0s; }
+  .hero h1 { animation-delay: 0.08s; }
+  .hero-sub { animation-delay: 0.16s; }
+  .hero-cta { animation-delay: 0.24s; }
+
+  .feature-card {
+    animation: fadeUp 0.5s ease both;
+  }
+  .feature-card:nth-child(1) { animation-delay: 0.3s; }
+  .feature-card:nth-child(2) { animation-delay: 0.38s; }
+  .feature-card:nth-child(3) { animation-delay: 0.46s; }
+  .feature-card:nth-child(4) { animation-delay: 0.54s; }
+  .feature-card:nth-child(5) { animation-delay: 0.62s; }
+  .feature-card:nth-child(6) { animation-delay: 0.7s; }
+
+  @keyframes fadeUp {
+    from {
+      opacity: 0;
+      transform: translateY(18px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="grid-bg" aria-hidden="true"></div>
+<div class="glow-orb" aria-hidden="true"></div>
+
+<div class="wrapper">
+
+  <!-- NAV -->
+  <nav>
+    <div class="nav-logo">jkbase<span>.app</span></div>
+    <ul class="nav-links">
+      <li><a href="#features">Features</a></li>
+      <li><a href="https://docs.jkbase.app">Docs</a></li>
+      <li><a href="https://github.com/jkbase">GitHub</a></li>
+      <li><a href="https://console.jkbase.app">Console</a></li>
+    </ul>
+  </nav>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-label">open source / self-hostable / Rust</div>
+    <h1>jkbase<span class="dot">.</span></h1>
+    <p class="hero-sub">The self-hostable Firebase alternative. Built in Rust.</p>
+    <a href="https://console.jkbase.app" class="hero-cta">
+      Get Started <span class="arrow">-></span>
+    </a>
+  </section>
+
+  <!-- FEATURES -->
+  <section id="features">
+    <p class="section-label">Capabilities</p>
+    <h2 class="section-title">Everything you need to ship.</h2>
+    <p class="section-desc">Six primitives that compose into a complete platform. No vendor lock-in. Deploy on your own hardware.</p>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">01</div>
+        <h3>Static Hosting</h3>
+        <p>Deploy any static site or SPA. Push files, get a URL with automatic TLS. Global edge caching. Zero configuration required.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">02</div>
+        <h3>WASM Functions</h3>
+        <p>Write serverless functions in Rust or JavaScript, compiled to WebAssembly. Sub-millisecond cold starts. Scale to zero when idle.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">03</div>
+        <h3>Server Containers</h3>
+        <p>Deploy long-running services from a Dockerfile. Persistent volumes, health checks, automatic restarts. Full control over your runtime.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">04</div>
+        <h3>Firecracker Isolation</h3>
+        <p>Every project runs in its own Firecracker microVM. Hardware-level isolation with minimal overhead. The same technology behind AWS Lambda.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">05</div>
+        <h3>Automatic TLS</h3>
+        <p>Certificates provisioned and renewed automatically via ACME. Wildcard support for project subdomains. HTTPS everywhere, always.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">06</div>
+        <h3>CLI-First Workflow</h3>
+        <p>Everything is a command. Init, deploy, logs, rollback -- all from your terminal. Scriptable. Composable. No clicking through dashboards.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- HOW IT WORKS -->
+  <section class="how-section" id="how">
+    <p class="section-label">Workflow</p>
+    <h2 class="section-title">Three commands to production.</h2>
+    <p class="section-desc">No build pipelines. No YAML files. No waiting. Write code, deploy, done.</p>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">01</div>
+        <span class="step-cmd">$ jkbase init</span>
+        <p>Scaffold a project. Pick your primitives. Generates a jkbase.toml with sensible defaults.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">02</div>
+        <span class="step-cmd">$ jkbase deploy</span>
+        <p>Push to production in seconds. Assets uploaded, containers built, functions compiled -- all in one command.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">03</div>
+        <span class="step-cmd">// live</span>
+        <p>Your project is online at your-project.jkbase.app with automatic TLS. That's it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- TERMINAL DEMO -->
+  <section class="terminal-section">
+    <p class="section-label">In practice</p>
+    <h2 class="section-title">Deploy a site in 20 seconds.</h2>
+    <p class="section-desc">A real workflow. No tricks, no cuts.</p>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <span class="terminal-dot"></span>
+        <span class="terminal-dot"></span>
+        <span class="terminal-dot"></span>
+        <span>terminal</span>
+      </div>
+      <div class="terminal-body">
+        <div><span class="prompt">~ $ </span><span class="cmd">mkdir my-app && cd my-app</span></div>
+        <div><span class="prompt">~/my-app $ </span><span class="cmd">jkbase init</span></div>
+        <div><span class="output">  created jkbase.toml</span></div>
+        <div><span class="output">  created index.html</span></div>
+        <div>&nbsp;</div>
+        <div><span class="prompt">~/my-app $ </span><span class="cmd">jkbase deploy</span></div>
+        <div><span class="output">  uploading 2 files (4.2 KB)</span></div>
+        <div><span class="output">  provisioning TLS certificate</span></div>
+        <div><span class="output">  deploying to microVM</span></div>
+        <div>&nbsp;</div>
+        <div><span class="output-accent">  live at https://my-app.jkbase.app</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BOTTOM CTA -->
+  <section class="bottom-cta">
+    <h2 class="section-title">Ship something today.</h2>
+    <p class="section-desc">Your infrastructure. Your hardware. Your rules. Open source, self-hostable, no compromises.</p>
+    <a href="https://console.jkbase.app" class="hero-cta">
+      Open Console <span class="arrow">-></span>
+    </a>
+  </section>
+
+  <!-- FOOTER -->
+  <footer>
+    <span>jkbase -- built in Rust</span>
+    <ul class="footer-links">
+      <li><a href="https://docs.jkbase.app">Docs</a></li>
+      <li><a href="https://github.com/jkbase">GitHub</a></li>
+      <li><a href="https://console.jkbase.app">Console</a></li>
+      <li><a href="mailto:joe.leaver@lbmepublishing.com">Contact</a></li>
+    </ul>
+  </footer>
+
+</div>
+
+</body>
+</html>

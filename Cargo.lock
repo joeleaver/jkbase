@@ -1466,6 +1466,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1473,6 +1474,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tar",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1516,12 +1518,14 @@ dependencies = [
  "axum",
  "base64",
  "flate2",
+ "hyper",
  "jkbase-common",
  "redb",
  "serde",
  "serde_json",
  "tar",
  "tokio",
+ "tower-http",
  "tracing",
 ]
 

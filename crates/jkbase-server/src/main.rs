@@ -136,7 +136,7 @@ async fn main() -> Result<()> {
     }));
 
     let state = Arc::new(state);
-    let router = api::router(state);
+    let router = api::router(state, args.domain.clone());
 
     let tls_config = if args.tls {
         let cf_token = args.cloudflare_token
@@ -156,11 +156,13 @@ async fn main() -> Result<()> {
         None
     };
 
+    let api_addr = format!("127.0.0.1:{}", args.api_port);
     let proxy_config = ProxyConfig {
         http_port: args.proxy_port,
         https_port: if args.tls { Some(args.https_port) } else { None },
         platform_domain: args.domain,
         tls_config,
+        api_addr: Some(api_addr),
     };
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();

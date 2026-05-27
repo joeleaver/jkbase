@@ -1,0 +1,6 @@
+[project]
+name = "console"
+
+[hosting]
+public = "."
+spa = true
