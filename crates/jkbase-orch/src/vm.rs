@@ -122,6 +122,7 @@ impl VmInstance {
         }
 
         if let Some(data_path) = &config.data_disk_path {
+            info!(id, data_disk = %data_path.display(), "attaching data disk as /dev/vdc");
             client
                 .set_drive(&Drive {
                     drive_id: "data".to_string(),
