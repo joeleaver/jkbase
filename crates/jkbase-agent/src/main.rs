@@ -343,11 +343,11 @@ async fn proxy_to_server(port: u16, req: Request<hyper::body::Incoming>) -> Resp
     };
     tokio::spawn(conn);
 
-    let proxy_req = Request::builder()
-        .method(req.method())
-        .uri(path)
-        .body(req.into_body())
-        .unwrap();
+    let mut builder = Request::builder().method(req.method()).uri(path);
+    for (key, value) in req.headers() {
+        builder = builder.header(key, value);
+    }
+    let proxy_req = builder.body(req.into_body()).unwrap();
 
     match sender.send_request(proxy_req).await {
         Ok(resp) => {
