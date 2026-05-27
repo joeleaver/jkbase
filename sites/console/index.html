@@ -29,8 +29,10 @@
   --danger-dim: rgba(255, 68, 102, 0.08);
   --success: #00cc88;
   --success-dim: rgba(0, 204, 136, 0.08);
+  --warning: #ffaa00;
   --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
   --sidebar-w: 240px;
+  --sub-sidebar-w: 200px;
   --transition: 150ms ease;
 }
 
@@ -290,7 +292,7 @@ body {
   background: currentColor;
 }
 
-/* Account icon - simple person silhouette via CSS */
+/* Account icon */
 .icon-account {
   position: relative;
 }
@@ -407,43 +409,143 @@ body {
   flex-shrink: 0;
 }
 
-.breadcrumb {
-  font-size: 12px;
-  color: var(--text-dim);
+/* --- Project sub-sidebar --- */
+
+.project-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.project-subnav {
+  width: var(--sub-sidebar-w);
+  flex-shrink: 0;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.subnav-header {
+  padding: 16px 14px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.subnav-back {
   display: flex;
   align-items: center;
   gap: 6px;
-}
-
-.breadcrumb-link {
-  color: var(--text-dim);
-  cursor: pointer;
-  background: none;
-  border: none;
   font-family: var(--mono);
   font-size: 12px;
-  padding: 0;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px 0;
+  margin-bottom: 8px;
   transition: color var(--transition);
 }
 
-.breadcrumb-link:hover {
+.subnav-back:hover {
   color: var(--accent);
 }
 
-.breadcrumb-sep {
-  color: var(--text-dim);
-  opacity: 0.5;
-}
-
-.breadcrumb-current {
+.subnav-project-name {
+  font-size: 14px;
+  font-weight: 600;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.content {
+.subnav-items {
+  padding: 8px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.subnav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  font-family: var(--mono);
+  width: 100%;
+  text-align: left;
+  transition: all var(--transition);
+}
+
+.subnav-item:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.subnav-item.active {
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.subnav-icon {
+  font-size: 12px;
+  width: 16px;
+  text-align: center;
+  flex-shrink: 0;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.subnav-item.active .subnav-icon {
+  opacity: 1;
+}
+
+/* Mobile sub-nav toggle */
+.subnav-toggle {
+  display: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  margin-bottom: 16px;
+  transition: all var(--transition);
+}
+
+.subnav-toggle:hover {
+  color: var(--text);
+  border-color: var(--border-hover);
+}
+
+/* --- Feature content area --- */
+
+.feature-content {
   flex: 1;
   padding: 28px 32px;
-  max-width: 860px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.feature-content-inner {
+  max-width: 720px;
   width: 100%;
+}
+
+.feature-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 20px;
 }
 
 /* --- Cards / Sections --- */
@@ -575,23 +677,420 @@ body {
   color: var(--text-dim);
 }
 
-/* --- Detail Header --- */
+/* --- Status dots --- */
 
-.detail-title-row {
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot.green {
+  background: var(--success);
+}
+
+.status-dot.red {
+  background: var(--danger);
+}
+
+.status-dot.yellow {
+  background: var(--warning);
+}
+
+/* --- Overview stats --- */
+
+.overview-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.stat-value {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.stat-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* --- VM Status --- */
+
+.vm-status-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vm-status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.vm-status-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 100px;
+}
+
+.vm-status-value {
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* --- Hosting --- */
+
+.hosting-row {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex-wrap: wrap;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
 }
 
-.detail-url {
-  font-size: 12px;
+.hosting-row:last-of-type {
+  border-bottom: none;
+}
+
+.hosting-row.dim {
+  color: var(--text-dim);
+}
+
+.hosting-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  min-width: 60px;
+  letter-spacing: 0.5px;
+}
+
+.hosting-url {
   color: var(--accent);
   text-decoration: none;
 }
 
-.detail-url:hover {
+.hosting-url:hover {
   text-decoration: underline;
+}
+
+.btn-danger-text {
+  color: var(--danger) !important;
+}
+
+.domain-add-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  align-items: center;
+}
+
+.domain-add-form .input {
+  width: 180px;
+  flex: none;
+}
+
+.domain-suffix {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+
+.hosting-info {
+  margin-top: 20px;
+  padding: 16px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.hosting-info-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.hosting-info-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin-bottom: 12px;
+}
+
+/* --- Functions list --- */
+
+.function-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+
+.function-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.function-route {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+/* --- Server cards --- */
+
+.server-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.server-card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.server-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.server-port {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-left: 4px;
+}
+
+.server-badges {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
+.server-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.server-logs-area {
+  padding: 12px;
+}
+
+.server-logs-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.server-logs-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* --- Secrets --- */
+
+.secret-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.secret-table td {
+  padding: 8px 0;
+  font-size: 13px;
+  border-bottom: 1px solid rgba(26, 26, 40, 0.5);
+}
+
+.secret-table tr:last-child td {
+  border-bottom: none;
+}
+
+.secret-key {
+  color: var(--text);
+}
+
+.secret-actions {
+  text-align: right;
+  width: 40px;
+}
+
+.secret-add-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  align-items: flex-start;
+}
+
+.secret-add-form .input {
+  flex: 1;
+}
+
+.secret-delete-confirm {
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: var(--danger-dim);
+  border: 1px solid rgba(255, 68, 102, 0.2);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.secret-delete-confirm-text {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.secret-delete-confirm-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* --- Logs --- */
+
+.log-container {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-ts {
+  color: var(--text-dim);
+}
+
+.log-server {
+  color: #aa88ff;
+}
+
+.log-stream-stdout {
+  color: var(--text);
+}
+
+.log-stream-stderr {
+  color: var(--danger);
+}
+
+.log-empty {
+  padding: 32px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+/* --- Danger Zone --- */
+
+.danger-zone {
+  background: var(--bg-card);
+  border: 1px solid rgba(255, 68, 102, 0.2);
+  border-radius: 8px;
+  padding: 18px 20px;
+  margin-top: 16px;
+}
+
+.danger-zone-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--danger);
+  margin-bottom: 8px;
+}
+
+.danger-zone-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 14px;
+  line-height: 1.5;
+}
+
+.danger-zone-confirm {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: rgba(255, 68, 102, 0.06);
+  border: 1px solid rgba(255, 68, 102, 0.2);
+  border-radius: 6px;
+}
+
+.danger-zone-confirm-text {
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.danger-zone-confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* --- Settings --- */
+
+.settings-field {
+  margin-bottom: 20px;
+}
+
+.settings-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+
+.settings-value {
+  font-size: 13px;
+  color: var(--text);
+  padding: 9px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  user-select: all;
 }
 
 /* --- Onboarding --- */
@@ -714,206 +1213,27 @@ body {
   border-color: var(--border-hover);
 }
 
-/* --- Secrets --- */
+/* --- Empty state --- */
 
-.secret-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.secret-table td {
-  padding: 8px 0;
-  font-size: 13px;
-  border-bottom: 1px solid rgba(26, 26, 40, 0.5);
-}
-
-.secret-table tr:last-child td {
-  border-bottom: none;
-}
-
-.secret-key {
-  color: var(--text);
-}
-
-.secret-actions {
-  text-align: right;
-  width: 40px;
-}
-
-.hosting-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-}
-
-.hosting-row:last-of-type {
-  border-bottom: none;
-}
-
-.hosting-row.dim {
-  color: var(--text-dim);
-}
-
-.hosting-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  color: var(--text-dim);
-  min-width: 60px;
-  letter-spacing: 0.5px;
-}
-
-.hosting-url {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.hosting-url:hover {
-  text-decoration: underline;
-}
-
-.btn-danger-text {
-  color: var(--danger) !important;
-}
-
-.domain-add-form {
-  display: flex;
-  gap: 8px;
-  margin-top: 12px;
-  align-items: center;
-}
-
-.domain-add-form .input {
-  width: 180px;
-  flex: none;
-}
-
-.domain-suffix {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-right: 4px;
-}
-
-.secret-add-form {
-  display: flex;
-  gap: 8px;
-  margin-top: 12px;
-  align-items: flex-start;
-}
-
-.secret-add-form .input {
-  flex: 1;
-}
-
-.secret-delete-confirm {
-  margin-top: 10px;
-  padding: 10px 14px;
-  background: var(--danger-dim);
-  border: 1px solid rgba(255, 68, 102, 0.2);
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.secret-delete-confirm-text {
-  font-size: 12px;
-  color: var(--text);
-}
-
-.secret-delete-confirm-actions {
-  display: flex;
-  gap: 6px;
-  flex-shrink: 0;
-}
-
-/* --- Logs --- */
-
-.log-container {
-  background: var(--bg-code);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 12px;
-  max-height: 400px;
-  overflow-y: auto;
-  font-size: 12px;
-  line-height: 1.7;
-}
-
-.log-line {
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-
-.log-ts {
-  color: var(--text-dim);
-}
-
-.log-server {
-  color: #aa88ff;
-}
-
-.log-stream-stdout {
-  color: var(--text);
-}
-
-.log-stream-stderr {
-  color: var(--danger);
-}
-
-.log-empty {
-  padding: 32px 16px;
+.empty-state {
+  padding: 40px 20px;
   text-align: center;
   color: var(--text-dim);
-  font-size: 12px;
 }
 
-/* --- Danger Zone --- */
-
-.danger-zone {
-  background: var(--bg-card);
-  border: 1px solid rgba(255, 68, 102, 0.2);
-  border-radius: 8px;
-  padding: 18px 20px;
-  margin-top: 16px;
-}
-
-.danger-zone-title {
-  font-size: 13px;
+.empty-state-title {
+  font-size: 14px;
   font-weight: 600;
-  color: var(--danger);
+  color: var(--text);
   margin-bottom: 8px;
 }
 
-.danger-zone-desc {
+.empty-state-desc {
   font-size: 12px;
   color: var(--text-dim);
-  margin-bottom: 14px;
-  line-height: 1.5;
-}
-
-.danger-zone-confirm {
-  margin-top: 12px;
-  padding: 12px 14px;
-  background: rgba(255, 68, 102, 0.06);
-  border: 1px solid rgba(255, 68, 102, 0.2);
-  border-radius: 6px;
-}
-
-.danger-zone-confirm-text {
-  font-size: 12px;
-  color: var(--text);
-  margin-bottom: 10px;
-  line-height: 1.5;
-}
-
-.danger-zone-confirm-actions {
-  display: flex;
-  gap: 8px;
-  justify-content: flex-end;
+  line-height: 1.6;
+  max-width: 400px;
+  margin: 0 auto;
 }
 
 /* --- Auth Screen --- */
@@ -1141,6 +1461,13 @@ body {
   font-weight: 600;
 }
 
+.content {
+  flex: 1;
+  padding: 28px 32px;
+  max-width: 860px;
+  width: 100%;
+}
+
 /* --- Responsive --- */
 
 @media (max-width: 768px) {
@@ -1172,6 +1499,10 @@ body {
     padding: 20px 16px;
   }
 
+  .feature-content {
+    padding: 20px 16px;
+  }
+
   .onboarding {
     padding: 28px 20px;
     margin-top: 20px;
@@ -1185,6 +1516,33 @@ body {
   .project-table td:nth-child(3) {
     display: none;
   }
+
+  .project-subnav {
+    display: none;
+  }
+
+  .project-subnav.mobile-open {
+    display: flex;
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 98;
+    width: 220px;
+    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.4);
+  }
+
+  .subnav-toggle {
+    display: block;
+  }
+
+  .overview-stats {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .domain-add-form {
+    flex-wrap: wrap;
+  }
 }
 
 @media (max-width: 480px) {
@@ -1192,10 +1550,8 @@ body {
     font-size: 14px;
   }
 
-  .detail-title-row {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 6px;
+  .overview-stats {
+    grid-template-columns: 1fr;
   }
 }
 </style>
@@ -1229,6 +1585,9 @@ body {
     revealedToken: null,
     // project detail
     currentProject: null,
+    projectView: "overview", // overview, hosting, functions, servers, secrets, settings
+    projectStatus: null,
+    statusLoading: false,
     secrets: [],
     logs: [],
     secretsLoading: false,
@@ -1241,12 +1600,12 @@ body {
     accountSuccess: null,
     // sidebar mobile
     sidebarOpen: false,
+    // sub-nav mobile
+    subnavOpen: false,
     // domains
     domains: [],
     domainsLoading: false,
     showAddDomain: false,
-    // collapsible sections
-    sectionsOpen: { deploy: true, hosting: true, secrets: true, logs: true },
   };
 
   // --- API helpers ---
@@ -1290,6 +1649,7 @@ body {
     state.error = null;
     state.success = null;
     state.sidebarOpen = false;
+    state.subnavOpen = false;
     render();
   }
 
@@ -1404,6 +1764,9 @@ body {
   function openProject(project) {
     state.currentProject = project;
     state.view = "project-detail";
+    state.projectView = "overview";
+    state.projectStatus = null;
+    state.statusLoading = false;
     state.secrets = [];
     state.logs = [];
     state.domains = project.domains || [];
@@ -1413,11 +1776,35 @@ body {
     state.showAddDomain = false;
     state.deleteSecretConfirm = null;
     state.deleteConfirm = false;
-    state.sectionsOpen = { deploy: true, hosting: true, secrets: true, logs: true };
+    state.subnavOpen = false;
     render();
+    // Fetch all data in parallel
+    loadStatus(project.id);
     loadSecrets(project.id);
     loadDomains(project.id);
     loadLogs(project.id);
+  }
+
+  function setProjectView(view) {
+    state.projectView = view;
+    state.error = null;
+    state.success = null;
+    state.subnavOpen = false;
+    render();
+  }
+
+  function loadStatus(projectId) {
+    state.statusLoading = true;
+    render();
+    api("GET", "/projects/" + projectId + "/status").then(function(status) {
+      state.projectStatus = status;
+      state.statusLoading = false;
+      render();
+    }).catch(function(e) {
+      state.projectStatus = null;
+      state.statusLoading = false;
+      render();
+    });
   }
 
   function loadSecrets(projectId) {
@@ -1473,9 +1860,10 @@ body {
       state.logs = logs;
       state.logsLoading = false;
       render();
-      var logEl = document.querySelector(".log-container");
-      if (logEl) {
-        logEl.scrollTop = logEl.scrollHeight;
+      // Scroll all log containers to bottom
+      var logEls = document.querySelectorAll(".log-container");
+      for (var i = 0; i < logEls.length; i++) {
+        logEls[i].scrollTop = logEls[i].scrollHeight;
       }
     }).catch(function(e) {
       state.logsLoading = false;
@@ -1616,6 +2004,7 @@ body {
     state.error = null;
     state.success = null;
     state.sidebarOpen = false;
+    state.subnavOpen = false;
     if (view === "projects") {
       state.currentProject = null;
       render();
@@ -2009,265 +2398,488 @@ body {
     );
   }
 
-  // --- Project Detail ---
+  // --- Project Sub-Navigation ---
 
-  function toggleSection(key) {
-    state.sectionsOpen[key] = !state.sectionsOpen[key];
-    render();
-  }
+  var subnavItems = [
+    { key: "overview",   label: "Overview",   icon: "#" },
+    { key: "hosting",    label: "Hosting",    icon: "@" },
+    { key: "functions",  label: "Functions",  icon: "f" },
+    { key: "servers",    label: "Servers",    icon: ">" },
+    { key: "secrets",    label: "Secrets",    icon: "*" },
+    { key: "settings",   label: "Settings",   icon: "%" },
+  ];
 
-  function renderCollapsibleCard(key, title, headerRight, bodyFn) {
-    var isOpen = state.sectionsOpen[key];
-    return h("div", { className: "card" },
-      h("div", { className: "card-header", onClick: function() { toggleSection(key); } },
-        h("div", { className: "card-title" },
-          h("span", { className: "card-chevron" + (isOpen ? " open" : "") }, ">"),
-          title
-        ),
-        headerRight || null
+  function renderProjectSubnav(project) {
+    return h("aside", {
+      className: "project-subnav" + (state.subnavOpen ? " mobile-open" : ""),
+    },
+      h("div", { className: "subnav-header" },
+        h("button", {
+          className: "subnav-back",
+          onClick: function() { navTo("projects"); },
+        }, "<- Projects"),
+        h("div", { className: "subnav-project-name" }, project.name)
       ),
-      isOpen ? h("div", { className: "card-body" }, bodyFn()) : null
+      h("div", { className: "subnav-items" },
+        subnavItems.map(function(item) {
+          return h("button", {
+            className: "subnav-item" + (state.projectView === item.key ? " active" : ""),
+            onClick: function() { setProjectView(item.key); },
+          },
+            h("span", { className: "subnav-icon" }, item.icon),
+            item.label
+          );
+        })
+      )
     );
   }
 
-  function renderDeploySection(project) {
+  // --- Feature Views ---
+
+  // Overview
+  function renderOverviewView(project) {
     var deployed = project.current_version != null;
-    return renderCollapsibleCard("deploy", "Deploy", null, function() {
-      return h("div", null,
-        h("div", { className: "section-desc", style: "margin-bottom: 12px" },
-          deployed
-            ? "Deployed v" + project.current_version
-            : "Not deployed"
+    var status = state.projectStatus;
+
+    var functionsCount = 0;
+    var serversCount = 0;
+    if (status) {
+      functionsCount = (status.functions_loaded || []).length;
+      serversCount = (status.servers || []).length;
+    }
+    var secretsCount = state.secrets.length;
+    var domainsCount = state.domains.length;
+
+    return h("div", { className: "feature-content-inner" },
+      h("div", { className: "feature-title" }, "Overview"),
+
+      // Quick stats
+      h("div", { className: "overview-stats" },
+        h("div", { className: "stat-card" },
+          h("div", { className: "stat-value" }, String(functionsCount)),
+          h("div", { className: "stat-label" }, "Functions")
         ),
-        h("div", { className: "section-desc" }, "Deploy or update from your terminal:"),
-        h("div", { className: "code-block-row" },
-          h("code", { className: "code-block" }, "cd your-project && jkbase deploy"),
-          h("button", { className: "copy-btn", onClick: function() {
-            navigator.clipboard.writeText("cd your-project && jkbase deploy");
-            this.textContent = "Copied";
-            var btn = this;
-            setTimeout(function() { btn.textContent = "Copy"; }, 2000);
-          }}, "Copy")
+        h("div", { className: "stat-card" },
+          h("div", { className: "stat-value" }, String(serversCount)),
+          h("div", { className: "stat-label" }, "Servers")
+        ),
+        h("div", { className: "stat-card" },
+          h("div", { className: "stat-value" }, String(secretsCount)),
+          h("div", { className: "stat-label" }, "Secrets")
+        ),
+        h("div", { className: "stat-card" },
+          h("div", { className: "stat-value" }, String(domainsCount)),
+          h("div", { className: "stat-label" }, "Domain Aliases")
         )
-      );
-    });
+      ),
+
+      // Deploy status
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "card-title", style: "margin-bottom: 12px" }, "Deploy Status"),
+          h("div", { style: "display: flex; align-items: center; gap: 8px; margin-bottom: 14px" },
+            h("span", { className: "status-dot " + (deployed ? "green" : "yellow") }),
+            h("span", { style: "font-size: 13px" },
+              deployed ? "Deployed v" + project.current_version : "Not deployed"
+            )
+          ),
+          h("div", { className: "section-desc" }, "Deploy or update from your terminal:"),
+          h("div", { className: "code-block-row" },
+            h("code", { className: "code-block" }, "cd your-project && jkbase deploy"),
+            h("button", { className: "copy-btn", onClick: function() {
+              navigator.clipboard.writeText("cd your-project && jkbase deploy");
+              this.textContent = "Copied";
+              var btn = this;
+              setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+            }}, "Copy")
+          )
+        )
+      ),
+
+      // VM Status
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "card-title", style: "margin-bottom: 12px" },
+            "VM Status",
+            state.statusLoading
+              ? h("span", { style: "font-size: 12px; color: var(--text-dim); font-weight: 400; margin-left: 8px" }, "loading...")
+              : null
+          ),
+          status
+            ? h("div", { className: "vm-status-grid" },
+                h("div", { className: "vm-status-row" },
+                  h("span", { className: "vm-status-label" }, "Status"),
+                  h("span", { className: "vm-status-value", style: "display: flex; align-items: center; gap: 6px" },
+                    h("span", { className: "status-dot " + (status.status === "running" ? "green" : status.status === "stopped" ? "red" : "yellow") }),
+                    status.status || "unknown"
+                  )
+                ),
+                status.pid != null
+                  ? h("div", { className: "vm-status-row" },
+                      h("span", { className: "vm-status-label" }, "PID"),
+                      h("span", { className: "vm-status-value" }, String(status.pid))
+                    )
+                  : null,
+                status.serve_dir != null
+                  ? h("div", { className: "vm-status-row" },
+                      h("span", { className: "vm-status-label" }, "Serve Dir"),
+                      h("span", { className: "vm-status-value" }, status.serve_dir)
+                    )
+                  : null,
+                h("div", { className: "vm-status-row" },
+                  h("span", { className: "vm-status-label" }, "Functions"),
+                  h("span", { className: "vm-status-value" }, String(functionsCount) + " loaded")
+                ),
+                h("div", { className: "vm-status-row" },
+                  h("span", { className: "vm-status-label" }, "Servers"),
+                  h("span", { className: "vm-status-value" }, String(serversCount) + " running")
+                )
+              )
+            : !state.statusLoading
+              ? h("div", { className: "section-desc" }, "Status unavailable. The project may not be deployed yet.")
+              : null
+        )
+      )
+    );
   }
 
-  function renderHostingSection(project) {
-    var headerBtn = h("button", {
-      className: "btn btn-secondary btn-sm",
-      onClick: function(e) {
-        e.stopPropagation();
-        state.showAddDomain = true;
-        state.sectionsOpen.hosting = true;
-        render();
-      },
-    }, "Add Domain");
-
-    return renderCollapsibleCard("hosting", "Hosting", headerBtn, function() {
-      var primaryUrl = project.url
-        ? h("div", { className: "hosting-row" },
-            h("span", { className: "hosting-label" }, "Primary"),
-            h("a", {
-              className: "hosting-url",
-              href: project.url,
-              target: "_blank",
-              rel: "noopener",
-            }, project.url.replace("https://", ""))
-          )
-        : h("div", { className: "hosting-row dim" },
-            h("span", { className: "hosting-label" }, "Primary"),
-            h("span", null, project.id + ".jkbase.app (not deployed)")
-          );
-
-      var aliasRows = state.domains.map(function(domain) {
-        var url = "https://" + domain + ".jkbase.app";
-        return h("div", { className: "hosting-row" },
-          h("span", { className: "hosting-label" }, "Alias"),
+  // Hosting
+  function renderHostingView(project) {
+    var primaryUrl = project.url
+      ? h("div", { className: "hosting-row" },
+          h("span", { className: "hosting-label" }, "Primary"),
           h("a", {
             className: "hosting-url",
-            href: url,
+            href: project.url,
             target: "_blank",
             rel: "noopener",
-          }, domain + ".jkbase.app"),
-          h("button", {
-            className: "btn btn-ghost btn-sm btn-danger-text",
-            onClick: function() { removeDomain(project.id, domain); },
-          }, "Remove")
+          }, project.url.replace("https://", ""))
+        )
+      : h("div", { className: "hosting-row dim" },
+          h("span", { className: "hosting-label" }, "Primary"),
+          h("span", null, project.id + ".jkbase.app (not deployed)")
         );
-      });
 
-      var addForm = state.showAddDomain
-        ? h("form", { className: "domain-add-form", onSubmit: function(e) {
-            e.preventDefault();
-            var input = e.target.querySelector("input");
-            var domain = input.value.trim().toLowerCase();
-            if (domain) addDomain(project.id, domain);
-          }},
-            h("input", {
-              className: "input input-sm",
-              type: "text",
-              placeholder: "subdomain name",
-              required: "required",
-              autocomplete: "off",
-              pattern: "[a-zA-Z0-9][a-zA-Z0-9-]*",
-              title: "Letters, numbers, and hyphens",
-            }),
-            h("span", { className: "domain-suffix" }, ".jkbase.app"),
-            h("button", { className: "btn btn-primary btn-sm", type: "submit" }, "Add"),
-            h("button", {
-              className: "btn btn-secondary btn-sm",
-              type: "button",
-              onClick: function() { state.showAddDomain = false; render(); },
-            }, "Cancel")
-          )
-        : null;
-
-      return h("div", null,
-        primaryUrl,
-        aliasRows,
-        addForm,
-        state.domainsLoading ? h("div", { className: "dim" }, "Loading domains...") : null
+    var aliasRows = state.domains.map(function(domain) {
+      var url = "https://" + domain + ".jkbase.app";
+      return h("div", { className: "hosting-row" },
+        h("span", { className: "hosting-label" }, "Alias"),
+        h("a", {
+          className: "hosting-url",
+          href: url,
+          target: "_blank",
+          rel: "noopener",
+        }, domain + ".jkbase.app"),
+        h("button", {
+          className: "btn btn-ghost btn-sm btn-danger-text",
+          onClick: function() { removeDomain(project.id, domain); },
+        }, "Remove")
       );
     });
+
+    var addForm = state.showAddDomain
+      ? h("form", { className: "domain-add-form", onSubmit: function(e) {
+          e.preventDefault();
+          var input = e.target.querySelector("input");
+          var domain = input.value.trim().toLowerCase();
+          if (domain) addDomain(project.id, domain);
+        }},
+          h("input", {
+            className: "input input-sm",
+            type: "text",
+            placeholder: "subdomain name",
+            required: "required",
+            autocomplete: "off",
+            pattern: "[a-zA-Z0-9][a-zA-Z0-9-]*",
+            title: "Letters, numbers, and hyphens",
+          }),
+          h("span", { className: "domain-suffix" }, ".jkbase.app"),
+          h("button", { className: "btn btn-primary btn-sm", type: "submit" }, "Add"),
+          h("button", {
+            className: "btn btn-secondary btn-sm",
+            type: "button",
+            onClick: function() { state.showAddDomain = false; render(); },
+          }, "Cancel")
+        )
+      : null;
+
+    return h("div", { className: "feature-content-inner" },
+      h("div", { className: "feature-title" }, "Hosting"),
+      state.error ? h("div", { className: "error-banner" }, state.error) : null,
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px" },
+            h("div", { className: "card-title" }, "Domains"),
+            h("button", {
+              className: "btn btn-secondary btn-sm",
+              onClick: function() {
+                state.showAddDomain = true;
+                render();
+              },
+            }, "Add Domain")
+          ),
+          primaryUrl,
+          aliasRows,
+          addForm,
+          state.domainsLoading ? h("div", { style: "margin-top: 8px; font-size: 12px; color: var(--text-dim)" }, "Loading domains...") : null
+        )
+      ),
+
+      h("div", { className: "hosting-info" },
+        h("div", { className: "hosting-info-title" }, "Multi-site hosting"),
+        h("div", { className: "hosting-info-desc" },
+          "You can serve multiple sites from a single project by configuring routes in your jkbase.toml. " +
+          "Each site directory maps to a path prefix or domain alias."
+        ),
+        h("code", { className: "code-block", style: "margin-top: 0" },
+          "[hosting]\nserve_dir = \"public\"\n\n[[hosting.sites]]\ndir = \"docs\"\nprefix = \"/docs\""
+        )
+      )
+    );
   }
 
-  function renderSecretsSection(project) {
-    var headerBtn = h("button", {
-      className: "btn btn-secondary btn-sm",
-      onClick: function(e) {
-        e.stopPropagation();
-        state.showAddSecret = true;
-        state.sectionsOpen.secrets = true;
-        render();
-      },
-    }, "Add Secret");
+  // Functions
+  function renderFunctionsView(project) {
+    var status = state.projectStatus;
+    var functions = status ? (status.functions_loaded || []) : [];
 
-    return renderCollapsibleCard("secrets", "Secrets", headerBtn, function() {
-      var items = [];
+    return h("div", { className: "feature-content-inner" },
+      h("div", { className: "feature-title" }, "Functions"),
 
-      if (state.secretsLoading && state.secrets.length === 0) {
-        items.push(h("div", { className: "section-desc" }, "Loading secrets..."));
-      } else if (state.secrets.length > 0) {
-        items.push(
-          h("table", { className: "secret-table" },
-            h("tbody", null,
-              state.secrets.map(function(secret) {
-                return h("tr", null,
-                  h("td", { className: "secret-key" }, secret.key),
-                  h("td", { className: "secret-actions" },
-                    h("button", {
-                      className: "btn-icon",
-                      title: "Delete secret",
-                      disabled: state.secretsLoading ? "disabled" : null,
-                      onClick: function() {
-                        state.deleteSecretConfirm = secret.key;
-                        render();
-                      },
-                    }, "x")
+      state.statusLoading
+        ? h("div", { className: "loading" }, "Loading functions...")
+        : functions.length > 0
+          ? h("div", null,
+              h("div", { className: "section-desc", style: "margin-bottom: 16px" },
+                String(functions.length) + " function" + (functions.length !== 1 ? "s" : "") + " loaded. Functions are deployed via the CLI and cannot be managed from the console."
+              ),
+              functions.map(function(name) {
+                return h("div", { className: "function-item" },
+                  h("span", { className: "function-name" }, name),
+                  h("span", { className: "function-route" }, "/functions/" + name)
+                );
+              })
+            )
+          : h("div", { className: "empty-state" },
+              h("div", { className: "empty-state-title" }, "No functions deployed"),
+              h("div", { className: "empty-state-desc" },
+                "Functions are JavaScript modules that run on the server. Add a functions directory to your project and deploy with the CLI to see them here."
+              ),
+              h("code", { className: "code-block", style: "max-width: 360px; margin: 16px auto 0; text-align: left" },
+                "# functions/hello.js\nexport default function(req) {\n  return { message: \"hello\" };\n}"
+              )
+            )
+    );
+  }
+
+  // Servers
+  function renderServersView(project) {
+    var status = state.projectStatus;
+    var servers = status ? (status.servers || []) : [];
+
+    return h("div", { className: "feature-content-inner" },
+      h("div", { className: "feature-title" }, "Servers"),
+
+      state.statusLoading
+        ? h("div", { className: "loading" }, "Loading servers...")
+        : servers.length > 0
+          ? h("div", null,
+              h("div", { className: "section-desc", style: "margin-bottom: 16px" },
+                String(servers.length) + " server container" + (servers.length !== 1 ? "s" : "")
+              ),
+              servers.map(function(server) {
+                // Filter logs for this server
+                var serverLogs = state.logs.filter(function(log) {
+                  return log.server === server.name;
+                });
+
+                return h("div", { className: "server-card" },
+                  h("div", { className: "server-card-header" },
+                    h("span", { className: "server-name" }, server.name),
+                    h("span", { className: "server-port" }, ":" + server.port),
+                    h("div", { className: "server-badges" },
+                      h("span", { className: "server-badge" },
+                        h("span", { className: "status-dot " + (server.running ? "green" : "red") }),
+                        server.running ? "running" : "stopped"
+                      ),
+                      h("span", { className: "server-badge" },
+                        h("span", { className: "status-dot " + (server.healthy ? "green" : server.healthy === false ? "red" : "yellow") }),
+                        server.healthy ? "healthy" : server.healthy === false ? "unhealthy" : "unknown"
+                      )
+                    )
+                  ),
+                  h("div", { className: "server-logs-area" },
+                    h("div", { className: "server-logs-toolbar" },
+                      h("span", { className: "server-logs-label" }, "Logs"),
+                      h("button", {
+                        className: "btn btn-secondary btn-sm",
+                        disabled: state.logsLoading ? "disabled" : null,
+                        onClick: function() { loadLogs(project.id); },
+                      }, state.logsLoading ? "Loading..." : "Refresh")
+                    ),
+                    serverLogs.length > 0
+                      ? h("div", { className: "log-container" },
+                          serverLogs.map(function(entry) {
+                            var streamClass = entry.stream === "stderr" ? "log-stream-stderr" : "log-stream-stdout";
+                            return h("div", { className: "log-line" },
+                              h("span", { className: "log-ts" }, "[" + formatTimestamp(entry.timestamp) + "] "),
+                              h("span", { className: streamClass }, entry.line)
+                            );
+                          })
+                        )
+                      : h("div", { className: "log-empty" }, "No logs for this server.")
                   )
                 );
               })
             )
-          )
-        );
-      } else if (!state.secretsLoading) {
-        items.push(h("div", { className: "section-desc" }, "No secrets configured."));
-      }
-
-      if (state.deleteSecretConfirm) {
-        items.push(
-          h("div", { className: "secret-delete-confirm" },
-            h("div", { className: "secret-delete-confirm-text" },
-              "Delete ",
-              h("span", { className: "highlight" }, state.deleteSecretConfirm),
-              "?"
-            ),
-            h("div", { className: "secret-delete-confirm-actions" },
-              h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
-                state.deleteSecretConfirm = null;
-                render();
-              }}, "Cancel"),
-              h("button", { className: "btn btn-danger btn-sm", onClick: function() {
-                deleteSecret(project.id, state.deleteSecretConfirm);
-              }}, "Delete")
+          : h("div", { className: "empty-state" },
+              h("div", { className: "empty-state-title" }, "No server containers"),
+              h("div", { className: "empty-state-desc" },
+                "Servers are long-running processes defined in your jkbase.toml. They get their own port, health checks, and log streams. Deploy with the CLI to see them here."
+              ),
+              h("code", { className: "code-block", style: "max-width: 360px; margin: 16px auto 0; text-align: left" },
+                "[[servers]]\nname = \"api\"\ncommand = \"node server.js\"\nport = 3000"
+              )
             )
-          )
-        );
-      }
-
-      if (state.showAddSecret) {
-        items.push(
-          h("form", { className: "secret-add-form", onSubmit: function(e) {
-            e.preventDefault();
-            var inputs = e.target.querySelectorAll("input");
-            var key = inputs[0].value.trim();
-            var value = inputs[1].value;
-            if (key && value) addSecret(project.id, key, value);
-          }},
-            h("input", {
-              className: "input",
-              type: "text",
-              placeholder: "KEY_NAME",
-              required: "required",
-              autocomplete: "off",
-            }),
-            h("input", {
-              className: "input",
-              type: "text",
-              placeholder: "secret value",
-              required: "required",
-              autocomplete: "off",
-            }),
-            h("button", {
-              className: "btn btn-primary btn-sm",
-              type: "submit",
-              disabled: state.secretsLoading ? "disabled" : null,
-            }, state.secretsLoading ? "Saving..." : "Save"),
-            h("button", {
-              className: "btn btn-secondary btn-sm",
-              type: "button",
-              onClick: function() {
-                state.showAddSecret = false;
-                render();
-              },
-            }, "Cancel")
-          )
-        );
-      }
-
-      return h("div", null, items);
-    });
+    );
   }
 
-  function renderLogsSection(project) {
-    var refreshBtn = h("button", {
-      className: "btn btn-secondary btn-sm",
-      disabled: state.logsLoading ? "disabled" : null,
-      onClick: function(e) {
-        e.stopPropagation();
-        loadLogs(project.id);
-      },
-    }, state.logsLoading ? "Loading..." : "Refresh");
+  // Secrets
+  function renderSecretsView(project) {
+    var items = [];
 
-    return renderCollapsibleCard("logs", "Logs", refreshBtn, function() {
-      if (state.logsLoading && state.logs.length === 0) {
-        return h("div", { className: "section-desc" }, "Loading logs...");
-      }
-      if (state.logs.length === 0) {
-        return h("div", { className: "log-empty" }, "No logs yet. Deploy a server container to see logs here.");
-      }
-      return h("div", { className: "log-container" },
-        state.logs.map(function(entry) {
-          var streamClass = entry.stream === "stderr" ? "log-stream-stderr" : "log-stream-stdout";
-          return h("div", { className: "log-line" },
-            h("span", { className: "log-ts" }, "[" + formatTimestamp(entry.timestamp) + "] "),
-            h("span", { className: "log-server" }, "[" + entry.server + "] "),
-            h("span", { className: streamClass }, entry.line)
-          );
-        })
+    if (state.secretsLoading && state.secrets.length === 0) {
+      items.push(h("div", { className: "section-desc" }, "Loading secrets..."));
+    } else if (state.secrets.length > 0) {
+      items.push(
+        h("table", { className: "secret-table" },
+          h("tbody", null,
+            state.secrets.map(function(secret) {
+              return h("tr", null,
+                h("td", { className: "secret-key" }, secret.key),
+                h("td", { className: "secret-actions" },
+                  h("button", {
+                    className: "btn-icon",
+                    title: "Delete secret",
+                    disabled: state.secretsLoading ? "disabled" : null,
+                    onClick: function() {
+                      state.deleteSecretConfirm = secret.key;
+                      render();
+                    },
+                  }, "x")
+                )
+              );
+            })
+          )
+        )
       );
-    });
+    } else if (!state.secretsLoading) {
+      items.push(h("div", { className: "section-desc" }, "No secrets configured."));
+    }
+
+    if (state.deleteSecretConfirm) {
+      items.push(
+        h("div", { className: "secret-delete-confirm" },
+          h("div", { className: "secret-delete-confirm-text" },
+            "Delete ",
+            h("span", { className: "highlight" }, state.deleteSecretConfirm),
+            "?"
+          ),
+          h("div", { className: "secret-delete-confirm-actions" },
+            h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
+              state.deleteSecretConfirm = null;
+              render();
+            }}, "Cancel"),
+            h("button", { className: "btn btn-danger btn-sm", onClick: function() {
+              deleteSecret(project.id, state.deleteSecretConfirm);
+            }}, "Delete")
+          )
+        )
+      );
+    }
+
+    if (state.showAddSecret) {
+      items.push(
+        h("form", { className: "secret-add-form", onSubmit: function(e) {
+          e.preventDefault();
+          var inputs = e.target.querySelectorAll("input");
+          var key = inputs[0].value.trim();
+          var value = inputs[1].value;
+          if (key && value) addSecret(project.id, key, value);
+        }},
+          h("input", {
+            className: "input",
+            type: "text",
+            placeholder: "KEY_NAME",
+            required: "required",
+            autocomplete: "off",
+          }),
+          h("input", {
+            className: "input",
+            type: "text",
+            placeholder: "secret value",
+            required: "required",
+            autocomplete: "off",
+          }),
+          h("button", {
+            className: "btn btn-primary btn-sm",
+            type: "submit",
+            disabled: state.secretsLoading ? "disabled" : null,
+          }, state.secretsLoading ? "Saving..." : "Save"),
+          h("button", {
+            className: "btn btn-secondary btn-sm",
+            type: "button",
+            onClick: function() {
+              state.showAddSecret = false;
+              render();
+            },
+          }, "Cancel")
+        )
+      );
+    }
+
+    return h("div", { className: "feature-content-inner" },
+      h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px" },
+        h("div", { className: "feature-title", style: "margin-bottom: 0" }, "Secrets"),
+        h("button", {
+          className: "btn btn-secondary btn-sm",
+          onClick: function() {
+            state.showAddSecret = true;
+            render();
+          },
+        }, "Add Secret")
+      ),
+      state.error ? h("div", { className: "error-banner" }, state.error) : null,
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", null, items)
+        )
+      )
+    );
+  }
+
+  // Settings
+  function renderSettingsView(project) {
+    return h("div", { className: "feature-content-inner" },
+      h("div", { className: "feature-title" }, "Settings"),
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "settings-field" },
+            h("div", { className: "settings-label" }, "Project ID"),
+            h("div", { className: "settings-value" }, project.id)
+          ),
+          h("div", { className: "settings-field", style: "margin-bottom: 0" },
+            h("div", { className: "settings-label" }, "Project Name"),
+            h("div", { className: "settings-value" }, project.name)
+          )
+        )
+      ),
+
+      renderDangerZone(project)
+    );
   }
 
   function renderDangerZone(project) {
@@ -2306,48 +2918,53 @@ body {
     );
   }
 
+  // --- Project Detail View (main orchestrator) ---
+
+  function renderFeatureContent(project) {
+    switch (state.projectView) {
+      case "overview":   return renderOverviewView(project);
+      case "hosting":    return renderHostingView(project);
+      case "functions":  return renderFunctionsView(project);
+      case "servers":    return renderServersView(project);
+      case "secrets":    return renderSecretsView(project);
+      case "settings":   return renderSettingsView(project);
+      default:           return renderOverviewView(project);
+    }
+  }
+
   function renderProjectDetailView() {
     var project = state.currentProject;
     if (!project) return renderProjectsView();
-
-    var deployed = project.current_version != null;
-
-    var titleRow = h("div", { className: "detail-title-row" },
-      h("span", null, project.name),
-      project.url
-        ? h("a", {
-            className: "detail-url",
-            href: project.url,
-            target: "_blank",
-            rel: "noopener",
-          }, project.url)
-        : null
-    );
 
     return h("div", { className: "app-layout" },
       renderSidebar(),
       h("div", { className: "main-area" },
         h("div", { className: "topbar" },
-          h("div", { className: "topbar-title" }, titleRow),
+          h("div", { className: "topbar-title" }, project.name),
           h("div", { className: "topbar-actions" },
-            h("div", { className: "breadcrumb" },
-              h("button", {
-                className: "breadcrumb-link",
-                onClick: function() { navTo("projects"); },
-              }, "Projects"),
-              h("span", { className: "breadcrumb-sep" }, "/"),
-              h("span", { className: "breadcrumb-current" }, project.name)
-            )
+            project.url
+              ? h("a", {
+                  className: "project-url-link",
+                  href: project.url,
+                  target: "_blank",
+                  rel: "noopener",
+                  style: "font-size: 12px",
+                }, project.url.replace("https://", ""))
+              : null
           )
         ),
-        h("div", { className: "content" },
-          state.error ? h("div", { className: "error-banner" }, state.error) : null,
-          state.success ? h("div", { className: "success-banner" }, state.success) : null,
-          renderDeploySection(project),
-          renderHostingSection(project),
-          renderSecretsSection(project),
-          renderLogsSection(project),
-          renderDangerZone(project)
+        h("div", { className: "project-layout" },
+          renderProjectSubnav(project),
+          h("div", { className: "feature-content" },
+            h("button", {
+              className: "subnav-toggle",
+              onClick: function() {
+                state.subnavOpen = !state.subnavOpen;
+                render();
+              },
+            }, (state.subnavOpen ? "x Close" : "= ") + " " + subnavItems.filter(function(i) { return i.key === state.projectView; })[0].label),
+            renderFeatureContent(project)
+          )
         )
       )
     );

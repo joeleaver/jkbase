@@ -110,6 +110,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
         .route("/projects/{id}/logs", get(get_project_logs))
+        .route("/projects/{id}/status", get(get_project_status))
         .route("/projects/{id}/domains", get(list_domains).post(add_domain))
         .route("/projects/{id}/domains/{domain}", axum::routing::delete(remove_domain))
         .route("/me", get(get_me))
@@ -732,6 +733,49 @@ fn slug(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+async fn get_project_status(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+
+    let Some(ref routing_table) = state.routing_table else {
+        return Json(serde_json::json!({"status": "no routing"})).into_response();
+    };
+
+    let backend_ip = {
+        let table = routing_table.read().await;
+        table.get(&id).cloned()
+    };
+
+    let Some(ip) = backend_ip else {
+        return Json(serde_json::json!({"status": "not running"})).into_response();
+    };
+
+    let url = format!("http://{}:80/_jkbase/health", ip);
+    match proxy_to_vm(&ip, &url).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [(hyper::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(_) => Json(serde_json::json!({"status": "unreachable"})).into_response(),
+    }
 }
 
 async fn get_project_logs(
