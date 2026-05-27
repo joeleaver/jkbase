@@ -111,20 +111,6 @@ async fn main() -> Result<()> {
     let store = Store::open(&db_path)?;
     let routing_table = new_routing_table();
 
-    // Restore routing table from persisted allocations
-    let existing_allocs = store.list_vm_allocations()?;
-    if !existing_allocs.is_empty() {
-        let mut table = routing_table.write().await;
-        for alloc in &existing_allocs {
-            info!(
-                project = %alloc.project_id,
-                ip = %alloc.ip,
-                "restoring route from persisted allocation"
-            );
-            table.insert(alloc.project_id.clone(), alloc.ip.clone());
-        }
-    }
-
     let base_rootfs_path = data_dir.join("base-rootfs.ext4");
     rootfs::build_base_rootfs(&args.agent_bin, &base_rootfs_path).await?;
 
@@ -186,6 +172,7 @@ async fn main() -> Result<()> {
 
     // Clean up orphaned state from a previous crash
     cleanup_orphans(&platform).await;
+    restore_active_projects(&platform, &routing_table).await;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -256,6 +243,50 @@ async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
             );
             let _ = teardown_tap(&alloc.tap_device).await;
             let _ = plat.store.remove_vm_allocation(&alloc.project_id);
+        }
+    }
+}
+
+async fn restore_active_projects(
+    platform: &Arc<Mutex<PlatformState>>,
+    routing: &jkbase_proxy::RoutingTable,
+) {
+    let projects = {
+        let plat = platform.lock().await;
+        match plat.store.list_projects() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to list projects for restore");
+                return;
+            }
+        }
+    };
+
+    let active_projects: Vec<_> = projects
+        .into_iter()
+        .filter(|p| {
+            p.state == jkbase_control::store::ProjectState::Active
+                && p.current_version.is_some()
+        })
+        .collect();
+
+    if active_projects.is_empty() {
+        return;
+    }
+
+    info!(
+        count = active_projects.len(),
+        "restoring active projects"
+    );
+
+    for project in &active_projects {
+        info!(project = %project.id, "restoring VM");
+        if let Err(e) = handle_deploy(&project.id, platform.clone(), routing.clone()).await {
+            tracing::error!(
+                project = %project.id,
+                error = %e,
+                "failed to restore project VM"
+            );
         }
     }
 }

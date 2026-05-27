@@ -10,11 +10,20 @@ const VM_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("vm_al
 const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectState {
+    Active,
+    Stopped,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
     pub current_version: Option<u64>,
+    #[serde(default = "default_state")]
+    pub state: ProjectState,
     pub vm_ip: Option<String>,
 }
 
@@ -24,6 +33,10 @@ pub struct VmAllocation {
     pub ip: String,
     pub tap_device: String,
     pub mac: String,
+}
+
+fn default_state() -> ProjectState {
+    ProjectState::Stopped
 }
 
 #[derive(Clone)]

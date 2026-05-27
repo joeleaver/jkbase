@@ -233,6 +233,7 @@ async fn create_project(
         name: req.name,
         current_version: None,
         vm_ip: None,
+        state: crate::store::ProjectState::Stopped,
     };
 
     if let Err(e) = state.store.create_project(&project) {
@@ -410,6 +411,7 @@ async fn do_deploy(
 
     // Update project state
     project.current_version = Some(version);
+    project.state = crate::store::ProjectState::Active;
     state.store.update_project(project)?;
 
     info!(
