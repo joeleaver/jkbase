@@ -816,6 +816,10 @@ fn to_response(p: &Project) -> ProjectResponse {
         id: p.id.clone(),
         name: p.name.clone(),
         current_version: p.current_version,
-        url: Some(format!("https://{}.jkbase.app", p.id)),
+        url: if p.current_version.is_some() {
+            Some(format!("https://{}.jkbase.app", p.id))
+        } else {
+            None
+        },
     }
 }

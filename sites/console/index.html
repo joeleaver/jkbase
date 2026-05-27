@@ -344,6 +344,19 @@ body {
   color: var(--text-dim);
 }
 
+.project-not-deployed {
+  font-size: 12px;
+  color: #665;
+  font-style: italic;
+}
+
+.project-hint {
+  font-size: 12px;
+  color: #556;
+  margin-top: 6px;
+  font-family: var(--mono);
+}
+
 .project-url a {
   font-size: 12px;
   color: var(--accent);
@@ -825,19 +838,25 @@ body {
   }
 
   function renderProjectCard(project) {
+    var deployed = project.current_version != null;
     return h("div", { className: "project-card" },
       h("div", { className: "project-info" },
         h("div", { className: "project-name" }, project.name),
         h("div", { className: "project-meta" },
-          project.current_version != null
+          deployed
             ? h("span", { className: "project-version" }, "v" + project.current_version)
-            : h("span", { className: "project-version" }, "no deployments"),
+            : h("span", { className: "project-not-deployed" }, "not deployed"),
           project.url
             ? h("span", { className: "project-url" },
                 h("a", { href: project.url, target: "_blank", rel: "noopener" }, project.url)
               )
             : null
-        )
+        ),
+        !deployed
+          ? h("div", { className: "project-hint" },
+              "Deploy with: jkbase deploy --project " + project.id
+            )
+          : null
       ),
       h("div", { className: "project-actions" },
         h("button", {
