@@ -117,12 +117,20 @@ impl ContainerSupervisor {
             let manifest: ServerManifest = serde_json::from_str(&manifest_content)
                 .with_context(|| format!("failed to parse manifest for server '{name}'"))?;
 
-            // Prefer pre-extracted rootfs in content image (no tmpfs pressure)
             let pre_extracted = self.servers_dir.join(&name);
             let tarball = self.servers_dir.join(format!("{name}.tar.gz"));
-            let rootfs_dir = if pre_extracted.is_dir() {
-                info!(server = %name, "using pre-extracted rootfs");
+            let has_volumes = !manifest.volumes.is_empty();
+
+            let rootfs_dir = if pre_extracted.is_dir() && !has_volumes {
+                info!(server = %name, "using pre-extracted rootfs (read-only)");
                 pre_extracted
+            } else if pre_extracted.is_dir() && has_volumes {
+                // Copy to tmpfs so volume mount points can be created
+                let writable = self.extract_dir.join(&name);
+                info!(server = %name, "copying rootfs to tmpfs for writable volume mounts");
+                let _ = std::fs::remove_dir_all(&writable);
+                copy_dir(&pre_extracted, &writable)?;
+                writable
             } else if tarball.exists() {
                 let extract_to = self.extract_dir.join(&name);
                 info!(server = %name, "extracting server rootfs to tmpfs");
@@ -272,6 +280,23 @@ impl ContainerSupervisor {
         }
         servers.clear();
     }
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else if entry.file_type()?.is_symlink() {
+            let link = std::fs::read_link(entry.path())?;
+            let _ = std::os::unix::fs::symlink(link, &target);
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 fn extract_tarball(tarball: &Path, target: &Path) -> Result<()> {
