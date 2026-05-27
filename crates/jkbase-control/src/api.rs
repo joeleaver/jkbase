@@ -6,6 +6,7 @@ use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::extract::DefaultBodyLimit;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -97,6 +98,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(get_project).delete(delete_project),
         )
         .route("/projects/{id}/deploy", post(deploy))
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .route(
             "/projects/{id}/secrets",
             get(list_secrets).post(set_secret),
