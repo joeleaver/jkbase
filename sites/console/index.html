@@ -32,7 +32,6 @@
   --warning: #ffaa00;
   --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
   --sidebar-w: 240px;
-  --sub-sidebar-w: 200px;
   --transition: 150ms ease;
 }
 
@@ -211,7 +210,7 @@ body {
 }
 
 .sidebar-brand {
-  padding: 20px 20px 24px;
+  padding: 20px 20px 16px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -232,19 +231,180 @@ body {
   flex-shrink: 0;
 }
 
+/* --- Project Selector Dropdown --- */
+
+.project-selector {
+  position: relative;
+  margin: 0 12px 12px;
+}
+
+.project-selector-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all var(--transition);
+  text-align: left;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-selector-trigger:hover {
+  border-color: var(--border-hover);
+}
+
+.project-selector-trigger.open {
+  border-color: var(--accent);
+}
+
+.project-selector-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.project-selector-placeholder {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.project-selector-chevron {
+  color: var(--text-dim);
+  font-size: 10px;
+  flex-shrink: 0;
+  transition: transform var(--transition);
+}
+
+.project-selector-chevron.open {
+  transform: rotate(180deg);
+}
+
+.project-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 110;
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.project-dropdown-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  text-align: left;
+  transition: background var(--transition);
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.project-dropdown-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.project-dropdown-item.active {
+  background: var(--accent-dim);
+}
+
+.project-dropdown-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.project-dropdown-badge {
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.project-dropdown-badge.deployed {
+  color: var(--success);
+}
+
+.project-dropdown-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.project-dropdown-new {
+  display: flex;
+  align-items: center;
+  padding: 9px 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  text-align: left;
+  transition: background var(--transition);
+  width: 100%;
+  flex-shrink: 0;
+}
+
+.project-dropdown-new:hover {
+  background: var(--accent-dim);
+}
+
+/* --- Sidebar Feature Nav --- */
+
 .sidebar-nav {
   flex: 1;
   padding: 0 8px;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  overflow-y: auto;
+}
+
+.sidebar-nav-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 12px 12px 6px;
 }
 
 .sidebar-nav-item {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 12px;
+  padding: 8px 12px;
   border-radius: 6px;
   font-size: 13px;
   color: var(--text-dim);
@@ -263,59 +423,28 @@ body {
 }
 
 .sidebar-nav-item.active {
-  color: var(--text);
+  color: var(--accent);
   background: var(--accent-dim);
 }
 
 .sidebar-nav-icon {
-  width: 18px;
-  height: 18px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  font-size: 12px;
+  width: 16px;
+  text-align: center;
   flex-shrink: 0;
-  font-size: 13px;
-  line-height: 1;
+  color: inherit;
+  opacity: 0.7;
 }
 
-/* CSS grid icon for Projects */
-.icon-grid {
-  display: grid;
-  grid-template-columns: 6px 6px;
-  grid-template-rows: 6px 6px;
-  gap: 2px;
+.sidebar-nav-item.active .sidebar-nav-icon {
+  opacity: 1;
 }
 
-.icon-grid span {
-  display: block;
-  border-radius: 1px;
-  background: currentColor;
-}
-
-/* Account icon */
-.icon-account {
-  position: relative;
-}
-
-.icon-account::before {
-  content: "";
-  display: block;
-  width: 8px;
-  height: 8px;
-  border: 1.5px solid currentColor;
-  border-radius: 50%;
-  margin: 0 auto 1px;
-}
-
-.icon-account::after {
-  content: "";
-  display: block;
-  width: 14px;
-  height: 5px;
-  border: 1.5px solid currentColor;
-  border-bottom: none;
-  border-radius: 7px 7px 0 0;
-  margin: 0 auto;
+.sidebar-empty-prompt {
+  padding: 16px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
 }
 
 .sidebar-bottom {
@@ -405,147 +534,38 @@ body {
 .topbar-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 12px;
   flex-shrink: 0;
 }
 
-/* --- Project sub-sidebar --- */
+/* --- Profile Icon --- */
 
-.project-layout {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-
-.project-subnav {
-  width: var(--sub-sidebar-w);
-  flex-shrink: 0;
-  background: var(--bg-sidebar);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-}
-
-.subnav-header {
-  padding: 16px 14px 12px;
-  border-bottom: 1px solid var(--border);
-}
-
-.subnav-back {
+.profile-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #1a1a2e;
+  border: 1px solid #2a2a4e;
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--text-dim);
-  background: none;
-  border: none;
+  justify-content: center;
   cursor: pointer;
-  padding: 4px 0;
-  margin-bottom: 8px;
-  transition: color var(--transition);
+  transition: border-color var(--transition);
+  flex-shrink: 0;
 }
 
-.subnav-back:hover {
-  color: var(--accent);
+.profile-icon:hover {
+  border-color: var(--accent);
 }
 
-.subnav-project-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.subnav-items {
-  padding: 8px 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.subnav-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 6px;
+.profile-icon-letter {
   font-size: 13px;
-  color: var(--text-dim);
-  cursor: pointer;
-  border: none;
-  background: transparent;
-  font-family: var(--mono);
-  width: 100%;
-  text-align: left;
-  transition: all var(--transition);
-}
-
-.subnav-item:hover {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.subnav-item.active {
-  color: var(--accent);
-  background: var(--accent-dim);
-}
-
-.subnav-icon {
-  font-size: 12px;
-  width: 16px;
-  text-align: center;
-  flex-shrink: 0;
-  color: inherit;
-  opacity: 0.7;
-}
-
-.subnav-item.active .subnav-icon {
-  opacity: 1;
-}
-
-/* Mobile sub-nav toggle */
-.subnav-toggle {
-  display: none;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--text-dim);
-  background: var(--bg-sidebar);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 6px 12px;
-  cursor: pointer;
-  margin-bottom: 16px;
-  transition: all var(--transition);
-}
-
-.subnav-toggle:hover {
-  color: var(--text);
-  border-color: var(--border-hover);
-}
-
-/* --- Feature content area --- */
-
-.feature-content {
-  flex: 1;
-  padding: 28px 32px;
-  overflow-y: auto;
-  min-width: 0;
-}
-
-.feature-content-inner {
-  max-width: 720px;
-  width: 100%;
-}
-
-.feature-title {
-  font-size: 15px;
   font-weight: 600;
-  color: var(--text);
-  margin-bottom: 20px;
+  color: var(--accent);
+  font-family: var(--mono);
+  text-transform: uppercase;
+  line-height: 1;
+  user-select: none;
 }
 
 /* --- Cards / Sections --- */
@@ -599,82 +619,6 @@ body {
 
 .card-static {
   padding: 18px 20px;
-}
-
-/* --- Project Table --- */
-
-.project-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.project-table th {
-  text-align: left;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 0 16px 10px;
-  border-bottom: 1px solid var(--border);
-}
-
-.project-table td {
-  padding: 12px 16px;
-  font-size: 13px;
-  border-bottom: 1px solid rgba(26, 26, 40, 0.5);
-  vertical-align: middle;
-}
-
-.project-table tr:last-child td {
-  border-bottom: none;
-}
-
-.project-table tr:hover td {
-  background: rgba(255, 255, 255, 0.015);
-}
-
-.project-name-link {
-  color: var(--text);
-  font-weight: 500;
-  cursor: pointer;
-  background: none;
-  border: none;
-  font-family: var(--mono);
-  font-size: 13px;
-  padding: 0;
-  transition: color var(--transition);
-  text-align: left;
-}
-
-.project-name-link:hover {
-  color: var(--accent);
-}
-
-.status-deployed {
-  font-size: 12px;
-  color: var(--success);
-}
-
-.status-not-deployed {
-  font-size: 12px;
-  color: var(--text-dim);
-  font-style: italic;
-}
-
-.project-url-link {
-  font-size: 12px;
-  color: var(--accent);
-  text-decoration: none;
-  word-break: break-all;
-}
-
-.project-url-link:hover {
-  text-decoration: underline;
-}
-
-.dim-dash {
-  color: var(--text-dim);
 }
 
 /* --- Status dots --- */
@@ -1379,6 +1323,27 @@ body {
   max-width: 380px;
 }
 
+/* --- Account back link --- */
+
+.account-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  margin-bottom: 20px;
+  transition: color var(--transition);
+}
+
+.account-back:hover {
+  color: var(--accent);
+}
+
 /* --- Modal --- */
 
 .modal-overlay {
@@ -1468,6 +1433,38 @@ body {
   width: 100%;
 }
 
+.feature-content {
+  flex: 1;
+  padding: 28px 32px;
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.feature-content-inner {
+  max-width: 720px;
+  width: 100%;
+}
+
+.feature-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 20px;
+}
+
+/* --- Project URL link --- */
+
+.project-url-link {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.project-url-link:hover {
+  text-decoration: underline;
+}
+
 /* --- Responsive --- */
 
 @media (max-width: 768px) {
@@ -1512,30 +1509,6 @@ body {
     flex-direction: column;
   }
 
-  .project-table th:nth-child(3),
-  .project-table td:nth-child(3) {
-    display: none;
-  }
-
-  .project-subnav {
-    display: none;
-  }
-
-  .project-subnav.mobile-open {
-    display: flex;
-    position: fixed;
-    top: 0;
-    left: 0;
-    bottom: 0;
-    z-index: 98;
-    width: 220px;
-    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.4);
-  }
-
-  .subnav-toggle {
-    display: block;
-  }
-
   .overview-stats {
     grid-template-columns: 1fr 1fr;
   }
@@ -1575,7 +1548,7 @@ body {
     token: localStorage.getItem(TOKEN_KEY) || null,
     email: localStorage.getItem(EMAIL_KEY) || null,
     view: "loading",
-    // views: loading, auth, auth-signin, token-reveal, projects, project-detail, account
+    // views: loading, auth, auth-signin, token-reveal, console, account
     projects: [],
     loading: false,
     error: null,
@@ -1585,7 +1558,7 @@ body {
     revealedToken: null,
     // project detail
     currentProject: null,
-    projectView: "overview", // overview, hosting, functions, servers, secrets, settings
+    projectTab: "overview", // overview, hosting, functions, servers, secrets, settings
     projectStatus: null,
     statusLoading: false,
     secrets: [],
@@ -1600,8 +1573,8 @@ body {
     accountSuccess: null,
     // sidebar mobile
     sidebarOpen: false,
-    // sub-nav mobile
-    subnavOpen: false,
+    // project dropdown
+    dropdownOpen: false,
     // domains
     domains: [],
     domainsLoading: false,
@@ -1649,7 +1622,7 @@ body {
     state.error = null;
     state.success = null;
     state.sidebarOpen = false;
-    state.subnavOpen = false;
+    state.dropdownOpen = false;
     render();
   }
 
@@ -1657,7 +1630,7 @@ body {
     api("GET", "/me").then(function(me) {
       state.email = me.email;
       localStorage.setItem(EMAIL_KEY, me.email);
-      state.view = "projects";
+      state.view = "console";
       render();
       loadProjects();
     }).catch(function() {
@@ -1698,7 +1671,7 @@ body {
       localStorage.setItem(TOKEN_KEY, data.token);
       localStorage.setItem(EMAIL_KEY, email);
       state.loading = false;
-      state.view = "projects";
+      state.view = "console";
       render();
       loadProjects();
     }).catch(function(e) {
@@ -1717,6 +1690,17 @@ body {
     api("GET", "/projects").then(function(projects) {
       state.projects = projects;
       state.loading = false;
+      // If we had a current project, update its data from the fresh list
+      if (state.currentProject) {
+        var updated = projects.filter(function(p) { return p.id === state.currentProject.id; })[0];
+        if (updated) {
+          state.currentProject = updated;
+        } else {
+          // Project was deleted
+          state.currentProject = null;
+          state.projectTab = "overview";
+        }
+      }
       render();
     }).catch(function(e) {
       state.loading = false;
@@ -1749,7 +1733,7 @@ body {
     api("DELETE", "/projects/" + id).then(function() {
       state.loading = false;
       state.currentProject = null;
-      state.view = "projects";
+      state.projectTab = "overview";
       render();
       loadProjects();
     }).catch(function(e) {
@@ -1763,8 +1747,8 @@ body {
 
   function openProject(project) {
     state.currentProject = project;
-    state.view = "project-detail";
-    state.projectView = "overview";
+    state.view = "console";
+    state.projectTab = "overview";
     state.projectStatus = null;
     state.statusLoading = false;
     state.secrets = [];
@@ -1776,7 +1760,8 @@ body {
     state.showAddDomain = false;
     state.deleteSecretConfirm = null;
     state.deleteConfirm = false;
-    state.subnavOpen = false;
+    state.dropdownOpen = false;
+    state.sidebarOpen = false;
     render();
     // Fetch all data in parallel
     loadStatus(project.id);
@@ -1785,11 +1770,11 @@ body {
     loadLogs(project.id);
   }
 
-  function setProjectView(view) {
-    state.projectView = view;
+  function setProjectTab(tab) {
+    state.projectTab = tab;
     state.error = null;
     state.success = null;
-    state.subnavOpen = false;
+    state.sidebarOpen = false;
     render();
   }
 
@@ -2004,11 +1989,12 @@ body {
     state.error = null;
     state.success = null;
     state.sidebarOpen = false;
-    state.subnavOpen = false;
-    if (view === "projects") {
-      state.currentProject = null;
+    state.dropdownOpen = false;
+    if (view === "console") {
       render();
-      loadProjects();
+      if (state.projects.length === 0) {
+        loadProjects();
+      }
     } else if (view === "account") {
       state.accountError = null;
       state.accountSuccess = null;
@@ -2019,39 +2005,107 @@ body {
     }
   }
 
-  function activeNav() {
-    if (state.view === "projects" || state.view === "project-detail") return "projects";
-    if (state.view === "account") return "account";
-    return "";
+  function getUserInitial() {
+    if (state.email) {
+      return state.email.charAt(0).toUpperCase();
+    }
+    return "?";
   }
 
-  // --- Grid icon component ---
+  // --- Sidebar feature nav items ---
 
-  function gridIcon() {
-    var wrap = h("span", { className: "sidebar-nav-icon" });
-    var grid = document.createElement("span");
-    grid.className = "icon-grid";
-    grid.appendChild(document.createElement("span"));
-    grid.appendChild(document.createElement("span"));
-    grid.appendChild(document.createElement("span"));
-    grid.appendChild(document.createElement("span"));
-    wrap.appendChild(grid);
-    return wrap;
+  var featureNavItems = [
+    { key: "overview",   label: "Overview",   icon: "#" },
+    { key: "hosting",    label: "Hosting",    icon: "@" },
+    { key: "functions",  label: "Functions",  icon: "f" },
+    { key: "servers",    label: "Servers",    icon: ">" },
+    { key: "secrets",    label: "Secrets",    icon: "*" },
+    { key: "settings",   label: "Settings",   icon: "%" },
+  ];
+
+  // --- Close dropdown on outside click ---
+
+  function handleGlobalClick(e) {
+    if (!state.dropdownOpen) return;
+    var selector = document.querySelector(".project-selector");
+    if (selector && !selector.contains(e.target)) {
+      state.dropdownOpen = false;
+      render();
+    }
   }
 
-  function accountIcon() {
-    return h("span", { className: "sidebar-nav-icon icon-account" });
-  }
+  document.addEventListener("click", handleGlobalClick);
 
   // --- Sidebar ---
 
+  function renderProjectDropdown() {
+    var items = state.projects.map(function(project) {
+      var isActive = state.currentProject && state.currentProject.id === project.id;
+      var deployed = project.current_version != null;
+      return h("button", {
+        className: "project-dropdown-item" + (isActive ? " active" : ""),
+        onClick: function(e) {
+          e.stopPropagation();
+          openProject(project);
+        },
+      },
+        h("span", { className: "project-dropdown-item-name" }, project.name),
+        h("span", {
+          className: "project-dropdown-badge" + (deployed ? " deployed" : ""),
+        }, deployed ? "v" + project.current_version : "--")
+      );
+    });
+
+    return h("div", { className: "project-dropdown" },
+      items,
+      state.projects.length > 0 ? h("div", { className: "project-dropdown-divider" }) : null,
+      h("button", {
+        className: "project-dropdown-new",
+        onClick: function(e) {
+          e.stopPropagation();
+          state.dropdownOpen = false;
+          state.showNewProjectModal = true;
+          state.error = null;
+          render();
+        },
+      }, "+ New Project")
+    );
+  }
+
   function renderSidebar() {
-    var nav = activeNav();
+    var projectName = state.currentProject ? state.currentProject.name : null;
+
+    var featureNav = null;
+    if (state.currentProject) {
+      featureNav = h("nav", { className: "sidebar-nav" },
+        featureNavItems.map(function(item) {
+          return h("button", {
+            className: "sidebar-nav-item" + (state.projectTab === item.key ? " active" : ""),
+            onClick: function() { setProjectTab(item.key); },
+          },
+            h("span", { className: "sidebar-nav-icon" }, item.icon),
+            item.label
+          );
+        })
+      );
+    } else {
+      featureNav = h("div", { className: "sidebar-nav" },
+        h("div", { className: "sidebar-empty-prompt" },
+          state.projects.length > 0
+            ? "Select a project to get started."
+            : state.loading
+              ? "Loading projects..."
+              : "No projects yet. Create one to get started."
+        )
+      );
+    }
+
     return h("div", null,
       h("div", {
         className: "sidebar-overlay" + (state.sidebarOpen ? " open" : ""),
         onClick: function() {
           state.sidebarOpen = false;
+          state.dropdownOpen = false;
           render();
         },
       }),
@@ -2068,27 +2122,44 @@ body {
           h("span", { className: "sidebar-brand-dot" }),
           h("span", { className: "sidebar-brand-text" }, "jkbase")
         ),
-        h("nav", { className: "sidebar-nav" },
+
+        // Project selector dropdown
+        h("div", { className: "project-selector" },
           h("button", {
-            className: "sidebar-nav-item" + (nav === "projects" ? " active" : ""),
-            onClick: function() { navTo("projects"); },
+            className: "project-selector-trigger" + (state.dropdownOpen ? " open" : ""),
+            onClick: function(e) {
+              e.stopPropagation();
+              state.dropdownOpen = !state.dropdownOpen;
+              render();
+            },
           },
-            gridIcon(),
-            "Projects"
+            projectName
+              ? h("span", { className: "project-selector-name" }, projectName)
+              : h("span", { className: "project-selector-placeholder" }, "Select a project..."),
+            h("span", { className: "project-selector-chevron" + (state.dropdownOpen ? " open" : "") }, "v")
           ),
-          h("button", {
-            className: "sidebar-nav-item" + (nav === "account" ? " active" : ""),
-            onClick: function() { navTo("account"); },
-          },
-            accountIcon(),
-            "Account"
-          )
+          state.dropdownOpen ? renderProjectDropdown() : null
         ),
+
+        featureNav,
+
         h("div", { className: "sidebar-bottom" },
           h("div", { className: "sidebar-email" }, state.email || ""),
           h("button", { className: "sidebar-signout", onClick: logout }, "Sign Out")
         )
       )
+    );
+  }
+
+  // --- Profile icon ---
+
+  function renderProfileIcon() {
+    return h("div", {
+      className: "profile-icon",
+      onClick: function() { navTo("account"); },
+      title: "Account",
+    },
+      h("span", { className: "profile-icon-letter" }, getUserInitial())
     );
   }
 
@@ -2230,7 +2301,7 @@ body {
           style: "width: 100%; justify-content: center",
           onClick: function() {
             state.revealedToken = null;
-            state.view = "projects";
+            state.view = "console";
             render();
             loadProjects();
           },
@@ -2239,7 +2310,7 @@ body {
     );
   }
 
-  // --- Projects List ---
+  // --- Onboarding ---
 
   function renderOnboarding() {
     return h("div", { className: "onboarding" },
@@ -2282,75 +2353,7 @@ body {
     );
   }
 
-  function renderProjectTable() {
-    return h("table", { className: "project-table" },
-      h("thead", null,
-        h("tr", null,
-          h("th", null, "Name"),
-          h("th", null, "Status"),
-          h("th", null, "URL")
-        )
-      ),
-      h("tbody", null,
-        state.projects.map(function(project) {
-          var deployed = project.current_version != null;
-          return h("tr", null,
-            h("td", null,
-              h("button", {
-                className: "project-name-link",
-                onClick: function() { openProject(project); },
-              }, project.name)
-            ),
-            h("td", null,
-              deployed
-                ? h("span", { className: "status-deployed" }, "deployed v" + project.current_version)
-                : h("span", { className: "status-not-deployed" }, "not deployed")
-            ),
-            h("td", null,
-              project.url
-                ? h("a", {
-                    className: "project-url-link",
-                    href: project.url,
-                    target: "_blank",
-                    rel: "noopener",
-                  }, project.url)
-                : h("span", { className: "dim-dash" }, "--")
-            )
-          );
-        })
-      )
-    );
-  }
-
-  function renderProjectsView() {
-    return h("div", { className: "app-layout" },
-      renderSidebar(),
-      h("div", { className: "main-area" },
-        h("div", { className: "topbar" },
-          h("div", { className: "topbar-title" }, "Projects"),
-          h("div", { className: "topbar-actions" },
-            h("button", {
-              className: "btn btn-primary btn-sm",
-              onClick: function() {
-                state.showNewProjectModal = true;
-                state.error = null;
-                render();
-              },
-            }, "+ New Project")
-          )
-        ),
-        h("div", { className: "content" },
-          state.error ? h("div", { className: "error-banner" }, state.error) : null,
-          state.loading
-            ? h("div", { className: "loading" }, "Loading...")
-            : state.projects.length === 0
-              ? renderOnboarding()
-              : renderProjectTable()
-        )
-      ),
-      state.showNewProjectModal ? renderNewProjectModal() : null
-    );
-  }
+  // --- New Project Modal ---
 
   function renderNewProjectModal() {
     return h("div", { className: "modal-overlay", onClick: function(e) {
@@ -2398,42 +2401,6 @@ body {
     );
   }
 
-  // --- Project Sub-Navigation ---
-
-  var subnavItems = [
-    { key: "overview",   label: "Overview",   icon: "#" },
-    { key: "hosting",    label: "Hosting",    icon: "@" },
-    { key: "functions",  label: "Functions",  icon: "f" },
-    { key: "servers",    label: "Servers",    icon: ">" },
-    { key: "secrets",    label: "Secrets",    icon: "*" },
-    { key: "settings",   label: "Settings",   icon: "%" },
-  ];
-
-  function renderProjectSubnav(project) {
-    return h("aside", {
-      className: "project-subnav" + (state.subnavOpen ? " mobile-open" : ""),
-    },
-      h("div", { className: "subnav-header" },
-        h("button", {
-          className: "subnav-back",
-          onClick: function() { navTo("projects"); },
-        }, "<- Projects"),
-        h("div", { className: "subnav-project-name" }, project.name)
-      ),
-      h("div", { className: "subnav-items" },
-        subnavItems.map(function(item) {
-          return h("button", {
-            className: "subnav-item" + (state.projectView === item.key ? " active" : ""),
-            onClick: function() { setProjectView(item.key); },
-          },
-            h("span", { className: "subnav-icon" }, item.icon),
-            item.label
-          );
-        })
-      )
-    );
-  }
-
   // --- Feature Views ---
 
   // Overview
@@ -2451,7 +2418,6 @@ body {
     var domainsCount = state.domains.length;
 
     return h("div", { className: "feature-content-inner" },
-      h("div", { className: "feature-title" }, "Overview"),
 
       // Quick stats
       h("div", { className: "overview-stats" },
@@ -2604,7 +2570,6 @@ body {
       : null;
 
     return h("div", { className: "feature-content-inner" },
-      h("div", { className: "feature-title" }, "Hosting"),
       state.error ? h("div", { className: "error-banner" }, state.error) : null,
 
       h("div", { className: "card" },
@@ -2645,7 +2610,6 @@ body {
     var functions = status ? (status.functions_loaded || []) : [];
 
     return h("div", { className: "feature-content-inner" },
-      h("div", { className: "feature-title" }, "Functions"),
 
       state.statusLoading
         ? h("div", { className: "loading" }, "Loading functions...")
@@ -2679,7 +2643,6 @@ body {
     var servers = status ? (status.servers || []) : [];
 
     return h("div", { className: "feature-content-inner" },
-      h("div", { className: "feature-title" }, "Servers"),
 
       state.statusLoading
         ? h("div", { className: "loading" }, "Loading servers...")
@@ -2863,7 +2826,6 @@ body {
   // Settings
   function renderSettingsView(project) {
     return h("div", { className: "feature-content-inner" },
-      h("div", { className: "feature-title" }, "Settings"),
 
       h("div", { className: "card" },
         h("div", { className: "card-static" },
@@ -2918,10 +2880,10 @@ body {
     );
   }
 
-  // --- Project Detail View (main orchestrator) ---
+  // --- Feature content router ---
 
   function renderFeatureContent(project) {
-    switch (state.projectView) {
+    switch (state.projectTab) {
       case "overview":   return renderOverviewView(project);
       case "hosting":    return renderHostingView(project);
       case "functions":  return renderFunctionsView(project);
@@ -2932,41 +2894,67 @@ body {
     }
   }
 
-  function renderProjectDetailView() {
+  function getTabLabel() {
+    for (var i = 0; i < featureNavItems.length; i++) {
+      if (featureNavItems[i].key === state.projectTab) return featureNavItems[i].label;
+    }
+    return "Overview";
+  }
+
+  // --- Console View (main app view) ---
+
+  function renderConsoleView() {
     var project = state.currentProject;
-    if (!project) return renderProjectsView();
+    var topbarTitle;
+    var topbarActions;
+    var mainContent;
+
+    if (project) {
+      // Project selected: show feature view
+      topbarTitle = h("div", { className: "topbar-title" },
+        h("span", { style: "color: var(--text-dim); font-weight: 400" }, project.name),
+        h("span", { style: "color: var(--text-dim); font-weight: 400; margin: 0 4px" }, "/"),
+        getTabLabel()
+      );
+      topbarActions = h("div", { className: "topbar-actions" },
+        project.url
+          ? h("a", {
+              className: "project-url-link",
+              href: project.url,
+              target: "_blank",
+              rel: "noopener",
+              style: "font-size: 12px",
+            }, project.url.replace("https://", ""))
+          : null,
+        renderProfileIcon()
+      );
+      mainContent = h("div", { className: "feature-content" },
+        renderFeatureContent(project)
+      );
+    } else {
+      // No project selected: show onboarding or loading
+      topbarTitle = h("div", { className: "topbar-title" }, "Projects");
+      topbarActions = h("div", { className: "topbar-actions" },
+        renderProfileIcon()
+      );
+      mainContent = h("div", { className: "content" },
+        state.error ? h("div", { className: "error-banner" }, state.error) : null,
+        state.loading
+          ? h("div", { className: "loading" }, "Loading...")
+          : renderOnboarding()
+      );
+    }
 
     return h("div", { className: "app-layout" },
       renderSidebar(),
       h("div", { className: "main-area" },
         h("div", { className: "topbar" },
-          h("div", { className: "topbar-title" }, project.name),
-          h("div", { className: "topbar-actions" },
-            project.url
-              ? h("a", {
-                  className: "project-url-link",
-                  href: project.url,
-                  target: "_blank",
-                  rel: "noopener",
-                  style: "font-size: 12px",
-                }, project.url.replace("https://", ""))
-              : null
-          )
+          topbarTitle,
+          topbarActions
         ),
-        h("div", { className: "project-layout" },
-          renderProjectSubnav(project),
-          h("div", { className: "feature-content" },
-            h("button", {
-              className: "subnav-toggle",
-              onClick: function() {
-                state.subnavOpen = !state.subnavOpen;
-                render();
-              },
-            }, (state.subnavOpen ? "x Close" : "= ") + " " + subnavItems.filter(function(i) { return i.key === state.projectView; })[0].label),
-            renderFeatureContent(project)
-          )
-        )
-      )
+        mainContent
+      ),
+      state.showNewProjectModal ? renderNewProjectModal() : null
     );
   }
 
@@ -2977,9 +2965,17 @@ body {
       renderSidebar(),
       h("div", { className: "main-area" },
         h("div", { className: "topbar" },
-          h("div", { className: "topbar-title" }, "Account")
+          h("div", { className: "topbar-title" }, "Account"),
+          h("div", { className: "topbar-actions" },
+            renderProfileIcon()
+          )
         ),
         h("div", { className: "content" },
+          h("button", {
+            className: "account-back",
+            onClick: function() { navTo("console"); },
+          }, "<- Back to console"),
+
           state.accountError ? h("div", { className: "error-banner" }, state.accountError) : null,
           state.accountSuccess ? h("div", { className: "success-banner" }, state.accountSuccess) : null,
 
@@ -3088,17 +3084,14 @@ body {
       case "token-reveal":
         view = renderTokenRevealScreen();
         break;
-      case "projects":
-        view = renderProjectsView();
-        break;
-      case "project-detail":
-        view = renderProjectDetailView();
+      case "console":
+        view = renderConsoleView();
         break;
       case "account":
         view = renderAccountView();
         break;
       default:
-        view = renderProjectsView();
+        view = renderConsoleView();
     }
     app.appendChild(view);
 
