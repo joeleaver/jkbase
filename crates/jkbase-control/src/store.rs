@@ -10,12 +10,24 @@ const VM_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("vm_al
 const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
+const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectState {
     Active,
     Stopped,
+    Hibernated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub project_id: String,
+    pub snapshot_path: String,
+    pub mem_file_path: String,
+    pub created_at: u64,
+    pub vcpu_count: u32,
+    pub mem_size_mib: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +77,7 @@ impl Store {
         let _ = txn.open_table(TENANTS)?;
         let _ = txn.open_table(API_TOKENS)?;
         let _ = txn.open_table(SECRETS)?;
+        let _ = txn.open_table(SNAPSHOTS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -155,6 +168,38 @@ impl Store {
         let txn = self.db.begin_write()?;
         let existed = {
             let mut table = txn.open_table(VM_ALLOCATIONS)?;
+            table.remove(project_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    // -- Snapshots --
+
+    pub fn save_snapshot_meta(&self, meta: &SnapshotMeta) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SNAPSHOTS)?;
+            let data = serde_json::to_vec(meta)?;
+            table.insert(meta.project_id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_snapshot_meta(&self, project_id: &str) -> Result<Option<SnapshotMeta>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SNAPSHOTS)?;
+        match table.get(project_id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_snapshot_meta(&self, project_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(SNAPSHOTS)?;
             table.remove(project_id)?.is_some()
         };
         txn.commit()?;

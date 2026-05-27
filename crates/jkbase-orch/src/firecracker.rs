@@ -158,4 +158,50 @@ impl FirecrackerClient {
             .context("failed to start instance")?;
         Ok(())
     }
+
+    pub async fn pause_vm(&self) -> Result<()> {
+        let json = serde_json::to_string(&serde_json::json!({"state": "Paused"}))?;
+        self.request("PATCH", "/vm", Some(json))
+            .await
+            .context("failed to pause VM")?;
+        Ok(())
+    }
+
+    pub async fn create_snapshot(&self, snapshot_path: &str, mem_file_path: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct SnapshotCreate {
+            snapshot_type: String,
+            snapshot_path: String,
+            mem_file_path: String,
+        }
+        self.put(
+            "/snapshot/create",
+            &SnapshotCreate {
+                snapshot_type: "Full".to_string(),
+                snapshot_path: snapshot_path.to_string(),
+                mem_file_path: mem_file_path.to_string(),
+            },
+        )
+        .await
+        .context("failed to create snapshot")
+    }
+
+    pub async fn load_snapshot(&self, snapshot_path: &str, mem_file_path: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct SnapshotLoad {
+            snapshot_path: String,
+            mem_file_path: String,
+            resume_vm: bool,
+        }
+        self.put(
+            "/snapshot/load",
+            &SnapshotLoad {
+                snapshot_path: snapshot_path.to_string(),
+                mem_file_path: mem_file_path.to_string(),
+                resume_vm: true,
+            },
+        )
+        .await
+        .context("failed to load snapshot")
+    }
 }
