@@ -38,6 +38,26 @@ struct Args {
     /// Platform domain for subdomain routing
     #[arg(long, default_value = "jkbase.app")]
     domain: String,
+
+    /// Enable TLS with automatic ACME certificates
+    #[arg(long)]
+    tls: bool,
+
+    /// HTTPS port (requires --tls)
+    #[arg(long, default_value = "443")]
+    https_port: u16,
+
+    /// Cloudflare API token for DNS-01 ACME challenges (requires --tls)
+    #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
+    cloudflare_token: Option<String>,
+
+    /// Cloudflare zone ID for the platform domain (requires --tls)
+    #[arg(long, env = "CLOUDFLARE_ZONE_ID")]
+    cloudflare_zone_id: Option<String>,
+
+    /// Email for ACME account (requires --tls)
+    #[arg(long, env = "ACME_EMAIL")]
+    acme_email: Option<String>,
 }
 
 struct PlatformState {
@@ -76,11 +96,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    let data_dir = args.data_dir.clone();
 
-    tokio::fs::create_dir_all(&args.data_dir).await?;
+    tokio::fs::create_dir_all(&data_dir).await?;
 
-    let db_path = args.data_dir.join("jkbase.redb");
-    let deploy_dir = args.data_dir.join("hosting");
+    let db_path = data_dir.join("jkbase.redb");
+    let deploy_dir = data_dir.join("hosting");
     tokio::fs::create_dir_all(&deploy_dir).await?;
 
     let store = Store::open(&db_path)?;
@@ -100,7 +121,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let base_rootfs_path = args.data_dir.join("base-rootfs.ext4");
+    let base_rootfs_path = data_dir.join("base-rootfs.ext4");
     rootfs::build_base_rootfs(&args.agent_bin, &base_rootfs_path).await?;
 
     let platform = Arc::new(Mutex::new(PlatformState {
@@ -111,7 +132,7 @@ async fn main() -> Result<()> {
             .join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
         kernel_path: args.fc_dir.join("vmlinux.bin"),
         base_rootfs_path,
-        data_dir: args.data_dir,
+        data_dir: data_dir.clone(),
     }));
 
     let mut state = AppState::new(store, deploy_dir);
@@ -127,11 +148,31 @@ async fn main() -> Result<()> {
     let state = Arc::new(state);
     let router = api::router(state);
 
-    let proxy_config = ProxyConfig {
-        port: args.proxy_port,
-        platform_domain: args.domain,
+    let tls_config = if args.tls {
+        let cf_token = args.cloudflare_token
+            .ok_or_else(|| anyhow::anyhow!("--cloudflare-token required when --tls is enabled"))?;
+        let cf_zone = args.cloudflare_zone_id
+            .ok_or_else(|| anyhow::anyhow!("--cloudflare-zone-id required when --tls is enabled"))?;
+        let acme_email = args.acme_email
+            .ok_or_else(|| anyhow::anyhow!("--acme-email required when --tls is enabled"))?;
+        Some(jkbase_proxy::tls::TlsConfig {
+            domain: args.domain.clone(),
+            cert_dir: data_dir.join("certs"),
+            cloudflare_token: cf_token,
+            cloudflare_zone_id: cf_zone,
+            acme_email,
+        })
+    } else {
+        None
     };
-    let proxy_port = proxy_config.port;
+
+    let proxy_config = ProxyConfig {
+        http_port: args.proxy_port,
+        https_port: if args.tls { Some(args.https_port) } else { None },
+        platform_domain: args.domain,
+        tls_config,
+    };
+    let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();
     tokio::spawn(async move {
         if let Err(e) = jkbase_proxy::serve(proxy_config, proxy_routes).await {

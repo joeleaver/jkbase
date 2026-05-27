@@ -1,3 +1,5 @@
+pub mod tls;
+
 use anyhow::Result;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -10,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
 pub type RoutingTable = Arc<RwLock<HashMap<String, String>>>;
@@ -19,25 +22,121 @@ pub fn new_routing_table() -> RoutingTable {
 }
 
 pub struct ProxyConfig {
-    pub port: u16,
+    pub http_port: u16,
+    pub https_port: Option<u16>,
     pub platform_domain: String,
+    pub tls_config: Option<tls::TlsConfig>,
 }
 
 pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let listener = TcpListener::bind(addr).await?;
     let platform_domain = Arc::new(config.platform_domain);
-    info!(%addr, domain = %platform_domain, "proxy listening");
+
+    // If TLS is configured, provision cert and serve HTTPS
+    if let (Some(https_port), Some(tls_cfg)) = (config.https_port, &config.tls_config) {
+        let rustls_config = tls::load_or_provision_tls(tls_cfg).await?;
+        let acceptor = TlsAcceptor::from(rustls_config);
+
+        // Spawn HTTPS listener
+        let routes_tls = routes.clone();
+        let domain_tls = platform_domain.clone();
+        let acceptor_clone = acceptor.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_https(https_port, acceptor_clone, routes_tls, domain_tls).await {
+                error!(error = %e, "HTTPS proxy error");
+            }
+        });
+
+        // HTTP → HTTPS redirect on the HTTP port
+        let domain_redirect = platform_domain.clone();
+        serve_http_redirect(config.http_port, domain_redirect).await
+    } else {
+        // No TLS — serve plain HTTP (development mode)
+        serve_http(config.http_port, routes, platform_domain).await
+    }
+}
+
+async fn serve_http(port: u16, routes: RoutingTable, domain: Arc<String>) -> Result<()> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr).await?;
+    info!(%addr, domain = %domain, "HTTP proxy listening");
 
     loop {
         let (stream, _peer) = listener.accept().await?;
         let routes = routes.clone();
-        let domain = platform_domain.clone();
+        let domain = domain.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| proxy_request(routes.clone(), domain.clone(), req));
             if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
                 error!(error = %e, "proxy connection error");
+            }
+        });
+    }
+}
+
+async fn serve_https(
+    port: u16,
+    acceptor: TlsAcceptor,
+    routes: RoutingTable,
+    domain: Arc<String>,
+) -> Result<()> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr).await?;
+    info!(%addr, domain = %domain, "HTTPS proxy listening");
+
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let routes = routes.clone();
+        let domain = domain.clone();
+        tokio::spawn(async move {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            let io = TokioIo::new(tls_stream);
+            let svc = service_fn(move |req| proxy_request(routes.clone(), domain.clone(), req));
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                error!(error = %e, "HTTPS connection error");
+            }
+        });
+    }
+}
+
+async fn serve_http_redirect(port: u16, domain: Arc<String>) -> Result<()> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = TcpListener::bind(addr).await?;
+    info!(%addr, "HTTP→HTTPS redirect listening");
+
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let domain = domain.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                let host = req
+                    .headers()
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or(&domain)
+                    .to_string();
+                let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                let location = format!("https://{host}{path}");
+                async move {
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(StatusCode::MOVED_PERMANENTLY)
+                            .header("Location", location)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                }
+            });
+            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                error!(error = %e, "redirect connection error");
             }
         });
     }
@@ -54,9 +153,7 @@ async fn proxy_request(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Strip port number if present
     let hostname = host.split(':').next().unwrap_or("");
-
     let project_id = extract_project_id(hostname, &platform_domain);
 
     let backend_ip = {
@@ -117,13 +214,9 @@ async fn forward_request(
 }
 
 fn extract_project_id(hostname: &str, platform_domain: &str) -> String {
-    // project.platform.tld → project
-    // www.project.platform.tld → project (strip leading www)
-    // bare hostname (no dots, or not matching platform domain) → use as-is
     let suffix = format!(".{platform_domain}");
 
     if let Some(subdomain) = hostname.strip_suffix(&suffix) {
-        // Strip leading "www." if present
         subdomain
             .strip_prefix("www.")
             .unwrap_or(subdomain)
