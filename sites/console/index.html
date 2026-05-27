@@ -12,22 +12,26 @@
 }
 
 :root {
-  --bg: #0a0a0f;
-  --bg-raised: #111118;
-  --bg-input: #0d0d14;
-  --border: #1a1a2e;
-  --border-hover: #2a2a4e;
+  --bg: #08080c;
+  --bg-sidebar: #0c0c14;
+  --bg-card: #0f0f18;
+  --bg-input: #0a0a12;
+  --bg-code: #060610;
+  --border: #1a1a28;
+  --border-hover: #2a2a48;
   --text: #e0e0e8;
-  --text-dim: #888899;
+  --text-dim: #6e6e80;
   --accent: #00d4ff;
   --accent-hover: #33dfff;
-  --accent-dim: rgba(0, 212, 255, 0.1);
+  --accent-dim: rgba(0, 212, 255, 0.08);
   --danger: #ff4466;
   --danger-hover: #ff6680;
-  --danger-dim: rgba(255, 68, 102, 0.1);
+  --danger-dim: rgba(255, 68, 102, 0.08);
   --success: #00cc88;
-  --success-dim: rgba(0, 204, 136, 0.1);
-  --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", "Monaco", monospace;
+  --success-dim: rgba(0, 204, 136, 0.08);
+  --mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+  --sidebar-w: 240px;
+  --transition: 150ms ease;
 }
 
 html, body {
@@ -38,42 +42,16 @@ body {
   font-family: var(--mono);
   background: var(--bg);
   color: var(--text);
+  font-size: 13px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
 }
 
-/* --- Header --- */
+/* --- Focus States --- */
 
-.header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 24px;
-  height: 56px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg);
-  position: sticky;
-  top: 0;
-  z-index: 100;
-}
-
-.header-brand {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--accent);
-  letter-spacing: -0.02em;
-  cursor: pointer;
-}
-
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.header-email {
-  font-size: 13px;
-  color: var(--text-dim);
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* --- Buttons --- */
@@ -85,11 +63,17 @@ body {
   border-radius: 6px;
   border: 1px solid transparent;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: all var(--transition);
   display: inline-flex;
   align-items: center;
   gap: 8px;
   white-space: nowrap;
+  line-height: 1.4;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .btn:disabled {
@@ -115,18 +99,29 @@ body {
 
 .btn-secondary:hover:not(:disabled) {
   border-color: var(--border-hover);
-  background: var(--bg-raised);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .btn-ghost {
   background: transparent;
   color: var(--text-dim);
   padding: 6px 12px;
+  border: none;
 }
 
 .btn-ghost:hover:not(:disabled) {
   color: var(--text);
-  background: var(--bg-raised);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.btn-danger-fill {
+  background: var(--danger);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn-danger-fill:hover:not(:disabled) {
+  background: var(--danger-hover);
 }
 
 .btn-danger {
@@ -145,248 +140,477 @@ body {
   padding: 5px 10px;
 }
 
+.btn-icon {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all var(--transition);
+}
+
+.btn-icon:hover {
+  color: var(--danger);
+  background: var(--danger-dim);
+}
+
 /* --- Inputs --- */
 
 .input {
   font-family: var(--mono);
-  font-size: 14px;
-  padding: 10px 14px;
+  font-size: 13px;
+  padding: 9px 12px;
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text);
   outline: none;
-  transition: border-color 0.15s ease;
+  transition: border-color var(--transition);
   width: 100%;
 }
 
 .input:focus {
-  border-color: var(--accent);
+  border-color: var(--border-hover);
 }
 
 .input::placeholder {
   color: var(--text-dim);
 }
 
-/* --- Auth Screen --- */
+/* --- Sidebar Layout --- */
 
-.auth-screen {
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 100;
+  transition: transform 200ms ease;
+}
+
+.sidebar-brand {
+  padding: 20px 20px 24px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  padding: 24px;
+  gap: 8px;
 }
 
-.auth-card {
-  width: 100%;
-  max-width: 400px;
-}
-
-.auth-title {
-  font-size: 22px;
-  font-weight: 600;
-  color: var(--accent);
-  margin-bottom: 4px;
+.sidebar-brand-text {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
   letter-spacing: -0.02em;
 }
 
-.auth-subtitle {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-bottom: 32px;
+.sidebar-brand-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex-shrink: 0;
 }
 
-.auth-form {
+.sidebar-nav {
+  flex: 1;
+  padding: 0 8px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 2px;
 }
 
-.auth-form .input {
-  margin-bottom: 4px;
-}
-
-.auth-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 4px;
-}
-
-.auth-actions .btn {
-  flex: 1;
-}
-
-.auth-back {
-  margin-top: 16px;
-  text-align: center;
-}
-
-.token-reveal {
-  margin: 16px 0;
-  padding: 16px;
-  background: #0d0d12;
-  border: 1px solid #1a1a22;
-  border-radius: 6px;
-}
-
-.token-label {
-  font-size: 12px;
-  color: var(--text-dim);
-  margin-bottom: 8px;
-}
-
-.token-value {
-  display: block;
-  padding: 10px 12px;
-  background: #000;
-  border: 1px solid #222;
-  border-radius: 4px;
-  font-size: 13px;
-  color: var(--accent);
-  word-break: break-all;
-  margin-bottom: 8px;
-  user-select: all;
-}
-
-.token-warning {
-  font-size: 12px;
-  color: var(--text-dim);
-  margin-top: 10px;
-  line-height: 1.5;
-}
-
-/* --- Console Layout --- */
-
-.console {
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 32px 24px;
-}
-
-.console-toolbar {
+.sidebar-nav-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 24px;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  font-family: var(--mono);
+  width: 100%;
+  text-align: left;
+  transition: all var(--transition);
 }
 
-.console-title {
-  font-size: 16px;
-  font-weight: 600;
+.sidebar-nav-item:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sidebar-nav-item.active {
+  color: var(--text);
+  background: var(--accent-dim);
+}
+
+.sidebar-nav-icon {
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* CSS grid icon for Projects */
+.icon-grid {
+  display: grid;
+  grid-template-columns: 6px 6px;
+  grid-template-rows: 6px 6px;
+  gap: 2px;
+}
+
+.icon-grid span {
+  display: block;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+/* Account icon - simple person silhouette via CSS */
+.icon-account {
+  position: relative;
+}
+
+.icon-account::before {
+  content: "";
+  display: block;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  margin: 0 auto 1px;
+}
+
+.icon-account::after {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 5px;
+  border: 1.5px solid currentColor;
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  margin: 0 auto;
+}
+
+.sidebar-bottom {
+  padding: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.sidebar-email {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-signout {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px 0;
+  transition: color var(--transition);
+}
+
+.sidebar-signout:hover {
   color: var(--text);
 }
 
-/* --- Back Link --- */
+/* Mobile sidebar */
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 99;
+}
 
-.back-link {
-  display: inline-flex;
+.hamburger {
+  display: none;
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 101;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 8px 10px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.main-area {
+  flex: 1;
+  margin-left: var(--sidebar-w);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 32px;
+  height: 56px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  gap: 16px;
+}
+
+.topbar-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.breadcrumb {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
+}
+
+.breadcrumb-link {
   color: var(--text-dim);
   cursor: pointer;
   background: none;
   border: none;
   font-family: var(--mono);
+  font-size: 12px;
   padding: 0;
-  margin-bottom: 24px;
-  transition: color 0.15s ease;
+  transition: color var(--transition);
 }
 
-.back-link:hover {
+.breadcrumb-link:hover {
+  color: var(--accent);
+}
+
+.breadcrumb-sep {
+  color: var(--text-dim);
+  opacity: 0.5;
+}
+
+.breadcrumb-current {
   color: var(--text);
 }
 
-/* --- Project Cards --- */
-
-.project-grid {
-  display: grid;
-  gap: 12px;
+.content {
+  flex: 1;
+  padding: 28px 32px;
+  max-width: 860px;
+  width: 100%;
 }
 
-.project-card {
-  background: var(--bg-raised);
+/* --- Cards / Sections --- */
+
+.card {
+  background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 18px 20px;
-  transition: border-color 0.15s ease;
+  margin-bottom: 16px;
+  overflow: hidden;
+}
+
+.card-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  padding: 14px 20px;
   cursor: pointer;
+  user-select: none;
+  transition: background var(--transition);
+  gap: 12px;
 }
 
-.project-card:hover {
-  border-color: var(--border-hover);
+.card-header:hover {
+  background: rgba(255, 255, 255, 0.015);
 }
 
-.project-info {
-  min-width: 0;
-  flex: 1;
-}
-
-.project-name {
-  font-size: 15px;
+.card-title {
+  font-size: 13px;
   font-weight: 600;
   color: var(--text);
-  margin-bottom: 4px;
-}
-
-.project-meta {
   display: flex;
   align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
+  gap: 8px;
 }
 
-.project-version {
-  font-size: 12px;
-  padding: 2px 8px;
-  background: var(--accent-dim);
+.card-chevron {
+  color: var(--text-dim);
+  font-size: 11px;
+  transition: transform var(--transition);
+  flex-shrink: 0;
+}
+
+.card-chevron.open {
+  transform: rotate(90deg);
+}
+
+.card-body {
+  padding: 0 20px 18px;
+}
+
+.card-static {
+  padding: 18px 20px;
+}
+
+/* --- Project Table --- */
+
+.project-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.project-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.project-table td {
+  padding: 12px 16px;
+  font-size: 13px;
+  border-bottom: 1px solid rgba(26, 26, 40, 0.5);
+  vertical-align: middle;
+}
+
+.project-table tr:last-child td {
+  border-bottom: none;
+}
+
+.project-table tr:hover td {
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.project-name-link {
+  color: var(--text);
+  font-weight: 500;
+  cursor: pointer;
+  background: none;
+  border: none;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 0;
+  transition: color var(--transition);
+  text-align: left;
+}
+
+.project-name-link:hover {
   color: var(--accent);
-  border-radius: 4px;
-  border: 1px solid rgba(0, 212, 255, 0.2);
 }
 
-.project-not-deployed {
+.status-deployed {
+  font-size: 12px;
+  color: var(--success);
+}
+
+.status-not-deployed {
   font-size: 12px;
   color: var(--text-dim);
   font-style: italic;
 }
 
-.project-url a {
+.project-url-link {
   font-size: 12px;
   color: var(--accent);
   text-decoration: none;
   word-break: break-all;
 }
 
-.project-url a:hover {
+.project-url-link:hover {
   text-decoration: underline;
 }
 
-/* --- Onboarding Empty State --- */
+.dim-dash {
+  color: var(--text-dim);
+}
+
+/* --- Detail Header --- */
+
+.detail-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.detail-url {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.detail-url:hover {
+  text-decoration: underline;
+}
+
+/* --- Onboarding --- */
 
 .onboarding {
-  background: var(--bg-raised);
+  background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 32px;
+  padding: 40px 32px;
+  text-align: center;
+  max-width: 560px;
+  margin: 40px auto 0;
 }
 
 .onboarding-title {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--text);
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
 .onboarding-subtitle {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-dim);
-  margin-bottom: 28px;
+  margin-bottom: 32px;
 }
 
 .onboarding-steps {
@@ -395,27 +619,29 @@ body {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  text-align: left;
+  margin-bottom: 28px;
 }
 
 .onboarding-step {
   counter-increment: steps;
   display: flex;
-  gap: 16px;
+  gap: 14px;
   align-items: flex-start;
 }
 
 .onboarding-step::before {
   content: counter(steps);
   flex-shrink: 0;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
   border: 1px solid var(--border);
   color: var(--accent);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   margin-top: 1px;
 }
@@ -426,26 +652,25 @@ body {
 }
 
 .onboarding-step-label {
-  font-size: 14px;
+  font-size: 13px;
   color: var(--text);
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
 .onboarding-step-desc {
   font-size: 12px;
   color: var(--text-dim);
-  margin-bottom: 4px;
 }
 
 /* --- Code Blocks --- */
 
 .code-block {
   display: block;
-  padding: 10px 14px;
-  background: #000;
-  border: 1px solid #1a1a22;
+  padding: 9px 12px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
   border-radius: 4px;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--accent);
   font-family: var(--mono);
   word-break: break-all;
@@ -453,89 +678,101 @@ body {
   margin-top: 6px;
 }
 
-/* --- Section --- */
-
-.section {
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 20px 24px;
-  margin-bottom: 16px;
-}
-
-.section-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  margin-bottom: 16px;
-}
-
-.section-desc {
-  font-size: 13px;
-  color: var(--text-dim);
-  margin-bottom: 12px;
-  line-height: 1.5;
-}
-
-/* --- Detail Header --- */
-
-.detail-header {
-  margin-bottom: 24px;
-}
-
-.detail-name {
-  font-size: 20px;
-  font-weight: 600;
-  color: var(--text);
-  margin-bottom: 6px;
-}
-
-.detail-meta {
+.code-block-row {
   display: flex;
   align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.code-block-row .code-block {
+  flex: 1;
+  margin-top: 0;
+}
+
+.copy-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all var(--transition);
+  flex-shrink: 0;
+}
+
+.copy-btn:hover {
+  color: var(--text);
+  border-color: var(--border-hover);
 }
 
 /* --- Secrets --- */
 
-.secret-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 12px;
+.secret-table {
+  width: 100%;
+  border-collapse: collapse;
 }
 
-.secret-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
+.secret-table td {
+  padding: 8px 0;
+  font-size: 13px;
+  border-bottom: 1px solid rgba(26, 26, 40, 0.5);
+}
+
+.secret-table tr:last-child td {
+  border-bottom: none;
 }
 
 .secret-key {
-  font-size: 13px;
   color: var(--text);
+}
+
+.secret-actions {
+  text-align: right;
+  width: 40px;
 }
 
 .secret-add-form {
   display: flex;
   gap: 8px;
   margin-top: 12px;
+  align-items: flex-start;
 }
 
 .secret-add-form .input {
   flex: 1;
 }
 
+.secret-delete-confirm {
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: var(--danger-dim);
+  border: 1px solid rgba(255, 68, 102, 0.2);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.secret-delete-confirm-text {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.secret-delete-confirm-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 /* --- Logs --- */
 
 .log-container {
-  background: #000;
-  border: 1px solid #1a1a22;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
   border-radius: 4px;
   padding: 12px;
   max-height: 400px;
@@ -565,56 +802,191 @@ body {
   color: var(--danger);
 }
 
-.log-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 12px;
-}
-
 .log-empty {
-  padding: 24px;
+  padding: 32px 16px;
   text-align: center;
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 /* --- Danger Zone --- */
 
 .danger-zone {
-  background: var(--bg-raised);
+  background: var(--bg-card);
   border: 1px solid rgba(255, 68, 102, 0.2);
   border-radius: 8px;
-  padding: 20px 24px;
+  padding: 18px 20px;
   margin-top: 16px;
 }
 
-.danger-zone .section-title {
+.danger-zone-title {
+  font-size: 13px;
+  font-weight: 600;
   color: var(--danger);
+  margin-bottom: 8px;
 }
 
 .danger-zone-desc {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-dim);
-  margin-bottom: 12px;
+  margin-bottom: 14px;
+  line-height: 1.5;
 }
 
-/* --- Account --- */
+.danger-zone-confirm {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: rgba(255, 68, 102, 0.06);
+  border: 1px solid rgba(255, 68, 102, 0.2);
+  border-radius: 6px;
+}
 
-.account-field {
+.danger-zone-confirm-text {
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.danger-zone-confirm-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+/* --- Auth Screen --- */
+
+.auth-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 24px;
 }
 
-.account-label {
-  font-size: 12px;
-  color: var(--text-dim);
-  margin-bottom: 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+.auth-brand-text {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: -0.02em;
 }
 
-.account-value {
-  font-size: 14px;
+.auth-brand-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.auth-heading {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.auth-subtitle {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 24px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.auth-form .btn-primary {
+  width: 100%;
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.auth-switch {
+  margin-top: 20px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.auth-switch-link {
+  color: var(--accent);
+  cursor: pointer;
+  background: none;
+  border: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0;
+  transition: color var(--transition);
+}
+
+.auth-switch-link:hover {
+  color: var(--accent-hover);
+}
+
+/* Token reveal screen */
+.token-reveal-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  margin: 20px 0;
+}
+
+.token-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 8px;
+}
+
+.token-value {
+  display: block;
+  padding: 10px 12px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--accent);
+  word-break: break-all;
+  user-select: all;
+  margin-bottom: 10px;
+  font-family: var(--mono);
+}
+
+.token-warning {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin-top: 10px;
+}
+
+/* --- Account sections --- */
+
+.account-field-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 6px;
+}
+
+.account-field-value {
+  font-size: 13px;
   color: var(--text);
 }
 
@@ -622,7 +994,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-width: 400px;
+  max-width: 380px;
 }
 
 /* --- Modal --- */
@@ -640,7 +1012,7 @@ body {
 }
 
 .modal {
-  background: var(--bg-raised);
+  background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 24px;
@@ -649,7 +1021,7 @@ body {
 }
 
 .modal-title {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   margin-bottom: 20px;
 }
@@ -657,7 +1029,7 @@ body {
 .modal-form {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 
 .modal-actions {
@@ -667,89 +1039,101 @@ body {
   margin-top: 4px;
 }
 
-/* --- Loading / Messages --- */
+/* --- Messages --- */
 
 .loading {
   text-align: center;
   padding: 48px 24px;
   color: var(--text-dim);
-  font-size: 14px;
-}
-
-.error-msg {
-  color: var(--danger);
   font-size: 13px;
-  margin-top: 8px;
 }
 
 .error-banner {
   background: var(--danger-dim);
-  border: 1px solid rgba(255, 68, 102, 0.3);
+  border: 1px solid rgba(255, 68, 102, 0.2);
   border-radius: 6px;
   padding: 10px 14px;
   color: var(--danger);
-  font-size: 13px;
+  font-size: 12px;
   margin-bottom: 16px;
 }
 
 .success-banner {
   background: var(--success-dim);
-  border: 1px solid rgba(0, 204, 136, 0.3);
+  border: 1px solid rgba(0, 204, 136, 0.2);
   border-radius: 6px;
   padding: 10px 14px;
   color: var(--success);
-  font-size: 13px;
+  font-size: 12px;
   margin-bottom: 16px;
 }
 
-/* --- Confirm Dialog --- */
-
-.confirm-text {
-  font-size: 14px;
-  color: var(--text);
-  margin-bottom: 20px;
+.section-desc {
+  font-size: 12px;
+  color: var(--text-dim);
   line-height: 1.5;
 }
 
-.confirm-highlight {
+.highlight {
   color: var(--accent);
   font-weight: 600;
 }
 
 /* --- Responsive --- */
 
-@media (max-width: 600px) {
-  .header {
-    padding: 0 16px;
+@media (max-width: 768px) {
+  .sidebar {
+    transform: translateX(-100%);
   }
 
-  .console {
-    padding: 24px 16px;
+  .sidebar.open {
+    transform: translateX(0);
   }
 
-  .project-card {
-    flex-direction: column;
-    align-items: flex-start;
+  .sidebar-overlay.open {
+    display: block;
   }
 
-  .auth-actions {
-    flex-direction: column;
+  .hamburger {
+    display: block;
   }
 
-  .header-email {
-    display: none;
+  .main-area {
+    margin-left: 0;
+  }
+
+  .topbar {
+    padding: 0 16px 0 52px;
+  }
+
+  .content {
+    padding: 20px 16px;
   }
 
   .onboarding {
-    padding: 24px 16px;
-  }
-
-  .section {
-    padding: 16px;
+    padding: 28px 20px;
+    margin-top: 20px;
   }
 
   .secret-add-form {
     flex-direction: column;
+  }
+
+  .project-table th:nth-child(3),
+  .project-table td:nth-child(3) {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .topbar-title {
+    font-size: 14px;
+  }
+
+  .detail-title-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
   }
 }
 </style>
@@ -773,13 +1157,13 @@ body {
     token: localStorage.getItem(TOKEN_KEY) || null,
     email: localStorage.getItem(EMAIL_KEY) || null,
     view: "loading",
-    // views: loading, auth, auth-signin, token-reveal, console, project-detail, account
+    // views: loading, auth, auth-signin, token-reveal, projects, project-detail, account
     projects: [],
     loading: false,
     error: null,
     success: null,
     showNewProjectModal: false,
-    deleteConfirm: null,
+    deleteConfirm: false,
     revealedToken: null,
     // project detail
     currentProject: null,
@@ -793,6 +1177,10 @@ body {
     accountLoading: false,
     accountError: null,
     accountSuccess: null,
+    // sidebar mobile
+    sidebarOpen: false,
+    // collapsible sections
+    sectionsOpen: { deploy: true, secrets: true, logs: true },
   };
 
   // --- API helpers ---
@@ -835,6 +1223,7 @@ body {
     state.currentProject = null;
     state.error = null;
     state.success = null;
+    state.sidebarOpen = false;
     render();
   }
 
@@ -842,7 +1231,7 @@ body {
     api("GET", "/me").then(function(me) {
       state.email = me.email;
       localStorage.setItem(EMAIL_KEY, me.email);
-      state.view = "console";
+      state.view = "projects";
       render();
       loadProjects();
     }).catch(function() {
@@ -883,7 +1272,7 @@ body {
       localStorage.setItem(TOKEN_KEY, data.token);
       localStorage.setItem(EMAIL_KEY, email);
       state.loading = false;
-      state.view = "console";
+      state.view = "projects";
       render();
       loadProjects();
     }).catch(function(e) {
@@ -928,13 +1317,13 @@ body {
 
   function deleteProject(id) {
     state.error = null;
-    state.deleteConfirm = null;
+    state.deleteConfirm = false;
     state.loading = true;
     render();
     api("DELETE", "/projects/" + id).then(function() {
       state.loading = false;
       state.currentProject = null;
-      state.view = "console";
+      state.view = "projects";
       render();
       loadProjects();
     }).catch(function(e) {
@@ -955,6 +1344,8 @@ body {
     state.success = null;
     state.showAddSecret = false;
     state.deleteSecretConfirm = null;
+    state.deleteConfirm = false;
+    state.sectionsOpen = { deploy: true, secrets: true, logs: true };
     render();
     loadSecrets(project.id);
     loadLogs(project.id);
@@ -1013,7 +1404,6 @@ body {
       state.logs = logs;
       state.logsLoading = false;
       render();
-      // scroll log container to bottom
       var logEl = document.querySelector(".log-container");
       if (logEl) {
         logEl.scrollTop = logEl.scrollHeight;
@@ -1036,7 +1426,6 @@ body {
     api("POST", "/me/token", {}).then(function(data) {
       state.revealedToken = data.token;
       state.accountLoading = false;
-      // Also update stored token
       state.token = data.token;
       localStorage.setItem(TOKEN_KEY, data.token);
       render();
@@ -1072,13 +1461,14 @@ body {
       for (var i = 0; i < keys.length; i++) {
         var k = keys[i];
         var v = attrs[k];
+        if (v == null || v === false) continue;
         if (k.startsWith("on") && typeof v === "function") {
           el.addEventListener(k.slice(2).toLowerCase(), v);
         } else if (k === "className") {
           el.className = v;
         } else if (k === "htmlFor") {
           el.setAttribute("for", v);
-        } else if (v != null && v !== false) {
+        } else {
           el.setAttribute(k, v);
         }
       }
@@ -1090,7 +1480,7 @@ body {
         el.appendChild(document.createTextNode(child));
       } else if (Array.isArray(child)) {
         for (var j = 0; j < child.length; j++) {
-          if (child[j]) el.appendChild(child[j]);
+          if (child[j] != null && child[j] !== false) el.appendChild(child[j]);
         }
       } else {
         el.appendChild(child);
@@ -1111,13 +1501,111 @@ body {
     }
   }
 
-  // --- Auth Views ---
+  // --- Navigation helpers ---
+
+  function navTo(view) {
+    state.view = view;
+    state.error = null;
+    state.success = null;
+    state.sidebarOpen = false;
+    if (view === "projects") {
+      state.currentProject = null;
+      render();
+      loadProjects();
+    } else if (view === "account") {
+      state.accountError = null;
+      state.accountSuccess = null;
+      state.revealedToken = null;
+      render();
+    } else {
+      render();
+    }
+  }
+
+  function activeNav() {
+    if (state.view === "projects" || state.view === "project-detail") return "projects";
+    if (state.view === "account") return "account";
+    return "";
+  }
+
+  // --- Grid icon component ---
+
+  function gridIcon() {
+    var wrap = h("span", { className: "sidebar-nav-icon" });
+    var grid = document.createElement("span");
+    grid.className = "icon-grid";
+    grid.appendChild(document.createElement("span"));
+    grid.appendChild(document.createElement("span"));
+    grid.appendChild(document.createElement("span"));
+    grid.appendChild(document.createElement("span"));
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  function accountIcon() {
+    return h("span", { className: "sidebar-nav-icon icon-account" });
+  }
+
+  // --- Sidebar ---
+
+  function renderSidebar() {
+    var nav = activeNav();
+    return h("div", null,
+      h("div", {
+        className: "sidebar-overlay" + (state.sidebarOpen ? " open" : ""),
+        onClick: function() {
+          state.sidebarOpen = false;
+          render();
+        },
+      }),
+      h("button", {
+        className: "hamburger",
+        onClick: function() {
+          state.sidebarOpen = !state.sidebarOpen;
+          render();
+        },
+        "aria-label": "Toggle menu",
+      }, "="),
+      h("aside", { className: "sidebar" + (state.sidebarOpen ? " open" : "") },
+        h("div", { className: "sidebar-brand" },
+          h("span", { className: "sidebar-brand-dot" }),
+          h("span", { className: "sidebar-brand-text" }, "jkbase")
+        ),
+        h("nav", { className: "sidebar-nav" },
+          h("button", {
+            className: "sidebar-nav-item" + (nav === "projects" ? " active" : ""),
+            onClick: function() { navTo("projects"); },
+          },
+            gridIcon(),
+            "Projects"
+          ),
+          h("button", {
+            className: "sidebar-nav-item" + (nav === "account" ? " active" : ""),
+            onClick: function() { navTo("account"); },
+          },
+            accountIcon(),
+            "Account"
+          )
+        ),
+        h("div", { className: "sidebar-bottom" },
+          h("div", { className: "sidebar-email" }, state.email || ""),
+          h("button", { className: "sidebar-signout", onClick: logout }, "Sign Out")
+        )
+      )
+    );
+  }
+
+  // --- Auth Screens ---
 
   function renderAuthScreen() {
     return h("div", { className: "auth-screen" },
       h("div", { className: "auth-card" },
-        h("div", { className: "auth-title" }, "jkbase"),
-        h("div", { className: "auth-subtitle" }, "create your account"),
+        h("div", { className: "auth-brand" },
+          h("span", { className: "auth-brand-dot" }),
+          h("span", { className: "auth-brand-text" }, "jkbase")
+        ),
+        h("div", { className: "auth-heading" }, "Create Account"),
+        h("div", { className: "auth-subtitle" }, "Get started with your new account"),
         state.error ? h("div", { className: "error-banner" }, state.error) : null,
         h("form", { className: "auth-form", onSubmit: function(e) {
           e.preventDefault();
@@ -1143,17 +1631,16 @@ body {
             autocomplete: "new-password",
             disabled: state.loading ? "disabled" : null,
           }),
-          h("div", { className: "auth-actions" },
-            h("button", {
-              className: "btn btn-primary",
-              type: "submit",
-              disabled: state.loading ? "disabled" : null,
-            }, state.loading ? "Creating..." : "Create Account")
-          )
-        ),
-        h("div", { className: "auth-back" },
           h("button", {
-            className: "btn btn-ghost btn-sm",
+            className: "btn btn-primary",
+            type: "submit",
+            disabled: state.loading ? "disabled" : null,
+          }, state.loading ? "Creating..." : "Create Account")
+        ),
+        h("div", { className: "auth-switch" },
+          "Already have an account? ",
+          h("button", {
+            className: "auth-switch-link",
             onClick: function() {
               state.error = null;
               state.view = "auth-signin";
@@ -1168,8 +1655,12 @@ body {
   function renderSignInScreen() {
     return h("div", { className: "auth-screen" },
       h("div", { className: "auth-card" },
-        h("div", { className: "auth-title" }, "jkbase"),
-        h("div", { className: "auth-subtitle" }, "sign in to your account"),
+        h("div", { className: "auth-brand" },
+          h("span", { className: "auth-brand-dot" }),
+          h("span", { className: "auth-brand-text" }, "jkbase")
+        ),
+        h("div", { className: "auth-heading" }, "Sign In"),
+        h("div", { className: "auth-subtitle" }, "Welcome back"),
         state.error ? h("div", { className: "error-banner" }, state.error) : null,
         h("form", { className: "auth-form", onSubmit: function(e) {
           e.preventDefault();
@@ -1194,23 +1685,22 @@ body {
             autocomplete: "current-password",
             disabled: state.loading ? "disabled" : null,
           }),
-          h("div", { className: "auth-actions" },
-            h("button", {
-              className: "btn btn-primary",
-              type: "submit",
-              disabled: state.loading ? "disabled" : null,
-            }, state.loading ? "Signing in..." : "Sign In")
-          )
-        ),
-        h("div", { className: "auth-back" },
           h("button", {
-            className: "btn btn-ghost btn-sm",
+            className: "btn btn-primary",
+            type: "submit",
+            disabled: state.loading ? "disabled" : null,
+          }, state.loading ? "Signing in..." : "Sign In")
+        ),
+        h("div", { className: "auth-switch" },
+          "Don't have an account? ",
+          h("button", {
+            className: "auth-switch-link",
             onClick: function() {
               state.error = null;
               state.view = "auth";
               render();
             },
-          }, "Create an account")
+          }, "Create one")
         )
       )
     );
@@ -1219,70 +1709,45 @@ body {
   function renderTokenRevealScreen() {
     return h("div", { className: "auth-screen" },
       h("div", { className: "auth-card" },
-        h("div", { className: "auth-title" }, "Account created"),
+        h("div", { className: "auth-brand" },
+          h("span", { className: "auth-brand-dot" }),
+          h("span", { className: "auth-brand-text" }, "jkbase")
+        ),
+        h("div", { className: "auth-heading" }, "Account created"),
         h("div", { className: "auth-subtitle" }, "Save your API token for CLI access"),
-        h("div", { className: "token-reveal" },
-          h("div", { className: "token-label" }, "Your API token:"),
+        h("div", { className: "token-reveal-card" },
+          h("div", { className: "token-label" }, "API Token"),
           h("code", { className: "token-value" }, state.revealedToken),
-          h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
+          h("button", { className: "copy-btn", onClick: function() {
             navigator.clipboard.writeText(state.revealedToken);
             this.textContent = "Copied";
             var btn = this;
             setTimeout(function() { btn.textContent = "Copy"; }, 2000);
           }}, "Copy"),
           h("div", { className: "token-warning" },
-            "Save this token somewhere safe. You will need it to authenticate the CLI with: jkbase login --token YOUR_TOKEN"
+            "This token provides full API access. Keep it safe. Use it to authenticate the CLI: jkbase login --token YOUR_TOKEN"
           )
         ),
-        h("div", { className: "auth-actions" },
-          h("button", {
-            className: "btn btn-primary",
-            onClick: function() {
-              state.revealedToken = null;
-              state.view = "console";
-              render();
-              loadProjects();
-            },
-          }, "Continue to Console")
-        )
+        h("button", {
+          className: "btn btn-primary",
+          style: "width: 100%; justify-content: center",
+          onClick: function() {
+            state.revealedToken = null;
+            state.view = "projects";
+            render();
+            loadProjects();
+          },
+        }, "Continue to Console")
       )
     );
   }
 
-  // --- Console Header ---
-
-  function renderHeader() {
-    return h("header", { className: "header" },
-      h("div", { className: "header-brand", onClick: function() {
-        state.view = "console";
-        state.currentProject = null;
-        state.error = null;
-        state.success = null;
-        render();
-        loadProjects();
-      }}, "jkbase console"),
-      h("div", { className: "header-right" },
-        h("span", { className: "header-email" }, state.email || ""),
-        h("button", { className: "btn btn-ghost btn-sm", onClick: function() {
-          state.view = "account";
-          state.error = null;
-          state.success = null;
-          state.accountError = null;
-          state.accountSuccess = null;
-          state.revealedToken = null;
-          render();
-        }}, "Account"),
-        h("button", { className: "btn btn-ghost btn-sm", onClick: logout }, "Sign Out")
-      )
-    );
-  }
-
-  // --- Console: Project List ---
+  // --- Projects List ---
 
   function renderOnboarding() {
     return h("div", { className: "onboarding" },
       h("div", { className: "onboarding-title" }, "Get started with jkbase"),
-      h("div", { className: "onboarding-subtitle" }, "Deploy your first project in a few steps."),
+      h("div", { className: "onboarding-subtitle" }, "Deploy your first project in a few steps"),
       h("ol", { className: "onboarding-steps" },
         h("li", { className: "onboarding-step" },
           h("div", { className: "onboarding-step-content" },
@@ -1299,7 +1764,7 @@ body {
         h("li", { className: "onboarding-step" },
           h("div", { className: "onboarding-step-content" },
             h("div", { className: "onboarding-step-label" }, "Create a project directory"),
-            h("div", { className: "onboarding-step-desc" }, "Add a jkbase.toml to your project root.")
+            h("div", { className: "onboarding-step-desc" }, "Add a jkbase.toml to your project root")
           )
         ),
         h("li", { className: "onboarding-step" },
@@ -1308,56 +1773,83 @@ body {
             h("code", { className: "code-block" }, "jkbase deploy")
           )
         )
-      )
+      ),
+      h("button", {
+        className: "btn btn-primary btn-sm",
+        onClick: function() {
+          state.showNewProjectModal = true;
+          state.error = null;
+          render();
+        },
+      }, "+ New Project")
     );
   }
 
-  function renderProjectCard(project) {
-    var deployed = project.current_version != null;
-    return h("div", { className: "project-card", onClick: function(e) {
-      // Don't navigate if clicking a link inside the card
-      if (e.target.tagName === "A") return;
-      openProject(project);
-    }},
-      h("div", { className: "project-info" },
-        h("div", { className: "project-name" }, project.name),
-        h("div", { className: "project-meta" },
-          deployed
-            ? h("span", { className: "project-version" }, "v" + project.current_version)
-            : h("span", { className: "project-not-deployed" }, "not deployed"),
-          project.url
-            ? h("span", { className: "project-url" },
-                h("a", { href: project.url, target: "_blank", rel: "noopener" }, project.url)
-              )
-            : null
+  function renderProjectTable() {
+    return h("table", { className: "project-table" },
+      h("thead", null,
+        h("tr", null,
+          h("th", null, "Name"),
+          h("th", null, "Status"),
+          h("th", null, "URL")
         )
+      ),
+      h("tbody", null,
+        state.projects.map(function(project) {
+          var deployed = project.current_version != null;
+          return h("tr", null,
+            h("td", null,
+              h("button", {
+                className: "project-name-link",
+                onClick: function() { openProject(project); },
+              }, project.name)
+            ),
+            h("td", null,
+              deployed
+                ? h("span", { className: "status-deployed" }, "deployed v" + project.current_version)
+                : h("span", { className: "status-not-deployed" }, "not deployed")
+            ),
+            h("td", null,
+              project.url
+                ? h("a", {
+                    className: "project-url-link",
+                    href: project.url,
+                    target: "_blank",
+                    rel: "noopener",
+                  }, project.url)
+                : h("span", { className: "dim-dash" }, "--")
+            )
+          );
+        })
       )
     );
   }
 
-  function renderProjectList() {
-    return h("div", null,
-      renderHeader(),
-      h("main", { className: "console" },
-        state.error ? h("div", { className: "error-banner" }, state.error) : null,
-        h("div", { className: "console-toolbar" },
-          h("div", { className: "console-title" }, "Projects"),
-          h("button", {
-            className: "btn btn-primary btn-sm",
-            onClick: function() {
-              state.showNewProjectModal = true;
-              state.error = null;
-              render();
-            },
-          }, "+ New Project")
+  function renderProjectsView() {
+    return h("div", { className: "app-layout" },
+      renderSidebar(),
+      h("div", { className: "main-area" },
+        h("div", { className: "topbar" },
+          h("div", { className: "topbar-title" }, "Projects"),
+          h("div", { className: "topbar-actions" },
+            h("button", {
+              className: "btn btn-primary btn-sm",
+              onClick: function() {
+                state.showNewProjectModal = true;
+                state.error = null;
+                render();
+              },
+            }, "+ New Project")
+          )
         ),
-        state.loading
-          ? h("div", { className: "loading" }, "Loading...")
-          : state.projects.length === 0
-            ? renderOnboarding()
-            : h("div", { className: "project-grid" },
-                state.projects.map(renderProjectCard)
-              )
+        h("div", { className: "content" },
+          state.error ? h("div", { className: "error-banner" }, state.error) : null,
+          state.loading
+            ? h("div", { className: "loading" }, "Loading...")
+            : state.projects.length === 0
+              ? renderOnboarding()
+              : renderProjectTable()
+        )
       ),
       state.showNewProjectModal ? renderNewProjectModal() : null
     );
@@ -1409,128 +1901,117 @@ body {
     );
   }
 
-  // --- Console: Project Detail ---
+  // --- Project Detail ---
 
-  function renderProjectDetail() {
-    var project = state.currentProject;
-    if (!project) return renderProjectList();
+  function toggleSection(key) {
+    state.sectionsOpen[key] = !state.sectionsOpen[key];
+    render();
+  }
 
-    var deployed = project.current_version != null;
-
-    return h("div", null,
-      renderHeader(),
-      h("main", { className: "console" },
-        h("button", { className: "back-link", onClick: function() {
-          state.view = "console";
-          state.currentProject = null;
-          state.error = null;
-          state.success = null;
-          render();
-          loadProjects();
-        }}, "< Projects"),
-
-        state.error ? h("div", { className: "error-banner" }, state.error) : null,
-        state.success ? h("div", { className: "success-banner" }, state.success) : null,
-
-        // Header area
-        h("div", { className: "detail-header" },
-          h("div", { className: "detail-name" }, project.name),
-          h("div", { className: "detail-meta" },
-            deployed
-              ? h("span", { className: "project-version" }, "v" + project.current_version)
-              : h("span", { className: "project-not-deployed" }, "not deployed"),
-            project.url
-              ? h("span", { className: "project-url" },
-                  h("a", { href: project.url, target: "_blank", rel: "noopener" }, project.url)
-                )
-              : null
-          )
+  function renderCollapsibleCard(key, title, headerRight, bodyFn) {
+    var isOpen = state.sectionsOpen[key];
+    return h("div", { className: "card" },
+      h("div", { className: "card-header", onClick: function() { toggleSection(key); } },
+        h("div", { className: "card-title" },
+          h("span", { className: "card-chevron" + (isOpen ? " open" : "") }, ">"),
+          title
         ),
-
-        // Deploy section
-        h("div", { className: "section" },
-          h("div", { className: "section-title" }, "Deploy"),
-          h("div", { className: "section-desc" }, "Deploy or update this project from your terminal:"),
-          h("code", { className: "code-block" }, "cd your-project && jkbase deploy")
-        ),
-
-        // Secrets section
-        renderSecretsSection(project),
-
-        // Logs section
-        renderLogsSection(project),
-
-        // Danger zone
-        h("div", { className: "danger-zone" },
-          h("div", { className: "section-title" }, "Danger Zone"),
-          h("div", { className: "danger-zone-desc" }, "Permanently delete this project and all associated data."),
-          h("button", {
-            className: "btn btn-danger",
-            onClick: function() {
-              state.deleteConfirm = project;
-              render();
-            },
-          }, "Delete Project")
-        )
+        headerRight || null
       ),
-      state.deleteConfirm ? renderDeleteConfirm() : null
+      isOpen ? h("div", { className: "card-body" }, bodyFn()) : null
     );
   }
 
+  function renderDeploySection(project) {
+    var deployed = project.current_version != null;
+    return renderCollapsibleCard("deploy", "Deploy", null, function() {
+      return h("div", null,
+        h("div", { className: "section-desc", style: "margin-bottom: 12px" },
+          deployed
+            ? "Deployed v" + project.current_version
+            : "Not deployed"
+        ),
+        h("div", { className: "section-desc" }, "Deploy or update from your terminal:"),
+        h("div", { className: "code-block-row" },
+          h("code", { className: "code-block" }, "cd your-project && jkbase deploy"),
+          h("button", { className: "copy-btn", onClick: function() {
+            navigator.clipboard.writeText("cd your-project && jkbase deploy");
+            this.textContent = "Copied";
+            var btn = this;
+            setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+          }}, "Copy")
+        )
+      );
+    });
+  }
+
   function renderSecretsSection(project) {
-    return h("div", { className: "section" },
-      h("div", { className: "section-title" }, "Secrets"),
-      state.secretsLoading && state.secrets.length === 0
-        ? h("div", { className: "loading", style: "padding: 16px" }, "Loading secrets...")
-        : null,
-      state.secrets.length > 0
-        ? h("div", { className: "secret-list" },
-            state.secrets.map(function(secret) {
-              return h("div", { className: "secret-item" },
-                h("span", { className: "secret-key" }, secret.key),
-                h("button", {
-                  className: "btn btn-danger btn-sm",
-                  disabled: state.secretsLoading ? "disabled" : null,
-                  onClick: function() {
-                    state.deleteSecretConfirm = secret.key;
-                    render();
-                  },
-                }, "Delete")
-              );
-            })
+    var headerBtn = h("button", {
+      className: "btn btn-secondary btn-sm",
+      onClick: function(e) {
+        e.stopPropagation();
+        state.showAddSecret = true;
+        state.sectionsOpen.secrets = true;
+        render();
+      },
+    }, "Add Secret");
+
+    return renderCollapsibleCard("secrets", "Secrets", headerBtn, function() {
+      var items = [];
+
+      if (state.secretsLoading && state.secrets.length === 0) {
+        items.push(h("div", { className: "section-desc" }, "Loading secrets..."));
+      } else if (state.secrets.length > 0) {
+        items.push(
+          h("table", { className: "secret-table" },
+            h("tbody", null,
+              state.secrets.map(function(secret) {
+                return h("tr", null,
+                  h("td", { className: "secret-key" }, secret.key),
+                  h("td", { className: "secret-actions" },
+                    h("button", {
+                      className: "btn-icon",
+                      title: "Delete secret",
+                      disabled: state.secretsLoading ? "disabled" : null,
+                      onClick: function() {
+                        state.deleteSecretConfirm = secret.key;
+                        render();
+                      },
+                    }, "x")
+                  )
+                );
+              })
+            )
           )
-        : (!state.secretsLoading
-            ? h("div", { className: "section-desc" }, "No secrets configured.")
-            : null
-          ),
-      state.deleteSecretConfirm
-        ? h("div", { style: "margin: 12px 0; padding: 12px; background: var(--danger-dim); border: 1px solid rgba(255,68,102,0.3); border-radius: 6px" },
-            h("div", { style: "font-size: 13px; color: var(--text); margin-bottom: 10px" },
-              "Delete secret ",
-              h("span", { className: "confirm-highlight" }, state.deleteSecretConfirm),
+        );
+      } else if (!state.secretsLoading) {
+        items.push(h("div", { className: "section-desc" }, "No secrets configured."));
+      }
+
+      if (state.deleteSecretConfirm) {
+        items.push(
+          h("div", { className: "secret-delete-confirm" },
+            h("div", { className: "secret-delete-confirm-text" },
+              "Delete ",
+              h("span", { className: "highlight" }, state.deleteSecretConfirm),
               "?"
             ),
-            h("div", { style: "display: flex; gap: 8px; justify-content: flex-end" },
+            h("div", { className: "secret-delete-confirm-actions" },
               h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
                 state.deleteSecretConfirm = null;
                 render();
               }}, "Cancel"),
               h("button", { className: "btn btn-danger btn-sm", onClick: function() {
                 deleteSecret(project.id, state.deleteSecretConfirm);
-              }}, "Confirm Delete")
+              }}, "Delete")
             )
           )
-        : null,
-      !state.showAddSecret
-        ? h("button", {
-            className: "btn btn-secondary btn-sm",
-            style: "margin-top: 12px",
-            onClick: function() {
-              state.showAddSecret = true;
-              render();
-            },
-          }, "Add Secret")
-        : h("form", { className: "secret-add-form", onSubmit: function(e) {
+        );
+      }
+
+      if (state.showAddSecret) {
+        items.push(
+          h("form", { className: "secret-add-form", onSubmit: function(e) {
             e.preventDefault();
             var inputs = e.target.querySelectorAll("input");
             var key = inputs[0].value.trim();
@@ -1565,66 +2046,120 @@ body {
               },
             }, "Cancel")
           )
-    );
+        );
+      }
+
+      return h("div", null, items);
+    });
   }
 
   function renderLogsSection(project) {
-    return h("div", { className: "section" },
-      h("div", { className: "log-toolbar" },
-        h("div", { className: "section-title", style: "margin-bottom: 0" }, "Logs"),
-        h("button", {
-          className: "btn btn-secondary btn-sm",
-          disabled: state.logsLoading ? "disabled" : null,
-          onClick: function() { loadLogs(project.id); },
-        }, state.logsLoading ? "Loading..." : "Refresh")
+    var refreshBtn = h("button", {
+      className: "btn btn-secondary btn-sm",
+      disabled: state.logsLoading ? "disabled" : null,
+      onClick: function(e) {
+        e.stopPropagation();
+        loadLogs(project.id);
+      },
+    }, state.logsLoading ? "Loading..." : "Refresh");
+
+    return renderCollapsibleCard("logs", "Logs", refreshBtn, function() {
+      if (state.logsLoading && state.logs.length === 0) {
+        return h("div", { className: "section-desc" }, "Loading logs...");
+      }
+      if (state.logs.length === 0) {
+        return h("div", { className: "log-empty" }, "No logs yet. Deploy a server container to see logs here.");
+      }
+      return h("div", { className: "log-container" },
+        state.logs.map(function(entry) {
+          var streamClass = entry.stream === "stderr" ? "log-stream-stderr" : "log-stream-stdout";
+          return h("div", { className: "log-line" },
+            h("span", { className: "log-ts" }, "[" + formatTimestamp(entry.timestamp) + "] "),
+            h("span", { className: "log-server" }, "[" + entry.server + "] "),
+            h("span", { className: streamClass }, entry.line)
+          );
+        })
+      );
+    });
+  }
+
+  function renderDangerZone(project) {
+    return h("div", { className: "danger-zone" },
+      h("div", { className: "danger-zone-title" }, "Delete this project"),
+      h("div", { className: "danger-zone-desc" },
+        "Permanently delete ", h("span", { className: "highlight" }, project.name),
+        " and all associated deployments, secrets, and logs. This action cannot be undone."
       ),
-      state.logsLoading && state.logs.length === 0
-        ? h("div", { className: "loading", style: "padding: 16px" }, "Loading logs...")
-        : state.logs.length === 0
-          ? h("div", { className: "log-empty" }, "No logs yet. Deploy a server container to see logs here.")
-          : h("div", { className: "log-container" },
-              state.logs.map(function(entry) {
-                var streamClass = entry.stream === "stderr" ? "log-stream-stderr" : "log-stream-stdout";
-                return h("div", { className: "log-line" },
-                  h("span", { className: "log-ts" }, "[" + formatTimestamp(entry.timestamp) + "] "),
-                  h("span", { className: "log-server" }, "[" + entry.server + "] "),
-                  h("span", { className: streamClass }, entry.line)
-                );
-              })
+      !state.deleteConfirm
+        ? h("button", {
+            className: "btn btn-danger",
+            onClick: function() {
+              state.deleteConfirm = true;
+              render();
+            },
+          }, "Delete Project")
+        : h("div", { className: "danger-zone-confirm" },
+            h("div", { className: "danger-zone-confirm-text" },
+              "Are you sure? This will permanently remove all data for this project."
+            ),
+            h("div", { className: "danger-zone-confirm-actions" },
+              h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
+                state.deleteConfirm = false;
+                render();
+              }}, "Cancel"),
+              h("button", {
+                className: "btn btn-danger-fill btn-sm",
+                disabled: state.loading ? "disabled" : null,
+                onClick: function() {
+                  deleteProject(project.id);
+                },
+              }, state.loading ? "Deleting..." : "Confirm Delete")
             )
+          )
     );
   }
 
-  function renderDeleteConfirm() {
-    var project = state.deleteConfirm;
-    return h("div", { className: "modal-overlay", onClick: function(e) {
-      if (e.target === e.currentTarget) {
-        state.deleteConfirm = null;
-        render();
-      }
-    }},
-      h("div", { className: "modal" },
-        h("div", { className: "modal-title" }, "Delete Project"),
-        h("div", { className: "confirm-text" },
-          "Are you sure you want to delete ",
-          h("span", { className: "confirm-highlight" }, project.name),
-          "? This action cannot be undone. All deployments, secrets, and logs will be permanently removed."
+  function renderProjectDetailView() {
+    var project = state.currentProject;
+    if (!project) return renderProjectsView();
+
+    var deployed = project.current_version != null;
+
+    var titleRow = h("div", { className: "detail-title-row" },
+      h("span", null, project.name),
+      project.url
+        ? h("a", {
+            className: "detail-url",
+            href: project.url,
+            target: "_blank",
+            rel: "noopener",
+          }, project.url)
+        : null
+    );
+
+    return h("div", { className: "app-layout" },
+      renderSidebar(),
+      h("div", { className: "main-area" },
+        h("div", { className: "topbar" },
+          h("div", { className: "topbar-title" }, titleRow),
+          h("div", { className: "topbar-actions" },
+            h("div", { className: "breadcrumb" },
+              h("button", {
+                className: "breadcrumb-link",
+                onClick: function() { navTo("projects"); },
+              }, "Projects"),
+              h("span", { className: "breadcrumb-sep" }, "/"),
+              h("span", { className: "breadcrumb-current" }, project.name)
+            )
+          )
         ),
-        h("div", { className: "modal-actions" },
-          h("button", {
-            className: "btn btn-secondary",
-            onClick: function() {
-              state.deleteConfirm = null;
-              render();
-            },
-          }, "Cancel"),
-          h("button", {
-            className: "btn btn-danger",
-            onClick: function() {
-              deleteProject(project.id);
-            },
-            disabled: state.loading ? "disabled" : null,
-          }, state.loading ? "Deleting..." : "Delete")
+        h("div", { className: "content" },
+          state.error ? h("div", { className: "error-banner" }, state.error) : null,
+          state.success ? h("div", { className: "success-banner" }, state.success) : null,
+          renderDeploySection(project),
+          renderSecretsSection(project),
+          renderLogsSection(project),
+          renderDangerZone(project)
         )
       )
     );
@@ -1633,95 +2168,94 @@ body {
   // --- Account View ---
 
   function renderAccountView() {
-    return h("div", null,
-      renderHeader(),
-      h("main", { className: "console" },
-        h("button", { className: "back-link", onClick: function() {
-          state.view = "console";
-          state.error = null;
-          state.success = null;
-          state.accountError = null;
-          state.accountSuccess = null;
-          state.revealedToken = null;
-          render();
-          loadProjects();
-        }}, "< Projects"),
-
-        h("div", { className: "console-title", style: "margin-bottom: 24px" }, "Account"),
-
-        state.accountError ? h("div", { className: "error-banner" }, state.accountError) : null,
-        state.accountSuccess ? h("div", { className: "success-banner" }, state.accountSuccess) : null,
-
-        // Email
-        h("div", { className: "section" },
-          h("div", { className: "account-field" },
-            h("div", { className: "account-label" }, "Email"),
-            h("div", { className: "account-value" }, state.email || "")
-          )
+    return h("div", { className: "app-layout" },
+      renderSidebar(),
+      h("div", { className: "main-area" },
+        h("div", { className: "topbar" },
+          h("div", { className: "topbar-title" }, "Account")
         ),
+        h("div", { className: "content" },
+          state.accountError ? h("div", { className: "error-banner" }, state.accountError) : null,
+          state.accountSuccess ? h("div", { className: "success-banner" }, state.accountSuccess) : null,
 
-        // API Token
-        h("div", { className: "section" },
-          h("div", { className: "section-title" }, "API Token"),
-          h("div", { className: "section-desc" }, "Generate a new API token. This will replace your current token."),
-          state.revealedToken
-            ? h("div", { className: "token-reveal" },
-                h("div", { className: "token-label" }, "Your new API token:"),
-                h("code", { className: "token-value" }, state.revealedToken),
-                h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
-                  navigator.clipboard.writeText(state.revealedToken);
-                  this.textContent = "Copied";
-                  var btn = this;
-                  setTimeout(function() { btn.textContent = "Copy"; }, 2000);
-                }}, "Copy"),
-                h("div", { className: "token-warning" },
-                  "Save this token somewhere safe. Your previous token is no longer valid."
+          // Profile
+          h("div", { className: "card" },
+            h("div", { className: "card-static" },
+              h("div", { className: "card-title", style: "margin-bottom: 14px" }, "Profile"),
+              h("div", { className: "account-field-label" }, "Email"),
+              h("div", { className: "account-field-value" }, state.email || "")
+            )
+          ),
+
+          // API Token
+          h("div", { className: "card" },
+            h("div", { className: "card-static" },
+              h("div", { className: "card-title", style: "margin-bottom: 14px" }, "API Token"),
+              h("div", { className: "section-desc", style: "margin-bottom: 14px" },
+                "Generate a new API token. This will replace your current token."
+              ),
+              state.revealedToken
+                ? h("div", null,
+                    h("div", { className: "token-label" }, "Your new API token"),
+                    h("code", { className: "token-value" }, state.revealedToken),
+                    h("button", { className: "copy-btn", onClick: function() {
+                      navigator.clipboard.writeText(state.revealedToken);
+                      this.textContent = "Copied";
+                      var btn = this;
+                      setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+                    }}, "Copy"),
+                    h("div", { className: "token-warning" },
+                      "This token provides full API access. Keep it safe. Your previous token is no longer valid."
+                    )
+                  )
+                : h("button", {
+                    className: "btn btn-secondary",
+                    disabled: state.accountLoading ? "disabled" : null,
+                    onClick: generateToken,
+                  }, state.accountLoading ? "Generating..." : "Generate New Token")
+            )
+          ),
+
+          // Change Password
+          h("div", { className: "card" },
+            h("div", { className: "card-static" },
+              h("div", { className: "card-title", style: "margin-bottom: 14px" }, "Change Password"),
+              h("form", { className: "account-form", onSubmit: function(e) {
+                e.preventDefault();
+                var inputs = e.target.querySelectorAll("input");
+                var current = inputs[0].value;
+                var next = inputs[1].value;
+                if (current && next) {
+                  changePassword(current, next);
+                  inputs[0].value = "";
+                  inputs[1].value = "";
+                }
+              }},
+                h("input", {
+                  className: "input",
+                  type: "password",
+                  placeholder: "Current password",
+                  required: "required",
+                  autocomplete: "current-password",
+                  disabled: state.accountLoading ? "disabled" : null,
+                }),
+                h("input", {
+                  className: "input",
+                  type: "password",
+                  placeholder: "New password (8+ characters)",
+                  required: "required",
+                  minlength: "8",
+                  autocomplete: "new-password",
+                  disabled: state.accountLoading ? "disabled" : null,
+                }),
+                h("div", null,
+                  h("button", {
+                    className: "btn btn-primary",
+                    type: "submit",
+                    disabled: state.accountLoading ? "disabled" : null,
+                  }, state.accountLoading ? "Updating..." : "Update Password")
                 )
               )
-            : h("button", {
-                className: "btn btn-secondary",
-                disabled: state.accountLoading ? "disabled" : null,
-                onClick: generateToken,
-              }, state.accountLoading ? "Generating..." : "Generate New Token")
-        ),
-
-        // Change Password
-        h("div", { className: "section" },
-          h("div", { className: "section-title" }, "Change Password"),
-          h("form", { className: "account-form", onSubmit: function(e) {
-            e.preventDefault();
-            var inputs = e.target.querySelectorAll("input");
-            var current = inputs[0].value;
-            var next = inputs[1].value;
-            if (current && next) {
-              changePassword(current, next);
-              inputs[0].value = "";
-              inputs[1].value = "";
-            }
-          }},
-            h("input", {
-              className: "input",
-              type: "password",
-              placeholder: "Current password",
-              required: "required",
-              autocomplete: "current-password",
-              disabled: state.accountLoading ? "disabled" : null,
-            }),
-            h("input", {
-              className: "input",
-              type: "password",
-              placeholder: "New password (8+ characters)",
-              required: "required",
-              minlength: "8",
-              autocomplete: "new-password",
-              disabled: state.accountLoading ? "disabled" : null,
-            }),
-            h("div", null,
-              h("button", {
-                className: "btn btn-primary",
-                type: "submit",
-                disabled: state.accountLoading ? "disabled" : null,
-              }, state.accountLoading ? "Updating..." : "Update Password")
             )
           )
         )
@@ -1749,21 +2283,21 @@ body {
       case "token-reveal":
         view = renderTokenRevealScreen();
         break;
-      case "console":
-        view = renderProjectList();
+      case "projects":
+        view = renderProjectsView();
         break;
       case "project-detail":
-        view = renderProjectDetail();
+        view = renderProjectDetailView();
         break;
       case "account":
         view = renderAccountView();
         break;
       default:
-        view = renderProjectList();
+        view = renderProjectsView();
     }
     app.appendChild(view);
 
-    // Auto-focus first input in view
+    // Auto-focus first visible input
     var firstInput = app.querySelector("input:not([disabled])");
     if (firstInput && document.activeElement && !document.activeElement.matches("input")) {
       firstInput.focus();
