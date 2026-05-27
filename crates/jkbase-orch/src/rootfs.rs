@@ -74,13 +74,22 @@ fi
 
 MOUNT_DIR=$(mktemp -d)
 
-# Size: content + preserved data + overhead (minimum 4MB)
+# Size: content + preserved data + volume headroom + overhead
 CONTENT_SIZE_KB=$(du -sk "{content}/" | cut -f1)
 DATA_SIZE_KB=0
 if [ -n "$DATA_BACKUP" ]; then
     DATA_SIZE_KB=$(du -sk "$DATA_BACKUP/" | cut -f1)
 fi
-TOTAL_KB=$(( CONTENT_SIZE_KB + DATA_SIZE_KB ))
+# Add 256MB headroom for volume data if server manifests declare volumes
+HAS_VOLUMES=0
+if ls "{content}"/_servers/*.json 2>/dev/null | xargs grep -l '"volumes"' 2>/dev/null | grep -q .; then
+    HAS_VOLUMES=1
+fi
+VOLUME_HEADROOM_KB=0
+if [ "$HAS_VOLUMES" -eq 1 ]; then
+    VOLUME_HEADROOM_KB=262144
+fi
+TOTAL_KB=$(( CONTENT_SIZE_KB + DATA_SIZE_KB + VOLUME_HEADROOM_KB ))
 OVERHEAD=$(( TOTAL_KB / 10 ))
 if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
 SIZE_KB=$(( TOTAL_KB + OVERHEAD ))
