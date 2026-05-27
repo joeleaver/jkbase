@@ -343,6 +343,7 @@ fn spawn_server(
     std_cmd.env_clear();
     std_cmd.env("PORT", manifest.port.to_string());
     std_cmd.env("HOME", "/root");
+    std_cmd.env("HOSTNAME", "0.0.0.0");
     std_cmd.env(
         "PATH",
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
