@@ -137,6 +137,7 @@ pub struct InitResponse {
 #[derive(Deserialize)]
 pub struct RegisterRequest {
     pub email: String,
+    #[serde(default)]
     pub password: String,
 }
 
