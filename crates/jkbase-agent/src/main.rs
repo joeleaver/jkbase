@@ -330,6 +330,14 @@ async fn handle_request(
         return Ok(health_response(&state).await);
     }
 
+    if path == "/_jkbase/sync" {
+        unsafe { libc::sync() };
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(Bytes::from("{\"synced\":true}")))
+            .unwrap());
+    }
+
     if path == "/_jkbase/logs" || path.starts_with("/_jkbase/logs?") {
         return Ok(logs_response(&state, &req).await);
     }

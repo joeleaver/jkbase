@@ -350,7 +350,10 @@ async fn handle_deploy(
     }
 
     if let Some(mut old_vm) = plat.vms.remove(project_id) {
-        info!(project = %project_id, "stopping old VM for redeploy");
+        info!(project = %project_id, "syncing and stopping old VM for redeploy");
+        if let Ok(Some(alloc)) = plat.store.get_vm_allocation(project_id) {
+            let _ = sync_agent(&alloc.ip).await;
+        }
         old_vm.stop().await?;
     }
 
@@ -792,6 +795,20 @@ fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
         }
     }
     false
+}
+
+async fn sync_agent(ip: &str) -> Result<()> {
+    if let Ok(stream) = tokio::net::TcpStream::connect(format!("{ip}:80")).await {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        if let Ok((mut sender, conn)) = hyper::client::conn::http1::handshake(io).await {
+            tokio::spawn(conn);
+            let req = hyper::Request::builder()
+                .uri(format!("http://{ip}:80/_jkbase/sync"))
+                .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
+            let _ = sender.send_request(req).await;
+        }
+    }
+    Ok(())
 }
 
 async fn wait_for_agent(ip: &str) -> Result<()> {

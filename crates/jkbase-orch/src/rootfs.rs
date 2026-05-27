@@ -95,7 +95,7 @@ if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
 SIZE_KB=$(( TOTAL_KB + OVERHEAD ))
 
 dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
-mkfs.ext4 -F -q -m 0 -O ^has_journal "$IMAGE"
+mkfs.ext4 -F -q -m 1 "$IMAGE"
 mount -o loop "$IMAGE" "$MOUNT_DIR"
 
 cp -a "{content}"/. "$MOUNT_DIR/"
