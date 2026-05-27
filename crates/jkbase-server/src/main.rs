@@ -618,6 +618,17 @@ async fn wake_project(
                 Ok(vm) => vm,
                 Err(e) => {
                     tracing::warn!(project = %project_id, error = %e, "snapshot restore failed, cold booting");
+                    // Clean up the failed restore's Firecracker process and socket
+                    let failed_sock = runtime_dir.join(project_id).join("firecracker.sock");
+                    if failed_sock.exists() {
+                        let _ = tokio::fs::remove_file(&failed_sock).await;
+                    }
+                    // Kill any leftover Firecracker for this project
+                    let _ = tokio::process::Command::new("pkill")
+                        .args(["-f", &format!("firecracker.*{project_id}")])
+                        .status()
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     VmInstance::start(project_id, &config, &runtime_dir).await?
                 }
             }
