@@ -62,7 +62,7 @@ fi
 MOUNT_DIR=$(mktemp -d)
 
 # Size the image to fit the content (minimum 4MB, 10% overhead for ext4 metadata)
-CONTENT_SIZE_KB=$(du -skL "{content}" | cut -f1)
+CONTENT_SIZE_KB=$(du -sk "{content}/" | cut -f1)
 OVERHEAD=$(( CONTENT_SIZE_KB / 10 ))
 if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
 SIZE_KB=$(( CONTENT_SIZE_KB + OVERHEAD ))
@@ -71,7 +71,7 @@ dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
 mkfs.ext4 -F -q -m 0 -O ^has_journal "$IMAGE"
 mount -o loop "$IMAGE" "$MOUNT_DIR"
 
-cp -r "{content}"/. "$MOUNT_DIR/"
+cp -a "{content}"/. "$MOUNT_DIR/"
 
 umount "$MOUNT_DIR"
 rmdir "$MOUNT_DIR"
