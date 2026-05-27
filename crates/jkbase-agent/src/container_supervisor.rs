@@ -125,12 +125,9 @@ impl ContainerSupervisor {
                 info!(server = %name, "using pre-extracted rootfs (read-only)");
                 pre_extracted
             } else if pre_extracted.is_dir() && has_volumes {
-                // Copy to tmpfs so volume mount points can be created
-                let writable = self.extract_dir.join(&name);
-                info!(server = %name, "copying rootfs to tmpfs for writable volume mounts");
-                let _ = std::fs::remove_dir_all(&writable);
-                copy_dir(&pre_extracted, &writable)?;
-                writable
+                remount_rw("/srv/www");
+                info!(server = %name, "using pre-extracted rootfs (remounted rw for volume mounts)");
+                pre_extracted
             } else if tarball.exists() {
                 let extract_to = self.extract_dir.join(&name);
                 info!(server = %name, "extracting server rootfs to tmpfs");
@@ -282,21 +279,27 @@ impl ContainerSupervisor {
     }
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &target)?;
-        } else if entry.file_type()?.is_symlink() {
-            let link = std::fs::read_link(entry.path())?;
-            let _ = std::os::unix::fs::symlink(link, &target);
-        } else {
-            std::fs::copy(entry.path(), &target)?;
-        }
+fn remount_rw(target: &str) {
+    use std::ffi::CString;
+    use std::ptr;
+
+    let tgt = CString::new(target).unwrap();
+    let ret = unsafe {
+        libc::mount(
+            ptr::null(),
+            tgt.as_ptr(),
+            ptr::null(),
+            libc::MS_REMOUNT,
+            ptr::null(),
+        )
+    };
+    if ret != 0 {
+        tracing::warn!(
+            target = target,
+            error = %std::io::Error::last_os_error(),
+            "remount rw failed"
+        );
     }
-    Ok(())
 }
 
 fn extract_tarball(tarball: &Path, target: &Path) -> Result<()> {
