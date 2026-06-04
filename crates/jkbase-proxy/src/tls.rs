@@ -123,6 +123,11 @@ impl CertManager {
         self.challenges.read().await.get(token).cloned()
     }
 
+    /// Whether a per-host certificate has been issued and loaded for `host`.
+    pub fn has_cert(&self, host: &str) -> bool {
+        self.resolver.hosts.read().unwrap().contains_key(host)
+    }
+
     /// Provision/renew the wildcard cert if missing or near expiry, and load it
     /// into the resolver.
     async fn ensure_wildcard(&self) -> Result<()> {

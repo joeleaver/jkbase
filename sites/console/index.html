@@ -2082,18 +2082,33 @@ body {
 
   // --- Domains ---
 
-  function loadDomains(projectId) {
-    state.domainsLoading = true;
-    render();
+  function loadDomains(projectId, silent) {
+    if (!silent) {
+      state.domainsLoading = true;
+      render();
+    }
     api("GET", "/projects/" + projectId + "/domains").then(function(domains) {
-      state.domains = domains;
+      state.domains = domains || [];
       state.domainsLoading = false;
       render();
     }).catch(function(e) {
       state.domainsLoading = false;
-      state.error = e.message;
+      if (!silent) { state.error = e.message; }
       render();
     });
+  }
+
+  // Poll quietly while any custom domain's cert is still provisioning so the
+  // HTTPS indicator flips to active without a manual refresh.
+  function startDomainPollLoop() {
+    setInterval(function() {
+      if (state.view === "console" &&
+          state.projectTab === "domains" &&
+          state.currentProject &&
+          state.domains.some(function(d) { return d.tls === "provisioning"; })) {
+        loadDomains(state.currentProject.id, true);
+      }
+    }, 8000);
   }
 
   function addDomain(projectId, domain, site) {
@@ -2858,12 +2873,20 @@ body {
     var label = isCustom ? d.host : d.host + ".jkbase.app";
     var busy = state.domainBusy === d.host;
 
+    var tlsChip = null;
+    if (d.tls === "active") {
+      tlsChip = h("span", { className: "badge badge-active" }, "HTTPS");
+    } else if (d.tls === "provisioning") {
+      tlsChip = h("span", { className: "badge badge-pending" }, "HTTPS provisioning");
+    }
+
     var head = h("div", { className: "domain-head" },
       h("a", { className: "domain-host", href: href, target: "_blank", rel: "noopener" }, label),
       h("span", { className: "badge" }, d.kind),
       d.status === "active"
         ? h("span", { className: "badge badge-active" }, "active")
         : h("span", { className: "badge badge-pending" }, "pending verification"),
+      tlsChip,
       d.site ? h("span", { className: "domain-site" }, "site ", h("code", null, d.site)) : null,
       h("span", { className: "domain-spacer" }),
       h("div", { className: "domain-actions" },
@@ -2897,8 +2920,10 @@ body {
           err
         )
       );
-    } else if (d.status === "active" && isCustom) {
-      challenge = h("div", { className: "domain-hint" }, "HTTPS is provisioned automatically once this domain points at the platform.");
+    } else if (d.tls === "provisioning") {
+      challenge = h("div", { className: "domain-hint" },
+        "Point this domain's A record at the platform — an HTTPS certificate is issued automatically (usually within a few minutes)."
+      );
     }
 
     return h("div", { className: "domain-item" }, head, challenge);
@@ -3583,6 +3608,7 @@ body {
   // --- Init ---
 
   startLogTailLoop();
+  startDomainPollLoop();
 
   if (state.token) {
     state.view = "loading";

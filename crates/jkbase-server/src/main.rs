@@ -179,11 +179,13 @@ async fn main() -> Result<()> {
     state.domain_map = Some(domain_map.clone());
     state.platform_domain = args.domain.clone();
     if let Some(ref cm) = cert_manager {
-        let cm = cm.clone();
+        let cm_req = cm.clone();
         state.cert_request = Some(Arc::new(move |host: String| {
-            let cm = cm.clone();
+            let cm = cm_req.clone();
             tokio::spawn(async move { cm.ensure_cert(&host).await });
         }));
+        let cm_status = cm.clone();
+        state.cert_status = Some(Arc::new(move |host: &str| cm_status.has_cert(host)));
     }
 
     let platform_for_cb = platform.clone();

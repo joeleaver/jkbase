@@ -33,6 +33,8 @@ pub type DomainMap = Arc<tokio::sync::RwLock<std::collections::HashMap<String, D
 /// Fire-and-forget request to (proactively) issue a TLS cert for a verified
 /// custom domain. Wired by the server to the proxy's CertManager.
 pub type CertRequest = Arc<dyn Fn(String) + Send + Sync>;
+/// Query whether a per-host TLS cert has been issued for a custom domain.
+pub type CertStatusFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 pub struct AppState {
     pub store: Store,
@@ -42,6 +44,7 @@ pub struct AppState {
     pub routing_table: Option<RoutingTable>,
     pub domain_map: Option<DomainMap>,
     pub cert_request: Option<CertRequest>,
+    pub cert_status: Option<CertStatusFn>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     deploy_locks: Mutex<std::collections::HashSet<String>>,
@@ -82,6 +85,7 @@ impl AppState {
             routing_table: None,
             domain_map: None,
             cert_request: None,
+            cert_status: None,
             platform_domain: "jkbase.app".to_string(),
             deploy_locks: Mutex::new(std::collections::HashSet::new()),
         }
@@ -1370,6 +1374,9 @@ struct DomainResponse {
     site: Option<String>,
     /// DNS TXT challenge the user must publish to verify a custom domain.
     verification: Option<DomainChallenge>,
+    /// HTTPS status: `active` (cert serving), `provisioning` (verified custom
+    /// domain awaiting issuance), or `None` (not applicable / unverified).
+    tls: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1378,23 +1385,42 @@ struct DomainChallenge {
     value: String,
 }
 
-impl DomainResponse {
-    fn from_record(r: crate::store::DomainRecord) -> Self {
-        let verification = if r.kind == DomainKind::Custom && r.status == DomainStatus::Pending {
-            Some(DomainChallenge {
-                record: format!("_jkbase-challenge.{}", r.host),
-                value: r.token.clone(),
-            })
-        } else {
-            None
-        };
-        DomainResponse {
-            host: r.host,
-            kind: r.kind,
-            status: r.status,
-            site: r.site,
-            verification,
+/// HTTPS state for a domain. Subdomains are covered by the wildcard cert;
+/// custom domains get a per-host cert issued after verification.
+fn tls_status(state: &AppState, r: &crate::store::DomainRecord) -> Option<String> {
+    if r.status != DomainStatus::Active {
+        return None;
+    }
+    match r.kind {
+        DomainKind::Subdomain => Some("active".to_string()),
+        DomainKind::Custom => {
+            let has_cert = state
+                .cert_status
+                .as_ref()
+                .map(|f| f(&r.host))
+                .unwrap_or(false);
+            Some(if has_cert { "active" } else { "provisioning" }.to_string())
         }
+    }
+}
+
+fn domain_response(state: &AppState, r: crate::store::DomainRecord) -> DomainResponse {
+    let verification = if r.kind == DomainKind::Custom && r.status == DomainStatus::Pending {
+        Some(DomainChallenge {
+            record: format!("_jkbase-challenge.{}", r.host),
+            value: r.token.clone(),
+        })
+    } else {
+        None
+    };
+    let tls = tls_status(state, &r);
+    DomainResponse {
+        host: r.host,
+        kind: r.kind,
+        status: r.status,
+        site: r.site,
+        verification,
+        tls,
     }
 }
 
@@ -1408,8 +1434,10 @@ async fn list_domains(
     }
     match state.store.list_domains_for_project(&id) {
         Ok(list) => {
-            let resp: Vec<DomainResponse> =
-                list.into_iter().map(DomainResponse::from_record).collect();
+            let resp: Vec<DomainResponse> = list
+                .into_iter()
+                .map(|r| domain_response(&state, r))
+                .collect();
             Json(resp).into_response()
         }
         Err(e) => internal_error(e),
@@ -1502,7 +1530,7 @@ async fn add_domain(
     }
     let _ = refresh_domain_cache(&state, &id);
     info!(project = %id, host = %host, ?status, "domain claimed");
-    Json(DomainResponse::from_record(record)).into_response()
+    Json(domain_response(&state, record)).into_response()
 }
 
 async fn verify_domain(
@@ -1517,7 +1545,7 @@ async fn verify_domain(
     };
 
     if record.status == DomainStatus::Active {
-        return Json(DomainResponse::from_record(record)).into_response();
+        return Json(domain_response(&state, record)).into_response();
     }
 
     if !dns_txt_contains(&record.host, &record.token).await {
@@ -1544,7 +1572,7 @@ async fn verify_domain(
         req(record.host.clone());
     }
     info!(project = %id, host = %record.host, "custom domain verified");
-    Json(DomainResponse::from_record(record)).into_response()
+    Json(domain_response(&state, record)).into_response()
 }
 
 async fn remove_domain(
