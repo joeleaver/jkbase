@@ -30,6 +30,9 @@ pub type DeployCallback = Box<
 pub type RoutingTable = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
 /// host-key → owner/site, mirror of all Active domains (see jkbase-proxy::DomainMap).
 pub type DomainMap = Arc<tokio::sync::RwLock<std::collections::HashMap<String, DomainTarget>>>;
+/// Fire-and-forget request to (proactively) issue a TLS cert for a verified
+/// custom domain. Wired by the server to the proxy's CertManager.
+pub type CertRequest = Arc<dyn Fn(String) + Send + Sync>;
 
 pub struct AppState {
     pub store: Store,
@@ -38,6 +41,7 @@ pub struct AppState {
     pub deploy_callback: Option<DeployCallback>,
     pub routing_table: Option<RoutingTable>,
     pub domain_map: Option<DomainMap>,
+    pub cert_request: Option<CertRequest>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     deploy_locks: Mutex<std::collections::HashSet<String>>,
@@ -77,6 +81,7 @@ impl AppState {
             deploy_callback: None,
             routing_table: None,
             domain_map: None,
+            cert_request: None,
             platform_domain: "jkbase.app".to_string(),
             deploy_locks: Mutex::new(std::collections::HashSet::new()),
         }
@@ -1534,6 +1539,10 @@ async fn verify_domain(
     }
     activate_domain(&state, &record).await;
     let _ = refresh_domain_cache(&state, &id);
+    // Proactively request a TLS cert for the now-verified custom domain.
+    if let (DomainKind::Custom, Some(req)) = (record.kind, &state.cert_request) {
+        req(record.host.clone());
+    }
     info!(project = %id, host = %record.host, "custom domain verified");
     Json(DomainResponse::from_record(record)).into_response()
 }

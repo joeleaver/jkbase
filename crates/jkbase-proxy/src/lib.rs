@@ -48,7 +48,7 @@ pub struct ProxyConfig {
     pub http_port: u16,
     pub https_port: Option<u16>,
     pub platform_domain: String,
-    pub tls_config: Option<tls::TlsConfig>,
+    pub cert_manager: Option<Arc<tls::CertManager>>,
     pub api_addr: Option<String>,
     pub domains: Option<DomainMap>,
     pub activity_tracker: Option<ActivityTracker>,
@@ -74,9 +74,10 @@ pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
         wake_cb: config.wake_callback,
     });
 
-    if let (Some(https_port), Some(tls_cfg)) = (config.https_port, &config.tls_config) {
-        let rustls_config = tls::load_or_provision_tls(tls_cfg).await?;
-        let acceptor = TlsAcceptor::from(rustls_config);
+    if let (Some(https_port), Some(cert_manager)) = (config.https_port, config.cert_manager.clone())
+    {
+        let acceptor = TlsAcceptor::from(cert_manager.server_config());
+        cert_manager.spawn_reconcile();
 
         let shared_tls = shared.clone();
         tokio::spawn(async move {
@@ -85,7 +86,7 @@ pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
             }
         });
 
-        serve_http_redirect(config.http_port, shared.domain.clone()).await
+        serve_http_redirect(config.http_port, shared.domain.clone(), cert_manager).await
     } else {
         serve_http(config.http_port, shared).await
     }
@@ -135,30 +136,49 @@ async fn serve_https(port: u16, acceptor: TlsAcceptor, shared: Arc<SharedState>)
     }
 }
 
-async fn serve_http_redirect(port: u16, domain: Arc<String>) -> Result<()> {
+async fn serve_http_redirect(
+    port: u16,
+    domain: Arc<String>,
+    cert_manager: Arc<tls::CertManager>,
+) -> Result<()> {
+    const ACME_PREFIX: &str = "/.well-known/acme-challenge/";
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "HTTP->HTTPS redirect listening");
+    info!(%addr, "HTTP->HTTPS redirect listening (with ACME HTTP-01)");
 
     loop {
         let (stream, _peer) = listener.accept().await?;
         let domain = domain.clone();
+        let cm = cert_manager.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
-                let host = req
-                    .headers()
-                    .get("host")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or(&domain)
-                    .to_string();
-                let path = req
-                    .uri()
-                    .path_and_query()
-                    .map(|pq| pq.as_str())
-                    .unwrap_or("/");
-                let location = format!("https://{host}{path}");
+                let domain = domain.clone();
+                let cm = cm.clone();
                 async move {
+                    let path = req.uri().path().to_string();
+                    // Answer ACME HTTP-01 challenges instead of redirecting them.
+                    if let Some(token) = path.strip_prefix(ACME_PREFIX) {
+                        return Ok::<_, hyper::Error>(match cm.challenge_response(token).await {
+                            Some(body) => Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "text/plain")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                            None => Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        });
+                    }
+                    let host = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or(&domain)
+                        .to_string();
+                    let pq = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                    let location = format!("https://{host}{pq}");
                     Ok::<_, hyper::Error>(
                         Response::builder()
                             .status(StatusCode::MOVED_PERMANENTLY)

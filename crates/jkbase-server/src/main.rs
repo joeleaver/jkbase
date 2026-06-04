@@ -10,6 +10,7 @@ use jkbase_control::store::{
 use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
+use jkbase_proxy::tls::CertManager;
 use jkbase_proxy::{
     self, new_domain_map, new_routing_table, ActivityTracker, DomainMap, DomainTarget, ProxyConfig,
 };
@@ -60,6 +61,10 @@ struct Args {
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
+
+    /// Use the Let's Encrypt staging environment (untrusted certs; avoids prod rate limits)
+    #[arg(long)]
+    acme_staging: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,10 +147,44 @@ async fn main() -> Result<()> {
         data_dir: data_dir.clone(),
     }));
 
+    // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
+    // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
+    let cert_manager: Option<Arc<CertManager>> = if args.tls {
+        let cf_token = args
+            .cloudflare_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--cloudflare-token required when --tls is enabled"))?;
+        let cf_zone = args
+            .cloudflare_zone_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--cloudflare-zone-id required when --tls is enabled"))?;
+        let acme_email = args
+            .acme_email
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--acme-email required when --tls is enabled"))?;
+        let tls_config = jkbase_proxy::tls::TlsConfig {
+            domain: args.domain.clone(),
+            cert_dir: data_dir.join("certs"),
+            cloudflare_token: cf_token,
+            cloudflare_zone_id: cf_zone,
+            acme_email,
+        };
+        Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
+    } else {
+        None
+    };
+
     let mut state = AppState::new(store, log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
     state.domain_map = Some(domain_map.clone());
     state.platform_domain = args.domain.clone();
+    if let Some(ref cm) = cert_manager {
+        let cm = cm.clone();
+        state.cert_request = Some(Arc::new(move |host: String| {
+            let cm = cm.clone();
+            tokio::spawn(async move { cm.ensure_cert(&host).await });
+        }));
+    }
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();
@@ -161,27 +200,6 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
-
-    let tls_config = if args.tls {
-        let cf_token = args
-            .cloudflare_token
-            .ok_or_else(|| anyhow::anyhow!("--cloudflare-token required when --tls is enabled"))?;
-        let cf_zone = args
-            .cloudflare_zone_id
-            .ok_or_else(|| anyhow::anyhow!("--cloudflare-zone-id required when --tls is enabled"))?;
-        let acme_email = args
-            .acme_email
-            .ok_or_else(|| anyhow::anyhow!("--acme-email required when --tls is enabled"))?;
-        Some(jkbase_proxy::tls::TlsConfig {
-            domain: args.domain.clone(),
-            cert_dir: data_dir.join("certs"),
-            cloudflare_token: cf_token,
-            cloudflare_zone_id: cf_zone,
-            acme_email,
-        })
-    } else {
-        None
-    };
 
     // Set up wake callback for the proxy
     let platform_for_wake = platform.clone();
@@ -202,7 +220,7 @@ async fn main() -> Result<()> {
         http_port: args.proxy_port,
         https_port: if args.tls { Some(args.https_port) } else { None },
         platform_domain: args.domain,
-        tls_config,
+        cert_manager: cert_manager.clone(),
         api_addr: Some(api_addr),
         domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
