@@ -351,6 +351,19 @@ async fn handle_request(
         }
     }
 
+    // Host-bound site: the proxy sets X-Jkbase-Site (stripped from inbound, so
+    // trusted) when the request's hostname maps to a specific site. Serve that
+    // site's whole tree.
+    if let Some(site_name) = req
+        .headers()
+        .get("x-jkbase-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(site) = state.sites.iter().find(|s| s.name == site_name) {
+            return static_server::handle_static_with_path(&site.root, &path, site.spa).await;
+        }
+    }
+
     // Multi-site routing: find the best matching site by prefix
     if !state.sites.is_empty() {
         for site in &state.sites {

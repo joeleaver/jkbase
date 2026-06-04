@@ -69,6 +69,10 @@ pub struct SiteConfig {
     pub public: String,
     pub spa: Option<bool>,
     pub prefix: Option<String>,
+    /// Optional hostname binding: a bare label (`docs` → `docs.jkbase.app`) or a
+    /// full custom domain (`docs.example.com`). When set, this site is served on
+    /// that host rather than (only) by path prefix.
+    pub domain: Option<String>,
 }
 
 impl ProjectConfig {
@@ -101,6 +105,7 @@ impl ProjectConfig {
                 public: site.public.clone(),
                 spa: site.spa.unwrap_or(false),
                 prefix: site.prefix.clone().unwrap_or_else(|| "/".to_string()),
+                domain: site.domain.clone(),
             });
         }
 
@@ -121,6 +126,7 @@ impl ProjectConfig {
                 public,
                 spa,
                 prefix: "/".to_string(),
+                domain: None,
             });
         }
 
@@ -136,4 +142,39 @@ pub struct ResolvedSite {
     pub public: String,
     pub spa: bool,
     pub prefix: String,
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn site_domain_round_trips_and_resolves() {
+        let toml = r#"
+            [project]
+            name = "demo"
+            [sites.docs]
+            public = "./docs"
+            domain = "docs"
+            [sites.blog]
+            public = "./blog"
+            domain = "blog.example.com"
+            spa = true
+        "#;
+        let cfg: ProjectConfig = toml::from_str(toml).unwrap();
+        let sites = cfg.resolved_sites();
+        let docs = sites.iter().find(|s| s.name == "docs").unwrap();
+        assert_eq!(docs.domain.as_deref(), Some("docs"));
+        let blog = sites.iter().find(|s| s.name == "blog").unwrap();
+        assert_eq!(blog.domain.as_deref(), Some("blog.example.com"));
+        assert!(blog.spa);
+
+        // Round-trips through the _sites.json wire format.
+        let json = serde_json::to_string(&sites).unwrap();
+        let back: Vec<ResolvedSite> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().any(|s| s.domain.as_deref() == Some("docs")));
+    }
 }

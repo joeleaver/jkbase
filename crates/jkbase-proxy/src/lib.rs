@@ -7,7 +7,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -18,14 +18,29 @@ use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
 
+/// Running backends: host-key → VM IP (fast path; only entries for live VMs).
 pub type RoutingTable = Arc<RwLock<HashMap<String, String>>>;
-pub type KnownProjects = Arc<RwLock<HashSet<String>>>;
 pub type ActivityTracker = Arc<RwLock<HashMap<String, Instant>>>;
 pub type WakeCallback = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync,
 >;
 
+pub use jkbase_common::routing::DomainTarget;
+
+/// All Active domains (running or hibernated): host-key → target. This is the
+/// authority for "does this host exist + who owns it + which site", independent
+/// of whether the VM is currently up. Maintained by the control plane.
+pub type DomainMap = Arc<RwLock<HashMap<String, DomainTarget>>>;
+
+/// Header the proxy uses to tell the agent which site to serve. Always stripped
+/// from inbound requests and set only by the proxy, so it can't be spoofed.
+pub const SITE_HEADER: &str = "x-jkbase-site";
+
 pub fn new_routing_table() -> RoutingTable {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+pub fn new_domain_map() -> DomainMap {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
@@ -35,7 +50,7 @@ pub struct ProxyConfig {
     pub platform_domain: String,
     pub tls_config: Option<tls::TlsConfig>,
     pub api_addr: Option<String>,
-    pub known_projects: Option<KnownProjects>,
+    pub domains: Option<DomainMap>,
     pub activity_tracker: Option<ActivityTracker>,
     pub wake_callback: Option<WakeCallback>,
 }
@@ -44,7 +59,7 @@ struct SharedState {
     routes: RoutingTable,
     domain: Arc<String>,
     api_addr: Arc<Option<String>>,
-    known_projects: Option<KnownProjects>,
+    domains: Option<DomainMap>,
     activity: Option<ActivityTracker>,
     wake_cb: Option<WakeCallback>,
 }
@@ -54,7 +69,7 @@ pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
         routes,
         domain: Arc::new(config.platform_domain),
         api_addr: Arc::new(config.api_addr),
-        known_projects: config.known_projects,
+        domains: config.domains,
         activity: config.activity_tracker,
         wake_cb: config.wake_callback,
     });
@@ -173,7 +188,7 @@ async fn proxy_request(
     let hostname = host.split(':').next().unwrap_or("");
     let subdomain = extract_subdomain(hostname, &shared.domain);
 
-    // Route api.{domain} to the control plane
+    // Route api.{domain} to the control plane (infra, never a tenant project).
     if subdomain.as_deref() == Some("api") {
         if let Some(ref addr) = *shared.api_addr {
             return match forward_to_api(addr, req).await {
@@ -186,26 +201,39 @@ async fn proxy_request(
         }
     }
 
-    let project_id = match subdomain.as_deref() {
-        None => "www".to_string(),
-        Some("www") => "www".to_string(),
+    // Host-key: bare apex/www both resolve to the "www" landing project.
+    let host_key = match subdomain.as_deref() {
+        None | Some("www") => "www".to_string(),
         Some(sub) => sub.to_string(),
     };
 
-    // Record activity for idle detection
+    // Resolve owner + site from the domain registry. A miss means the host is
+    // not claimed by anyone → 404 (this replaces the old known_projects check).
+    let target = if let Some(ref domains) = shared.domains {
+        domains.read().await.get(&host_key).cloned()
+    } else {
+        None
+    };
+    let Some(target) = target else {
+        return Ok(not_found(&host_key));
+    };
+    let project_id = target.project_id;
+    let site = target.site.as_deref();
+
+    // Record activity per project (the VM), not per host.
     if let Some(ref tracker) = shared.activity {
         let mut t = tracker.write().await;
         t.insert(project_id.clone(), Instant::now());
     }
 
-    // Fast path: VM is running, forward immediately
+    // Fast path: VM running. Routes are keyed by host-key too.
     let backend_ip = {
         let table = shared.routes.read().await;
-        table.get(&project_id).cloned()
+        table.get(&host_key).cloned()
     };
 
     if let Some(ip) = backend_ip {
-        return match forward_request(&ip, req).await {
+        return match forward_request(&ip, site, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend request failed");
@@ -214,26 +242,14 @@ async fn proxy_request(
         };
     }
 
-    // Not in routing table. Is it a known project? (might be hibernated)
-    let is_known = if let Some(ref kp) = shared.known_projects {
-        let set = kp.read().await;
-        set.contains(&project_id)
-    } else {
-        false
-    };
-
-    if !is_known {
-        return Ok(not_found(&project_id));
-    }
-
-    // Known project but not running — wake it
+    // Known but not running — wake the owning project, then forward.
     let Some(ref cb) = shared.wake_cb else {
-        return Ok(not_found(&project_id));
+        return Ok(not_found(&host_key));
     };
 
-    info!(project = %project_id, "waking hibernated project");
+    info!(project = %project_id, host = %host_key, "waking hibernated project");
     match (cb)(project_id.clone()).await {
-        Ok(ip) => match forward_request(&ip, req).await {
+        Ok(ip) => match forward_request(&ip, site, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend failed after wake");
@@ -288,7 +304,8 @@ async fn forward_to_api(
 
     let mut builder = Request::builder().method(req.method()).uri(&uri);
     for (key, value) in req.headers() {
-        if key != "host" {
+        // Strip host and the trusted internal site header (anti-spoof).
+        if key != "host" && key.as_str().to_ascii_lowercase() != SITE_HEADER {
             builder = builder.header(key, value);
         }
     }
@@ -308,6 +325,7 @@ async fn forward_to_api(
 
 async fn forward_request(
     backend_ip: &str,
+    site: Option<&str>,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
     let path_and_query = req
@@ -324,7 +342,14 @@ async fn forward_request(
 
     let mut builder = Request::builder().method(req.method()).uri(&uri);
     for (key, value) in req.headers() {
-        builder = builder.header(key, value);
+        // Drop any inbound site header so a client can't pick the served site;
+        // the proxy is the sole authority for it.
+        if key.as_str().to_ascii_lowercase() != SITE_HEADER {
+            builder = builder.header(key, value);
+        }
+    }
+    if let Some(site) = site {
+        builder = builder.header(SITE_HEADER, site);
     }
     let proxy_req = builder.body(req.into_body()).unwrap();
 
@@ -374,5 +399,18 @@ mod tests {
             extract_subdomain("custom.example.com", "jkbase.app"),
             Some("custom.example.com".to_string())
         );
+    }
+
+    // The apex and "www" both map to the "www" landing project's host-key.
+    #[test]
+    fn host_key_normalizes_apex_and_www() {
+        let key = |h: &str| match extract_subdomain(h, "jkbase.app").as_deref() {
+            None | Some("www") => "www".to_string(),
+            Some(sub) => sub.to_string(),
+        };
+        assert_eq!(key("jkbase.app"), "www");
+        assert_eq!(key("www.jkbase.app"), "www");
+        assert_eq!(key("docs.jkbase.app"), "docs");
+        assert_eq!(key("docs.example.com"), "docs.example.com");
     }
 }

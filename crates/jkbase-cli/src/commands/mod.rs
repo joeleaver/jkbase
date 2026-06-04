@@ -117,14 +117,40 @@ pub enum SecretCommand {
 
 #[derive(Subcommand)]
 pub enum DomainCommand {
-    /// Add a custom domain
-    Add { domain: String },
-    /// Verify domain ownership
-    Verify { domain: String },
-    /// List custom domains
-    List,
-    /// Remove a custom domain
-    Rm { domain: String },
+    /// Attach a subdomain (`docs`) or custom domain (`docs.example.com`)
+    Add {
+        domain: String,
+        /// Bind this domain to a specific site within the project
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Verify ownership of a custom domain (after adding its DNS TXT record)
+    Verify {
+        domain: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// List attached domains and their status
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Remove an attached domain
+    Rm {
+        domain: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
 }
 
 fn resolve_project_id(project: Option<String>) -> anyhow::Result<String> {
@@ -212,24 +238,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             api,
         } => run_logs(follow, service, limit, json, project, api).await,
         Command::Secret(cmd) => run_secret(cmd).await,
-        Command::Domain(cmd) => match cmd {
-            DomainCommand::Add { domain } => {
-                println!("Adding domain {domain}...");
-                Ok(())
-            }
-            DomainCommand::Verify { domain } => {
-                println!("Verifying domain {domain}...");
-                Ok(())
-            }
-            DomainCommand::List => {
-                println!("Listing domains...");
-                Ok(())
-            }
-            DomainCommand::Rm { domain } => {
-                println!("Removing domain {domain}...");
-                Ok(())
-            }
-        },
+        Command::Domain(cmd) => run_domain(cmd).await,
         Command::Dev => {
             println!("Starting local development environment...");
             Ok(())
@@ -443,6 +452,125 @@ fn human_age(ts: u64) -> String {
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86400)
+    }
+}
+
+async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
+    match cmd {
+        DomainCommand::Add {
+            domain,
+            site,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let client = auth_client()?;
+            let resp = client
+                .post(format!("{api}/projects/{project_id}/domains"))
+                .json(&serde_json::json!({ "domain": domain, "site": site }))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            let body: serde_json::Value = api_json(resp).await?;
+            let host = body["host"].as_str().unwrap_or(&domain);
+            let status = body["status"].as_str().unwrap_or("");
+            if let Some(v) = body.get("verification").filter(|v| !v.is_null()) {
+                println!("Domain '{host}' added (pending verification).");
+                println!("Add this DNS record, then run `jkbase domain verify {host}`:");
+                println!(
+                    "  {}  TXT  {}",
+                    v["record"].as_str().unwrap_or(""),
+                    v["value"].as_str().unwrap_or("")
+                );
+            } else {
+                println!("Domain '{host}' added ({status}).");
+            }
+            Ok(())
+        }
+        DomainCommand::Verify {
+            domain,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let client = auth_client()?;
+            let resp = client
+                .post(format!("{api}/projects/{project_id}/domains/{domain}/verify"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            let body: serde_json::Value = api_json(resp).await?;
+            println!(
+                "Domain '{}' is now {}.",
+                body["host"].as_str().unwrap_or(&domain),
+                body["status"].as_str().unwrap_or("active")
+            );
+            Ok(())
+        }
+        DomainCommand::List { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let client = auth_client()?;
+            let resp = client
+                .get(format!("{api}/projects/{project_id}/domains"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            let domains: Vec<serde_json::Value> = api_json(resp).await?;
+            if domains.is_empty() {
+                println!("No domains attached to project '{project_id}'");
+                return Ok(());
+            }
+            for d in &domains {
+                let site = d["site"].as_str().map(|s| format!(" -> site {s}")).unwrap_or_default();
+                println!(
+                    "  {:<28} {:<8} {}{}",
+                    d["host"].as_str().unwrap_or(""),
+                    d["status"].as_str().unwrap_or(""),
+                    d["kind"].as_str().unwrap_or(""),
+                    site
+                );
+            }
+            Ok(())
+        }
+        DomainCommand::Rm {
+            domain,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let client = auth_client()?;
+            let resp = client
+                .delete(format!("{api}/projects/{project_id}/domains/{domain}"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            if resp.status().is_success() {
+                println!("Removed domain '{domain}' from '{project_id}'");
+                Ok(())
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                anyhow::bail!(
+                    "failed to remove domain: {}",
+                    body["error"].as_str().unwrap_or("unknown error")
+                );
+            }
+        }
+    }
+}
+
+fn auth_client() -> anyhow::Result<reqwest::Client> {
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    Ok(crate::credentials::authenticated_client(&token))
+}
+
+/// Parse a JSON response, turning a non-2xx into an error carrying the API's message.
+async fn api_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> anyhow::Result<T> {
+    if resp.status().is_success() {
+        Ok(resp.json().await.context("invalid API response")?)
+    } else {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!("{}", body["error"].as_str().unwrap_or("request failed"));
     }
 }
 

@@ -12,6 +12,11 @@ const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_token
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 const DEPLOYMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deployments");
+const DOMAINS: TableDefinition<&str, &[u8]> = TableDefinition::new("domains");
+
+/// Subdomain labels reserved for the platform; tenants cannot claim them as new
+/// hostnames (existing projects with these ids are grandfathered at backfill).
+pub const RESERVED_LABELS: &[&str] = &["api", "www", "console"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,6 +74,46 @@ pub struct DeploymentMeta {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainKind {
+    /// `<label>.jkbase.app` — platform-owned, covered by the wildcard cert.
+    Subdomain,
+    /// An external domain (e.g. `docs.example.com`) the tenant must prove they own.
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DomainStatus {
+    /// Claimed but not yet routable (custom domains await DNS-TXT verification).
+    Pending,
+    /// Verified/owned and eligible for routing.
+    Active,
+}
+
+/// A claimed hostname. The registry of these is the single source of truth for
+/// routing — global uniqueness is enforced on `host` (the routing key: a bare
+/// label for [`DomainKind::Subdomain`], the full host for [`DomainKind::Custom`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainRecord {
+    pub host: String,
+    pub project_id: String,
+    pub tenant_id: String,
+    /// Which site within the project this host serves; `None` = the default site.
+    pub site: Option<String>,
+    pub kind: DomainKind,
+    pub status: DomainStatus,
+    /// DNS-TXT verification token (relevant for custom domains).
+    pub token: String,
+    pub created_at: u64,
+}
+
+/// Whether `host` is a reserved platform label.
+pub fn host_is_reserved(host: &str) -> bool {
+    RESERVED_LABELS.contains(&host)
+}
+
 fn default_state() -> ProjectState {
     ProjectState::Stopped
 }
@@ -90,6 +135,7 @@ impl Store {
         let _ = txn.open_table(SECRETS)?;
         let _ = txn.open_table(SNAPSHOTS)?;
         let _ = txn.open_table(DEPLOYMENTS)?;
+        let _ = txn.open_table(DOMAINS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -274,6 +320,93 @@ impl Store {
         Ok(existed)
     }
 
+    // -- Domains --
+
+    pub fn get_domain(&self, host: &str) -> Result<Option<DomainRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DOMAINS)?;
+        match table.get(host)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically claim a host: fails if it's already taken. The availability
+    /// check and the insert happen in one write txn to avoid a TOCTOU race
+    /// between two tenants claiming the same host.
+    pub fn claim_domain(&self, record: &DomainRecord) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let claimed = {
+            let mut table = txn.open_table(DOMAINS)?;
+            if table.get(record.host.as_str())?.is_some() {
+                false
+            } else {
+                let data = serde_json::to_vec(record)?;
+                table.insert(record.host.as_str(), data.as_slice())?;
+                true
+            }
+        };
+        txn.commit()?;
+        Ok(claimed)
+    }
+
+    /// Overwrite an existing record (e.g. flipping Pending → Active on verify).
+    pub fn save_domain(&self, record: &DomainRecord) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DOMAINS)?;
+            let data = serde_json::to_vec(record)?;
+            table.insert(record.host.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_domain(&self, host: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(DOMAINS)?;
+            table.remove(host)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    pub fn list_all_domains(&self) -> Result<Vec<DomainRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DOMAINS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            out.push(serde_json::from_slice::<DomainRecord>(value.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_domains_for_project(&self, project_id: &str) -> Result<Vec<DomainRecord>> {
+        Ok(self
+            .list_all_domains()?
+            .into_iter()
+            .filter(|d| d.project_id == project_id)
+            .collect())
+    }
+
+    pub fn list_active_domains_for_project(&self, project_id: &str) -> Result<Vec<DomainRecord>> {
+        Ok(self
+            .list_domains_for_project(project_id)?
+            .into_iter()
+            .filter(|d| d.status == DomainStatus::Active)
+            .collect())
+    }
+
+    /// True if `host` can be claimed: not reserved and not already registered.
+    pub fn host_key_available(&self, host: &str) -> Result<bool> {
+        if host_is_reserved(host) {
+            return Ok(false);
+        }
+        Ok(self.get_domain(host)?.is_none())
+    }
+
     pub fn create_tenant(&self, tenant: &Tenant) -> Result<()> {
         let txn = self.db.begin_write()?;
         {
@@ -456,6 +589,72 @@ mod tests {
             store.list_deployments("a").unwrap().iter().map(|d| d.version).collect::<Vec<_>>(),
             vec![10, 1]
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn domain(host: &str, project: &str, tenant: &str, status: DomainStatus) -> DomainRecord {
+        DomainRecord {
+            host: host.to_string(),
+            project_id: project.to_string(),
+            tenant_id: tenant.to_string(),
+            site: None,
+            kind: if host.contains('.') {
+                DomainKind::Custom
+            } else {
+                DomainKind::Subdomain
+            },
+            status,
+            token: "tok".to_string(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn claim_is_atomic_and_unique() {
+        let (store, path) = tmp_db();
+        assert!(store
+            .claim_domain(&domain("docs", "a", "t1", DomainStatus::Active))
+            .unwrap());
+        // Second claim of the same host fails, even for a different tenant.
+        assert!(!store
+            .claim_domain(&domain("docs", "b", "t2", DomainStatus::Active))
+            .unwrap());
+        assert_eq!(store.get_domain("docs").unwrap().unwrap().project_id, "a");
+
+        // Reserved labels are never available; free labels are.
+        assert!(!store.host_key_available("api").unwrap());
+        assert!(!store.host_key_available("docs").unwrap()); // taken
+        assert!(store.host_key_available("blog").unwrap());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_filter_and_purge_per_project() {
+        let (store, path) = tmp_db();
+        store
+            .claim_domain(&domain("blog", "a", "t1", DomainStatus::Active))
+            .unwrap();
+        store
+            .claim_domain(&domain("docs.example.com", "a", "t1", DomainStatus::Pending))
+            .unwrap();
+        store
+            .claim_domain(&domain("other", "b", "t2", DomainStatus::Active))
+            .unwrap();
+
+        let all_a = store.list_domains_for_project("a").unwrap();
+        assert_eq!(all_a.len(), 2);
+        let active_a = store.list_active_domains_for_project("a").unwrap();
+        assert_eq!(active_a.len(), 1);
+        assert_eq!(active_a[0].host, "blog");
+
+        // Purge project a's domains (delete_project path).
+        for d in store.list_domains_for_project("a").unwrap() {
+            store.remove_domain(&d.host).unwrap();
+        }
+        assert!(store.list_domains_for_project("a").unwrap().is_empty());
+        assert!(store.get_domain("other").unwrap().is_some()); // b untouched
 
         let _ = std::fs::remove_file(&path);
     }

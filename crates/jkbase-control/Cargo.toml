@@ -20,3 +20,4 @@ tower-http = { version = "0.6", features = ["cors"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
+reqwest = { workspace = true }

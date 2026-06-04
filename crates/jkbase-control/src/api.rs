@@ -1,6 +1,9 @@
 use crate::auth::{self, ApiToken, Tenant};
 use crate::logstore::LogStore;
-use crate::store::{Project, Store};
+use crate::store::{
+    DomainKind, DomainRecord, DomainStatus, Project, Store,
+};
+use jkbase_common::routing::DomainTarget;
 use axum::body::Bytes;
 use axum::extract::{Path, State, Request};
 use axum::http::{HeaderValue, Method, StatusCode};
@@ -25,6 +28,8 @@ pub type DeployCallback = Box<
 >;
 
 pub type RoutingTable = Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>;
+/// host-key → owner/site, mirror of all Active domains (see jkbase-proxy::DomainMap).
+pub type DomainMap = Arc<tokio::sync::RwLock<std::collections::HashMap<String, DomainTarget>>>;
 
 pub struct AppState {
     pub store: Store,
@@ -32,6 +37,9 @@ pub struct AppState {
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
     pub routing_table: Option<RoutingTable>,
+    pub domain_map: Option<DomainMap>,
+    /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
+    pub platform_domain: String,
     deploy_locks: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -68,6 +76,8 @@ impl AppState {
             deploy_dir,
             deploy_callback: None,
             routing_table: None,
+            domain_map: None,
+            platform_domain: "jkbase.app".to_string(),
             deploy_locks: Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -117,6 +127,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/rollback", post(rollback))
         .route("/projects/{id}/status", get(get_project_status))
         .route("/projects/{id}/domains", get(list_domains).post(add_domain))
+        .route("/projects/{id}/domains/{domain}/verify", post(verify_domain))
         .route("/projects/{id}/domains/{domain}", axum::routing::delete(remove_domain))
         .route("/me", get(get_me))
         .route("/me/token", post(generate_new_token))
@@ -464,6 +475,16 @@ async fn create_project(
 ) -> impl IntoResponse {
     let id = slug(&req.name);
 
+    if crate::store::host_is_reserved(&id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!("'{id}' is a reserved name"),
+            }),
+        )
+            .into_response();
+    }
+
     if state.store.get_project(&id).ok().flatten().is_some() {
         return (
             StatusCode::CONFLICT,
@@ -472,6 +493,32 @@ async fn create_project(
             }),
         )
             .into_response();
+    }
+
+    // Claim the project's primary subdomain (host-key == project id). This also
+    // reserves the name in the unified hostname namespace.
+    let primary = DomainRecord {
+        host: id.clone(),
+        project_id: id.clone(),
+        tenant_id: tenant.id.clone(),
+        site: None,
+        kind: DomainKind::Subdomain,
+        status: DomainStatus::Active,
+        token: String::new(),
+        created_at: auth::timestamp(),
+    };
+    match state.store.claim_domain(&primary) {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("'{id}' is already in use"),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => return internal_error(e),
     }
 
     let project = Project {
@@ -485,14 +532,13 @@ async fn create_project(
     };
 
     if let Err(e) = state.store.create_project(&project) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response();
+        let _ = state.store.remove_domain(&id); // roll back the claim
+        return internal_error(e);
     }
+
+    // Register the primary in the live map so the subdomain resolves (waking the
+    // VM on first hit once deployed).
+    activate_domain(&state, &primary).await;
 
     info!(project_id = %id, "project created");
     (StatusCode::CREATED, Json(to_response(&project))).into_response()
@@ -565,6 +611,14 @@ async fn delete_project(
                     if let Ok(deployments) = state.store.list_deployments(&id) {
                         for d in deployments {
                             let _ = state.store.remove_deployment(&id, d.version);
+                        }
+                    }
+                    // Release all claimed hostnames so they can't be taken over
+                    // or left dangling in the routing maps.
+                    if let Ok(domains) = state.store.list_domains_for_project(&id) {
+                        for d in domains {
+                            let _ = state.store.remove_domain(&d.host);
+                            deactivate_host(&state, &d.host).await;
                         }
                     }
                     info!(project_id = %id, "project deleted");
@@ -712,19 +766,15 @@ async fn do_deploy(
     let _ = tokio::fs::remove_file(&live_link).await;
     tokio::fs::symlink(&deploy_path, &live_link).await?;
 
-    // Read domain aliases from deploy
-    let domains_path = deploy_path.join("_domains.json");
-    if domains_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&domains_path) {
-            if let Ok(domains) = serde_json::from_str::<Vec<String>>(&content) {
-                project.domains = domains;
-            }
-        }
-    }
-
     project.current_version = Some(version);
     project.state = crate::store::ProjectState::Active;
     state.store.update_project(project)?;
+
+    // Reconcile domains declared in the deploy into the registry (subdomains we
+    // own go Active; custom domains start Pending until DNS-TXT verified). Never
+    // routes an unverified host. Best-effort: a taken/foreign host is skipped.
+    reconcile_deploy_domains(state, project, &deploy_path).await;
+    let _ = refresh_domain_cache(state, &project.id);
 
     // Record version history and prune old artifacts so disk usage stays bounded.
     state.store.save_deployment(&crate::store::DeploymentMeta {
@@ -1307,28 +1357,66 @@ async fn delete_secret(
     }
 }
 
+#[derive(Serialize)]
+struct DomainResponse {
+    host: String,
+    kind: DomainKind,
+    status: DomainStatus,
+    site: Option<String>,
+    /// DNS TXT challenge the user must publish to verify a custom domain.
+    verification: Option<DomainChallenge>,
+}
+
+#[derive(Serialize)]
+struct DomainChallenge {
+    record: String,
+    value: String,
+}
+
+impl DomainResponse {
+    fn from_record(r: crate::store::DomainRecord) -> Self {
+        let verification = if r.kind == DomainKind::Custom && r.status == DomainStatus::Pending {
+            Some(DomainChallenge {
+                record: format!("_jkbase-challenge.{}", r.host),
+                value: r.token.clone(),
+            })
+        } else {
+            None
+        };
+        DomainResponse {
+            host: r.host,
+            kind: r.kind,
+            status: r.status,
+            site: r.site,
+            verification,
+        }
+    }
+}
+
 async fn list_domains(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.store.get_project(&id) {
-        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {
-            Json(p.domains).into_response()
+    if !owns_project(&state, &tenant, &id) {
+        return project_not_found(&id);
+    }
+    match state.store.list_domains_for_project(&id) {
+        Ok(list) => {
+            let resp: Vec<DomainResponse> =
+                list.into_iter().map(DomainResponse::from_record).collect();
+            Json(resp).into_response()
         }
-        _ => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("project '{id}' not found"),
-            }),
-        )
-            .into_response(),
+        Err(e) => internal_error(e),
     }
 }
 
 #[derive(Deserialize)]
 pub struct AddDomainRequest {
     pub domain: String,
+    /// Optional site within the project this domain should serve.
+    #[serde(default)]
+    pub site: Option<String>,
 }
 
 async fn add_domain(
@@ -1337,54 +1425,117 @@ async fn add_domain(
     Path(id): Path<String>,
     Json(req): Json<AddDomainRequest>,
 ) -> impl IntoResponse {
-    let mut project = match state.store.get_project(&id) {
-        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("project '{id}' not found"),
-                }),
-            )
-                .into_response()
-        }
+    if !owns_project(&state, &tenant, &id) {
+        return project_not_found(&id);
+    }
+
+    let (host, kind) = match derive_host_key(&req.domain, &state.platform_domain) {
+        Ok(v) => v,
+        Err(msg) => return bad_request(msg),
     };
 
-    let domain = req.domain.to_lowercase().trim().to_string();
-    if domain.is_empty() {
+    // Global uniqueness: a host owned by anyone else (or reserved) is rejected.
+    match state.store.get_domain(&host) {
+        Ok(Some(existing)) => {
+            if existing.project_id == id {
+                return bad_request(format!("'{host}' is already attached to this project"));
+            }
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("'{host}' is already in use"),
+                }),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => return internal_error(e),
+    }
+    if crate::store::host_is_reserved(&host) {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
             Json(ErrorResponse {
-                error: "domain cannot be empty".to_string(),
+                error: format!("'{host}' is a reserved name"),
             }),
         )
             .into_response();
     }
 
-    if !project.domains.contains(&domain) {
-        project.domains.push(domain.clone());
-        if let Err(e) = state.store.update_project(&project) {
+    // Platform subdomains are owned by us → Active immediately (wildcard cert
+    // covers them). Custom domains start Pending until DNS-TXT verified.
+    let status = match kind {
+        DomainKind::Subdomain => DomainStatus::Active,
+        DomainKind::Custom => DomainStatus::Pending,
+    };
+    let record = DomainRecord {
+        host: host.clone(),
+        project_id: id.clone(),
+        tenant_id: tenant.id.clone(),
+        site: req.site.clone(),
+        kind,
+        status,
+        token: auth::generate_token(),
+        created_at: auth::timestamp(),
+    };
+
+    match state.store.claim_domain(&record) {
+        Ok(true) => {}
+        Ok(false) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::CONFLICT,
                 Json(ErrorResponse {
-                    error: e.to_string(),
+                    error: format!("'{host}' was just claimed by someone else"),
                 }),
             )
-                .into_response();
+                .into_response()
         }
-
-        // Register in routing table if project is deployed
-        if let Some(ref rt) = state.routing_table {
-            if let Ok(Some(alloc)) = state.store.get_vm_allocation(&id) {
-                let mut table = rt.write().await;
-                table.insert(domain.clone(), alloc.ip.clone());
-            }
-        }
-
-        info!(project = %id, domain = %domain, "domain alias added");
+        Err(e) => return internal_error(e),
     }
 
-    Json(project.domains).into_response()
+    if record.status == DomainStatus::Active {
+        activate_domain(&state, &record).await;
+    }
+    let _ = refresh_domain_cache(&state, &id);
+    info!(project = %id, host = %host, ?status, "domain claimed");
+    Json(DomainResponse::from_record(record)).into_response()
+}
+
+async fn verify_domain(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path((id, host)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let host = host.to_lowercase();
+    let mut record = match state.store.get_domain(&host) {
+        Ok(Some(r)) if r.project_id == id && r.tenant_id == tenant.id => r,
+        _ => return project_not_found(&host),
+    };
+
+    if record.status == DomainStatus::Active {
+        return Json(DomainResponse::from_record(record)).into_response();
+    }
+
+    if !dns_txt_contains(&record.host, &record.token).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "TXT record _jkbase-challenge.{} not found or doesn't match (DNS may take a few minutes to propagate)",
+                    record.host
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    record.status = DomainStatus::Active;
+    if let Err(e) = state.store.save_domain(&record) {
+        return internal_error(e);
+    }
+    activate_domain(&state, &record).await;
+    let _ = refresh_domain_cache(&state, &id);
+    info!(project = %id, host = %record.host, "custom domain verified");
+    Json(DomainResponse::from_record(record)).into_response()
 }
 
 async fn remove_domain(
@@ -1392,38 +1543,252 @@ async fn remove_domain(
     Extension(tenant): Extension<Tenant>,
     Path((id, domain)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let mut project = match state.store.get_project(&id) {
-        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("project '{id}' not found"),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    project.domains.retain(|d| d != &domain);
-    if let Err(e) = state.store.update_project(&project) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response();
+    let host = domain.to_lowercase();
+    match state.store.get_domain(&host) {
+        Ok(Some(r)) if r.project_id == id && r.tenant_id == tenant.id => {}
+        _ => return project_not_found(&host),
     }
 
-    // Remove from routing table
+    if let Err(e) = state.store.remove_domain(&host) {
+        return internal_error(e);
+    }
+    deactivate_host(&state, &host).await;
+    let _ = refresh_domain_cache(&state, &id);
+    info!(project = %id, host = %host, "domain removed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// -- domain helpers --
+
+fn owns_project(state: &AppState, tenant: &Tenant, id: &str) -> bool {
+    matches!(state.store.get_project(id), Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id))
+}
+
+fn project_not_found(id: &str) -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: format!("'{id}' not found"),
+        }),
+    )
+        .into_response()
+}
+
+fn bad_request(msg: impl Into<String>) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse { error: msg.into() }),
+    )
+        .into_response()
+}
+
+fn internal_error(e: impl std::fmt::Display) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            error: e.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Normalize a user-supplied domain to its routing host-key and classify it.
+/// Accepts a bare label (`docs`), a platform host (`docs.jkbase.app`), or a full
+/// custom domain (`docs.example.com`). Nested platform subdomains and the apex
+/// are rejected (flat scheme only).
+fn derive_host_key(input: &str, platform_domain: &str) -> Result<(String, DomainKind), String> {
+    let d = input.trim().trim_end_matches('.').to_lowercase();
+    if d.is_empty() {
+        return Err("domain cannot be empty".to_string());
+    }
+    let suffix = format!(".{platform_domain}");
+    if d == platform_domain {
+        return Err("cannot attach the platform apex domain".to_string());
+    }
+    if let Some(label) = d.strip_suffix(&suffix) {
+        if label.is_empty() || label.contains('.') {
+            return Err("only flat subdomains (<label>.{platform}) are supported".replace(
+                "{platform}",
+                platform_domain,
+            ));
+        }
+        return Ok((label.to_string(), DomainKind::Subdomain));
+    }
+    if d.contains('.') {
+        Ok((d, DomainKind::Custom))
+    } else {
+        // bare label → platform subdomain
+        Ok((d, DomainKind::Subdomain))
+    }
+}
+
+/// Insert an Active domain into the in-memory maps. Adds to `routes` only when
+/// the owning project is already running (its primary key is present), so we
+/// never point traffic at a hibernated VM's stale IP.
+async fn activate_domain(state: &AppState, record: &DomainRecord) {
+    if let Some(ref dm) = state.domain_map {
+        dm.write().await.insert(
+            record.host.clone(),
+            DomainTarget {
+                project_id: record.project_id.clone(),
+                site: record.site.clone(),
+            },
+        );
+    }
     if let Some(ref rt) = state.routing_table {
         let mut table = rt.write().await;
-        table.remove(&domain);
+        if let Some(ip) = table.get(&record.project_id).cloned() {
+            table.insert(record.host.clone(), ip);
+        }
+    }
+}
+
+async fn deactivate_host(state: &AppState, host: &str) {
+    if let Some(ref dm) = state.domain_map {
+        dm.write().await.remove(host);
+    }
+    if let Some(ref rt) = state.routing_table {
+        rt.write().await.remove(host);
+    }
+}
+
+/// Keep `project.domains` as a denormalized cache (used by ProjectResponse) of
+/// the project's claimed hosts. Best-effort.
+fn refresh_domain_cache(state: &AppState, project_id: &str) -> anyhow::Result<()> {
+    if let Some(mut project) = state.store.get_project(project_id)? {
+        let mut hosts: Vec<String> = state
+            .store
+            .list_domains_for_project(project_id)?
+            .into_iter()
+            .filter(|d| d.host != project_id) // exclude the primary label
+            .map(|d| d.host)
+            .collect();
+        hosts.sort();
+        if project.domains != hosts {
+            project.domains = hosts;
+            state.store.update_project(&project)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile domains declared in a deploy (per-site `domain` in `_sites.json`
+/// and legacy project-level `_domains.json`) into the DOMAINS registry. Owned
+/// subdomains become Active; custom domains are claimed Pending (never routed
+/// until verified). Hosts already owned by another project are left untouched.
+async fn reconcile_deploy_domains(state: &AppState, project: &Project, deploy_path: &std::path::Path) {
+    let Some(tenant_id) = project.tenant_id.clone() else {
+        return;
+    };
+
+    // (raw host, optional site name)
+    let mut declared: Vec<(String, Option<String>)> = Vec::new();
+
+    let sites: Vec<jkbase_common::config::ResolvedSite> = std::fs::read_to_string(deploy_path.join("_sites.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    for s in sites {
+        if let Some(domain) = s.domain {
+            declared.push((domain, Some(s.name)));
+        }
+    }
+    let legacy: Vec<String> = std::fs::read_to_string(deploy_path.join("_domains.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default();
+    for d in legacy {
+        declared.push((d, None));
     }
 
-    info!(project = %id, domain = %domain, "domain alias removed");
-    StatusCode::NO_CONTENT.into_response()
+    for (raw, site) in declared {
+        let (host, kind) = match derive_host_key(&raw, &state.platform_domain) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(project = %project.id, domain = %raw, error = %e, "skipping invalid declared domain");
+                continue;
+            }
+        };
+        match state.store.get_domain(&host) {
+            Ok(Some(existing)) if existing.project_id == project.id => continue, // already ours
+            Ok(Some(_)) => {
+                tracing::warn!(project = %project.id, host = %host, "declared domain owned by another project, skipping");
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(project = %project.id, host = %host, error = %e, "domain lookup failed");
+                continue;
+            }
+        }
+        if crate::store::host_is_reserved(&host) {
+            tracing::warn!(project = %project.id, host = %host, "declared domain is reserved, skipping");
+            continue;
+        }
+        let status = match kind {
+            DomainKind::Subdomain => DomainStatus::Active,
+            DomainKind::Custom => DomainStatus::Pending,
+        };
+        let record = DomainRecord {
+            host: host.clone(),
+            project_id: project.id.clone(),
+            tenant_id: tenant_id.clone(),
+            site,
+            kind,
+            status,
+            token: auth::generate_token(),
+            created_at: auth::timestamp(),
+        };
+        match state.store.claim_domain(&record) {
+            Ok(true) => {
+                if record.status == DomainStatus::Active {
+                    activate_domain(state, &record).await;
+                }
+                info!(project = %project.id, host = %host, ?status, "declared domain reconciled");
+            }
+            Ok(false) => {} // lost a race; leave it
+            Err(e) => {
+                tracing::warn!(project = %project.id, host = %host, error = %e, "failed to claim declared domain");
+            }
+        }
+    }
+}
+
+/// Look up `_jkbase-challenge.<host>` TXT via DNS-over-HTTPS and check the token
+/// is present. Returns false (retryable) on any network/parse error.
+async fn dns_txt_contains(host: &str, expected: &str) -> bool {
+    let name = format!("_jkbase-challenge.{host}");
+    let url = format!("https://cloudflare-dns.com/dns-query?name={name}&type=TXT");
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(_) => return false,
+    };
+    let Some(answers) = json["Answer"].as_array() else {
+        return false;
+    };
+    for a in answers {
+        if let Some(data) = a["data"].as_str() {
+            // TXT data is returned quoted, and may be chunked: "abc" "def".
+            let joined: String = data
+                .split_whitespace()
+                .map(|chunk| chunk.trim_matches('"'))
+                .collect();
+            if joined == expected || data.trim_matches('"') == expected {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn to_response(p: &Project) -> ProjectResponse {

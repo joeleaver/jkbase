@@ -1523,6 +1523,7 @@ dependencies = [
  "hyper-util",
  "jkbase-common",
  "redb",
+ "reqwest",
  "serde",
  "serde_json",
  "tar",

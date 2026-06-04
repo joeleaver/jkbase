@@ -4,11 +4,15 @@ use anyhow::Result;
 use clap::Parser;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
-use jkbase_control::store::{ProjectState, SnapshotMeta, Store, VmAllocation};
+use jkbase_control::store::{
+    DomainKind, DomainRecord, DomainStatus, ProjectState, SnapshotMeta, Store, VmAllocation,
+};
 use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
-use jkbase_proxy::{self, new_routing_table, ActivityTracker, KnownProjects, ProxyConfig};
+use jkbase_proxy::{
+    self, new_domain_map, new_routing_table, ActivityTracker, DomainMap, DomainTarget, ProxyConfig,
+};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -120,7 +124,7 @@ async fn main() -> Result<()> {
     let log_store = LogStore::new(logs_dir.clone());
     let log_shipper = LogShipper::new(log_store.clone(), logs_dir.join(".cursors.json"));
     let routing_table = new_routing_table();
-    let known_projects: KnownProjects = Arc::new(RwLock::new(HashSet::new()));
+    let domain_map: DomainMap = new_domain_map();
     let activity_tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
 
     let base_rootfs_path = data_dir.join("base-rootfs.ext4");
@@ -140,17 +144,19 @@ async fn main() -> Result<()> {
 
     let mut state = AppState::new(store, log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
+    state.domain_map = Some(domain_map.clone());
+    state.platform_domain = args.domain.clone();
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();
-    let known_for_cb = known_projects.clone();
+    let domain_for_cb = domain_map.clone();
     let shipper_for_cb = log_shipper.clone();
     state.deploy_callback = Some(Box::new(move |project_id: String, _version: u64| {
         let platform = platform_for_cb.clone();
         let routing = routing_for_cb.clone();
-        let known = known_for_cb.clone();
+        let domains = domain_for_cb.clone();
         let shipper = shipper_for_cb.clone();
-        Box::pin(async move { handle_deploy(&project_id, platform, routing, known, shipper).await })
+        Box::pin(async move { handle_deploy(&project_id, platform, routing, domains, shipper).await })
     }));
 
     let state = Arc::new(state);
@@ -180,15 +186,15 @@ async fn main() -> Result<()> {
     // Set up wake callback for the proxy
     let platform_for_wake = platform.clone();
     let routing_for_wake = routing_table.clone();
-    let known_for_wake = known_projects.clone();
+    let domain_for_wake = domain_map.clone();
     let shipper_for_wake = log_shipper.clone();
     let wake_callback: jkbase_proxy::WakeCallback =
         Arc::new(move |project_id: String| {
             let platform = platform_for_wake.clone();
             let routing = routing_for_wake.clone();
-            let known = known_for_wake.clone();
+            let domains = domain_for_wake.clone();
             let shipper = shipper_for_wake.clone();
-            Box::pin(async move { wake_project(&project_id, platform, routing, known, shipper).await })
+            Box::pin(async move { wake_project(&project_id, platform, routing, domains, shipper).await })
         });
 
     let api_addr = format!("127.0.0.1:{}", args.api_port);
@@ -198,20 +204,23 @@ async fn main() -> Result<()> {
         platform_domain: args.domain,
         tls_config,
         api_addr: Some(api_addr),
-        known_projects: Some(known_projects.clone()),
+        domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
         wake_callback: Some(wake_callback),
     };
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();
+
+    // Reconcile state and build the domain map BEFORE the proxy serves traffic,
+    // or apex/www/console would 404 in the gap.
+    cleanup_orphans(&platform).await;
+    backfill_domains(&platform, &domain_map).await;
+
     tokio::spawn(async move {
         if let Err(e) = jkbase_proxy::serve(proxy_config, proxy_routes).await {
             tracing::error!(error = %e, "proxy error");
         }
     });
-
-    cleanup_orphans(&platform).await;
-    initialize_projects(&platform, &known_projects).await;
 
     // Spawn log shipper loop (pulls guest logs into the persistent store)
     tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
@@ -315,53 +324,96 @@ async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
     }
 }
 
-async fn initialize_projects(
-    platform: &Arc<Mutex<PlatformState>>,
-    known_projects: &KnownProjects,
-) {
-    let projects = {
-        let plat = platform.lock().await;
-        match plat.store.list_projects() {
+/// Reconcile persisted state into the in-memory domain map at startup. Grandfathers
+/// each deployed project's primary subdomain and any legacy `project.domains` into
+/// the DOMAINS registry as Active (trusted prod data — no re-verification), then
+/// loads all Active domains into the map so hosts resolve before traffic arrives.
+async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &DomainMap) {
+    let active = {
+        let mut plat = platform.lock().await;
+        let projects = match plat.store.list_projects() {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(error = %e, "failed to list projects");
                 return;
             }
+        };
+
+        for project in &projects {
+            if project.current_version.is_none() {
+                continue;
+            }
+            match project.state {
+                ProjectState::Active | ProjectState::Hibernated => {
+                    plat.vm_states
+                        .insert(project.id.clone(), VmLifecycle::Hibernated);
+                    if project.state == ProjectState::Active {
+                        let mut p = project.clone();
+                        p.state = ProjectState::Hibernated;
+                        let _ = plat.store.update_project(&p);
+                    }
+
+                    let tenant_id = project.tenant_id.clone().unwrap_or_default();
+                    // Grandfather the primary subdomain (host-key == project id).
+                    grandfather_domain(&plat.store, &project.id, &project.id, &tenant_id);
+                    // Grandfather legacy project.domains (already-trusted aliases).
+                    for host in &project.domains {
+                        grandfather_domain(&plat.store, host, &project.id, &tenant_id);
+                    }
+                }
+                ProjectState::Stopped => {}
+            }
         }
+
+        plat.store.list_all_domains().unwrap_or_default()
     };
 
-    let mut kp = known_projects.write().await;
-    let mut plat = platform.lock().await;
-
-    for project in &projects {
-        if project.current_version.is_none() {
-            continue;
-        }
-
-        match project.state {
-            ProjectState::Active | ProjectState::Hibernated => {
-                kp.insert(project.id.clone());
-                plat.vm_states
-                    .insert(project.id.clone(), VmLifecycle::Hibernated);
-
-                if project.state == ProjectState::Active {
-                    let mut p = project.clone();
-                    p.state = ProjectState::Hibernated;
-                    let _ = plat.store.update_project(&p);
-                }
-            }
-            ProjectState::Stopped => {}
+    let mut map = domain_map.write().await;
+    let mut count = 0usize;
+    for d in active {
+        if d.status == DomainStatus::Active {
+            map.insert(
+                d.host,
+                DomainTarget {
+                    project_id: d.project_id,
+                    site: d.site,
+                },
+            );
+            count += 1;
         }
     }
+    info!(domains = count, "domain map built; projects registered for on-demand wake");
+}
 
-    info!(count = kp.len(), "projects registered for on-demand wake");
+/// Ensure an Active DomainRecord exists for `host` (idempotent). Used by backfill
+/// to migrate pre-registry data without forcing re-verification.
+fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &str) {
+    if matches!(store.get_domain(host), Ok(Some(_))) {
+        return;
+    }
+    let kind = if host.contains('.') {
+        DomainKind::Custom
+    } else {
+        DomainKind::Subdomain
+    };
+    let record = DomainRecord {
+        host: host.to_string(),
+        project_id: project_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        site: None,
+        kind,
+        status: DomainStatus::Active,
+        token: String::new(),
+        created_at: 0,
+    };
+    let _ = store.claim_domain(&record);
 }
 
 async fn handle_deploy(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
-    known_projects: KnownProjects,
+    domain_map: DomainMap,
     shipper: Arc<LogShipper>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
@@ -453,32 +505,47 @@ async fn handle_deploy(
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
-    let domains = plat
+    let active_domains = plat
         .store
-        .get_project(project_id)
-        .ok()
-        .flatten()
-        .map(|p| p.domains)
+        .list_active_domains_for_project(project_id)
         .unwrap_or_default();
     drop(plat);
 
     wait_for_agent(&alloc.ip).await?;
 
-    {
-        let mut kp = known_projects.write().await;
-        kp.insert(project_id.to_string());
-    }
-    {
-        let mut table = routing.write().await;
-        table.insert(project_id.to_string(), alloc.ip.clone());
-        for domain in &domains {
-            table.insert(domain.clone(), alloc.ip.clone());
-            info!(project = %project_id, alias = %domain, "domain alias registered");
-        }
-    }
+    register_active_routes(&routing, &domain_map, &active_domains, project_id, &alloc.ip).await;
 
     info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");
     Ok(())
+}
+
+/// Point all of a project's Active hosts at its VM IP (fast-path routes) and
+/// ensure the shared domain map reflects them. `routes` is keyed by host-key.
+async fn register_active_routes(
+    routing: &jkbase_proxy::RoutingTable,
+    domain_map: &DomainMap,
+    active_domains: &[DomainRecord],
+    project_id: &str,
+    ip: &str,
+) {
+    let mut table = routing.write().await;
+    let mut map = domain_map.write().await;
+    // The primary label always routes, even if its DomainRecord predates the registry.
+    table.insert(project_id.to_string(), ip.to_string());
+    map.entry(project_id.to_string()).or_insert_with(|| DomainTarget {
+        project_id: project_id.to_string(),
+        site: None,
+    });
+    for d in active_domains {
+        table.insert(d.host.clone(), ip.to_string());
+        map.insert(
+            d.host.clone(),
+            DomainTarget {
+                project_id: d.project_id.clone(),
+                site: d.site.clone(),
+            },
+        );
+    }
 }
 
 async fn hibernate_project(
@@ -497,13 +564,14 @@ async fn hibernate_project(
         _ => anyhow::bail!("project {project_id} is not running"),
     }
 
-    // Remove from routing table first (new requests will trigger wake)
+    // Remove from the routes fast-path first (new requests will trigger wake).
+    // Leave the domain map intact so hibernated hosts still resolve + wake.
     {
         let mut table = routing.write().await;
         table.remove(project_id);
-        if let Ok(Some(proj)) = plat.store.get_project(project_id) {
-            for domain in &proj.domains {
-                table.remove(domain);
+        if let Ok(domains) = plat.store.list_active_domains_for_project(project_id) {
+            for d in &domains {
+                table.remove(&d.host);
             }
         }
     }
@@ -564,7 +632,7 @@ async fn wake_project(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
-    known_projects: KnownProjects,
+    domain_map: DomainMap,
     shipper: Arc<LogShipper>,
 ) -> Result<String> {
     let mut plat = platform.lock().await;
@@ -597,7 +665,7 @@ async fn wake_project(
                         project_id,
                         platform.clone(),
                         routing,
-                        known_projects,
+                        domain_map,
                         shipper,
                     ))
                     .await;
@@ -623,7 +691,7 @@ async fn wake_project(
             drop(plat);
             info!(project = %project_id, "no allocation, cold booting");
             let routing_clone = routing.clone();
-            handle_deploy(project_id, platform, routing, known_projects, shipper).await?;
+            handle_deploy(project_id, platform, routing, domain_map, shipper).await?;
             let table = routing_clone.read().await;
             return table
                 .get(project_id)
@@ -657,12 +725,9 @@ async fn wake_project(
         vsock_cid: None,
     };
     let runtime_dir = plat.data_dir.join("run");
-    let domains = plat
+    let active_domains = plat
         .store
-        .get_project(project_id)
-        .ok()
-        .flatten()
-        .map(|p| p.domains)
+        .list_active_domains_for_project(project_id)
         .unwrap_or_default();
     drop(plat);
 
@@ -721,13 +786,7 @@ async fn wake_project(
     }
     drop(plat);
 
-    {
-        let mut table = routing.write().await;
-        table.insert(project_id.to_string(), alloc.ip.clone());
-        for domain in &domains {
-            table.insert(domain.clone(), alloc.ip.clone());
-        }
-    }
+    register_active_routes(&routing, &domain_map, &active_domains, project_id, &alloc.ip).await;
 
     info!(project = %project_id, ip = %alloc.ip, "VM awake, routing active");
     Ok(alloc.ip)
