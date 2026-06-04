@@ -128,10 +128,19 @@ impl CertManager {
     async fn ensure_wildcard(&self) -> Result<()> {
         let cert_path = self.cfg.cert_dir.join("fullchain.pem");
         let key_path = self.cfg.cert_dir.join("privkey.pem");
-        let fresh = cert_path.exists() && key_path.exists() && !needs_renewal(&cert_path);
+        let have_cached = cert_path.exists() && key_path.exists();
+        let fresh = have_cached && !needs_renewal(&cert_path);
         if !fresh {
             info!("provisioning wildcard certificate via ACME DNS-01");
-            self.provision_wildcard().await?;
+            if let Err(e) = self.provision_wildcard().await {
+                // Don't take the whole server down over a transient ACME/DNS error
+                // if we already have a usable (if aging) cert; reconcile will retry.
+                if have_cached {
+                    warn!(error = %e, "wildcard provisioning failed; using existing cert, will retry");
+                } else {
+                    return Err(e).context("wildcard provisioning failed and no cached cert exists");
+                }
+            }
         }
         let ck = read_certified_key(&cert_path, &key_path)?;
         *self.resolver.wildcard.write().unwrap() = Some(Arc::new(ck));
