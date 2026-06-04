@@ -13,12 +13,27 @@ pub enum Command {
     Project(project::ProjectCommand),
     /// Roll back to a previous deployment
     Rollback {
-        /// Specific version to roll back to
+        /// Specific version to roll back to (defaults to the previous version)
         #[arg(long)]
         version: Option<u64>,
         /// Skip confirmation prompt
         #[arg(long)]
         force: bool,
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// List deployment history
+    Deployments {
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
     },
     /// Initialize the platform and create the first admin account
     Init {
@@ -137,13 +152,13 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Deploy(args) => deploy::run(args).await,
         Command::Project(cmd) => project::run(cmd).await,
-        Command::Rollback { version, force: _ } => {
-            match version {
-                Some(v) => println!("Rolling back to version {v}..."),
-                None => println!("Rolling back to previous version..."),
-            }
-            Ok(())
-        }
+        Command::Rollback {
+            version,
+            force,
+            project,
+            api,
+        } => run_rollback(version, force, project, api).await,
+        Command::Deployments { project, api } => run_deployments(project, api).await,
         Command::Init { email, api } => {
             let client = reqwest::Client::new();
             let resp = client
@@ -300,6 +315,134 @@ fn print_line(line: &jkbase_common::logs::LogLine, json: bool) {
         eprintln!("{formatted}");
     } else {
         println!("{formatted}");
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Deployment {
+    version: u64,
+    created_at: u64,
+    active: bool,
+}
+
+async fn fetch_deployments(
+    client: &reqwest::Client,
+    api: &str,
+    project_id: &str,
+) -> anyhow::Result<Vec<Deployment>> {
+    let resp = client
+        .get(format!("{api}/projects/{project_id}/deployments"))
+        .send()
+        .await
+        .context("failed to connect to API")?;
+    if !resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let err = body["error"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("failed to list deployments: {err}");
+    }
+    resp.json().await.context("invalid deployments response")
+}
+
+async fn run_deployments(project: Option<String>, api: String) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+
+    let deployments = fetch_deployments(&client, &api, &project_id).await?;
+    if deployments.is_empty() {
+        println!("No deployments for project '{project_id}'");
+        return Ok(());
+    }
+    for d in &deployments {
+        println!(
+            "  v{:<5} {:<14} {}",
+            d.version,
+            human_age(d.created_at),
+            if d.active { "(active)" } else { "" }
+        );
+    }
+    Ok(())
+}
+
+async fn run_rollback(
+    version: Option<u64>,
+    force: bool,
+    project: Option<String>,
+    api: String,
+) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+
+    // Resolve the target version: explicit, or the one just before the active deploy.
+    let target = match version {
+        Some(v) => v,
+        None => {
+            let deployments = fetch_deployments(&client, &api, &project_id).await?;
+            let active_idx = deployments.iter().position(|d| d.active);
+            match active_idx {
+                Some(i) => deployments
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("no previous deployment to roll back to"))?
+                    .version,
+                None => deployments
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("no deployments to roll back to"))?
+                    .version,
+            }
+        }
+    };
+
+    if !force {
+        print!("Roll back '{project_id}' to v{target}? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    println!("Rolling back '{project_id}' to v{target}...");
+    let resp = client
+        .post(format!("{api}/projects/{project_id}/rollback"))
+        .json(&serde_json::json!({ "version": target }))
+        .send()
+        .await
+        .context("failed to connect to API")?;
+
+    if resp.status().is_success() {
+        println!("Rolled back '{project_id}' to v{target}");
+        Ok(())
+    } else {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let err = body["error"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("rollback failed: {err}");
+    }
+}
+
+/// Render a unix-seconds timestamp as a coarse relative age, dependency-free.
+fn human_age(ts: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if ts == 0 || ts > now {
+        return "just now".to_string();
+    }
+    let secs = now - ts;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
     }
 }
 

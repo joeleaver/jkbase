@@ -11,6 +11,7 @@ const TENANTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenants");
 const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+const DEPLOYMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deployments");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,6 +59,16 @@ pub struct Secret {
     pub value: String,
 }
 
+/// Metadata for one immutable deployment of a project. The artifacts live on
+/// disk at `{deploy_dir}/{project_id}/deployments/v{version}`; this records the
+/// version history so the platform can list past deploys and roll back to one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentMeta {
+    pub project_id: String,
+    pub version: u64,
+    pub created_at: u64,
+}
+
 fn default_state() -> ProjectState {
     ProjectState::Stopped
 }
@@ -78,6 +89,7 @@ impl Store {
         let _ = txn.open_table(API_TOKENS)?;
         let _ = txn.open_table(SECRETS)?;
         let _ = txn.open_table(SNAPSHOTS)?;
+        let _ = txn.open_table(DEPLOYMENTS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -201,6 +213,62 @@ impl Store {
         let existed = {
             let mut table = txn.open_table(SNAPSHOTS)?;
             table.remove(project_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    // -- Deployments --
+
+    // Zero-padded so the compound key sorts by version within a project.
+    fn deployment_key(project_id: &str, version: u64) -> String {
+        format!("{project_id}:{version:020}")
+    }
+
+    pub fn save_deployment(&self, meta: &DeploymentMeta) -> Result<()> {
+        let key = Self::deployment_key(&meta.project_id, meta.version);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DEPLOYMENTS)?;
+            let data = serde_json::to_vec(meta)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_deployment(&self, project_id: &str, version: u64) -> Result<Option<DeploymentMeta>> {
+        let key = Self::deployment_key(project_id, version);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DEPLOYMENTS)?;
+        match table.get(key.as_str())? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All deployments for a project, newest version first.
+    pub fn list_deployments(&self, project_id: &str) -> Result<Vec<DeploymentMeta>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DEPLOYMENTS)?;
+        let prefix = format!("{project_id}:");
+        let mut deployments = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if key.value().starts_with(&prefix) {
+                deployments.push(serde_json::from_slice::<DeploymentMeta>(value.value())?);
+            }
+        }
+        deployments.sort_by_key(|d| std::cmp::Reverse(d.version));
+        Ok(deployments)
+    }
+
+    pub fn remove_deployment(&self, project_id: &str, version: u64) -> Result<bool> {
+        let key = Self::deployment_key(project_id, version);
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(DEPLOYMENTS)?;
+            table.remove(key.as_str())?.is_some()
         };
         txn.commit()?;
         Ok(existed)
@@ -338,5 +406,57 @@ impl Store {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_db() -> (Store, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("jkbase-store-test-{nanos}.redb"));
+        (Store::open(&path).unwrap(), path)
+    }
+
+    fn meta(project: &str, version: u64) -> DeploymentMeta {
+        DeploymentMeta {
+            project_id: project.to_string(),
+            version,
+            created_at: version, // arbitrary but ordered
+        }
+    }
+
+    #[test]
+    fn deployments_listed_newest_first_and_scoped_per_project() {
+        let (store, path) = tmp_db();
+        store.save_deployment(&meta("a", 1)).unwrap();
+        store.save_deployment(&meta("a", 2)).unwrap();
+        store.save_deployment(&meta("a", 10)).unwrap();
+        store.save_deployment(&meta("b", 5)).unwrap();
+
+        let a = store.list_deployments("a").unwrap();
+        assert_eq!(
+            a.iter().map(|d| d.version).collect::<Vec<_>>(),
+            vec![10, 2, 1],
+            "newest version first"
+        );
+        let b = store.list_deployments("b").unwrap();
+        assert_eq!(b.len(), 1, "other project's deployments excluded");
+        assert_eq!(b[0].version, 5);
+
+        assert_eq!(store.get_deployment("a", 2).unwrap().unwrap().version, 2);
+        assert!(store.get_deployment("a", 99).unwrap().is_none());
+
+        assert!(store.remove_deployment("a", 2).unwrap());
+        assert_eq!(
+            store.list_deployments("a").unwrap().iter().map(|d| d.version).collect::<Vec<_>>(),
+            vec![10, 1]
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

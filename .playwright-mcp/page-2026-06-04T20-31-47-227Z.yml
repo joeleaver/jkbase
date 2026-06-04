@@ -1,0 +1,11 @@
+- generic [ref=e4]:
+  - generic [ref=e7]: jkbase
+  - generic [ref=e8]: Create Account
+  - generic [ref=e9]: Get started with your new account
+  - generic [ref=e10]:
+    - textbox "you@example.com" [active] [ref=e11]
+    - textbox "password (8+ characters)" [ref=e12]
+    - button "Create Account" [ref=e13] [cursor=pointer]
+  - generic [ref=e14]:
+    - text: Already have an account?
+    - button "Sign In" [ref=e15] [cursor=pointer]

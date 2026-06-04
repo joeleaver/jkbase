@@ -113,6 +113,8 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
         .route("/projects/{id}/logs", get(get_project_logs))
+        .route("/projects/{id}/deployments", get(list_deployments))
+        .route("/projects/{id}/rollback", post(rollback))
         .route("/projects/{id}/status", get(get_project_status))
         .route("/projects/{id}/domains", get(list_domains).post(add_domain))
         .route("/projects/{id}/domains/{domain}", axum::routing::delete(remove_domain))
@@ -560,6 +562,11 @@ async fn delete_project(
                     if let Err(e) = state.log_store.clear(&id) {
                         tracing::warn!(project_id = %id, error = %e, "failed to clear project logs");
                     }
+                    if let Ok(deployments) = state.store.list_deployments(&id) {
+                        for d in deployments {
+                            let _ = state.store.remove_deployment(&id, d.version);
+                        }
+                    }
                     info!(project_id = %id, "project deleted");
                     StatusCode::NO_CONTENT.into_response()
                 }
@@ -719,6 +726,14 @@ async fn do_deploy(
     project.state = crate::store::ProjectState::Active;
     state.store.update_project(project)?;
 
+    // Record version history and prune old artifacts so disk usage stays bounded.
+    state.store.save_deployment(&crate::store::DeploymentMeta {
+        project_id: project.id.clone(),
+        version,
+        created_at: auth::timestamp(),
+    })?;
+    prune_deployments(state, &project.id, version);
+
     info!(
         project_id = %project.id,
         version,
@@ -730,6 +745,214 @@ async fn do_deploy(
     }
 
     Ok(version)
+}
+
+/// Keep only the most recent `MAX_DEPLOYMENTS` deployments on disk + in history.
+/// Never removes the currently-live version (`keep_version`). Best-effort: a
+/// failure to prune one old version is logged, not fatal to the deploy.
+fn prune_deployments(state: &AppState, project_id: &str, keep_version: u64) {
+    const MAX_DEPLOYMENTS: usize = 10;
+
+    let deployments = match state.store.list_deployments(project_id) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(project_id, error = %e, "failed to list deployments for pruning");
+            return;
+        }
+    };
+    if deployments.len() <= MAX_DEPLOYMENTS {
+        return;
+    }
+
+    for old in deployments.into_iter().skip(MAX_DEPLOYMENTS) {
+        if old.version == keep_version {
+            continue;
+        }
+        let dir = state
+            .deploy_dir
+            .join(project_id)
+            .join("deployments")
+            .join(format!("v{}", old.version));
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(project_id, version = old.version, error = %e, "failed to remove old deployment dir");
+            }
+        }
+        let _ = state.store.remove_deployment(project_id, old.version);
+        info!(project_id, version = old.version, "pruned old deployment");
+    }
+}
+
+#[derive(Serialize)]
+struct DeploymentResponse {
+    version: u64,
+    created_at: u64,
+    active: bool,
+}
+
+async fn list_deployments(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let project = match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    match state.store.list_deployments(&id) {
+        Ok(list) => {
+            let resp: Vec<DeploymentResponse> = list
+                .into_iter()
+                .map(|d| DeploymentResponse {
+                    version: d.version,
+                    created_at: d.created_at,
+                    active: Some(d.version) == project.current_version,
+                })
+                .collect();
+            Json(resp).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct RollbackRequest {
+    pub version: u64,
+}
+
+async fn rollback(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<RollbackRequest>,
+) -> impl IntoResponse {
+    let mut project = match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
+        Ok(Some(_)) | Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let target = req.version;
+    let deploy_path = state
+        .deploy_dir
+        .join(&id)
+        .join("deployments")
+        .join(format!("v{target}"));
+    if !deploy_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("deployment v{target} not found for project '{id}'"),
+            }),
+        )
+            .into_response();
+    }
+    if project.current_version == Some(target) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("v{target} is already the active deployment"),
+            }),
+        )
+            .into_response();
+    }
+
+    // Reuse the deploy lock so a rollback can't race a concurrent deploy/rollback.
+    {
+        let mut locks = state.deploy_locks.lock().await;
+        if !locks.insert(id.clone()) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "a deploy or rollback is already in progress".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let result = do_rollback(&state, &mut project, &deploy_path, target).await;
+
+    {
+        let mut locks = state.deploy_locks.lock().await;
+        locks.remove(&id);
+    }
+
+    match result {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(DeployResponse {
+                version: target,
+                project_id: id,
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn do_rollback(
+    state: &AppState,
+    project: &mut Project,
+    deploy_path: &std::path::Path,
+    target: u64,
+) -> anyhow::Result<()> {
+    // Atomically repoint `live` at the target version (same swap as a deploy).
+    let live_link = state.deploy_dir.join(&project.id).join("live");
+    let _ = tokio::fs::remove_file(&live_link).await;
+    tokio::fs::symlink(deploy_path, &live_link).await?;
+
+    project.current_version = Some(target);
+    project.state = crate::store::ProjectState::Active;
+    state.store.update_project(project)?;
+
+    info!(project_id = %project.id, version = target, "rolled back");
+
+    // Rebuild the content image from the now-current `live` and restart the VM.
+    if let Some(cb) = &state.deploy_callback {
+        cb(project.id.clone(), target).await?;
+    }
+
+    Ok(())
 }
 
 fn slug(name: &str) -> String {
