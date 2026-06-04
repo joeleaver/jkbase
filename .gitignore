@@ -1,3 +1,4 @@
 /target
 /.firecracker
 .env
+/.playwright-mcp
