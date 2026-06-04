@@ -1527,6 +1527,166 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- Badges --- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.badge-active {
+  color: var(--success);
+  border-color: rgba(0, 204, 136, 0.35);
+  background: var(--success-dim);
+}
+.badge-pending {
+  color: var(--warning);
+  border-color: rgba(255, 170, 0, 0.35);
+  background: rgba(255, 170, 0, 0.07);
+}
+.badge-accent {
+  color: var(--accent);
+  border-color: rgba(0, 212, 255, 0.3);
+  background: var(--accent-dim);
+}
+
+/* --- Domain list --- */
+.domain-item {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.domain-item:last-child {
+  border-bottom: none;
+}
+.domain-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.domain-host {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.domain-host:hover {
+  text-decoration: underline;
+}
+.domain-host.plain {
+  color: var(--text);
+}
+.domain-spacer {
+  flex: 1;
+}
+.domain-site {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.domain-site code {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.domain-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.domain-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* --- DNS verification challenge --- */
+.dns-challenge {
+  margin-top: 12px;
+  padding: 14px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.dns-challenge-title {
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+.dns-challenge-desc {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+.dns-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.dns-field-label {
+  width: 56px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+.dns-field-value {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 9px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.dns-challenge-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.dns-error {
+  font-size: 12px;
+  color: var(--danger);
+}
+
+/* --- Deployments --- */
+.deploy-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.deploy-item:last-child {
+  border-bottom: none;
+}
+.deploy-version {
+  font-family: var(--mono);
+  font-size: 14px;
+  color: var(--text);
+  min-width: 56px;
+}
+.deploy-time {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.deploy-spacer {
+  flex: 1;
+}
 </style>
 </head>
 <body>
@@ -1583,6 +1743,13 @@ body {
     domains: [],
     domainsLoading: false,
     showAddDomain: false,
+    domainBusy: null,       // host currently being verified/removed
+    domainError: null,      // inline verification error
+    // deployments
+    deployments: [],
+    deploymentsLoading: false,
+    rollbackConfirm: null,  // version awaiting rollback confirmation
+    rollbackBusy: false,
   };
 
   // --- API helpers ---
@@ -1759,7 +1926,12 @@ body {
     state.logs = [];
     state.logsFollow = false;
     state.logsCursor = 0;
-    state.domains = project.domains || [];
+    state.domains = [];
+    state.domainBusy = null;
+    state.domainError = null;
+    state.deployments = [];
+    state.rollbackConfirm = null;
+    state.rollbackBusy = false;
     state.error = null;
     state.success = null;
     state.showAddSecret = false;
@@ -1773,6 +1945,7 @@ body {
     loadStatus(project.id);
     loadSecrets(project.id);
     loadDomains(project.id);
+    loadDeployments(project.id);
     loadLogs(project.id);
   }
 
@@ -1923,24 +2096,76 @@ body {
     });
   }
 
-  function addDomain(projectId, domain) {
+  function addDomain(projectId, domain, site) {
     state.error = null;
-    api("POST", "/projects/" + projectId + "/domains", { domain: domain }).then(function(domains) {
-      state.domains = domains;
+    var body = { domain: domain };
+    if (site) body.site = site;
+    api("POST", "/projects/" + projectId + "/domains", body).then(function() {
       state.showAddDomain = false;
-      render();
+      loadDomains(projectId);
     }).catch(function(e) {
       state.error = e.message;
       render();
     });
   }
 
-  function removeDomain(projectId, domain) {
+  function verifyDomain(projectId, host) {
+    state.domainBusy = host;
+    state.domainError = null;
+    render();
+    api("POST", "/projects/" + projectId + "/domains/" + encodeURIComponent(host) + "/verify")
+      .then(function() {
+        state.domainBusy = null;
+        loadDomains(projectId);
+      })
+      .catch(function(e) {
+        state.domainBusy = null;
+        state.domainError = { host: host, message: e.message };
+        render();
+      });
+  }
+
+  function removeDomain(projectId, host) {
     state.error = null;
-    api("DELETE", "/projects/" + projectId + "/domains/" + encodeURIComponent(domain)).then(function() {
-      state.domains = state.domains.filter(function(d) { return d !== domain; });
+    state.domainBusy = host;
+    render();
+    api("DELETE", "/projects/" + projectId + "/domains/" + encodeURIComponent(host)).then(function() {
+      state.domainBusy = null;
+      loadDomains(projectId);
+    }).catch(function(e) {
+      state.domainBusy = null;
+      state.error = e.message;
+      render();
+    });
+  }
+
+  // --- Deployments ---
+
+  function loadDeployments(projectId) {
+    state.deploymentsLoading = true;
+    render();
+    api("GET", "/projects/" + projectId + "/deployments").then(function(deployments) {
+      state.deployments = deployments || [];
+      state.deploymentsLoading = false;
       render();
     }).catch(function(e) {
+      state.deploymentsLoading = false;
+      state.error = e.message;
+      render();
+    });
+  }
+
+  function rollbackTo(projectId, version) {
+    state.rollbackBusy = true;
+    state.error = null;
+    render();
+    api("POST", "/projects/" + projectId + "/rollback", { version: version }).then(function() {
+      state.rollbackBusy = false;
+      state.rollbackConfirm = null;
+      loadDeployments(projectId);
+      loadStatus(projectId);
+    }).catch(function(e) {
+      state.rollbackBusy = false;
       state.error = e.message;
       render();
     });
@@ -2066,12 +2291,14 @@ body {
   // --- Sidebar feature nav items ---
 
   var featureNavItems = [
-    { key: "overview",   label: "Overview",   icon: "#" },
-    { key: "hosting",    label: "Hosting",    icon: "@" },
-    { key: "functions",  label: "Functions",  icon: "f" },
-    { key: "servers",    label: "Servers",    icon: ">" },
-    { key: "secrets",    label: "Secrets",    icon: "*" },
-    { key: "settings",   label: "Settings",   icon: "%" },
+    { key: "overview",   label: "Overview",    icon: "#" },
+    { key: "hosting",    label: "Hosting",     icon: "@" },
+    { key: "domains",    label: "Domains",     icon: "~" },
+    { key: "functions",  label: "Functions",   icon: "f" },
+    { key: "servers",    label: "Servers",     icon: ">" },
+    { key: "deployments",label: "Deployments", icon: "^" },
+    { key: "secrets",    label: "Secrets",     icon: "*" },
+    { key: "settings",   label: "Settings",    icon: "%" },
   ];
 
   // --- Close dropdown on outside click ---
@@ -2466,7 +2693,10 @@ body {
       serversCount = (status.servers || []).length;
     }
     var secretsCount = state.secrets.length;
-    var domainsCount = state.domains.length;
+    // Exclude the project's primary subdomain (host === project id) from the count.
+    var domainsCount = state.domains.filter(function(d) {
+      return d && d.host && d.host !== project.id;
+    }).length;
 
     return h("div", { className: "feature-content-inner" },
 
@@ -2577,82 +2807,250 @@ body {
           h("span", null, project.id + ".jkbase.app (not deployed)")
         );
 
-    var aliasRows = state.domains.map(function(domain) {
-      var url = "https://" + domain + ".jkbase.app";
-      return h("div", { className: "hosting-row" },
-        h("span", { className: "hosting-label" }, "Alias"),
-        h("a", {
-          className: "hosting-url",
-          href: url,
-          target: "_blank",
-          rel: "noopener",
-        }, domain + ".jkbase.app"),
-        h("button", {
-          className: "btn btn-ghost btn-sm btn-danger-text",
-          onClick: function() { removeDomain(project.id, domain); },
-        }, "Remove")
-      );
-    });
-
-    var addForm = state.showAddDomain
-      ? h("form", { className: "domain-add-form", onSubmit: function(e) {
-          e.preventDefault();
-          var input = e.target.querySelector("input");
-          var domain = input.value.trim().toLowerCase();
-          if (domain) addDomain(project.id, domain);
-        }},
-          h("input", {
-            className: "input input-sm",
-            type: "text",
-            placeholder: "subdomain name",
-            required: "required",
-            autocomplete: "off",
-            pattern: "[a-zA-Z0-9][a-zA-Z0-9-]*",
-            title: "Letters, numbers, and hyphens",
-          }),
-          h("span", { className: "domain-suffix" }, ".jkbase.app"),
-          h("button", { className: "btn btn-primary btn-sm", type: "submit" }, "Add"),
-          h("button", {
-            className: "btn btn-secondary btn-sm",
-            type: "button",
-            onClick: function() { state.showAddDomain = false; render(); },
-          }, "Cancel")
-        )
-      : null;
-
     return h("div", { className: "feature-content-inner" },
-      state.error ? h("div", { className: "error-banner" }, state.error) : null,
-
       h("div", { className: "card" },
         h("div", { className: "card-static" },
-          h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px" },
-            h("div", { className: "card-title" }, "Domains"),
-            h("button", {
-              className: "btn btn-secondary btn-sm",
-              onClick: function() {
-                state.showAddDomain = true;
-                render();
-              },
-            }, "Add Domain")
-          ),
+          h("div", { className: "card-title", style: "margin-bottom: 14px" }, "Hosting"),
           primaryUrl,
-          aliasRows,
-          addForm,
-          state.domainsLoading ? h("div", { style: "margin-top: 8px; font-size: 12px; color: var(--text-dim)" }, "Loading domains...") : null
+          h("div", { className: "domain-hint" },
+            "Manage subdomains and custom domains in the ",
+            h("a", {
+              className: "hosting-url",
+              href: "#",
+              onClick: function(e) { e.preventDefault(); setProjectTab("domains"); },
+            }, "Domains"),
+            " tab."
+          )
         )
       ),
 
       h("div", { className: "hosting-info" },
         h("div", { className: "hosting-info-title" }, "Multi-site hosting"),
         h("div", { className: "hosting-info-desc" },
-          "You can serve multiple sites from a single project by configuring routes in your jkbase.toml. " +
-          "Each site directory maps to a path prefix or domain alias."
+          "Serve multiple sites from one project by declaring them in jkbase.toml. " +
+          "Bind each site to a subdomain or custom domain (or a path prefix), then attach the domain in the Domains tab."
         ),
         h("code", { className: "code-block", style: "margin-top: 0" },
-          "[hosting]\nserve_dir = \"public\"\n\n[[hosting.sites]]\ndir = \"docs\"\nprefix = \"/docs\""
+          "[hosting]\npublic = \"./public\"\n\n[sites.docs]\npublic = \"./docs\"\ndomain = \"docs\"            # docs.jkbase.app\n\n[sites.blog]\npublic = \"./blog\"\ndomain = \"blog.example.com\"  # custom domain"
         )
       )
     );
+  }
+
+  // Domains
+  function dnsField(label, value, copyable) {
+    return h("div", { className: "dns-field" },
+      h("div", { className: "dns-field-label" }, label),
+      h("div", { className: "dns-field-value" }, value),
+      copyable
+        ? h("button", {
+            className: "copy-btn",
+            type: "button",
+            onClick: function() { navigator.clipboard.writeText(value); },
+          }, "Copy")
+        : null
+    );
+  }
+
+  function renderDomainItem(project, d) {
+    var isCustom = d.kind === "custom";
+    var href = isCustom ? "https://" + d.host : "https://" + d.host + ".jkbase.app";
+    var label = isCustom ? d.host : d.host + ".jkbase.app";
+    var busy = state.domainBusy === d.host;
+
+    var head = h("div", { className: "domain-head" },
+      h("a", { className: "domain-host", href: href, target: "_blank", rel: "noopener" }, label),
+      h("span", { className: "badge" }, d.kind),
+      d.status === "active"
+        ? h("span", { className: "badge badge-active" }, "active")
+        : h("span", { className: "badge badge-pending" }, "pending verification"),
+      d.site ? h("span", { className: "domain-site" }, "site ", h("code", null, d.site)) : null,
+      h("span", { className: "domain-spacer" }),
+      h("div", { className: "domain-actions" },
+        h("button", {
+          className: "btn btn-ghost btn-sm btn-danger-text",
+          disabled: busy ? "disabled" : null,
+          onClick: function() { removeDomain(project.id, d.host); },
+        }, "Remove")
+      )
+    );
+
+    var challenge = null;
+    if (d.status === "pending" && d.verification) {
+      var err = state.domainError && state.domainError.host === d.host
+        ? h("span", { className: "dns-error" }, state.domainError.message)
+        : null;
+      challenge = h("div", { className: "dns-challenge" },
+        h("div", { className: "dns-challenge-title" }, "Verify domain ownership"),
+        h("div", { className: "dns-challenge-desc" },
+          "Add this TXT record at your DNS provider, then click Verify."
+        ),
+        dnsField("Type", "TXT", false),
+        dnsField("Name", d.verification.record, true),
+        dnsField("Value", d.verification.value, true),
+        h("div", { className: "dns-challenge-actions" },
+          h("button", {
+            className: "btn btn-primary btn-sm",
+            disabled: busy ? "disabled" : null,
+            onClick: function() { verifyDomain(project.id, d.host); },
+          }, busy ? "Verifying..." : "Verify"),
+          err
+        )
+      );
+    } else if (d.status === "active" && isCustom) {
+      challenge = h("div", { className: "domain-hint" }, "HTTPS is provisioned automatically once this domain points at the platform.");
+    }
+
+    return h("div", { className: "domain-item" }, head, challenge);
+  }
+
+  function renderAddDomainForm(project) {
+    return h("form", {
+      className: "domain-add-form",
+      style: "flex-wrap: wrap; gap: 8px; margin: 4px 0 14px",
+      onSubmit: function(e) {
+        e.preventDefault();
+        var inputs = e.target.querySelectorAll("input");
+        var domain = inputs[0].value.trim().toLowerCase();
+        var site = inputs[1].value.trim();
+        if (domain) addDomain(project.id, domain, site || null);
+      },
+    },
+      h("input", {
+        className: "input input-sm",
+        type: "text",
+        placeholder: "docs   or   docs.example.com",
+        required: "required",
+        autocomplete: "off",
+        style: "min-width: 240px; flex: 1",
+      }),
+      h("input", {
+        className: "input input-sm",
+        type: "text",
+        placeholder: "site (optional)",
+        autocomplete: "off",
+        style: "width: 150px",
+      }),
+      h("button", { className: "btn btn-primary btn-sm", type: "submit" }, "Add"),
+      h("button", {
+        className: "btn btn-secondary btn-sm",
+        type: "button",
+        onClick: function() { state.showAddDomain = false; state.error = null; render(); },
+      }, "Cancel")
+    );
+  }
+
+  function renderDomainsView(project) {
+    var primary = h("div", { className: "domain-item" },
+      h("div", { className: "domain-head" },
+        project.url
+          ? h("a", { className: "domain-host", href: project.url, target: "_blank", rel: "noopener" }, project.id + ".jkbase.app")
+          : h("span", { className: "domain-host plain" }, project.id + ".jkbase.app"),
+        h("span", { className: "badge badge-accent" }, "primary"),
+        project.url
+          ? h("span", { className: "badge badge-active" }, "active")
+          : h("span", { className: "badge" }, "not deployed"),
+        h("span", { className: "domain-spacer" })
+      )
+    );
+
+    var rows = state.domains
+      .filter(function(d) { return d.host !== project.id; })
+      .map(function(d) { return renderDomainItem(project, d); });
+
+    return h("div", { className: "feature-content-inner" },
+      state.error ? h("div", { className: "error-banner" }, state.error) : null,
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px" },
+            h("div", { className: "card-title" }, "Domains"),
+            state.showAddDomain ? null : h("button", {
+              className: "btn btn-secondary btn-sm",
+              onClick: function() { state.showAddDomain = true; state.error = null; render(); },
+            }, "Add domain")
+          ),
+          h("div", { className: "section-desc", style: "margin-bottom: 4px" },
+            "Subdomains on jkbase.app are live immediately. Custom domains need DNS-TXT verification."
+          ),
+          state.showAddDomain ? renderAddDomainForm(project) : null,
+          primary,
+          rows,
+          (!rows.length && !state.domainsLoading)
+            ? h("div", { className: "domain-hint" }, "No additional domains yet.")
+            : null,
+          state.domainsLoading ? h("div", { className: "domain-hint" }, "Loading domains...") : null
+        )
+      )
+    );
+  }
+
+  // Deployments
+  function renderDeploymentsView(project) {
+    var rows = state.deployments.map(function(d) {
+      var actions;
+      if (d.active) {
+        actions = h("span", { className: "badge badge-active" }, "active");
+      } else if (state.rollbackConfirm === d.version) {
+        actions = h("div", { className: "domain-actions" },
+          h("button", {
+            className: "btn btn-secondary btn-sm",
+            onClick: function() { state.rollbackConfirm = null; render(); },
+          }, "Cancel"),
+          h("button", {
+            className: "btn btn-primary btn-sm",
+            disabled: state.rollbackBusy ? "disabled" : null,
+            onClick: function() { rollbackTo(project.id, d.version); },
+          }, state.rollbackBusy ? "Rolling back..." : "Confirm rollback")
+        );
+      } else {
+        actions = h("button", {
+          className: "btn btn-secondary btn-sm",
+          onClick: function() { state.rollbackConfirm = d.version; render(); },
+        }, "Roll back");
+      }
+      return h("div", { className: "deploy-item" },
+        h("span", { className: "deploy-version" }, "v" + d.version),
+        h("span", { className: "deploy-time" }, humanAge(d.created_at)),
+        h("span", { className: "deploy-spacer" }),
+        actions
+      );
+    });
+
+    var body;
+    if (state.deploymentsLoading && !state.deployments.length) {
+      body = h("div", { className: "domain-hint" }, "Loading deployments...");
+    } else if (!rows.length) {
+      body = h("div", { className: "empty-state" },
+        h("div", { className: "empty-state-title" }, "No deployments yet"),
+        h("div", { className: "empty-state-desc" }, "Run jkbase deploy to create your first version.")
+      );
+    } else {
+      body = rows;
+    }
+
+    return h("div", { className: "feature-content-inner" },
+      state.error ? h("div", { className: "error-banner" }, state.error) : null,
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "card-title", style: "margin-bottom: 6px" }, "Deployment history"),
+          h("div", { className: "section-desc", style: "margin-bottom: 6px" },
+            "Each deploy is an immutable version. Roll back to instantly repoint the live version."
+          ),
+          body
+        )
+      )
+    );
+  }
+
+  function humanAge(ts) {
+    if (!ts) return "";
+    var secs = Math.floor(Date.now() / 1000) - ts;
+    if (secs < 0) secs = 0;
+    if (secs < 60) return secs + "s ago";
+    if (secs < 3600) return Math.floor(secs / 60) + "m ago";
+    if (secs < 86400) return Math.floor(secs / 3600) + "h ago";
+    return Math.floor(secs / 86400) + "d ago";
   }
 
   // Functions
@@ -2962,13 +3360,15 @@ body {
 
   function renderFeatureContent(project) {
     switch (state.projectTab) {
-      case "overview":   return renderOverviewView(project);
-      case "hosting":    return renderHostingView(project);
-      case "functions":  return renderFunctionsView(project);
-      case "servers":    return renderServersView(project);
-      case "secrets":    return renderSecretsView(project);
-      case "settings":   return renderSettingsView(project);
-      default:           return renderOverviewView(project);
+      case "overview":    return renderOverviewView(project);
+      case "hosting":     return renderHostingView(project);
+      case "domains":     return renderDomainsView(project);
+      case "functions":   return renderFunctionsView(project);
+      case "servers":     return renderServersView(project);
+      case "deployments": return renderDeploymentsView(project);
+      case "secrets":     return renderSecretsView(project);
+      case "settings":    return renderSettingsView(project);
+      default:            return renderOverviewView(project);
     }
   }
 
