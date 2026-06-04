@@ -2975,6 +2975,7 @@ body {
         project.url
           ? h("span", { className: "badge badge-active" }, "active")
           : h("span", { className: "badge" }, "not deployed"),
+        project.url ? h("span", { className: "badge badge-active" }, "HTTPS") : null,
         h("span", { className: "domain-spacer" })
       )
     );
