@@ -1,4 +1,5 @@
 use crate::auth::{self, ApiToken, Tenant};
+use crate::logstore::LogStore;
 use crate::store::{Project, Store};
 use axum::body::Bytes;
 use axum::extract::{Path, State, Request};
@@ -27,6 +28,7 @@ pub type RoutingTable = Arc<tokio::sync::RwLock<std::collections::HashMap<String
 
 pub struct AppState {
     pub store: Store,
+    pub log_store: LogStore,
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
     pub routing_table: Option<RoutingTable>,
@@ -59,9 +61,10 @@ pub struct ErrorResponse {
 }
 
 impl AppState {
-    pub fn new(store: Store, deploy_dir: PathBuf) -> Self {
+    pub fn new(store: Store, log_store: LogStore, deploy_dir: PathBuf) -> Self {
         Self {
             store,
+            log_store,
             deploy_dir,
             deploy_callback: None,
             routing_table: None,
@@ -554,6 +557,9 @@ async fn delete_project(
         Ok(Some(project)) if project.tenant_id.as_deref() == Some(&tenant.id) => {
             match state.store.delete_project(&id) {
                 Ok(_) => {
+                    if let Err(e) = state.log_store.clear(&id) {
+                        tracing::warn!(project_id = %id, error = %e, "failed to clear project logs");
+                    }
                     info!(project_id = %id, "project deleted");
                     StatusCode::NO_CONTENT.into_response()
                 }
@@ -797,30 +803,36 @@ async fn get_project_logs(
         }
     }
 
-    let Some(ref routing_table) = state.routing_table else {
-        return Json(serde_json::json!([])).into_response();
-    };
-
-    let backend_ip = {
-        let table = routing_table.read().await;
-        table.get(&id).cloned()
-    };
-
-    let Some(ip) = backend_ip else {
-        return Json(serde_json::json!([])).into_response();
-    };
-
+    // Served from the host-persisted log store (populated by the server's log
+    // shipper), so logs remain available even while the VM is hibernated.
     let query = req.uri().query().unwrap_or("");
-    let url = format!("http://{}:80/_jkbase/logs?{}", ip, query);
+    let param = |key: &str| -> Option<&str> {
+        query.split('&').find_map(|p| p.strip_prefix(key))
+    };
+    let limit: usize = param("limit=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
+        .min(5000);
+    let since: Option<u64> = param("since=").and_then(|v| v.parse().ok());
+    let service = param("service=").map(|s| s.to_string());
 
-    match proxy_to_vm(&ip, &url).await {
-        Ok(body) => (
+    match state
+        .log_store
+        .read(&id, limit, service.as_deref(), since)
+    {
+        Ok(lines) => (
             StatusCode::OK,
             [(hyper::header::CONTENT_TYPE, "application/json")],
-            body,
+            Json(lines),
         )
             .into_response(),
-        Err(_) => Json(serde_json::json!([])).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 

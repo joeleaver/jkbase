@@ -37,14 +37,23 @@ pub enum Command {
     /// View logs
     Logs {
         /// Follow log output
-        #[arg(long)]
+        #[arg(long, short)]
         follow: bool,
-        /// Filter by service name
+        /// Filter by service (container) name
         #[arg(long)]
         service: Option<String>,
-        /// Output as JSON
+        /// Number of recent lines to show
+        #[arg(long, short = 'n', default_value = "200")]
+        limit: usize,
+        /// Output raw JSON lines
         #[arg(long)]
         json: bool,
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
     },
     /// Manage secrets
     #[command(subcommand)]
@@ -182,16 +191,11 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Logs {
             follow,
             service,
-            json: _,
-        } => {
-            match (&service, follow) {
-                (Some(s), true) => println!("Tailing logs for {s}..."),
-                (Some(s), false) => println!("Fetching logs for {s}..."),
-                (None, true) => println!("Tailing logs..."),
-                (None, false) => println!("Fetching logs..."),
-            }
-            Ok(())
-        }
+            limit,
+            json,
+            project,
+            api,
+        } => run_logs(follow, service, limit, json, project, api).await,
         Command::Secret(cmd) => run_secret(cmd).await,
         Command::Domain(cmd) => match cmd {
             DomainCommand::Add { domain } => {
@@ -215,6 +219,87 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             println!("Starting local development environment...");
             Ok(())
         }
+    }
+}
+
+async fn run_logs(
+    follow: bool,
+    service: Option<String>,
+    limit: usize,
+    json: bool,
+    project: Option<String>,
+    api: String,
+) -> anyhow::Result<()> {
+    use jkbase_common::logs::LogLine;
+
+    let project_id = resolve_project_id(project)?;
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+    let url = format!("{api}/projects/{project_id}/logs");
+
+    // Fetch one page of logs. `since` returns only lines newer than that store seq.
+    let fetch = |since: Option<u64>| {
+        let client = client.clone();
+        let url = url.clone();
+        let service = service.clone();
+        async move {
+            let mut req = client.get(&url);
+            match since {
+                Some(s) => req = req.query(&[("since", s.to_string())]),
+                None => req = req.query(&[("limit", limit.to_string())]),
+            }
+            if let Some(ref svc) = service {
+                req = req.query(&[("service", svc)]);
+            }
+            let resp = req.send().await.context("failed to connect to API")?;
+            if !resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to fetch logs: {err}");
+            }
+            let lines: Vec<LogLine> = resp.json().await.context("invalid logs response")?;
+            Ok::<Vec<LogLine>, anyhow::Error>(lines)
+        }
+    };
+
+    let lines = fetch(None).await?;
+    if lines.is_empty() && !follow {
+        eprintln!("No logs for project '{project_id}'");
+        return Ok(());
+    }
+    let mut cursor = lines.last().map(|l| l.seq).unwrap_or(0);
+    for line in &lines {
+        print_line(line, json);
+    }
+
+    if !follow {
+        return Ok(());
+    }
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let new_lines = fetch(Some(cursor)).await?;
+        for line in &new_lines {
+            print_line(line, json);
+            cursor = cursor.max(line.seq);
+        }
+    }
+}
+
+fn print_line(line: &jkbase_common::logs::LogLine, json: bool) {
+    if json {
+        if let Ok(s) = serde_json::to_string(line) {
+            println!("{s}");
+        }
+        return;
+    }
+    // stdout lines to stdout, stderr lines to stderr (so redirection works).
+    let formatted = format!("{} [{}] {}", line.timestamp, line.server, line.line);
+    if line.stream == "stderr" {
+        eprintln!("{formatted}");
+    } else {
+        println!("{formatted}");
     }
 }
 

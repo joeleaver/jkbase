@@ -397,14 +397,26 @@ async fn logs_response(
     req: &Request<hyper::body::Incoming>,
 ) -> Response<Full<Bytes>> {
     let query = req.uri().query().unwrap_or("");
-    let limit: usize = query
-        .split('&')
-        .find_map(|p| p.strip_prefix("limit="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
+    let param = |key: &str| -> Option<u64> {
+        query
+            .split('&')
+            .find_map(|p| p.strip_prefix(key))
+            .and_then(|v| v.parse().ok())
+    };
 
-    let logs = state.containers.get_logs(limit).await;
-    let body = serde_json::to_vec(&logs).unwrap_or_default();
+    // `since` (incremental cursor) takes precedence over `limit` (tail).
+    let lines = if let Some(since) = param("since=") {
+        state.containers.get_logs_since(since).await
+    } else {
+        let limit = param("limit=").unwrap_or(200) as usize;
+        state.containers.get_logs(limit).await
+    };
+
+    let resp = jkbase_common::logs::LogsResponse {
+        boot_id: state.containers.boot_id().to_string(),
+        lines,
+    };
+    let body = serde_json::to_vec(&resp).unwrap_or_default();
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")

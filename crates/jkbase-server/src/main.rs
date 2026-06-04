@@ -1,7 +1,11 @@
+mod log_shipper;
+
 use anyhow::Result;
 use clap::Parser;
 use jkbase_control::api::{self, AppState};
+use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{ProjectState, SnapshotMeta, Store, VmAllocation};
+use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
 use jkbase_proxy::{self, new_routing_table, ActivityTracker, KnownProjects, ProxyConfig};
@@ -111,6 +115,10 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&deploy_dir).await?;
 
     let store = Store::open(&db_path)?;
+    let logs_dir = data_dir.join("logs");
+    tokio::fs::create_dir_all(&logs_dir).await?;
+    let log_store = LogStore::new(logs_dir.clone());
+    let log_shipper = LogShipper::new(log_store.clone(), logs_dir.join(".cursors.json"));
     let routing_table = new_routing_table();
     let known_projects: KnownProjects = Arc::new(RwLock::new(HashSet::new()));
     let activity_tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
@@ -130,17 +138,19 @@ async fn main() -> Result<()> {
         data_dir: data_dir.clone(),
     }));
 
-    let mut state = AppState::new(store, deploy_dir);
+    let mut state = AppState::new(store, log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();
     let known_for_cb = known_projects.clone();
+    let shipper_for_cb = log_shipper.clone();
     state.deploy_callback = Some(Box::new(move |project_id: String, _version: u64| {
         let platform = platform_for_cb.clone();
         let routing = routing_for_cb.clone();
         let known = known_for_cb.clone();
-        Box::pin(async move { handle_deploy(&project_id, platform, routing, known).await })
+        let shipper = shipper_for_cb.clone();
+        Box::pin(async move { handle_deploy(&project_id, platform, routing, known, shipper).await })
     }));
 
     let state = Arc::new(state);
@@ -171,12 +181,14 @@ async fn main() -> Result<()> {
     let platform_for_wake = platform.clone();
     let routing_for_wake = routing_table.clone();
     let known_for_wake = known_projects.clone();
+    let shipper_for_wake = log_shipper.clone();
     let wake_callback: jkbase_proxy::WakeCallback =
         Arc::new(move |project_id: String| {
             let platform = platform_for_wake.clone();
             let routing = routing_for_wake.clone();
             let known = known_for_wake.clone();
-            Box::pin(async move { wake_project(&project_id, platform, routing, known).await })
+            let shipper = shipper_for_wake.clone();
+            Box::pin(async move { wake_project(&project_id, platform, routing, known, shipper).await })
         });
 
     let api_addr = format!("127.0.0.1:{}", args.api_port);
@@ -201,6 +213,9 @@ async fn main() -> Result<()> {
     cleanup_orphans(&platform).await;
     initialize_projects(&platform, &known_projects).await;
 
+    // Spawn log shipper loop (pulls guest logs into the persistent store)
+    tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
+
     // Spawn idle detection loop
     if args.idle_timeout_secs > 0 {
         let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
@@ -210,6 +225,7 @@ async fn main() -> Result<()> {
             routing_table.clone(),
             activity_tracker.clone(),
             idle_timeout,
+            log_shipper.clone(),
         ));
     }
 
@@ -223,8 +239,13 @@ async fn main() -> Result<()> {
 
     let platform_for_shutdown = platform.clone();
     let routing_for_shutdown = routing_table.clone();
+    let shipper_for_shutdown = log_shipper.clone();
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(platform_for_shutdown, routing_for_shutdown))
+        .with_graceful_shutdown(shutdown_signal(
+            platform_for_shutdown,
+            routing_for_shutdown,
+            shipper_for_shutdown,
+        ))
         .await?;
 
     Ok(())
@@ -233,6 +254,7 @@ async fn main() -> Result<()> {
 async fn shutdown_signal(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
+    shipper: Arc<LogShipper>,
 ) {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -255,7 +277,9 @@ async fn shutdown_signal(
 
     for project_id in &running_projects {
         info!(project = %project_id, "hibernating for shutdown");
-        if let Err(e) = hibernate_project(project_id, platform.clone(), routing.clone()).await {
+        if let Err(e) =
+            hibernate_project(project_id, platform.clone(), routing.clone(), shipper.clone()).await
+        {
             tracing::error!(project = %project_id, error = %e, "hibernate failed, force stopping");
             let mut plat = platform.lock().await;
             if let Some(mut vm) = plat.vms.remove(project_id) {
@@ -338,6 +362,7 @@ async fn handle_deploy(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     known_projects: KnownProjects,
+    shipper: Arc<LogShipper>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
 
@@ -353,6 +378,8 @@ async fn handle_deploy(
         info!(project = %project_id, "syncing and stopping old VM for redeploy");
         if let Ok(Some(alloc)) = plat.store.get_vm_allocation(project_id) {
             let _ = sync_agent(&alloc.ip).await;
+            // Capture any final log lines before the old agent goes away.
+            shipper.ship(project_id, &alloc.ip).await;
         }
         old_vm.stop().await?;
     }
@@ -458,6 +485,7 @@ async fn hibernate_project(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
+    shipper: Arc<LogShipper>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
 
@@ -490,7 +518,18 @@ async fn hibernate_project(
     };
 
     let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
+    let agent_ip = plat
+        .store
+        .get_vm_allocation(project_id)
+        .ok()
+        .flatten()
+        .map(|a| a.ip);
     drop(plat);
+
+    // Final flush of the agent's buffer before we pause it for hibernation.
+    if let Some(ip) = &agent_ip {
+        shipper.ship(project_id, ip).await;
+    }
 
     let (snapshot_path, mem_file_path) = vm.hibernate(&snapshot_dir).await?;
 
@@ -526,6 +565,7 @@ async fn wake_project(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     known_projects: KnownProjects,
+    shipper: Arc<LogShipper>,
 ) -> Result<String> {
     let mut plat = platform.lock().await;
 
@@ -558,6 +598,7 @@ async fn wake_project(
                         platform.clone(),
                         routing,
                         known_projects,
+                        shipper,
                     ))
                     .await;
                 }
@@ -582,7 +623,7 @@ async fn wake_project(
             drop(plat);
             info!(project = %project_id, "no allocation, cold booting");
             let routing_clone = routing.clone();
-            handle_deploy(project_id, platform, routing, known_projects).await?;
+            handle_deploy(project_id, platform, routing, known_projects, shipper).await?;
             let table = routing_clone.read().await;
             return table
                 .get(project_id)
@@ -711,6 +752,7 @@ async fn idle_detection_loop(
     routing: jkbase_proxy::RoutingTable,
     activity: ActivityTracker,
     idle_timeout: Duration,
+    shipper: Arc<LogShipper>,
 ) {
     let check_interval = Duration::from_secs(60);
 
@@ -735,8 +777,13 @@ async fn idle_detection_loop(
 
             if should_hibernate {
                 info!(project = %project_id, "idle timeout, hibernating");
-                if let Err(e) =
-                    hibernate_project(&project_id, platform.clone(), routing.clone()).await
+                if let Err(e) = hibernate_project(
+                    &project_id,
+                    platform.clone(),
+                    routing.clone(),
+                    shipper.clone(),
+                )
+                .await
                 {
                     tracing::error!(project = %project_id, error = %e, "failed to hibernate");
                 }
@@ -744,6 +791,33 @@ async fn idle_detection_loop(
                 let mut tracker = activity.write().await;
                 tracker.remove(&project_id);
             }
+        }
+    }
+}
+
+/// Periodically pull new guest logs from every running VM into the persistent
+/// log store so they survive hibernation, restart, and crashes.
+async fn log_shipper_loop(platform: Arc<Mutex<PlatformState>>, shipper: Arc<LogShipper>) {
+    loop {
+        tokio::time::sleep(log_shipper::POLL_INTERVAL).await;
+
+        let targets: Vec<(String, String)> = {
+            let plat = platform.lock().await;
+            plat.vm_states
+                .iter()
+                .filter(|(_, s)| **s == VmLifecycle::Running)
+                .filter_map(|(id, _)| {
+                    plat.store
+                        .get_vm_allocation(id)
+                        .ok()
+                        .flatten()
+                        .map(|a| (id.clone(), a.ip))
+                })
+                .collect()
+        };
+
+        for (project_id, ip) in targets {
+            shipper.ship(&project_id, &ip).await;
         }
     }
 }

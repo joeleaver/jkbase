@@ -1585,6 +1585,8 @@ dependencies = [
  "jkbase-orch",
  "jkbase-proxy",
  "rustls",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
