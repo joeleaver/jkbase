@@ -1565,6 +1565,10 @@ body {
     logs: [],
     secretsLoading: false,
     logsLoading: false,
+    logsFollow: false,
+    logsCursor: 0,
+    logsLimit: 200,
+    logsErrorsOnly: false,
     showAddSecret: false,
     deleteSecretConfirm: null,
     // account
@@ -1753,6 +1757,8 @@ body {
     state.statusLoading = false;
     state.secrets = [];
     state.logs = [];
+    state.logsFollow = false;
+    state.logsCursor = 0;
     state.domains = project.domains || [];
     state.error = null;
     state.success = null;
@@ -1838,23 +1844,67 @@ body {
     });
   }
 
+  function scrollLogsToBottom() {
+    var logEls = document.querySelectorAll(".log-container");
+    for (var i = 0; i < logEls.length; i++) {
+      logEls[i].scrollTop = logEls[i].scrollHeight;
+    }
+  }
+
+  // Full (re)load: replaces the buffer and resets the tail cursor.
   function loadLogs(projectId) {
     state.logsLoading = true;
     render();
-    api("GET", "/projects/" + projectId + "/logs?limit=200").then(function(logs) {
-      state.logs = logs;
+    api("GET", "/projects/" + projectId + "/logs?limit=" + state.logsLimit).then(function(logs) {
+      state.logs = logs || [];
+      state.logsCursor = state.logs.length ? state.logs[state.logs.length - 1].seq : 0;
       state.logsLoading = false;
       render();
-      // Scroll all log containers to bottom
-      var logEls = document.querySelectorAll(".log-container");
-      for (var i = 0; i < logEls.length; i++) {
-        logEls[i].scrollTop = logEls[i].scrollHeight;
-      }
+      scrollLogsToBottom();
     }).catch(function(e) {
       state.logsLoading = false;
       state.error = e.message;
       render();
     });
+  }
+
+  // Incremental tail: fetch only lines newer than the cursor and append them.
+  // Driven by the global poll loop while "Follow" is on. Stays quiet on errors
+  // so a transient blip (e.g. VM waking) doesn't disrupt the view.
+  var LOGS_MAX_BUFFER = 2000;
+  function tailLogs(projectId) {
+    api("GET", "/projects/" + projectId + "/logs?since=" + state.logsCursor).then(function(logs) {
+      if (!logs || !logs.length) return;
+      state.logs = state.logs.concat(logs);
+      if (state.logs.length > LOGS_MAX_BUFFER) {
+        state.logs = state.logs.slice(state.logs.length - LOGS_MAX_BUFFER);
+      }
+      state.logsCursor = logs[logs.length - 1].seq;
+      render();
+      scrollLogsToBottom();
+    }).catch(function() {});
+  }
+
+  function toggleLogsFollow(projectId) {
+    state.logsFollow = !state.logsFollow;
+    render();
+    if (state.logsFollow) {
+      // Reconcile immediately so the user sees fresh lines without waiting a tick.
+      tailLogs(projectId);
+    }
+  }
+
+  // Single global loop: cheap no-op unless the user is actively following logs on
+  // the Servers tab. Avoids per-view interval setup/teardown bookkeeping.
+  function startLogTailLoop() {
+    setInterval(function() {
+      if (state.logsFollow &&
+          state.view === "console" &&
+          state.projectTab === "servers" &&
+          state.currentProject) {
+        tailLogs(state.currentProject.id);
+      }
+    }, 2000);
   }
 
   // --- Domains ---
@@ -1972,7 +2022,8 @@ body {
 
   function formatTimestamp(ts) {
     try {
-      var d = new Date(ts);
+      // Log timestamps are unix seconds; Date expects milliseconds.
+      var d = new Date(ts * 1000);
       var hh = String(d.getHours()).padStart(2, "0");
       var mm = String(d.getMinutes()).padStart(2, "0");
       var ss = String(d.getSeconds()).padStart(2, "0");
@@ -2651,10 +2702,42 @@ body {
               h("div", { className: "section-desc", style: "margin-bottom: 16px" },
                 String(servers.length) + " server container" + (servers.length !== 1 ? "s" : "")
               ),
+              h("div", { className: "server-logs-toolbar", style: "margin-bottom: 16px" },
+                h("button", {
+                  className: "btn btn-sm " + (state.logsFollow ? "btn-primary" : "btn-secondary"),
+                  onClick: function() { toggleLogsFollow(project.id); },
+                }, state.logsFollow ? "● Following" : "Follow logs"),
+                h("button", {
+                  className: "btn btn-secondary btn-sm",
+                  disabled: state.logsLoading ? "disabled" : null,
+                  onClick: function() { loadLogs(project.id); },
+                }, state.logsLoading ? "Loading..." : "Refresh"),
+                h("label", { className: "server-logs-label", style: "margin-left: 8px" }, "Lines"),
+                h("select", {
+                  className: "btn btn-secondary btn-sm",
+                  onChange: function(e) {
+                    state.logsLimit = parseInt(e.target.value, 10) || 200;
+                    loadLogs(project.id);
+                  },
+                },
+                  [100, 200, 500, 1000].map(function(n) {
+                    return h("option",
+                      n === state.logsLimit ? { value: String(n), selected: "selected" } : { value: String(n) },
+                      String(n));
+                  })
+                ),
+                h("button", {
+                  className: "btn btn-sm " + (state.logsErrorsOnly ? "btn-primary" : "btn-secondary"),
+                  style: "margin-left: 8px",
+                  onClick: function() { state.logsErrorsOnly = !state.logsErrorsOnly; render(); },
+                }, "Errors only")
+              ),
               servers.map(function(server) {
-                // Filter logs for this server
+                // Filter logs for this server (and optionally to stderr only)
                 var serverLogs = state.logs.filter(function(log) {
-                  return log.server === server.name;
+                  if (log.server !== server.name) return false;
+                  if (state.logsErrorsOnly && log.stream !== "stderr") return false;
+                  return true;
                 });
 
                 return h("div", { className: "server-card" },
@@ -2674,12 +2757,7 @@ body {
                   ),
                   h("div", { className: "server-logs-area" },
                     h("div", { className: "server-logs-toolbar" },
-                      h("span", { className: "server-logs-label" }, "Logs"),
-                      h("button", {
-                        className: "btn btn-secondary btn-sm",
-                        disabled: state.logsLoading ? "disabled" : null,
-                        onClick: function() { loadLogs(project.id); },
-                      }, state.logsLoading ? "Loading..." : "Refresh")
+                      h("span", { className: "server-logs-label" }, "Logs")
                     ),
                     serverLogs.length > 0
                       ? h("div", { className: "log-container" },
@@ -3103,6 +3181,8 @@ body {
   }
 
   // --- Init ---
+
+  startLogTailLoop();
 
   if (state.token) {
     state.view = "loading";
