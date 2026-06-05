@@ -224,6 +224,17 @@ pub fn stage_rw_prealloc(dst: &Path, size_bytes: u64, uid: u32, gid: u32) -> Res
     if !status.success() {
         bail!("fallocate failed for {} ({status})", dst.display());
     }
+    // Format as an empty journal-less ext4 so the guest can mount it RW. Safe:
+    // the image is empty and host-created — the host never parses guest-written
+    // data here (build output is read back out-of-band, never host-mounted).
+    let status = std::process::Command::new("mkfs.ext4")
+        .args(["-F", "-q", "-O", "^has_journal"])
+        .arg(dst)
+        .status()
+        .with_context(|| format!("run mkfs.ext4 for {}", dst.display()))?;
+    if !status.success() {
+        bail!("mkfs.ext4 failed for {} ({status})", dst.display());
+    }
     chown_to(dst, uid, gid)?;
     Ok(())
 }
