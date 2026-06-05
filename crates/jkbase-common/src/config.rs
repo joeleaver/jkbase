@@ -34,6 +34,10 @@ pub struct RouteTarget {
 pub struct FunctionConfig {
     pub source: String,
     pub runtime: Option<String>,
+    /// 5-field UNIX cron, e.g. "*/5 * * * *". When set, the host invokes this
+    /// function on the schedule (waking the project if hibernated).
+    #[serde(default)]
+    pub schedule: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

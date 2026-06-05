@@ -13,6 +13,7 @@ const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 const DEPLOYMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deployments");
 const DOMAINS: TableDefinition<&str, &[u8]> = TableDefinition::new("domains");
+const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
@@ -72,6 +73,19 @@ pub struct DeploymentMeta {
     pub project_id: String,
     pub version: u64,
     pub created_at: u64,
+}
+
+/// A registered cron schedule for one WASM function. The host scheduler reads
+/// these as the single source of truth and fires due functions, advancing
+/// `last_run` after each successful invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRecord {
+    pub project_id: String,
+    pub function: String,
+    /// 5-field UNIX cron, e.g. "*/5 * * * *".
+    pub cron: String,
+    /// Epoch secs of the last fired occurrence; `None` = never run.
+    pub last_run: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +150,7 @@ impl Store {
         let _ = txn.open_table(SNAPSHOTS)?;
         let _ = txn.open_table(DEPLOYMENTS)?;
         let _ = txn.open_table(DOMAINS)?;
+        let _ = txn.open_table(SCHEDULES)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -318,6 +333,87 @@ impl Store {
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    // -- Schedules --
+
+    fn schedule_key(project_id: &str, function: &str) -> String {
+        format!("{project_id}:{function}")
+    }
+
+    pub fn save_schedule(&self, rec: &ScheduleRecord) -> Result<()> {
+        let key = Self::schedule_key(&rec.project_id, &rec.function);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEDULES)?;
+            let data = serde_json::to_vec(rec)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Every schedule across all projects (the scheduler loop reads this each tick).
+    pub fn list_schedules(&self) -> Result<Vec<ScheduleRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEDULES)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            out.push(serde_json::from_slice::<ScheduleRecord>(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_schedules_for_project(&self, project_id: &str) -> Result<Vec<ScheduleRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEDULES)?;
+        let prefix = format!("{project_id}:");
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            if k.value().starts_with(&prefix) {
+                out.push(serde_json::from_slice::<ScheduleRecord>(v.value())?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn remove_schedule(&self, project_id: &str, function: &str) -> Result<bool> {
+        let key = Self::schedule_key(project_id, function);
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(SCHEDULES)?;
+            table.remove(key.as_str())?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Read-modify-write just `last_run`. No-op if the schedule was removed
+    /// concurrently (e.g. an undeploy raced the fire).
+    pub fn update_schedule_last_run(
+        &self,
+        project_id: &str,
+        function: &str,
+        ts: u64,
+    ) -> Result<()> {
+        let key = Self::schedule_key(project_id, function);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(SCHEDULES)?;
+            // Copy out to an owned buffer so the read AccessGuard borrow ends
+            // before we take the mutable borrow for insert.
+            let existing = table.get(key.as_str())?.map(|d| d.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut rec: ScheduleRecord = serde_json::from_slice(&bytes)?;
+                rec.last_run = Some(ts);
+                let out = serde_json::to_vec(&rec)?;
+                table.insert(key.as_str(), out.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     // -- Domains --
@@ -589,6 +685,50 @@ mod tests {
             store.list_deployments("a").unwrap().iter().map(|d| d.version).collect::<Vec<_>>(),
             vec![10, 1]
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schedules_scoped_per_project_with_last_run_rmw() {
+        let (store, path) = tmp_db();
+        let rec = |p: &str, f: &str| ScheduleRecord {
+            project_id: p.to_string(),
+            function: f.to_string(),
+            cron: "*/5 * * * *".to_string(),
+            last_run: None,
+        };
+        store.save_schedule(&rec("a", "f1")).unwrap();
+        store.save_schedule(&rec("a", "f2")).unwrap();
+        store.save_schedule(&rec("b", "f1")).unwrap();
+
+        let mut a: Vec<_> = store
+            .list_schedules_for_project("a")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.function)
+            .collect();
+        a.sort();
+        assert_eq!(a, vec!["f1", "f2"], "prefix-scoped to project a");
+        assert_eq!(store.list_schedules().unwrap().len(), 3, "all projects");
+
+        store.update_schedule_last_run("a", "f1", 123).unwrap();
+        let f1 = store
+            .list_schedules_for_project("a")
+            .unwrap()
+            .into_iter()
+            .find(|s| s.function == "f1")
+            .unwrap();
+        assert_eq!(f1.last_run, Some(123), "last_run advanced");
+        assert_eq!(f1.cron, "*/5 * * * *", "cron preserved across rmw");
+
+        // RMW on a missing schedule is a silent no-op.
+        store.update_schedule_last_run("a", "ghost", 1).unwrap();
+
+        assert!(store.remove_schedule("a", "f1").unwrap());
+        assert!(!store.remove_schedule("a", "f1").unwrap(), "second remove false");
+        assert_eq!(store.list_schedules_for_project("a").unwrap().len(), 1);
+        assert_eq!(store.list_schedules_for_project("b").unwrap().len(), 1, "b intact");
 
         let _ = std::fs::remove_file(&path);
     }

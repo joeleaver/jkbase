@@ -85,6 +85,24 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         None
     };
 
+    // Serialize function schedules (inline cron from [functions.NAME])
+    let schedules_json = {
+        let scheds: Vec<_> = config
+            .functions
+            .iter()
+            .filter_map(|(name, f)| {
+                f.schedule
+                    .as_ref()
+                    .map(|c| serde_json::json!({ "function": name, "cron": c }))
+            })
+            .collect();
+        if scheds.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string_pretty(&scheds)?)
+        }
+    };
+
     println!("Packaging...");
     let tarball = create_tarball(
         project_dir,
@@ -94,6 +112,7 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         route_config.as_deref(),
         sites_json.as_deref(),
         domains_json.as_deref(),
+        schedules_json.as_deref(),
     )
     .context("failed to create tarball")?;
     println!("  {} bytes compressed", tarball.len());
@@ -330,6 +349,7 @@ fn read_crate_name(cargo_toml: &Path) -> Result<String> {
 const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
 
+#[allow(clippy::too_many_arguments)] // threads several optional sidecar artifacts
 fn create_tarball(
     project_dir: &Path,
     sites: &[jkbase_common::config::ResolvedSite],
@@ -338,6 +358,7 @@ fn create_tarball(
     route_config_json: Option<&str>,
     sites_json: Option<&str>,
     domains_json: Option<&str>,
+    schedules_json: Option<&str>,
 ) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let enc = GzEncoder::new(buf, Compression::fast());
@@ -391,6 +412,10 @@ fn create_tarball(
 
     if let Some(domains_json) = domains_json {
         append_json_file(&mut tar, "_domains.json", domains_json)?;
+    }
+
+    if let Some(schedules_json) = schedules_json {
+        append_json_file(&mut tar, "_schedules.json", schedules_json)?;
     }
 
     let enc = tar.into_inner()?;

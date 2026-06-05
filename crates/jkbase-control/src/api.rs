@@ -622,6 +622,12 @@ async fn delete_project(
                             let _ = state.store.remove_deployment(&id, d.version);
                         }
                     }
+                    // Drop any cron schedules so the host scheduler stops firing.
+                    if let Ok(schedules) = state.store.list_schedules_for_project(&id) {
+                        for s in schedules {
+                            let _ = state.store.remove_schedule(&id, &s.function);
+                        }
+                    }
                     // Release all claimed hostnames so they can't be taken over
                     // or left dangling in the routing maps.
                     if let Ok(domains) = state.store.list_domains_for_project(&id) {
@@ -784,6 +790,11 @@ async fn do_deploy(
     // routes an unverified host. Best-effort: a taken/foreign host is skipped.
     reconcile_deploy_domains(state, project, &deploy_path).await;
     let _ = refresh_domain_cache(state, &project.id);
+
+    // Reconcile function cron schedules declared in the deploy into the durable
+    // registry (replace-on-redeploy, preserving last_run so cadence/catch-up
+    // survive). The host scheduler reads this registry as source of truth.
+    reconcile_deploy_schedules(state, project, &deploy_path);
 
     // Record version history and prune old artifacts so disk usage stays bounded.
     state.store.save_deployment(&crate::store::DeploymentMeta {
@@ -1713,6 +1724,70 @@ fn refresh_domain_cache(state: &AppState, project_id: &str) -> anyhow::Result<()
 /// and legacy project-level `_domains.json`) into the DOMAINS registry. Owned
 /// subdomains become Active; custom domains are claimed Pending (never routed
 /// until verified). Hosts already owned by another project are left untouched.
+#[derive(serde::Deserialize)]
+struct DeclaredSchedule {
+    function: String,
+    cron: String,
+}
+
+/// Reconcile inline `[functions.NAME] schedule` crons (shipped as `_schedules.json`)
+/// into the durable registry. Replace-on-redeploy: upsert declared schedules
+/// (preserving `last_run` so we don't replay catch-up or reset cadence), and prune
+/// schedules for functions removed/renamed in this deploy. Invalid cron expressions
+/// are rejected at write time so the scheduler loop never holds an unparseable cron.
+fn reconcile_deploy_schedules(state: &AppState, project: &Project, deploy_path: &std::path::Path) {
+    use std::str::FromStr;
+
+    let declared: Vec<DeclaredSchedule> =
+        std::fs::read_to_string(deploy_path.join("_schedules.json"))
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+
+    let existing = state
+        .store
+        .list_schedules_for_project(&project.id)
+        .unwrap_or_default();
+    let declared_names: std::collections::HashSet<&str> =
+        declared.iter().map(|d| d.function.as_str()).collect();
+
+    for d in &declared {
+        // The `cron` crate is 6-field (field 0 = seconds); a 5-field UNIX expr is
+        // left-padded with "0 " to fire at second 0. Must match the loop's parser.
+        if cron::Schedule::from_str(&format!("0 {}", d.cron)).is_err() {
+            tracing::warn!(project = %project.id, function = %d.function, cron = %d.cron,
+                "skipping invalid cron expression");
+            continue;
+        }
+
+        // Preserve last_run on an unchanged redeploy; reseed to now when the cron
+        // changes or the schedule is new (so we never replay from epoch 0).
+        let prior = existing.iter().find(|e| e.function == d.function);
+        let last_run = match prior {
+            Some(p) if p.cron == d.cron => p.last_run,
+            _ => Some(auth::timestamp()),
+        };
+
+        let rec = crate::store::ScheduleRecord {
+            project_id: project.id.clone(),
+            function: d.function.clone(),
+            cron: d.cron.clone(),
+            last_run,
+        };
+        if let Err(e) = state.store.save_schedule(&rec) {
+            tracing::warn!(project = %project.id, function = %d.function, error = %e,
+                "failed to persist schedule");
+        }
+    }
+
+    // Prune schedules for functions no longer declared.
+    for e in &existing {
+        if !declared_names.contains(e.function.as_str()) {
+            let _ = state.store.remove_schedule(&project.id, &e.function);
+        }
+    }
+}
+
 async fn reconcile_deploy_domains(state: &AppState, project: &Project, deploy_path: &std::path::Path) {
     let Some(tenant_id) = project.tenant_id.clone() else {
         return;
