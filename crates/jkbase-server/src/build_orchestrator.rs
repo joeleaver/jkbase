@@ -28,7 +28,7 @@ use jkbase_common::config::ProjectConfig;
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
-use jkbase_orch::build_vm::{BuildOutcome, BuildVm, BuildVmConfig};
+use jkbase_orch::build_vm::{BuildOutcome, BuildVm, BuildVmConfig, SealFn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,6 +77,10 @@ pub struct BuildDeps {
     pub console_log_max_bytes: u64,
     /// Max build VMs booting concurrently across all jobs.
     pub max_concurrent: usize,
+    /// Isolated build network for dependency fetches; `None` → offline builds.
+    pub net: Option<Arc<BuildNet>>,
+    /// Max time the FETCH phase may hold the network before the host force-seals.
+    pub fetch_deadline: Duration,
 }
 
 impl BuildDeps {
@@ -187,6 +191,123 @@ pub fn provision_cgroup(cgroup_mount: &Path, parent: &str) {
         return;
     }
     info!(parent = %parent_dir.display(), "build cgroup provisioned");
+}
+
+/// Isolated per-build network: an IP/TAP slot pool on the build bridge. A build
+/// VM can reach ONLY the egress proxy on the gateway (enforced host-side by the
+/// firewall from `tools/setup-build-net.sh`); the proxy does the allowlist +
+/// public-IP pinning. `None` in [`BuildDeps`] → offline (network-free) builds.
+pub struct BuildNet {
+    pub bridge: String,
+    pub gateway: String,
+    pub proxy_port: u16,
+    subnet_prefix: String,
+    uid: u32,
+    free_slots: Mutex<Vec<u8>>,
+}
+
+/// A leased build-network slot (its TAP + guest IP/MAC); returned via [`BuildNet::release`].
+pub struct NetLease {
+    slot: u8,
+    tap: String,
+    guest_ip: String,
+    mac: String,
+}
+
+impl BuildNet {
+    /// `pool_size` concurrent slots → guest IPs `<subnet>.2 ..= .(1+pool_size)`.
+    pub fn new(bridge: String, gateway: String, proxy_port: u16, uid: u32, pool_size: u8) -> Self {
+        let subnet_prefix = {
+            let mut parts: Vec<&str> = gateway.split('.').collect();
+            parts.truncate(3);
+            parts.join(".")
+        };
+        // Reversed so pop() hands out ascending slot numbers.
+        let free_slots: Vec<u8> = (1..=pool_size).rev().collect();
+        Self {
+            bridge,
+            gateway,
+            proxy_port,
+            subnet_prefix,
+            uid,
+            free_slots: Mutex::new(free_slots),
+        }
+    }
+
+    pub fn proxy_url(&self) -> String {
+        format!("http://{}:{}", self.gateway, self.proxy_port)
+    }
+
+    /// Lease a slot and bring up its TAP — owned by the build uid (so the jailed
+    /// firecracker can open it) and mastered to the build bridge.
+    pub async fn acquire(&self) -> Result<NetLease> {
+        let slot = {
+            let mut slots = self.free_slots.lock().await;
+            slots
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("build network pool exhausted"))?
+        };
+        let tap = format!("jkbld{slot}");
+        let guest_ip = format!("{}.{}", self.subnet_prefix, slot as u16 + 1);
+        let mac = format!("AA:FC:00:1F:00:{slot:02X}");
+        if let Err(e) = self.setup_tap(&tap).await {
+            self.free_slots.lock().await.push(slot);
+            return Err(e);
+        }
+        Ok(NetLease {
+            slot,
+            tap,
+            guest_ip,
+            mac,
+        })
+    }
+
+    /// Tear the leased TAP down (idempotent — the seal may already have deleted
+    /// it) and return its slot to the pool.
+    pub async fn release(&self, lease: NetLease) {
+        let _ = run_ip(&["link", "delete", &lease.tap]).await;
+        self.free_slots.lock().await.push(lease.slot);
+    }
+
+    async fn setup_tap(&self, tap: &str) -> Result<()> {
+        let _ = run_ip(&["link", "delete", tap]).await; // clear any stale device
+        run_ip(&[
+            "tuntap",
+            "add",
+            "dev",
+            tap,
+            "mode",
+            "tap",
+            "user",
+            &self.uid.to_string(),
+        ])
+        .await?;
+        run_ip(&["link", "set", tap, "master", &self.bridge]).await?;
+        run_ip(&["link", "set", tap, "up"]).await?;
+        Ok(())
+    }
+}
+
+async fn run_ip(args: &[&str]) -> Result<()> {
+    let status = tokio::process::Command::new("ip").args(args).status().await?;
+    if !status.success() {
+        bail!("ip {args:?} failed: {status}");
+    }
+    Ok(())
+}
+
+/// The host seal action: delete the build VM's TAP so its COMPILE phase is
+/// offline. Host-enforced — the guest can't recreate a host TAP.
+fn make_seal(tap: String) -> SealFn {
+    Box::new(move || {
+        let tap = tap.clone();
+        Box::pin(async move {
+            let _ = tokio::process::Command::new("ip")
+                .args(["link", "delete", &tap])
+                .status()
+                .await;
+        })
+    })
 }
 
 /// One unit of build work fanned out to its own build VM.
@@ -453,6 +574,25 @@ async fn build_one_target_inner(
     build_ro_ext4_from_dir(&source_path, &source_img, 16)
         .with_context(|| format!("build source image for '{}'", spec.name))?;
 
+    // Lease an isolated TAP when a build network is configured, so this VM can
+    // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
+    let lease = match &deps.net {
+        Some(net) => Some(net.acquire().await.context("acquire build network")?),
+        None => None,
+    };
+    let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
+        match (&deps.net, &lease) {
+            (Some(net), Some(l)) => (
+                Some(l.tap.clone()),
+                Some(l.mac.clone()),
+                Some(l.guest_ip.clone()),
+                Some(net.gateway.clone()),
+                Some(net.proxy_url()),
+                Some(make_seal(l.tap.clone())),
+            ),
+            _ => (None, None, None, None, None, None),
+        };
+
     let cfg = BuildVmConfig {
         jailer_bin: deps.jailer_bin.clone(),
         firecracker_bin: deps.firecracker_bin.clone(),
@@ -479,15 +619,13 @@ async fn build_one_target_inner(
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
-        // Offline build (no NIC): egress/fetch-then-seal lands per-target once the
-        // proxy + bridge are wired in; B1 builds are network-free.
-        tap_device: None,
-        guest_mac: None,
-        guest_ip: None,
-        gateway_ip: None,
-        egress_proxy: None,
-        fetch_deadline: Duration::from_secs(120),
-        seal: None,
+        tap_device,
+        guest_mac,
+        guest_ip,
+        gateway_ip,
+        egress_proxy,
+        fetch_deadline: deps.fetch_deadline,
+        seal,
     };
 
     // Keep the VM id short: it becomes the jailer chroot path, and the
@@ -524,9 +662,12 @@ async fn build_one_target_inner(
     }
 
     let runtime_dir = workspace.join("run");
-    let run = BuildVm::run(&vm_id, &cfg, &runtime_dir)
-        .await
-        .with_context(|| format!("run build VM for '{}'", spec.name))?;
+    let run_res = BuildVm::run(&vm_id, &cfg, &runtime_dir).await;
+    // Always return the network lease (delete TAP + free slot), even on error.
+    if let (Some(net), Some(l)) = (&deps.net, lease) {
+        net.release(l).await;
+    }
+    let run = run_res.with_context(|| format!("run build VM for '{}'", spec.name))?;
 
     // Meter on exit BEFORE any outcome bail — even timed-out/crashed builds held
     // resources (anti-mining, threat-model P1-4). build_seconds = max(cgroup CPU,
@@ -1075,6 +1216,8 @@ public = "./public"
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 2,
+            net: None,
+            fetch_deadline: Duration::from_secs(60),
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -1117,5 +1260,129 @@ public = "./public"
 
         let _ = std::fs::remove_dir_all(&staged);
         println!("PASS: real run_project_build fan-out — 2 fn + 1 server + sidecars + manifest");
+    }
+
+    /// On-box: a real networked build VM reaches the network ONLY through the
+    /// egress proxy (allowlist enforced), cannot egress directly (firewall), and
+    /// is sealed for compile. Ignored by default — needs KVM + root + outbound
+    /// internet AND the build bridge/firewall provisioned (tools/setup-build-net.sh).
+    /// Run with `--ignored` after `sudo tools/setup-build-net.sh`.
+    #[tokio::test]
+    #[ignore = "needs KVM + root + internet + provisioned build bridge"]
+    async fn networked_build_egress_allowlist_and_seal() {
+        use jkbase_orch::build_output;
+        use jkbase_orch::build_vm::{BuildOutcome, BuildVm, BuildVmConfig};
+
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_FC_RELEASE");
+            return;
+        };
+
+        // Egress proxy on the build gateway (firewall lets build VMs reach it).
+        let listener = tokio::net::TcpListener::bind("172.31.0.1:3128").await.unwrap();
+        tokio::spawn(crate::egress::serve(
+            listener,
+            Arc::new(crate::egress::EgressConfig::with_default_allowlist()),
+        ));
+
+        // Fixture: build.sh probes the proxy (allow + block), direct egress
+        // (firewall must block it), and the seal (compile must be offline).
+        let src = data.join("net-src");
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("build.sh"),
+            r#"#!/bin/sh
+P=172.31.0.1; PP=3128
+status() { printf "CONNECT %s:443 HTTP/1.1\r\nHost: %s\r\n\r\n" "$1" "$1" | nc -w 5 $P $PP 2>/dev/null | head -1 | grep -oE '[0-9]{3}' | head -1; }
+case "${1:-all}" in
+  fetch)
+    status registry.npmjs.org > /out/allow
+    status evil.example.com   > /out/block
+    if nc -w 4 1.1.1.1 443 </dev/null >/dev/null 2>&1; then echo up; else echo down; fi > /out/direct
+    ;;
+  compile)
+    if nc -w 4 $P $PP </dev/null >/dev/null 2>&1; then echo up; else echo down; fi > /out/sealed
+    cp "$SRC/app.wasm" "$OUT/function.wasm"
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("app.wasm"), b"\0asm\x01\0\0\0net").unwrap();
+
+        let workspace = data.join("net-ws");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source_img = workspace.join("source.img");
+        let output_img = workspace.join("output.img");
+        build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
+
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, 100_000, 8);
+        let lease = net.acquire().await.expect("acquire build net");
+        let release = format!("/sys/class/net/{}", lease.tap); // for diagnostics only
+        eprintln!("leased tap={} ip={} ({release})", lease.tap, lease.guest_ip);
+
+        let cfg = BuildVmConfig {
+            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: data.join("vmlinux.bin"),
+            toolchain_rootfs: data.join("toolchains").join("default.ext4"),
+            source_drive: source_img,
+            scratch_size_bytes: 256 * 1024 * 1024,
+            output_drive: output_img.clone(),
+            output_size_bytes: 64 * 1024 * 1024,
+            cache_drive: None,
+            vcpu_count: 1,
+            mem_size_mib: 512,
+            vsock_cid: None,
+            timeout: Duration::from_secs(60),
+            chroot_base: data.join("bj"),
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+            uid: 100_000,
+            gid: 100_000,
+            parent_cgroup: "jkbase-build".into(),
+            cgroup_pids_max: 512,
+            cgroup_mem_max_bytes: 512 * 1024 * 1024,
+            cgroup_cpu_max: "100000 100000".into(),
+            fsize_limit_bytes: Some(64 * 1024 * 1024),
+            console_log_max_bytes: 1024 * 1024,
+            seccomp_filter: None,
+            netns: None,
+            tap_device: Some(lease.tap.clone()),
+            guest_mac: Some(lease.mac.clone()),
+            guest_ip: Some(lease.guest_ip.clone()),
+            gateway_ip: Some(net.gateway.clone()),
+            egress_proxy: Some(net.proxy_url()),
+            fetch_deadline: Duration::from_secs(20),
+            seal: Some(make_seal(lease.tap.clone())),
+        };
+        std::fs::create_dir_all(&cfg.chroot_base).unwrap();
+
+        let run = BuildVm::run("netseal", &cfg, &data.join("run")).await;
+        net.release(lease).await;
+        let run = run.expect("build VM run");
+        assert_eq!(run.outcome, BuildOutcome::Completed, "build VM should complete");
+
+        let read = |name: &str| {
+            build_output::read_capped(&output_img, name, 64)
+                .ok()
+                .flatten()
+                .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+                .unwrap_or_else(|| "<missing>".into())
+        };
+        let (allow, block, direct, sealed) =
+            (read("/allow"), read("/block"), read("/direct"), read("/sealed"));
+        println!("allow={allow} block={block} direct={direct} sealed={sealed}");
+
+        assert_eq!(allow, "200", "allowlisted host must tunnel through the proxy");
+        assert_eq!(block, "403", "off-allowlist host must be refused by the proxy");
+        assert_eq!(direct, "down", "direct egress must be blocked by the firewall");
+        assert_eq!(sealed, "down", "compile phase must be sealed (offline)");
+        println!("PASS: networked build — proxy allowlist + firewall + fetch-then-seal");
     }
 }

@@ -73,9 +73,25 @@ struct Args {
     /// Bind address for the build egress proxy (host-side default-deny forward
     /// proxy with allowlist + public-IP pinning). Disabled when unset. Build VMs
     /// route their dependency fetches through this; bind it where only the build
-    /// network can reach it (e.g. the build gateway IP).
+    /// network can reach it (e.g. the build gateway IP). Ignored when --build-net
+    /// is set (then it binds on the build gateway automatically).
     #[arg(long)]
     egress_addr: Option<String>,
+
+    /// Enable the isolated build network so build VMs fetch deps through the
+    /// egress proxy and are sealed for compile (provision the bridge + firewall
+    /// first with tools/setup-build-net.sh).
+    #[arg(long)]
+    build_net: bool,
+
+    #[arg(long, default_value = "jkbuild0")]
+    build_bridge: String,
+
+    #[arg(long, default_value = "172.31.0.1")]
+    build_gateway: String,
+
+    #[arg(long, default_value = "3128")]
+    build_proxy_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +236,21 @@ async fn main() -> Result<()> {
     let fc_release = args.fc_dir.join("release-v1.15.1-x86_64");
     let build_kernel = data_dir.join("build-kernel").join("vmlinux.bin");
     build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel)?;
+    // Isolated build network (per-build TAP pool on the build bridge). Build VMs
+    // reach only the egress proxy on the gateway; the firewall from
+    // tools/setup-build-net.sh enforces it. `None` → offline builds.
+    let build_uid = 100_000u32;
+    let build_net = if args.build_net {
+        Some(Arc::new(build_orchestrator::BuildNet::new(
+            args.build_bridge.clone(),
+            args.build_gateway.clone(),
+            args.build_proxy_port,
+            build_uid,
+            64, // concurrent build-network slots
+        )))
+    } else {
+        None
+    };
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
         firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
@@ -233,8 +264,8 @@ async fn main() -> Result<()> {
         chroot_base: data_dir.join("bj"),
         cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
         parent_cgroup: "jkbase-build".to_string(),
-        uid: 100_000,
-        gid: 100_000,
+        uid: build_uid,
+        gid: build_uid,
         timeout: Duration::from_secs(600),
         vcpu_count: 2,
         mem_size_mib: 1024,
@@ -245,6 +276,8 @@ async fn main() -> Result<()> {
         output_size_bytes: 128 * 1024 * 1024,
         console_log_max_bytes: 1024 * 1024,
         max_concurrent: 4,
+        net: build_net,
+        fetch_deadline: Duration::from_secs(300),
     });
     // The jail chroot base + toolchain dir must exist on the data-dir fs.
     let _ = std::fs::create_dir_all(&build_deps.chroot_base);
@@ -331,9 +364,15 @@ async fn main() -> Result<()> {
         log_shipper.clone(),
     ));
 
-    // Spawn the build egress proxy (default-deny forward proxy + SSRF defense)
-    // when an address is configured. Build VMs reach the network only through it.
-    if let Some(egress_addr) = args.egress_addr.clone() {
+    // Spawn the build egress proxy (default-deny forward proxy + SSRF defense).
+    // With --build-net it binds on the build gateway (where the firewall lets the
+    // build VMs reach it); otherwise on an explicit --egress-addr.
+    let egress_addr = if args.build_net {
+        Some(format!("{}:{}", args.build_gateway, args.build_proxy_port))
+    } else {
+        args.egress_addr.clone()
+    };
+    if let Some(egress_addr) = egress_addr {
         let cfg = Arc::new(egress::EgressConfig::with_default_allowlist());
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(&egress_addr).await {
