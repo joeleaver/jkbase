@@ -228,6 +228,12 @@ async fn main() -> Result<()> {
         Box::pin(async move { handle_deploy(&project_id, platform, routing, domains, shipper).await })
     }));
 
+    let platform_for_teardown = platform.clone();
+    state.teardown_callback = Some(Box::new(move |project_id: String| {
+        let platform = platform_for_teardown.clone();
+        Box::pin(async move { handle_teardown(&project_id, &platform).await })
+    }));
+
     // Build-pipeline wiring: control owns the `POST /build` funnel + build-job;
     // this server owns jkbase-orch + the jailer privilege, exposed via
     // `build_callback` (mirrors `deploy_callback`). The kernel is staged onto the
@@ -330,6 +336,7 @@ async fn main() -> Result<()> {
     // Reconcile state and build the domain map BEFORE the proxy serves traffic,
     // or apex/www/console would 404 in the gap.
     cleanup_orphans(&platform).await;
+    reconcile_orphans_on_boot(&platform).await;
     backfill_domains(&platform, &domain_map).await;
 
     tokio::spawn(async move {
@@ -481,6 +488,94 @@ async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
             );
             let _ = teardown_tap(&alloc.tap_device).await;
             let _ = plat.store.remove_vm_allocation(&alloc.project_id);
+        }
+    }
+}
+
+/// Fully reap a deleted project (the `teardown_callback` control invokes from
+/// `DELETE /projects/{id}`): stop the VM, free its IP/TAP allocation, drop its
+/// snapshot, and remove every on-disk artifact. Best-effort + idempotent — any
+/// step that fails is reconciled by `reconcile_orphans_on_boot` on the next boot.
+async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>) -> Result<()> {
+    let mut plat = platform.lock().await;
+    if let Some(mut vm) = plat.vms.remove(project_id) {
+        let _ = vm.stop().await;
+    }
+    plat.vm_states.remove(project_id);
+    let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+    let _ = plat.store.remove_snapshot_meta(project_id);
+    let _ = plat.store.remove_vm_allocation(project_id);
+    let data_dir = plat.data_dir.clone();
+    drop(plat);
+
+    // Kill any leaked Firecracker that outlived the handle, then drop its TAP.
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-f", &format!("firecracker.*{project_id}")])
+        .status()
+        .await;
+    if let Some(a) = alloc {
+        let _ = teardown_tap(&a.tap_device).await;
+    }
+    remove_project_artifacts(&data_dir, project_id).await;
+    info!(project = %project_id, "project torn down");
+    Ok(())
+}
+
+/// Remove every per-project on-disk artifact (content image, data disk, snapshot,
+/// run dir, hosting tree, build workspace). Best-effort; absent paths are ignored.
+async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
+    let _ =
+        tokio::fs::remove_file(data_dir.join("content-images").join(format!("{project_id}.ext4")))
+            .await;
+    let _ =
+        tokio::fs::remove_file(data_dir.join("data-disks").join(format!("{project_id}.ext4"))).await;
+    for dir in ["snapshots", "run", "hosting", "builds"] {
+        let _ = tokio::fs::remove_dir_all(data_dir.join(dir).join(project_id)).await;
+    }
+}
+
+/// Boot-time sweep for projects deleted but left with artifacts behind (a teardown
+/// that failed midway, or a project removed before teardown existed). For every
+/// per-project image/dir whose name is NOT a currently registered project, drop the
+/// stale artifact. Registered projects are never touched, so live data disks are
+/// safe. `builds/` is reaped wholesale by the build reconcile, so it is omitted.
+async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
+    let plat = platform.lock().await;
+    let registered: HashSet<String> = match plat.store.list_projects() {
+        Ok(ps) => ps.into_iter().map(|p| p.id).collect(),
+        Err(_) => return,
+    };
+    let data_dir = plat.data_dir.clone();
+    drop(plat);
+
+    for sub in ["content-images", "data-disks"] {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_suffix(".ext4") else {
+                continue;
+            };
+            if !registered.contains(id) {
+                let _ = std::fs::remove_file(entry.path());
+                info!(project = %id, artifact = %sub, "reaped orphaned artifact");
+            }
+        }
+    }
+    for sub in ["hosting", "run", "snapshots"] {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().to_string();
+            if !registered.contains(&id) {
+                let _ = std::fs::remove_dir_all(entry.path());
+                info!(project = %id, artifact = %sub, "reaped orphaned dir");
+            }
         }
     }
 }

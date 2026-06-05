@@ -26,6 +26,15 @@ pub type DeployCallback = Box<
         + Sync,
 >;
 
+/// Fully reap a deleted project's runtime resources — stop its VM, free the
+/// IP/TAP allocation, and remove its on-disk artifacts. Mirrors `DeployCallback`
+/// (control owns no orch dependency); the server binary provides the impl.
+pub type TeardownCallback = Box<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Inputs handed to the server-provided build orchestrator for one build job.
 pub struct BuildContext {
     pub project_id: String,
@@ -62,6 +71,9 @@ pub struct AppState {
     pub log_store: LogStore,
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
+    /// Tears down a deleted project's VM + IP/TAP + on-disk artifacts (mirrors
+    /// `deploy_callback`). `None` leaves cleanup to the boot-time orphan sweep.
+    pub teardown_callback: Option<TeardownCallback>,
     /// Server-provided per-target build orchestrator (mirrors `deploy_callback`).
     /// `None` disables the server-side build pipeline (`POST /build` → 501).
     pub build_callback: Option<BuildCallback>,
@@ -131,6 +143,7 @@ impl AppState {
             log_store,
             deploy_dir,
             deploy_callback: None,
+            teardown_callback: None,
             build_callback: None,
             routing_table: None,
             domain_map: None,
@@ -709,6 +722,17 @@ async fn delete_project(
 ) -> impl IntoResponse {
     match state.store.get_project(&id) {
         Ok(Some(project)) if project.tenant_id.as_deref() == Some(&tenant.id) => {
+            // Serialize against an in-flight deploy/build/rollback for this project
+            // so teardown can't race a deployment that is mid-activation.
+            let Some(_guard) = DeployLockGuard::try_acquire(&state, &id) else {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "a deploy/build/rollback is in progress for this project".to_string(),
+                    }),
+                )
+                    .into_response();
+            };
             match state.store.delete_project(&id) {
                 Ok(_) => {
                     if let Err(e) = state.log_store.clear(&id) {
@@ -736,6 +760,14 @@ async fn delete_project(
                             let _ = state.store.remove_domain(&d.host);
                             deactivate_host(&state, &d.host).await;
                         }
+                    }
+                    // Stop the VM, free the IP/TAP, and remove on-disk artifacts.
+                    // Best-effort: a failure is reconciled by the boot-time orphan
+                    // sweep, so it must not fail the delete.
+                    if let Some(cb) = &state.teardown_callback
+                        && let Err(e) = cb(id.clone()).await
+                    {
+                        tracing::warn!(project_id = %id, error = %e, "project teardown failed; boot-time orphan sweep will reconcile");
                     }
                     info!(project_id = %id, "project deleted");
                     StatusCode::NO_CONTENT.into_response()
