@@ -69,7 +69,10 @@ async fn main() -> anyhow::Result<()> {
         "BuildVm::run id={id} mem={}MiB cgroup_mem_max={}B cpu.max=\"{}\" pids.max={} …",
         cfg.mem_size_mib, cfg.cgroup_mem_max_bytes, cfg.cgroup_cpu_max, cfg.cgroup_pids_max
     );
-    let outcome = BuildVm::run(&id, &cfg, &runtime_dir).await?;
-    println!("OUTCOME: {outcome:?}");
+    let run = BuildVm::run(&id, &cfg, &runtime_dir).await?;
+    println!(
+        "OUTCOME: {:?} (cpu={:?}us wall={:?})",
+        run.outcome, run.cpu_usec, run.wall
+    );
     Ok(())
 }

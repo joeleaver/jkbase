@@ -370,8 +370,10 @@ async fn build_one_target(
     )
     .await;
 
-    let outcome =
-        build_one_target_inner(spec, config, deps, src_dir, workspace, staged, build_id).await;
+    let outcome = build_one_target_inner(
+        spec, config, deps, src_dir, workspace, staged, project_id, build_id,
+    )
+    .await;
 
     match &outcome {
         Ok(log) => {
@@ -418,6 +420,7 @@ async fn build_one_target_inner(
     src_dir: &Path,
     workspace: &Path,
     staged: &Path,
+    project_id: &str,
     build_id: u64,
 ) -> Result<Option<Vec<u8>>> {
     let source_path = src_dir.join(&spec.source_subdir);
@@ -512,9 +515,23 @@ async fn build_one_target_inner(
     }
 
     let runtime_dir = workspace.join("run");
-    let outcome = BuildVm::run(&vm_id, &cfg, &runtime_dir)
+    let run = BuildVm::run(&vm_id, &cfg, &runtime_dir)
         .await
         .with_context(|| format!("run build VM for '{}'", spec.name))?;
+
+    // Meter on exit BEFORE any outcome bail — even timed-out/crashed builds held
+    // resources (anti-mining, threat-model P1-4). build_seconds = max(cgroup CPU,
+    // wall-clock floor), so a sub-tick build can't escape billing.
+    let cpu_secs = run.cpu_usec.map(|u| u.div_ceil(1_000_000)).unwrap_or(0);
+    let build_secs = cpu_secs.max(run.wall.as_secs());
+    if build_secs > 0 {
+        let hour = (now() / 3600) * 3600;
+        if let Err(e) = deps.store.add_build_usage(project_id, hour, build_secs) {
+            warn!(project = %project_id, target = %spec.name, error = %e,
+                  "failed to record build-minute usage");
+        }
+    }
+    let outcome = run.outcome;
 
     // Best-effort: the log tail is useful even when the build failed.
     let log_tail = build_output::read_capped(&output_img, "/build.log", TARGET_LOG_CAP)
@@ -1080,6 +1097,14 @@ public = "./public"
         let rec = store.get_build(project_id, build_id).unwrap().unwrap();
         assert_eq!(rec.targets.len(), 3);
         assert!(rec.targets.iter().all(|t| t.phase == BuildPhase::Succeeded));
+
+        // Build minutes metered on exit (3 VMs, each ≥1 wall-clock second).
+        let month_start = jkbase_control::store::month_start_epoch(now());
+        let billed = store
+            .sum_month_to_date(project_id, month_start)
+            .unwrap()
+            .build_seconds;
+        assert!(billed >= 3, "expected ≥3 build-seconds, got {billed}");
 
         let _ = std::fs::remove_dir_all(&staged);
         println!("PASS: real run_project_build fan-out — 2 fn + 1 server + sidecars + manifest");

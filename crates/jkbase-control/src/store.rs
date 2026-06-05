@@ -180,6 +180,10 @@ pub struct UsageBucket {
     /// Latest sampled storage gauge (bytes).
     pub storage_bytes_last: u64,
     pub sample_count: u32,
+    /// Build-VM seconds billed this hour, metered on build exit (not the 60 s
+    /// sampler tick). Distinct from `cpu_jiffies` (runtime-VM CPU).
+    #[serde(default)]
+    pub build_seconds: u64,
 }
 
 /// Per-project resource limits. Absent override -> [`DEFAULT_QUOTA`].
@@ -187,11 +191,21 @@ pub struct UsageBucket {
 pub struct QuotaLimits {
     pub storage_bytes_max: u64,
     pub bandwidth_bytes_per_month: u64,
+    /// Server-side build-VM seconds per UTC month. `#[serde(default)]` so quota
+    /// overrides stored before build metering existed still deserialize.
+    #[serde(default = "default_build_seconds_per_month")]
+    pub build_seconds_per_month: u64,
+}
+
+const DEFAULT_BUILD_SECONDS_PER_MONTH: u64 = 200 * 60; // 200 build-minutes/month
+fn default_build_seconds_per_month() -> u64 {
+    DEFAULT_BUILD_SECONDS_PER_MONTH
 }
 
 pub const DEFAULT_QUOTA: QuotaLimits = QuotaLimits {
     storage_bytes_max: 16 * 1024 * 1024 * 1024,        // 16 GiB
     bandwidth_bytes_per_month: 100 * 1024 * 1024 * 1024, // 100 GiB/month
+    build_seconds_per_month: DEFAULT_BUILD_SECONDS_PER_MONTH,
 };
 
 /// Enforcement state for a project. Source of truth for the wake gate, so a
@@ -214,6 +228,7 @@ pub struct MonthToDate {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub storage_bytes: u64,
+    pub build_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,6 +701,36 @@ impl Store {
         Ok(())
     }
 
+    /// Add `build_seconds` to a project's hourly bucket. Metered on build-VM exit
+    /// (we own the lifecycle), so a build killed between 60 s sampler ticks is
+    /// still billed — closing the free-compute window (threat-model P1-4).
+    pub fn add_build_usage(
+        &self,
+        project_id: &str,
+        hour_epoch: u64,
+        build_seconds: u64,
+    ) -> Result<()> {
+        let key = Self::usage_key(project_id, hour_epoch);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(USAGE)?;
+            let existing = table.get(key.as_str())?.map(|d| d.value().to_vec());
+            let mut bucket: UsageBucket = match existing {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => UsageBucket {
+                    project_id: project_id.to_string(),
+                    hour_epoch,
+                    ..Default::default()
+                },
+            };
+            bucket.build_seconds = bucket.build_seconds.saturating_add(build_seconds);
+            let out = serde_json::to_vec(&bucket)?;
+            table.insert(key.as_str(), out.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// All buckets for a project with `hour_epoch` in `[from_hour, to_hour]`, oldest first.
     pub fn list_usage_for_project(
         &self,
@@ -726,6 +771,7 @@ impl Store {
                     mtd.cpu_jiffies = mtd.cpu_jiffies.saturating_add(b.cpu_jiffies);
                     mtd.rx_bytes = mtd.rx_bytes.saturating_add(b.rx_bytes);
                     mtd.tx_bytes = mtd.tx_bytes.saturating_add(b.tx_bytes);
+                    mtd.build_seconds = mtd.build_seconds.saturating_add(b.build_seconds);
                 }
                 if b.hour_epoch >= newest_hour {
                     newest_hour = b.hour_epoch;
@@ -1106,6 +1152,32 @@ mod tests {
     }
 
     #[test]
+    fn build_usage_accumulates_and_sums_month_to_date() {
+        let (store, _p) = tmp_db();
+        let month_start = month_start_epoch(1_700_000_000);
+        let h0 = month_start; // first hour of the month
+        let h1 = month_start + 3600;
+        // Two builds in different hours of the same month.
+        store.add_build_usage("p", h0, 30).unwrap();
+        store.add_build_usage("p", h0, 12).unwrap(); // same hour accumulates
+        store.add_build_usage("p", h1, 8).unwrap();
+        // A different project must not leak in.
+        store.add_build_usage("other", h0, 999).unwrap();
+
+        let mtd = store.sum_month_to_date("p", month_start).unwrap();
+        assert_eq!(mtd.build_seconds, 50);
+        // build_seconds is independent of runtime CPU jiffies.
+        assert_eq!(mtd.cpu_jiffies, 0);
+
+        // A build before the month boundary is excluded.
+        store.add_build_usage("p", month_start - 3600, 100).unwrap();
+        assert_eq!(
+            store.sum_month_to_date("p", month_start).unwrap().build_seconds,
+            50
+        );
+    }
+
+    #[test]
     fn deployments_listed_newest_first_and_scoped_per_project() {
         let (store, path) = tmp_db();
         store.save_deployment(&meta("a", 1)).unwrap();
@@ -1235,10 +1307,12 @@ mod tests {
                 &QuotaLimits {
                     storage_bytes_max: 123,
                     bandwidth_bytes_per_month: 456,
+                    build_seconds_per_month: 789,
                 },
             )
             .unwrap();
         assert_eq!(store.get_quota("p").unwrap().storage_bytes_max, 123);
+        assert_eq!(store.get_quota("p").unwrap().build_seconds_per_month, 789);
         assert!(store.get_quota_override("p").unwrap().is_some());
         assert!(store.remove_quota("p").unwrap());
         assert_eq!(

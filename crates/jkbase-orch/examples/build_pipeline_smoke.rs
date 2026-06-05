@@ -69,8 +69,9 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&cfg.chroot_base)?;
     println!("[2/3] booting jailed build VM (timeout {}s) ...", cfg.timeout.as_secs());
-    let outcome = BuildVm::run("bp-smoke", &cfg, &data.join("run")).await?;
-    println!("    outcome: {outcome:?}");
+    let run = BuildVm::run("bp-smoke", &cfg, &data.join("run")).await?;
+    let outcome = run.outcome;
+    println!("    outcome: {outcome:?} (cpu={:?}us wall={:?})", run.cpu_usec, run.wall);
 
     if let Some(log) = build_output::read_capped(&output_img, "/build.log", 8 * 1024)? {
         println!("    --- build.log ---\n{}", String::from_utf8_lossy(&log).trim_end());

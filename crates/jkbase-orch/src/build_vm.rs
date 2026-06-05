@@ -115,6 +115,18 @@ pub enum BuildOutcome {
     TimedOut,
 }
 
+/// One build VM run: its [`BuildOutcome`] plus resource usage captured at
+/// teardown, for build-minute metering (design §8).
+#[derive(Debug, Clone, Copy)]
+pub struct BuildRun {
+    pub outcome: BuildOutcome,
+    /// Total CPU the build cgroup consumed (microseconds), from `cpu.stat` read
+    /// just before the cgroup is reaped; `None` if unreadable.
+    pub cpu_usec: Option<u64>,
+    /// Wall-clock from stage→exit (or timeout-kill), excluding teardown.
+    pub wall: Duration,
+}
+
 /// Host-side orchestrator for a single ephemeral, jailed build microVM.
 pub struct BuildVm;
 
@@ -122,7 +134,7 @@ impl BuildVm {
     /// Stage drives into a fresh jail, boot the VM under the jailer, wait for it
     /// to finish (or hit the wall-clock timeout), then tear everything down. The
     /// jail (and its `mknod`'d device nodes) is removed on every exit path.
-    pub async fn run(id: &str, config: &BuildVmConfig, runtime_dir: &Path) -> Result<BuildOutcome> {
+    pub async fn run(id: &str, config: &BuildVmConfig, runtime_dir: &Path) -> Result<BuildRun> {
         let id = jailer::sanitize_id(id)?;
         // jailer names the chroot dir after the exec-file basename, not "firecracker".
         let exec_basename = config
@@ -138,11 +150,18 @@ impl BuildVm {
             &id,
         );
 
+        let started = std::time::Instant::now();
         let result = Self::run_inner(&id, config, runtime_dir, &layout).await;
+        let wall = started.elapsed();
         // Teardown runs whether the build succeeded, errored, or timed out — and
-        // is the real containment guarantee (see [`Self::teardown`]).
-        Self::teardown(config, &layout).await;
-        result
+        // is the real containment guarantee (see [`Self::teardown`]). It also
+        // reads the cgroup's total CPU before reaping it, for build metering.
+        let cpu_usec = Self::teardown(config, &layout).await;
+        result.map(|outcome| BuildRun {
+            outcome,
+            cpu_usec,
+            wall,
+        })
     }
 
     async fn run_inner(
@@ -384,7 +403,7 @@ impl BuildVm {
     /// Move artifacts out (raw bytes, never mounted), assert the cgroup is empty
     /// (force-killing any escapee), delete the jail, and alarm if anything —
     /// especially a `mknod`'d device node — survives. Best-effort but loud.
-    async fn teardown(config: &BuildVmConfig, layout: &JailerLayout) {
+    async fn teardown(config: &BuildVmConfig, layout: &JailerLayout) -> Option<u64> {
         // Move the output image out as RAW BYTES before deleting the jail. It is
         // attacker-controlled ext4, so the extractor MUST NOT mount it or run
         // any ext4 userspace tool (mount/losetup/blkid/file/e2fsck) — threat
@@ -408,6 +427,10 @@ impl BuildVm {
                       "failed to move build cache image back out of the jail");
             }
         }
+
+        // Read the build cgroup's cumulative CPU (cpu.stat `usage_usec`) before it
+        // is reaped below — for build-minute metering (design §8).
+        let cpu_usec = read_cgroup_cpu_usec(&layout.cgroup_dir);
 
         // Liveness assertion: rmdir of the leaf cgroup only succeeds when it is
         // empty. If not, the PID-ns collapse didn't reap everything — kill the
@@ -439,7 +462,21 @@ impl BuildVm {
             error!(jail = %layout.chroot_id_dir.display(),
                    "build VM jail NOT fully removed — possible leaked device node (escape primitive)");
         }
+
+        cpu_usec
     }
+}
+
+/// Read a cgroup-v2 leaf's cumulative CPU time (`cpu.stat` `usage_usec`, in
+/// microseconds). `None` if the controller/file is absent or unparseable.
+fn read_cgroup_cpu_usec(cgroup_dir: &Path) -> Option<u64> {
+    let stat = std::fs::read_to_string(cgroup_dir.join("cpu.stat")).ok()?;
+    for line in stat.lines() {
+        if let Some(v) = line.strip_prefix("usage_usec ") {
+            return v.trim().parse().ok();
+        }
+    }
+    None
 }
 
 /// Poll for the Firecracker API socket, but only return once it exists AND the

@@ -877,6 +877,35 @@ async fn build(
             .into_response();
     }
 
+    // Pre-build 402 gate: a project already at its build-minute cap can't launch
+    // (prevents launch-storms — threat-model P1-4; the build VM is metered on
+    // exit, but the gate must debit before launch). deploy_locks already
+    // serializes builds per project, so this MTD check can't be raced past.
+    {
+        let month_start = crate::store::month_start_epoch(auth::timestamp());
+        let used = state
+            .store
+            .sum_month_to_date(&id, month_start)
+            .map(|m| m.build_seconds)
+            .unwrap_or(0);
+        let cap = state
+            .store
+            .get_quota(&id)
+            .map(|q| q.build_seconds_per_month)
+            .unwrap_or(crate::store::DEFAULT_QUOTA.build_seconds_per_month);
+        if used >= cap {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ErrorResponse {
+                    error: format!(
+                        "build-minute quota exceeded: {used} of {cap} build-seconds used this month"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    }
+
     // Serialize against concurrent deploys/builds for this project. The guard is
     // moved into the spawned build task and releases the lock on drop — including
     // if that task unwinds, so a panicking build can't wedge the project.
@@ -1335,6 +1364,8 @@ pub struct UsageResponse {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub storage_bytes: u64,
+    /// Month-to-date server-side build-VM seconds.
+    pub build_seconds: u64,
     pub month_start: u64,
 }
 
@@ -1342,16 +1373,23 @@ pub struct UsageResponse {
 pub struct QuotaResponse {
     pub storage_bytes_max: u64,
     pub bandwidth_bytes_per_month: u64,
+    pub build_seconds_per_month: u64,
     /// True if this project has a per-project override (vs platform defaults).
     pub overridden: bool,
     pub bandwidth_blocked: bool,
     pub blocked_reason: Option<String>,
 }
 
+fn default_build_seconds_quota() -> u64 {
+    crate::store::DEFAULT_QUOTA.build_seconds_per_month
+}
+
 #[derive(Deserialize)]
 pub struct SetQuotaRequest {
     pub storage_bytes_max: u64,
     pub bandwidth_bytes_per_month: u64,
+    #[serde(default = "default_build_seconds_quota")]
+    pub build_seconds_per_month: u64,
 }
 
 /// Month-to-date metered usage for a project. Works while hibernated (store-only).
@@ -1379,6 +1417,7 @@ async fn get_project_usage(
             rx_bytes: mtd.rx_bytes,
             tx_bytes: mtd.tx_bytes,
             storage_bytes: mtd.storage_bytes,
+            build_seconds: mtd.build_seconds,
             month_start,
         })
         .into_response(),
@@ -1415,6 +1454,7 @@ async fn get_project_quota(
     Json(QuotaResponse {
         storage_bytes_max: limits.storage_bytes_max,
         bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+        build_seconds_per_month: limits.build_seconds_per_month,
         overridden,
         bandwidth_blocked: status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false),
         blocked_reason: status.and_then(|s| s.blocked_reason),
@@ -1451,11 +1491,15 @@ async fn set_project_quota(
         bandwidth_bytes_per_month: req
             .bandwidth_bytes_per_month
             .min(crate::store::DEFAULT_QUOTA.bandwidth_bytes_per_month),
+        build_seconds_per_month: req
+            .build_seconds_per_month
+            .min(crate::store::DEFAULT_QUOTA.build_seconds_per_month),
     };
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
             storage_bytes_max: limits.storage_bytes_max,
             bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+            build_seconds_per_month: limits.build_seconds_per_month,
             overridden: true,
             bandwidth_blocked: false,
             blocked_reason: None,
