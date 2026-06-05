@@ -235,7 +235,11 @@ async fn main() -> Result<()> {
     // cgroup is provisioned best-effort (needs root).
     let fc_release = args.fc_dir.join("release-v1.15.1-x86_64");
     let build_kernel = data_dir.join("build-kernel").join("vmlinux.bin");
-    build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel)?;
+    // Non-fatal: a build-provisioning gap disables builds but must not knock over
+    // the (separate) runtime hosting path — the kernel here feeds only builds.
+    if let Err(e) = build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel) {
+        tracing::warn!(error = %e, "build kernel staging failed; builds disabled until provisioned");
+    }
     // Isolated build network (per-build TAP pool on the build bridge). Build VMs
     // reach only the egress proxy on the gateway; the firewall from
     // tools/setup-build-net.sh enforces it. `None` → offline builds.
@@ -251,6 +255,11 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // Fail closed: with --build-net we MUST NOT run attacker-controlled build VMs
+    // unless their isolation firewall is actually provisioned + present.
+    if let Some(net) = &build_net {
+        net.verify_firewall().await?;
+    }
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
         firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),

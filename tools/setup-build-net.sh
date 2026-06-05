@@ -51,4 +51,18 @@ iptables -C INPUT -i "$BRIDGE" -j JKBUILD 2>/dev/null \
 iptables -C FORWARD -i "$BRIDGE" -j DROP 2>/dev/null \
     || iptables -I FORWARD 1 -i "$BRIDGE" -j DROP
 
+# 3. IPv6: the proxy is IPv4-only, so there is nothing to allow over v6 — disable
+# IPv6 on the bridge and drop all v6 from it. (Build VMs also boot ipv6.disable=1
+# and their TAPs are bridge-port-isolated, so this is defense in depth against
+# any host-side fe80:: link-local path around the IPv4 firewall.)
+sysctl -w "net.ipv6.conf.${BRIDGE}.disable_ipv6=1" >/dev/null 2>&1 || true
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N JKBUILD 2>/dev/null || ip6tables -F JKBUILD
+    ip6tables -A JKBUILD -j DROP
+    ip6tables -C INPUT -i "$BRIDGE" -j JKBUILD 2>/dev/null \
+        || ip6tables -I INPUT 1 -i "$BRIDGE" -j JKBUILD
+    ip6tables -C FORWARD -i "$BRIDGE" -j DROP 2>/dev/null \
+        || ip6tables -I FORWARD 1 -i "$BRIDGE" -j DROP
+fi
+
 echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (egress proxy)"

@@ -356,6 +356,12 @@ impl BuildVm {
             // (deletes the TAP) before the guest's COMPILE phase.
             boot_args.push_str(&format!(" ip={ip}::{gw}:255.255.255.0::eth0:off"));
         }
+        if config.tap_device.is_some() {
+            // No IPv6 in build VMs: the egress proxy is IPv4-only, and an IPv6
+            // link-local address would otherwise bypass the IPv4 build firewall
+            // (host services + other build VMs over fe80::).
+            boot_args.push_str(" ipv6.disable=1");
+        }
         if let Some(proxy) = &config.egress_proxy {
             boot_args.push_str(&format!(" jkbase.proxy={proxy}"));
         }

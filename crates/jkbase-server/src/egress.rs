@@ -23,9 +23,20 @@
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+
+/// Max concurrent egress connections. Bounds task/FD use so a hostile build VM
+/// can't slowloris the shared server process to FD exhaustion.
+const MAX_CONNS: usize = 256;
+/// A client must send its request head within this window (anti-slowloris).
+const HEAD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard ceiling on a single connection's total lifetime, so a killed guest whose
+/// socket never FINs can't pin a task/FD indefinitely.
+const CONN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Curated egress allowlist: the dependency registries + git hosts a build may
 /// fetch from, plus their known content-download hosts. Exact-match only.
@@ -159,6 +170,10 @@ async fn resolve_pinned(host: &str, port: u16, cfg: &EgressConfig) -> Result<Soc
     if !host_allowed(host, &cfg.allowlist) {
         return Err(Deny::HostNotAllowed);
     }
+    // Only the fetch protocols — never relay to SSH/SMTP/etc. on an allowed host.
+    if port != 80 && port != 443 {
+        return Err(Deny::HostNotAllowed);
+    }
     // lookup_host handles both names and IP-literals; either way the result is
     // re-checked by pick_safe_addr, so an IP-literal host that somehow passed the
     // allowlist still can't reach a private/metadata address.
@@ -172,6 +187,7 @@ async fn resolve_pinned(host: &str, port: u16, cfg: &EgressConfig) -> Result<Soc
 /// connection is handled independently.
 pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
     info!(allowlist = cfg.allowlist.len(), "egress proxy listening");
+    let sem = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
         let (client, peer) = match listener.accept().await {
             Ok(c) => c,
@@ -180,10 +196,23 @@ pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
                 continue;
             }
         };
+        // Non-blocking cap: drop excess connections immediately rather than
+        // queueing (which would just move the exhaustion to the accept backlog).
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!(%peer, "egress connection cap reached; dropping");
+                drop(client);
+                continue;
+            }
+        };
         let cfg = cfg.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(client, cfg).await {
-                debug!(%peer, error = %e, "egress connection ended");
+            let _permit = permit;
+            match tokio::time::timeout(CONN_TIMEOUT, handle_conn(client, cfg)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => debug!(%peer, error = %e, "egress connection ended"),
+                Err(_) => debug!(%peer, "egress connection exceeded lifetime cap"),
             }
         });
     }
@@ -232,7 +261,10 @@ fn deny_code(d: Deny) -> (u16, &'static str) {
 }
 
 async fn handle_conn(mut client: TcpStream, cfg: Arc<EgressConfig>) -> Result<()> {
-    let head = read_head(&mut client).await?;
+    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!("request head not received within {HEAD_TIMEOUT:?}"),
+    };
     let head_str = String::from_utf8_lossy(&head);
     let request_line = head_str.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -454,6 +486,15 @@ mod tests {
         );
         assert_eq!(
             resolve_pinned("169.254.169.254", 443, &cfg).await,
+            Err(Deny::HostNotAllowed)
+        );
+        // An allowed host on a non-fetch port (SSH/SMTP/...) is refused.
+        assert_eq!(
+            resolve_pinned("github.com", 22, &cfg).await,
+            Err(Deny::HostNotAllowed)
+        );
+        assert_eq!(
+            resolve_pinned("crates.io", 8080, &cfg).await,
             Err(Deny::HostNotAllowed)
         );
     }

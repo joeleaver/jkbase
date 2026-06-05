@@ -283,9 +283,74 @@ impl BuildNet {
         ])
         .await?;
         run_ip(&["link", "set", tap, "master", &self.bridge]).await?;
+        // Bridge port isolation: isolated ports cannot forward to each other at
+        // L2 (only to the bridge/gateway), so concurrent tenants' build VMs are
+        // mutually unreachable even though they share one bridge. This is what
+        // actually blocks VM-to-VM lateral movement (the L3 FORWARD DROP never
+        // sees intra-bridge frames).
+        run_ip(&[
+            "link", "set", "dev", tap, "type", "bridge_slave", "isolated", "on",
+        ])
+        .await?;
+        // Belt-and-suspenders: drop IPv6 on the port (the guest also boots with
+        // ipv6.disable=1), so there's no fe80:: path around the IPv4 firewall.
+        let _ = tokio::process::Command::new("sysctl")
+            .arg("-w")
+            .arg(format!("net.ipv6.conf.{tap}.disable_ipv6=1"))
+            .status()
+            .await;
         run_ip(&["link", "set", tap, "up"]).await?;
         Ok(())
     }
+
+    /// Verify the build bridge + firewall are provisioned (tools/setup-build-net.sh)
+    /// before we ever launch a networked build VM — so attacker-controlled code is
+    /// never run with the "reach only the proxy" isolation silently absent (e.g.
+    /// after a reboot or an iptables flush). Errors listing what to run if not.
+    pub async fn verify_firewall(&self) -> Result<()> {
+        let bridge_up = tokio::process::Command::new("ip")
+            .args(["link", "show", &self.bridge])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !bridge_up {
+            bail!(
+                "build bridge {} missing — run `sudo tools/setup-build-net.sh`",
+                self.bridge
+            );
+        }
+        let input_hook = vec!["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
+        let fwd_drop = vec!["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
+        for check in [input_hook, fwd_drop] {
+            let ok = tokio::process::Command::new("iptables")
+                .args(&check)
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                bail!(
+                    "build firewall rule missing ({check:?}) — run `sudo tools/setup-build-net.sh`"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Month-to-date build-seconds used vs the project's monthly cap, or `None` on a
+/// store error (callers then proceed — fail-open mid-build is acceptable; the
+/// intake 402 gate is the primary control).
+fn build_quota_state(deps: &BuildDeps, project_id: &str) -> Option<(u64, u64)> {
+    let month_start = jkbase_control::store::month_start_epoch(now());
+    let used = deps
+        .store
+        .sum_month_to_date(project_id, month_start)
+        .ok()?
+        .build_seconds;
+    let cap = deps.store.get_quota(project_id).ok()?.build_seconds_per_month;
+    Some((used, cap))
 }
 
 async fn run_ip(args: &[&str]) -> Result<()> {
@@ -544,6 +609,16 @@ async fn build_one_target_inner(
     project_id: &str,
     build_id: u64,
 ) -> Result<Option<Vec<u8>>> {
+    // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
+    // intake, but a build fans out one metered VM per target — refuse remaining
+    // targets once month-to-date build-seconds reach the cap, so a many-target
+    // manifest can't overrun the cap by the target count (threat-model P1-4).
+    if let Some((used, cap)) = build_quota_state(deps, project_id)
+        && used >= cap
+    {
+        bail!("build-minute quota exhausted ({used}/{cap} build-seconds this month)");
+    }
+
     let source_path = src_dir.join(&spec.source_subdir);
     if !source_path.is_dir() {
         bail!(
@@ -573,6 +648,33 @@ async fn build_one_target_inner(
     // RO source drive built from the subdir in userspace — no mount (P0-3).
     build_ro_ext4_from_dir(&source_path, &source_img, 16)
         .with_context(|| format!("build source image for '{}'", spec.name))?;
+
+    // Keep the VM id short: it becomes the jailer chroot path, and the Firecracker
+    // API Unix socket under it must stay within SUN_LEN (~108 bytes). Checked
+    // BEFORE leasing a TAP, so a too-long path bails without leaking a net slot.
+    let kind_char = match spec.kind {
+        TargetKind::Function => 'f',
+        TargetKind::Server => 's',
+    };
+    let short_name: String = sanitize(&spec.name).chars().take(16).collect();
+    let vm_id = format!("b{build_id}-{kind_char}-{short_name}");
+    let exec_basename = deps
+        .firecracker_bin
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("firecracker");
+    let socket_len = deps.chroot_base.as_os_str().len()
+        + 1
+        + exec_basename.len()
+        + 1
+        + vm_id.len()
+        + "/root/run/firecracker.socket".len();
+    if socket_len >= 108 {
+        bail!(
+            "build VM socket path would be {socket_len} bytes (>= SUN_LEN 108); \
+             shorten the data dir or the target name"
+        );
+    }
 
     // Lease an isolated TAP when a build network is configured, so this VM can
     // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
@@ -627,39 +729,6 @@ async fn build_one_target_inner(
         fetch_deadline: deps.fetch_deadline,
         seal,
     };
-
-    // Keep the VM id short: it becomes the jailer chroot path, and the
-    // Firecracker API Unix socket under it must stay within SUN_LEN (~108 bytes).
-    // Per-build + per-kind + index is already unique within a project's build.
-    let kind_char = match spec.kind {
-        TargetKind::Function => 'f',
-        TargetKind::Server => 's',
-    };
-    let short_name: String = sanitize(&spec.name).chars().take(16).collect();
-    let vm_id = format!("b{build_id}-{kind_char}-{short_name}");
-
-    // Fail fast with a clear error if the jailer chroot would push the
-    // Firecracker API Unix socket past SUN_LEN (~108): the host connects at the
-    // absolute path chroot_base/<exec>/<id>/root/run/firecracker.socket, and an
-    // over-long --data-dir + high build_id would otherwise surface as an opaque
-    // ENAMETOOLONG deep inside BuildVm.
-    let exec_basename = deps
-        .firecracker_bin
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("firecracker");
-    let socket_len = deps.chroot_base.as_os_str().len()
-        + 1
-        + exec_basename.len()
-        + 1
-        + vm_id.len()
-        + "/root/run/firecracker.socket".len();
-    if socket_len >= 108 {
-        bail!(
-            "build VM socket path would be {socket_len} bytes (>= SUN_LEN 108); \
-             shorten the data dir or the target name"
-        );
-    }
 
     let runtime_dir = workspace.join("run");
     let run_res = BuildVm::run(&vm_id, &cfg, &runtime_dir).await;
@@ -756,7 +825,16 @@ fn read_built_manifest(output_img: &Path, workspace: &Path, tag: &str) -> Result
 /// source/public PATHS are joined onto the unpacked source root. A `..`, an
 /// absolute path, or a `/`-bearing name would let a tenant read arbitrary
 /// host files into the build VM or write artifacts into another tenant's tree.
+/// Max build targets (functions + servers) per build — bounds the fan-out so a
+/// hostile manifest can't launch an unbounded number of metered build VMs.
+const MAX_TARGETS: usize = 64;
+
 fn validate_manifest(config: &ProjectConfig) -> Result<()> {
+    let target_count = config.functions.len() + config.servers.len();
+    if target_count > MAX_TARGETS {
+        bail!("too many build targets ({target_count}); max {MAX_TARGETS} functions + servers");
+    }
+
     fn name_ok(n: &str) -> bool {
         !n.is_empty()
             && n.len() <= 64
