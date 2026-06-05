@@ -265,6 +265,7 @@ async fn main() -> Result<()> {
         routing_table.clone(),
         domain_map.clone(),
         log_shipper.clone(),
+        activity_tracker.clone(),
     ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
@@ -883,6 +884,27 @@ async fn idle_detection_loop(
     loop {
         tokio::time::sleep(check_interval).await;
 
+        // Seed a baseline for any Running VM the proxy hasn't tracked. Activity is
+        // only recorded on proxy requests, so a project that receives none — e.g. a
+        // cron-only function project, woken host->agent — would otherwise never be a
+        // hibernation candidate and never scale to zero. Seeding `now` gives it an
+        // idle clock that ages out after `idle_timeout` of no further activity.
+        {
+            let running: Vec<String> = {
+                let plat = platform.lock().await;
+                plat.vm_states
+                    .iter()
+                    .filter(|(_, s)| **s == VmLifecycle::Running)
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            let mut tracker = activity.write().await;
+            let now = Instant::now();
+            for id in running {
+                tracker.entry(id).or_insert(now);
+            }
+        }
+
         let candidates: Vec<String> = {
             let tracker = activity.read().await;
             let now = Instant::now();
@@ -1124,6 +1146,7 @@ async fn scheduler_loop(
     routing: jkbase_proxy::RoutingTable,
     domain_map: DomainMap,
     shipper: Arc<LogShipper>,
+    activity: ActivityTracker,
 ) {
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FIRES));
     let in_flight: Arc<Mutex<HashSet<(String, String)>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -1173,6 +1196,7 @@ async fn scheduler_loop(
             let shipper = shipper.clone();
             let sem = sem.clone();
             let in_flight = in_flight.clone();
+            let activity = activity.clone();
 
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.unwrap();
@@ -1194,6 +1218,15 @@ async fn scheduler_loop(
                             &sched.function,
                             fire_at,
                         );
+                        drop(plat);
+                        // Count the fire as activity so the project re-hibernates
+                        // idle_timeout AFTER the last fire (frequent crons stay warm;
+                        // sparse crons scale to zero between fires) rather than
+                        // churning on the idle loop's seeded baseline.
+                        activity
+                            .write()
+                            .await
+                            .insert(sched.project_id.clone(), Instant::now());
                     }
                     Err(e) => {
                         // last_run unadvanced -> retried next tick (bounded by the cap).
