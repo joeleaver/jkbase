@@ -1,7 +1,7 @@
 use crate::auth::{self, ApiToken, Tenant};
 use crate::logstore::LogStore;
 use crate::store::{
-    DomainKind, DomainRecord, DomainStatus, Project, Store,
+    BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, Project, Store,
 };
 use jkbase_common::routing::DomainTarget;
 use axum::body::Bytes;
@@ -17,12 +17,33 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
 pub type DeployCallback = Box<
     dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Inputs handed to the server-provided build orchestrator for one build job.
+pub struct BuildContext {
+    pub project_id: String,
+    pub build_id: u64,
+    /// The uploaded source tree as a gzipped tar (jkbase.toml + per-target source
+    /// dirs + site content; `.git`/`node_modules`/`target` excluded by the CLI).
+    pub source_tar_gz: Vec<u8>,
+}
+
+/// Drives the per-target build fan-out (design §12) and returns a fully-assembled
+/// artifact directory (the `_functions/*`, `_servers/*`, `*.json` layout) ready
+/// for [`activate_deployment`]. Provided by the server binary, which owns
+/// jkbase-orch and the jailer privilege — control has no orch dependency, exactly
+/// mirroring [`DeployCallback`]. The orchestrator reports per-target progress by
+/// writing the build record through its own `Store` handle (the same redb the API
+/// reads), so `GET /builds/{id}` reflects live sub-status.
+pub type BuildCallback = Arc<
+    dyn Fn(BuildContext) -> Pin<Box<dyn Future<Output = anyhow::Result<PathBuf>> + Send>>
         + Send
         + Sync,
 >;
@@ -41,13 +62,19 @@ pub struct AppState {
     pub log_store: LogStore,
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
+    /// Server-provided per-target build orchestrator (mirrors `deploy_callback`).
+    /// `None` disables the server-side build pipeline (`POST /build` → 501).
+    pub build_callback: Option<BuildCallback>,
     pub routing_table: Option<RoutingTable>,
     pub domain_map: Option<DomainMap>,
     pub cert_request: Option<CertRequest>,
     pub cert_status: Option<CertStatusFn>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
-    deploy_locks: Mutex<std::collections::HashSet<String>>,
+    /// Per-project serialization for deploy/build/rollback. A plain
+    /// `std::sync::Mutex` (critical sections never await) so [`DeployLockGuard`]
+    /// can release on `Drop` — a panicking spawned build task can't leak the lock.
+    deploy_locks: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +94,14 @@ pub struct ProjectResponse {
 #[derive(Serialize)]
 pub struct DeployResponse {
     pub version: u64,
+    pub project_id: String,
+}
+
+/// 202 response to `POST /build`: the build runs asynchronously; poll the
+/// build-job resource at `GET /projects/{id}/builds/{build_id}` for status.
+#[derive(Serialize)]
+pub struct BuildStartedResponse {
+    pub build_id: u64,
     pub project_id: String,
 }
 
@@ -96,13 +131,53 @@ impl AppState {
             log_store,
             deploy_dir,
             deploy_callback: None,
+            build_callback: None,
             routing_table: None,
             domain_map: None,
             cert_request: None,
             cert_status: None,
             platform_domain: "jkbase.app".to_string(),
-            deploy_locks: Mutex::new(std::collections::HashSet::new()),
+            deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+}
+
+/// RAII guard for the per-project deploy/build/rollback lock. Acquiring fails if
+/// the project is already locked; the guard releases the lock on `Drop` —
+/// including when the holder unwinds. That matters most for the build path, which
+/// moves the guard into a detached task running a multi-minute, attacker-
+/// influenced fan-out: a panic there must not wedge the project forever.
+struct DeployLockGuard {
+    state: Arc<AppState>,
+    id: String,
+}
+
+impl DeployLockGuard {
+    /// Lock `id`, or `None` if a deploy/build/rollback is already in progress.
+    fn try_acquire(state: &Arc<AppState>, id: &str) -> Option<Self> {
+        let mut locks = state
+            .deploy_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if locks.insert(id.to_string()) {
+            Some(Self {
+                state: state.clone(),
+                id: id.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for DeployLockGuard {
+    fn drop(&mut self) {
+        let mut locks = self
+            .state
+            .deploy_locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.remove(&self.id);
     }
 }
 
@@ -139,7 +214,10 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(get_project).delete(delete_project),
         )
         .route("/projects/{id}/deploy", post(deploy))
+        .route("/projects/{id}/build", post(build))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
+        .route("/projects/{id}/builds", get(list_builds))
+        .route("/projects/{id}/builds/{build_id}", get(get_build))
         .route(
             "/projects/{id}/secrets",
             get(list_secrets).post(set_secret),
@@ -716,27 +794,19 @@ async fn deploy(
         }
     };
 
-    // Acquire deploy lock
-    {
-        let mut locks = state.deploy_locks.lock().await;
-        if !locks.insert(id.clone()) {
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: "deploy already in progress".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
+    // Serialize against concurrent deploy/build/rollback; the guard releases the
+    // lock on drop, even if `do_deploy` unwinds.
+    let Some(_guard) = DeployLockGuard::try_acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "deploy already in progress".to_string(),
+            }),
+        )
+            .into_response();
+    };
 
     let result = do_deploy(&state, &mut project, &body).await;
-
-    // Release deploy lock
-    {
-        let mut locks = state.deploy_locks.lock().await;
-        locks.remove(&id);
-    }
 
     match result {
         Ok(version) => (
@@ -757,10 +827,348 @@ async fn deploy(
     }
 }
 
+/// Authorize that `tenant` owns project `id`, returning the project or a ready
+/// HTTP error response (404 if missing/foreign, 500 on store error).
+type ApiError = (StatusCode, Json<ErrorResponse>);
+
+fn require_project_owner(
+    state: &AppState,
+    tenant: &Tenant,
+    id: &str,
+) -> Result<Project, ApiError> {
+    match state.store.get_project(id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => Ok(p),
+        Ok(Some(_)) | Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+/// `POST /projects/{id}/build` — the one build-pipeline intake funnel. Accepts a
+/// gzipped source tarball, registers a build job, and fans out per-target build
+/// VMs asynchronously (design §4/§12). Returns 202 immediately; the client polls
+/// the build-job resource. Reuses `deploy_locks` (serialize per project), the
+/// 2 GiB body limit, and the storage-quota 402 in the shared deploy tail.
+async fn build(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    if state.build_callback.is_none() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(ErrorResponse {
+                error: "server-side build pipeline is not enabled".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Pre-build 402 gate: a project already at its build-minute cap can't launch
+    // (prevents launch-storms — threat-model P1-4; the build VM is metered on
+    // exit, but the gate must debit before launch). deploy_locks already
+    // serializes builds per project, so this MTD check can't be raced past.
+    {
+        let month_start = crate::store::month_start_epoch(auth::timestamp());
+        let used = state
+            .store
+            .sum_month_to_date(&id, month_start)
+            .map(|m| m.build_seconds)
+            .unwrap_or(0);
+        let cap = state
+            .store
+            .get_quota(&id)
+            .map(|q| q.build_seconds_per_month)
+            .unwrap_or(crate::store::DEFAULT_QUOTA.build_seconds_per_month);
+        if used >= cap {
+            return (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ErrorResponse {
+                    error: format!(
+                        "build-minute quota exceeded: {used} of {cap} build-seconds used this month"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    // Serialize against concurrent deploys/builds for this project. The guard is
+    // moved into the spawned build task and releases the lock on drop — including
+    // if that task unwinds, so a panicking build can't wedge the project.
+    let Some(guard) = DeployLockGuard::try_acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "a deploy or build is already in progress".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let build_id = match state.store.next_build_id(&id) {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let now = auth::timestamp();
+    let rec = BuildRecord {
+        project_id: id.clone(),
+        build_id,
+        phase: BuildPhase::Queued,
+        targets: Vec::new(),
+        log_tail: String::new(),
+        phase_timings_ms: Default::default(),
+        deployed_version: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    if let Err(e) = state.store.save_build(&rec) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let state_bg = state.clone();
+    let id_bg = id.clone();
+    let source = body.to_vec();
+    tokio::spawn(async move {
+        // Released on completion OR panic-unwind of the build task.
+        let _guard = guard;
+        run_build_job(state_bg, &id_bg, build_id, source).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(BuildStartedResponse {
+            build_id,
+            project_id: id,
+        }),
+    )
+        .into_response()
+}
+
+/// Re-read the latest build record, apply `f`, stamp `updated_at`, and persist.
+/// Re-reading each time preserves concurrent per-target writes from the server
+/// orchestrator — control only mutates at phase boundaries, so they don't overlap.
+fn update_build(
+    state: &AppState,
+    project_id: &str,
+    build_id: u64,
+    f: impl FnOnce(&mut BuildRecord),
+) {
+    match state.store.get_build(project_id, build_id) {
+        Ok(Some(mut r)) => {
+            f(&mut r);
+            r.updated_at = auth::timestamp();
+            if let Err(e) = state.store.save_build(&r) {
+                tracing::warn!(project_id, build_id, error = %e, "failed to persist build record");
+            }
+        }
+        Ok(None) => tracing::warn!(project_id, build_id, "build record vanished mid-update"),
+        Err(e) => tracing::warn!(project_id, build_id, error = %e, "failed to read build record"),
+    }
+}
+
+/// Drive one build job to a terminal state: fan out per-target build VMs (via the
+/// server-provided callback), then on success hand the assembled artifacts to the
+/// shared deploy tail. Atomic — any target failure fails the whole build and no
+/// `live` swap happens (design §12). Always leaves the record Succeeded or Failed.
+async fn run_build_job(
+    state: Arc<AppState>,
+    project_id: &str,
+    build_id: u64,
+    source_tar_gz: Vec<u8>,
+) {
+    update_build(&state, project_id, build_id, |r| r.phase = BuildPhase::Building);
+
+    let Some(cb) = state.build_callback.clone() else {
+        update_build(&state, project_id, build_id, |r| {
+            r.phase = BuildPhase::Failed;
+            r.error = Some("build pipeline not enabled".to_string());
+        });
+        return;
+    };
+
+    let fanout_start = std::time::Instant::now();
+    let ctx = BuildContext {
+        project_id: project_id.to_string(),
+        build_id,
+        source_tar_gz,
+    };
+    let staged = match cb(ctx).await {
+        Ok(p) => p,
+        Err(e) => {
+            update_build(&state, project_id, build_id, |r| {
+                r.phase = BuildPhase::Failed;
+                r.error = Some(format!("build failed: {e:#}"));
+            });
+            return;
+        }
+    };
+    let fanout_ms = fanout_start.elapsed().as_millis() as u64;
+
+    let mut project = match state.store.get_project(project_id) {
+        Ok(Some(p)) => p,
+        _ => {
+            update_build(&state, project_id, build_id, |r| {
+                r.phase = BuildPhase::Failed;
+                r.error = Some("project not found at activation".to_string());
+            });
+            return;
+        }
+    };
+
+    let activate_start = std::time::Instant::now();
+    match activate_deployment(&state, &mut project, &staged).await {
+        Ok(version) => {
+            let activate_ms = activate_start.elapsed().as_millis() as u64;
+            update_build(&state, project_id, build_id, |r| {
+                r.phase = BuildPhase::Succeeded;
+                r.deployed_version = Some(version);
+                r.phase_timings_ms.insert("fanout".to_string(), fanout_ms);
+                r.phase_timings_ms.insert("activate".to_string(), activate_ms);
+            });
+            info!(project_id, build_id, version, "build succeeded; deployment activated");
+        }
+        Err(e) => {
+            update_build(&state, project_id, build_id, |r| {
+                r.phase = BuildPhase::Failed;
+                r.error = Some(format!("activation failed: {e:#}"));
+                r.phase_timings_ms.insert("fanout".to_string(), fanout_ms);
+            });
+        }
+    }
+
+    let _ = state.store.prune_builds(project_id, 20);
+}
+
+/// `GET /projects/{id}/builds/{build_id}` — one build job's terminal/in-flight
+/// status, per-target sub-status, captured log tail, and per-phase timings.
+async fn get_build(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path((id, build_id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    match state.store.get_build(&id, build_id) {
+        Ok(Some(rec)) => (StatusCode::OK, Json(rec)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("build {build_id} not found"),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/builds` — build history, newest first.
+async fn list_builds(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    match state.store.list_builds(&id) {
+        Ok(builds) => (StatusCode::OK, Json(builds)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 async fn do_deploy(
     state: &AppState,
     project: &mut Project,
     tarball: &[u8],
+) -> anyhow::Result<u64> {
+    // Unpack the uploaded artifact tarball into a staging dir on the same
+    // filesystem as the deployment tree, then activate it via the shared tail.
+    let staged = state.deploy_dir.join(&project.id).join(".staging-deploy");
+    let _ = tokio::fs::remove_dir_all(&staged).await;
+    tokio::fs::create_dir_all(&staged).await?;
+
+    let tar = flate2::read::GzDecoder::new(tarball);
+    let mut archive = tar::Archive::new(tar);
+    archive.unpack(&staged)?;
+
+    activate_deployment(state, project, &staged).await
+}
+
+/// Recursively copy `src` into `dst` (used only when a staged dir lands on a
+/// different filesystem than `deploy_dir`, so the atomic rename can't be used).
+/// Symlinks are recreated as symlinks (not dereferenced) to match `tar::unpack`.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(&target, &to)?;
+        } else if ft.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Activate a fully-assembled artifact directory as the project's next
+/// deployment version. `staged` holds the `_functions/*`, `_servers/*`, and
+/// `*.json` layout; it is MOVED into `deployments/v{N}` (so it must live on the
+/// same filesystem as `deploy_dir`). Shared verbatim by the artifact-upload path
+/// (`do_deploy`) and the build pipeline, so both get the identical tail: server
+/// rootfs pre-extract → storage-quota gate → atomic `live` swap → reconcile
+/// domains/schedules → record history + prune → deploy callback (boot runtime).
+async fn activate_deployment(
+    state: &AppState,
+    project: &mut Project,
+    staged: &std::path::Path,
 ) -> anyhow::Result<u64> {
     let version = project.current_version.unwrap_or(0) + 1;
 
@@ -769,11 +1177,20 @@ async fn do_deploy(
         .join(&project.id)
         .join("deployments")
         .join(format!("v{version}"));
-    tokio::fs::create_dir_all(&deploy_path).await?;
-
-    let tar = flate2::read::GzDecoder::new(tarball);
-    let mut archive = tar::Archive::new(tar);
-    archive.unpack(&deploy_path)?;
+    if let Some(parent) = deploy_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+    // Same-filesystem move (staging lives under deploy_dir); recursive-copy
+    // fallback covers the rare cross-filesystem case, cleaning a partial v{N} if
+    // it fails mid-copy.
+    if tokio::fs::rename(staged, &deploy_path).await.is_err() {
+        if let Err(e) = copy_dir_recursive(staged, &deploy_path) {
+            let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+            return Err(anyhow::anyhow!("cross-filesystem stage copy failed: {e}"));
+        }
+        let _ = tokio::fs::remove_dir_all(staged).await;
+    }
 
     // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM)
     let servers_dir = deploy_path.join("_servers");
@@ -947,6 +1364,8 @@ pub struct UsageResponse {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     pub storage_bytes: u64,
+    /// Month-to-date server-side build-VM seconds.
+    pub build_seconds: u64,
     pub month_start: u64,
 }
 
@@ -954,16 +1373,23 @@ pub struct UsageResponse {
 pub struct QuotaResponse {
     pub storage_bytes_max: u64,
     pub bandwidth_bytes_per_month: u64,
+    pub build_seconds_per_month: u64,
     /// True if this project has a per-project override (vs platform defaults).
     pub overridden: bool,
     pub bandwidth_blocked: bool,
     pub blocked_reason: Option<String>,
 }
 
+fn default_build_seconds_quota() -> u64 {
+    crate::store::DEFAULT_QUOTA.build_seconds_per_month
+}
+
 #[derive(Deserialize)]
 pub struct SetQuotaRequest {
     pub storage_bytes_max: u64,
     pub bandwidth_bytes_per_month: u64,
+    #[serde(default = "default_build_seconds_quota")]
+    pub build_seconds_per_month: u64,
 }
 
 /// Month-to-date metered usage for a project. Works while hibernated (store-only).
@@ -991,6 +1417,7 @@ async fn get_project_usage(
             rx_bytes: mtd.rx_bytes,
             tx_bytes: mtd.tx_bytes,
             storage_bytes: mtd.storage_bytes,
+            build_seconds: mtd.build_seconds,
             month_start,
         })
         .into_response(),
@@ -1027,6 +1454,7 @@ async fn get_project_quota(
     Json(QuotaResponse {
         storage_bytes_max: limits.storage_bytes_max,
         bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+        build_seconds_per_month: limits.build_seconds_per_month,
         overridden,
         bandwidth_blocked: status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false),
         blocked_reason: status.and_then(|s| s.blocked_reason),
@@ -1063,11 +1491,15 @@ async fn set_project_quota(
         bandwidth_bytes_per_month: req
             .bandwidth_bytes_per_month
             .min(crate::store::DEFAULT_QUOTA.bandwidth_bytes_per_month),
+        build_seconds_per_month: req
+            .build_seconds_per_month
+            .min(crate::store::DEFAULT_QUOTA.build_seconds_per_month),
     };
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
             storage_bytes_max: limits.storage_bytes_max,
             bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+            build_seconds_per_month: limits.build_seconds_per_month,
             overridden: true,
             bandwidth_blocked: false,
             blocked_reason: None,
@@ -1141,26 +1573,19 @@ async fn rollback(
             .into_response();
     }
 
-    // Reuse the deploy lock so a rollback can't race a concurrent deploy/rollback.
-    {
-        let mut locks = state.deploy_locks.lock().await;
-        if !locks.insert(id.clone()) {
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: "a deploy or rollback is already in progress".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    }
+    // Reuse the deploy lock so a rollback can't race a concurrent deploy/build/
+    // rollback; the guard releases on drop, even if `do_rollback` unwinds.
+    let Some(_guard) = DeployLockGuard::try_acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "a deploy or rollback is already in progress".to_string(),
+            }),
+        )
+            .into_response();
+    };
 
     let result = do_rollback(&state, &mut project, &deploy_path, target).await;
-
-    {
-        let mut locks = state.deploy_locks.lock().await;
-        locks.remove(&id);
-    }
 
     match result {
         Ok(()) => (

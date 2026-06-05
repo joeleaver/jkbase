@@ -1,3 +1,10 @@
+//! `jkbase deploy` — server-side build + deploy.
+//!
+//! The platform builds, not the laptop: this tars the project **source** (no
+//! `docker`/`cargo` locally), POSTs it to the build funnel, and streams the
+//! resulting build job until the deployment goes live. One build VM is fanned
+//! out per server/function server-side (design §12).
+
 use anyhow::{Context, Result};
 use clap::Args;
 use flate2::write::GzEncoder;
@@ -5,6 +12,7 @@ use flate2::Compression;
 use jkbase_common::config::ProjectConfig;
 use serde::Deserialize;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Args)]
 pub struct DeployArgs {
@@ -22,15 +30,39 @@ pub struct DeployArgs {
 }
 
 #[derive(Deserialize)]
-struct DeployResponse {
-    version: u64,
-    project_id: String,
+struct BuildStarted {
+    build_id: u64,
+}
+
+#[derive(Deserialize)]
+struct BuildStatus {
+    phase: String,
+    #[serde(default)]
+    targets: Vec<TargetStatus>,
+    #[serde(default)]
+    log_tail: String,
+    #[serde(default)]
+    deployed_version: Option<u64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TargetStatus {
+    name: String,
+    kind: String,
+    phase: String,
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
 }
+
+/// Directories never shipped as source — build outputs and VCS metadata.
+const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
 
 pub async fn run(args: DeployArgs) -> Result<()> {
     let (config, config_path) = ProjectConfig::find_and_load()?;
@@ -44,86 +76,20 @@ pub async fn run(args: DeployArgs) -> Result<()> {
                 "no project specified — use --project or set project.name in jkbase.toml"
             )
         })?;
+    let project_id = slug(&project_name);
 
-    let resolved_sites = config.resolved_sites();
-
-    // Build WASM functions
-    let mut wasm_files: Vec<(String, std::path::PathBuf)> = Vec::new();
-    for (name, func_config) in &config.functions {
-        let source = project_dir.join(&func_config.source);
-        let wasm_path = build_function(name, &source)?;
-        wasm_files.push((name.clone(), wasm_path));
-    }
-
-    // Build server containers
-    let mut server_artifacts: Vec<ServerArtifact> = Vec::new();
-    for (name, server_config) in &config.servers {
-        let dockerfile_path = project_dir.join(&server_config.dockerfile);
-        println!("  Server '{name}': building {}...", dockerfile_path.display());
-        let artifact = build_server(name, &dockerfile_path, project_dir, server_config)?;
-        server_artifacts.push(artifact);
-    }
-
-    // Serialize route config for the agent
-    let route_config = if !config.routes.is_empty() {
-        Some(serde_json::to_string_pretty(&config.routes)?)
-    } else {
-        None
-    };
-
-    // Serialize sites config for multi-site routing
-    let sites_json = if !config.sites.is_empty() {
-        Some(serde_json::to_string_pretty(&resolved_sites)?)
-    } else {
-        None
-    };
-
-    // Serialize domain aliases
-    let domains_json = if !config.domains.is_empty() {
-        Some(serde_json::to_string_pretty(&config.domains)?)
-    } else {
-        None
-    };
-
-    // Serialize function schedules (inline cron from [functions.NAME])
-    let schedules_json = {
-        let scheds: Vec<_> = config
-            .functions
-            .iter()
-            .filter_map(|(name, f)| {
-                f.schedule
-                    .as_ref()
-                    .map(|c| serde_json::json!({ "function": name, "cron": c }))
-            })
-            .collect();
-        if scheds.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string_pretty(&scheds)?)
-        }
-    };
-
-    println!("Packaging...");
-    let tarball = create_tarball(
-        project_dir,
-        &resolved_sites,
-        &wasm_files,
-        &server_artifacts,
-        route_config.as_deref(),
-        sites_json.as_deref(),
-        domains_json.as_deref(),
-        schedules_json.as_deref(),
-    )
-    .context("failed to create tarball")?;
+    println!("Packaging source...");
+    let tarball = tar_source(project_dir).context("failed to package source")?;
     println!("  {} bytes compressed", tarball.len());
 
-    let project_id = slug(&project_name);
-    let url = format!("{}/projects/{}/deploy", args.api, project_id);
-
-    println!("Deploying '{project_name}'...");
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated — run `jkbase init` or `jkbase login` first"))?;
+    let token = crate::credentials::load_token()?.ok_or_else(|| {
+        anyhow::anyhow!("not authenticated — run `jkbase init` or `jkbase login` first")
+    })?;
     let client = crate::credentials::authenticated_client(&token);
+
+    // Kick off the server-side build.
+    let url = format!("{}/projects/{}/build", args.api, project_id);
+    println!("Building '{project_name}' on the platform...");
     let resp = client
         .post(&url)
         .header("Content-Type", "application/gzip")
@@ -132,312 +98,108 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         .await
         .context("failed to connect to platform API")?;
 
-    if resp.status().is_success() {
-        let deploy: DeployResponse = resp.json().await?;
-        println!(
-            "Deployed {} v{} successfully",
-            deploy.project_id, deploy.version
-        );
-    } else {
+    if !resp.status().is_success() {
         let status = resp.status();
-        let err: ErrorResponse = resp
-            .json()
+        let err: ErrorResponse = resp.json().await.unwrap_or(ErrorResponse {
+            error: "unknown error".to_string(),
+        });
+        anyhow::bail!("build request failed ({status}): {}", err.error);
+    }
+    let started: BuildStarted = resp.json().await.context("parse build response")?;
+
+    // Stream the build job to completion.
+    let status_url = format!(
+        "{}/projects/{}/builds/{}",
+        args.api, project_id, started.build_id
+    );
+    // Overall budget: the server caps a build at 600s; allow margin, then bail
+    // rather than poll forever (e.g. if the server restarted mid-build).
+    let deadline = std::time::Instant::now() + Duration::from_secs(720);
+    let mut last_fingerprint = String::new();
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "build did not finish within 12 minutes; the server may have restarted — \
+                 re-run `jkbase deploy` or check the build status later"
+            );
+        }
+        let resp = client
+            .get(&status_url)
+            .send()
             .await
-            .unwrap_or(ErrorResponse {
+            .context("failed to poll build status")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err: ErrorResponse = resp.json().await.unwrap_or(ErrorResponse {
                 error: "unknown error".to_string(),
             });
-        anyhow::bail!("deploy failed ({}): {}", status, err.error);
-    }
+            anyhow::bail!("build status check failed ({status}): {}", err.error);
+        }
+        let status: BuildStatus = resp.json().await.context("parse build status")?;
 
-    Ok(())
-}
-
-struct ServerArtifact {
-    name: String,
-    rootfs_tarball: std::path::PathBuf,
-    manifest_json: String,
-}
-
-fn build_server(
-    name: &str,
-    dockerfile: &Path,
-    context_dir: &Path,
-    config: &jkbase_common::config::ServerConfig,
-) -> Result<ServerArtifact> {
-    let image_tag = format!("jkbase-server-{name}:build");
-    let dockerfile_dir = dockerfile.parent().unwrap_or(context_dir);
-
-    let status = std::process::Command::new("docker")
-        .args(["build", "-t", &image_tag, "-f"])
-        .arg(dockerfile)
-        .arg(dockerfile_dir)
-        .status()
-        .context("failed to run docker build — is Docker installed?")?;
-
-    if !status.success() {
-        anyhow::bail!("docker build failed for server '{name}'");
-    }
-
-    let output = std::process::Command::new("docker")
-        .args(["create", &image_tag])
-        .output()
-        .context("failed to create container for export")?;
-
-    if !output.status.success() {
-        anyhow::bail!("docker create failed for server '{name}'");
-    }
-
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    let inspect_output = std::process::Command::new("docker")
-        .args(["inspect", "--format", "{{json .Config}}", &image_tag])
-        .output()
-        .context("failed to inspect image")?;
-
-    let inspect_json: serde_json::Value =
-        serde_json::from_slice(&inspect_output.stdout).unwrap_or_default();
-
-    let mut cmd: Vec<String> = Vec::new();
-    if let Some(entrypoint) = inspect_json["Entrypoint"].as_array() {
-        for v in entrypoint {
-            if let Some(s) = v.as_str() {
-                cmd.push(s.to_string());
+        // Print per-target transitions as they change.
+        let fingerprint = status
+            .targets
+            .iter()
+            .map(|t| format!("{}:{}:{}", t.kind, t.name, t.phase))
+            .collect::<Vec<_>>()
+            .join(",");
+        if fingerprint != last_fingerprint {
+            for t in &status.targets {
+                println!("  [{}] {} — {}", t.kind, t.name, t.phase);
             }
+            last_fingerprint = fingerprint;
         }
-    }
-    if let Some(docker_cmd) = inspect_json["Cmd"].as_array() {
-        for v in docker_cmd {
-            if let Some(s) = v.as_str() {
-                cmd.push(s.to_string());
+
+        match status.phase.as_str() {
+            "succeeded" => {
+                let version = status.deployed_version.unwrap_or(0);
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "project_id": project_id, "version": version })
+                    );
+                } else {
+                    println!("Deployed {project_id} v{version} successfully");
+                }
+                return Ok(());
             }
+            "failed" => {
+                for t in &status.targets {
+                    if t.phase == "failed" {
+                        println!(
+                            "  [{}] {} FAILED: {}",
+                            t.kind,
+                            t.name,
+                            t.detail.as_deref().unwrap_or("(no detail)")
+                        );
+                    }
+                }
+                if !status.log_tail.trim().is_empty() {
+                    println!("--- build log ---\n{}", status.log_tail.trim_end());
+                }
+                anyhow::bail!(
+                    "build failed: {}",
+                    status.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+            _ => tokio::time::sleep(Duration::from_secs(2)).await,
         }
     }
-    if cmd.is_empty() {
-        cmd = vec!["/bin/sh".to_string()];
-    }
-
-    let working_dir = inspect_json["WorkingDir"]
-        .as_str()
-        .unwrap_or("/")
-        .to_string();
-
-    let tarball_path = std::env::temp_dir().join(format!("jkbase-server-{name}.tar.gz"));
-    let export_status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "docker export {} | gzip > {}",
-            container_id,
-            tarball_path.display()
-        ))
-        .status()
-        .context("failed to export container filesystem")?;
-
-    let _ = std::process::Command::new("docker")
-        .args(["rm", &container_id])
-        .status();
-
-    if !export_status.success() {
-        anyhow::bail!("docker export failed for server '{name}'");
-    }
-
-    let volumes: Vec<serde_json::Value> = config
-        .volumes
-        .iter()
-        .map(|v| serde_json::json!({"name": v.name, "mount": v.mount}))
-        .collect();
-
-    let manifest = serde_json::json!({
-        "port": config.port,
-        "cmd": cmd,
-        "env": {},
-        "working_dir": working_dir,
-        "health_check": config.health_check.as_ref().map(|h| serde_json::json!({
-            "path": h.path.as_deref().unwrap_or("/"),
-            "interval_secs": parse_duration_secs(h.interval.as_deref().unwrap_or("10s")),
-            "timeout_secs": parse_duration_secs(h.timeout.as_deref().unwrap_or("5s")),
-        })),
-        "volumes": volumes,
-    });
-
-    println!(
-        "  Server '{name}': image exported ({} bytes)",
-        std::fs::metadata(&tarball_path)
-            .map(|m| m.len())
-            .unwrap_or(0)
-    );
-
-    Ok(ServerArtifact {
-        name: name.to_string(),
-        rootfs_tarball: tarball_path,
-        manifest_json: serde_json::to_string_pretty(&manifest)?,
-    })
 }
 
-fn parse_duration_secs(s: &str) -> u64 {
-    let s = s.trim();
-    if let Some(num) = s.strip_suffix('s') {
-        num.parse().unwrap_or(10)
-    } else if let Some(num) = s.strip_suffix('m') {
-        num.parse::<u64>().unwrap_or(1) * 60
-    } else {
-        s.parse().unwrap_or(10)
-    }
-}
-
-fn build_function(name: &str, source: &Path) -> Result<std::path::PathBuf> {
-    if source.extension().is_some_and(|e| e == "wasm") {
-        if !source.exists() {
-            anyhow::bail!("WASM file not found: {}", source.display());
-        }
-        println!("  Function '{name}': using pre-built {}", source.display());
-        return Ok(source.to_owned());
-    }
-
-    if !source.join("Cargo.toml").exists() {
-        anyhow::bail!(
-            "function '{}' source at {} is not a Rust crate (no Cargo.toml) or .wasm file",
-            name,
-            source.display()
-        );
-    }
-
-    println!("  Function '{name}': compiling {}...", source.display());
-    let status = std::process::Command::new("cargo")
-        .args([
-            "build",
-            "--target",
-            "wasm32-wasip1",
-            "--release",
-            "--manifest-path",
-        ])
-        .arg(source.join("Cargo.toml"))
-        .status()
-        .context("failed to run cargo build for function")?;
-
-    if !status.success() {
-        anyhow::bail!("failed to compile function '{name}'");
-    }
-
-    let target_dir = source.join("target/wasm32-wasip1/release");
-    let crate_name = read_crate_name(&source.join("Cargo.toml"))?;
-    let wasm_path = target_dir.join(format!("{crate_name}.wasm"));
-
-    if !wasm_path.exists() {
-        anyhow::bail!(
-            "expected WASM output at {} but not found",
-            wasm_path.display()
-        );
-    }
-
-    Ok(wasm_path)
-}
-
-fn read_crate_name(cargo_toml: &Path) -> Result<String> {
-    let content = std::fs::read_to_string(cargo_toml)?;
-    let parsed: toml::Value = toml::from_str(&content)?;
-    parsed["package"]["name"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not read package name from {}",
-                cargo_toml.display()
-            )
-        })
-}
-
-const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
-const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
-
-#[allow(clippy::too_many_arguments)] // threads several optional sidecar artifacts
-fn create_tarball(
-    project_dir: &Path,
-    sites: &[jkbase_common::config::ResolvedSite],
-    wasm_files: &[(String, std::path::PathBuf)],
-    server_artifacts: &[ServerArtifact],
-    route_config_json: Option<&str>,
-    sites_json: Option<&str>,
-    domains_json: Option<&str>,
-    schedules_json: Option<&str>,
-) -> Result<Vec<u8>> {
-    let buf = Vec::new();
-    let enc = GzEncoder::new(buf, Compression::fast());
+/// Tar+gzip the project source tree, paths relative to `project_dir`, excluding
+/// build/VCS dirs. Keeps `jkbase.toml` + `Dockerfile` + all source — the platform
+/// reads the manifest and builds each target from its declared subdir.
+fn tar_source(project_dir: &Path) -> Result<Vec<u8>> {
+    let enc = GzEncoder::new(Vec::new(), Compression::fast());
     let mut tar = tar::Builder::new(enc);
-
-    let multi_site = sites.len() > 1 || sites.first().is_some_and(|s| s.name != "default");
-
-    if multi_site {
-        for site in sites {
-            let site_dir = project_dir.join(&site.public);
-            let tar_prefix = format!("_site_{}", site.name);
-            if site_dir.is_dir() {
-                println!("  Site '{}': {} -> /{}", site.name, site.public, site.prefix);
-                append_dir_prefixed(&mut tar, &site_dir, &site_dir, &tar_prefix)?;
-            }
-        }
-    } else if let Some(site) = sites.first() {
-        let site_dir = project_dir.join(&site.public);
-        if site_dir.is_dir() {
-            append_dir_filtered(&mut tar, &site_dir, &site_dir)?;
-        }
-    }
-
-    if !wasm_files.is_empty() {
-        for (name, wasm_path) in wasm_files {
-            let tar_path = Path::new("_functions").join(format!("{name}.wasm"));
-            tar.append_path_with_name(wasm_path, &tar_path)?;
-        }
-    }
-
-    for artifact in server_artifacts {
-        let tar_path = Path::new("_servers").join(format!("{}.tar.gz", artifact.name));
-        tar.append_path_with_name(&artifact.rootfs_tarball, &tar_path)?;
-
-        let manifest_path = Path::new("_servers").join(format!("{}.json", artifact.name));
-        let manifest_bytes = artifact.manifest_json.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(manifest_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        tar.append_data(&mut header, &manifest_path, manifest_bytes)?;
-    }
-
-    if let Some(routes_json) = route_config_json {
-        append_json_file(&mut tar, "_routes.json", routes_json)?;
-    }
-
-    if let Some(sites_json) = sites_json {
-        append_json_file(&mut tar, "_sites.json", sites_json)?;
-    }
-
-    if let Some(domains_json) = domains_json {
-        append_json_file(&mut tar, "_domains.json", domains_json)?;
-    }
-
-    if let Some(schedules_json) = schedules_json {
-        append_json_file(&mut tar, "_schedules.json", schedules_json)?;
-    }
-
+    append_source(&mut tar, project_dir, project_dir)?;
     let enc = tar.into_inner()?;
-    let compressed = enc.finish()?;
-    Ok(compressed)
+    Ok(enc.finish()?)
 }
 
-fn append_json_file(
-    tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
-    name: &str,
-    content: &str,
-) -> Result<()> {
-    let bytes = content.as_bytes();
-    let mut header = tar::Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    tar.append_data(&mut header, name, bytes)?;
-    Ok(())
-}
-
-fn append_dir_filtered(
+fn append_source(
     tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
     root: &Path,
     dir: &Path,
@@ -445,58 +207,19 @@ fn append_dir_filtered(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let rel = path.strip_prefix(root)?;
-        let name = rel
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-
-        if EXCLUDED_FILES.contains(&name) {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
             continue;
-        }
-
-        if path.is_dir() {
-            if EXCLUDED_DIRS.contains(&name) {
+        } else if ft.is_dir() {
+            if EXCLUDED_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
-            tar.append_dir(rel, &path)?;
-            append_dir_filtered(tar, root, &path)?;
-        } else {
+            append_source(tar, root, &path)?;
+        } else if ft.is_file() {
+            let rel = path.strip_prefix(root)?;
             tar.append_path_with_name(&path, rel)?;
-        }
-    }
-    Ok(())
-}
-
-fn append_dir_prefixed(
-    tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
-    root: &Path,
-    dir: &Path,
-    prefix: &str,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path.strip_prefix(root)?;
-        let name = rel
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-
-        if EXCLUDED_FILES.contains(&name) {
-            continue;
-        }
-
-        let tar_path = Path::new(prefix).join(rel);
-
-        if path.is_dir() {
-            if EXCLUDED_DIRS.contains(&name) {
-                continue;
-            }
-            tar.append_dir(&tar_path, &path)?;
-            append_dir_prefixed(tar, root, &path, prefix)?;
-        } else {
-            tar.append_path_with_name(&path, &tar_path)?;
         }
     }
     Ok(())

@@ -1,0 +1,566 @@
+//! Default-deny **egress proxy** for build VMs (design §9; threat-model P0-1).
+//!
+//! A build VM runs attacker-controlled code and may only reach the network
+//! through this host-side forward proxy, which is itself the SSRF/exfil chokepoint
+//! and so must be conservative. Two **independent, both-required** checks gate
+//! every connection:
+//!
+//! 1. **Hostname allowlist** — only the curated registry/git hosts
+//!    ([`DEFAULT_ALLOWLIST`]); exact match, never a tenant-supplied host.
+//! 2. **Safe destination IP** — the proxy resolves the hostname *itself* and
+//!    pins egress to a resolved **public** IP, rejecting RFC1918/loopback/
+//!    link-local/cloud-metadata/CGNAT/etc. ([`ip_is_public`]). Resolving here
+//!    (not in the guest) and connecting to the pinned IP defeats DNS-rebind/
+//!    TOCTOU, and re-checking on *every* request/CONNECT defeats off-allowlist
+//!    redirects (each hop the client follows is a fresh, independently-gated
+//!    request through the proxy).
+//!
+//! This card is the allowlist + SSRF layer. The TLS-terminating caching **mirror**
+//! (cross-tenant dedup) and **fetch-then-seal** (host tears the TAP down before
+//! the compile phase) are separate cards; HTTPS here is a CONNECT tunnel, not
+//! intercepted.
+
+use anyhow::Result;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
+
+/// Max concurrent egress connections. Bounds task/FD use so a hostile build VM
+/// can't slowloris the shared server process to FD exhaustion.
+const MAX_CONNS: usize = 256;
+/// A client must send its request head within this window (anti-slowloris).
+const HEAD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard ceiling on a single connection's total lifetime, so a killed guest whose
+/// socket never FINs can't pin a task/FD indefinitely.
+const CONN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Curated egress allowlist: the dependency registries + git hosts a build may
+/// fetch from, plus their known content-download hosts. Exact-match only.
+pub const DEFAULT_ALLOWLIST: &[&str] = &[
+    // Rust
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    // Node
+    "registry.npmjs.org",
+    // Python
+    "pypi.org",
+    "files.pythonhosted.org",
+    // Git deps
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+];
+
+/// Why an egress connection was refused (for logging; the client sees a 403/502).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deny {
+    /// Hostname not on the allowlist.
+    HostNotAllowed,
+    /// DNS resolution failed.
+    ResolveFailed,
+    /// The host resolved only to non-public (SSRF) addresses.
+    NoSafeAddr,
+}
+
+/// True if `ip` is a globally-routable public address safe to egress to. Default
+/// **deny**: only addresses that are clearly public unicast pass. v4-mapped IPv6
+/// is canonicalized first so `::ffff:169.254.169.254` is caught as the metadata
+/// IP. This is the load-bearing SSRF check — keep it conservative.
+pub fn ip_is_public(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4_is_public(v4),
+        IpAddr::V6(v6) => v6_is_public(v6),
+    }
+}
+
+fn v4_is_public(ip: Ipv4Addr) -> bool {
+    // std-stable categories: loopback (127/8), private (10/8, 172.16/12,
+    // 192.168/16), link-local (169.254/16 — incl. 169.254.169.254 metadata),
+    // broadcast (255.255.255.255), unspecified (0.0.0.0), multicast (224/4),
+    // documentation (192.0.2/24, 198.51.100/24, 203.0.113/24).
+    if ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_documentation()
+    {
+        return false;
+    }
+    let o = ip.octets();
+    // Ranges not covered by the stable std helpers:
+    if o[0] == 0 {
+        return false; // 0.0.0.0/8 "this network"
+    }
+    if o[0] == 100 && (o[1] & 0xc0) == 64 {
+        return false; // 100.64.0.0/10 CGNAT
+    }
+    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+        return false; // 192.0.0.0/24 IETF protocol assignments
+    }
+    if o[0] == 192 && o[1] == 88 && o[2] == 99 {
+        return false; // 192.88.99.0/24 6to4 relay anycast
+    }
+    if o[0] == 198 && (o[1] & 0xfe) == 18 {
+        return false; // 198.18.0.0/15 benchmarking
+    }
+    if o[0] >= 240 {
+        return false; // 240.0.0.0/4 reserved
+    }
+    true
+}
+
+fn v6_is_public(ip: Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    let seg = ip.segments();
+    // Allow ONLY global unicast 2000::/3, which excludes ULA (fc00::/7) and
+    // link-local (fe80::/10) by construction; then carve out documentation and
+    // 6to4 (which embeds a v4 that could be private/metadata).
+    if (seg[0] & 0xe000) != 0x2000 {
+        return false;
+    }
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return false; // 2001:db8::/32 documentation
+    }
+    if seg[0] == 0x2002 {
+        return false; // 2002::/16 6to4
+    }
+    true
+}
+
+/// Exact, case-insensitive allowlist match (trailing dot tolerated). Never does
+/// suffix/subdomain matching — `crates.io.evil.com` must not pass for `crates.io`.
+pub fn host_allowed(host: &str, allowlist: &[String]) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    allowlist.iter().any(|a| a.eq_ignore_ascii_case(&h))
+}
+
+/// First public, egress-safe address from a resolved set (the pinned target).
+/// `None` if every resolved address is non-public (a rebind/SSRF attempt).
+pub fn pick_safe_addr<I: IntoIterator<Item = SocketAddr>>(addrs: I) -> Option<SocketAddr> {
+    addrs.into_iter().find(|a| ip_is_public(a.ip()))
+}
+
+/// Configuration for the egress proxy: the host allowlist.
+pub struct EgressConfig {
+    pub allowlist: Vec<String>,
+}
+
+impl EgressConfig {
+    pub fn with_default_allowlist() -> Self {
+        Self {
+            allowlist: DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+/// Allowlist the host, resolve it *here*, and pin to a safe public address.
+/// Returns the address to connect to, or a [`Deny`] reason.
+async fn resolve_pinned(host: &str, port: u16, cfg: &EgressConfig) -> Result<SocketAddr, Deny> {
+    if !host_allowed(host, &cfg.allowlist) {
+        return Err(Deny::HostNotAllowed);
+    }
+    // Only the fetch protocols — never relay to SSH/SMTP/etc. on an allowed host.
+    if port != 80 && port != 443 {
+        return Err(Deny::HostNotAllowed);
+    }
+    // lookup_host handles both names and IP-literals; either way the result is
+    // re-checked by pick_safe_addr, so an IP-literal host that somehow passed the
+    // allowlist still can't reach a private/metadata address.
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| Deny::ResolveFailed)?;
+    pick_safe_addr(addrs).ok_or(Deny::NoSafeAddr)
+}
+
+/// Serve the egress proxy on `listener` until the task is dropped. Each accepted
+/// connection is handled independently.
+pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
+    info!(allowlist = cfg.allowlist.len(), "egress proxy listening");
+    let sem = Arc::new(Semaphore::new(MAX_CONNS));
+    loop {
+        let (client, peer) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "egress accept failed");
+                continue;
+            }
+        };
+        // Non-blocking cap: drop excess connections immediately rather than
+        // queueing (which would just move the exhaustion to the accept backlog).
+        let permit = match sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!(%peer, "egress connection cap reached; dropping");
+                drop(client);
+                continue;
+            }
+        };
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(CONN_TIMEOUT, handle_conn(client, cfg)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => debug!(%peer, error = %e, "egress connection ended"),
+                Err(_) => debug!(%peer, "egress connection exceeded lifetime cap"),
+            }
+        });
+    }
+}
+
+const MAX_HEAD_BYTES: usize = 16 * 1024;
+
+/// Read the request head (up to the blank line) without consuming any body
+/// bytes that follow. Bounded by [`MAX_HEAD_BYTES`].
+async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > MAX_HEAD_BYTES {
+            anyhow::bail!("request head exceeded {MAX_HEAD_BYTES} bytes");
+        }
+    }
+    Ok(buf)
+}
+
+async fn deny_response(stream: &mut TcpStream, code: u16, reason: &str) -> Result<()> {
+    let body = format!("egress denied: {reason}");
+    let resp = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    let _ = stream.flush().await;
+    Ok(())
+}
+
+fn deny_code(d: Deny) -> (u16, &'static str) {
+    match d {
+        Deny::HostNotAllowed => (403, "Forbidden"),
+        Deny::ResolveFailed => (502, "Bad Gateway"),
+        Deny::NoSafeAddr => (403, "Forbidden"),
+    }
+}
+
+async fn handle_conn(mut client: TcpStream, cfg: Arc<EgressConfig>) -> Result<()> {
+    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut client)).await {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!("request head not received within {HEAD_TIMEOUT:?}"),
+    };
+    let head_str = String::from_utf8_lossy(&head);
+    let request_line = head_str.lines().next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        // HTTPS tunnel: target is "host:port".
+        let (host, port) = match split_authority(target, 443) {
+            Some(hp) => hp,
+            None => {
+                deny_response(&mut client, 400, "Bad Request").await?;
+                return Ok(());
+            }
+        };
+        match resolve_pinned(&host, port, &cfg).await {
+            Ok(addr) => {
+                let mut upstream = TcpStream::connect(addr).await?;
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                info!(%host, %addr, "egress CONNECT tunnel");
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            }
+            Err(d) => {
+                warn!(%host, ?d, "egress CONNECT denied");
+                let (code, reason) = deny_code(d);
+                deny_response(&mut client, code, reason).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // Plaintext HTTP forward proxy: target is an absolute-form URI.
+    let Some((host, port, path)) = parse_absolute_http(target) else {
+        deny_response(&mut client, 400, "Bad Request").await?;
+        return Ok(());
+    };
+    match resolve_pinned(&host, port, &cfg).await {
+        Ok(addr) => {
+            let mut upstream = TcpStream::connect(addr).await?;
+            // Rewrite request-line to origin-form and forward the (rewritten) head.
+            let rewritten = head_str.replacen(target, &path, 1);
+            upstream.write_all(rewritten.as_bytes()).await?;
+            info!(%host, %addr, "egress HTTP forward");
+            // Stream request body + response; the client re-requests each redirect
+            // through the proxy, so every hop is independently re-gated.
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        }
+        Err(d) => {
+            warn!(%host, ?d, "egress HTTP denied");
+            let (code, reason) = deny_code(d);
+            deny_response(&mut client, code, reason).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Split `host:port` (or bare `host`) into `(host, port)`, defaulting the port.
+/// Handles bracketed IPv6 literals (`[::1]:443`).
+fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        // [ipv6]:port
+        let (host, after) = rest.split_once(']')?;
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_string(), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => {
+            let port = p.parse().ok()?;
+            Some((h.to_string(), port))
+        }
+        _ => Some((authority.to_string(), default_port)),
+    }
+}
+
+/// Parse an absolute-form HTTP request target (`http://host[:port]/path`) into
+/// `(host, port, origin-form-path)`. Returns `None` for non-http schemes.
+fn parse_absolute_http(target: &str) -> Option<(String, u16, String)> {
+    let rest = target.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = split_authority(authority, 80)?;
+    Some((host, port, path.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn rejects_ssrf_addresses() {
+        // Every one of these must be denied.
+        for s in [
+            "127.0.0.1",
+            "127.10.20.30",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "169.254.0.1",
+            "0.0.0.0",
+            "100.64.0.1",   // CGNAT
+            "100.127.0.1",  // CGNAT
+            "192.0.0.1",    // IETF
+            "192.0.2.1",    // doc TEST-NET-1
+            "198.18.0.1",   // benchmarking
+            "198.51.100.1", // doc TEST-NET-2
+            "203.0.113.1",  // doc TEST-NET-3
+            "192.88.99.1",  // 6to4 relay
+            "240.0.0.1",    // reserved
+            "255.255.255.255",
+            "224.0.0.1", // multicast
+            "::1",
+            "::",
+            "fe80::1",                // link-local
+            "fc00::1",                // ULA
+            "fd12:3456::1",           // ULA
+            "ff02::1",                // multicast
+            "2001:db8::1",            // documentation
+            "2002:c0a8:0101::1",      // 6to4
+            "::ffff:169.254.169.254", // v4-mapped metadata
+            "::ffff:10.0.0.1",        // v4-mapped private
+        ] {
+            assert!(!ip_is_public(ip(s)), "{s} must be denied");
+        }
+    }
+
+    #[test]
+    fn allows_real_public_addresses() {
+        for s in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "140.82.112.3",        // github
+            "151.101.0.1",         // fastly (crates/pypi CDN)
+            "2606:4700:4700::1111", // cloudflare v6
+            "2620:0:861:ed1a::1",  // public v6
+        ] {
+            assert!(ip_is_public(ip(s)), "{s} must be allowed");
+        }
+    }
+
+    #[test]
+    fn host_allowlist_is_exact() {
+        let al: Vec<String> = DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect();
+        assert!(host_allowed("crates.io", &al));
+        assert!(host_allowed("CRATES.IO", &al)); // case-insensitive
+        assert!(host_allowed("crates.io.", &al)); // trailing dot
+        assert!(host_allowed("static.crates.io", &al));
+        assert!(host_allowed("registry.npmjs.org", &al));
+        // Spoofing / rebind hostnames must NOT pass.
+        assert!(!host_allowed("crates.io.evil.com", &al));
+        assert!(!host_allowed("evilcrates.io", &al));
+        assert!(!host_allowed("notcrates.io", &al));
+        assert!(!host_allowed("sub.crates.io", &al)); // exact only; not a known host
+        assert!(!host_allowed("169.254.169.254", &al));
+        assert!(!host_allowed("evil.com", &al));
+    }
+
+    #[test]
+    fn pick_safe_addr_skips_unsafe() {
+        let addrs = vec![
+            "10.0.0.1:443".parse().unwrap(),          // private — skip
+            "169.254.169.254:443".parse().unwrap(),   // metadata — skip
+            "140.82.112.3:443".parse().unwrap(),      // public — take this
+            "8.8.8.8:443".parse().unwrap(),
+        ];
+        let picked = pick_safe_addr(addrs).unwrap();
+        assert_eq!(picked.ip(), ip("140.82.112.3"));
+
+        // All-unsafe resolves to nothing (rebind attempt → denied).
+        let unsafe_only: Vec<SocketAddr> = vec![
+            "10.0.0.1:443".parse().unwrap(),
+            "127.0.0.1:443".parse().unwrap(),
+        ];
+        assert!(pick_safe_addr(unsafe_only).is_none());
+    }
+
+    #[test]
+    fn authority_parsing() {
+        assert_eq!(split_authority("crates.io:443", 80), Some(("crates.io".into(), 443)));
+        assert_eq!(split_authority("crates.io", 443), Some(("crates.io".into(), 443)));
+        assert_eq!(split_authority("[::1]:8443", 443), Some(("::1".into(), 8443)));
+        assert_eq!(split_authority("[2606:4700::1111]", 443), Some(("2606:4700::1111".into(), 443)));
+        assert_eq!(split_authority("", 443), None);
+
+        assert_eq!(
+            parse_absolute_http("http://pypi.org/simple/flask/"),
+            Some(("pypi.org".into(), 80, "/simple/flask/".into()))
+        );
+        assert_eq!(
+            parse_absolute_http("http://registry.npmjs.org:8080/x"),
+            Some(("registry.npmjs.org".into(), 8080, "/x".into()))
+        );
+        assert!(parse_absolute_http("https://crates.io/").is_none()); // not plaintext-forward
+        assert!(parse_absolute_http("ftp://x/").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_pinned_denies_non_allowlisted_host_before_dns() {
+        let cfg = EgressConfig::with_default_allowlist();
+        // Not on the allowlist → denied without any DNS lookup.
+        assert_eq!(
+            resolve_pinned("evil.example.com", 443, &cfg).await,
+            Err(Deny::HostNotAllowed)
+        );
+        assert_eq!(
+            resolve_pinned("169.254.169.254", 443, &cfg).await,
+            Err(Deny::HostNotAllowed)
+        );
+        // An allowed host on a non-fetch port (SSH/SMTP/...) is refused.
+        assert_eq!(
+            resolve_pinned("github.com", 22, &cfg).await,
+            Err(Deny::HostNotAllowed)
+        );
+        assert_eq!(
+            resolve_pinned("crates.io", 8080, &cfg).await,
+            Err(Deny::HostNotAllowed)
+        );
+    }
+
+    /// Live end-to-end: drive a real client (curl) through the proxy. Ignored by
+    /// default (needs outbound internet). Run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "needs outbound internet"]
+    async fn proxy_tunnels_allowlisted_and_denies_others() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve(
+            listener,
+            Arc::new(EgressConfig::with_default_allowlist()),
+        ));
+        let proxy = format!("http://127.0.0.1:{port}");
+
+        async fn curl(proxy: &str, url: &str) -> std::process::Output {
+            tokio::process::Command::new("curl")
+                .args(["-sS", "--max-time", "20", "-x", proxy, "-o", "/dev/null", url])
+                .output()
+                .await
+                .unwrap()
+        }
+
+        // Allowlisted host: the CONNECT tunnel establishes and TLS completes
+        // (any HTTP status is a successful transfer for curl without -f).
+        let ok = curl(&proxy, "https://crates.io/").await;
+        assert!(
+            ok.status.success(),
+            "allowlisted fetch should tunnel: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        // Off-allowlist host: the proxy 403s the CONNECT, so curl fails.
+        let denied = curl(&proxy, "https://example.com/").await;
+        assert!(!denied.status.success(), "off-allowlist host must be denied");
+        let err = String::from_utf8_lossy(&denied.stderr);
+        assert!(
+            err.contains("403"),
+            "expected a 403 proxy denial, got: {err}"
+        );
+
+        // A would-be SSRF to the cloud-metadata IP over plaintext HTTP: the proxy
+        // returns its OWN 403 (it never connects to 169.254.169.254). curl exits 0
+        // because it got a response, so assert the status code is the proxy denial.
+        let meta = tokio::process::Command::new("curl")
+            .args([
+                "-sS",
+                "--max-time",
+                "10",
+                "-x",
+                &proxy,
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "http://169.254.169.254/latest/meta-data/",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&meta.stdout).trim(),
+            "403",
+            "metadata IP must get the proxy's 403, never be reached"
+        );
+    }
+}

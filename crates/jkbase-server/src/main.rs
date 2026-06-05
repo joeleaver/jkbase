@@ -1,3 +1,5 @@
+mod build_orchestrator;
+mod egress;
 mod log_shipper;
 mod metering;
 
@@ -67,6 +69,29 @@ struct Args {
     /// Use the Let's Encrypt staging environment (untrusted certs; avoids prod rate limits)
     #[arg(long)]
     acme_staging: bool,
+
+    /// Bind address for the build egress proxy (host-side default-deny forward
+    /// proxy with allowlist + public-IP pinning). Disabled when unset. Build VMs
+    /// route their dependency fetches through this; bind it where only the build
+    /// network can reach it (e.g. the build gateway IP). Ignored when --build-net
+    /// is set (then it binds on the build gateway automatically).
+    #[arg(long)]
+    egress_addr: Option<String>,
+
+    /// Enable the isolated build network so build VMs fetch deps through the
+    /// egress proxy and are sealed for compile (provision the bridge + firewall
+    /// first with tools/setup-build-net.sh).
+    #[arg(long)]
+    build_net: bool,
+
+    #[arg(long, default_value = "jkbuild0")]
+    build_bridge: String,
+
+    #[arg(long, default_value = "172.31.0.1")]
+    build_gateway: String,
+
+    #[arg(long, default_value = "3128")]
+    build_proxy_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +201,7 @@ async fn main() -> Result<()> {
         None
     };
 
+    let store_for_builds = store.clone();
     let mut state = AppState::new(store, log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
     state.domain_map = Some(domain_map.clone());
@@ -201,6 +227,74 @@ async fn main() -> Result<()> {
         let shipper = shipper_for_cb.clone();
         Box::pin(async move { handle_deploy(&project_id, platform, routing, domains, shipper).await })
     }));
+
+    // Build-pipeline wiring: control owns the `POST /build` funnel + build-job;
+    // this server owns jkbase-orch + the jailer privilege, exposed via
+    // `build_callback` (mirrors `deploy_callback`). The kernel is staged onto the
+    // data-dir filesystem (same-fs hard-link into the jail), and the parent build
+    // cgroup is provisioned best-effort (needs root).
+    let fc_release = args.fc_dir.join("release-v1.15.1-x86_64");
+    let build_kernel = data_dir.join("build-kernel").join("vmlinux.bin");
+    // Non-fatal: a build-provisioning gap disables builds but must not knock over
+    // the (separate) runtime hosting path — the kernel here feeds only builds.
+    if let Err(e) = build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel) {
+        tracing::warn!(error = %e, "build kernel staging failed; builds disabled until provisioned");
+    }
+    // Isolated build network (per-build TAP pool on the build bridge). Build VMs
+    // reach only the egress proxy on the gateway; the firewall from
+    // tools/setup-build-net.sh enforces it. `None` → offline builds.
+    let build_uid = 100_000u32;
+    let build_net = if args.build_net {
+        Some(Arc::new(build_orchestrator::BuildNet::new(
+            args.build_bridge.clone(),
+            args.build_gateway.clone(),
+            args.build_proxy_port,
+            build_uid,
+            64, // concurrent build-network slots
+        )))
+    } else {
+        None
+    };
+    // Fail closed: with --build-net we MUST NOT run attacker-controlled build VMs
+    // unless their isolation firewall is actually provisioned + present.
+    if let Some(net) = &build_net {
+        net.verify_firewall().await?;
+    }
+    let build_deps = Arc::new(build_orchestrator::BuildDeps {
+        jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+        firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+        kernel_path: build_kernel,
+        data_dir: data_dir.clone(),
+        deploy_dir: data_dir.join("hosting"),
+        toolchain_dir: data_dir.join("toolchains"),
+        store: store_for_builds,
+        // Short base: it prefixes the jailer chroot, and the Firecracker API
+        // socket path under it must stay within SUN_LEN (~108 bytes).
+        chroot_base: data_dir.join("bj"),
+        cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+        parent_cgroup: "jkbase-build".to_string(),
+        uid: build_uid,
+        gid: build_uid,
+        timeout: Duration::from_secs(600),
+        vcpu_count: 2,
+        mem_size_mib: 1024,
+        cgroup_pids_max: 512,
+        cgroup_mem_max_bytes: 1536 * 1024 * 1024,
+        cgroup_cpu_max: "200000 100000".to_string(),
+        scratch_size_bytes: 512 * 1024 * 1024,
+        output_size_bytes: 128 * 1024 * 1024,
+        console_log_max_bytes: 1024 * 1024,
+        max_concurrent: 4,
+        net: build_net,
+        fetch_deadline: Duration::from_secs(300),
+    });
+    // The jail chroot base + toolchain dir must exist on the data-dir fs.
+    let _ = std::fs::create_dir_all(&build_deps.chroot_base);
+    let _ = std::fs::create_dir_all(&build_deps.toolchain_dir);
+    build_orchestrator::provision_cgroup(&build_deps.cgroup_mount, &build_deps.parent_cgroup);
+    // Fail builds left mid-flight by a previous crash + reap their orphan dirs.
+    build_orchestrator::reconcile_on_boot(&build_deps.store, &build_deps.data_dir, &build_deps.deploy_dir);
+    state.build_callback = Some(build_orchestrator::build_callback(build_deps));
 
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
@@ -278,6 +372,29 @@ async fn main() -> Result<()> {
         routing_table.clone(),
         log_shipper.clone(),
     ));
+
+    // Spawn the build egress proxy (default-deny forward proxy + SSRF defense).
+    // With --build-net it binds on the build gateway (where the firewall lets the
+    // build VMs reach it); otherwise on an explicit --egress-addr.
+    let egress_addr = if args.build_net {
+        Some(format!("{}:{}", args.build_gateway, args.build_proxy_port))
+    } else {
+        args.egress_addr.clone()
+    };
+    if let Some(egress_addr) = egress_addr {
+        let cfg = Arc::new(egress::EgressConfig::with_default_allowlist());
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&egress_addr).await {
+                Ok(listener) => {
+                    info!(addr = %egress_addr, "egress proxy starting");
+                    egress::serve(listener, cfg).await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, addr = %egress_addr, "failed to bind egress proxy")
+                }
+            }
+        });
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
