@@ -12,6 +12,7 @@ const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_token
 const SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("secrets");
 const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 const DEPLOYMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deployments");
+const BUILDS: TableDefinition<&str, &[u8]> = TableDefinition::new("builds");
 const DOMAINS: TableDefinition<&str, &[u8]> = TableDefinition::new("domains");
 const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
@@ -76,6 +77,75 @@ pub struct DeploymentMeta {
     pub project_id: String,
     pub version: u64,
     pub created_at: u64,
+}
+
+/// Lifecycle phase of a build job, or of one of its per-target sub-builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildPhase {
+    /// Accepted, not yet started.
+    Queued,
+    /// Source unpacked; per-target build VMs running (or assembling).
+    Building,
+    /// All targets built and the artifacts activated via the deploy tail.
+    Succeeded,
+    /// A target failed, timed out, or crashed — the whole build failed (atomic).
+    Failed,
+}
+
+/// Which kind of deploy target a sub-build produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetKind {
+    Function,
+    Server,
+}
+
+/// Per-target status within a build job. One build VM fans out per target
+/// (design §12); this records that VM's progress and outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildTargetStatus {
+    pub name: String,
+    pub kind: TargetKind,
+    pub phase: BuildPhase,
+    /// Human-readable detail: the build VM outcome, exit code, or failure reason.
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+}
+
+/// One server-side build job: the `POST /build` intake fans out per-target build
+/// VMs, collects artifacts, and (on success) hands them to the deploy tail. The
+/// record is persisted independent of `log_shipper` so `GET /builds/{id}` can
+/// surface terminal status, per-target sub-status, the captured log tail, and
+/// per-phase timings. `build_id` is a per-project monotonic sequence; the on-disk
+/// key zero-pads it so builds sort by recency within a project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRecord {
+    pub project_id: String,
+    pub build_id: u64,
+    pub phase: BuildPhase,
+    #[serde(default)]
+    pub targets: Vec<BuildTargetStatus>,
+    /// Captured tail of the combined build log.
+    #[serde(default)]
+    pub log_tail: String,
+    /// Per-phase wall-clock timings (e.g. `fanout`, `activate`) in milliseconds.
+    #[serde(default)]
+    pub phase_timings_ms: std::collections::BTreeMap<String, u64>,
+    /// Set once a successful build activates a deployment.
+    #[serde(default)]
+    pub deployed_version: Option<u64>,
+    /// Set on failure: the terminal error summary.
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// A registered cron schedule for one WASM function. The host scheduler reads
@@ -222,6 +292,7 @@ impl Store {
         let _ = txn.open_table(SECRETS)?;
         let _ = txn.open_table(SNAPSHOTS)?;
         let _ = txn.open_table(DEPLOYMENTS)?;
+        let _ = txn.open_table(BUILDS)?;
         let _ = txn.open_table(DOMAINS)?;
         let _ = txn.open_table(SCHEDULES)?;
         let _ = txn.open_table(USAGE)?;
@@ -409,6 +480,83 @@ impl Store {
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    // -- Builds --
+
+    // Zero-padded so the compound key sorts by build_id within a project.
+    fn build_key(project_id: &str, build_id: u64) -> String {
+        format!("{project_id}:{build_id:020}")
+    }
+
+    /// The next build id for a project: one past the highest existing id. Safe
+    /// because `POST /build` serializes per project via the deploy lock.
+    pub fn next_build_id(&self, project_id: &str) -> Result<u64> {
+        Ok(self
+            .list_builds(project_id)?
+            .first()
+            .map(|b| b.build_id)
+            .unwrap_or(0)
+            + 1)
+    }
+
+    pub fn save_build(&self, rec: &BuildRecord) -> Result<()> {
+        let key = Self::build_key(&rec.project_id, rec.build_id);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(BUILDS)?;
+            let data = serde_json::to_vec(rec)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_build(&self, project_id: &str, build_id: u64) -> Result<Option<BuildRecord>> {
+        let key = Self::build_key(project_id, build_id);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BUILDS)?;
+        match table.get(key.as_str())? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All build jobs for a project, newest build_id first.
+    pub fn list_builds(&self, project_id: &str) -> Result<Vec<BuildRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BUILDS)?;
+        let prefix = format!("{project_id}:");
+        let mut builds = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if key.value().starts_with(&prefix) {
+                builds.push(serde_json::from_slice::<BuildRecord>(value.value())?);
+            }
+        }
+        builds.sort_by_key(|b| std::cmp::Reverse(b.build_id));
+        Ok(builds)
+    }
+
+    pub fn remove_build(&self, project_id: &str, build_id: u64) -> Result<bool> {
+        let key = Self::build_key(project_id, build_id);
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(BUILDS)?;
+            table.remove(key.as_str())?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Keep only the `keep` most recent build records for a project (history
+    /// bound; artifacts already live under the deployment, not the build job).
+    pub fn prune_builds(&self, project_id: &str, keep: usize) -> Result<()> {
+        let builds = self.list_builds(project_id)?;
+        for old in builds.into_iter().skip(keep) {
+            let _ = self.remove_build(project_id, old.build_id);
+        }
+        Ok(())
     }
 
     // -- Schedules --

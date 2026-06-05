@@ -32,8 +32,16 @@ pub struct RouteTarget {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FunctionConfig {
+    /// Source directory (server-side build) or a pre-built `.wasm` path. Builds
+    /// run on the platform from this subdir of the uploaded source tree.
     pub source: String,
+    /// Declared toolchain runtime: `wasi-http` (default) or `wasip1` (legacy
+    /// Rust build path). Drives toolchain selection in the build pipeline.
     pub runtime: Option<String>,
+    /// Source language hint (`rust`|`javascript`|`python`|`tinygo`|`cpp`); the
+    /// build pipeline auto-detects when omitted.
+    #[serde(default)]
+    pub language: Option<String>,
     /// 5-field UNIX cron, e.g. "*/5 * * * *". When set, the host invokes this
     /// function on the schedule (waking the project if hibernated).
     #[serde(default)]
@@ -42,11 +50,40 @@ pub struct FunctionConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
-    pub dockerfile: String,
+    /// Source directory the platform builds (zero-config buildpacks). The
+    /// default path; preferred over `dockerfile`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Build strategy: `auto` (buildpack detect, default) or `dockerfile` (the
+    /// gated escape hatch). Auto-detected when omitted.
+    #[serde(default)]
+    pub builder: Option<String>,
+    /// Source language hint for buildpack selection; auto-detected when omitted.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional Dockerfile path (the BYO escape hatch). No longer required now
+    /// that buildpacks are the default; kept for the `builder = "dockerfile"`
+    /// path and for backward-compatible parsing of older manifests.
+    #[serde(default)]
+    pub dockerfile: Option<String>,
     pub port: u16,
     pub health_check: Option<HealthCheckConfig>,
     #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
+}
+
+impl ServerConfig {
+    /// The build source subdir: explicit `source`, else the Dockerfile's parent
+    /// directory (legacy manifests), else the project root (`.`).
+    pub fn source_dir(&self) -> &str {
+        if let Some(s) = self.source.as_deref() {
+            return s;
+        }
+        if let Some(df) = self.dockerfile.as_deref() {
+            return Path::new(df).parent().and_then(|p| p.to_str()).unwrap_or(".");
+        }
+        "."
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +175,106 @@ impl ProjectConfig {
         sites.sort_by_key(|s| std::cmp::Reverse(s.prefix.len()));
         sites
     }
+
+    /// True when the deploy serves more than one named site (so each site's
+    /// content is packaged under its own `_site_<name>/` prefix rather than at
+    /// the artifact root). The single synthesized `default` site is not "multi".
+    pub fn is_multi_site(&self) -> bool {
+        let sites = self.resolved_sites();
+        sites.len() > 1 || sites.first().is_some_and(|s| s.name != "default")
+    }
+
+    /// `_routes.json` sidecar (explicit host route table), or `None`.
+    pub fn routes_json(&self) -> Option<String> {
+        if self.routes.is_empty() {
+            return None;
+        }
+        serde_json::to_string_pretty(&self.routes).ok()
+    }
+
+    /// `_sites.json` sidecar (multi-site routing). Emitted only when the manifest
+    /// declares explicit `[sites.*]` — the synthesized default site is implicit.
+    pub fn sites_json(&self) -> Option<String> {
+        if self.sites.is_empty() {
+            return None;
+        }
+        serde_json::to_string_pretty(&self.resolved_sites()).ok()
+    }
+
+    /// `_domains.json` sidecar (legacy domain aliases), or `None`.
+    pub fn domains_json(&self) -> Option<String> {
+        if self.domains.is_empty() {
+            return None;
+        }
+        serde_json::to_string_pretty(&self.domains).ok()
+    }
+
+    /// `_schedules.json` sidecar: the inline `schedule = "<cron>"` from each
+    /// `[functions.<name>]`, as `[{function, cron}]`. `None` when none declared.
+    pub fn schedules_json(&self) -> Option<String> {
+        let mut scheds: Vec<_> = self
+            .functions
+            .iter()
+            .filter_map(|(name, f)| {
+                f.schedule
+                    .as_ref()
+                    .map(|c| (name.clone(), c.clone()))
+            })
+            .collect();
+        if scheds.is_empty() {
+            return None;
+        }
+        // Stable output regardless of HashMap iteration order.
+        scheds.sort();
+        let json: Vec<_> = scheds
+            .into_iter()
+            .map(|(function, cron)| serde_json::json!({ "function": function, "cron": cron }))
+            .collect();
+        serde_json::to_string_pretty(&json).ok()
+    }
+}
+
+impl ServerConfig {
+    /// Assemble the on-disk `ServerManifest` JSON for this server: build-derived
+    /// `cmd`/`env`/`working_dir` overlaid with the manifest-authoritative
+    /// `port`/`health_check`/`volumes` from jkbase.toml. This is the §5a
+    /// OCI-config → ServerManifest translate, performed host-side after the build.
+    pub fn manifest_value(
+        &self,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        working_dir: &str,
+    ) -> serde_json::Value {
+        let volumes: Vec<serde_json::Value> = self
+            .volumes
+            .iter()
+            .map(|v| serde_json::json!({ "name": v.name, "mount": v.mount }))
+            .collect();
+        serde_json::json!({
+            "port": self.port,
+            "cmd": if cmd.is_empty() { vec!["/bin/sh".to_string()] } else { cmd },
+            "env": env,
+            "working_dir": working_dir,
+            "health_check": self.health_check.as_ref().map(|h| serde_json::json!({
+                "path": h.path.as_deref().unwrap_or("/"),
+                "interval_secs": parse_duration_secs(h.interval.as_deref().unwrap_or("10s")),
+                "timeout_secs": parse_duration_secs(h.timeout.as_deref().unwrap_or("5s")),
+            })),
+            "volumes": volumes,
+        })
+    }
+}
+
+/// Parse a short duration like `10s`, `2m`, or a bare number of seconds.
+pub fn parse_duration_secs(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix('s') {
+        num.parse().unwrap_or(10)
+    } else if let Some(num) = s.strip_suffix('m') {
+        num.parse::<u64>().unwrap_or(1) * 60
+    } else {
+        s.parse().unwrap_or(10)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,5 +317,90 @@ mod tests {
         let back: Vec<ResolvedSite> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 2);
         assert!(back.iter().any(|s| s.domain.as_deref() == Some("docs")));
+    }
+
+    #[test]
+    fn sidecars_emit_only_when_declared() {
+        // Bare project: no routes/sites/domains/schedules → no sidecars.
+        let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        assert!(bare.routes_json().is_none());
+        assert!(bare.sites_json().is_none());
+        assert!(bare.domains_json().is_none());
+        assert!(bare.schedules_json().is_none());
+        assert!(!bare.is_multi_site());
+
+        let cfg: ProjectConfig = toml::from_str(
+            r#"
+            domains = ["alias.example.com"]
+            [project]
+            name = "demo"
+            [routes."api.example.com"]
+            service = "function"
+            name = "api"
+            [functions.api]
+            source = "./functions/api"
+            schedule = "*/5 * * * *"
+            [functions.beat]
+            source = "./functions/beat"
+            schedule = "0 * * * *"
+            [sites.docs]
+            public = "./docs"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.is_multi_site());
+        assert!(cfg.routes_json().unwrap().contains("api.example.com"));
+        assert!(cfg.sites_json().unwrap().contains("docs"));
+        assert!(cfg.domains_json().unwrap().contains("alias.example.com"));
+
+        // Schedules are sorted by function name regardless of HashMap order.
+        let sched = cfg.schedules_json().unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&sched).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["function"], "api");
+        assert_eq!(parsed[1]["function"], "beat");
+    }
+
+    #[test]
+    fn server_manifest_translate_overlays_toml() {
+        let cfg: ProjectConfig = toml::from_str(
+            r#"
+            [project]
+            name = "demo"
+            [servers.web]
+            source = "./server"
+            port = 8000
+            [servers.web.health_check]
+            path = "/healthz"
+            interval = "2m"
+            timeout = "5s"
+            [[servers.web.volumes]]
+            name = "data"
+            mount = "/data"
+            "#,
+        )
+        .unwrap();
+        let web = &cfg.servers["web"];
+        assert_eq!(web.source_dir(), "./server");
+
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let m = web.manifest_value(vec!["./app".to_string()], env, "/srv");
+        assert_eq!(m["port"], 8000); // jkbase.toml authoritative
+        assert_eq!(m["cmd"][0], "./app"); // build-derived
+        assert_eq!(m["working_dir"], "/srv");
+        assert_eq!(m["env"]["FOO"], "bar");
+        assert_eq!(m["health_check"]["path"], "/healthz");
+        assert_eq!(m["health_check"]["interval_secs"], 120); // 2m
+        assert_eq!(m["health_check"]["timeout_secs"], 5);
+        assert_eq!(m["volumes"][0]["mount"], "/data");
+
+        // Legacy dockerfile manifests still parse and resolve a source dir.
+        let legacy: ProjectConfig = toml::from_str(
+            "[servers.api]\ndockerfile = \"./api/Dockerfile\"\nport = 3000\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.servers["api"].source_dir(), "./api");
     }
 }
