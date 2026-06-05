@@ -557,11 +557,15 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     let data_dir = plat.data_dir.clone();
     drop(plat);
 
+    // Collect each directory's entries up front: removing files while iterating a
+    // live read_dir handle skips entries (the kernel readdir cursor shifts under
+    // the deletions), so a single pass would reap only a subset of the orphans.
     for sub in ["content-images", "data-disks"] {
         let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let entries: Vec<_> = entries.flatten().collect();
+        for entry in entries {
             let name = entry.file_name().to_string_lossy().to_string();
             let Some(id) = name.strip_suffix(".ext4") else {
                 continue;
@@ -576,7 +580,8 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
         let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let entries: Vec<_> = entries.flatten().collect();
+        for entry in entries {
             if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
