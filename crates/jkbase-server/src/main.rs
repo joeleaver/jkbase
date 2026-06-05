@@ -1,4 +1,5 @@
 mod build_orchestrator;
+mod egress;
 mod log_shipper;
 mod metering;
 
@@ -68,6 +69,13 @@ struct Args {
     /// Use the Let's Encrypt staging environment (untrusted certs; avoids prod rate limits)
     #[arg(long)]
     acme_staging: bool,
+
+    /// Bind address for the build egress proxy (host-side default-deny forward
+    /// proxy with allowlist + public-IP pinning). Disabled when unset. Build VMs
+    /// route their dependency fetches through this; bind it where only the build
+    /// network can reach it (e.g. the build gateway IP).
+    #[arg(long)]
+    egress_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +330,23 @@ async fn main() -> Result<()> {
         routing_table.clone(),
         log_shipper.clone(),
     ));
+
+    // Spawn the build egress proxy (default-deny forward proxy + SSRF defense)
+    // when an address is configured. Build VMs reach the network only through it.
+    if let Some(egress_addr) = args.egress_addr.clone() {
+        let cfg = Arc::new(egress::EgressConfig::with_default_allowlist());
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&egress_addr).await {
+                Ok(listener) => {
+                    info!(addr = %egress_addr, "egress proxy starting");
+                    egress::serve(listener, cfg).await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, addr = %egress_addr, "failed to bind egress proxy")
+                }
+            }
+        });
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
