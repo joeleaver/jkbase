@@ -1605,6 +1605,7 @@ dependencies = [
  "chrono",
  "clap",
  "cron",
+ "flate2",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1615,7 +1616,9 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tar",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

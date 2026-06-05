@@ -1,3 +1,4 @@
+mod build_orchestrator;
 mod log_shipper;
 mod metering;
 
@@ -176,6 +177,7 @@ async fn main() -> Result<()> {
         None
     };
 
+    let store_for_builds = store.clone();
     let mut state = AppState::new(store, log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
     state.domain_map = Some(domain_map.clone());
@@ -201,6 +203,48 @@ async fn main() -> Result<()> {
         let shipper = shipper_for_cb.clone();
         Box::pin(async move { handle_deploy(&project_id, platform, routing, domains, shipper).await })
     }));
+
+    // Build-pipeline wiring: control owns the `POST /build` funnel + build-job;
+    // this server owns jkbase-orch + the jailer privilege, exposed via
+    // `build_callback` (mirrors `deploy_callback`). The kernel is staged onto the
+    // data-dir filesystem (same-fs hard-link into the jail), and the parent build
+    // cgroup is provisioned best-effort (needs root).
+    let fc_release = args.fc_dir.join("release-v1.15.1-x86_64");
+    let build_kernel = data_dir.join("build-kernel").join("vmlinux.bin");
+    build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel)?;
+    let build_deps = Arc::new(build_orchestrator::BuildDeps {
+        jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+        firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+        kernel_path: build_kernel,
+        data_dir: data_dir.clone(),
+        deploy_dir: data_dir.join("hosting"),
+        toolchain_dir: data_dir.join("toolchains"),
+        store: store_for_builds,
+        // Short base: it prefixes the jailer chroot, and the Firecracker API
+        // socket path under it must stay within SUN_LEN (~108 bytes).
+        chroot_base: data_dir.join("bj"),
+        cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+        parent_cgroup: "jkbase-build".to_string(),
+        uid: 100_000,
+        gid: 100_000,
+        timeout: Duration::from_secs(600),
+        vcpu_count: 2,
+        mem_size_mib: 1024,
+        cgroup_pids_max: 512,
+        cgroup_mem_max_bytes: 1536 * 1024 * 1024,
+        cgroup_cpu_max: "200000 100000".to_string(),
+        scratch_size_bytes: 512 * 1024 * 1024,
+        output_size_bytes: 128 * 1024 * 1024,
+        console_log_max_bytes: 1024 * 1024,
+        max_concurrent: 4,
+    });
+    // The jail chroot base + toolchain dir must exist on the data-dir fs.
+    let _ = std::fs::create_dir_all(&build_deps.chroot_base);
+    let _ = std::fs::create_dir_all(&build_deps.toolchain_dir);
+    build_orchestrator::provision_cgroup(&build_deps.cgroup_mount, &build_deps.parent_cgroup);
+    // Fail builds left mid-flight by a previous crash + reap their orphan dirs.
+    build_orchestrator::reconcile_on_boot(&build_deps.store, &build_deps.data_dir, &build_deps.deploy_dir);
+    state.build_callback = Some(build_orchestrator::build_callback(build_deps));
 
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
