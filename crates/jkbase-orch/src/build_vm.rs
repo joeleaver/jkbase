@@ -145,12 +145,11 @@ impl BuildVm {
         jailer::assert_same_fs(&config.chroot_base, &config.source_drive)?;
         jailer::assert_same_fs(&config.chroot_base, &config.kernel_path)?;
 
-        // VERIFY(build/jailer): jailer CREATES the chroot root/ itself. This
-        // code pre-stages drives into root/drives/ *before* spawning jailer,
-        // which jailer may clobber or reject. The known-good pattern
-        // (firecracker-go-sdk) stages drives *after* the API socket appears.
-        // The on-box boot test must settle whether pre-staging survives; if not,
-        // move staging into configure_and_wait() before set_drive().
+        // CONFIRMED (2026-06-05, jailer docs + on-box): pre-staging drive files
+        // into the chroot BEFORE launching jailer is the correct pattern. Jailer
+        // "does nothing if the path exists" and never clobbers staged files;
+        // firecracker-go-sdk likewise hard-links resources in pre-launch. We
+        // reference them by chroot-relative path once the socket appears.
         //
         // Stale-state hygiene: a prior crashed/killed build may have skipped
         // teardown. Clear the socket and the whole per-id tree before staging.

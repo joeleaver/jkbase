@@ -70,8 +70,15 @@ impl JailerConfig {
             a.push("--resource-limit".into());
             a.push(format!("{k}={v}").into());
         }
-        // Fresh PID namespace: a guest fork-bomb is reaped when the tree dies.
-        a.push("--new-pid-ns".into());
+        // NOTE: --new-pid-ns is intentionally omitted. CONFIRMED on box
+        // (2026-06-05): it makes jailer FORK firecracker into the new namespace
+        // and the jailer parent exits 0 immediately, detaching firecracker —
+        // which breaks foreground wait()/kill on the Child handle. The host-pid
+        // benefit is marginal for a single-process VMM (a guest fork-bomb
+        // consumes GUEST pids, not host pids; host pids are already capped by the
+        // pids.max cgroup), and teardown's cgroup.kill guarantees reaping.
+        // Re-adding it would require managing firecracker via <root>/<exec>.pid
+        // instead of the Child handle.
         if let Some(ns) = &self.netns {
             a.push("--netns".into());
             a.push(ns.clone().into_os_string());
@@ -284,7 +291,6 @@ mod tests {
             "memory.swap.max=0",
             "--cgroup",
             "cpu.max=400000 100000",
-            "--new-pid-ns",
             "--",
             "--api-sock",
             "run/firecracker.socket",
