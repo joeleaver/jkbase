@@ -209,8 +209,8 @@ async fn proxy_request(
     let subdomain = extract_subdomain(hostname, &shared.domain);
 
     // Route api.{domain} to the control plane (infra, never a tenant project).
-    if subdomain.as_deref() == Some("api") {
-        if let Some(ref addr) = *shared.api_addr {
+    if subdomain.as_deref() == Some("api")
+        && let Some(ref addr) = *shared.api_addr {
             return match forward_to_api(addr, req).await {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
@@ -219,7 +219,6 @@ async fn proxy_request(
                 }
             };
         }
-    }
 
     // Host-key: bare apex/www both resolve to the "www" landing project.
     let host_key = match subdomain.as_deref() {

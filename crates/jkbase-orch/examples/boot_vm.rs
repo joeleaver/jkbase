@@ -17,6 +17,7 @@ async fn main() -> anyhow::Result<()> {
         kernel_path: base.join("vmlinux.bin"),
         rootfs_path: base.join("jkbase-rootfs.ext4"),
         content_image_path: None,
+        data_disk_path: None,
         vcpu_count: 1,
         mem_size_mib: 128,
         tap_device: Some("tap0".to_string()),

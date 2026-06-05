@@ -12,7 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -252,7 +252,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn load_sites_config(serve_dir: &PathBuf) -> Vec<SiteEntry> {
+fn load_sites_config(serve_dir: &Path) -> Vec<SiteEntry> {
     let sites_path = serve_dir.join("_sites.json");
     if !sites_path.exists() {
         return Vec::new();
@@ -284,7 +284,7 @@ fn load_sites_config(serve_dir: &PathBuf) -> Vec<SiteEntry> {
         .collect()
 }
 
-fn load_route_config(serve_dir: &PathBuf) -> Vec<RouteEntry> {
+fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
     let routes_path = serve_dir.join("_routes.json");
     if !routes_path.exists() {
         return Vec::new();
@@ -336,20 +336,18 @@ async fn handle_request(
     // Check route config for server routing
     for route in &state.route_config {
         let prefix = route.prefix.trim_end_matches('*');
-        if path.starts_with(prefix) {
-            if let Some(port) = state.containers.get_server_for_route(&route.server_name).await {
+        if path.starts_with(prefix)
+            && let Some(port) = state.containers.get_server_for_route(&route.server_name).await {
                 return Ok(proxy_to_server(port, req).await);
             }
-        }
     }
 
     // Check if this is a function call
-    if let Some(func_name) = extract_function_name(&path) {
-        if state.functions.has_function(&func_name) {
+    if let Some(func_name) = extract_function_name(&path)
+        && state.functions.has_function(&func_name) {
             info!(function = %func_name, path = %path, "routing to function");
             return Ok(invoke_function(state, &func_name, req).await);
         }
-    }
 
     // Host-bound site: the proxy sets X-Jkbase-Site (stripped from inbound, so
     // trusted) when the request's hostname maps to a specific site. Serve that
@@ -358,11 +356,9 @@ async fn handle_request(
         .headers()
         .get("x-jkbase-site")
         .and_then(|v| v.to_str().ok())
-    {
-        if let Some(site) = state.sites.iter().find(|s| s.name == site_name) {
+        && let Some(site) = state.sites.iter().find(|s| s.name == site_name) {
             return static_server::handle_static_with_path(&site.root, &path, site.spa).await;
         }
-    }
 
     // Multi-site routing: find the best matching site by prefix
     if !state.sites.is_empty() {

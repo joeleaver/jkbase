@@ -90,7 +90,7 @@ impl PlatformState {
         let existing = self.store.list_vm_allocations()?;
         let used_octets: HashSet<u8> = existing
             .iter()
-            .filter_map(|a| a.ip.split('.').last()?.parse::<u8>().ok())
+            .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
             .collect();
 
         for octet in 2..=254u8 {
@@ -1005,13 +1005,11 @@ fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
     for entry in std::fs::read_dir(&servers_dir).into_iter().flatten() {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if content.contains("\"volumes\"") && content.contains("\"mount\"") {
+        if path.extension().is_some_and(|e| e == "json")
+            && let Ok(content) = std::fs::read_to_string(&path)
+                && content.contains("\"volumes\"") && content.contains("\"mount\"") {
                     return true;
                 }
-            }
-        }
     }
     false
 }

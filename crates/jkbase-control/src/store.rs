@@ -626,12 +626,11 @@ impl Store {
         for entry in tokens_table.iter()? {
             let (_key, value) = entry?;
             let api_token: ApiToken = serde_json::from_slice(value.value())?;
-            if auth::verify_token(raw_token, &api_token.token_hash) {
-                if let Some(tenant_data) = tenants_table.get(api_token.tenant_id.as_str())? {
+            if auth::verify_token(raw_token, &api_token.token_hash)
+                && let Some(tenant_data) = tenants_table.get(api_token.tenant_id.as_str())? {
                     let tenant: Tenant = serde_json::from_slice(tenant_data.value())?;
                     return Ok(Some(tenant));
                 }
-            }
         }
 
         Ok(None)

@@ -72,7 +72,7 @@ pub async fn run(args: DeployArgs) -> Result<()> {
     };
 
     // Serialize sites config for multi-site routing
-    let sites_json = if config.sites.len() > 0 {
+    let sites_json = if !config.sites.is_empty() {
         Some(serde_json::to_string_pretty(&resolved_sites)?)
     } else {
         None

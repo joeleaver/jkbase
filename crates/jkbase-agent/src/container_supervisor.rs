@@ -304,17 +304,6 @@ impl ContainerSupervisor {
         let buf = self.logs.buffer.lock().await;
         buf.iter().filter(|l| l.seq > since).cloned().collect()
     }
-
-    pub async fn stop_all(&self) {
-        let mut servers = self.servers.write().await;
-        for server in servers.iter_mut() {
-            if let Some(ref mut process) = server.process {
-                info!(server = %server.name, "stopping server");
-                let _ = process.kill().await;
-            }
-        }
-        servers.clear();
-    }
 }
 
 fn remount_rw(target: &str) {

@@ -43,11 +43,10 @@ impl VmInstance {
         if socket_path.exists() {
             tokio::fs::remove_file(&socket_path).await?;
         }
-        if let Some(ref vp) = vsock_path {
-            if vp.exists() {
+        if let Some(ref vp) = vsock_path
+            && vp.exists() {
                 tokio::fs::remove_file(vp).await?;
             }
-        }
 
         let log_path = vm_dir.join("console.log");
         let log_file = std::fs::File::create(&log_path)
@@ -186,11 +185,10 @@ impl VmInstance {
         if self.socket_path.exists() {
             let _ = tokio::fs::remove_file(&self.socket_path).await;
         }
-        if let Some(ref vp) = self.vsock_path {
-            if vp.exists() {
+        if let Some(ref vp) = self.vsock_path
+            && vp.exists() {
                 let _ = tokio::fs::remove_file(vp).await;
             }
-        }
 
         info!(self.id, "VM stopped");
         Ok(())
