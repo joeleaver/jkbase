@@ -131,7 +131,7 @@ impl ProjectConfig {
         }
 
         // Sort by prefix length descending (longest match first)
-        sites.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        sites.sort_by_key(|s| std::cmp::Reverse(s.prefix.len()));
         sites
     }
 }
