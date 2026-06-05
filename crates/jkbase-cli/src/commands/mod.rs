@@ -35,6 +35,31 @@ pub enum Command {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
+    /// Show month-to-date metered usage (CPU, bandwidth, storage)
+    Usage {
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Show or set per-project resource quotas. Set values can only restrict
+    /// (never raise above platform defaults).
+    Quota {
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Set the storage cap, in GiB (clamped to the platform default)
+        #[arg(long)]
+        set_storage_gib: Option<f64>,
+        /// Set the monthly bandwidth cap, in GiB (clamped to the platform default)
+        #[arg(long)]
+        set_bandwidth_gib: Option<f64>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
     /// Initialize the platform and create the first admin account
     Init {
         /// Your email address
@@ -185,6 +210,13 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             api,
         } => run_rollback(version, force, project, api).await,
         Command::Deployments { project, api } => run_deployments(project, api).await,
+        Command::Usage { project, api } => run_usage(project, api).await,
+        Command::Quota {
+            project,
+            set_storage_gib,
+            set_bandwidth_gib,
+            api,
+        } => run_quota(project, set_storage_gib, set_bandwidth_gib, api).await,
         Command::Init { email, api } => {
             let client = reqwest::Client::new();
             let resp = client
@@ -370,6 +402,116 @@ async fn run_deployments(project: Option<String>, api: String) -> anyhow::Result
             human_age(d.created_at),
             if d.active { "(active)" } else { "" }
         );
+    }
+    Ok(())
+}
+
+fn fmt_bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.2} {}", U[i])
+    }
+}
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+
+    let resp = client
+        .get(format!("{api}/projects/{project_id}/usage"))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("failed to fetch usage ({})", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
+    let cpu = v["cpu_seconds"].as_f64().unwrap_or(0.0);
+    let rx = v["rx_bytes"].as_u64().unwrap_or(0);
+    let tx = v["tx_bytes"].as_u64().unwrap_or(0);
+    let storage = v["storage_bytes"].as_u64().unwrap_or(0);
+
+    println!("Usage for '{project_id}' (month-to-date):");
+    println!("  CPU:       {cpu:.1} cpu-seconds");
+    println!(
+        "  Bandwidth: {} (rx {} + tx {})",
+        fmt_bytes(rx + tx),
+        fmt_bytes(rx),
+        fmt_bytes(tx)
+    );
+    println!("  Storage:   {}", fmt_bytes(storage));
+    Ok(())
+}
+
+async fn run_quota(
+    project: Option<String>,
+    set_storage_gib: Option<f64>,
+    set_bandwidth_gib: Option<f64>,
+    api: String,
+) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let token = crate::credentials::load_token()?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+    let url = format!("{api}/projects/{project_id}/quota");
+
+    if set_storage_gib.is_some() || set_bandwidth_gib.is_some() {
+        // Fill any unset field from the current values so a partial set is fine.
+        let cur: serde_json::Value = client.get(&url).send().await?.json().await?;
+        let storage = match set_storage_gib {
+            Some(g) => (g * GIB) as u64,
+            None => cur["storage_bytes_max"].as_u64().unwrap_or(0),
+        };
+        let bw = match set_bandwidth_gib {
+            Some(g) => (g * GIB) as u64,
+            None => cur["bandwidth_bytes_per_month"].as_u64().unwrap_or(0),
+        };
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "storage_bytes_max": storage,
+                "bandwidth_bytes_per_month": bw,
+            }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("failed to set quota ({})", resp.status());
+        }
+        println!("Quota updated (values are clamped to platform defaults).");
+    }
+
+    let v: serde_json::Value = client.get(&url).send().await?.json().await?;
+    println!("Quota for '{project_id}':");
+    println!(
+        "  Storage cap:   {}",
+        fmt_bytes(v["storage_bytes_max"].as_u64().unwrap_or(0))
+    );
+    println!(
+        "  Bandwidth cap: {} / month",
+        fmt_bytes(v["bandwidth_bytes_per_month"].as_u64().unwrap_or(0))
+    );
+    println!(
+        "  Source:        {}",
+        if v["overridden"].as_bool().unwrap_or(false) {
+            "per-project override"
+        } else {
+            "platform default"
+        }
+    );
+    if v["bandwidth_blocked"].as_bool().unwrap_or(false) {
+        let reason = v["blocked_reason"].as_str().unwrap_or("over quota");
+        println!("  STATUS:        BLOCKED — {reason}");
     }
     Ok(())
 }

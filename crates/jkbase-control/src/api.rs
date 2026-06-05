@@ -75,6 +75,20 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Typed deploy error carried inside `anyhow::Error` so `do_deploy` keeps its
+/// `anyhow::Result` (and all its `?`), while the handler can downcast this case
+/// to HTTP 402. Everything else stays 500.
+#[derive(Debug)]
+struct QuotaExceeded(String);
+
+impl std::fmt::Display for QuotaExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for QuotaExceeded {}
+
 impl AppState {
     pub fn new(store: Store, log_store: LogStore, deploy_dir: PathBuf) -> Self {
         Self {
@@ -135,6 +149,11 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/deployments", get(list_deployments))
         .route("/projects/{id}/rollback", post(rollback))
         .route("/projects/{id}/status", get(get_project_status))
+        .route("/projects/{id}/usage", get(get_project_usage))
+        .route(
+            "/projects/{id}/quota",
+            get(get_project_quota).post(set_project_quota),
+        )
         .route("/projects/{id}/domains", get(list_domains).post(add_domain))
         .route("/projects/{id}/domains/{domain}/verify", post(verify_domain))
         .route("/projects/{id}/domains/{domain}", axum::routing::delete(remove_domain))
@@ -628,6 +647,10 @@ async fn delete_project(
                             let _ = state.store.remove_schedule(&id, &s.function);
                         }
                     }
+                    // Drop metering buckets + quota override + enforcement state.
+                    let _ = state.store.purge_usage(&id);
+                    let _ = state.store.remove_quota(&id);
+                    let _ = state.store.remove_quota_status(&id);
                     // Release all claimed hostnames so they can't be taken over
                     // or left dangling in the routing maps.
                     if let Ok(domains) = state.store.list_domains_for_project(&id) {
@@ -724,13 +747,13 @@ async fn deploy(
             }),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            let (status, msg) = match e.downcast_ref::<QuotaExceeded>() {
+                Some(q) => (StatusCode::PAYMENT_REQUIRED, q.to_string()),
+                None => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            (status, Json(ErrorResponse { error: msg })).into_response()
+        }
     }
 }
 
@@ -775,6 +798,21 @@ async fn do_deploy(
                 std::fs::remove_file(&path)?;
             }
         }
+    }
+
+    // Storage hard cap: the new deployment artifacts are now on disk, so the
+    // project's billed footprint (content image + data disk + all deployments)
+    // is measurable. Reject before activating if it exceeds the cap, and remove
+    // the just-unpacked artifacts so a rejected deploy leaves no orphan bytes.
+    let cap = state.store.get_quota(&project.id)?.storage_bytes_max;
+    let data_dir = state.deploy_dir.parent().unwrap_or(&state.deploy_dir);
+    let footprint = jkbase_common::storage::project_storage_bytes(data_dir, &project.id);
+    if footprint > cap {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(QuotaExceeded(format!(
+            "storage quota exceeded: deploy would use {footprint} bytes, cap is {cap}"
+        ))
+        .into());
     }
 
     let live_link = state.deploy_dir.join(&project.id).join("live");
@@ -892,6 +930,149 @@ async fn list_deployments(
                 .collect();
             Json(resp).into_response()
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct UsageResponse {
+    /// Month-to-date CPU seconds (cpu_jiffies / USER_HZ).
+    pub cpu_seconds: f64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub storage_bytes: u64,
+    pub month_start: u64,
+}
+
+#[derive(Serialize)]
+pub struct QuotaResponse {
+    pub storage_bytes_max: u64,
+    pub bandwidth_bytes_per_month: u64,
+    /// True if this project has a per-project override (vs platform defaults).
+    pub overridden: bool,
+    pub bandwidth_blocked: bool,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SetQuotaRequest {
+    pub storage_bytes_max: u64,
+    pub bandwidth_bytes_per_month: u64,
+}
+
+/// Month-to-date metered usage for a project. Works while hibernated (store-only).
+async fn get_project_usage(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+    let month_start = crate::store::month_start_epoch(auth::timestamp());
+    match state.store.sum_month_to_date(&id, month_start) {
+        Ok(mtd) => Json(UsageResponse {
+            cpu_seconds: mtd.cpu_jiffies as f64 / 100.0,
+            rx_bytes: mtd.rx_bytes,
+            tx_bytes: mtd.tx_bytes,
+            storage_bytes: mtd.storage_bytes,
+            month_start,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_project_quota(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+    let limits = state.store.get_quota(&id).unwrap_or(crate::store::DEFAULT_QUOTA);
+    let overridden = state.store.get_quota_override(&id).ok().flatten().is_some();
+    let status = state.store.get_quota_status(&id).ok().flatten();
+    Json(QuotaResponse {
+        storage_bytes_max: limits.storage_bytes_max,
+        bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+        overridden,
+        bandwidth_blocked: status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false),
+        blocked_reason: status.and_then(|s| s.blocked_reason),
+    })
+    .into_response()
+}
+
+/// Set a per-project quota override. Owner-scoped, and CLAMPED to the platform
+/// defaults: a tenant can only *restrict* their own limits, never raise them
+/// above [`DEFAULT_QUOTA`]. Granting a specific tenant a higher limit needs an
+/// operator/admin path (no admin-role concept exists yet — tracked separately).
+async fn set_project_quota(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<SetQuotaRequest>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+    let limits = crate::store::QuotaLimits {
+        storage_bytes_max: req
+            .storage_bytes_max
+            .min(crate::store::DEFAULT_QUOTA.storage_bytes_max),
+        bandwidth_bytes_per_month: req
+            .bandwidth_bytes_per_month
+            .min(crate::store::DEFAULT_QUOTA.bandwidth_bytes_per_month),
+    };
+    match state.store.set_quota(&id, &limits) {
+        Ok(()) => Json(QuotaResponse {
+            storage_bytes_max: limits.storage_bytes_max,
+            bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
+            overridden: true,
+            bandwidth_blocked: false,
+            blocked_reason: None,
+        })
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

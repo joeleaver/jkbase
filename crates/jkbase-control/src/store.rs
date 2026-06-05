@@ -14,6 +14,9 @@ const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots"
 const DEPLOYMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("deployments");
 const DOMAINS: TableDefinition<&str, &[u8]> = TableDefinition::new("domains");
 const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
+const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
+const QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("quotas");
+const QUOTA_STATUS: TableDefinition<&str, &[u8]> = TableDefinition::new("quota_status");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
@@ -88,6 +91,61 @@ pub struct ScheduleRecord {
     pub last_run: Option<u64>,
 }
 
+/// One hour's metered usage for a project. Counters accumulate across samples
+/// within the hour; storage is a gauge so we keep both its time-integral
+/// (`storage_byte_seconds`, for GB-hour billing) and the latest reading.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageBucket {
+    pub project_id: String,
+    /// Epoch seconds floored to the hour: `(now / 3600) * 3600`.
+    pub hour_epoch: u64,
+    /// CPU jiffies (USER_HZ=100); convert to seconds (/100.0) only at display.
+    pub cpu_jiffies: u64,
+    /// TAP rx bytes = guest egress.
+    pub rx_bytes: u64,
+    /// TAP tx bytes = guest ingress.
+    pub tx_bytes: u64,
+    /// Time-integral of the storage gauge (bytes * seconds) for the hour.
+    pub storage_byte_seconds: u64,
+    /// Latest sampled storage gauge (bytes).
+    pub storage_bytes_last: u64,
+    pub sample_count: u32,
+}
+
+/// Per-project resource limits. Absent override -> [`DEFAULT_QUOTA`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct QuotaLimits {
+    pub storage_bytes_max: u64,
+    pub bandwidth_bytes_per_month: u64,
+}
+
+pub const DEFAULT_QUOTA: QuotaLimits = QuotaLimits {
+    storage_bytes_max: 5 * 1024 * 1024 * 1024,         // 5 GiB
+    bandwidth_bytes_per_month: 100 * 1024 * 1024 * 1024, // 100 GiB/month
+};
+
+/// Enforcement state for a project. Source of truth for the wake gate, so a
+/// racing wake is refused even mid-hibernate. Written before hibernation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuotaStatus {
+    pub project_id: String,
+    pub bandwidth_blocked: bool,
+    pub blocked_reason: Option<String>,
+    /// Epoch secs the block was set.
+    pub blocked_at: u64,
+    /// `month_start_epoch` that triggered the block; used to clear on rollover.
+    pub blocked_month: u64,
+}
+
+/// Summed month-to-date usage. Storage is the latest gauge, not summed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct MonthToDate {
+    pub cpu_jiffies: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub storage_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DomainKind {
@@ -132,6 +190,21 @@ fn default_state() -> ProjectState {
     ProjectState::Stopped
 }
 
+/// Epoch seconds of the start (00:00:00) of the UTC calendar month containing
+/// `now`. The single month-boundary convention used by metering, enforcement,
+/// and the usage API — all UTC, so rollover is deterministic and host-TZ-free.
+pub fn month_start_epoch(now: u64) -> u64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    let dt = match Utc.timestamp_opt(now as i64, 0).single() {
+        Some(dt) => dt,
+        None => return 0,
+    };
+    Utc.with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: Arc<Database>,
@@ -151,6 +224,9 @@ impl Store {
         let _ = txn.open_table(DEPLOYMENTS)?;
         let _ = txn.open_table(DOMAINS)?;
         let _ = txn.open_table(SCHEDULES)?;
+        let _ = txn.open_table(USAGE)?;
+        let _ = txn.open_table(QUOTAS)?;
+        let _ = txn.open_table(QUOTA_STATUS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -414,6 +490,229 @@ impl Store {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    // -- Usage (metering rollups) --
+
+    fn usage_key(project_id: &str, hour_epoch: u64) -> String {
+        format!("{project_id}:{hour_epoch:020}")
+    }
+
+    /// Accumulate one sample's deltas into the project's current hour bucket.
+    #[allow(clippy::too_many_arguments)] // one flat sample row; a struct adds no clarity here
+    pub fn add_usage(
+        &self,
+        project_id: &str,
+        hour_epoch: u64,
+        cpu_jiffies: u64,
+        rx_bytes: u64,
+        tx_bytes: u64,
+        storage_bytes_sample: u64,
+        elapsed_secs: u64,
+    ) -> Result<()> {
+        let key = Self::usage_key(project_id, hour_epoch);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(USAGE)?;
+            let existing = table.get(key.as_str())?.map(|d| d.value().to_vec());
+            let mut bucket: UsageBucket = match existing {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => UsageBucket {
+                    project_id: project_id.to_string(),
+                    hour_epoch,
+                    ..Default::default()
+                },
+            };
+            bucket.cpu_jiffies = bucket.cpu_jiffies.saturating_add(cpu_jiffies);
+            bucket.rx_bytes = bucket.rx_bytes.saturating_add(rx_bytes);
+            bucket.tx_bytes = bucket.tx_bytes.saturating_add(tx_bytes);
+            bucket.storage_byte_seconds = bucket
+                .storage_byte_seconds
+                .saturating_add(storage_bytes_sample.saturating_mul(elapsed_secs));
+            bucket.storage_bytes_last = storage_bytes_sample;
+            bucket.sample_count += 1;
+            let out = serde_json::to_vec(&bucket)?;
+            table.insert(key.as_str(), out.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// All buckets for a project with `hour_epoch` in `[from_hour, to_hour]`, oldest first.
+    pub fn list_usage_for_project(
+        &self,
+        project_id: &str,
+        from_hour: u64,
+        to_hour: u64,
+    ) -> Result<Vec<UsageBucket>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(USAGE)?;
+        let prefix = format!("{project_id}:");
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            if k.value().starts_with(&prefix) {
+                let b: UsageBucket = serde_json::from_slice(v.value())?;
+                if b.hour_epoch >= from_hour && b.hour_epoch <= to_hour {
+                    out.push(b);
+                }
+            }
+        }
+        out.sort_by_key(|b| b.hour_epoch);
+        Ok(out)
+    }
+
+    /// Sum of all buckets at/after `month_start_epoch`. Storage is the latest
+    /// gauge (newest bucket), not summed.
+    pub fn sum_month_to_date(&self, project_id: &str, month_start_epoch: u64) -> Result<MonthToDate> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(USAGE)?;
+        let prefix = format!("{project_id}:");
+        let mut mtd = MonthToDate::default();
+        let mut newest_hour = 0u64;
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            if k.value().starts_with(&prefix) {
+                let b: UsageBucket = serde_json::from_slice(v.value())?;
+                if b.hour_epoch >= month_start_epoch {
+                    mtd.cpu_jiffies = mtd.cpu_jiffies.saturating_add(b.cpu_jiffies);
+                    mtd.rx_bytes = mtd.rx_bytes.saturating_add(b.rx_bytes);
+                    mtd.tx_bytes = mtd.tx_bytes.saturating_add(b.tx_bytes);
+                }
+                if b.hour_epoch >= newest_hour {
+                    newest_hour = b.hour_epoch;
+                    mtd.storage_bytes = b.storage_bytes_last;
+                }
+            }
+        }
+        Ok(mtd)
+    }
+
+    /// Remove buckets whose `hour_epoch` is strictly older than `cutoff_hour`.
+    pub fn prune_usage(&self, cutoff_hour: u64) -> Result<usize> {
+        let stale: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(USAGE)?;
+            let mut keys = Vec::new();
+            for entry in table.iter()? {
+                let (k, v) = entry?;
+                let b: UsageBucket = serde_json::from_slice(v.value())?;
+                if b.hour_epoch < cutoff_hour {
+                    keys.push(k.value().to_string());
+                }
+            }
+            keys
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(USAGE)?;
+            for k in &stale {
+                table.remove(k.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(stale.len())
+    }
+
+    /// Drop all usage buckets for a project (called on project delete).
+    pub fn purge_usage(&self, project_id: &str) -> Result<usize> {
+        let prefix = format!("{project_id}:");
+        let keys: Vec<String> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(USAGE)?;
+            let mut keys = Vec::new();
+            for entry in table.iter()? {
+                let (k, _) = entry?;
+                if k.value().starts_with(&prefix) {
+                    keys.push(k.value().to_string());
+                }
+            }
+            keys
+        };
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(USAGE)?;
+            for k in &keys {
+                table.remove(k.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(keys.len())
+    }
+
+    // -- Quotas --
+
+    pub fn set_quota(&self, project_id: &str, limits: &QuotaLimits) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(QUOTAS)?;
+            let data = serde_json::to_vec(limits)?;
+            table.insert(project_id, data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_quota_override(&self, project_id: &str) -> Result<Option<QuotaLimits>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(QUOTAS)?;
+        match table.get(project_id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The project's effective limits: its override, else [`DEFAULT_QUOTA`].
+    pub fn get_quota(&self, project_id: &str) -> Result<QuotaLimits> {
+        Ok(self.get_quota_override(project_id)?.unwrap_or(DEFAULT_QUOTA))
+    }
+
+    pub fn remove_quota(&self, project_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(QUOTAS)?;
+            table.remove(project_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    // -- Quota status (enforcement state) --
+
+    pub fn save_quota_status(&self, status: &QuotaStatus) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(QUOTA_STATUS)?;
+            let data = serde_json::to_vec(status)?;
+            table.insert(status.project_id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_quota_status(&self, project_id: &str) -> Result<Option<QuotaStatus>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(QUOTA_STATUS)?;
+        match table.get(project_id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_quota_status(&self, project_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(QUOTA_STATUS)?;
+            table.remove(project_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
     }
 
     // -- Domains --
@@ -728,6 +1027,90 @@ mod tests {
         assert!(!store.remove_schedule("a", "f1").unwrap(), "second remove false");
         assert_eq!(store.list_schedules_for_project("a").unwrap().len(), 1);
         assert_eq!(store.list_schedules_for_project("b").unwrap().len(), 1, "b intact");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn usage_accumulates_and_sums_month_to_date() {
+        let (store, path) = tmp_db();
+        let h0: u64 = 1_700_000_000 / 3600 * 3600; // some hour
+        let h1 = h0 + 3600;
+        // two samples in h0, one in h1
+        store.add_usage("a", h0, 10, 100, 200, 1000, 60).unwrap();
+        store.add_usage("a", h0, 5, 50, 60, 1000, 60).unwrap();
+        store.add_usage("a", h1, 7, 70, 80, 2000, 60).unwrap();
+        store.add_usage("b", h0, 99, 9, 9, 9, 60).unwrap();
+
+        let buckets = store.list_usage_for_project("a", 0, u64::MAX).unwrap();
+        assert_eq!(buckets.len(), 2, "two hour buckets for a");
+        assert_eq!(buckets[0].cpu_jiffies, 15, "h0 accumulated 10+5");
+        assert_eq!(buckets[0].sample_count, 2);
+        assert_eq!(buckets[0].storage_bytes_last, 1000);
+
+        // month-to-date from h0 sums both hours; storage = latest gauge (h1)
+        let mtd = store.sum_month_to_date("a", h0).unwrap();
+        assert_eq!(mtd.cpu_jiffies, 22);
+        assert_eq!(mtd.rx_bytes, 220);
+        assert_eq!(mtd.tx_bytes, 340);
+        assert_eq!(mtd.storage_bytes, 2000, "latest gauge, not summed");
+
+        // window starting after h0 excludes it
+        let mtd_h1 = store.sum_month_to_date("a", h1).unwrap();
+        assert_eq!(mtd_h1.cpu_jiffies, 7);
+
+        // prune older than h1 drops h0 only (for all projects)
+        let pruned = store.prune_usage(h1).unwrap();
+        assert_eq!(pruned, 2, "a@h0 and b@h0");
+        assert_eq!(store.list_usage_for_project("a", 0, u64::MAX).unwrap().len(), 1);
+
+        // purge drops the rest for a, leaves nothing
+        store.purge_usage("a").unwrap();
+        assert!(store.list_usage_for_project("a", 0, u64::MAX).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quota_default_override_and_status() {
+        let (store, path) = tmp_db();
+        // default when no override
+        assert_eq!(
+            store.get_quota("p").unwrap().storage_bytes_max,
+            DEFAULT_QUOTA.storage_bytes_max
+        );
+        assert!(store.get_quota_override("p").unwrap().is_none());
+
+        store
+            .set_quota(
+                "p",
+                &QuotaLimits {
+                    storage_bytes_max: 123,
+                    bandwidth_bytes_per_month: 456,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get_quota("p").unwrap().storage_bytes_max, 123);
+        assert!(store.get_quota_override("p").unwrap().is_some());
+        assert!(store.remove_quota("p").unwrap());
+        assert_eq!(
+            store.get_quota("p").unwrap().bandwidth_bytes_per_month,
+            DEFAULT_QUOTA.bandwidth_bytes_per_month
+        );
+
+        // status round-trip
+        assert!(store.get_quota_status("p").unwrap().is_none());
+        store
+            .save_quota_status(&QuotaStatus {
+                project_id: "p".to_string(),
+                bandwidth_blocked: true,
+                blocked_reason: Some("cap".to_string()),
+                blocked_at: 1,
+                blocked_month: month_start_epoch(1_700_000_000),
+            })
+            .unwrap();
+        assert!(store.get_quota_status("p").unwrap().unwrap().bandwidth_blocked);
+        assert!(store.remove_quota_status("p").unwrap());
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,11 +1,13 @@
 mod log_shipper;
+mod metering;
 
 use anyhow::Result;
 use clap::Parser;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    DomainKind, DomainRecord, DomainStatus, ProjectState, SnapshotMeta, Store, VmAllocation,
+    month_start_epoch, DomainKind, DomainRecord, DomainStatus, ProjectState, QuotaStatus,
+    SnapshotMeta, Store, VmAllocation,
 };
 use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
@@ -266,6 +268,15 @@ async fn main() -> Result<()> {
         domain_map.clone(),
         log_shipper.clone(),
         activity_tracker.clone(),
+    ));
+
+    // Spawn the metering + quota-enforcement loop. Samples per-project CPU,
+    // bandwidth, and storage into hourly rollup buckets and hibernates +
+    // blocks projects that exceed their monthly bandwidth cap.
+    tokio::spawn(metering_loop(
+        platform.clone(),
+        routing_table.clone(),
+        log_shipper.clone(),
     ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
@@ -694,7 +705,34 @@ async fn hibernate_project(
     Ok(())
 }
 
+/// Wake a project, refusing if it is over an enforced quota. The quota gate
+/// reads QUOTA_STATUS (the metering loop's source of truth) so a request racing
+/// the over-quota hibernation is still refused. All other failures are transient
+/// (`Unavailable`) and the proxy retries them.
 async fn wake_project(
+    project_id: &str,
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domain_map: DomainMap,
+    shipper: Arc<LogShipper>,
+) -> std::result::Result<String, jkbase_proxy::WakeError> {
+    {
+        let plat = platform.lock().await;
+        if let Ok(Some(status)) = plat.store.get_quota_status(project_id)
+            && status.bandwidth_blocked {
+                return Err(jkbase_proxy::WakeError::OverQuota(
+                    status
+                        .blocked_reason
+                        .unwrap_or_else(|| "over quota".to_string()),
+                ));
+            }
+    }
+    wake_project_inner(project_id, platform, routing, domain_map, shipper)
+        .await
+        .map_err(|e| jkbase_proxy::WakeError::Unavailable(e.to_string()))
+}
+
+async fn wake_project_inner(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
@@ -727,7 +765,7 @@ async fn wake_project(
                 let p = platform.lock().await;
                 if p.vm_states.get(project_id) == Some(&VmLifecycle::Hibernated) {
                     drop(p);
-                    return Box::pin(wake_project(
+                    return Box::pin(wake_project_inner(
                         project_id,
                         platform.clone(),
                         routing,
@@ -1250,7 +1288,9 @@ async fn fire_schedule(
     domain_map: DomainMap,
     shipper: Arc<LogShipper>,
 ) -> Result<()> {
-    let ip = wake_project(project_id, platform, routing, domain_map, shipper).await?;
+    let ip = wake_project(project_id, platform, routing, domain_map, shipper)
+        .await
+        .map_err(|e| anyhow::anyhow!("wake failed: {e:?}"))?;
 
     let call = async {
         let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await?;
@@ -1274,6 +1314,150 @@ async fn fire_schedule(
         anyhow::bail!("scheduled fn {name} returned {status}");
     }
     Ok(())
+}
+
+/// Sample interval. Coarse — usage is billed over hours, not seconds.
+const METERING_TICK: Duration = Duration::from_secs(60);
+/// Keep ~3 months of hourly buckets; prune older so month-to-date is never lost.
+const USAGE_RETENTION_SECS: u64 = 90 * 86400;
+
+/// Host-side metering + quota enforcement. Each tick: sample per-project CPU
+/// (/proc), bandwidth (TAP /sys, delta-accumulated), and storage (on-disk), roll
+/// them into the current hour bucket, then enforce the monthly bandwidth cap by
+/// hibernating + flagging over-quota projects (the wake gate refuses to wake a
+/// flagged project). All `/proc`,`/sys`,fs I/O happens with the platform lock
+/// released (the log_shipper_loop idiom).
+async fn metering_loop(
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    shipper: Arc<LogShipper>,
+) {
+    let mut state = metering::SamplerState::default();
+    let mut last_sample = Instant::now();
+    let mut ticks: u64 = 0;
+
+    loop {
+        tokio::time::sleep(METERING_TICK).await;
+        ticks += 1;
+        let now = jkbase_control::auth::timestamp();
+        let hour_epoch = now / 3600 * 3600;
+        let elapsed = last_sample.elapsed().as_secs().max(1);
+        last_sample = Instant::now();
+
+        // Snapshot everything we need under one platform lock, then release it
+        // before any /proc, /sys, or filesystem I/O.
+        let (running_pids, allocs, projects, data_dir, store) = {
+            let plat = platform.lock().await;
+            let running_pids: Vec<(String, u32)> = plat
+                .vm_states
+                .iter()
+                .filter(|(_, s)| **s == VmLifecycle::Running)
+                .filter_map(|(id, _)| {
+                    plat.vms.get(id).and_then(|vm| vm.pid()).map(|pid| (id.clone(), pid))
+                })
+                .collect();
+            let allocs: Vec<(String, String)> = plat
+                .store
+                .list_vm_allocations()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| (a.project_id, a.tap_device))
+                .collect();
+            let projects: Vec<String> = plat
+                .store
+                .list_projects()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.id)
+                .collect();
+            (running_pids, allocs, projects, plat.data_dir.clone(), plat.store.clone())
+        };
+
+        // CPU deltas (only Running VMs have a live pid).
+        let mut cpu: HashMap<String, u64> = HashMap::new();
+        for (id, pid) in &running_pids {
+            if let Some(cur) = metering::read_cpu_jiffies(*pid) {
+                cpu.insert(id.clone(), state.cpu_delta(id, *pid, cur));
+            }
+        }
+        // Bandwidth deltas from each project's TAP.
+        let mut bw: HashMap<String, (u64, u64)> = HashMap::new();
+        for (id, tap) in &allocs {
+            if let Some((rx, tx)) = metering::read_tap_bytes(tap) {
+                bw.insert(id.clone(), state.tap_delta(id, tap, rx, tx));
+            }
+        }
+
+        // Roll each project's sample into its current hour bucket. Skip projects
+        // with nothing to record (no storage, no deltas) to avoid empty rows.
+        for id in &projects {
+            let cpu_j = cpu.get(id).copied().unwrap_or(0);
+            let (rx, tx) = bw.get(id).copied().unwrap_or((0, 0));
+            let storage = jkbase_common::storage::project_storage_bytes(&data_dir, id);
+            if cpu_j == 0 && rx == 0 && tx == 0 && storage == 0 {
+                continue;
+            }
+            if let Err(e) = store.add_usage(id, hour_epoch, cpu_j, rx, tx, storage, elapsed) {
+                tracing::warn!(project = %id, error = %e, "metering: add_usage failed");
+            }
+        }
+
+        // --- Quota enforcement (monthly bandwidth cap) ---
+        let month_start = month_start_epoch(now);
+        for id in &projects {
+            let cap = store.get_quota(id).map(|q| q.bandwidth_bytes_per_month).unwrap_or(u64::MAX);
+            let mtd = store.sum_month_to_date(id, month_start).unwrap_or_default();
+            let used = mtd.rx_bytes.saturating_add(mtd.tx_bytes);
+            let status = store.get_quota_status(id).ok().flatten();
+            let blocked = status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false);
+
+            if used > cap && !blocked {
+                // Write the block FIRST (source of truth for the wake gate) so a
+                // request racing the hibernate is refused, then hibernate.
+                let _ = store.save_quota_status(&QuotaStatus {
+                    project_id: id.clone(),
+                    bandwidth_blocked: true,
+                    blocked_reason: Some("monthly bandwidth cap exceeded".to_string()),
+                    blocked_at: now,
+                    blocked_month: month_start,
+                });
+                tracing::warn!(project = %id, used, cap, "bandwidth cap exceeded; hibernating + blocking wake");
+                let is_running = {
+                    platform.lock().await.vm_states.get(id) == Some(&VmLifecycle::Running)
+                };
+                if is_running
+                    && let Err(e) =
+                        hibernate_project(id, platform.clone(), routing.clone(), shipper.clone()).await
+                    {
+                        tracing::error!(project = %id, error = %e, "failed to hibernate over-quota project");
+                    }
+            } else if blocked {
+                // Clear on month rollover (new period) or if usage is back under
+                // cap (e.g. an admin raised the override).
+                let stale_month =
+                    status.as_ref().map(|s| s.blocked_month != month_start).unwrap_or(false);
+                if stale_month || used <= cap {
+                    let _ = store.save_quota_status(&QuotaStatus {
+                        project_id: id.clone(),
+                        bandwidth_blocked: false,
+                        blocked_reason: None,
+                        blocked_at: 0,
+                        blocked_month: month_start,
+                    });
+                    tracing::info!(project = %id, "bandwidth block cleared");
+                }
+            }
+        }
+
+        // Prune old buckets roughly hourly (60 ticks * 60s).
+        if ticks.is_multiple_of(60) {
+            let cutoff_hour = now.saturating_sub(USAGE_RETENTION_SECS) / 3600 * 3600;
+            if let Ok(n) = store.prune_usage(cutoff_hour)
+                && n > 0 {
+                    tracing::info!(pruned = n, "metering: pruned old usage buckets");
+                }
+        }
+    }
 }
 
 async fn sync_agent(ip: &str) -> Result<()> {

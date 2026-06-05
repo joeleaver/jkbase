@@ -177,6 +177,12 @@ impl VmInstance {
         &self.log_path
     }
 
+    /// OS pid of the Firecracker process, or `None` once it has exited.
+    /// Used by host-side CPU metering to read `/proc/<pid>/stat`.
+    pub fn pid(&self) -> Option<u32> {
+        self.process.id()
+    }
+
     pub async fn stop(&mut self) -> Result<()> {
         info!(self.id, "stopping VM");
         self.process.kill().await.context("failed to kill Firecracker process")?;

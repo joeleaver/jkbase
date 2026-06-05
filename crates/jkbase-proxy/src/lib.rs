@@ -21,8 +21,20 @@ use tracing::{error, info};
 /// Running backends: host-key → VM IP (fast path; only entries for live VMs).
 pub type RoutingTable = Arc<RwLock<HashMap<String, String>>>;
 pub type ActivityTracker = Arc<RwLock<HashMap<String, Instant>>>;
+/// Why a wake didn't return a routable backend.
+#[derive(Debug)]
+pub enum WakeError {
+    /// Project is over an enforced quota; do not retry until the period resets.
+    /// Surfaced as HTTP 402 with no Retry-After.
+    OverQuota(String),
+    /// Transient (still starting up / restore in progress). Surfaced as 503.
+    Unavailable(String),
+}
+
 pub type WakeCallback = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync,
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, WakeError>> + Send>>
+        + Send
+        + Sync,
 >;
 
 pub use jkbase_common::routing::DomainTarget;
@@ -275,7 +287,11 @@ async fn proxy_request(
                 Ok(bad_gateway())
             }
         },
-        Err(e) => {
+        Err(WakeError::OverQuota(reason)) => {
+            info!(project = %project_id, %reason, "refusing wake: over quota");
+            Ok(payment_required(&reason))
+        }
+        Err(WakeError::Unavailable(e)) => {
             error!(project = %project_id, error = %e, "failed to wake project");
             Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -285,6 +301,14 @@ async fn proxy_request(
                 .unwrap())
         }
     }
+}
+
+fn payment_required(reason: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::PAYMENT_REQUIRED)
+        .header("Content-Type", "text/plain")
+        .body(Full::new(Bytes::from(format!("project over quota: {reason}"))))
+        .unwrap()
 }
 
 fn bad_gateway() -> Response<Full<Bytes>> {

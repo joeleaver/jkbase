@@ -1946,6 +1946,7 @@ body {
     loadSecrets(project.id);
     loadDomains(project.id);
     loadDeployments(project.id);
+    loadUsage(project.id);
     loadLogs(project.id);
   }
 
@@ -2170,6 +2171,31 @@ body {
     });
   }
 
+  function loadUsage(projectId) {
+    state.usageLoading = true;
+    render();
+    Promise.all([
+      api("GET", "/projects/" + projectId + "/usage"),
+      api("GET", "/projects/" + projectId + "/quota"),
+    ]).then(function(res) {
+      state.usage = res[0] || null;
+      state.quota = res[1] || null;
+      state.usageLoading = false;
+      render();
+    }).catch(function(e) {
+      state.usageLoading = false;
+      state.error = e.message;
+      render();
+    });
+  }
+
+  function fmtBytes(b) {
+    b = b || 0;
+    var u = ["B", "KiB", "MiB", "GiB", "TiB"], i = 0, v = b;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return i === 0 ? b + " B" : v.toFixed(2) + " " + u[i];
+  }
+
   function rollbackTo(projectId, version) {
     state.rollbackBusy = true;
     state.error = null;
@@ -2312,6 +2338,7 @@ body {
     { key: "functions",  label: "Functions",   icon: "f" },
     { key: "servers",    label: "Servers",     icon: ">" },
     { key: "deployments",label: "Deployments", icon: "^" },
+    { key: "usage",      label: "Usage",       icon: "$" },
     { key: "secrets",    label: "Secrets",     icon: "*" },
     { key: "settings",   label: "Settings",    icon: "%" },
   ];
@@ -3384,9 +3411,66 @@ body {
 
   // --- Feature content router ---
 
+  function usageBar(used, cap) {
+    var pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+    var color = pct >= 100 ? "#d9534f" : (pct >= 80 ? "#e0a800" : "#4737be");
+    return h("div", { style: "background:#eee;border-radius:4px;height:8px;overflow:hidden;margin-top:4px" },
+      h("div", { style: "width:" + pct.toFixed(1) + "%;height:100%;background:" + color }));
+  }
+
+  function renderUsageView(project) {
+    var u = state.usage, q = state.quota;
+    var body;
+    if (state.usageLoading && !u) {
+      body = h("div", { className: "domain-hint" }, "Loading usage...");
+    } else if (!u || !q) {
+      body = h("div", { className: "domain-hint" }, "No usage data yet.");
+    } else {
+      var storageMax = q.storage_bytes_max || 0;
+      var bwMax = q.bandwidth_bytes_per_month || 0;
+      var bw = (u.rx_bytes || 0) + (u.tx_bytes || 0);
+      body = h("div", {},
+        q.bandwidth_blocked ? h("div", { className: "error-banner" },
+          "Project is BLOCKED — " + (q.blocked_reason || "over quota") +
+          ". It will resume when the month resets or the cap is raised.") : null,
+        h("div", { style: "margin-bottom:14px" },
+          h("div", { className: "section-desc" }, "CPU (month-to-date)"),
+          h("div", {}, (u.cpu_seconds || 0).toFixed(1) + " cpu-seconds")
+        ),
+        h("div", { style: "margin-bottom:14px" },
+          h("div", { className: "section-desc" },
+            "Bandwidth (month-to-date) — " + fmtBytes(bw) + " of " + fmtBytes(bwMax)),
+          usageBar(bw, bwMax),
+          h("div", { style: "font-size:11px;color:#888;margin-top:3px" },
+            "rx " + fmtBytes(u.rx_bytes) + " · tx " + fmtBytes(u.tx_bytes))
+        ),
+        h("div", {},
+          h("div", { className: "section-desc" },
+            "Storage — " + fmtBytes(u.storage_bytes) + " of " + fmtBytes(storageMax)),
+          usageBar(u.storage_bytes || 0, storageMax)
+        ),
+        h("div", { style: "font-size:11px;color:#888;margin-top:12px" },
+          "Limits: " + (q.overridden ? "per-project override" : "platform default") +
+          ". Set with: jkbase quota --set-storage-gib / --set-bandwidth-gib")
+      );
+    }
+    return h("div", { className: "feature-content-inner" },
+      state.error ? h("div", { className: "error-banner" }, state.error) : null,
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "card-title", style: "margin-bottom: 6px" }, "Usage & quotas"),
+          h("div", { className: "section-desc", style: "margin-bottom: 10px" },
+            "Metered host-side. Bandwidth and storage are capped; exceeding the monthly bandwidth cap hibernates the project until the month resets."),
+          body
+        )
+      )
+    );
+  }
+
   function renderFeatureContent(project) {
     switch (state.projectTab) {
       case "overview":    return renderOverviewView(project);
+      case "usage":       return renderUsageView(project);
       case "hosting":     return renderHostingView(project);
       case "domains":     return renderDomainsView(project);
       case "functions":   return renderFunctionsView(project);
