@@ -1249,13 +1249,16 @@ async fn activate_deployment(
         }
     }
 
-    // Storage hard cap: the new deployment artifacts are now on disk, so the
-    // project's billed footprint (content image + data disk + all deployments)
-    // is measurable. Reject before activating if it exceeds the cap, and remove
-    // the just-unpacked artifacts so a rejected deploy leaves no orphan bytes.
+    // Storage hard cap: bill the would-be-live footprint — content image + data
+    // disk + THIS version only, NOT the retained rollback history (bounded by a
+    // deployment count, not the cap). Measured before the `live` symlink is
+    // repointed, so a deploy whose live footprint fits is never refused by old
+    // versions still on disk. Reject + remove the just-unpacked artifacts so a
+    // rejected deploy leaves no orphan bytes.
     let cap = state.store.get_quota(&project.id)?.storage_bytes_max;
     let data_dir = state.deploy_dir.parent().unwrap_or(&state.deploy_dir);
-    let footprint = jkbase_common::storage::project_storage_bytes(data_dir, &project.id);
+    let footprint =
+        jkbase_common::storage::project_storage_bytes_for(data_dir, &project.id, &deploy_path);
     if footprint > cap {
         let _ = tokio::fs::remove_dir_all(&deploy_path).await;
         return Err(QuotaExceeded(format!(
