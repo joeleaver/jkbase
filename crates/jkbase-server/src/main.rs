@@ -534,8 +534,8 @@ async fn handle_deploy(
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
         data_disk_path,
-        vcpu_count: 1,
-        mem_size_mib: 1024,
+        vcpu_count: 4,
+        mem_size_mib: 3072,
         tap_device: Some(alloc.tap_device.clone()),
         guest_mac: Some(alloc.mac.clone()),
         guest_ip: Some(alloc.ip.clone()),
@@ -687,8 +687,8 @@ async fn hibernate_project(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        vcpu_count: 1,
-        mem_size_mib: 1024,
+        vcpu_count: 4,
+        mem_size_mib: 3072,
     };
     plat.store.save_snapshot_meta(&meta)?;
 
@@ -820,8 +820,8 @@ async fn wake_project_inner(
         rootfs_path: plat.base_rootfs_path.clone(),
         content_image_path: Some(content_image_path),
         data_disk_path,
-        vcpu_count: 1,
-        mem_size_mib: 1024,
+        vcpu_count: 4,
+        mem_size_mib: 3072,
         tap_device: Some(alloc.tap_device.clone()),
         guest_mac: Some(alloc.mac.clone()),
         guest_ip: Some(alloc.ip.clone()),
