@@ -139,7 +139,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(get_project).delete(delete_project),
         )
         .route("/projects/{id}/deploy", post(deploy))
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
         .route(
             "/projects/{id}/secrets",
             get(list_secrets).post(set_secret),
