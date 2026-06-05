@@ -120,7 +120,7 @@ pub struct QuotaLimits {
 }
 
 pub const DEFAULT_QUOTA: QuotaLimits = QuotaLimits {
-    storage_bytes_max: 5 * 1024 * 1024 * 1024,         // 5 GiB
+    storage_bytes_max: 16 * 1024 * 1024 * 1024,        // 16 GiB
     bandwidth_bytes_per_month: 100 * 1024 * 1024 * 1024, // 100 GiB/month
 };
 
