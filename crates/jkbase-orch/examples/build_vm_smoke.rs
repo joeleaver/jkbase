@@ -53,6 +53,17 @@ async fn main() -> anyhow::Result<()> {
         netns: None,
     };
 
+    // Optionally build the source drive from a directory (no mount, no root)
+    // via the drive-creation primitive, instead of expecting a prebuilt image.
+    if let Ok(src_dir) = std::env::var("SOURCE_DIR") {
+        println!("building source image from {src_dir} via build_image::build_ro_ext4_from_dir …");
+        jkbase_orch::build_image::build_ro_ext4_from_dir(
+            std::path::Path::new(&src_dir),
+            &cfg.source_drive,
+            8,
+        )?;
+    }
+
     let runtime_dir = data.join("run");
     println!(
         "BuildVm::run id={id} mem={}MiB cgroup_mem_max={}B cpu.max=\"{}\" pids.max={} …",
