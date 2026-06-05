@@ -43,7 +43,8 @@ chmod 0755 "$STAGE/bin/busybox"
 for app in sh ash mount umount mkdir rmdir chroot pivot_root switch_root sync \
            reboot poweroff halt echo cat sleep ls cp mv rm ln test true false \
            env dirname basename printf grep sed awk tar gzip gunzip find xargs \
-           chmod chown id head tail wc touch mktemp; do
+           chmod chown id head tail wc touch mktemp \
+           nc wget ping ip route ifconfig; do
     ln -sf busybox "$STAGE/bin/$app"
 done
 

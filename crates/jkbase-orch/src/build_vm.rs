@@ -25,18 +25,32 @@
 //!     powers off on completion is a separate card; this spine treats "guest
 //!     powered off within the timeout" as completion.
 
-use crate::firecracker::{BootSource, Drive, FirecrackerClient, MachineConfig, VsockConfig};
+use crate::firecracker::{
+    BootSource, Drive, FirecrackerClient, MachineConfig, NetworkInterface, VsockConfig,
+};
 use crate::jailer::{self, JailerConfig, JailerLayout};
 use anyhow::{bail, Context, Result};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+
+/// Host action that **seals** a build: tears down the network (deletes the TAP /
+/// drops the route) so the COMPILE phase runs offline. Called once, on the
+/// guest's fetch-complete console marker or at the fetch deadline — whichever is
+/// first. Host-enforced: the guest has no API to bring the network back.
+pub type SealFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Console marker the in-guest build-runner prints once dependency fetching is
+/// done, signalling the host it may seal the network early (design §9).
+pub const FETCH_COMPLETE_MARKER: &[u8] = b"[seal] FETCH-COMPLETE";
 use tracing::{error, info, warn};
 
 /// Inputs for one ephemeral build VM. Read-only images (`toolchain_rootfs`,
@@ -96,6 +110,24 @@ pub struct BuildVmConfig {
     pub seccomp_filter: Option<PathBuf>,
     /// Network namespace; `None` → the build VM has no network at all.
     pub netns: Option<PathBuf>,
+
+    // --- egress / fetch-then-seal (design §9) ---
+    /// Host TAP the guest reaches the network through (the egress proxy). `None`
+    /// → an offline build (single-phase). When set, the build is two-phase:
+    /// FETCH (network up) → host-enforced SEAL (TAP torn down) → COMPILE (offline).
+    pub tap_device: Option<String>,
+    pub guest_mac: Option<String>,
+    pub guest_ip: Option<String>,
+    pub gateway_ip: Option<String>,
+    /// Egress proxy URL exposed to the build (becomes `HTTP(S)_PROXY`), passed to
+    /// the guest via the kernel cmdline (`jkbase.proxy=`).
+    pub egress_proxy: Option<String>,
+    /// Max wall-time the FETCH phase may hold the network before the host
+    /// force-seals — even if the guest never signals fetch-complete (so a hostile
+    /// build gets the network for at most this long).
+    pub fetch_deadline: Duration,
+    /// Host seal action (see [`SealFn`]). Ignored when `tap_device` is `None`.
+    pub seal: Option<SealFn>,
 }
 
 /// Why a build VM stopped.
@@ -248,15 +280,19 @@ impl BuildVm {
             log_file,
             config.console_log_max_bytes,
         )));
+        // Notified when a console drain spots the fetch-complete marker, so the
+        // host can seal the network early (see [`configure_and_wait`]).
+        let seal_notify = Arc::new(Notify::new());
         let mut drains = Vec::new();
         if let Some(out) = process.stdout.take() {
-            drains.push(tokio::spawn(drain_into(out, log.clone())));
+            drains.push(tokio::spawn(drain_into(out, log.clone(), seal_notify.clone())));
         }
         if let Some(err) = process.stderr.take() {
-            drains.push(tokio::spawn(drain_into(err, log.clone())));
+            drains.push(tokio::spawn(drain_into(err, log.clone(), seal_notify.clone())));
         }
 
-        let outcome = Self::configure_and_wait(id, config, layout, &mut process).await;
+        let outcome =
+            Self::configure_and_wait(id, config, layout, &mut process, seal_notify).await;
 
         // Explicit reap of the jailer/firecracker child; the cgroup liveness
         // check in teardown is what actually guarantees no escapee survives.
@@ -300,6 +336,7 @@ impl BuildVm {
         config: &BuildVmConfig,
         layout: &JailerLayout,
         process: &mut Child,
+        seal_notify: Arc<Notify>,
     ) -> Result<BuildOutcome> {
         wait_for_socket(&layout.host_socket, process).await?;
         // Host connects at the absolute socket path; firecracker's --api-sock
@@ -313,11 +350,19 @@ impl BuildVm {
                 mem_size_mib: config.mem_size_mib,
             })
             .await?;
+        let mut boot_args = "console=ttyS0 reboot=k panic=1 pci=off ro".to_string();
+        if let (Some(ip), Some(gw)) = (&config.guest_ip, &config.gateway_ip) {
+            // Kernel IP autoconfig for the FETCH phase; the host seals the network
+            // (deletes the TAP) before the guest's COMPILE phase.
+            boot_args.push_str(&format!(" ip={ip}::{gw}:255.255.255.0::eth0:off"));
+        }
+        if let Some(proxy) = &config.egress_proxy {
+            boot_args.push_str(&format!(" jkbase.proxy={proxy}"));
+        }
         client
             .set_boot_source(&BootSource {
                 kernel_image_path: "kernel".to_string(),
-                // No network args — the build VM has no NIC until egress lands.
-                boot_args: "console=ttyS0 reboot=k panic=1 pci=off ro".to_string(),
+                boot_args,
             })
             .await?;
 
@@ -365,6 +410,16 @@ impl BuildVm {
                 .await?;
         }
 
+        if let (Some(tap), Some(mac)) = (&config.tap_device, &config.guest_mac) {
+            client
+                .set_network_interface(&NetworkInterface {
+                    iface_id: "eth0".to_string(),
+                    guest_mac: mac.clone(),
+                    host_dev_name: tap.clone(),
+                })
+                .await?;
+        }
+
         if let Some(cid) = config.vsock_cid {
             client
                 .set_vsock(&VsockConfig {
@@ -377,25 +432,61 @@ impl BuildVm {
         info!(id, timeout_secs = config.timeout.as_secs(), "booting build VM");
         client.start().await?;
 
-        match tokio::time::timeout(config.timeout, process.wait()).await {
-            Ok(status) => {
-                let status = status.context("failed waiting on build VM process")?;
-                if status.success() {
-                    info!(id, "build VM exited cleanly (guest powered off)");
-                    Ok(BuildOutcome::Completed)
-                } else {
-                    let (code, signal) = (status.code(), status.signal());
-                    warn!(id, ?code, ?signal, "build VM died abnormally (crash / cgroup OOM-kill)");
-                    Ok(BuildOutcome::Crashed { code, signal })
+        // Fetch-then-seal: when a seal action is configured, the host tears the
+        // network down once the guest signals fetch-complete (console marker) OR
+        // at `fetch_deadline` — whichever first. The deadline is the hard cap, so
+        // a hostile build gets the network for at most that long, even if it never
+        // signals. Runs concurrently with the exit/timeout wait.
+        let seal_fut = async {
+            if config.seal.is_some() {
+                tokio::select! {
+                    _ = seal_notify.notified() => {
+                        info!(id, "guest signalled fetch-complete; sealing network");
+                    }
+                    _ = tokio::time::sleep(config.fetch_deadline) => {
+                        warn!(id, deadline_secs = config.fetch_deadline.as_secs(),
+                              "fetch deadline reached; force-sealing network");
+                    }
                 }
+                if let Some(seal) = &config.seal {
+                    seal().await;
+                    info!(id, "build network sealed (compile runs offline)");
+                }
+            } else {
+                std::future::pending::<()>().await;
             }
-            Err(_elapsed) => {
-                warn!(
-                    id,
-                    timeout_secs = config.timeout.as_secs(),
-                    "build VM exceeded wall-clock timeout; killing"
-                );
-                Ok(BuildOutcome::TimedOut)
+        };
+        tokio::pin!(seal_fut);
+        let exit = process.wait();
+        tokio::pin!(exit);
+        let timeout = tokio::time::sleep(config.timeout);
+        tokio::pin!(timeout);
+        let mut sealed = config.seal.is_none();
+
+        loop {
+            tokio::select! {
+                _ = &mut seal_fut, if !sealed => {
+                    sealed = true;
+                }
+                status = &mut exit => {
+                    let status = status.context("failed waiting on build VM process")?;
+                    return Ok(if status.success() {
+                        info!(id, "build VM exited cleanly (guest powered off)");
+                        BuildOutcome::Completed
+                    } else {
+                        let (code, signal) = (status.code(), status.signal());
+                        warn!(id, ?code, ?signal, "build VM died abnormally (crash / cgroup OOM-kill)");
+                        BuildOutcome::Crashed { code, signal }
+                    });
+                }
+                _ = &mut timeout => {
+                    warn!(
+                        id,
+                        timeout_secs = config.timeout.as_secs(),
+                        "build VM exceeded wall-clock timeout; killing"
+                    );
+                    return Ok(BuildOutcome::TimedOut);
+                }
             }
         }
     }
@@ -543,18 +634,42 @@ impl<W: Write> BoundedLog<W> {
     }
 }
 
-/// Drain a child stdout/stderr stream into the shared, byte-capped console log.
+/// Drain a child stdout/stderr stream into the shared, byte-capped console log,
+/// and notify `seal` the first time the [`FETCH_COMPLETE_MARKER`] appears (so the
+/// host can seal the network early). A small rolling window catches the marker
+/// even when it straddles two reads.
 async fn drain_into<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     log: Arc<Mutex<BoundedLog<std::fs::File>>>,
+    seal: Arc<Notify>,
 ) {
     let mut buf = [0u8; 8192];
+    let mut tail: Vec<u8> = Vec::new();
+    let mut fired = false;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let mut guard = log.lock().await;
-                let _ = guard.write_chunk(&buf[..n]);
+                {
+                    let mut guard = log.lock().await;
+                    let _ = guard.write_chunk(&buf[..n]);
+                }
+                if !fired {
+                    tail.extend_from_slice(&buf[..n]);
+                    let keep = FETCH_COMPLETE_MARKER.len() * 2;
+                    if tail.len() > keep {
+                        tail.drain(..tail.len() - keep);
+                    }
+                    if tail
+                        .windows(FETCH_COMPLETE_MARKER.len())
+                        .any(|w| w == FETCH_COMPLETE_MARKER)
+                    {
+                        fired = true;
+                        // notify_one stores a permit if the seal task isn't yet
+                        // waiting, so the wakeup is never lost.
+                        seal.notify_one();
+                    }
+                }
             }
         }
     }

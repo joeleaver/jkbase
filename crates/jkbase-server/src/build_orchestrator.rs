@@ -479,6 +479,15 @@ async fn build_one_target_inner(
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
+        // Offline build (no NIC): egress/fetch-then-seal lands per-target once the
+        // proxy + bridge are wired in; B1 builds are network-free.
+        tap_device: None,
+        guest_mac: None,
+        guest_ip: None,
+        gateway_ip: None,
+        egress_proxy: None,
+        fetch_deadline: Duration::from_secs(120),
+        seal: None,
     };
 
     // Keep the VM id short: it becomes the jailer chroot path, and the

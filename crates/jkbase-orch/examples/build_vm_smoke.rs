@@ -51,6 +51,13 @@ async fn main() -> anyhow::Result<()> {
         console_log_max_bytes: env_or("CONSOLE_MAX", 16 * 1024 * 1024),
         seccomp_filter: None,
         netns: None,
+        tap_device: None,
+        guest_mac: None,
+        guest_ip: None,
+        gateway_ip: None,
+        egress_proxy: None,
+        fetch_deadline: Duration::from_secs(120),
+        seal: None,
     };
 
     // Optionally build the source drive from a directory (no mount, no root)

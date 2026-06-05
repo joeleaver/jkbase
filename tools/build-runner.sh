@@ -16,9 +16,18 @@
 # toolchain image stays read-only and shared across builds — all writes land on
 # the throwaway scratch upper.
 #
-# Contract: run the source's build, write artifacts + a `status` file (the build
-# exit code) + a `build.log` to the output drive, then `reboot -f` — on x86 that
-# is what makes the firecracker process exit (poweroff does NOT; see the FAQ).
+# Network model (fetch-then-seal, design §9). When the host attaches a NIC it
+# passes `jkbase.proxy=<url>` on the kernel cmdline. Then the build is TWO-PHASE:
+#   FETCH   — `build.sh fetch`  runs with HTTP(S)_PROXY set (network up via the
+#             allowlist egress proxy); on completion we print FETCH-COMPLETE.
+#   SEAL    — the HOST tears the TAP down (host-enforced; we just observe eth0's
+#             carrier drop — we have no API to bring it back).
+#   COMPILE — `build.sh compile` runs with the network gone.
+# With no `jkbase.proxy=` (offline build) we run `build.sh` once, unchanged.
+#
+# Contract: write artifacts + a `status` file (the build exit code) + a
+# `build.log` to the output drive, then `reboot -f` — on x86 that is what makes
+# the firecracker process exit (poweroff does NOT; see the FAQ).
 
 set +e
 
@@ -33,16 +42,64 @@ mount -t ext4 -o ro /dev/vdc /src     2>/dev/null || echo "[build-runner] WARN: 
 mount               /dev/vdd /out     2>/dev/null || echo "[build-runner] WARN: no output drive"
 mount               /dev/vde /cache   2>/dev/null   # optional
 
-run_build() {
-    # $1 = root prefix ("" = current root, "/newroot" = overlay). Build env points
-    # at the bind-mounted IO drives; cwd is the build workspace.
+# Egress proxy URL from the kernel cmdline (empty = offline build).
+PROXY=$(sed -n 's/.*jkbase\.proxy=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null)
+
+run_phase() {
+    # $1 = root prefix ("" = current root, "/newroot" = overlay)
+    # $2 = phase arg passed to build.sh ("" | "fetch" | "compile")
+    # $3 = proxy URL to export (empty = none)
+    root="${1:-/}"
+    phase="$2"
+    penv=""
+    if [ -n "$3" ]; then
+        penv="http_proxy=$3 https_proxy=$3 HTTP_PROXY=$3 HTTPS_PROXY=$3"
+    fi
     if [ -f /src/build.sh ]; then
-        chroot "${1:-/}" /bin/sh -c \
-            'cd /work 2>/dev/null; SRC=/src OUT=/out CACHE=/cache sh /src/build.sh >/out/build.log 2>&1'
+        chroot "$root" /bin/sh -c \
+            "cd /work 2>/dev/null; SRC=/src OUT=/out CACHE=/cache $penv sh /src/build.sh $phase >>/out/build.log 2>&1"
         return $?
     fi
-    echo "no /src/build.sh found" >/out/build.log
+    echo "no /src/build.sh found" >>/out/build.log
     return 127
+}
+
+# Block until the host has sealed the network (deleted the TAP), or a timeout, by
+# probing the proxy endpoint until it is unreachable. The host owns the TAP, so
+# this is observation only — we cannot bring the network back.
+wait_for_seal() {
+    seal_host=$(echo "$PROXY" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||')
+    seal_port=$(echo "$PROXY" | sed 's|^[a-z]*://[^:/]*:||; s|/.*||')
+    [ -z "$seal_port" ] && seal_port=80
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if ! nc -w 1 "$seal_host" "$seal_port" </dev/null >/dev/null 2>&1; then
+            echo "[seal] network sealed (proxy $seal_host:$seal_port unreachable); compiling offline"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "[seal] WARN: proxy still reachable after wait; compiling anyway"
+}
+
+# Run the build under root prefix $1, one-shot (offline) or two-phase (networked).
+do_build() {
+    root="$1"
+    if [ -n "$PROXY" ]; then
+        echo "[build-runner] networked build via proxy $PROXY (fetch-then-seal)"
+        run_phase "$root" fetch "$PROXY"
+        rc=$?
+        echo "[seal] FETCH-COMPLETE"
+        if [ "$rc" -ne 0 ]; then
+            return "$rc"
+        fi
+        wait_for_seal
+        run_phase "$root" compile ""
+        return $?
+    fi
+    run_phase "$root" "" ""
+    return $?
 }
 
 RC=127
@@ -59,7 +116,7 @@ if mount -t overlay overlay \
     mount -o bind /dev             /newroot/dev   2>/dev/null
     mount -t tmpfs tmpfs           /newroot/tmp   2>/dev/null
     echo "[build-runner] CoW overlay active; building in a writable rootfs"
-    run_build /newroot
+    do_build /newroot
     RC=$?
     sync
     umount /newroot/tmp /newroot/proc /newroot/dev /newroot/src /newroot/out /newroot/cache /newroot/work 2>/dev/null
@@ -67,7 +124,7 @@ if mount -t overlay overlay \
 else
     echo "[build-runner] WARN: overlay unavailable; building without a writable rootfs"
     mount -o bind /scratch /work 2>/dev/null || mkdir -p /work
-    run_build ""
+    do_build ""
     RC=$?
 fi
 
