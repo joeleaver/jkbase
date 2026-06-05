@@ -56,6 +56,11 @@ pub enum Command {
         /// Set the monthly bandwidth cap, in GiB (clamped to the platform default)
         #[arg(long)]
         set_bandwidth_gib: Option<f64>,
+        /// Platform-operator admin token. With a valid token the server allows
+        /// raising limits above the platform defaults (operator-only; ignored by a
+        /// server started without --admin-token). Falls back to $JKBASE_ADMIN_TOKEN.
+        #[arg(long, env = "JKBASE_ADMIN_TOKEN")]
+        admin_token: Option<String>,
         /// Platform API URL
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
@@ -215,8 +220,9 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             project,
             set_storage_gib,
             set_bandwidth_gib,
+            admin_token,
             api,
-        } => run_quota(project, set_storage_gib, set_bandwidth_gib, api).await,
+        } => run_quota(project, set_storage_gib, set_bandwidth_gib, admin_token, api).await,
         Command::Init { email, api } => {
             let client = reqwest::Client::new();
             let resp = client
@@ -458,6 +464,7 @@ async fn run_quota(
     project: Option<String>,
     set_storage_gib: Option<f64>,
     set_bandwidth_gib: Option<f64>,
+    admin_token: Option<String>,
     api: String,
 ) -> anyhow::Result<()> {
     let project_id = resolve_project_id(project)?;
@@ -477,18 +484,25 @@ async fn run_quota(
             Some(g) => (g * GIB) as u64,
             None => cur["bandwidth_bytes_per_month"].as_u64().unwrap_or(0),
         };
-        let resp = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "storage_bytes_max": storage,
-                "bandwidth_bytes_per_month": bw,
-            }))
-            .send()
-            .await?;
+        let mut post = client.post(&url).json(&serde_json::json!({
+            "storage_bytes_max": storage,
+            "bandwidth_bytes_per_month": bw,
+        }));
+        if let Some(tok) = &admin_token {
+            post = post.header("X-Admin-Token", tok);
+        }
+        let resp = post.send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("failed to set quota ({})", resp.status());
         }
-        println!("Quota updated (values are clamped to platform defaults).");
+        println!(
+            "{}",
+            if admin_token.is_some() {
+                "Quota updated (admin override)."
+            } else {
+                "Quota updated (values are clamped to platform defaults)."
+            }
+        );
     }
 
     let v: serde_json::Value = client.get(&url).send().await?.json().await?;

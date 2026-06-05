@@ -83,6 +83,10 @@ pub struct AppState {
     pub cert_status: Option<CertStatusFn>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
+    /// Optional platform-operator admin token (jkbase-server `--admin-token`).
+    /// When `Some` and a request presents a matching `X-Admin-Token`, the quota
+    /// endpoint may raise limits above defaults. `None` = no admin path at all.
+    pub admin_token: Option<String>,
     /// Per-project serialization for deploy/build/rollback. A plain
     /// `std::sync::Mutex` (critical sections never await) so [`DeployLockGuard`]
     /// can release on `Drop` — a panicking spawned build task can't leak the lock.
@@ -150,9 +154,36 @@ impl AppState {
             cert_request: None,
             cert_status: None,
             platform_domain: "jkbase.app".to_string(),
+            admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
+
+    /// True if the request carries a valid platform-admin token. Always false
+    /// unless the server was started with `--admin-token`, so a tenant can never
+    /// self-elevate above the platform default quotas.
+    fn is_admin_request(&self, headers: &axum::http::HeaderMap) -> bool {
+        let Some(configured) = self.admin_token.as_deref() else {
+            return false;
+        };
+        let Some(presented) = headers.get("x-admin-token").and_then(|v| v.to_str().ok()) else {
+            return false;
+        };
+        ct_eq(configured.as_bytes(), presented.as_bytes())
+    }
+}
+
+/// Length-checked constant-time byte comparison, so a near-miss admin token isn't
+/// distinguishable by how long the comparison takes.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// RAII guard for the per-project deploy/build/rollback lock. Acquiring fails if
@@ -1497,38 +1528,56 @@ async fn get_project_quota(
     .into_response()
 }
 
-/// Set a per-project quota override. Owner-scoped, and CLAMPED to the platform
-/// defaults: a tenant can only *restrict* their own limits, never raise them
-/// above [`DEFAULT_QUOTA`]. Granting a specific tenant a higher limit needs an
-/// operator/admin path (no admin-role concept exists yet — tracked separately).
+/// Set a per-project quota override. Owner-scoped and CLAMPED to the platform
+/// defaults for tenants: a tenant can only *restrict* their own limits, never
+/// raise them above [`DEFAULT_QUOTA`] (untrusted-tenant threat model). A platform
+/// operator presenting a valid `X-Admin-Token` (server `--admin-token`) bypasses
+/// both the owner-scoping and the clamp, so it can grant a specific project a
+/// higher limit. No admin token configured ⇒ no admin path: every set is clamped.
 async fn set_project_quota(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetQuotaRequest>,
 ) -> impl IntoResponse {
-    match state.store.get_project(&id) {
-        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("project '{id}' not found"),
-                }),
-            )
-                .into_response()
-        }
+    let is_admin = state.is_admin_request(&headers);
+    // Owner-scoped for tenants; a platform admin may target any project.
+    let permitted = match state.store.get_project(&id) {
+        Ok(Some(p)) => is_admin || p.tenant_id.as_deref() == Some(&tenant.id),
+        _ => false,
+    };
+    if !permitted {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
     }
+    // Tenants may only self-restrict (clamp to defaults); a platform-admin
+    // override may raise a limit ABOVE the default.
+    let limit = |requested: u64, default: u64| {
+        if is_admin {
+            requested
+        } else {
+            requested.min(default)
+        }
+    };
     let limits = crate::store::QuotaLimits {
-        storage_bytes_max: req
-            .storage_bytes_max
-            .min(crate::store::DEFAULT_QUOTA.storage_bytes_max),
-        bandwidth_bytes_per_month: req
-            .bandwidth_bytes_per_month
-            .min(crate::store::DEFAULT_QUOTA.bandwidth_bytes_per_month),
-        build_seconds_per_month: req
-            .build_seconds_per_month
-            .min(crate::store::DEFAULT_QUOTA.build_seconds_per_month),
+        storage_bytes_max: limit(
+            req.storage_bytes_max,
+            crate::store::DEFAULT_QUOTA.storage_bytes_max,
+        ),
+        bandwidth_bytes_per_month: limit(
+            req.bandwidth_bytes_per_month,
+            crate::store::DEFAULT_QUOTA.bandwidth_bytes_per_month,
+        ),
+        build_seconds_per_month: limit(
+            req.build_seconds_per_month,
+            crate::store::DEFAULT_QUOTA.build_seconds_per_month,
+        ),
     };
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
@@ -2555,5 +2604,20 @@ fn to_response(p: &Project) -> ProjectResponse {
             None
         },
         domains: p.domains.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ct_eq;
+
+    #[test]
+    fn ct_eq_matches_only_identical_bytes() {
+        assert!(ct_eq(b"s3cr3t-admin-token", b"s3cr3t-admin-token"));
+        assert!(!ct_eq(b"s3cr3t-admin-token", b"s3cr3t-admin-toker")); // last byte
+        assert!(!ct_eq(b"s3cr3t-admin-token", b"S3cr3t-admin-token")); // first byte
+        assert!(!ct_eq(b"short", b"longer-token")); // length mismatch
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b"")); // both empty
     }
 }

@@ -92,6 +92,14 @@ struct Args {
 
     #[arg(long, default_value = "3128")]
     build_proxy_port: u16,
+
+    /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
+    /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
+    /// platform defaults and target any project. Unset (default) = no admin path:
+    /// every tenant stays clamped to defaults. This is an OPERATOR credential,
+    /// not a tenant privilege — keep it out of tenant reach.
+    #[arg(long, env = "JKBASE_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +214,7 @@ async fn main() -> Result<()> {
     state.routing_table = Some(routing_table.clone());
     state.domain_map = Some(domain_map.clone());
     state.platform_domain = args.domain.clone();
+    state.admin_token = args.admin_token.clone();
     if let Some(ref cm) = cert_manager {
         let cm_req = cm.clone();
         state.cert_request = Some(Arc::new(move |host: String| {
