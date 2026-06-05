@@ -225,6 +225,14 @@ ExecStart=$JKBASE_DIR/target/release/jkbase-server \
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
+# Firecracker VMs are children in this unit's cgroup. With the default
+# KillMode=control-group, "systemctl restart/stop" SIGTERMs every Firecracker
+# process at the same instant as jkbase-server, so the orchestrator's graceful
+# hibernate races a dying VM and fails with "failed to pause VM". KillMode=mixed
+# sends SIGTERM to jkbase-server ONLY; it then pauses+snapshots and kills each
+# VM itself before exiting. TimeoutStopSec gives that drain time before SIGKILL.
+KillMode=mixed
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target

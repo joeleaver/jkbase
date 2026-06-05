@@ -147,19 +147,26 @@ fn load_cursors(path: &Path) -> HashMap<String, Cursor> {
 }
 
 async fn fetch_logs(ip: &str, since: u64) -> Result<LogsResponse> {
-    let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await?;
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::spawn(conn);
+    // Bound the whole connect->handshake->send->collect against a wedged agent so
+    // neither the 2s steady-state poll nor the shutdown final-flush can hang (and
+    // so the spawned `conn` task can't accumulate against an unresponsive guest).
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await?;
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+        tokio::spawn(conn);
 
-    let url = format!("http://{ip}:80/_jkbase/logs?since={since}");
-    let req = hyper::Request::builder()
-        .uri(url)
-        .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
+        let url = format!("http://{ip}:80/_jkbase/logs?since={since}");
+        let req = hyper::Request::builder()
+            .uri(url)
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
 
-    let resp = sender.send_request(req).await?;
-    let body = http_body_util::BodyExt::collect(resp.into_body())
-        .await?
-        .to_bytes();
-    Ok(serde_json::from_slice(&body)?)
+        let resp = sender.send_request(req).await?;
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await?
+            .to_bytes();
+        Ok(serde_json::from_slice(&body)?)
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("fetch_logs timed out"))?
 }

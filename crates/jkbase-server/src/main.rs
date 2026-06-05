@@ -309,11 +309,10 @@ async fn shutdown_signal(
         if let Err(e) =
             hibernate_project(project_id, platform.clone(), routing.clone(), shipper.clone()).await
         {
-            tracing::error!(project = %project_id, error = %e, "hibernate failed, force stopping");
-            let mut plat = platform.lock().await;
-            if let Some(mut vm) = plat.vms.remove(project_id) {
-                let _ = vm.stop().await;
-            }
+            // hibernate_project self-cleans its own wedge/timeout paths; this is a
+            // last-resort catch for an unexpected Err, routed through the same helper.
+            tracing::error!(project = %project_id, error = %e, "hibernate errored, force stopping");
+            force_stop_and_cleanup(project_id, &platform).await;
         }
     }
 
@@ -328,9 +327,13 @@ async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
     };
 
     for alloc in &allocs {
-        let reachable = tokio::net::TcpStream::connect(format!("{}:80", alloc.ip))
-            .await
-            .is_ok();
+        let reachable = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(format!("{}:80", alloc.ip)),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
 
         if !reachable {
             info!(
@@ -614,12 +617,45 @@ async fn hibernate_project(
         .map(|a| a.ip);
     drop(plat);
 
-    // Final flush of the agent's buffer before we pause it for hibernation.
-    if let Some(ip) = &agent_ip {
-        shipper.ship(project_id, ip).await;
+    // Pre-pause wedge detection: if the agent is unreachable/wedged, skip the
+    // flush + pause/snapshot entirely and go straight to a clean force-stop. A
+    // wedged guest can't complete a Firecracker Pause+snapshot anyway, and
+    // attempting it is what produces the "failed to pause VM" stall.
+    let wedged = match &agent_ip {
+        Some(ip) => !agent_alive(ip).await,
+        None => true, // no allocation/ip -> nothing to pause cleanly
+    };
+    if wedged {
+        tracing::warn!(project = %project_id, "agent unreachable/wedged, force-stopping instead of hibernating");
+        force_stop_and_cleanup(project_id, &platform).await;
+        return Ok(());
     }
 
-    let (snapshot_path, mem_file_path) = vm.hibernate(&snapshot_dir).await?;
+    // Final flush of the agent's buffer before we pause it. Bounded so a wedged
+    // agent (that passed the probe but then stalls) can't block shutdown.
+    if let Some(ip) = &agent_ip {
+        let _ = tokio::time::timeout(Duration::from_secs(3), shipper.ship(project_id, ip)).await;
+    }
+
+    // Bound pause+snapshot so one bad VM can't stall the drain of the rest. The
+    // budget is generous because snapshotting a 1 GiB mem file is legit slow I/O
+    // (Pause itself is sub-second). Any timeout or error -> clean force-stop.
+    let (snapshot_path, mem_file_path) =
+        match tokio::time::timeout(Duration::from_secs(60), vm.hibernate(&snapshot_dir)).await {
+            Ok(Ok(paths)) => paths,
+            Ok(Err(e)) => {
+                tracing::error!(project = %project_id, error = %e, "hibernate failed, force-stopping");
+                drop(vm); // Drop SIGKILLs the process; force_stop handles the rest.
+                force_stop_and_cleanup(project_id, &platform).await;
+                return Ok(());
+            }
+            Err(_elapsed) => {
+                tracing::error!(project = %project_id, "hibernate timed out (VM wedged), force-stopping");
+                drop(vm);
+                force_stop_and_cleanup(project_id, &platform).await;
+                return Ok(());
+            }
+        };
 
     let mut plat = platform.lock().await;
     let meta = SnapshotMeta {
@@ -969,6 +1005,77 @@ fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
         }
     }
     false
+}
+
+/// Application-level liveness probe. Returns true only if the agent answers HTTP
+/// within the budget. A wedged agent (kernel up, userspace stuck) completes the
+/// TCP handshake but never answers, so a bare TCP connect is NOT sufficient — we
+/// must hit `/_jkbase/health` and bound it with a timeout.
+async fn agent_alive(ip: &str) -> bool {
+    let probe = async {
+        let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await.ok()?;
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
+        tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .uri(format!("http://{ip}:80/_jkbase/health"))
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .ok()?;
+        let resp = sender.send_request(req).await.ok()?;
+        Some(resp.status().is_success())
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), probe).await,
+        Ok(Some(true))
+    )
+}
+
+/// Centralized force-stop + state reconciliation for a project whose graceful
+/// hibernate could not complete (wedged agent, pause/snapshot timeout, or error).
+/// Idempotent and best-effort: every step is independently fallible-ignored so a
+/// failure in one does not strand the others. After this runs the project is left
+/// as Hibernated-with-no-snapshot, so the next request cold-boots cleanly.
+async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformState>>) {
+    let mut plat = platform.lock().await;
+
+    // The VM handle may already be gone (hibernate_project removes it before the
+    // pause that fails) — stop() it if present, but don't rely on it.
+    if let Some(mut vm) = plat.vms.remove(project_id) {
+        let _ = vm.stop().await;
+    }
+
+    let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+
+    // Drop any snapshot meta so wake deterministically cold-boots rather than
+    // trying to restore a stale or half-written snapshot.
+    let _ = plat.store.remove_snapshot_meta(project_id);
+
+    // Persisted state -> Hibernated keeps the project's domains routed so the next
+    // request cold-boots cleanly (snapshot is gone, so wake falls through to boot).
+    if let Ok(Some(mut proj)) = plat.store.get_project(project_id) {
+        proj.state = ProjectState::Hibernated;
+        let _ = plat.store.update_project(&proj);
+    }
+
+    // Never leave it stuck at Hibernating (shared with the idle loop — that would
+    // make wake_project spin and bail on every subsequent request).
+    plat.vm_states
+        .insert(project_id.to_string(), VmLifecycle::Hibernated);
+
+    drop(plat);
+
+    // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-f", &format!("firecracker.*{project_id}")])
+        .status()
+        .await;
+
+    // Tear down TAP so cleanup_orphans reconciles consistently on next boot (a
+    // leaked-but-listening process would otherwise read as "reachable" and the
+    // stale allocation would never be reaped). wake re-runs setup_tap.
+    if let Some(a) = alloc {
+        let _ = teardown_tap(&a.tap_device).await;
+    }
 }
 
 async fn sync_agent(ip: &str) -> Result<()> {

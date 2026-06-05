@@ -49,6 +49,20 @@ for dev in $(losetup -l -n -O NAME,BACK-FILE 2>/dev/null | grep /var/jkbase/cont
     sudo losetup -d "$dev" 2>/dev/null || true
 done
 
+# Ensure the live unit drains VMs cleanly on restart. Firecracker processes are
+# children in jkbase.service's cgroup; the default KillMode=control-group SIGTERMs
+# them at the same instant as jkbase-server, racing graceful hibernation ("failed
+# to pause VM"). A drop-in (idempotent, no ExecStart duplication) fixes already-
+# provisioned boxes that predate the provision.sh change.
+echo "Refreshing systemd drain settings..."
+sudo mkdir -p /etc/systemd/system/jkbase.service.d
+sudo tee /etc/systemd/system/jkbase.service.d/10-drain.conf > /dev/null << 'DROPIN'
+[Service]
+KillMode=mixed
+TimeoutStopSec=120
+DROPIN
+sudo systemctl daemon-reload
+
 echo "Restarting service..."
 sudo systemctl restart jkbase
 
