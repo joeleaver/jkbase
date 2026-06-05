@@ -29,9 +29,14 @@ use crate::firecracker::{BootSource, Drive, FirecrackerClient, MachineConfig, Vs
 use crate::jailer::{self, JailerConfig, JailerLayout};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 /// Inputs for one ephemeral build VM. Read-only images (`toolchain_rootfs`,
@@ -99,6 +104,12 @@ pub enum BuildOutcome {
     /// The guest powered itself off within the timeout — the build ran to
     /// completion. Success vs failure is read later from the output drive.
     Completed,
+    /// The VM died abnormally — firecracker exited non-zero or was signal-killed
+    /// (e.g. a cgroup OOM-kill). The build did not complete; output is unusable.
+    Crashed {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
     /// The wall-clock timeout tripped before the guest exited; the VM was
     /// force-killed. Billed for the minutes it consumed.
     TimedOut,
@@ -192,35 +203,50 @@ impl BuildVm {
             jailer::chown_to(&layout.drives_dir.join("cache.img"), config.uid, config.gid)?;
         }
 
-        // TODO(build/jailer) P0: console.log is an unbounded inherited fd — a
-        // hostile guest can fill the host partition via ttyS0. Bound it (piped
-        // drain capped at config.console_log_max_bytes) before untrusted builds.
+        // Bound the console log: a hostile guest can spam ttyS0 without limit, so
+        // pipe firecracker's stdout/stderr and drain them into a byte-capped file
+        // (config.console_log_max_bytes) rather than handing over an unbounded fd.
+        // Past the ceiling, output is discarded with a one-time marker, so the
+        // guest never blocks on a full pipe and never fills the host partition.
         let log_path = runtime_dir.join(format!("{id}.console.log"));
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let log_file =
             std::fs::File::create(&log_path).context("failed to create build VM console log")?;
-        let stderr_log = log_file
-            .try_clone()
-            .context("failed to clone log file handle")?;
 
         let jcfg = Self::jailer_config(id, config);
         info!(id, log = %log_path.display(), "spawning build microVM via jailer");
         let mut process = Command::new(&config.jailer_bin)
             .args(jcfg.argv(layout))
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(stderr_log))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true) // panic backstop; teardown is the real guarantee
             .spawn()
             .context("failed to spawn jailer for build VM")?;
 
+        let log = Arc::new(Mutex::new(BoundedLog::new(
+            log_file,
+            config.console_log_max_bytes,
+        )));
+        let mut drains = Vec::new();
+        if let Some(out) = process.stdout.take() {
+            drains.push(tokio::spawn(drain_into(out, log.clone())));
+        }
+        if let Some(err) = process.stderr.take() {
+            drains.push(tokio::spawn(drain_into(err, log.clone())));
+        }
+
         let outcome = Self::configure_and_wait(id, config, layout, &mut process).await;
 
-        // Explicit reap of the jailer child; the cgroup liveness check in
-        // teardown is what actually guarantees no escapee survives.
+        // Explicit reap of the jailer/firecracker child; the cgroup liveness
+        // check in teardown is what actually guarantees no escapee survives.
         let _ = process.start_kill();
         let _ = process.wait().await;
+        // Flush the console drains (the pipes close on exit → tasks finish).
+        for d in drains {
+            let _ = tokio::time::timeout(Duration::from_secs(2), d).await;
+        }
         outcome
     }
 
@@ -335,8 +361,14 @@ impl BuildVm {
         match tokio::time::timeout(config.timeout, process.wait()).await {
             Ok(status) => {
                 let status = status.context("failed waiting on build VM process")?;
-                info!(id, ?status, "build VM exited");
-                Ok(BuildOutcome::Completed)
+                if status.success() {
+                    info!(id, "build VM exited cleanly (guest powered off)");
+                    Ok(BuildOutcome::Completed)
+                } else {
+                    let (code, signal) = (status.code(), status.signal());
+                    warn!(id, ?code, ?signal, "build VM died abnormally (crash / cgroup OOM-kill)");
+                    Ok(BuildOutcome::Crashed { code, signal })
+                }
             }
             Err(_elapsed) => {
                 warn!(
@@ -430,4 +462,84 @@ async fn wait_for_socket(socket_path: &Path, process: &mut Child) -> Result<()> 
         "Firecracker API socket did not appear at {}",
         socket_path.display()
     )
+}
+
+/// A byte-capped writer for guest console output. Past the ceiling it discards
+/// input (after a one-time marker), so a hostile guest spamming ttyS0 can
+/// neither fill the host disk nor block on a full pipe.
+struct BoundedLog<W: Write> {
+    inner: W,
+    remaining: u64,
+    truncated: bool,
+}
+
+impl<W: Write> BoundedLog<W> {
+    fn new(inner: W, max_bytes: u64) -> Self {
+        Self {
+            inner,
+            remaining: max_bytes,
+            truncated: false,
+        }
+    }
+
+    fn write_chunk(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        if self.remaining == 0 {
+            self.mark_truncated();
+            return Ok(());
+        }
+        let n = self.remaining.min(buf.len() as u64) as usize;
+        self.inner.write_all(&buf[..n])?;
+        self.remaining -= n as u64;
+        if self.remaining == 0 {
+            self.mark_truncated();
+        }
+        Ok(())
+    }
+
+    fn mark_truncated(&mut self) {
+        if !self.truncated {
+            self.truncated = true;
+            let _ = self
+                .inner
+                .write_all(b"\n[console log truncated: byte ceiling reached]\n");
+        }
+    }
+}
+
+/// Drain a child stdout/stderr stream into the shared, byte-capped console log.
+async fn drain_into<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    log: Arc<Mutex<BoundedLog<std::fs::File>>>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut guard = log.lock().await;
+                let _ = guard.write_chunk(&buf[..n]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_log_caps_and_marks_once() {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut bl = BoundedLog::new(&mut buf, 10);
+            bl.write_chunk(b"hello").unwrap(); // 5 / 10
+            bl.write_chunk(b"WORLD!!!").unwrap(); // 5 more -> hits cap + marker
+            bl.write_chunk(b"discarded").unwrap(); // dropped
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("helloWORLD"), "got {s:?}");
+        assert!(s.contains("truncated"));
+        assert!(!s.contains("discarded"));
+        assert_eq!(s.matches("truncated").count(), 1, "marker written once");
+    }
 }

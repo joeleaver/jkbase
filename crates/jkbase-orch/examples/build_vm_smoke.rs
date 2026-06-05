@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         cgroup_mem_max_bytes: env_or("CGROUP_MEM_MAX", 512 * 1024 * 1024),
         cgroup_cpu_max: std::env::var("CGROUP_CPU_MAX").unwrap_or_else(|_| "100000 100000".to_string()),
         fsize_limit_bytes: None,
-        console_log_max_bytes: 16 * 1024 * 1024,
+        console_log_max_bytes: env_or("CONSOLE_MAX", 16 * 1024 * 1024),
         seccomp_filter: None,
         netns: None,
     };
