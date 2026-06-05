@@ -113,10 +113,20 @@ pub struct JailerLayout {
 }
 
 impl JailerLayout {
-    pub fn new(chroot_base: &Path, cgroup_mount: &Path, parent_cgroup: &str, id: &str) -> Self {
-        // VERIFY(build/jailer): jailer names the per-id dir after the exec-file
-        // basename ("firecracker") under chroot_base.
-        let chroot_id_dir = chroot_base.join("firecracker").join(id);
+    pub fn new(
+        chroot_base: &Path,
+        cgroup_mount: &Path,
+        parent_cgroup: &str,
+        exec_basename: &str,
+        id: &str,
+    ) -> Self {
+        // CONFIRMED on box (2026-06-05, jailer v1.15.1): the per-id dir is named
+        // after the exec-file *basename* (e.g. "firecracker-v1.15.1-x86_64"), NOT
+        // the literal "firecracker". The cgroup leaf, by contrast, is
+        // <cgroup_mount>/<parent>/<id> with no exec basename, and is root-owned
+        // (so the jailed uid cannot raise its own limits — leaf-only writes are
+        // safe, no parent ceiling needed).
+        let chroot_id_dir = chroot_base.join(exec_basename).join(id);
         let chroot_root = chroot_id_dir.join("root");
         Self {
             host_socket: chroot_root.join("run/firecracker.socket"),
@@ -231,6 +241,7 @@ mod tests {
             Path::new("/data/jailer"),
             Path::new("/sys/fs/cgroup"),
             "jkbase-build",
+            "firecracker-v1.15.1-x86_64",
             "abc",
         );
         let cfg = JailerConfig {
@@ -288,6 +299,7 @@ mod tests {
             Path::new("/d"),
             Path::new("/sys/fs/cgroup"),
             "jkbase-build",
+            "fc",
             "x",
         );
         let cfg = JailerConfig {
@@ -311,28 +323,31 @@ mod tests {
 
     #[test]
     fn layout_paths_diverge_host_vs_chroot_relative() {
+        // Chroot dir uses the exec-file basename (confirmed on box); the cgroup
+        // leaf does not.
         let l = JailerLayout::new(
             Path::new("/data/jailer"),
             Path::new("/sys/fs/cgroup"),
             "jkbase-build",
+            "firecracker-v1.15.1-x86_64",
             "abc",
         );
         assert_eq!(
             l.chroot_id_dir,
-            PathBuf::from("/data/jailer/firecracker/abc")
+            PathBuf::from("/data/jailer/firecracker-v1.15.1-x86_64/abc")
         );
         assert_eq!(
             l.chroot_root,
-            PathBuf::from("/data/jailer/firecracker/abc/root")
+            PathBuf::from("/data/jailer/firecracker-v1.15.1-x86_64/abc/root")
         );
         assert_eq!(
             l.host_socket,
-            PathBuf::from("/data/jailer/firecracker/abc/root/run/firecracker.socket")
+            PathBuf::from("/data/jailer/firecracker-v1.15.1-x86_64/abc/root/run/firecracker.socket")
         );
         assert_eq!(l.api_sock_arg, "run/firecracker.socket");
         assert_eq!(
             l.drives_dir,
-            PathBuf::from("/data/jailer/firecracker/abc/root/drives")
+            PathBuf::from("/data/jailer/firecracker-v1.15.1-x86_64/abc/root/drives")
         );
         assert_eq!(l.cgroup_dir, PathBuf::from("/sys/fs/cgroup/jkbase-build/abc"));
         assert_eq!(

@@ -113,10 +113,17 @@ impl BuildVm {
     /// jail (and its `mknod`'d device nodes) is removed on every exit path.
     pub async fn run(id: &str, config: &BuildVmConfig, runtime_dir: &Path) -> Result<BuildOutcome> {
         let id = jailer::sanitize_id(id)?;
+        // jailer names the chroot dir after the exec-file basename, not "firecracker".
+        let exec_basename = config
+            .firecracker_bin
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("firecracker_bin has no valid UTF-8 file name")?;
         let layout = JailerLayout::new(
             &config.chroot_base,
             &config.cgroup_mount,
             &config.parent_cgroup,
+            exec_basename,
             &id,
         );
 
@@ -138,6 +145,13 @@ impl BuildVm {
         jailer::assert_same_fs(&config.chroot_base, &config.source_drive)?;
         jailer::assert_same_fs(&config.chroot_base, &config.kernel_path)?;
 
+        // VERIFY(build/jailer): jailer CREATES the chroot root/ itself. This
+        // code pre-stages drives into root/drives/ *before* spawning jailer,
+        // which jailer may clobber or reject. The known-good pattern
+        // (firecracker-go-sdk) stages drives *after* the API socket appears.
+        // The on-box boot test must settle whether pre-staging survives; if not,
+        // move staging into configure_and_wait() before set_drive().
+        //
         // Stale-state hygiene: a prior crashed/killed build may have skipped
         // teardown. Clear the socket and the whole per-id tree before staging.
         if layout.host_socket.exists() {
