@@ -48,7 +48,9 @@ sudo apt-get install -y -qq \
     ufw \
     fail2ban \
     jq \
-    iptables
+    iptables \
+    busybox-static \
+    e2fsprogs
 
 echo "[2b/7] Installing Docker..."
 if ! command -v docker &>/dev/null; then
@@ -193,6 +195,45 @@ fi
 BRIDGE
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
 
+# Build cgroup provisioner (ExecStartPre, reboot-surviving). Build VMs run under
+# the jailer in leaf cgroups beneath /sys/fs/cgroup/jkbase-build; that parent must
+# exist with +cpu +memory +pids delegated or a hostile build's memory.max never
+# applies and it can drive HOST OOM (threat model: all tenants untrusted). The
+# server also does this best-effort at startup, but provisioning it here makes it
+# explicit, loud, and independent of the binary. Best-effort/exit 0: a cgroup
+# hiccup must never block the runtime from starting.
+sudo tee /usr/local/bin/jkbase-build-cgroup.sh > /dev/null << 'CGROUP'
+#!/bin/bash
+WANT="+cpu +memory +pids"
+ROOT=/sys/fs/cgroup
+PARENT="$ROOT/jkbase-build"
+# Delegate controllers down from the root so children can receive them.
+echo "$WANT" > "$ROOT/cgroup.subtree_control" 2>/dev/null || true
+mkdir -p "$PARENT" 2>/dev/null || true
+if ! echo "$WANT" > "$PARENT/cgroup.subtree_control" 2>/dev/null; then
+    echo "jkbase-build-cgroup: WARNING could not delegate '$WANT' to $PARENT" >&2
+fi
+have="$(cat "$PARENT/cgroup.subtree_control" 2>/dev/null || true)"
+case "$have" in
+    *memory*) echo "jkbase-build-cgroup: ready ($have)" ;;
+    *) echo "jkbase-build-cgroup: WARNING memory controller NOT delegated — build OOM containment is OFF ($have)" >&2 ;;
+esac
+exit 0
+CGROUP
+sudo chmod +x /usr/local/bin/jkbase-build-cgroup.sh
+
+# Isolated build network provisioner (ExecStartPre, reboot-surviving). Creates the
+# jkbuild0 bridge + JKBUILD firewall so build VMs can reach ONLY the egress proxy
+# on the build gateway (default-deny; no internet, no other VMs, no NAT). Required
+# because the server runs with --build-net (fail-closed: it refuses to start if the
+# bridge/rules are missing). Install the maintained script verbatim. Note: this
+# deliberately does NOT touch the global net.bridge.bridge-nf-call-iptables sysctl
+# — the isolation rests on INPUT-allowlist (L3 local delivery) + FORWARD DROP +
+# no-NAT + per-TAP bridge port-isolation + IPv6-disabled-on-bridge, none of which
+# need bridge netfilter, so we avoid a system-wide change to the runtime bridge.
+sudo cp "$JKBASE_DIR/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
+sudo chmod +x /usr/local/bin/jkbase-build-net.sh
+
 # Create .env file for secrets if it doesn't exist
 if [ ! -f /var/jkbase/.env ]; then
     echo "# jkbase environment" | sudo tee /var/jkbase/.env > /dev/null
@@ -213,6 +254,8 @@ Type=simple
 User=root
 EnvironmentFile=/var/jkbase/.env
 ExecStartPre=/usr/local/bin/jkbase-bridge.sh
+ExecStartPre=/usr/local/bin/jkbase-build-cgroup.sh
+ExecStartPre=/usr/local/bin/jkbase-build-net.sh
 ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --data-dir /var/jkbase \
     --fc-dir $HOME/.firecracker \
@@ -221,7 +264,8 @@ ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --proxy-port 80 \
     --domain jkbase.app \
     --tls \
-    --https-port 443
+    --https-port 443 \
+    --build-net
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -240,6 +284,19 @@ SERVICE
 
 sudo systemctl daemon-reload
 sudo systemctl enable jkbase
+
+# Bake the default build-VM toolchain image if absent (busybox "passthrough", B1).
+# select_toolchain reads <data-dir>/toolchains/ with precedence
+# {language}.ext4 -> {kind}.ext4 -> default.ext4. Without it, any build with a
+# server/function target fails "no toolchain image"; static-only sites are
+# unaffected. Built with `mkfs.ext4 -d` (no mount/loop/root-fs-parse, P0-3-safe).
+TOOLCHAIN=/var/jkbase/toolchains/default.ext4
+if [ ! -f "$TOOLCHAIN" ]; then
+    echo "Baking default build toolchain..."
+    sudo BUSYBOX=/bin/busybox "$JKBASE_DIR/tools/build-toolchain.sh" "$TOOLCHAIN"
+else
+    echo "Build toolchain already present: $TOOLCHAIN"
+fi
 
 echo "Service installed. Start with: sudo systemctl start jkbase"
 echo "Logs: sudo journalctl -u jkbase -f"

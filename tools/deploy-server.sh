@@ -20,7 +20,10 @@ TARGET="$1"
 
 echo "=== Deploying jkbase to $TARGET ==="
 
-ssh "$TARGET" 'bash -s' << 'REMOTE'
+# Keepalive: the release rebuild streams nothing for minutes (cargo output is
+# piped to `tail`), so an idle SSH session can be dropped mid-deploy. Send a
+# keepalive every 15s and tolerate a couple of minutes of silence.
+ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=8 "$TARGET" 'bash -s' << 'REMOTE'
 set -euo pipefail
 source "$HOME/.cargo/env"
 
