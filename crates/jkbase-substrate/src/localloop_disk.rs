@@ -177,6 +177,18 @@ impl DataDiskProvider for LocalLoop {
         })
     }
 
+    async fn set_writer_pid(&self, id: &str, token: &FenceToken, pid: u32) -> Result<()> {
+        validate_id(id)?;
+        // Only the current holder may refine the writer pid; if our token no longer
+        // matches the persisted holder we've been fenced.
+        match self.read_holder(id) {
+            Some(h) if h.epoch == token.epoch && h.source_id == token.source_id => {
+                self.write_holder(id, &Holder { pid, ..h })
+            }
+            _ => Err(SubstrateError::Fenced { scope: id.to_string() }),
+        }
+    }
+
     async fn detach(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         if let Some(h) = self.read_holder(id) {
@@ -258,6 +270,27 @@ mod tests {
             p.attach_rwo("d", &token(2)).await,
             Err(SubstrateError::RwoUnsafe { .. })
         ));
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[tokio::test]
+    async fn set_writer_pid_refines_holder_and_honors_token() {
+        let p = LocalLoop::open(dir("setpid")).unwrap();
+        std::fs::write(p.img_path("d"), b"").unwrap();
+        p.write_holder(
+            "d",
+            &Holder { pid: std::process::id(), epoch: 7, source_id: "src".into(), loop_dev: "/dev/loopX".into() },
+        )
+        .unwrap();
+        // The current holder refines the writer pid to the (now-known) FC pid.
+        p.set_writer_pid("d", &token(7), 4242).await.unwrap();
+        assert_eq!(p.read_holder("d").unwrap().pid, 4242);
+        // A superseded token can no longer refine — it has been fenced.
+        assert!(matches!(
+            p.set_writer_pid("d", &token(8), 99).await,
+            Err(SubstrateError::Fenced { .. })
+        ));
+        assert_eq!(p.read_holder("d").unwrap().pid, 4242); // unchanged
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 

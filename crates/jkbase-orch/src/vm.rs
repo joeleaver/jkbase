@@ -270,15 +270,28 @@ impl VmInstance {
 
         let client = FirecrackerClient::new(&socket_path);
 
-        // Firecracker v1.15.1: snapshot must be loaded BEFORE any boot-specific
-        // resources (drives, network). The snapshot contains the device config.
-        info!(id, "loading snapshot");
+        // Load the snapshot PAUSED (resume=false). The snapshot carries the device
+        // config, including the data drive — whose host path may be stale (the disk
+        // was just fenced+attached onto a possibly-different host device). Repoint
+        // the data drive to that fenced device, THEN resume, so the restored guest
+        // only ever writes through the read-write-once attach gate — never the path
+        // Firecracker would re-derive from the snapshot.
+        info!(id, "loading snapshot (paused)");
         client
             .load_snapshot(
                 snapshot_path.to_str().unwrap(),
                 mem_file_path.to_str().unwrap(),
+                false,
             )
             .await?;
+
+        if let Some(data_path) = &config.data_disk_path {
+            info!(id, data = %data_path.display(), "repointing data drive to fenced device");
+            client.patch_drive("data", &data_path.to_string_lossy()).await?;
+        }
+
+        info!(id, "resuming restored VM");
+        client.resume_vm().await?;
 
         info!(id, "VM restored from snapshot");
         Ok(VmInstance {

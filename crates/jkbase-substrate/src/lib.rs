@@ -285,6 +285,17 @@ pub trait DataDiskProvider: Backend {
     /// [`SubstrateError::RwoUnsafe`] if exclusivity cannot be proven (caller must
     /// then cold-boot rather than risk a second writer).
     async fn attach_rwo(&self, id: &str, token: &FenceToken) -> Result<BlockDevice>;
+    /// Refine the recorded *writer* of `id` to process `pid` — typically the
+    /// Firecracker PID, which is known only after the VM process spawns (after
+    /// [`attach_rwo`](DataDiskProvider::attach_rwo)). Host-local backends use it so
+    /// a future attach's liveness check tracks the actual writer rather than the
+    /// lifecycle-owner that attached; storage-enforced backends (whose exclusivity
+    /// is not PID-based) may ignore it. Guarded by `token`: returns
+    /// [`SubstrateError::Fenced`] if the caller no longer holds `id`. Default: no-op.
+    async fn set_writer_pid(&self, id: &str, token: &FenceToken, pid: u32) -> Result<()> {
+        let _ = (id, token, pid);
+        Ok(())
+    }
     /// Detach `id` from this host (release the exclusive hold).
     async fn detach(&self, id: &str) -> Result<()>;
     /// Destroy `id` and its data permanently.
