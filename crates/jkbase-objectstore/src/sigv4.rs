@@ -426,3 +426,30 @@ mod tests {
         assert!(verify_header("GET", "s3.jkbase.app", "/b/k", &q, &tampered, &auth, lookup, NOW).is_err());
     }
 }
+
+#[cfg(test)]
+mod cross_vector {
+    use super::*;
+    // Fixed SigV4 vectors shared verbatim with the JS SDK test
+    // (sdk/js/objectstore.test.mjs) so both implementations stay pinned to the same
+    // canonicalisation — that equality is what makes JS-signed requests verify here.
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn header_signature_is_stable() {
+        let (auth, amzd) =
+            sign_header("GET", "s3.test", "/b/k", &[], "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", NOW);
+        assert_eq!(amzd, "20231114T221320Z");
+        assert!(auth.ends_with(
+            "Signature=0f0c7b988b19fb25857e216bac0116a054f0cb91696c0ae00e81bb06520cf115"
+        ));
+    }
+
+    #[test]
+    fn presign_signature_is_stable() {
+        let url = presign("GET", "s3.test", "/b/k", "AKID", "SECRET", "us-east-1", 900, NOW);
+        assert!(url.ends_with(
+            "X-Amz-Signature=67dfd03db2009a8216e3779a68cb239b0ba9579b44c4b3fe168cd0b0bab28614"
+        ));
+    }
+}

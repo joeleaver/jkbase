@@ -39,3 +39,15 @@ jobs:
       # they are skipped on the runner.
       - name: Test (workspace)
         run: cargo test --workspace
+
+  # The object-store JS SDK: cross-validates its SigV4 signatures against the Rust
+  # server's vectors (so JS-signed requests verify server-side).
+  js-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: SDK SigV4 cross-validation
+        run: node --test sdk/js/objectstore.test.mjs

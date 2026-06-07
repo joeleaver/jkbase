@@ -1,0 +1,11 @@
+{
+  "name": "@jkbase/objectstore",
+  "version": "0.1.0",
+  "description": "SigV4-signing client for the jkbase object store (Web Crypto + fetch, no deps).",
+  "type": "module",
+  "exports": "./objectstore.mjs",
+  "scripts": {
+    "test": "node --test objectstore.test.mjs"
+  },
+  "license": "MIT"
+}
