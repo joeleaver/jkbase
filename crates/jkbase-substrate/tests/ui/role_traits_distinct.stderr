@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/role_traits_distinct.rs:9:21
+  |
+9 |     needs_data_disk(blob);
+  |     --------------- ^^^^ expected trait `DataDiskProvider`, found trait `BlobStore`
+  |     |
+  |     arguments to this function are incorrect
+  |
+  = note: expected struct `Arc<(dyn DataDiskProvider + 'static)>`
+             found struct `Arc<(dyn BlobStore + 'static)>`
+note: function defined here
+ --> tests/ui/role_traits_distinct.rs:6:4
+  |
+6 | fn needs_data_disk(_provider: Arc<dyn DataDiskProvider>) {}
+  |    ^^^^^^^^^^^^^^^ ------------------------------------

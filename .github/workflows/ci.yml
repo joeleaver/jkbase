@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede in-flight runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # NOTE: deliberately no `cargo fmt --check` — the tree carries heavy
+      # pre-existing rustfmt drift that a format gate would flag wholesale.
+
+      - name: Clippy (workspace, warnings = errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Runs the substrate neutrality grep gate + the trybuild role-trait
+      # compile-fail check too. KVM/root/network-gated tests are #[ignore]d, so
+      # they are skipped on the runner.
+      - name: Test (workspace)
+        run: cargo test --workspace

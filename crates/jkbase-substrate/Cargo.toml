@@ -13,3 +13,4 @@ redb = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+trybuild = "1"
