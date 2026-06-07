@@ -33,28 +33,39 @@ pub fn router(store: Arc<ObjectStore>) -> Router {
         )
         .route(
             "/{bucket}/{*key}",
-            put(put_object)
+            put(put_dispatch)
+                .post(post_dispatch)
                 .get(get_object)
                 .head(head_object)
-                .delete(delete_object),
+                .delete(delete_dispatch),
         )
         .with_state(store)
 }
 
 // ---- objects --------------------------------------------------------------
 
-async fn put_object(
+/// PUT on the object path: a plain object put, or a multipart UploadPart when
+/// `?uploadId=..&partNumber=..` is present.
+async fn put_dispatch(
     State(store): State<Arc<ObjectStore>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    // Stream the request body straight to disk — never buffer the whole object.
+    if let (Some(uid), Some(pn)) = (q.get("uploadId"), q.get("partNumber")) {
+        let part_number: u32 = match pn.parse() {
+            Ok(n) => n,
+            Err(_) => return s3_error(ObjectError::InvalidArgument(format!("partNumber {pn}"))),
+        };
+        let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
+        return match store.upload_part(&bucket, uid, part_number, reader).await {
+            Ok(etag) => ([(header::ETAG, quoted(&etag))], StatusCode::OK).into_response(),
+            Err(e) => s3_error(e),
+        };
+    }
+    // Plain object put — stream the body straight to disk, never buffered.
+    let content_type = content_type_of(&headers);
     let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
     match store.put_object(&bucket, &key, reader, &content_type).await {
         Ok(meta) => ([(header::ETAG, quoted(&meta.etag))], StatusCode::OK).into_response(),
@@ -82,14 +93,69 @@ async fn head_object(
     }
 }
 
-async fn delete_object(
+/// DELETE on the object path: AbortMultipartUpload when `?uploadId=..`, else a
+/// plain object delete.
+async fn delete_dispatch(
     State(store): State<Arc<ObjectStore>>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Some(uid) = q.get("uploadId") {
+        return match store.abort_multipart(&bucket, uid).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => s3_error(e),
+        };
+    }
     match store.delete_object(&bucket, &key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => s3_error(e),
     }
+}
+
+/// POST on the object path: InitiateMultipartUpload (`?uploads`) or
+/// CompleteMultipartUpload (`?uploadId=..`, body lists the parts in order).
+async fn post_dispatch(
+    State(store): State<Arc<ObjectStore>>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if q.contains_key("uploads") {
+        let content_type = content_type_of(&headers);
+        return match store.create_multipart(&bucket, &key, &content_type).await {
+            Ok(uid) => xml_ok(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
+                 </InitiateMultipartUploadResult>",
+                xml_escape(&bucket),
+                xml_escape(&key),
+                xml_escape(&uid)
+            )),
+            Err(e) => s3_error(e),
+        };
+    }
+    if let Some(uid) = q.get("uploadId") {
+        let bytes = match axum::body::to_bytes(body, 1 << 20).await {
+            Ok(b) => b,
+            Err(_) => return s3_error(ObjectError::InvalidArgument("parts list too large".into())),
+        };
+        let parts = parse_part_numbers(&String::from_utf8_lossy(&bytes));
+        return match store.complete_multipart(&bucket, &key, uid, &parts).await {
+            Ok(meta) => xml_ok(format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
+                 </CompleteMultipartUploadResult>",
+                xml_escape(&bucket),
+                xml_escape(&key),
+                xml_escape(&quoted(&meta.etag))
+            )),
+            Err(e) => s3_error(e),
+        };
+    }
+    s3_error(ObjectError::InvalidArgument("missing ?uploads or ?uploadId".into()))
 }
 
 // ---- buckets --------------------------------------------------------------
@@ -169,6 +235,34 @@ async fn list_objects(
 
 fn quoted(etag: &str) -> String {
     format!("\"{etag}\"")
+}
+
+fn content_type_of(headers: &HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+/// Extract `<PartNumber>N</PartNumber>` values from a CompleteMultipartUpload body
+/// in document order (the parts are concatenated in that order).
+fn parse_part_numbers(xml: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<PartNumber>") {
+        rest = &rest[i + "<PartNumber>".len()..];
+        match rest.find("</PartNumber>") {
+            Some(j) => {
+                if let Ok(n) = rest[..j].trim().parse::<u32>() {
+                    out.push(n);
+                }
+                rest = &rest[j..];
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 fn object_headers(meta: &ObjectMeta) -> [(header::HeaderName, String); 4] {
@@ -333,6 +427,69 @@ mod tests {
         assert!(xml.contains("<Key>img/b</Key>"));
         assert!(!xml.contains("doc/c"));
         assert!(xml.contains("<KeyCount>2</KeyCount>"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn between(s: &str, start: &str, end: &str) -> String {
+        let i = s.find(start).unwrap() + start.len();
+        let j = s[i..].find(end).unwrap();
+        s[i..i + j].to_string()
+    }
+
+    #[tokio::test]
+    async fn multipart_over_http() {
+        let (s, dir) = store();
+        let app = router(s);
+        app.clone().oneshot(Request::put("/mp-bucket").body(Body::empty()).unwrap()).await.unwrap();
+
+        // Initiate.
+        let r = app
+            .clone()
+            .oneshot(Request::post("/mp-bucket/big.bin?uploads").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (_, _, xml) = body_str(r).await;
+        let uid = between(&xml, "<UploadId>", "</UploadId>");
+
+        // Upload two parts.
+        for (n, data) in [(1, "AAAA"), (2, "BB")] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::put(format!("/mp-bucket/big.bin?uploadId={uid}&partNumber={n}"))
+                        .body(Body::from(data))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+
+        // Complete (parts listed in order).
+        let complete = "<CompleteMultipartUpload>\
+            <Part><PartNumber>1</PartNumber></Part>\
+            <Part><PartNumber>2</PartNumber></Part></CompleteMultipartUpload>";
+        let r = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/mp-bucket/big.bin?uploadId={uid}"))
+                    .body(Body::from(complete))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, _, xml) = body_str(r).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(xml.contains("CompleteMultipartUploadResult"));
+
+        // GET returns the concatenation.
+        let r = app
+            .clone()
+            .oneshot(Request::get("/mp-bucket/big.bin").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let (_, _, text) = body_str(r).await;
+        assert_eq!(text, "AAAABB");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
