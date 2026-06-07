@@ -14,6 +14,8 @@
 //! absolute paths) structurally impossible.
 
 mod http;
+pub mod sigv4;
 mod store;
 pub use http::router;
+pub use sigv4::{presign, verify_presigned};
 pub use store::{ObjectError, ObjectMeta, ObjectStore};
