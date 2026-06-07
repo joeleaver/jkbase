@@ -192,6 +192,11 @@ impl DataDiskProvider for CephRbd {
         Ok(())
     }
 
+    async fn exists(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        Ok(self.image_exists(id).await)
+    }
+
     async fn attach_rwo(&self, id: &str, token: &FenceToken) -> Result<BlockDevice> {
         validate_id(id)?;
         if !self.image_exists(id).await {

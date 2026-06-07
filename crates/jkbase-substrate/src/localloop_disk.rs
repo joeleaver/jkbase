@@ -133,6 +133,11 @@ impl DataDiskProvider for LocalLoop {
         Ok(())
     }
 
+    async fn exists(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        Ok(tokio::fs::try_exists(self.img_path(id)).await.unwrap_or(false))
+    }
+
     async fn attach_rwo(&self, id: &str, token: &FenceToken) -> Result<BlockDevice> {
         validate_id(id)?;
         let img = self.img_path(id);

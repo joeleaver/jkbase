@@ -280,6 +280,8 @@ pub trait DataDiskProvider: Backend {
     /// Ensure a disk of at least `size_bytes` exists for `id` (idempotent; formats
     /// on first creation, never reformats existing data).
     async fn ensure(&self, id: &str, size_bytes: u64) -> Result<()>;
+    /// Whether a disk for `id` already exists (without attaching it).
+    async fn exists(&self, id: &str) -> Result<bool>;
     /// Attach `id` read-write-once to this host, fencing any prior writer using
     /// `token`. Returns [`SubstrateError::Fenced`] if `token` is stale, or
     /// [`SubstrateError::RwoUnsafe`] if exclusivity cannot be proven (caller must
