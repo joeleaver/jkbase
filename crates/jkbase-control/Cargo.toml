@@ -16,6 +16,8 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 argon2 = { workspace = true }
 base64 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 tower-http = { version = "0.6", features = ["cors"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
