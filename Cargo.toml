@@ -8,6 +8,7 @@ members = [
     "crates/jkbase-control",
     "crates/jkbase-orch",
     "crates/jkbase-common",
+    "crates/jkbase-substrate",
 ]
 
 [workspace.dependencies]
@@ -15,8 +16,13 @@ jkbase-common = { path = "crates/jkbase-common" }
 jkbase-proxy = { path = "crates/jkbase-proxy" }
 jkbase-control = { path = "crates/jkbase-control" }
 jkbase-orch = { path = "crates/jkbase-orch" }
+jkbase-substrate = { path = "crates/jkbase-substrate" }
 
 serde = { version = "1", features = ["derive"] }
+async-trait = "0.1"
+thiserror = "2"
+bytes = "1"
+bitflags = "2"
 serde_json = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
