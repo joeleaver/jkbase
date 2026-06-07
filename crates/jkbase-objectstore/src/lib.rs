@@ -13,9 +13,11 @@
 //! sidecar; listing reads the sidecars. Hex encoding also makes traversal (`..`,
 //! absolute paths) structurally impossible.
 
+pub mod auth;
 mod http;
 pub mod sigv4;
 mod store;
+pub use auth::{Credential, Credentials, StaticCredentials};
 pub use http::router;
 pub use sigv4::{presign, verify_presigned};
 pub use store::{ObjectError, ObjectMeta, ObjectStore};

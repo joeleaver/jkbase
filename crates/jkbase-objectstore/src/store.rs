@@ -93,6 +93,7 @@ impl ObjectStore {
             return Err(ObjectError::BucketNotEmpty(bucket.to_string()));
         }
         tokio::fs::remove_dir(&dir).await?;
+        let _ = tokio::fs::remove_file(self.root.join(".owners").join(bucket)).await;
         Ok(())
     }
 
@@ -104,12 +105,34 @@ impl ObjectStore {
             Err(e) => return Err(e.into()),
         };
         while let Some(entry) = rd.next_entry().await? {
-            if entry.file_type().await?.is_dir() {
-                out.push(entry.file_name().to_string_lossy().into_owned());
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Skip bookkeeping dirs (e.g. `.owners`); a real bucket can't start with `.`.
+            if !name.starts_with('.') && entry.file_type().await?.is_dir() {
+                out.push(name);
             }
         }
         out.sort();
         Ok(out)
+    }
+
+    /// Record the owning tenant of `bucket` (for per-tenant isolation). Stored
+    /// outside the bucket dir so it never blocks bucket deletion or shows in lists.
+    pub async fn set_bucket_owner(&self, bucket: &str, owner: &str) -> Result<()> {
+        validate_bucket(bucket)?;
+        let odir = self.root.join(".owners");
+        tokio::fs::create_dir_all(&odir).await?;
+        tokio::fs::write(odir.join(bucket), owner).await?;
+        Ok(())
+    }
+
+    /// The tenant that owns `bucket`, if recorded.
+    pub async fn bucket_owner(&self, bucket: &str) -> Result<Option<String>> {
+        validate_bucket(bucket)?;
+        match tokio::fs::read_to_string(self.root.join(".owners").join(bucket)).await {
+            Ok(s) => Ok(Some(s.trim().to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
@@ -557,6 +580,22 @@ mod tests {
             Err(ObjectError::NoSuchUpload(_))
         ));
         assert!(matches!(s.head_object("ab-bucket", "k").await, Err(ObjectError::NoSuchKey(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bucket_ownership_recorded_and_not_listed() {
+        let dir = root("own");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("tenant-bucket").await.unwrap();
+        assert!(s.bucket_owner("tenant-bucket").await.unwrap().is_none());
+        s.set_bucket_owner("tenant-bucket", "tenant-a").await.unwrap();
+        assert_eq!(s.bucket_owner("tenant-bucket").await.unwrap().as_deref(), Some("tenant-a"));
+        // The hidden .owners registry is never surfaced as a bucket.
+        assert_eq!(s.list_buckets().await.unwrap(), vec!["tenant-bucket".to_string()]);
+        // Deleting the bucket clears its owner record.
+        s.delete_bucket("tenant-bucket").await.unwrap();
+        assert!(s.bucket_owner("tenant-bucket").await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
