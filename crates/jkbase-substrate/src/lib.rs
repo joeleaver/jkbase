@@ -27,8 +27,10 @@ use std::time::Duration;
 // ---- Backend implementations (per-role cards) -------------------------------
 pub mod flock_lease;
 pub mod localfs_blob;
+pub mod redb_control;
 pub use flock_lease::FlockLease;
 pub use localfs_blob::LocalFsBlobStore;
+pub use redb_control::RedbControlStore;
 
 bitflags::bitflags! {
     /// Capabilities a backend honestly advertises about itself. The factory
