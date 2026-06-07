@@ -25,8 +25,20 @@ pub enum ObjectError {
     InvalidKey(String),
     #[error("corrupt object metadata for {0}")]
     CorruptMeta(String),
+    #[error("no such upload: {0}")]
+    NoSuchUpload(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Per-upload info persisted at multipart-initiate (the final object's key +
+/// content-type, applied at complete).
+#[derive(Serialize, Deserialize)]
+struct UploadInfo {
+    key: String,
+    content_type: String,
 }
 
 type Result<T> = std::result::Result<T, ObjectError>;
@@ -209,6 +221,140 @@ impl ObjectStore {
         Ok(out)
     }
 
+    // ---- multipart upload -------------------------------------------------
+
+    /// Initiate a multipart upload; returns the opaque upload id.
+    pub async fn create_multipart(&self, bucket: &str, key: &str, content_type: &str) -> Result<String> {
+        validate_key(key)?;
+        let dir = self.require_bucket(bucket).await?;
+        let upload_id = new_upload_id();
+        let sdir = dir.join(".uploads").join(&upload_id);
+        tokio::fs::create_dir_all(&sdir).await?;
+        let info = UploadInfo {
+            key: key.to_string(),
+            content_type: content_type.to_string(),
+        };
+        tokio::fs::write(sdir.join("info.json"), serde_json::to_vec(&info).unwrap()).await?;
+        Ok(upload_id)
+    }
+
+    /// Upload one part (number 1..=10000), streamed; returns its hex-MD5 etag.
+    pub async fn upload_part<R: AsyncRead + Unpin>(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u32,
+        mut reader: R,
+    ) -> Result<String> {
+        if !(1..=10_000).contains(&part_number) {
+            return Err(ObjectError::InvalidArgument(format!("part number {part_number}")));
+        }
+        let sdir = self.staging(bucket, upload_id).await?;
+        let part = sdir.join(format!("part-{part_number}"));
+        let tmp = sdir.join(format!("part-{part_number}.tmp"));
+        let mut hasher = Md5::new();
+        {
+            let mut f = tokio::fs::File::create(&tmp).await?;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                f.write_all(&buf[..n]).await?;
+            }
+            f.sync_all().await?;
+        }
+        tokio::fs::rename(&tmp, &part).await?;
+        let raw = hasher.finalize();
+        // Persist the raw 16-byte digest; the final multipart etag is md5-of-md5s.
+        tokio::fs::write(sdir.join(format!("part-{part_number}.md5")), raw).await?;
+        Ok(hex(&raw))
+    }
+
+    /// Complete a multipart upload: concatenate `part_numbers` in order into the
+    /// final object, returning its metadata with the S3 multipart etag
+    /// `md5(concat of the part md5s)-<count>`.
+    pub async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_numbers: &[u32],
+    ) -> Result<ObjectMeta> {
+        validate_key(key)?;
+        let sdir = self.staging(bucket, upload_id).await?;
+        let info: UploadInfo =
+            serde_json::from_slice(&tokio::fs::read(sdir.join("info.json")).await?)
+                .map_err(|_| ObjectError::CorruptMeta(upload_id.to_string()))?;
+        if info.key != key {
+            return Err(ObjectError::InvalidArgument("key does not match upload".into()));
+        }
+        if part_numbers.is_empty() {
+            return Err(ObjectError::InvalidArgument("no parts".into()));
+        }
+        let dir = self.root.join(bucket);
+        let hk = hex(key.as_bytes());
+        let obj = dir.join(&hk);
+        let tmp = dir.join(format!(
+            "{hk}.cmpl.{}.{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut concat = Md5::new();
+        let mut size = 0u64;
+        {
+            let mut out = tokio::fs::File::create(&tmp).await?;
+            for &pn in part_numbers {
+                let mut pf = match tokio::fs::File::open(sdir.join(format!("part-{pn}"))).await {
+                    Ok(f) => f,
+                    Err(_) => {
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        return Err(ObjectError::InvalidArgument(format!("missing part {pn}")));
+                    }
+                };
+                size += tokio::io::copy(&mut pf, &mut out).await?;
+                concat.update(&tokio::fs::read(sdir.join(format!("part-{pn}.md5"))).await?);
+            }
+            out.sync_all().await?;
+        }
+        tokio::fs::rename(&tmp, &obj).await?;
+        let meta = ObjectMeta {
+            key: key.to_string(),
+            size,
+            etag: format!("{}-{}", hex(&concat.finalize()), part_numbers.len()),
+            content_type: info.content_type,
+            last_modified: now_secs(),
+        };
+        tokio::fs::write(dir.join(format!("{hk}.meta")), serde_json::to_vec(&meta).unwrap()).await?;
+        let _ = tokio::fs::remove_dir_all(&sdir).await;
+        if let Some(p) = sdir.parent() {
+            let _ = tokio::fs::remove_dir(p).await; // drop .uploads if now empty
+        }
+        Ok(meta)
+    }
+
+    /// Abort a multipart upload, discarding its staged parts.
+    pub async fn abort_multipart(&self, bucket: &str, upload_id: &str) -> Result<()> {
+        let sdir = self.staging(bucket, upload_id).await?;
+        let _ = tokio::fs::remove_dir_all(&sdir).await;
+        if let Some(p) = sdir.parent() {
+            let _ = tokio::fs::remove_dir(p).await; // drop .uploads if now empty
+        }
+        Ok(())
+    }
+
+    async fn staging(&self, bucket: &str, upload_id: &str) -> Result<PathBuf> {
+        let dir = self.require_bucket(bucket).await?;
+        validate_upload_id(upload_id)?;
+        let sdir = dir.join(".uploads").join(upload_id);
+        if !tokio::fs::try_exists(&sdir).await? {
+            return Err(ObjectError::NoSuchUpload(upload_id.to_string()));
+        }
+        Ok(sdir)
+    }
+
     async fn locate(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, PathBuf)> {
         let dir = self.require_bucket(bucket).await?;
         validate_key(key)?;
@@ -242,6 +388,27 @@ fn hex(bytes: &[u8]) -> String {
         s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
     }
     s
+}
+
+/// Opaque, traversal-safe (pure hex) upload id.
+fn new_upload_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{nanos:032x}{:08x}{:08x}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn validate_upload_id(id: &str) -> Result<()> {
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ObjectError::InvalidArgument(format!("invalid upload id {id:?}")))
+    }
 }
 
 /// S3 bucket naming (simplified): 3–63 chars, lowercase letters/digits/hyphen, not
@@ -347,6 +514,49 @@ mod tests {
         assert!(matches!(s.create_bucket("ok-bucket").await, Err(ObjectError::BucketAlreadyExists(_))));
         s.put_object("ok-bucket", "k", &b"x"[..], "x").await.unwrap();
         assert!(matches!(s.delete_bucket("ok-bucket").await, Err(ObjectError::BucketNotEmpty(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multipart_concatenates_parts_in_order() {
+        let dir = root("mpu");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("mp-bucket").await.unwrap();
+        let uid = s.create_multipart("mp-bucket", "big/file", "application/octet-stream").await.unwrap();
+        let e1 = s.upload_part("mp-bucket", &uid, 1, &b"hello "[..]).await.unwrap();
+        let e2 = s.upload_part("mp-bucket", &uid, 2, &b"world"[..]).await.unwrap();
+        assert_eq!(e1, format!("{:x}", Md5::digest(b"hello ")));
+        assert_eq!(e2, format!("{:x}", Md5::digest(b"world")));
+
+        let meta = s.complete_multipart("mp-bucket", "big/file", &uid, &[1, 2]).await.unwrap();
+        assert_eq!(meta.size, 11);
+        assert!(meta.etag.ends_with("-2")); // S3 multipart etag carries the part count
+        assert_eq!(read_all(s.get_object("mp-bucket", "big/file").await.unwrap().1).await, b"hello world");
+
+        // The upload id is consumed by complete.
+        assert!(matches!(
+            s.upload_part("mp-bucket", &uid, 3, &b"x"[..]).await,
+            Err(ObjectError::NoSuchUpload(_))
+        ));
+        // Bucket can still be emptied + deleted (the .uploads dir was cleaned up).
+        s.delete_object("mp-bucket", "big/file").await.unwrap();
+        s.delete_bucket("mp-bucket").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multipart_abort_discards_parts() {
+        let dir = root("mpu-abort");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("ab-bucket").await.unwrap();
+        let uid = s.create_multipart("ab-bucket", "k", "x").await.unwrap();
+        s.upload_part("ab-bucket", &uid, 1, &b"data"[..]).await.unwrap();
+        s.abort_multipart("ab-bucket", &uid).await.unwrap();
+        assert!(matches!(
+            s.complete_multipart("ab-bucket", "k", &uid, &[1]).await,
+            Err(ObjectError::NoSuchUpload(_))
+        ));
+        assert!(matches!(s.head_object("ab-bucket", "k").await, Err(ObjectError::NoSuchKey(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

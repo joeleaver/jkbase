@@ -214,6 +214,8 @@ fn s3_error(e: ObjectError) -> Response {
         ObjectError::BucketNotEmpty(_) => (StatusCode::CONFLICT, "BucketNotEmpty"),
         ObjectError::InvalidBucketName(_) => (StatusCode::BAD_REQUEST, "InvalidBucketName"),
         ObjectError::InvalidKey(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
+        ObjectError::NoSuchUpload(_) => (StatusCode::NOT_FOUND, "NoSuchUpload"),
+        ObjectError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
         ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
         }
