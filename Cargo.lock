@@ -1757,6 +1757,7 @@ dependencies = [
  "jkbase-control",
  "jkbase-orch",
  "jkbase-proxy",
+ "jkbase-substrate",
  "rustls",
  "serde",
  "serde_json",
