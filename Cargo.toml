@@ -9,6 +9,7 @@ members = [
     "crates/jkbase-orch",
     "crates/jkbase-common",
     "crates/jkbase-substrate",
+    "crates/jkbase-objectstore",
 ]
 
 [workspace.dependencies]
@@ -23,6 +24,7 @@ async-trait = "0.1"
 thiserror = "2"
 bytes = "1"
 bitflags = "2"
+md-5 = "0.10"
 serde_json = "1"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
