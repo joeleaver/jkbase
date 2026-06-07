@@ -17,11 +17,32 @@ pub struct ProjectConfig {
     pub sites: HashMap<String, SiteConfig>,
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Connected-repo build trigger ([build.repo]) — used by git-push / webhooks.
+    pub build: Option<BuildConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectMeta {
     pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BuildConfig {
+    /// The git remote a push to which triggers a build of this project.
+    pub repo: Option<RepoConfig>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoConfig {
+    /// Git remote URL to build from on push.
+    pub url: String,
+    /// Branch to build (default `main`).
+    #[serde(default = "default_branch")]
+    pub branch: String,
+}
+
+fn default_branch() -> String {
+    "main".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -317,6 +338,24 @@ mod tests {
         let back: Vec<ResolvedSite> = serde_json::from_str(&json).unwrap();
         assert_eq!(back.len(), 2);
         assert!(back.iter().any(|s| s.domain.as_deref() == Some("docs")));
+    }
+
+    #[test]
+    fn build_repo_block_parses_with_default_branch() {
+        let cfg: ProjectConfig = toml::from_str(
+            "[project]\nname = \"x\"\n[build.repo]\nurl = \"https://github.com/u/r.git\"\n",
+        )
+        .unwrap();
+        let repo = cfg.build.unwrap().repo.unwrap();
+        assert_eq!(repo.url, "https://github.com/u/r.git");
+        assert_eq!(repo.branch, "main"); // defaulted
+        // Explicit branch.
+        let cfg2: ProjectConfig =
+            toml::from_str("[build.repo]\nurl = \"u\"\nbranch = \"release\"\n").unwrap();
+        assert_eq!(cfg2.build.unwrap().repo.unwrap().branch, "release");
+        // No [build] block -> None.
+        let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        assert!(bare.build.is_none());
     }
 
     #[test]
