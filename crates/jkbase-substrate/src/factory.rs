@@ -49,6 +49,9 @@ pub enum BlobBackend {
 /// R2 backend selection.
 pub enum LeaseBackend {
     Flock { dir: PathBuf, source_id: String },
+    /// A pre-connected lease authority (e.g. [`EtcdLease`](crate::EtcdLease)) —
+    /// built by the caller because connecting is async while this factory is sync.
+    Connected(Arc<dyn Lease>),
 }
 /// R3 backend selection.
 pub enum DataDiskBackend {
@@ -77,6 +80,7 @@ pub fn build_substrate(cfg: SubstrateConfig) -> Result<Substrate> {
     };
     let lease: Arc<dyn Lease> = match cfg.lease {
         LeaseBackend::Flock { dir, source_id } => Arc::new(FlockLease::open(dir, source_id)?),
+        LeaseBackend::Connected(lease) => lease,
     };
     let data_disk: Arc<dyn DataDiskProvider> = match cfg.data_disk {
         DataDiskBackend::LocalLoop { dir } => Arc::new(LocalLoop::open(dir)?),
