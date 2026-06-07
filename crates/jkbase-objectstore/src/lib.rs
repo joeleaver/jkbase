@@ -18,6 +18,6 @@ mod http;
 pub mod sigv4;
 mod store;
 pub use auth::{Credential, Credentials, StaticCredentials};
-pub use http::router;
+pub use http::{Tenant, router, router_with_auth};
 pub use sigv4::{presign, sign_header, verify_header, verify_presigned};
 pub use store::{ObjectError, ObjectMeta, ObjectStore};

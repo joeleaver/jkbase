@@ -6,19 +6,25 @@
 //! ownership is a separate card and is expected to wrap this router as middleware.
 //! Multipart upload + presigned URLs are the next slice of this card.
 
-use crate::{ObjectError, ObjectMeta, ObjectStore};
+use crate::{Credentials, ObjectError, ObjectMeta, ObjectStore, sigv4};
 use axum::{
-    Router,
+    Extension, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::io::{ReaderStream, StreamReader};
+
+/// The authenticated tenant, injected into request extensions by [`auth_layer`].
+#[derive(Clone)]
+pub struct Tenant(pub String);
 
 /// Build the S3 router backed by `store`.
 pub fn router(store: Arc<ObjectStore>) -> Router {
@@ -40,6 +46,141 @@ pub fn router(store: Arc<ObjectStore>) -> Router {
                 .delete(delete_dispatch),
         )
         .with_state(store)
+}
+
+/// The S3 router with SigV4 auth + per-tenant bucket-ownership enforcement.
+pub fn router_with_auth(store: Arc<ObjectStore>, credentials: Arc<dyn Credentials>) -> Router {
+    router(store.clone()).layer(from_fn_with_state(AuthState { store, credentials }, auth_mw))
+}
+
+#[derive(Clone)]
+struct AuthState {
+    store: Arc<ObjectStore>,
+    credentials: Arc<dyn Credentials>,
+}
+
+/// Authenticate (SigV4 presigned or Authorization header) -> tenant, then enforce
+/// that the bucket in the path is owned by that tenant. Injects [`Tenant`] for the
+/// handlers (create claims ownership; list filters to owned).
+async fn auth_mw(State(st): State<AuthState>, mut req: Request, next: Next) -> Response {
+    let method = req.method().as_str().to_string();
+    let path = pct_decode(req.uri().path());
+    let query = parse_query(req.uri().query().unwrap_or(""));
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let now = now_secs();
+
+    let result = if query.iter().any(|(k, _)| k == "X-Amz-Signature") {
+        sigv4::verify_presigned(
+            &method,
+            &host,
+            &path,
+            &query,
+            |k| st.credentials.resolve(k).map(|c| c.secret_key),
+            now,
+        )
+    } else if let Some(auth) = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+    {
+        let headers: HashMap<String, String> = req
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_lowercase(), s.to_string())))
+            .collect();
+        sigv4::verify_header(
+            &method,
+            &host,
+            &path,
+            &query,
+            &headers,
+            auth,
+            |k| st.credentials.resolve(k).map(|c| c.secret_key),
+            now,
+        )
+    } else {
+        Err("anonymous requests are not allowed".to_string())
+    };
+    let access_key = match result {
+        Ok(k) => k,
+        Err(e) => return access_denied(&e),
+    };
+    let tenant = match st.credentials.resolve(&access_key) {
+        Some(c) => c.tenant_id,
+        None => return access_denied("unknown access key"),
+    };
+
+    // Per-tenant isolation: a bucket in the path (if any) must be unowned (a fresh
+    // create claims it) or owned by this tenant.
+    if let Some(bucket) = path_bucket(&path)
+        && let Ok(Some(owner)) = st.store.bucket_owner(&bucket).await
+        && owner != tenant
+    {
+        return access_denied("not the bucket owner");
+    }
+
+    req.extensions_mut().insert(Tenant(tenant));
+    next.run(req).await
+}
+
+fn access_denied(msg: &str) -> Response {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code><Message>{}</Message></Error>",
+        xml_escape(msg)
+    );
+    (StatusCode::FORBIDDEN, [(header::CONTENT_TYPE, "application/xml")], body).into_response()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// First path segment = the bucket; `/` (list all buckets) has none.
+fn path_bucket(path: &str) -> Option<String> {
+    path.trim_start_matches('/')
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Parse a query string into decoded (key, value) pairs.
+fn parse_query(qs: &str) -> Vec<(String, String)> {
+    if qs.is_empty() {
+        return Vec::new();
+    }
+    qs.split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => (pct_decode(k), pct_decode(v)),
+            None => (pct_decode(kv), String::new()),
+        })
+        .collect()
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            match u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                Ok(h) => {
+                    out.push(h);
+                    i += 3;
+                }
+                Err(_) => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---- objects --------------------------------------------------------------
@@ -160,9 +301,19 @@ async fn post_dispatch(
 
 // ---- buckets --------------------------------------------------------------
 
-async fn create_bucket(State(store): State<Arc<ObjectStore>>, Path(bucket): Path<String>) -> Response {
+async fn create_bucket(
+    State(store): State<Arc<ObjectStore>>,
+    Path(bucket): Path<String>,
+    tenant: Option<Extension<Tenant>>,
+) -> Response {
     match store.create_bucket(&bucket).await {
-        Ok(()) => StatusCode::OK.into_response(),
+        Ok(()) => {
+            // When authenticated, the creator owns the bucket (per-tenant isolation).
+            if let Some(Extension(Tenant(t))) = tenant {
+                let _ = store.set_bucket_owner(&bucket, &t).await;
+            }
+            StatusCode::OK.into_response()
+        }
         Err(e) => s3_error(e),
     }
 }
@@ -182,9 +333,26 @@ async fn head_bucket(State(store): State<Arc<ObjectStore>>, Path(bucket): Path<S
     }
 }
 
-async fn list_buckets(State(store): State<Arc<ObjectStore>>) -> Response {
+async fn list_buckets(
+    State(store): State<Arc<ObjectStore>>,
+    tenant: Option<Extension<Tenant>>,
+) -> Response {
     match store.list_buckets().await {
-        Ok(names) => {
+        Ok(all) => {
+            // Authenticated: show only the tenant's own buckets. Unauthenticated
+            // (the bare `router`): show all.
+            let names = match &tenant {
+                Some(Extension(Tenant(t))) => {
+                    let mut owned = Vec::new();
+                    for n in all {
+                        if store.bucket_owner(&n).await.ok().flatten().as_deref() == Some(t.as_str()) {
+                            owned.push(n);
+                        }
+                    }
+                    owned
+                }
+                None => all,
+            };
             let mut x = String::from(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                  <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Buckets>",
@@ -490,6 +658,58 @@ mod tests {
             .unwrap();
         let (_, _, text) = body_str(r).await;
         assert_eq!(text, "AAAABB");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn signed(method: &str, path: &str, key: &str, secret: &str, body: &str) -> Request<Body> {
+        let (auth, amzd) = crate::sigv4::sign_header(
+            method, "s3.test", path, &[], "UNSIGNED-PAYLOAD", key, secret, "us-east-1", now_secs(),
+        );
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "s3.test")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_enforces_signature_and_bucket_ownership() {
+        let (s, dir) = store();
+        let creds = std::sync::Arc::new(
+            crate::StaticCredentials::new()
+                .with("AKIAA", "secretA", "tenant-a")
+                .with("AKIAB", "secretB", "tenant-b"),
+        );
+        let app = router_with_auth(s, creds);
+
+        // Unsigned request -> 403.
+        let r = app.clone().oneshot(Request::put("/bkt").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // tenant-a creates a bucket + object (signed).
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", "AKIAA", "secretA", "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt/k", "AKIAA", "secretA", "hi")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // tenant-a reads its own object.
+        assert_eq!(
+            app.clone().oneshot(signed("GET", "/bkt/k", "AKIAA", "secretA", "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // tenant-b is signed-in but does not own the bucket -> 403.
+        assert_eq!(
+            app.clone().oneshot(signed("GET", "/bkt/k", "AKIAB", "secretB", "")).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
