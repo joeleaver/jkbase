@@ -100,6 +100,11 @@ impl ObjectStore {
         Ok(out)
     }
 
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
+        validate_bucket(bucket)?;
+        Ok(tokio::fs::try_exists(self.root.join(bucket)).await?)
+    }
+
     async fn require_bucket(&self, bucket: &str) -> Result<PathBuf> {
         validate_bucket(bucket)?;
         let dir = self.root.join(bucket);

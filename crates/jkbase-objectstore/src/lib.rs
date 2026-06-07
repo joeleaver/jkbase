@@ -13,5 +13,7 @@
 //! sidecar; listing reads the sidecars. Hex encoding also makes traversal (`..`,
 //! absolute paths) structurally impossible.
 
+mod http;
 mod store;
+pub use http::router;
 pub use store::{ObjectError, ObjectMeta, ObjectStore};
