@@ -24,6 +24,10 @@ use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// ---- Backend implementations (per-role cards) -------------------------------
+pub mod flock_lease;
+pub use flock_lease::FlockLease;
+
 bitflags::bitflags! {
     /// Capabilities a backend honestly advertises about itself. The factory
     /// negotiates these against the deployment topology — a >1-node cluster MUST

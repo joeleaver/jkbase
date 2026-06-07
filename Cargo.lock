@@ -1631,6 +1631,7 @@ dependencies = [
  "bitflags",
  "bytes",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
