@@ -41,13 +41,19 @@ jobs:
         run: cargo test --workspace
 
       # The substrate's optional cluster backends are feature-gated (off by
-      # default, so the line above never compiles them). Exercise the `s3`
-      # backend's lint + non-network unit tests so it can't bit-rot; its live
-      # MinIO contract test is #[ignore]d and runs only with --ignored + a server.
+      # default, so the line above never compiles them). Exercise each backend's
+      # lint + non-network unit tests, each feature ALONE (catches a feature that
+      # leans on another's deps), so they can't bit-rot. The live MinIO/etcd
+      # contract tests are #[ignore]d and run only with --ignored + a server.
+      # etcd-client compiles protobufs at build time, hence protoc.
+      - name: Install protoc (etcd backend builds protobufs)
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Substrate cluster backends (feature-gated)
         run: |
           cargo clippy -p jkbase-substrate --features s3 --all-targets -- -D warnings
           cargo test -p jkbase-substrate --features s3
+          cargo clippy -p jkbase-substrate --features etcd --all-targets -- -D warnings
+          cargo test -p jkbase-substrate --features etcd
 
   # The object-store JS SDK: cross-validates its SigV4 signatures against the Rust
   # server's vectors (so JS-signed requests verify server-side).

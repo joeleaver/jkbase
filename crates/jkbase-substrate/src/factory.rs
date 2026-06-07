@@ -30,10 +30,14 @@ pub struct SubstrateConfig {
     pub tenant_object_store_host: Option<String>,
 }
 
-/// R1 backend selection. Cluster backends (e.g. etcd) arrive as feature-gated
-/// variants in their own cards.
+/// R1 backend selection.
 pub enum ControlBackend {
     Redb { path: PathBuf },
+    /// A pre-connected control store (e.g. [`EtcdControlStore`](crate::EtcdControlStore)).
+    /// Replicated cluster backends connect asynchronously, while this factory is
+    /// sync, so the caller builds them at boot and hands the trait object in here;
+    /// capability negotiation still runs against its honest [`caps`](crate::Backend::caps).
+    Connected(Arc<dyn ControlStore>),
 }
 /// R4 backend selection.
 pub enum BlobBackend {
@@ -64,6 +68,7 @@ pub struct Substrate {
 pub fn build_substrate(cfg: SubstrateConfig) -> Result<Substrate> {
     let control: Arc<dyn ControlStore> = match cfg.control {
         ControlBackend::Redb { path } => Arc::new(RedbControlStore::open(path)?),
+        ControlBackend::Connected(store) => store,
     };
     let blob: Arc<dyn BlobStore> = match cfg.blob {
         BlobBackend::LocalFs { root } => Arc::new(LocalFsBlobStore::open(root)?),

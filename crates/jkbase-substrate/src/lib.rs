@@ -40,6 +40,12 @@ pub mod s3_blob;
 #[cfg(feature = "s3")]
 pub use s3_blob::{S3CompatBlobStore, S3Config};
 
+// Cluster-grade replicated R1 over etcd (optional, no etcd dep by default).
+#[cfg(feature = "etcd")]
+pub mod etcd_control;
+#[cfg(feature = "etcd")]
+pub use etcd_control::EtcdControlStore;
+
 // ---- Config-driven factory + capability negotiation -------------------------
 pub mod factory;
 pub use factory::{

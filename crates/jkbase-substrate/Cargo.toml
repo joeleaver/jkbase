@@ -16,10 +16,14 @@ redb = { workspace = true }
 object_store = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+# Cluster-grade replicated R1 (ControlStore) + R2 (Lease) over etcd. Optional.
+etcd-client = { workspace = true, optional = true }
 
 [features]
 # `s3` enables S3CompatBlobStore (object_store/aws). Off by default.
 s3 = ["dep:object_store", "dep:tokio-util", "dep:futures-util"]
+# `etcd` enables EtcdControlStore (replicated R1). Off by default.
+etcd = ["dep:etcd-client"]
 
 [dev-dependencies]
 tokio = { workspace = true }
