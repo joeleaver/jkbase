@@ -22,8 +22,10 @@ etcd-client = { workspace = true, optional = true }
 [features]
 # `s3` enables S3CompatBlobStore (object_store/aws). Off by default.
 s3 = ["dep:object_store", "dep:tokio-util", "dep:futures-util"]
-# `etcd` enables EtcdControlStore (replicated R1). Off by default.
+# `etcd` enables EtcdControlStore (replicated R1) + EtcdLease (R2). Off by default.
 etcd = ["dep:etcd-client"]
+# `ceph` enables CephRbd (storage-enforced R3). Shells out to rbd/ceph — no dep.
+ceph = []
 
 [dev-dependencies]
 tokio = { workspace = true }

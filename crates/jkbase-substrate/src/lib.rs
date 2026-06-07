@@ -51,6 +51,13 @@ pub mod etcd_lease;
 #[cfg(feature = "etcd")]
 pub use etcd_lease::EtcdLease;
 
+// Cluster-grade R3 (storage-enforced RWO) over Ceph RBD (optional; shells out to
+// the rbd/ceph CLIs, so no extra dependency — the feature only gates the module).
+#[cfg(feature = "ceph")]
+pub mod ceph_rbd;
+#[cfg(feature = "ceph")]
+pub use ceph_rbd::CephRbd;
+
 // ---- Config-driven factory + capability negotiation -------------------------
 pub mod factory;
 pub use factory::{

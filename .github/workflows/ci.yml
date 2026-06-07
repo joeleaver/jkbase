@@ -54,6 +54,8 @@ jobs:
           cargo test -p jkbase-substrate --features s3
           cargo clippy -p jkbase-substrate --features etcd --all-targets -- -D warnings
           cargo test -p jkbase-substrate --features etcd
+          cargo clippy -p jkbase-substrate --features ceph --all-targets -- -D warnings
+          cargo test -p jkbase-substrate --features ceph
 
   # The object-store JS SDK: cross-validates its SigV4 signatures against the Rust
   # server's vectors (so JS-signed requests verify server-side).

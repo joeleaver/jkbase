@@ -56,6 +56,10 @@ pub enum LeaseBackend {
 /// R3 backend selection.
 pub enum DataDiskBackend {
     LocalLoop { dir: PathBuf },
+    /// Ceph RBD with storage-enforced RWO (feature `ceph`). `conf`/`user` override
+    /// the system ceph config + client id when set.
+    #[cfg(feature = "ceph")]
+    CephRbd { pool: String, conf: Option<String>, user: Option<String> },
 }
 
 /// The assembled set of role backends, ready to hand to the control plane / HA.
@@ -84,6 +88,17 @@ pub fn build_substrate(cfg: SubstrateConfig) -> Result<Substrate> {
     };
     let data_disk: Arc<dyn DataDiskProvider> = match cfg.data_disk {
         DataDiskBackend::LocalLoop { dir } => Arc::new(LocalLoop::open(dir)?),
+        #[cfg(feature = "ceph")]
+        DataDiskBackend::CephRbd { pool, conf, user } => {
+            let mut c = crate::CephRbd::new(pool);
+            if let Some(conf) = conf {
+                c = c.with_conf(conf);
+            }
+            if let Some(user) = user {
+                c = c.with_user(user);
+            }
+            Arc::new(c)
+        }
     };
 
     negotiate(cfg.node_count, control.caps(), lease.caps(), data_disk.caps())?;
