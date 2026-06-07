@@ -11,6 +11,16 @@ bitflags = { workspace = true }
 tokio = { workspace = true }
 redb = { workspace = true }
 
+# Cluster-grade R4 (BlobStore) backend over any S3-compatible endpoint. Optional:
+# the default single-node build takes no cloud dependency (LocalFsBlobStore only).
+object_store = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+[features]
+# `s3` enables S3CompatBlobStore (object_store/aws). Off by default.
+s3 = ["dep:object_store", "dep:tokio-util", "dep:futures-util"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 trybuild = "1"

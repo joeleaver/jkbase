@@ -40,6 +40,15 @@ jobs:
       - name: Test (workspace)
         run: cargo test --workspace
 
+      # The substrate's optional cluster backends are feature-gated (off by
+      # default, so the line above never compiles them). Exercise the `s3`
+      # backend's lint + non-network unit tests so it can't bit-rot; its live
+      # MinIO contract test is #[ignore]d and runs only with --ignored + a server.
+      - name: Substrate cluster backends (feature-gated)
+        run: |
+          cargo clippy -p jkbase-substrate --features s3 --all-targets -- -D warnings
+          cargo test -p jkbase-substrate --features s3
+
   # The object-store JS SDK: cross-validates its SigV4 signatures against the Rust
   # server's vectors (so JS-signed requests verify server-side).
   js-sdk:

@@ -38,6 +38,9 @@ pub enum ControlBackend {
 /// R4 backend selection.
 pub enum BlobBackend {
     LocalFs { root: PathBuf },
+    /// Any S3-compatible endpoint (AWS S3 / MinIO / Ceph RGW). Feature `s3`.
+    #[cfg(feature = "s3")]
+    S3(crate::S3Config),
 }
 /// R2 backend selection.
 pub enum LeaseBackend {
@@ -64,6 +67,8 @@ pub fn build_substrate(cfg: SubstrateConfig) -> Result<Substrate> {
     };
     let blob: Arc<dyn BlobStore> = match cfg.blob {
         BlobBackend::LocalFs { root } => Arc::new(LocalFsBlobStore::open(root)?),
+        #[cfg(feature = "s3")]
+        BlobBackend::S3(s3cfg) => Arc::new(crate::S3CompatBlobStore::connect(s3cfg)?),
     };
     let lease: Arc<dyn Lease> = match cfg.lease {
         LeaseBackend::Flock { dir, source_id } => Arc::new(FlockLease::open(dir, source_id)?),

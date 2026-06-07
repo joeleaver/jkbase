@@ -34,6 +34,12 @@ pub use localfs_blob::LocalFsBlobStore;
 pub use localloop_disk::LocalLoop;
 pub use redb_control::RedbControlStore;
 
+// Cluster-grade R4 over any S3-compatible endpoint (optional, no cloud dep by default).
+#[cfg(feature = "s3")]
+pub mod s3_blob;
+#[cfg(feature = "s3")]
+pub use s3_blob::{S3CompatBlobStore, S3Config};
+
 // ---- Config-driven factory + capability negotiation -------------------------
 pub mod factory;
 pub use factory::{
