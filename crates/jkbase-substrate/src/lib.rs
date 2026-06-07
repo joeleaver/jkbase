@@ -34,6 +34,13 @@ pub use localfs_blob::LocalFsBlobStore;
 pub use localloop_disk::LocalLoop;
 pub use redb_control::RedbControlStore;
 
+// ---- Config-driven factory + capability negotiation -------------------------
+pub mod factory;
+pub use factory::{
+    BlobBackend, ControlBackend, DataDiskBackend, LeaseBackend, Substrate, SubstrateConfig,
+    assert_not_self_referential, build_substrate,
+};
+
 bitflags::bitflags! {
     /// Capabilities a backend honestly advertises about itself. The factory
     /// negotiates these against the deployment topology — a >1-node cluster MUST
