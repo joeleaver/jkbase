@@ -8,6 +8,4 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 bitflags = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
