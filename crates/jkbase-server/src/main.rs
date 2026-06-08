@@ -340,18 +340,23 @@ async fn main() -> Result<()> {
         parent_cgroup: "jkbase-build".to_string(),
         uid: build_uid,
         gid: build_uid,
-        timeout: Duration::from_secs(600),
-        vcpu_count: 2,
-        mem_size_mib: 1024,
-        cgroup_pids_max: 512,
-        cgroup_mem_max_bytes: 1536 * 1024 * 1024,
-        cgroup_cpu_max: "200000 100000".to_string(),
-        scratch_size_bytes: 512 * 1024 * 1024,
-        output_size_bytes: 128 * 1024 * 1024,
+        // Sized for real apps (Vite/monorepo builds + sizeable node_modules), not the
+        // toy fixtures: a Vite build can use multiple GiB of RAM, the full (dev-incl.)
+        // install + source + build output needs GiB of scratch, and the app erofs blob
+        // needs room in the output drive even after the production prune. The cgroup
+        // memory cap (> guest RAM) keeps a hostile build from host-OOM. Tunable per box.
+        timeout: Duration::from_secs(900),
+        vcpu_count: 4,
+        mem_size_mib: 4096,
+        cgroup_pids_max: 1024,
+        cgroup_mem_max_bytes: 4608 * 1024 * 1024,
+        cgroup_cpu_max: "400000 100000".to_string(),
+        scratch_size_bytes: 4096 * 1024 * 1024,
+        output_size_bytes: 1024 * 1024 * 1024,
         console_log_max_bytes: 1024 * 1024,
         max_concurrent: 4,
         net: build_net,
-        fetch_deadline: Duration::from_secs(300),
+        fetch_deadline: Duration::from_secs(600),
     });
     // The jail chroot base + toolchain dir must exist on the data-dir fs.
     let _ = std::fs::create_dir_all(&build_deps.chroot_base);

@@ -8,7 +8,7 @@ set -euo pipefail
 
 APKO_VER="${APKO_VER:-1.2.16}"
 MELANGE_VER="${MELANGE_VER:-0.52.1}" # only needed if/when we package a jkbuild apk
-BUN_VER="${BUN_VER:-1.1.45}"         # pinned; the BASELINE build (no AVX2) for CPU-template safety
+BUN_VER="${BUN_VER:-1.3.14}"         # standard x64 (AVX2). No FC CPU template is used, so the guest has host AVX2;
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 ASSET_DIR="${ASSET_DIR:-$REPO_ROOT/.firecracker/assets}"
@@ -44,11 +44,11 @@ if [ "${MELANGE:-0}" = "1" ]; then
         "https://github.com/chainguard-dev/melange/releases/download/v${MELANGE_VER}/melange_${MELANGE_VER}_linux_amd64.tar.gz"
 fi
 
-# Baked Bun binary (baseline = no-AVX2, safe across the Firecracker CPU templates).
+# Baked Bun binary (standard x64/AVX2; fixes the baseline solid-refresh/Vite bug).
 bun_zip="$(mktemp -d)/bun.zip"
-echo "[install] bun $BUN_VER (baseline) -> $ASSET_DIR/bun"
+echo "[install] bun $BUN_VER (standard) -> $ASSET_DIR/bun"
 curl -fSL -o "$bun_zip" \
-    "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VER}/bun-linux-x64-baseline.zip"
+    "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VER}/bun-linux-x64.zip"
 if [ -n "${BUN_SHA256:-}" ]; then
     echo "${BUN_SHA256}  $bun_zip" | sha256sum -c - || {
         echo "[install] bun sha256 mismatch" >&2

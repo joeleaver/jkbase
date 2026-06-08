@@ -50,7 +50,7 @@ console.log("listening on " + port);
 const PACKAGE_JSON: &str = r#"{
   "name": "bun-smoke",
   "module": "server.ts",
-  "packageManager": "bun@1.1.45",
+  "packageManager": "bun@1.3.14",
   "scripts": { "start": "bun run server.ts" }
 }
 "#;

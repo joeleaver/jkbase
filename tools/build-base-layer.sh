@@ -22,7 +22,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_CONFIG="${BASE_CONFIG:-$REPO_ROOT/images/apko/run-base.apko.yaml}"
 STORE="${STORE:-$REPO_ROOT/.firecracker/baselayers}"
 BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
-BUN_VER="${BUN_VER:-1.1.45}"
+BUN_VER="${BUN_VER:-1.3.14}"
 WORK="${WORK:-$REPO_ROOT/.firecracker/work/base-layer}"
 export PATH="$HOME/.local/bin:$PATH"
 

@@ -41,6 +41,7 @@ impl Buildpack for BunBuildpack {
         let bun_cache = ctx.cache_dir.join("bun");
         std::fs::create_dir_all(&bun_cache).ok();
 
+        // 1. Full install — the build (compile) needs the dev deps (vite, etc.).
         let mut cmd = Command::new(BUN_BIN);
         cmd.arg("install");
         // `--frozen-lockfile` requires a lockfile to exist; only enforce it when
@@ -51,18 +52,21 @@ impl Buildpack for BunBuildpack {
         }
         cmd.current_dir(ctx.app_dir)
             .env("BUN_INSTALL_CACHE_DIR", &bun_cache);
-        if let Some(proxy) = &ctx.proxy {
-            // Bun honours the standard proxy env vars for registry.npmjs.org.
-            cmd.env("HTTP_PROXY", proxy)
-                .env("HTTPS_PROXY", proxy)
-                .env("http_proxy", proxy)
-                .env("https_proxy", proxy);
-        }
+        apply_proxy(&mut cmd, ctx);
         let status = cmd
             .status()
             .with_context(|| format!("spawning `{BUN_BIN} install`"))?;
         if !status.success() {
             anyhow::bail!("bun install failed: {status}");
+        }
+
+        // 2. Pre-stage a PRODUCTION-only node_modules now, while the network is up,
+        //    for the offline compile to swap in — so the runtime app layer doesn't
+        //    carry dev/build tooling. We can't prune offline post-seal (bun can't
+        //    reinstall from a proxy-warmed cache without the network), so we build the
+        //    production tree here instead. No-op when there are no devDependencies.
+        if has_dev_dependencies(ctx.app_dir) {
+            stage_production_modules(ctx, &bun_cache)?;
         }
         Ok(())
     }
@@ -81,6 +85,12 @@ impl Buildpack for BunBuildpack {
                 anyhow::bail!("bun run build failed: {status}");
             }
         }
+
+        // Lean runtime layer: swap the full (dev-incl.) node_modules the build needed
+        // for the PRODUCTION-only tree the fetch phase pre-staged network-up, so the
+        // app layer carries only production deps + the build output — not vite/test/
+        // playwright/typescript tooling, which can dwarf the actual app.
+        swap_in_production_modules(ctx)?;
 
         let command = resolve_launch_command(ctx.app_dir).context(
             "could not determine a start command: add a `start` script to package.json \
@@ -241,6 +251,85 @@ fn has_build_script(app_dir: &Path) -> bool {
                 .map(|s| !s.is_empty())
         })
         .unwrap_or(false)
+}
+
+/// True when the app declares any `devDependencies` — the only case where pruning
+/// to production actually shrinks the layer.
+fn has_dev_dependencies(app_dir: &Path) -> bool {
+    read_package_json(app_dir)
+        .and_then(|pkg| {
+            pkg.get("devDependencies")
+                .and_then(|d| d.as_object())
+                .map(|o| !o.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+/// Apply the egress-proxy env vars (fetch phase only; `ctx.proxy` is `None` once the
+/// network is sealed). Bun honours the standard proxy vars for registry.npmjs.org.
+fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
+    if let Some(proxy) = &ctx.proxy {
+        cmd.env("HTTP_PROXY", proxy)
+            .env("HTTPS_PROXY", proxy)
+            .env("http_proxy", proxy)
+            .env("https_proxy", proxy);
+    }
+}
+
+/// Sibling dir (next to the workspace, on the same scratch fs) holding the
+/// pre-staged production `node_modules`. Both fetch and compile derive it identically.
+fn prod_modules_dir(ctx: &BuildContext) -> std::path::PathBuf {
+    ctx.app_dir
+        .parent()
+        .unwrap_or(ctx.app_dir)
+        .join("jkbuild-prod-modules")
+}
+
+/// Build a PRODUCTION-only `node_modules` in a sibling dir while the network is up
+/// (fetch phase), from the same manifest + lockfile, so the offline compile can swap
+/// it into the app layer. The cache is already warm from the full install, so this is
+/// fast. Drops dev deps (and their dev-only transitive subtrees) deterministically.
+fn stage_production_modules(ctx: &BuildContext, bun_cache: &Path) -> Result<()> {
+    let prod = prod_modules_dir(ctx);
+    let _ = std::fs::remove_dir_all(&prod);
+    std::fs::create_dir_all(&prod).with_context(|| format!("create {}", prod.display()))?;
+    // Same manifest + lockfile → the same production resolution.
+    std::fs::copy(ctx.app_dir.join("package.json"), prod.join("package.json"))
+        .context("copy package.json for production staging")?;
+    for lf in ["bun.lock", "bun.lockb"] {
+        let src = ctx.app_dir.join(lf);
+        if src.exists() {
+            std::fs::copy(&src, prod.join(lf)).with_context(|| format!("copy {lf}"))?;
+        }
+    }
+    let mut cmd = Command::new(BUN_BIN);
+    cmd.arg("install").arg("--production");
+    if has_lockfile(ctx.app_dir) {
+        cmd.arg("--frozen-lockfile");
+    }
+    cmd.current_dir(&prod).env("BUN_INSTALL_CACHE_DIR", bun_cache);
+    apply_proxy(&mut cmd, ctx);
+    let status = cmd
+        .status()
+        .with_context(|| format!("spawning `{BUN_BIN} install --production` (staging)"))?;
+    if !status.success() {
+        anyhow::bail!("staging production node_modules failed: {status}");
+    }
+    Ok(())
+}
+
+/// Swap the pre-staged production `node_modules` into the workspace, replacing the
+/// full (dev-incl.) tree the build used. No-op when nothing was staged (no dev deps).
+fn swap_in_production_modules(ctx: &BuildContext) -> Result<()> {
+    let prod_nm = prod_modules_dir(ctx).join("node_modules");
+    if !prod_nm.exists() {
+        return Ok(());
+    }
+    let app_nm = ctx.app_dir.join("node_modules");
+    let _ = std::fs::remove_dir_all(&app_nm);
+    std::fs::rename(&prod_nm, &app_nm)
+        .with_context(|| format!("swap production node_modules into {}", app_nm.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
