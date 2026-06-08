@@ -1,0 +1,35 @@
+[package]
+name = "jkbuild"
+version = "0.1.0"
+edition = "2024"
+
+# The jkbase build lifecycle. A lean, CNB-spec-aligned detect→build→export engine
+# we OWN (not the upstream Go lifecycle / Paketo). It ships as a statically-linked
+# binary (`jkbuild-init`) baked into the build-VM toolchain image as PID1, runs
+# untrusted tenant build logic inside the jailed microVM (the host jail is the
+# security boundary, not this binary), and emits jkbase's content-addressed
+# layered artifact to the `/out` drive. Buildpack modules (Bun first) live here.
+#
+# Built `--target x86_64-unknown-linux-musl --release` for the in-VM binary so it
+# runs as PID1 without a libc; the lib builds on the host for unit tests.
+
+[lib]
+name = "jkbuild"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jkbuild-init"
+path = "src/bin/jkbuild-init.rs"
+
+[dependencies]
+jkbuild-types = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

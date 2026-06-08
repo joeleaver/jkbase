@@ -1,9 +1,10 @@
 mod build_orchestrator;
 mod egress;
+mod layer_plan;
 mod log_shipper;
 mod metering;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
@@ -157,6 +158,19 @@ impl PlatformState {
     }
 }
 
+/// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
+/// dm-verity — required for the layered runtime) when present, else fall back to
+/// the historical `vmlinux.bin` so a server whose provisioning hasn't published
+/// 6.12 yet still boots. Used for both the runtime VM and the build-kernel source.
+fn resolve_guest_kernel(fc_dir: &std::path::Path) -> std::path::PathBuf {
+    let lts = fc_dir.join("vmlinux-6.12.92.bin");
+    if lts.exists() {
+        lts
+    } else {
+        fc_dir.join("vmlinux.bin")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -167,6 +181,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let data_dir = args.data_dir.clone();
+    let guest_kernel = resolve_guest_kernel(&args.fc_dir);
+    tracing::info!(kernel = %guest_kernel.display(), "guest kernel selected");
 
     tokio::fs::create_dir_all(&data_dir).await?;
 
@@ -207,7 +223,7 @@ async fn main() -> Result<()> {
         firecracker_bin: args
             .fc_dir
             .join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
-        kernel_path: args.fc_dir.join("vmlinux.bin"),
+        kernel_path: guest_kernel.clone(),
         base_rootfs_path,
         data_dir: data_dir.clone(),
         data_disk,
@@ -286,7 +302,7 @@ async fn main() -> Result<()> {
     let build_kernel = data_dir.join("build-kernel").join("vmlinux.bin");
     // Non-fatal: a build-provisioning gap disables builds but must not knock over
     // the (separate) runtime hosting path — the kernel here feeds only builds.
-    if let Err(e) = build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel) {
+    if let Err(e) = build_orchestrator::stage_kernel(&guest_kernel, &build_kernel) {
         tracing::warn!(error = %e, "build kernel staging failed; builds disabled until provisioned");
     }
     // Isolated build network (per-build TAP pool on the build bridge). Build VMs
@@ -857,12 +873,6 @@ async fn handle_deploy(
         anyhow::bail!("no deployed content for project {project_id}");
     }
 
-    let content_images_dir = plat.data_dir.join("content-images");
-    tokio::fs::create_dir_all(&content_images_dir).await?;
-    let content_image_path = content_images_dir.join(format!("{project_id}.ext4"));
-
-    rootfs::build_content_image(&content_dir, &content_image_path).await?;
-
     let alloc = match plat.store.get_vm_allocation(project_id)? {
         Some(existing) => {
             info!(project = %project_id, ip = %existing.ip, "reusing persisted IP");
@@ -882,21 +892,45 @@ async fn handle_deploy(
         }
     };
 
-    setup_tap(&alloc.tap_device).await?;
-
-    // Read what the fence + boot need, then DROP the platform lock: the RWO attach
-    // (first-deploy mkfs / reap+300ms / losetup) and the VM boot must NOT head-of-line
-    // block every other project on the single platform lock. Re-acquire only to commit.
+    // Read what the slow build + fence + boot need, then DROP the platform lock: the
+    // metadata-image build (mkfs + sha256 layer verify), the RWO attach (first-deploy
+    // mkfs / reap+300ms / losetup), and the VM boot must NOT head-of-line block every
+    // other project on the single platform lock. Re-acquire only to commit.
     let has_disk = check_project_has_volumes(&plat.data_dir, project_id)
         || plat.data_disk.exists(project_id).await.unwrap_or(false);
+    let data_dir = plat.data_dir.clone();
     let dd = plat.data_disk.clone();
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
     let firecracker_bin = plat.firecracker_bin.clone();
     let kernel_path = plat.kernel_path.clone();
     let rootfs_path = plat.base_rootfs_path.clone();
-    let runtime_dir = plat.data_dir.join("run");
+    let runtime_dir = data_dir.join("run");
     drop(plat);
+
+    setup_tap(&alloc.tap_device).await?;
+
+    // Build the per-project metadata image (device map + manifests + static sites)
+    // and resolve the erofs layer blobs to attach. Replaces the flat content image:
+    // a layered server's root is an overlay of app:runtime:base, so the runtime VM
+    // gets the metadata image (vdb) + the layer blobs (vdc..) instead of one blob.
+    let content_images_dir = data_dir.join("content-images");
+    tokio::fs::create_dir_all(&content_images_dir).await?;
+    let metadata_image_path = content_images_dir.join(format!("{project_id}.ext4"));
+    let plan = {
+        let content_dir = content_dir.clone();
+        let store_dir = data_dir.join("baselayers");
+        let out = metadata_image_path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<layer_plan::LayerPlan> {
+            // verify=true: cold-boot deploy re-checks every tenant + platform blob's
+            // sha256 before it can be attached to a VM.
+            let plan = layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, true)?;
+            layer_plan::build_metadata_image(&content_dir, &plan, &out)?;
+            Ok(plan)
+        })
+        .await
+        .context("metadata image build task")??
+    };
 
     // Fence the data disk read-write-once for projects that declare volumes (or
     // already have a disk): acquire the lease + attach via the RWO provider, preempting
@@ -912,7 +946,8 @@ async fn handle_deploy(
         firecracker_bin,
         kernel_path,
         rootfs_path,
-        content_image_path: Some(content_image_path),
+        metadata_image_path: Some(metadata_image_path),
+        layer_paths: plan.layer_paths.clone(),
         data_disk_path: disk_guard.as_ref().map(|g| g.device()),
         vcpu_count: 4,
         mem_size_mib: 3072,
@@ -1204,7 +1239,9 @@ async fn wake_project_inner(
         }
     };
 
-    let content_image_path = plat
+    // The metadata image already exists from deploy (with `_layers.json` baked in);
+    // wake reuses it as-is — no rebuild.
+    let metadata_image_path = plat
         .data_dir
         .join("content-images")
         .join(format!("{project_id}.ext4"));
@@ -1218,11 +1255,19 @@ async fn wake_project_inner(
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
 
+    // The erofs layer attach order for the cold-boot fallback (restore re-derives
+    // drives from the snapshot, so this only matters when restore fails/misses). Read
+    // the sidecar PAIRED with the metadata image — NOT a recompute from `live`, which
+    // can drift from the (last successfully built) image's baked `_layers.json` and
+    // mis-assign device letters. Absent ⇒ legacy/static image with no layers.
+    let layer_paths = layer_plan::read_layer_paths(&metadata_image_path);
+
     let mut config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
         rootfs_path: plat.base_rootfs_path.clone(),
-        content_image_path: Some(content_image_path),
+        metadata_image_path: Some(metadata_image_path),
+        layer_paths,
         data_disk_path: None,
         vcpu_count: 4,
         mem_size_mib: 3072,

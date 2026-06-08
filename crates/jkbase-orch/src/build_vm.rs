@@ -102,7 +102,11 @@ pub struct BuildVmConfig {
     pub cgroup_mem_max_bytes: u64,
     /// cgroup-v2 `cpu.max` value, e.g. `"400000 100000"` (4 vCPU equiv).
     pub cgroup_cpu_max: String,
-    /// Optional secondary output-size cap via `--resource-limit fsize=`.
+    /// Process-wide `RLIMIT_FSIZE` (bytes) on Firecracker via `--resource-limit
+    /// fsize=`. It bounds EVERY file FC writes — chiefly the RW drive backing
+    /// files — so it MUST be >= the largest RW drive (scratch/output/cache), or a
+    /// guest write past the limit's offset SIGXFSZ-kills the VM. It is not the
+    /// build-artifact cap (that is the fixed output-drive size). `None` → unbounded.
     pub fsize_limit_bytes: Option<u64>,
     /// Console-log byte ceiling (enforcement is a TODO — see module docs).
     pub console_log_max_bytes: u64,
@@ -122,6 +126,12 @@ pub struct BuildVmConfig {
     /// Egress proxy URL exposed to the build (becomes `HTTP(S)_PROXY`), passed to
     /// the guest via the kernel cmdline (`jkbase.proxy=`).
     pub egress_proxy: Option<String>,
+    /// Language hint (e.g. `"bun"`) for the in-VM lifecycle's detect, passed via
+    /// the kernel cmdline (`jkbase.lang=`). `None` → the guest auto-detects.
+    pub lang_hint: Option<String>,
+    /// Request the layered artifact (content-addressed erofs layers + index.json)
+    /// instead of the flat `rootfs.tar.gz` — passed as `jkbase.export=layered`.
+    pub export_layered: bool,
     /// Max wall-time the FETCH phase may hold the network before the host
     /// force-seals — even if the guest never signals fetch-complete (so a hostile
     /// build gets the network for at most this long).
@@ -364,6 +374,16 @@ impl BuildVm {
         }
         if let Some(proxy) = &config.egress_proxy {
             boot_args.push_str(&format!(" jkbase.proxy={proxy}"));
+        }
+        if let Some(lang) = &config.lang_hint
+            && !lang.is_empty()
+            && lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            // Safe token only (it lands verbatim on the kernel cmdline).
+            boot_args.push_str(&format!(" jkbase.lang={lang}"));
+        }
+        if config.export_layered {
+            boot_args.push_str(" jkbase.export=layered");
         }
         client
             .set_boot_source(&BootSource {

@@ -10,7 +10,13 @@ pub struct VmConfig {
     pub firecracker_bin: PathBuf,
     pub kernel_path: PathBuf,
     pub rootfs_path: PathBuf,
-    pub content_image_path: Option<PathBuf>,
+    /// Per-project metadata image (RO ext4): `_servers`/`_routes`/`_sites`/
+    /// `_functions` + the host-written `_layers.json`. Attached as `vdb`.
+    pub metadata_image_path: Option<PathBuf>,
+    /// Content-addressed erofs layer blobs (base, runtime, then one app layer per
+    /// server), attached RO as `vdc..` in this exact order. The host bakes the
+    /// matching device assignment into `_layers.json` inside the metadata image.
+    pub layer_paths: Vec<PathBuf>,
     pub data_disk_path: Option<PathBuf>,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
@@ -109,11 +115,26 @@ impl VmInstance {
             })
             .await?;
 
-        if let Some(content_path) = &config.content_image_path {
+        // Drive attach order fixes the guest device letters (Firecracker assigns
+        // vda, vdb, vdc… in PUT order, root first): rootfs=vda, metadata=vdb, the
+        // erofs layers=vdc.., then the data disk last. The host's `_layers.json`
+        // encodes this same assignment so the agent never hardcodes a letter.
+        if let Some(meta_path) = &config.metadata_image_path {
             client
                 .set_drive(&Drive {
-                    drive_id: "content".to_string(),
-                    path_on_host: content_path.to_string_lossy().to_string(),
+                    drive_id: "metadata".to_string(),
+                    path_on_host: meta_path.to_string_lossy().to_string(),
+                    is_root_device: false,
+                    is_read_only: true,
+                })
+                .await?;
+        }
+
+        for (i, layer) in config.layer_paths.iter().enumerate() {
+            client
+                .set_drive(&Drive {
+                    drive_id: format!("layer{i}"),
+                    path_on_host: layer.to_string_lossy().to_string(),
                     is_root_device: false,
                     is_read_only: true,
                 })
@@ -121,7 +142,7 @@ impl VmInstance {
         }
 
         if let Some(data_path) = &config.data_disk_path {
-            info!(id, data_disk = %data_path.display(), "attaching data disk as /dev/vdc");
+            info!(id, data_disk = %data_path.display(), "attaching data disk (drive id `data`, last)");
             client
                 .set_drive(&Drive {
                     drive_id: "data".to_string(),

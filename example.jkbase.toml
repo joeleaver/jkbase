@@ -5,11 +5,22 @@ name = "my-app"
 public = "./dist"
 spa = true
 
+# Server-side build: push raw source, the platform builds it (no Dockerfile).
+# `language` is optional — it's auto-detected from the source (e.g. bun.lock /
+# bun.lockb / a "bun@…" packageManager). Bun is the lead language; Node/Python/Go
+# build on the same lifecycle.
 [servers.api]
-dockerfile = "./Dockerfile"
+source = "./server"
+language = "bun"
 port = 8080
 health_check = { path = "/health", interval = "10s", timeout = "5s" }
 volumes = [{ name = "data", mount = "/app/data" }]
+
+# Bring-your-own container is a kept fallback, not a requirement:
+#   [servers.api]
+#   builder = "dockerfile"
+#   dockerfile = "./Dockerfile"
+#   port = 8080
 
 [routes]
 "/api/*" = { service = "server", name = "api" }

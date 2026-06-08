@@ -118,6 +118,8 @@ esac
         guest_ip: Some(GUEST.to_string()),
         gateway_ip: Some(GW.to_string()),
         egress_proxy: Some(format!("http://{GW}:{PORT}")), // non-empty → two-phase
+        lang_hint: None,
+        export_layered: false,
         fetch_deadline: Duration::from_secs(20),
         seal: Some(seal),
     };

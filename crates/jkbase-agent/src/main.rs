@@ -11,6 +11,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use jkbase_common::layers::RuntimeLayers;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -105,11 +107,15 @@ fn mount_content_drive(target: &str) {
     }
 }
 
-fn mount_data_disk() {
+fn mount_data_disk(device: Option<&str>) {
     use std::ffi::CString;
     use std::ptr;
 
-    let device = "/dev/vdc";
+    // The host writes the data-disk device into _layers.json. Fall back to the
+    // legacy fixed slot for pre-layered content images, where the data disk was
+    // attached right after the content drive (/dev/vdc). With no layers attached,
+    // the layered layout also lands the data disk at /dev/vdc, so this is safe.
+    let device = device.unwrap_or("/dev/vdc");
     let target = "/mnt/data";
 
     if !std::path::Path::new(device).exists() {
@@ -130,6 +136,93 @@ fn mount_data_disk() {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Read the host-written `_layers.json` from the metadata image, if present.
+/// Absent ⇒ a legacy flat content image (chroot servers; no erofs layers).
+fn load_runtime_layers(serve_dir: &Path) -> Option<RuntimeLayers> {
+    let path = serve_dir.join(RuntimeLayers::FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<RuntimeLayers>(&content) {
+        Ok(rl) => Some(rl),
+        Err(e) => {
+            eprintln!("failed to parse {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Mount each distinct erofs layer block device read-only under /tmp/layers, and
+/// return `server name` → its ordered lowerdir mountpoints (app first, base last)
+/// for the supervisor to overlay. A server whose layers don't all mount is omitted
+/// (it won't be started layered).
+fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
+    use std::ffi::CString;
+    use std::ptr;
+
+    let base = Path::new("/tmp/layers");
+    let _ = std::fs::create_dir_all(base);
+
+    let mountpoint_for = |device: &str| -> PathBuf {
+        let name = Path::new(device)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("dev");
+        base.join(name)
+    };
+
+    // Mount each distinct device exactly once.
+    let mut mounted: HashMap<String, PathBuf> = HashMap::new();
+    for server in rl.servers.values() {
+        for device in &server.layers {
+            if mounted.contains_key(device) {
+                continue;
+            }
+            if !Path::new(device).exists() {
+                eprintln!("layer device {device} not present; skipping");
+                continue;
+            }
+            let mp = mountpoint_for(device);
+            let _ = std::fs::create_dir_all(&mp);
+            let src = CString::new(device.as_bytes()).unwrap();
+            let tgt = CString::new(mp.to_string_lossy().as_bytes()).unwrap();
+            let fst = CString::new("erofs").unwrap();
+            let ret = unsafe {
+                libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, ptr::null())
+            };
+            if ret != 0 {
+                eprintln!(
+                    "failed to mount erofs {device} at {}: {}",
+                    mp.display(),
+                    std::io::Error::last_os_error()
+                );
+                continue;
+            }
+            mounted.insert(device.clone(), mp);
+        }
+    }
+
+    // Resolve each server's ordered devices to mountpoints.
+    let mut map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for (name, server) in &rl.servers {
+        let mut dirs = Vec::with_capacity(server.layers.len());
+        let mut ok = true;
+        for device in &server.layers {
+            match mounted.get(device) {
+                Some(mp) => dirs.push(mp.clone()),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && !dirs.is_empty() {
+            map.insert(name.clone(), dirs);
+        } else {
+            eprintln!("server '{name}' has unmounted layers; will not start layered");
+        }
+    }
+    map
 }
 
 fn is_pid1() -> bool {
@@ -175,9 +268,26 @@ async fn main() -> Result<()> {
     );
     let servers_dir = serve_dir.join("_servers");
 
+    let mut layer_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
     if is_pid1() {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
-        mount_data_disk();
+        // The metadata image carries _layers.json describing this boot's device
+        // assignment: the data-disk device and each server's erofs overlay stack.
+        match load_runtime_layers(&serve_dir) {
+            Some(rl) => {
+                // Layered image: mount the data disk only if the host mapped one
+                // (the fixed /dev/vdc slot is now a layer, not a data disk), then
+                // compose the erofs layer stack.
+                if let Some(dev) = rl.data_device.as_deref() {
+                    mount_data_disk(Some(dev));
+                }
+                layer_map = mount_layers(&rl);
+            }
+            None => {
+                // Legacy flat content image: data disk at the fixed /dev/vdc slot.
+                mount_data_disk(None);
+            }
+        }
     }
 
     let mut functions = FunctionRuntime::new();
@@ -190,7 +300,7 @@ async fn main() -> Result<()> {
         info!(functions = ?func_names, "loaded WASM functions");
     }
 
-    let containers = Arc::new(ContainerSupervisor::new(servers_dir));
+    let containers = Arc::new(ContainerSupervisor::new(servers_dir, layer_map));
     if let Err(e) = containers.start_all().await {
         error!(error = %e, "failed to start server containers");
     }
@@ -381,7 +491,13 @@ async fn handle_request(
         }
     }
 
-    // Fall through to default static file serving
+    // Fall through to default static file serving. handle_static serves the image
+    // ROOT, which holds the host-internal `_`-prefixed control files
+    // (`_servers/*.json` carries the app env, plus `_routes`/`_sites`/`_layers`/
+    // `_layerpaths`/`_functions`) — so it refuses any request that resolves onto a
+    // `_`-prefixed top-level entry, keeping tenant config off the public surface.
+    // (Site roots `_site_<name>/` are served via the site paths above, where
+    // `_`-prefixed framework dirs like `_next/` remain legitimate.)
     static_server::handle_static(&state.serve_dir, req).await
 }
 

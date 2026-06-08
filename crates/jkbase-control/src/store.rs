@@ -98,6 +98,12 @@ pub struct DeploymentMeta {
     pub project_id: String,
     pub version: u64,
     pub created_at: u64,
+    /// Content-addressed layer digests this version deploys (base + app). Used to
+    /// roll back to the exact layer set without rebuilding, and to refcount the
+    /// shared base-store on prune so a blob a retained version still references is
+    /// never GC'd. Empty for legacy (flat) deployments.
+    #[serde(default)]
+    pub layer_digests: Vec<String>,
 }
 
 /// Lifecycle phase of a build job, or of one of its per-target sub-builds.
@@ -138,6 +144,19 @@ pub struct BuildTargetStatus {
     pub started_at: Option<u64>,
     #[serde(default)]
     pub finished_at: Option<u64>,
+    /// `sha256:…` of the toolchain image this target built with (provenance).
+    #[serde(default)]
+    pub builder_digest: Option<String>,
+    /// Platform-computed cache key (toolchain + lockfile + source digests).
+    #[serde(default)]
+    pub cache_key: Option<String>,
+    /// Resolved source commit when the build came via git-push; else `None`.
+    #[serde(default)]
+    pub source_commit: Option<String>,
+    /// Per-phase wall-clock timings reported by the in-VM lifecycle
+    /// (`detect`/`fetch`/`compile`/`export`), in milliseconds.
+    #[serde(default)]
+    pub duration_breakdown_ms: std::collections::BTreeMap<String, u64>,
 }
 
 /// One server-side build job: the `POST /build` intake fans out per-target build
@@ -165,6 +184,9 @@ pub struct BuildRecord {
     /// Set on failure: the terminal error summary.
     #[serde(default)]
     pub error: Option<String>,
+    /// Resolved source commit when the build came via git-push; else `None`.
+    #[serde(default)]
+    pub source_commit: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -1204,7 +1226,39 @@ mod tests {
             project_id: project.to_string(),
             version,
             created_at: version, // arbitrary but ordered
+            layer_digests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn provenance_fields_are_backward_compatible() {
+        // Records written before B2 deserialize with the new fields defaulted.
+        let dm: DeploymentMeta =
+            serde_json::from_str(r#"{"project_id":"p","version":3,"created_at":7}"#).unwrap();
+        assert!(dm.layer_digests.is_empty());
+
+        let ts: BuildTargetStatus =
+            serde_json::from_str(r#"{"name":"web","kind":"server","phase":"succeeded"}"#).unwrap();
+        assert!(ts.builder_digest.is_none());
+        assert!(ts.cache_key.is_none());
+        assert!(ts.source_commit.is_none());
+        assert!(ts.duration_breakdown_ms.is_empty());
+        assert!(!ts.cache_hit);
+
+        let br: BuildRecord = serde_json::from_str(
+            r#"{"project_id":"p","build_id":1,"phase":"queued","created_at":0,"updated_at":0}"#,
+        )
+        .unwrap();
+        assert!(br.source_commit.is_none());
+
+        // New values round-trip through JSON.
+        let mut ts2 = ts.clone();
+        ts2.builder_digest = Some("sha256:abc".into());
+        ts2.duration_breakdown_ms.insert("compile".into(), 1200);
+        let back: BuildTargetStatus =
+            serde_json::from_str(&serde_json::to_string(&ts2).unwrap()).unwrap();
+        assert_eq!(back.builder_digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(back.duration_breakdown_ms.get("compile"), Some(&1200));
     }
 
     #[test]

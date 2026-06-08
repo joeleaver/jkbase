@@ -1758,9 +1758,11 @@ dependencies = [
  "jkbase-orch",
  "jkbase-proxy",
  "jkbase-substrate",
+ "jkbuild-types",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tokio",
  "toml 0.8.23",
@@ -1783,6 +1785,29 @@ dependencies = [
  "tokio",
  "tokio-util",
  "trybuild",
+]
+
+[[package]]
+name = "jkbuild"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "jkbuild-types",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
+name = "jkbuild-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

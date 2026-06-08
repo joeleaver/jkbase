@@ -40,52 +40,6 @@ rmdir "$MOUNT_DIR"
     Ok(())
 }
 
-/// Build a content image containing only the static files for a project.
-/// Small and fast to create — just the deployed files.
-pub async fn build_content_image(content_dir: &Path, output: &Path) -> Result<()> {
-    info!(output = %output.display(), "building content image");
-
-    let script = format!(
-        r#"
-set -euo pipefail
-IMAGE="{output}"
-
-# Unmount stale loop mounts from a previous failed build
-if losetup -j "$IMAGE" 2>/dev/null | grep -q .; then
-    for mp in $(findmnt -rn -S "$IMAGE" -o TARGET 2>/dev/null); do
-        umount "$mp" 2>/dev/null || true
-        rmdir "$mp" 2>/dev/null || true
-    done
-    losetup -d $(losetup -j "$IMAGE" -O NAME -n 2>/dev/null) 2>/dev/null || true
-fi
-
-MOUNT_DIR=$(mktemp -d)
-
-# Size the image to fit the content (minimum 4MB, 10% overhead for ext4 metadata)
-CONTENT_SIZE_KB=$(du -sk "{content}/" | cut -f1)
-OVERHEAD=$(( CONTENT_SIZE_KB / 10 ))
-if [ "$OVERHEAD" -lt 4096 ]; then OVERHEAD=4096; fi
-SIZE_KB=$(( CONTENT_SIZE_KB + OVERHEAD ))
-
-dd if=/dev/zero of="$IMAGE" bs=1K count=$SIZE_KB status=none
-mkfs.ext4 -F -q -m 0 -O ^has_journal "$IMAGE"
-mount -o loop "$IMAGE" "$MOUNT_DIR"
-
-cp -a "{content}"/. "$MOUNT_DIR/"
-
-umount "$MOUNT_DIR"
-rmdir "$MOUNT_DIR"
-"#,
-        output = output.display(),
-        content = content_dir.display(),
-    );
-
-    run_sudo_script(&script).await?;
-
-    info!(output = %output.display(), "content image built");
-    Ok(())
-}
-
 async fn run_sudo_script(script: &str) -> Result<()> {
     let status = Command::new("sudo")
         .arg("bash")

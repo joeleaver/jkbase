@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
         guest_ip: None,
         gateway_ip: None,
         egress_proxy: None,
+        lang_hint: None,
+        export_layered: false,
         fetch_deadline: Duration::from_secs(120),
         seal: None,
     };
