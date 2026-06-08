@@ -42,9 +42,14 @@ impl Buildpack for BunBuildpack {
         std::fs::create_dir_all(&bun_cache).ok();
 
         let mut cmd = Command::new(BUN_BIN);
-        cmd.arg("install")
-            .arg("--frozen-lockfile")
-            .current_dir(ctx.app_dir)
+        cmd.arg("install");
+        // `--frozen-lockfile` requires a lockfile to exist; only enforce it when
+        // one is present (a lockfile-less project still installs reproducibly
+        // enough offline since the seal forbids drift).
+        if has_lockfile(ctx.app_dir) {
+            cmd.arg("--frozen-lockfile");
+        }
+        cmd.current_dir(ctx.app_dir)
             .env("BUN_INSTALL_CACHE_DIR", &bun_cache);
         if let Some(proxy) = &ctx.proxy {
             // Bun honours the standard proxy env vars for registry.npmjs.org.
@@ -210,6 +215,10 @@ fn package_declares_bun(pkg: &serde_json::Value) -> bool {
         .and_then(|e| e.get("bun"))
         .is_some();
     pm_is_bun || engines_bun
+}
+
+fn has_lockfile(app_dir: &Path) -> bool {
+    app_dir.join("bun.lock").exists() || app_dir.join("bun.lockb").exists()
 }
 
 fn has_build_script(app_dir: &Path) -> bool {

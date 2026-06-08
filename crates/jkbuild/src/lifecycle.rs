@@ -6,18 +6,22 @@
 //! source's `build.sh`. The host jail is the security boundary; this binary just
 //! drives the build and writes `/out`.
 //!
-//! Mounts/overlay/seal/reboot are shell-outs (busybox/util-linux in the toolchain
-//! image), mirroring `build-runner.sh`. This path is exercised on the KVM box, not
-//! in CI; the pure helpers ([`parse_cmdline_value`]) and the detect/build/export
-//! logic are unit-tested.
+//! Early-boot mounts, the seal wait, and reboot use **libc/std directly** — NOT
+//! shell-outs — because the Wolfi toolchain image's busybox does not ship the
+//! `mount`/`reboot` applets. This path is exercised on the KVM box; the pure
+//! helpers ([`parse_cmdline_value`]) and the detect/build/export logic are
+//! unit-tested.
 
 use crate::buildpack::{BuildContext, BuildOutput, DetectContext};
 use crate::env::BuildEnv;
 use crate::{buildpacks, export};
 use anyhow::{Context, Result};
 use jkbuild_types::{CacheMeta, Index, FETCH_COMPLETE_MARKER};
+use std::ffi::CString;
+use std::io::Write;
+use std::net::TcpStream;
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 const SRC: &str = "/src";
 const OUT: &str = "/out";
@@ -77,7 +81,6 @@ pub fn run() -> Result<i32> {
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
-            // Surface the failure in the build log the host ships to the tenant.
             let _ = append_log(&format!("jkbuild: build failed: {e:#}\n"));
             1
         }
@@ -85,8 +88,7 @@ pub fn run() -> Result<i32> {
 
     if is_pid1() {
         let _ = std::fs::write(format!("{OUT}/status"), code.to_string());
-        let _ = Command::new("sync").status();
-        let _ = Command::new("reboot").arg("-f").status();
+        reboot();
     }
     Ok(code)
 }
@@ -132,6 +134,7 @@ fn drive(proxy: Option<String>, lang: Option<&str>, mode: ExportMode) -> Result<
         chosen.fetch(&mut ctx).context("fetch phase")?;
         // Tell the host it may seal the network now.
         println!("{FETCH_COMPLETE_MARKER}");
+        let _ = std::io::stdout().flush();
         wait_for_seal(proxy.as_deref());
         ctx.proxy = None; // network is gone; compile must be offline
     } else {
@@ -181,55 +184,112 @@ fn export_artifact(output: &BuildOutput, mode: ExportMode) -> Result<()> {
     Ok(())
 }
 
+/// Recursively copy `/src` into the writable workspace (preserving symlinks).
 fn prepare_workspace() -> Result<()> {
-    std::fs::create_dir_all(WORKSPACE).ok();
-    // `cp -a /src/. /scratch/workspace/` — preserve perms/symlinks, copy contents.
-    let status = Command::new("cp")
-        .arg("-a")
-        .arg(format!("{SRC}/."))
-        .arg(format!("{WORKSPACE}/"))
-        .status()
-        .context("copying source into workspace")?;
-    if !status.success() {
-        anyhow::bail!("failed to stage source into {WORKSPACE}");
+    let ws = Path::new(WORKSPACE);
+    std::fs::create_dir_all(ws).ok();
+    copy_tree(Path::new(SRC), ws).context("staging source into workspace")?;
+    // The source drive is an ext4 fs, so its mountpoint root carries a
+    // `lost+found` — strip it so it never lands in the app layer.
+    let _ = std::fs::remove_dir_all(ws.join("lost+found"));
+    Ok(())
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::symlink;
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            let _ = std::fs::remove_file(&to);
+            symlink(target, &to)?;
+        } else if ft.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
     }
     Ok(())
 }
 
-/// Best-effort early mounts mirroring `build-runner.sh` (proc/sys/dev/tmp + the
-/// drive set). Errors are ignored — a missing optional drive must not abort.
+/// Best-effort early mounts mirroring `build-runner.sh`, via libc (the image's
+/// busybox lacks a `mount` applet). Errors are logged, not fatal — a missing
+/// optional drive (e.g. cache) must not abort the build.
 fn mount_early() {
-    let _ = Command::new("mount").args(["-t", "proc", "proc", "/proc"]).status();
-    let _ = Command::new("mount").args(["-t", "sysfs", "sysfs", "/sys"]).status();
-    let _ = Command::new("mount").args(["-t", "devtmpfs", "devtmpfs", "/dev"]).status();
-    let _ = Command::new("mount").args(["-t", "tmpfs", "tmpfs", "/tmp"]).status();
-    for dir in ["/scratch", SRC, OUT, CACHE] {
+    let _ = std::fs::create_dir_all("/proc");
+    mount_log("proc", "/proc", "proc", 0);
+    mount_log("sysfs", "/sys", "sysfs", 0);
+    mount_log("devtmpfs", "/dev", "devtmpfs", 0);
+    mount_log("tmpfs", "/tmp", "tmpfs", 0);
+    for dir in [SRC, OUT, CACHE, "/scratch"] {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = Command::new("mount").args(["/dev/vdb", "/scratch"]).status();
-    let _ = Command::new("mount").args(["-t", "ext4", "-o", "ro", "/dev/vdc", SRC]).status();
-    let _ = Command::new("mount").args(["/dev/vdd", OUT]).status();
-    let _ = Command::new("mount").args(["/dev/vde", CACHE]).status(); // optional
+    // vdb scratch (RW), vdc source (RO), vdd output (RW), vde cache (RW, optional).
+    mount_log("/dev/vdb", "/scratch", "ext4", 0);
+    mount_log("/dev/vdc", SRC, "ext4", libc::MS_RDONLY);
+    mount_log("/dev/vdd", OUT, "ext4", 0);
+    mount_log("/dev/vde", CACHE, "ext4", 0);
 }
 
-/// Observe the host sealing the network (the proxy becoming unreachable). The host
-/// owns the TAP; we cannot bring the network back — this is observation only.
+fn mount_log(src: &str, target: &str, fstype: &str, flags: libc::c_ulong) {
+    if let Err(e) = mount(src, target, fstype, flags) {
+        eprintln!("jkbuild: mount {src} -> {target} ({fstype}) failed: {e}");
+    }
+}
+
+fn mount(src: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> std::io::Result<()> {
+    let src_c = CString::new(src).unwrap();
+    let tgt_c = CString::new(target).unwrap();
+    let fs_c = CString::new(fstype).unwrap();
+    let r = unsafe {
+        libc::mount(
+            src_c.as_ptr(),
+            tgt_c.as_ptr(),
+            fs_c.as_ptr(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Flush + reboot. As PID1 this is how a Firecracker x86 guest cleanly exits.
+fn reboot() -> ! {
+    unsafe {
+        libc::sync();
+        libc::reboot(libc::LINUX_REBOOT_CMD_RESTART);
+    }
+    // reboot only returns on failure; spin so PID1 never exits (which would panic
+    // the kernel before the host reads /out).
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Observe the host sealing the network (the proxy becoming unreachable) via TCP
+/// connect probes. The host owns the TAP; we cannot bring the network back.
 fn wait_for_seal(proxy: Option<&str>) {
     let Some(proxy) = proxy else { return };
     let (host, port) = split_proxy(proxy);
+    let authority = format!("{host}:{port}");
     for _ in 0..30 {
-        let reachable = Command::new("nc")
-            .args(["-w", "1", &host, &port])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        let reachable = std::net::ToSocketAddrs::to_socket_addrs(&authority)
+            .ok()
+            .and_then(|mut addrs| addrs.next())
+            .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(1)).is_ok())
             .unwrap_or(false);
         if !reachable {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -243,7 +303,6 @@ fn split_proxy(proxy: &str) -> (String, String) {
 }
 
 fn append_log(msg: &str) -> Result<()> {
-    use std::io::Write;
     eprint!("{msg}");
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -297,5 +356,23 @@ mod tests {
             split_proxy("10.0.0.1"),
             ("10.0.0.1".to_string(), "80".to_string())
         );
+    }
+
+    #[test]
+    fn copy_tree_preserves_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+        let d = std::env::temp_dir().join(format!("jkbuild-copytree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let src = d.join("src");
+        let dst = d.join("dst");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
+        symlink("a.txt", src.join("link")).unwrap();
+        copy_tree(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"world");
+        assert!(std::fs::symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
