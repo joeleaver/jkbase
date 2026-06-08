@@ -157,6 +157,19 @@ impl PlatformState {
     }
 }
 
+/// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
+/// dm-verity — required for the layered runtime) when present, else fall back to
+/// the historical `vmlinux.bin` so a server whose provisioning hasn't published
+/// 6.12 yet still boots. Used for both the runtime VM and the build-kernel source.
+fn resolve_guest_kernel(fc_dir: &std::path::Path) -> std::path::PathBuf {
+    let lts = fc_dir.join("vmlinux-6.12.92.bin");
+    if lts.exists() {
+        lts
+    } else {
+        fc_dir.join("vmlinux.bin")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
@@ -167,6 +180,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let data_dir = args.data_dir.clone();
+    let guest_kernel = resolve_guest_kernel(&args.fc_dir);
+    tracing::info!(kernel = %guest_kernel.display(), "guest kernel selected");
 
     tokio::fs::create_dir_all(&data_dir).await?;
 
@@ -207,7 +222,7 @@ async fn main() -> Result<()> {
         firecracker_bin: args
             .fc_dir
             .join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
-        kernel_path: args.fc_dir.join("vmlinux.bin"),
+        kernel_path: guest_kernel.clone(),
         base_rootfs_path,
         data_dir: data_dir.clone(),
         data_disk,
@@ -286,7 +301,7 @@ async fn main() -> Result<()> {
     let build_kernel = data_dir.join("build-kernel").join("vmlinux.bin");
     // Non-fatal: a build-provisioning gap disables builds but must not knock over
     // the (separate) runtime hosting path — the kernel here feeds only builds.
-    if let Err(e) = build_orchestrator::stage_kernel(&args.fc_dir.join("vmlinux.bin"), &build_kernel) {
+    if let Err(e) = build_orchestrator::stage_kernel(&guest_kernel, &build_kernel) {
         tracing::warn!(error = %e, "build kernel staging failed; builds disabled until provisioned");
     }
     // Isolated build network (per-build TAP pool on the build bridge). Build VMs
