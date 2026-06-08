@@ -102,7 +102,11 @@ pub struct BuildVmConfig {
     pub cgroup_mem_max_bytes: u64,
     /// cgroup-v2 `cpu.max` value, e.g. `"400000 100000"` (4 vCPU equiv).
     pub cgroup_cpu_max: String,
-    /// Optional secondary output-size cap via `--resource-limit fsize=`.
+    /// Process-wide `RLIMIT_FSIZE` (bytes) on Firecracker via `--resource-limit
+    /// fsize=`. It bounds EVERY file FC writes — chiefly the RW drive backing
+    /// files — so it MUST be >= the largest RW drive (scratch/output/cache), or a
+    /// guest write past the limit's offset SIGXFSZ-kills the VM. It is not the
+    /// build-artifact cap (that is the fixed output-drive size). `None` → unbounded.
     pub fsize_limit_bytes: Option<u64>,
     /// Console-log byte ceiling (enforcement is a TODO — see module docs).
     pub console_log_max_bytes: u64,

@@ -747,7 +747,12 @@ async fn build_one_target_inner(
         cgroup_pids_max: deps.cgroup_pids_max,
         cgroup_mem_max_bytes: deps.cgroup_mem_max_bytes,
         cgroup_cpu_max: deps.cgroup_cpu_max.clone(),
-        fsize_limit_bytes: Some(deps.output_size_bytes),
+        // RLIMIT_FSIZE is process-wide on Firecracker, so it must cover the
+        // LARGEST RW backing file it writes — the scratch drive, not just output
+        // (a 64 MiB cap with a 256 MiB scratch SIGXFSZ-kills any real build that
+        // writes past 64 MiB of scratch). The artifact size is already bounded by
+        // the fixed output-drive size. NB: include the cache image when wired.
+        fsize_limit_bytes: Some(deps.scratch_size_bytes.max(deps.output_size_bytes)),
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
@@ -1545,5 +1550,159 @@ esac
         assert_eq!(direct, "down", "direct egress must be blocked by the firewall");
         assert_eq!(sealed, "down", "compile phase must be sealed (offline)");
         println!("PASS: networked build — proxy allowlist + firewall + fetch-then-seal");
+    }
+
+    /// On-box: a real Bun server is built **through the orchestrator control
+    /// plane** — `run_project_build` resolves `language="bun"` →
+    /// `select_toolchain` picks `bun.ext4` → the `jkbuild` lifecycle runs
+    /// `bun install` in-VM → the flat `/rootfs.tar.gz` + `/manifest.json` are
+    /// collected into `staged/_servers/{name}.{tar.gz,json}` with the launch
+    /// contract intact (`cmd=[/opt/bun/bin/bun,run,start]`, `working_dir=/app`,
+    /// `NODE_ENV=production`). This proves the server-side wiring the
+    /// `bun_build_smoke` example exercises only at the build-VM layer. Offline
+    /// (no deps), so no egress proxy / seal.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       <test-bin> --ignored --nocapture bun_server_build_through_orchestrator
+    ///
+    /// Expects `$JKB_DATA/toolchains/bun.ext4`, a guest kernel at
+    /// `$JKB_DATA/vmlinux-6.12.92.bin` (or `vmlinux.bin`), all on one filesystem,
+    /// and the parent build cgroup provisioned. Skips cleanly if `bun.ext4` is
+    /// absent (toolchain not baked).
+    #[tokio::test]
+    #[ignore = "needs KVM + root + baked bun.ext4; set JKB_DATA + JKB_FC_RELEASE"]
+    async fn bun_server_build_through_orchestrator() {
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_FC_RELEASE");
+            return;
+        };
+        let toolchain_dir = data.join("toolchains");
+        if !toolchain_dir.join("bun.ext4").exists() {
+            eprintln!("skip: {}/bun.ext4 not baked", toolchain_dir.display());
+            return;
+        }
+        // Flat rung only needs a bootable kernel; prefer the 6.12 LTS image.
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+        };
+
+        // Fixture: a single Bun server, no Dockerfile, no deps. `language="bun"`
+        // is the authoritative detect hint (forwarded as `jkbase.lang=bun`).
+        let src = data.join("bun-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write(
+            src.join("jkbase.toml"),
+            r#"
+[project]
+name = "bunfix"
+[servers.api]
+source = "./server"
+language = "bun"
+port = 3000
+"#,
+        );
+        write(
+            src.join("server/server.ts"),
+            "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+        );
+        write(
+            src.join("server/package.json"),
+            "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+        );
+
+        let mut tarbuf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarbuf, flate2::Compression::fast());
+            let mut tb = tar::Builder::new(enc);
+            tb.append_dir_all(".", &src).unwrap();
+            tb.into_inner().unwrap().finish().unwrap();
+        }
+
+        let store = Store::open(&data.join("onbox-bun.redb")).unwrap();
+        let (project_id, build_id) = ("bunfix", 1u64);
+        store
+            .save_build(&BuildRecord {
+                project_id: project_id.into(),
+                build_id,
+                phase: BuildPhase::Building,
+                targets: vec![],
+                log_tail: String::new(),
+                phase_timings_ms: Default::default(),
+                deployed_version: None,
+                error: None,
+                source_commit: None,
+                created_at: now(),
+                updated_at: now(),
+            })
+            .unwrap();
+
+        let deps = Arc::new(BuildDeps {
+            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel,
+            data_dir: data.clone(),
+            deploy_dir: data.join("hosting"),
+            toolchain_dir,
+            store: store.clone(),
+            chroot_base: data.join("bj-bun"),
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+            parent_cgroup: "jkbase-build".into(),
+            uid: 100_000,
+            gid: 100_000,
+            timeout: Duration::from_secs(120),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            cgroup_pids_max: 512,
+            // Headroom above the 1 GiB guest so the bun build is not host-OOM-killed.
+            cgroup_mem_max_bytes: 1536 * 1024 * 1024,
+            cgroup_cpu_max: "200000 100000".into(),
+            scratch_size_bytes: 256 * 1024 * 1024,
+            output_size_bytes: 64 * 1024 * 1024,
+            console_log_max_bytes: 1024 * 1024,
+            max_concurrent: 1,
+            net: None,
+            fetch_deadline: Duration::from_secs(120),
+        });
+        std::fs::create_dir_all(&deps.chroot_base).unwrap();
+
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+            .await
+            .expect("bun server build should succeed");
+
+        // Flat server artifact assembled into the deploy shape.
+        assert!(staged.join("_servers/api.tar.gz").exists(), "api rootfs tarball");
+
+        // Manifest = jkbuild launch contract + jkbase.toml port.
+        let mani: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.join("_servers/api.json")).unwrap())
+                .unwrap();
+        assert_eq!(mani["port"], 3000);
+        assert_eq!(
+            mani["cmd"],
+            serde_json::json!(["/opt/bun/bin/bun", "run", "start"]),
+            "absolute Bun launch command"
+        );
+        assert_eq!(mani["working_dir"], "/app");
+        assert_eq!(mani["env"]["NODE_ENV"], "production");
+
+        // Per-target progress + billing recorded.
+        let rec = store.get_build(project_id, build_id).unwrap().unwrap();
+        assert_eq!(rec.targets.len(), 1);
+        assert_eq!(rec.targets[0].phase, BuildPhase::Succeeded);
+        let month_start = jkbase_control::store::month_start_epoch(now());
+        let billed = store
+            .sum_month_to_date(project_id, month_start)
+            .unwrap()
+            .build_seconds;
+        assert!(billed >= 1, "expected ≥1 build-second, got {billed}");
+
+        let _ = std::fs::remove_dir_all(&staged);
+        println!("PASS: run_project_build drove bun.ext4 -> flat server artifact + launch manifest");
     }
 }
