@@ -59,5 +59,18 @@ unzip -o -j "$bun_zip" -d "$ASSET_DIR" '*/bun' >/dev/null
 chmod 0755 "$ASSET_DIR/bun"
 echo "[install] bun staged: $("$ASSET_DIR/bun" --version 2>/dev/null || echo '(version check needs glibc match)')"
 
-echo "[install] done. apko=$BIN_DIR/apko bun=$ASSET_DIR/bun"
-echo "[install] ensure $BIN_DIR is on PATH, then run tools/build-image.sh"
+# Host layer tooling for tools/build-base-layer.sh (WS4): mkfs.erofs packs the
+# shared base/runtime erofs layers; fsverity is best-effort defense-in-depth on
+# the host blobs. These are OS packages, not Chainguard tarballs.
+if ! command -v mkfs.erofs >/dev/null 2>&1 || ! command -v fsverity >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "[install] erofs-utils + fsverity (host layer tooling) via apt"
+        sudo apt-get install -y -q erofs-utils fsverity || \
+            echo "[install] WARNING: could not install erofs-utils/fsverity; build-base-layer.sh needs mkfs.erofs" >&2
+    else
+        echo "[install] NOTE: install erofs-utils (mkfs.erofs) + fsverity for tools/build-base-layer.sh" >&2
+    fi
+fi
+
+echo "[install] done. apko=$BIN_DIR/apko bun=$ASSET_DIR/bun mkfs.erofs=$(command -v mkfs.erofs || echo MISSING)"
+echo "[install] ensure $BIN_DIR is on PATH, then run tools/build-image.sh + tools/build-base-layer.sh"
