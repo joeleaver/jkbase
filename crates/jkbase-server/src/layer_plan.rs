@@ -278,7 +278,12 @@ pub fn read_layer_paths(metadata_image: &Path) -> Vec<PathBuf> {
     if !metadata_image.exists() {
         return Vec::new();
     }
-    let dest = metadata_image.with_extension("layerpaths.tmp");
+    // Unique temp dest so two reads can't race on the same path.
+    let dest = metadata_image.with_extension(format!(
+        "layerpaths.{}.{}.tmp",
+        std::process::id(),
+        BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_file(&dest);
     let found = jkbase_orch::build_output::dump_file(
         metadata_image,
@@ -421,6 +426,67 @@ mod tests {
         let hex = "b".repeat(64);
         let f = format!("sha256-{hex}.erofs");
         assert_eq!(filename_to_digest(&f), format!("sha256:{hex}"));
+    }
+
+    #[test]
+    fn device_map_matches_attach_order() {
+        // Fabricate a store (base + bun runtime) and a one-server deployment, then
+        // assert the baked device map (`runtime_layers`) lines up with the attach
+        // order (`layer_paths`) that vm.rs PUTs as vdc.. — the load-bearing contract.
+        let root = std::env::temp_dir().join(format!("lp-dev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(store.join("x")).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+
+        let base_f = format!("sha256-{}.erofs", "a".repeat(64));
+        let rt_f = format!("sha256-{}.erofs", "b".repeat(64));
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        std::fs::write(store.join(&base_f), b"base").unwrap();
+        std::fs::write(store.join(&rt_f), b"rt").unwrap();
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+        std::fs::write(
+            store.join("platform.json"),
+            format!(
+                r#"{{"base":{{"digest":"sha256:{a}","file":"{base_f}"}},"runtimes":{{"bun":{{"digest":"sha256:{b}","file":"{rt_f}"}}}}}}"#,
+                a = "a".repeat(64),
+                b = "b".repeat(64),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_servers/api.json"),
+            format!(r#"{{"app_layer":"{app_f}","runtime":"bun","port":3000}}"#),
+        )
+        .unwrap();
+
+        let plan = compute_layer_plan(&deploy, &store, true, false).unwrap();
+
+        // Attach order vm.rs uses for vdc.. : [base, runtime, app].
+        assert_eq!(plan.layer_paths.len(), 3);
+        assert!(plan.layer_paths[0].ends_with(&base_f), "vdc = base");
+        assert!(plan.layer_paths[1].ends_with(&rt_f), "vdd = runtime");
+        assert!(plan.layer_paths[2].ends_with(&app_f), "vde = app");
+
+        // The server's overlay (app:runtime:base) must name the devices the attach
+        // order produces: app=vde(idx2), runtime=vdd(idx1), base=vdc(idx0).
+        let s = &plan.runtime_layers.servers["api"];
+        assert_eq!(s.layers, vec!["/dev/vde", "/dev/vdd", "/dev/vdc"]);
+
+        // Cross-check: each server-layer device letter indexes back to the right
+        // blob in layer_paths (device vd(c+i) ↔ layer_paths[i]).
+        for dev in &s.layers {
+            let letter = dev.chars().last().unwrap();
+            let idx = (letter as u8 - b'c') as usize;
+            assert!(idx < plan.layer_paths.len(), "{dev} maps into layer_paths");
+        }
+
+        // Data disk attaches after the 3 layers: vd(c+3) = vdf.
+        assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vdf"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

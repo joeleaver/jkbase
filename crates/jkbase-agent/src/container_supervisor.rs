@@ -534,9 +534,37 @@ fn spawn_server_layered(
         .clone()
         .unwrap_or_else(|| "/".to_string());
 
+    // Volumes (mirroring the flat chroot path's graceful degradation): only bind
+    // when the data disk is mounted, and create the source dir host-side first.
+    // Without this, a missing/failed data disk would hard-fail the server in the
+    // post-fork child (an opaque exit + restart loop) instead of warn-and-skip.
+    let volumes: Vec<VolumeMount> = if manifest.volumes.is_empty() {
+        Vec::new()
+    } else if std::path::Path::new("/mnt/data").exists() {
+        manifest
+            .volumes
+            .iter()
+            .filter_map(|v| {
+                let src = PathBuf::from("/mnt/data/volumes").join(&v.name);
+                match std::fs::create_dir_all(&src) {
+                    Ok(()) => Some(v.clone()),
+                    Err(e) => {
+                        warn!(server = %name, volume = %v.name, error = %e, "cannot create volume source; skipping");
+                        None
+                    }
+                }
+            })
+            .collect()
+    } else {
+        for v in &manifest.volumes {
+            warn!(server = %name, volume = %v.name, "no data disk mounted; skipping volume");
+        }
+        Vec::new()
+    };
+
     // Precompute the whole namespace recipe as CStrings before the fork — the
     // pre_exec closure runs between fork and exec and must not allocate.
-    let setup = LayeredSetup::build(&merged, &upper, &work, lowerdirs, &manifest.volumes, &working_dir)
+    let setup = LayeredSetup::build(&merged, &upper, &work, lowerdirs, &volumes, &working_dir)
         .with_context(|| format!("build layered setup for '{name}'"))?;
 
     let mut std_cmd = std::process::Command::new(&manifest.cmd[0]);
@@ -682,12 +710,13 @@ impl LayeredSetup {
             if libc::mount(self.c_devtmpfs.as_ptr(), self.dev_target.as_ptr(), self.c_devtmpfs.as_ptr(), 0, ptr::null()) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            // Bind persistent volumes (data disk) into the new root.
+            // Bind persistent volumes (data disk) into the new root. Best-effort: a
+            // volume that vanished between the host-side check and here must not kill
+            // the server — it runs without that volume, matching the flat path's
+            // graceful skip (the host-side check above is the observable warning).
             for (src, dst) in &self.volume_binds {
                 libc::mkdir(dst.as_ptr(), 0o755);
-                if libc::mount(src.as_ptr(), dst.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null()) != 0 {
-                    return Err(io::Error::last_os_error());
-                }
+                let _ = libc::mount(src.as_ptr(), dst.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null());
             }
             // pivot_root into the composed view.
             libc::mkdir(self.oldroot_dir.as_ptr(), 0o755);
