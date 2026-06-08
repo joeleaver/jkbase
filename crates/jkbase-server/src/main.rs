@@ -619,11 +619,9 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 /// Remove every per-project on-disk artifact (content image, data disk, snapshot,
 /// run dir, hosting tree, build workspace). Best-effort; absent paths are ignored.
 async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
-    let content_images = data_dir.join("content-images");
-    let _ = tokio::fs::remove_file(content_images.join(format!("{project_id}.ext4"))).await;
-    // The metadata image's paired layer-attach sidecar.
-    let _ = tokio::fs::remove_file(content_images.join(format!("{project_id}.ext4.layers.json")))
-        .await;
+    let _ =
+        tokio::fs::remove_file(data_dir.join("content-images").join(format!("{project_id}.ext4")))
+            .await;
     // Data disk: legacy `.ext4` plus the loop-managed `.img` + its holder record.
     let disks = data_dir.join("data-disks");
     for f in [format!("{project_id}.ext4"), format!("{project_id}.img"), format!("{project_id}.holder")] {

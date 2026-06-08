@@ -491,6 +491,22 @@ async fn handle_request(
         }
     }
 
+    // Never serve the host-internal control files at the image root (manifests,
+    // routes, sites, the layer device map + attach order, functions) from the public
+    // fallthrough — `_servers/*.json` carries the app's env, so exposing them to
+    // anyone hitting a path the routes/sites don't cover would leak tenant config.
+    // Site roots (`_site_<name>/`) are served via the site paths above, not here.
+    if path
+        .split('/')
+        .nth(1)
+        .is_some_and(|seg| seg.starts_with('_'))
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Full::new(Bytes::from("404 Not Found")))
+            .unwrap());
+    }
+
     // Fall through to default static file serving
     static_server::handle_static(&state.serve_dir, req).await
 }

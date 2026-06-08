@@ -262,25 +262,41 @@ pub fn compute_layer_plan(
     Ok(LayerPlan { layer_paths, runtime_layers })
 }
 
-/// The sidecar next to a metadata image holding the ordered erofs layer host paths
-/// (`layer_paths`) baked into that image's `_layers.json`. Read at wake so the
-/// cold-boot fallback attaches drives in the SAME order the image's device map
-/// expects — instead of recomputing from `live`, which can drift if the live
-/// deployment advanced past the (last successfully built) metadata image.
-pub fn sidecar_path(metadata_image: &Path) -> PathBuf {
-    let mut name = metadata_image.file_name().unwrap_or_default().to_os_string();
-    name.push(".layers.json");
-    metadata_image.with_file_name(name)
-}
+/// Host-only file embedded in the metadata image holding the ordered erofs layer
+/// host paths (`layer_paths`) the cold-boot fallback must attach, in the SAME order
+/// as the image's `_layers.json` device map. Embedded INSIDE the image (not an
+/// external sibling) so the single image rename publishes it ATOMICALLY with the
+/// device map — two separate files can't be published atomically, so a sibling
+/// sidecar could desync (image present, paths missing → silent device mismatch).
+/// The agent never reads it (it's a host concern); a static-serve guard keeps it,
+/// and the other `_`-prefixed control files, off the public surface.
+const LAYER_PATHS_FILE: &str = "_layerpaths.json";
 
-/// Read the persisted `layer_paths` paired with a metadata image, or an empty vec
-/// when the sidecar is absent (legacy flat image / static-only project).
+/// Read the `layer_paths` embedded in a metadata image via debugfs (no mount —
+/// P0-3), or an empty vec when absent (legacy flat image / static-only project).
 pub fn read_layer_paths(metadata_image: &Path) -> Vec<PathBuf> {
-    let path = sidecar_path(metadata_image);
-    let Ok(bytes) = std::fs::read(&path) else { return Vec::new() };
-    serde_json::from_slice::<Vec<String>>(&bytes)
-        .map(|v| v.into_iter().map(PathBuf::from).collect())
-        .unwrap_or_default()
+    if !metadata_image.exists() {
+        return Vec::new();
+    }
+    let dest = metadata_image.with_extension("layerpaths.tmp");
+    let _ = std::fs::remove_file(&dest);
+    let found = jkbase_orch::build_output::dump_file(
+        metadata_image,
+        &format!("/{LAYER_PATHS_FILE}"),
+        &dest,
+    )
+    .unwrap_or(false);
+    let result = if found {
+        std::fs::read(&dest)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+            .map(|v| v.into_iter().map(PathBuf::from).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let _ = std::fs::remove_file(&dest);
+    result
 }
 
 /// Monotonic suffix so concurrent / orphaned builds use distinct temp paths.
@@ -299,11 +315,11 @@ impl Drop for TempCleanup {
 
 /// Build the per-project metadata image: the deployment tree (manifests, routes,
 /// sites, functions) **minus the erofs blobs** (those attach as drives), plus the
-/// host-written `_layers.json` device map. Read-only ext4, built mount-free
-/// (`mkfs.ext4 -d`, P0-3). The finished image is published by an atomic rename and
-/// paired with a `.layers.json` sidecar (the ordered attach paths), so a concurrent
-/// or orphaned build can never leave a half-written or stage-colliding image, and a
-/// wake always sees an image whose device map matches its sidecar.
+/// host-written `_layers.json` device map AND the host-only `_layerpaths.json`
+/// attach order. Read-only ext4, built mount-free (`mkfs.ext4 -d`, P0-3). Built into
+/// UNIQUE temp paths and published by a SINGLE atomic rename, so a concurrent or
+/// orphaned build can never leave a half-written or stage-colliding image, and the
+/// device map + attach order are always published together (no desync window).
 pub fn build_metadata_image(deployment_dir: &Path, plan: &LayerPlan, out: &Path) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
     let base = out.file_name().and_then(|n| n.to_str()).unwrap_or("metadata.ext4");
@@ -314,9 +330,8 @@ pub fn build_metadata_image(deployment_dir: &Path, plan: &LayerPlan, out: &Path)
     );
     let stage = parent.join(format!("{uniq}.stage"));
     let tmp_img = parent.join(format!("{uniq}.tmp"));
-    let tmp_sidecar = parent.join(format!("{uniq}.sidecar"));
     // Removed on every return (success or error) — no leaked .stage / .tmp.
-    let _cleanup = TempCleanup(vec![stage.clone(), tmp_img.clone(), tmp_sidecar.clone()]);
+    let _cleanup = TempCleanup(vec![stage.clone(), tmp_img.clone()]);
 
     std::fs::create_dir_all(&stage)?;
     // Copy the deployment tree except `_layers/` (the erofs blobs are attached as
@@ -324,25 +339,27 @@ pub fn build_metadata_image(deployment_dir: &Path, plan: &LayerPlan, out: &Path)
     copy_dir_except(deployment_dir, &stage, "_layers")
         .with_context(|| format!("stage metadata from {}", deployment_dir.display()))?;
 
-    // Bake the device map the agent reads at boot.
-    let layers_json = serde_json::to_vec_pretty(&plan.runtime_layers)?;
-    std::fs::write(stage.join(RuntimeLayers::FILE), layers_json)?;
-
-    build_ro_ext4_from_dir(&stage, &tmp_img, 8)
-        .with_context(|| format!("mkfs metadata image for {}", out.display()))?;
-
-    // The attach-order sidecar paired with this exact image.
+    // Bake the device map the agent reads at boot...
+    std::fs::write(
+        stage.join(RuntimeLayers::FILE),
+        serde_json::to_vec_pretty(&plan.runtime_layers)?,
+    )?;
+    // ...and the host-only attach order (read back at wake via debugfs), so both are
+    // published atomically by the single image rename below.
     let paths: Vec<String> = plan
         .layer_paths
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    std::fs::write(&tmp_sidecar, serde_json::to_vec_pretty(&paths)?)?;
+    std::fs::write(stage.join(LAYER_PATHS_FILE), serde_json::to_vec_pretty(&paths)?)?;
 
-    // Publish: image first, then its sidecar — both atomic renames.
-    std::fs::rename(&tmp_img, out).with_context(|| format!("publish metadata image {}", out.display()))?;
-    std::fs::rename(&tmp_sidecar, sidecar_path(out))
-        .with_context(|| format!("publish layer sidecar for {}", out.display()))?;
+    build_ro_ext4_from_dir(&stage, &tmp_img, 8)
+        .with_context(|| format!("mkfs metadata image for {}", out.display()))?;
+
+    // Publish atomically: one rename of the finished image (with both control files
+    // already inside it).
+    std::fs::rename(&tmp_img, out)
+        .with_context(|| format!("publish metadata image {}", out.display()))?;
     Ok(())
 }
 
