@@ -18,6 +18,10 @@ const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules"
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
 const QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("quotas");
 const QUOTA_STATUS: TableDefinition<&str, &[u8]> = TableDefinition::new("quota_status");
+/// Per-project connected-repo trigger credentials (build · D): the git-push
+/// token fingerprint + rotatable webhook secrets. Kept out of the app-`SECRETS`
+/// table (those are tenant env vars) so the two never leak into each other.
+const REPO_TRIGGERS: TableDefinition<&str, &[u8]> = TableDefinition::new("repo_triggers");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
@@ -67,6 +71,29 @@ pub struct Secret {
     pub project_id: String,
     pub key: String,
     pub value: String,
+}
+
+/// One webhook HMAC secret with its mint time, so rotation can retire old
+/// secrets after a grace window (newest first in [`RepoTriggerConfig`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookSecret {
+    pub secret: String,
+    pub created_at: u64,
+}
+
+/// Per-project connected-repo build-trigger credentials (build · D). Stored
+/// once per project in the `REPO_TRIGGERS` table. Absent until the tenant mints
+/// a git-push token or a webhook secret.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepoTriggerConfig {
+    pub project_id: String,
+    /// SHA-256 (hex) of the per-project git-push token, or `None` if not minted.
+    /// The plaintext token is shown once at mint time and never stored.
+    pub git_token_fingerprint: Option<String>,
+    pub git_token_created_at: u64,
+    /// Rotatable webhook HMAC secrets, newest first (current + not-yet-retired).
+    #[serde(default)]
+    pub webhook_secrets: Vec<WebhookSecret>,
 }
 
 /// Metadata for one immutable deployment of a project. The artifacts live on
@@ -1106,6 +1133,41 @@ impl Store {
         let existed = {
             let mut table = txn.open_table(SECRETS)?;
             table.remove(compound_key.as_str())?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    // -- Connected-repo build triggers (build · D) --
+
+    /// Load a project's repo-trigger credentials, or `None` if it has none yet.
+    pub fn get_repo_trigger(&self, project_id: &str) -> Result<Option<RepoTriggerConfig>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(REPO_TRIGGERS)?;
+        match table.get(project_id)? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn save_repo_trigger(&self, cfg: &RepoTriggerConfig) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(REPO_TRIGGERS)?;
+            let data = serde_json::to_vec(cfg)?;
+            table.insert(cfg.project_id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Remove a project's repo-trigger credentials (project teardown). Returns
+    /// whether a record existed.
+    pub fn delete_repo_trigger(&self, project_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(REPO_TRIGGERS)?;
+            table.remove(project_id)?.is_some()
         };
         txn.commit()?;
         Ok(existed)
