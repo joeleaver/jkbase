@@ -1027,6 +1027,10 @@ fn seed_targets(store: &Store, project_id: &str, build_id: u64, specs: &[TargetS
                 cache_hit: false,
                 started_at: None,
                 finished_at: None,
+                builder_digest: None,
+                cache_key: None,
+                source_commit: None,
+                duration_breakdown_ms: Default::default(),
             })
             .collect();
         r.updated_at = now();
@@ -1343,6 +1347,7 @@ public = "./public"
                 phase_timings_ms: Default::default(),
                 deployed_version: None,
                 error: None,
+                source_commit: None,
                 created_at: now(),
                 updated_at: now(),
             })

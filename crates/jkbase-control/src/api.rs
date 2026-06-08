@@ -1500,6 +1500,7 @@ fn start_build_job(
         phase_timings_ms: Default::default(),
         deployed_version: None,
         error: None,
+        source_commit: None,
         created_at: now,
         updated_at: now,
     };
@@ -1810,6 +1811,7 @@ async fn activate_deployment(
         project_id: project.id.clone(),
         version,
         created_at: auth::timestamp(),
+        layer_digests: Vec::new(),
     })?;
     prune_deployments(state, &project.id, version);
 
