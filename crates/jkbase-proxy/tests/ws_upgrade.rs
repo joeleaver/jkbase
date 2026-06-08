@@ -125,6 +125,21 @@ async fn proxy_relays_websocket_upgrade() {
         head.starts_with("HTTP/1.1 101"),
         "expected a 101 upgrade, got: {head:?}"
     );
+    // hyper performs the server-side switch on the 101 status alone, so a status
+    // check is not enough: a regression that dropped the upgrade-header copy
+    // would still 101 (and still echo) yet emit a handshake a real WebSocket
+    // client rejects. Assert the relayed `Upgrade`/`Connection` headers survive.
+    // (A real handshake also carries `Sec-WebSocket-Accept`; the echo backend
+    // omits it, so we don't assert it here.)
+    let head_lower = head.to_ascii_lowercase();
+    assert!(
+        head_lower.contains("upgrade: websocket"),
+        "101 missing relayed `Upgrade` header, got: {head:?}"
+    );
+    assert!(
+        head_lower.contains("connection: upgrade"),
+        "101 missing relayed `Connection` header, got: {head:?}"
+    );
 
     // The byte stream is now spliced end-to-end: what we send is echoed back.
     client.write_all(b"hello-ws").await.unwrap();
