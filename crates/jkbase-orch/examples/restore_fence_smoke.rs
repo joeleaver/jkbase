@@ -6,9 +6,15 @@
 //! the snapshot (the old behaviour) it would point at the stale device; this proves
 //! it instead binds to the freshly-attached one and resumes.
 //!
-//! Needs root (losetup) + /dev/kvm. Run:
+//! Doubles as the WS0 guest-kernel gauntlet: the cold-boot -> Full-snapshot ->
+//! load(paused) -> patch_drive -> resume sequence is exactly the kernel-version-
+//! sensitive path, so pointing `KERNEL` at a bumped kernel validates that the new
+//! kernel can be snapshotted and restored under Firecracker before it is adopted.
+//!
+//! Needs root (losetup) + /dev/kvm. Run (KERNEL defaults to vmlinux.bin):
 //!   cargo build -p jkbase-orch --example restore_fence_smoke
 //!   sudo ./target/debug/examples/restore_fence_smoke
+//!   sudo env KERNEL=vmlinux-6.12.92.bin ./target/debug/examples/restore_fence_smoke
 
 use jkbase_orch::vm::{VmConfig, VmInstance};
 use std::path::PathBuf;
@@ -31,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
         .parent()
         .unwrap()
         .join(".firecracker");
+    // Kernel under test (WS0 gauntlet): default keeps the historical runtime kernel.
+    let kernel = std::env::var("KERNEL").unwrap_or_else(|_| "vmlinux.bin".to_string());
+    println!("[cfg] kernel = {}", base.join(&kernel).display());
     let work = std::env::temp_dir().join(format!("restore-fence-smoke-{}", std::process::id()));
     tokio::fs::create_dir_all(&work).await?;
     let data_img = work.join("data.ext4");
@@ -42,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mk_config = |dev: &str| VmConfig {
         firecracker_bin: base.join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
-        kernel_path: base.join("vmlinux.bin"),
+        kernel_path: base.join(&kernel),
         // Generic rootfs that boots to a console and stays alive (the jkbase rootfs
         // init exits without the full platform), so we have a stable VM to snapshot.
         rootfs_path: base.join("bionic.rootfs.ext4"),
