@@ -565,6 +565,12 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             if let Some(mut vm) = plat.vms.remove(project_id) {
                 let _ = vm.stop().await;
             }
+            // Force-kill ANY Firecracker for this project — including one a wake that
+            // outlasted our wait-loop hasn't yet recorded in `vms` — BEFORE we destroy
+            // the disk, so `destroy()` can never detach a loop device a live VM still
+            // maps (which another project could then be handed = corruption). The wake,
+            // finding its FC dead, fails and its guard releases.
+            reap_firecracker(project_id).await;
             // Release the data-disk lease + destroy the disk (detach loop device,
             // remove the image + holder record) as part of reaping the project.
             if let Some(token) = plat.disk_tokens.remove(project_id) {
@@ -860,30 +866,36 @@ async fn handle_deploy(
 
     setup_tap(&alloc.tap_device).await?;
 
+    // Read what the fence + boot need, then DROP the platform lock: the RWO attach
+    // (first-deploy mkfs / reap+300ms / losetup) and the VM boot must NOT head-of-line
+    // block every other project on the single platform lock. Re-acquire only to commit.
+    let has_disk = check_project_has_volumes(&plat.data_dir, project_id)
+        || plat.data_disk.exists(project_id).await.unwrap_or(false);
+    let dd = plat.data_disk.clone();
+    let ls = plat.lease.clone();
+    let hid = plat.host_id.clone();
+    let firecracker_bin = plat.firecracker_bin.clone();
+    let kernel_path = plat.kernel_path.clone();
+    let rootfs_path = plat.base_rootfs_path.clone();
+    let runtime_dir = plat.data_dir.join("run");
+    drop(plat);
+
     // Fence the data disk read-write-once for projects that declare volumes (or
-    // already have a disk): acquire the lease + attach via the RWO provider,
-    // preempting any prior writer. Held by an RAII guard until the VM is up, so a
-    // boot failure releases the lease instead of bricking the project.
-    let disk_guard = {
-        let has_volumes = check_project_has_volumes(&plat.data_dir, project_id);
-        let has_disk = has_volumes || plat.data_disk.exists(project_id).await.unwrap_or(false);
-        if has_disk {
-            let dd = plat.data_disk.clone();
-            let ls = plat.lease.clone();
-            let hid = plat.host_id.clone();
-            Some(fence_data_disk(&dd, &ls, &hid, project_id).await?)
-        } else {
-            None
-        }
+    // already have a disk): acquire the lease + attach via the RWO provider, preempting
+    // any prior writer. Held by an RAII guard until the VM is up, so a boot failure (or
+    // a cancelled future) releases the lease instead of bricking the project.
+    let disk_guard = if has_disk {
+        Some(fence_data_disk(&dd, &ls, &hid, project_id).await?)
+    } else {
+        None
     };
-    let data_disk_path = disk_guard.as_ref().map(|g| g.device());
 
     let config = VmConfig {
-        firecracker_bin: plat.firecracker_bin.clone(),
-        kernel_path: plat.kernel_path.clone(),
-        rootfs_path: plat.base_rootfs_path.clone(),
+        firecracker_bin,
+        kernel_path,
+        rootfs_path,
         content_image_path: Some(content_image_path),
-        data_disk_path,
+        data_disk_path: disk_guard.as_ref().map(|g| g.device()),
         vcpu_count: 4,
         mem_size_mib: 3072,
         tap_device: Some(alloc.tap_device.clone()),
@@ -892,22 +904,19 @@ async fn handle_deploy(
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
     };
-
-    let runtime_dir = plat.data_dir.join("run");
     // If start fails, `disk_guard` drops here and releases the lease + disk.
     let vm = VmInstance::start(project_id, &config, &runtime_dir).await?;
 
-    // VM is up: record Firecracker's PID as the data-disk writer (so a future attach's
-    // liveness check tracks the real writer, not this server), then DISARM the guard
-    // and hand the token to disk_tokens for teardown-time release.
+    // Re-acquire to commit the running VM: record Firecracker's PID as the data-disk
+    // writer (so a future attach's liveness check tracks the real writer, not this
+    // server), then DISARM the guard and hand the token to disk_tokens.
+    let mut plat = platform.lock().await;
     if let Some(guard) = disk_guard {
         if let Some(pid) = vm.pid() {
-            let dd = plat.data_disk.clone();
             let _ = dd.set_writer_pid(project_id, guard.token(), pid).await;
         }
         plat.disk_tokens.insert(project_id.to_string(), guard.disarm());
     }
-
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
@@ -1532,6 +1541,12 @@ impl Drop for DiskLeaseGuard {
         if !self.armed {
             return;
         }
+        // Release asynchronously. Guard against being dropped outside a runtime (e.g.
+        // during shutdown) so we never panic in Drop; the flock releases on process
+        // exit anyway.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         warn!(project = %self.project_id, "data-disk boot guard dropped before activation — detaching + releasing lease");
         let (dd, ls, id, tok) = (
             self.data_disk.clone(),
@@ -1539,7 +1554,7 @@ impl Drop for DiskLeaseGuard {
             self.project_id.clone(),
             self.token.clone(),
         );
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let _ = dd.detach(&id).await;
             let _ = ls.release(&tok).await;
         });
@@ -1547,12 +1562,12 @@ impl Drop for DiskLeaseGuard {
 }
 
 /// Acquire the data-disk lease + attach the disk **read-write-once**, fencing any
-/// prior writer, and return an armed [`DiskLeaseGuard`]. On `RwoUnsafe` (a prior
-/// writer still proven alive) it reaps a stale Firecracker for the project and retries
-/// once; if still unsafe it errors. The lease is held from `acquire` onward, so if
-/// `ensure`/`attach` fail this releases it before returning (no leak on the
-/// acquire→attach window); after a successful attach the returned guard owns the
-/// release until the caller `disarm`s it.
+/// prior writer, and return an armed [`DiskLeaseGuard`]. The armed guard is built the
+/// instant `acquire` succeeds and OWNS the `ensure`/`attach` steps, so if those error
+/// — OR the whole future is cancelled mid-attach (the wake/deploy callback is awaited
+/// inline by the proxy, so a client disconnect cancels it) — the guard drops and
+/// releases the lease. On `RwoUnsafe` (a prior writer still proven alive) it reaps a
+/// stale Firecracker and retries once. After success the caller `disarm`s the guard.
 async fn fence_data_disk(
     data_disk: &Arc<dyn DataDiskProvider>,
     lease: &Arc<dyn Lease>,
@@ -1563,23 +1578,19 @@ async fn fence_data_disk(
         .acquire(project_id, host_id, DISK_LEASE_TTL)
         .await
         .map_err(|e| anyhow::anyhow!("lease acquire for {project_id}: {e}"))?;
-    let device = match fence_attach(data_disk, project_id, &token).await {
-        Ok(d) => d,
-        Err(e) => {
-            // Lease was acquired but the disk couldn't be attached — release it.
-            let _ = data_disk.detach(project_id).await;
-            let _ = lease.release(&token).await;
-            return Err(e);
-        }
-    };
-    Ok(DiskLeaseGuard {
+    // Armed BEFORE the slow ensure/attach: any error or cancellation from here drops
+    // the guard (which detaches + releases the lease) — no acquire→attach leak.
+    let mut guard = DiskLeaseGuard {
         data_disk: data_disk.clone(),
         lease: lease.clone(),
         project_id: project_id.to_string(),
         token,
-        device,
+        device: PathBuf::new(),
         armed: true,
-    })
+    };
+    let device = fence_attach(data_disk, project_id, guard.token()).await?;
+    guard.device = device;
+    Ok(guard)
 }
 
 async fn fence_attach(

@@ -45,10 +45,18 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
         total = total.saturating_add(md.len());
     }
 
-    // Data disk: a sparse ext4 image (logical 1 GiB); bill ACTUAL blocks used.
-    let disk = data_dir
-        .join("data-disks")
-        .join(format!("{project_id}.ext4"));
+    // Data disk: a sparse image (logical 1 GiB); bill ACTUAL blocks used. Loop-managed
+    // as `{id}.img`; pre-substrate deployments used `{id}.ext4` — fall back to it so the
+    // quota cap + metering keep counting the disk after the rename.
+    let disks = data_dir.join("data-disks");
+    let disk = {
+        let img = disks.join(format!("{project_id}.img"));
+        if img.exists() {
+            img
+        } else {
+            disks.join(format!("{project_id}.ext4"))
+        }
+    };
     if let Ok(md) = std::fs::metadata(&disk) {
         total = total.saturating_add(md.blocks().saturating_mul(512));
     }
