@@ -2,8 +2,11 @@ use anyhow::{Context, Result};
 use jkbase_common::logs::LogLine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -40,7 +43,11 @@ pub struct HealthCheck {
 struct ManagedServer {
     name: String,
     manifest: ServerManifest,
+    /// Chroot root for legacy flat servers. Ignored when `layers` is set.
     rootfs_dir: PathBuf,
+    /// erofs overlay stack (lowerdir mountpoints, app first) for layered servers.
+    /// `None` ⇒ legacy flat chroot server.
+    layers: Option<Vec<PathBuf>>,
     process: Option<Child>,
     healthy: bool,
 }
@@ -81,6 +88,10 @@ pub struct ContainerSupervisor {
     servers: RwLock<Vec<ManagedServer>>,
     servers_dir: PathBuf,
     extract_dir: PathBuf,
+    /// `server name` → its erofs overlay stack (lowerdir mountpoints, app first),
+    /// resolved at boot from `_layers.json`. A server present here is layered
+    /// (overlay + pivot_root); absent ⇒ legacy flat chroot.
+    layer_map: HashMap<String, Vec<PathBuf>>,
     logs: LogSink,
     /// Identifies this agent process incarnation. Stable across snapshot restore
     /// (memory survives), regenerated on cold boot — lets the host detect resets.
@@ -103,12 +114,13 @@ fn now_secs() -> u64 {
 }
 
 impl ContainerSupervisor {
-    pub fn new(servers_dir: PathBuf) -> Self {
+    pub fn new(servers_dir: PathBuf, layer_map: HashMap<String, Vec<PathBuf>>) -> Self {
         let extract_dir = PathBuf::from("/tmp/jkbase-servers");
         Self {
             servers: RwLock::new(Vec::new()),
             servers_dir,
             extract_dir,
+            layer_map,
             logs: LogSink::new(),
             boot_id: generate_boot_id(),
         }
@@ -151,48 +163,63 @@ impl ContainerSupervisor {
             let manifest: ServerManifest = serde_json::from_str(&manifest_content)
                 .with_context(|| format!("failed to parse manifest for server '{name}'"))?;
 
-            let pre_extracted = self.servers_dir.join(&name);
-            let tarball = self.servers_dir.join(format!("{name}.tar.gz"));
-            let has_volumes = !manifest.volumes.is_empty();
+            let layers = self.layer_map.get(&name).cloned();
 
-            let rootfs_dir = if pre_extracted.is_dir() && !has_volumes {
-                info!(server = %name, "using pre-extracted rootfs (read-only)");
-                pre_extracted
-            } else if pre_extracted.is_dir() && has_volumes {
-                remount_rw("/srv/www");
-                info!(server = %name, "using pre-extracted rootfs (remounted rw for volume mounts)");
-                pre_extracted
-            } else if tarball.exists() {
-                let extract_to = self.extract_dir.join(&name);
-                info!(server = %name, "extracting server rootfs to tmpfs");
-                extract_tarball(&tarball, &extract_to)?;
-                extract_to
+            let (rootfs_dir, process) = if let Some(ref lowerdirs) = layers {
+                // Layered server: the erofs overlay stack (app:runtime:base) provides
+                // the root; the server runs in its own mount namespace and pivots into
+                // the composed view. Volumes are bound inside that namespace by
+                // spawn_server_layered. No rootfs tree lives in the metadata image.
+                info!(server = %name, port = manifest.port, layers = lowerdirs.len(), "starting layered server (overlay+pivot_root)");
+                let process = spawn_server_layered(&name, &manifest, lowerdirs, &self.logs)?;
+                (PathBuf::from("/"), process)
             } else {
-                warn!(server = %name, "no rootfs found, skipping");
-                continue;
-            };
+                // Legacy flat server: chroot into a self-contained rootfs tree.
+                let pre_extracted = self.servers_dir.join(&name);
+                let tarball = self.servers_dir.join(format!("{name}.tar.gz"));
+                let has_volumes = !manifest.volumes.is_empty();
 
-            // Bind-mount persistent volumes into the container rootfs
-            for vol in &manifest.volumes {
-                let src = PathBuf::from("/mnt/data/volumes").join(&vol.name);
-                let dst = rootfs_dir.join(vol.mount.trim_start_matches('/'));
-                if std::path::Path::new("/mnt/data").exists() {
-                    let _ = std::fs::create_dir_all(&src);
-                    let _ = std::fs::create_dir_all(&dst);
-                    bind_mount(&src, &dst);
-                    info!(server = %name, volume = %vol.name, mount = %vol.mount, "volume mounted");
+                let rootfs_dir = if pre_extracted.is_dir() && !has_volumes {
+                    info!(server = %name, "using pre-extracted rootfs (read-only)");
+                    pre_extracted
+                } else if pre_extracted.is_dir() && has_volumes {
+                    remount_rw("/srv/www");
+                    info!(server = %name, "using pre-extracted rootfs (remounted rw for volume mounts)");
+                    pre_extracted
+                } else if tarball.exists() {
+                    let extract_to = self.extract_dir.join(&name);
+                    info!(server = %name, "extracting server rootfs to tmpfs");
+                    extract_tarball(&tarball, &extract_to)?;
+                    extract_to
                 } else {
-                    warn!(server = %name, volume = %vol.name, "no data disk, skipping volume");
-                }
-            }
+                    warn!(server = %name, "no rootfs found, skipping");
+                    continue;
+                };
 
-            info!(server = %name, port = manifest.port, "starting server");
-            let process = spawn_server(&name, &manifest, &rootfs_dir, &self.logs)?;
+                // Bind-mount persistent volumes into the container rootfs
+                for vol in &manifest.volumes {
+                    let src = PathBuf::from("/mnt/data/volumes").join(&vol.name);
+                    let dst = rootfs_dir.join(vol.mount.trim_start_matches('/'));
+                    if std::path::Path::new("/mnt/data").exists() {
+                        let _ = std::fs::create_dir_all(&src);
+                        let _ = std::fs::create_dir_all(&dst);
+                        bind_mount(&src, &dst);
+                        info!(server = %name, volume = %vol.name, mount = %vol.mount, "volume mounted");
+                    } else {
+                        warn!(server = %name, volume = %vol.name, "no data disk, skipping volume");
+                    }
+                }
+
+                info!(server = %name, port = manifest.port, "starting server (chroot)");
+                let process = spawn_server_chroot(&name, &manifest, &rootfs_dir, &self.logs)?;
+                (rootfs_dir, process)
+            };
 
             servers.push(ManagedServer {
                 name,
                 manifest,
                 rootfs_dir,
+                layers,
                 process: Some(process),
                 healthy: false,
             });
@@ -233,12 +260,21 @@ impl ContainerSupervisor {
                             "server process exited, restarting"
                         );
                         server.healthy = false;
-                        match spawn_server(
-                            &server.name,
-                            &server.manifest,
-                            &server.rootfs_dir,
-                            &self.logs,
-                        ) {
+                        let respawn = match &server.layers {
+                            Some(lowerdirs) => spawn_server_layered(
+                                &server.name,
+                                &server.manifest,
+                                lowerdirs,
+                                &self.logs,
+                            ),
+                            None => spawn_server_chroot(
+                                &server.name,
+                                &server.manifest,
+                                &server.rootfs_dir,
+                                &self.logs,
+                            ),
+                        };
+                        match respawn {
                             Ok(new_process) => {
                                 server.process = Some(new_process);
                             }
@@ -354,67 +390,29 @@ fn generate_boot_id() -> String {
     format!("{nanos:x}-{}", std::process::id())
 }
 
-fn spawn_server(
-    name: &str,
-    manifest: &ServerManifest,
-    rootfs_dir: &Path,
-    logs: &LogSink,
-) -> Result<Child> {
-    use std::os::unix::process::CommandExt;
-
-    if manifest.cmd.is_empty() {
-        anyhow::bail!("server '{name}' has empty cmd");
-    }
-
-    let chroot_dir = rootfs_dir.to_path_buf();
-    let working_dir = manifest
-        .working_dir
-        .clone()
-        .unwrap_or_else(|| "/".to_string());
-
-    let mut std_cmd = std::process::Command::new(&manifest.cmd[0]);
-    if manifest.cmd.len() > 1 {
-        std_cmd.args(&manifest.cmd[1..]);
-    }
-
+/// Apply the per-server env every server process gets, plus its manifest env.
+/// `extra_path` (e.g. the bun bin dir) is appended to PATH when set.
+fn apply_server_env(std_cmd: &mut std::process::Command, manifest: &ServerManifest, extra_path: &str) {
     std_cmd.env_clear();
     std_cmd.env("PORT", manifest.port.to_string());
     std_cmd.env("HOME", "/root");
     std_cmd.env("HOSTNAME", "0.0.0.0");
-    std_cmd.env(
-        "PATH",
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-    );
+    let base_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    let path = if extra_path.is_empty() {
+        base_path.to_string()
+    } else {
+        format!("{base_path}:{extra_path}")
+    };
+    std_cmd.env("PATH", path);
     for (key, value) in &manifest.env {
         std_cmd.env(key, value);
     }
     std_cmd.stdout(Stdio::piped());
     std_cmd.stderr(Stdio::piped());
+}
 
-    unsafe {
-        std_cmd.pre_exec(move || {
-            if libc::chroot(
-                std::ffi::CString::new(chroot_dir.to_string_lossy().as_bytes())
-                    .map_err(|_| std::io::Error::other("invalid chroot path"))?
-                    .as_ptr(),
-            ) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            let wd = std::ffi::CString::new(working_dir.as_bytes())
-                .map_err(|_| std::io::Error::other("invalid working dir"))?;
-            if libc::chdir(wd.as_ptr()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = Command::from(std_cmd)
-        .spawn()
-        .with_context(|| format!("failed to spawn server '{name}': {:?}", manifest.cmd))?;
-
-    // Spawn log readers for stdout and stderr
+/// Drain the child's stdout/stderr into the shared log sink.
+fn attach_log_readers(child: &mut Child, name: &str, logs: &LogSink) {
     let server_name = name.to_string();
     if let Some(stdout) = child.stdout.take() {
         let sink = logs.clone();
@@ -438,9 +436,279 @@ fn spawn_server(
             }
         });
     }
+}
 
+/// Legacy flat server: chroot into a self-contained rootfs tree. Used only for
+/// pre-layered deployments; new server builds are layered (see
+/// [`spawn_server_layered`]).
+fn spawn_server_chroot(
+    name: &str,
+    manifest: &ServerManifest,
+    rootfs_dir: &Path,
+    logs: &LogSink,
+) -> Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    if manifest.cmd.is_empty() {
+        anyhow::bail!("server '{name}' has empty cmd");
+    }
+
+    let chroot_dir = rootfs_dir.to_path_buf();
+    let working_dir = manifest
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| "/".to_string());
+
+    let mut std_cmd = std::process::Command::new(&manifest.cmd[0]);
+    if manifest.cmd.len() > 1 {
+        std_cmd.args(&manifest.cmd[1..]);
+    }
+    apply_server_env(&mut std_cmd, manifest, "");
+
+    unsafe {
+        std_cmd.pre_exec(move || {
+            if libc::chroot(
+                CString::new(chroot_dir.to_string_lossy().as_bytes())
+                    .map_err(|_| io::Error::other("invalid chroot path"))?
+                    .as_ptr(),
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let wd = CString::new(working_dir.as_bytes())
+                .map_err(|_| io::Error::other("invalid working dir"))?;
+            if libc::chdir(wd.as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = Command::from(std_cmd)
+        .spawn()
+        .with_context(|| format!("failed to spawn server '{name}': {:?}", manifest.cmd))?;
+
+    attach_log_readers(&mut child, name, logs);
     info!(server = %name, pid = ?child.id(), cmd = ?manifest.cmd, "server process started (chroot: {})", rootfs_dir.display());
     Ok(child)
+}
+
+/// Where each layered server's overlay scratch (upper/work/merged) lives. On
+/// tmpfs because the agent root is a read-only erofs/ext4 image.
+const LAYER_RUN_BASE: &str = "/tmp/jkbase-run";
+
+/// Layered server: compose `lowerdir=app:runtime:base` over a tmpfs upper, then
+/// run the server in its own mount namespace pivoted into that composed root.
+/// This replaces chroot for the layered (erofs) runtime — each server gets a
+/// private root assembled from the shared platform layers plus its own app layer.
+/// The base/runtime layers are shared (RO) across every server in the VM; only
+/// the tmpfs upper and the app layer differ.
+fn spawn_server_layered(
+    name: &str,
+    manifest: &ServerManifest,
+    lowerdirs: &[PathBuf],
+    logs: &LogSink,
+) -> Result<Child> {
+    use std::os::unix::process::CommandExt;
+
+    if manifest.cmd.is_empty() {
+        anyhow::bail!("server '{name}' has empty cmd");
+    }
+    if lowerdirs.is_empty() {
+        anyhow::bail!("layered server '{name}' has no layers");
+    }
+
+    // Per-server overlay scratch on tmpfs. upper/work hold the container's runtime
+    // writes; merged is the composed root the child pivots into.
+    let run_dir = PathBuf::from(LAYER_RUN_BASE).join(name);
+    let upper = run_dir.join("upper");
+    let work = run_dir.join("work");
+    let merged = run_dir.join("merged");
+    for d in [&upper, &work, &merged] {
+        std::fs::create_dir_all(d)
+            .with_context(|| format!("create overlay scratch {}", d.display()))?;
+    }
+
+    let working_dir = manifest
+        .working_dir
+        .clone()
+        .unwrap_or_else(|| "/".to_string());
+
+    // Precompute the whole namespace recipe as CStrings before the fork — the
+    // pre_exec closure runs between fork and exec and must not allocate.
+    let setup = LayeredSetup::build(&merged, &upper, &work, lowerdirs, &manifest.volumes, &working_dir)
+        .with_context(|| format!("build layered setup for '{name}'"))?;
+
+    let mut std_cmd = std::process::Command::new(&manifest.cmd[0]);
+    if manifest.cmd.len() > 1 {
+        std_cmd.args(&manifest.cmd[1..]);
+    }
+    apply_server_env(&mut std_cmd, manifest, "/opt/bun/bin");
+
+    unsafe {
+        std_cmd.pre_exec(move || setup.enter());
+    }
+
+    let mut child = Command::from(std_cmd)
+        .spawn()
+        .with_context(|| format!("failed to spawn layered server '{name}': {:?}", manifest.cmd))?;
+
+    attach_log_readers(&mut child, name, logs);
+    info!(
+        server = %name,
+        pid = ?child.id(),
+        cmd = ?manifest.cmd,
+        layers = lowerdirs.len(),
+        "layered server process started (overlay+pivot_root)"
+    );
+    Ok(child)
+}
+
+/// An allocation-free, pre-built recipe for composing one layered server's root
+/// and pivoting into it from inside the post-fork child. All paths are CStrings
+/// so [`enter`](Self::enter) only issues syscalls.
+struct LayeredSetup {
+    overlay_opts: CString, // lowerdir=...:...,upperdir=...,workdir=...
+    merged: CString,       // overlay mountpoint == new root
+    put_old: CString,      // merged/oldroot
+    proc_target: CString,  // merged/proc
+    sys_target: CString,   // merged/sys
+    dev_target: CString,   // merged/dev
+    oldroot_dir: CString,  // merged/oldroot (mkdir before pivot)
+    volume_binds: Vec<(CString, CString)>, // (host src, merged/<mount>)
+    working_dir: CString,  // chdir target inside the new root
+    // constant fs labels, precomputed to keep enter() allocation-free
+    c_slash: CString,
+    c_overlay: CString,
+    c_proc: CString,
+    c_sysfs: CString,
+    c_devtmpfs: CString,
+    c_oldroot_abs: CString, // "/oldroot" after pivot
+}
+
+impl LayeredSetup {
+    fn build(
+        merged: &Path,
+        upper: &Path,
+        work: &Path,
+        lowerdirs: &[PathBuf],
+        volumes: &[VolumeMount],
+        working_dir: &str,
+    ) -> Result<Self> {
+        let lower = lowerdirs
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        let opts = format!(
+            "lowerdir={lower},upperdir={},workdir={}",
+            upper.to_string_lossy(),
+            work.to_string_lossy()
+        );
+        let cstr = |s: &str| CString::new(s).context("path contains NUL");
+        let cpath = |p: &Path| CString::new(p.to_string_lossy().as_bytes().to_vec()).context("path contains NUL");
+
+        let volume_binds = volumes
+            .iter()
+            .map(|v| {
+                let src = PathBuf::from("/mnt/data/volumes").join(&v.name);
+                let dst = merged.join(v.mount.trim_start_matches('/'));
+                Ok((cpath(&src)?, cpath(&dst)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            overlay_opts: cstr(&opts)?,
+            merged: cpath(merged)?,
+            put_old: cpath(&merged.join("oldroot"))?,
+            proc_target: cpath(&merged.join("proc"))?,
+            sys_target: cpath(&merged.join("sys"))?,
+            dev_target: cpath(&merged.join("dev"))?,
+            oldroot_dir: cpath(&merged.join("oldroot"))?,
+            volume_binds,
+            working_dir: cstr(working_dir)?,
+            c_slash: cstr("/")?,
+            c_overlay: cstr("overlay")?,
+            c_proc: cstr("proc")?,
+            c_sysfs: cstr("sysfs")?,
+            c_devtmpfs: cstr("devtmpfs")?,
+            c_oldroot_abs: cstr("/oldroot")?,
+        })
+    }
+
+    /// Runs in the post-fork child. Builds the overlay root, mounts proc/sys/dev
+    /// and volumes inside it, then `pivot_root`s in — all in a fresh, private
+    /// mount namespace so nothing leaks back to the agent. Returns on the first
+    /// failed syscall (the child's exec then aborts and the parent sees the error).
+    fn enter(&self) -> io::Result<()> {
+        unsafe {
+            // Private mount namespace: pivot_root requires the new root and its
+            // parent to not be shared, and keeps our mounts out of the agent's view.
+            if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::mount(
+                ptr::null(),
+                self.c_slash.as_ptr(),
+                ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                ptr::null(),
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // Compose the overlay root (lower=app:runtime:base, upper=tmpfs).
+            if libc::mount(
+                self.c_overlay.as_ptr(),
+                self.merged.as_ptr(),
+                self.c_overlay.as_ptr(),
+                0,
+                self.overlay_opts.as_ptr().cast(),
+            ) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // proc/sys/dev inside the new root (mkdir best-effort — the base layer
+            // already carries the skeleton; ignore EEXIST).
+            libc::mkdir(self.proc_target.as_ptr(), 0o555);
+            if libc::mount(self.c_proc.as_ptr(), self.proc_target.as_ptr(), self.c_proc.as_ptr(), 0, ptr::null()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::mkdir(self.sys_target.as_ptr(), 0o555);
+            if libc::mount(self.c_sysfs.as_ptr(), self.sys_target.as_ptr(), self.c_sysfs.as_ptr(), 0, ptr::null()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::mkdir(self.dev_target.as_ptr(), 0o755);
+            if libc::mount(self.c_devtmpfs.as_ptr(), self.dev_target.as_ptr(), self.c_devtmpfs.as_ptr(), 0, ptr::null()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Bind persistent volumes (data disk) into the new root.
+            for (src, dst) in &self.volume_binds {
+                libc::mkdir(dst.as_ptr(), 0o755);
+                if libc::mount(src.as_ptr(), dst.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            // pivot_root into the composed view.
+            libc::mkdir(self.oldroot_dir.as_ptr(), 0o755);
+            if libc::chdir(self.merged.as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::syscall(libc::SYS_pivot_root, self.merged.as_ptr(), self.put_old.as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Now rooted at the overlay; detach the old root lazily.
+            if libc::chdir(self.c_slash.as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            libc::umount2(self.c_oldroot_abs.as_ptr(), libc::MNT_DETACH);
+            // Land in the app's working directory (e.g. /app).
+            if libc::chdir(self.working_dir.as_ptr()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn bind_mount(src: &Path, dst: &Path) {
@@ -479,7 +747,7 @@ mod tests {
 
     #[tokio::test]
     async fn seq_increments_and_since_filters() {
-        let sup = ContainerSupervisor::new(PathBuf::from("/nonexistent"));
+        let sup = ContainerSupervisor::new(PathBuf::from("/nonexistent"), HashMap::new());
         sup.logs.push("web", "stdout", "a".into()).await;
         sup.logs.push("web", "stdout", "b".into()).await;
         sup.logs.push("web", "stderr", "c".into()).await;
@@ -499,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn ring_buffer_caps_but_seq_keeps_growing() {
-        let sup = ContainerSupervisor::new(PathBuf::from("/nonexistent"));
+        let sup = ContainerSupervisor::new(PathBuf::from("/nonexistent"), HashMap::new());
         for i in 0..(MAX_LOG_LINES + 50) {
             sup.logs.push("web", "stdout", format!("line{i}")).await;
         }
