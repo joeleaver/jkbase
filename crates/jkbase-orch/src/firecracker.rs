@@ -186,19 +186,53 @@ impl FirecrackerClient {
         .context("failed to create snapshot")
     }
 
-    pub async fn load_snapshot(&self, snapshot_path: &str, mem_file_path: &str) -> Result<()> {
+    /// Load a snapshot. When `resume` is false the VM is loaded **paused**, so the
+    /// caller can repoint drives ([`patch_drive`](Self::patch_drive)) — e.g. to a
+    /// freshly-fenced data device — before [`resume_vm`](Self::resume_vm) lets the
+    /// guest run again.
+    pub async fn load_snapshot(
+        &self,
+        snapshot_path: &str,
+        mem_file_path: &str,
+        resume: bool,
+    ) -> Result<()> {
         let body = serde_json::json!({
             "snapshot_path": snapshot_path,
             "mem_backend": {
                 "backend_type": "File",
                 "backend_path": mem_file_path
             },
-            "resume_vm": true
+            "resume_vm": resume
         });
         let json = serde_json::to_string(&body)?;
         self.request("PUT", "/snapshot/load", Some(json))
             .await
             .context("failed to load snapshot")?;
+        Ok(())
+    }
+
+    /// Repoint a drive's host backing file (PATCH `/drives/{id}`). Valid post-restore
+    /// while the VM is paused — used to bind the restored guest to the host device
+    /// the data disk was just fenced+attached onto, instead of the path baked into
+    /// the snapshot.
+    pub async fn patch_drive(&self, drive_id: &str, path_on_host: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "drive_id": drive_id,
+            "path_on_host": path_on_host,
+        });
+        let json = serde_json::to_string(&body)?;
+        self.request("PATCH", &format!("/drives/{drive_id}"), Some(json))
+            .await
+            .context("failed to patch drive")?;
+        Ok(())
+    }
+
+    /// Resume a paused VM (PATCH `/vm` `{state: Resumed}`).
+    pub async fn resume_vm(&self) -> Result<()> {
+        let json = serde_json::to_string(&serde_json::json!({"state": "Resumed"}))?;
+        self.request("PATCH", "/vm", Some(json))
+            .await
+            .context("failed to resume VM")?;
         Ok(())
     }
 }

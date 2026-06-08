@@ -103,10 +103,14 @@ impl LocalLoop {
     }
 
     fn write_holder(&self, id: &str, h: &Holder) -> Result<()> {
-        std::fs::write(
-            self.holder_path(id),
-            format!("{}\n{}\n{}\n{}", h.pid, h.epoch, h.source_id, h.loop_dev),
-        )?;
+        // Write atomically (temp + rename) so a crash mid-write never leaves a
+        // truncated holder that `read_holder` would parse as "no holder" — which
+        // would make the next attach skip the exclusivity/liveness gate.
+        let body = format!("{}\n{}\n{}\n{}", h.pid, h.epoch, h.source_id, h.loop_dev);
+        let dest = self.holder_path(id);
+        let tmp = self.dir.join(format!("{id}.holder.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &dest)?;
         Ok(())
     }
 }
@@ -131,6 +135,11 @@ impl DataDiskProvider for LocalLoop {
         drop(f);
         run("mkfs.ext4", &["-F", "-q", img.to_str().unwrap()]).await?;
         Ok(())
+    }
+
+    async fn exists(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        Ok(tokio::fs::try_exists(self.img_path(id)).await.unwrap_or(false))
     }
 
     async fn attach_rwo(&self, id: &str, token: &FenceToken) -> Result<BlockDevice> {
@@ -175,6 +184,18 @@ impl DataDiskProvider for LocalLoop {
         Ok(BlockDevice {
             path: PathBuf::from(dev),
         })
+    }
+
+    async fn set_writer_pid(&self, id: &str, token: &FenceToken, pid: u32) -> Result<()> {
+        validate_id(id)?;
+        // Only the current holder may refine the writer pid; if our token no longer
+        // matches the persisted holder we've been fenced.
+        match self.read_holder(id) {
+            Some(h) if h.epoch == token.epoch && h.source_id == token.source_id => {
+                self.write_holder(id, &Holder { pid, ..h })
+            }
+            _ => Err(SubstrateError::Fenced { scope: id.to_string() }),
+        }
     }
 
     async fn detach(&self, id: &str) -> Result<()> {
@@ -258,6 +279,27 @@ mod tests {
             p.attach_rwo("d", &token(2)).await,
             Err(SubstrateError::RwoUnsafe { .. })
         ));
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[tokio::test]
+    async fn set_writer_pid_refines_holder_and_honors_token() {
+        let p = LocalLoop::open(dir("setpid")).unwrap();
+        std::fs::write(p.img_path("d"), b"").unwrap();
+        p.write_holder(
+            "d",
+            &Holder { pid: std::process::id(), epoch: 7, source_id: "src".into(), loop_dev: "/dev/loopX".into() },
+        )
+        .unwrap();
+        // The current holder refines the writer pid to the (now-known) FC pid.
+        p.set_writer_pid("d", &token(7), 4242).await.unwrap();
+        assert_eq!(p.read_holder("d").unwrap().pid, 4242);
+        // A superseded token can no longer refine — it has been fenced.
+        assert!(matches!(
+            p.set_writer_pid("d", &token(8), 99).await,
+            Err(SubstrateError::Fenced { .. })
+        ));
+        assert_eq!(p.read_holder("d").unwrap().pid, 4242); // unchanged
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 

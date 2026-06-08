@@ -12,6 +12,7 @@ jkbase-common = { workspace = true }
 jkbase-proxy = { workspace = true }
 jkbase-control = { workspace = true }
 jkbase-orch = { workspace = true }
+jkbase-substrate = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

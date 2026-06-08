@@ -86,33 +86,6 @@ rmdir "$MOUNT_DIR"
     Ok(())
 }
 
-/// Create a sparse data disk for persistent volumes. Only created once —
-/// survives deploys, hibernation, and restarts. Destroyed on project delete.
-pub async fn create_data_disk(output: &Path, size_mib: u32) -> Result<()> {
-    if output.exists() {
-        info!(output = %output.display(), "data disk already exists");
-        return Ok(());
-    }
-
-    info!(output = %output.display(), size_mib, "creating sparse data disk");
-
-    let script = format!(
-        r#"
-set -euo pipefail
-IMAGE="{output}"
-truncate -s {size}M "$IMAGE"
-mkfs.ext4 -F -q -m 1 "$IMAGE"
-"#,
-        output = output.display(),
-        size = size_mib,
-    );
-
-    run_sudo_script(&script).await?;
-
-    info!(output = %output.display(), "data disk created");
-    Ok(())
-}
-
 async fn run_sudo_script(script: &str) -> Result<()> {
     let status = Command::new("sudo")
         .arg("bash")
