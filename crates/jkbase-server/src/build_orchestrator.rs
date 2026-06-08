@@ -84,22 +84,49 @@ pub struct BuildDeps {
 }
 
 impl BuildDeps {
-    /// Select the toolchain image for a target: per-language, else per-kind, else
-    /// `default.ext4`. (B1 ships a single passthrough `default.ext4`; richer
-    /// toolchains — CNB for servers, cargo-component for functions — are B2.)
+    /// Select the toolchain image for a target. Precedence: the per-language
+    /// jkbuild image (`{language}.ext4`, e.g. `bun.ext4`), then the jkbuild
+    /// per-kind image (`jkbuild-{kind}.ext4`), then a legacy per-kind image, then
+    /// the busybox passthrough `default.ext4`.
     fn select_toolchain(&self, kind: TargetKind, language: Option<&str>) -> Option<PathBuf> {
-        let kind_name = kind_name(kind);
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(lang) = language {
-            candidates.push(format!("{lang}.ext4"));
-        }
-        candidates.push(format!("{kind_name}.ext4"));
-        candidates.push("default.ext4".to_string());
-        candidates
+        toolchain_candidates(kind_name(kind), language)
             .into_iter()
             .map(|c| self.toolchain_dir.join(c))
             .find(|p| p.exists())
     }
+}
+
+/// The ordered toolchain-image filenames to try for a target (most specific
+/// first). Pure so it can be unit-tested without a full [`BuildDeps`].
+fn toolchain_candidates(kind_name: &str, language: Option<&str>) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(lang) = language.filter(|l| !l.is_empty()) {
+        candidates.push(format!("{lang}.ext4"));
+    }
+    candidates.push(format!("jkbuild-{kind_name}.ext4"));
+    candidates.push(format!("{kind_name}.ext4"));
+    candidates.push("default.ext4".to_string());
+    candidates
+}
+
+/// Cheap host-side language sniff to pick the per-language BUILD IMAGE before the
+/// VM boots. The authoritative detect runs in-VM (jkbuild); this only chooses
+/// which toolchain image to boot, so it stays a shallow file check. An explicit
+/// `hint` (from jkbase.toml `language=`) always wins.
+pub fn detect_language(source_path: &Path, hint: Option<&str>) -> Option<String> {
+    if let Some(h) = hint.filter(|h| !h.is_empty()) {
+        return Some(h.to_string());
+    }
+    let has = |f: &str| source_path.join(f).exists();
+    if has("bun.lockb") || has("bun.lock") || has("bunfig.toml") {
+        return Some("bun".to_string());
+    }
+    if let Ok(pkg) = std::fs::read_to_string(source_path.join("package.json"))
+        && pkg.contains("bun@")
+    {
+        return Some("bun".to_string());
+    }
+    None
 }
 
 /// Build the `build_callback` closure for `AppState` from shared deps. Mirrors
@@ -627,13 +654,16 @@ async fn build_one_target_inner(
             spec.name
         );
     }
+    // Resolve the language: the explicit jkbase.toml hint, else a cheap host-side
+    // sniff of the source (the in-VM lifecycle does the authoritative detect).
+    let language = detect_language(&source_path, spec.language.as_deref());
     let toolchain = deps
-        .select_toolchain(spec.kind, spec.language.as_deref())
+        .select_toolchain(spec.kind, language.as_deref())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no toolchain image for {}{} in {}",
                 kind_name(spec.kind),
-                spec.language
+                language
                     .as_deref()
                     .map(|l| format!("/{l}"))
                     .unwrap_or_default(),
@@ -726,6 +756,7 @@ async fn build_one_target_inner(
         guest_ip,
         gateway_ip,
         egress_proxy,
+        lang_hint: language.clone(),
         fetch_deadline: deps.fetch_deadline,
         seal,
     };
@@ -1141,6 +1172,52 @@ mod tests {
     }
 
     #[test]
+    fn toolchain_candidates_prefer_language_then_jkbuild_then_default() {
+        assert_eq!(
+            toolchain_candidates("server", Some("bun")),
+            ["bun.ext4", "jkbuild-server.ext4", "server.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec()
+        );
+        assert_eq!(
+            toolchain_candidates("server", None),
+            ["jkbuild-server.ext4", "server.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec()
+        );
+        // An empty language string is ignored (no `.ext4` candidate).
+        assert_eq!(
+            toolchain_candidates("function", Some("")),
+            ["jkbuild-function.ext4", "function.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec()
+        );
+    }
+
+    #[test]
+    fn detect_language_sniffs_bun_and_honours_hint() {
+        let dir = std::env::temp_dir().join(format!("jkb-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // An explicit hint always wins; an empty hint is ignored.
+        assert_eq!(detect_language(&dir, Some("rust")).as_deref(), Some("rust"));
+        assert_eq!(detect_language(&dir, Some("")), None);
+        // Bare dir → no detection.
+        assert_eq!(detect_language(&dir, None), None);
+
+        std::fs::write(dir.join("bun.lock"), "").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("bun"));
+        std::fs::remove_file(dir.join("bun.lock")).unwrap();
+
+        // package.json declaring bun as the package manager also counts.
+        std::fs::write(dir.join("package.json"), r#"{"packageManager":"bun@1.1.34"}"#).unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("bun"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn validate_manifest_rejects_traversal_and_bad_names() {
         // Clean manifest passes.
         let ok: ProjectConfig = toml::from_str(
@@ -1436,6 +1513,7 @@ esac
             guest_ip: Some(lease.guest_ip.clone()),
             gateway_ip: Some(net.gateway.clone()),
             egress_proxy: Some(net.proxy_url()),
+            lang_hint: None,
             fetch_deadline: Duration::from_secs(20),
             seal: Some(make_seal(lease.tap.clone())),
         };

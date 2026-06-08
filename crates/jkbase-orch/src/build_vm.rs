@@ -122,6 +122,9 @@ pub struct BuildVmConfig {
     /// Egress proxy URL exposed to the build (becomes `HTTP(S)_PROXY`), passed to
     /// the guest via the kernel cmdline (`jkbase.proxy=`).
     pub egress_proxy: Option<String>,
+    /// Language hint (e.g. `"bun"`) for the in-VM lifecycle's detect, passed via
+    /// the kernel cmdline (`jkbase.lang=`). `None` → the guest auto-detects.
+    pub lang_hint: Option<String>,
     /// Max wall-time the FETCH phase may hold the network before the host
     /// force-seals — even if the guest never signals fetch-complete (so a hostile
     /// build gets the network for at most this long).
@@ -364,6 +367,13 @@ impl BuildVm {
         }
         if let Some(proxy) = &config.egress_proxy {
             boot_args.push_str(&format!(" jkbase.proxy={proxy}"));
+        }
+        if let Some(lang) = &config.lang_hint
+            && !lang.is_empty()
+            && lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            // Safe token only (it lands verbatim on the kernel cmdline).
+            boot_args.push_str(&format!(" jkbase.lang={lang}"));
         }
         client
             .set_boot_source(&BootSource {
