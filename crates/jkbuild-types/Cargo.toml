@@ -1,0 +1,13 @@
+[package]
+name = "jkbuild-types"
+version = "0.1.0"
+edition = "2024"
+
+# Tiny crate of the serde structs that cross the build-VM boundary in `/out`.
+# Depended on by BOTH the in-VM `jkbuild` lifecycle (producer) and the host-side
+# `jkbase-server`/`jkbase-control` (consumer), so the wire contract has one
+# source of truth. Keep its dependency surface minimal.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

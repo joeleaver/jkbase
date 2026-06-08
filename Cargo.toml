@@ -10,6 +10,8 @@ members = [
     "crates/jkbase-common",
     "crates/jkbase-substrate",
     "crates/jkbase-objectstore",
+    "crates/jkbuild",
+    "crates/jkbuild-types",
 ]
 
 [workspace.dependencies]
@@ -18,6 +20,8 @@ jkbase-proxy = { path = "crates/jkbase-proxy" }
 jkbase-control = { path = "crates/jkbase-control" }
 jkbase-orch = { path = "crates/jkbase-orch" }
 jkbase-substrate = { path = "crates/jkbase-substrate" }
+jkbuild-types = { path = "crates/jkbuild-types" }
+jkbuild = { path = "crates/jkbuild" }
 
 serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"

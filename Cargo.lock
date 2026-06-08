@@ -1786,6 +1786,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "jkbuild"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "jkbuild-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+]
+
+[[package]]
+name = "jkbuild-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
