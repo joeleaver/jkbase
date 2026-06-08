@@ -85,9 +85,9 @@ async fn git_push_authenticates_lands_and_triggers_build() {
     store
         .save_repo_trigger(&RepoTriggerConfig {
             project_id: project_id.to_string(),
+            tenant_id: Some("tenant-1".to_string()),
             git_token_fingerprint: Some(auth::token_fingerprint(&token)),
             git_token_created_at: 1,
-            webhook_secrets: vec![],
         })
         .unwrap();
 
@@ -171,5 +171,80 @@ async fn git_push_authenticates_lands_and_triggers_build() {
     assert!(
         !bad.status.success(),
         "git push with a wrong token must be rejected"
+    );
+}
+
+/// Cross-tenant takeover guard: a credential minted by tenant A must not push
+/// into a project of the SAME slug that tenant B later (re)creates — even if the
+/// credential record outlives the delete (auth re-checks the current owner).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_token_after_delete_recreate_is_rejected() {
+    let base = scratch("takeover");
+    let store = Store::open(&base.join("db.redb")).unwrap();
+    let logs = LogStore::new(base.join("logs"));
+    let deploy_dir = base.join("data").join("hosting");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    let pid = "demo";
+
+    // Tenant A creates the project and mints a token.
+    let mk = |tenant: &str| Project {
+        id: pid.to_string(),
+        name: "demo".to_string(),
+        tenant_id: Some(tenant.to_string()),
+        current_version: None,
+        state: ProjectState::Active,
+        vm_ip: None,
+        domains: vec![],
+    };
+    store.create_project(&mk("tenant-A")).unwrap();
+    let token_a = auth::generate_git_token();
+    store
+        .save_repo_trigger(&RepoTriggerConfig {
+            project_id: pid.to_string(),
+            tenant_id: Some("tenant-A".to_string()),
+            git_token_fingerprint: Some(auth::token_fingerprint(&token_a)),
+            git_token_created_at: 1,
+        })
+        .unwrap();
+
+    // Simulate a delete that recreated the same slug under tenant B but LEFT the
+    // credential record behind (the auth tenant-check must reject it regardless).
+    store.delete_project(pid).unwrap();
+    store.create_project(&mk("tenant-B")).unwrap();
+
+    let state = Arc::new(AppState::new(store, logs, deploy_dir));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(state, "jkbase.app".to_string());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app.into_make_service()).await;
+    });
+    tokio::time::timeout(Duration::from_secs(5), reqwest::get(format!("http://{addr}/health")))
+        .await
+        .expect("server did not come up")
+        .unwrap();
+
+    let work = base.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    git_ok(&work, &["init", "-q", "-b", "main"]);
+    git_ok(&work, &["config", "user.email", "a@example.com"]);
+    git_ok(&work, &["config", "user.name", "A"]);
+    std::fs::write(work.join("jkbase.toml"), "[project]\nname = \"demo\"\n").unwrap();
+    git_ok(&work, &["add", "."]);
+    git_ok(&work, &["commit", "-q", "-m", "x"]);
+
+    let url = format!("http://jkbase:{token_a}@{addr}/git/{pid}");
+    let push = Command::new("timeout")
+        .args(["20", "git", "push", "-q", &url, "HEAD:main"])
+        .current_dir(&work)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", &work)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("spawn git push");
+    assert!(
+        !push.status.success(),
+        "tenant-A's stale token must NOT push into tenant-B's recreated project"
     );
 }

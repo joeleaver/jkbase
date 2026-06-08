@@ -1,5 +1,6 @@
 mod deploy;
 mod project;
+mod repo;
 
 use anyhow::Context;
 use clap::Subcommand;
@@ -106,6 +107,9 @@ pub enum Command {
     /// Manage custom domains
     #[command(subcommand)]
     Domain(DomainCommand),
+    /// Connect a repo for push-to-deploy (git push / GitHub Actions)
+    #[command(subcommand)]
+    Repo(repo::RepoCommand),
     /// Start local development environment
     Dev,
 }
@@ -277,6 +281,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         } => run_logs(follow, service, limit, json, project, api).await,
         Command::Secret(cmd) => run_secret(cmd).await,
         Command::Domain(cmd) => run_domain(cmd).await,
+        Command::Repo(cmd) => repo::run(cmd).await,
         Command::Dev => {
             println!("Starting local development environment...");
             Ok(())

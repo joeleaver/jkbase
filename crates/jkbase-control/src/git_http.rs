@@ -114,8 +114,9 @@ pub fn check_pack_object_count(body: &[u8]) -> Result<()> {
 }
 
 /// Run `git receive-pack --stateless-rpc` over the (already size/object-capped)
-/// request body, returning the report-status the git client expects.
-pub async fn receive_pack(repo: &Path, input: &[u8]) -> Result<Vec<u8>> {
+/// request body, returning the report-status the git client expects. Takes the
+/// pack by value so it's moved into the child's stdin, not copied.
+pub async fn receive_pack(repo: &Path, input: Vec<u8>) -> Result<Vec<u8>> {
     run_git(
         &["receive-pack", "--stateless-rpc", &repo.to_string_lossy()],
         Some(input),
@@ -150,9 +151,10 @@ pub async fn archive_commit_targz(repo: &Path, commit: &str) -> Result<Vec<u8>> 
     gz.finish().context("finish gzip")
 }
 
-/// Run a `git` subprocess, optionally feeding `stdin`, returning stdout on
-/// success and surfacing stderr on failure. `git` must be on the host PATH.
-async fn run_git(args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+/// Run a `git` subprocess, optionally feeding `stdin` (taken by value, moved
+/// into the child), returning stdout on success and surfacing stderr on failure.
+/// `git` must be on the host PATH.
+async fn run_git(args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
@@ -166,7 +168,7 @@ async fn run_git(args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
 
     // Write stdin and read stdout concurrently so a large report doesn't
     // deadlock against a still-writing stdin pipe.
-    let stdin_input = stdin.map(|b| b.to_vec());
+    let stdin_input = stdin;
     let writer = child.stdin.take();
     let write_task = tokio::spawn(async move {
         if let (Some(mut w), Some(buf)) = (writer, stdin_input) {

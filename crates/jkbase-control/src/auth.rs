@@ -50,17 +50,6 @@ pub fn generate_git_token() -> String {
     )
 }
 
-/// Mint a webhook HMAC secret (shared with the connected forge; stored plaintext
-/// because it must be re-derivable to verify signatures).
-pub fn generate_webhook_secret() -> String {
-    let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    format!(
-        "whsec_{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    )
-}
-
 /// SHA-256 (hex) fingerprint of a high-entropy token, used to store and look up
 /// the per-project git-push token WITHOUT keeping the plaintext. A 256-bit random
 /// token makes SHA-256 preimage-resistant (unlike a low-entropy password, which

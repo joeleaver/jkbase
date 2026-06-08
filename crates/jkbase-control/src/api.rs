@@ -1,7 +1,7 @@
 use crate::auth::{self, ApiToken, Tenant};
 use crate::logstore::LogStore;
 use crate::store::{
-    BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, Project, Store, WebhookSecret,
+    BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, Project, Store,
 };
 use jkbase_common::routing::DomainTarget;
 use axum::body::{Body, Bytes};
@@ -92,6 +92,13 @@ pub struct AppState {
     /// `std::sync::Mutex` (critical sections never await) so [`DeployLockGuard`]
     /// can release on `Drop` — a panicking spawned build task can't leak the lock.
     deploy_locks: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Bounds concurrent in-flight `git-receive-pack` bodies (each buffers up to
+    /// `PACK_MAX_BYTES`) so the unauthenticated-at-the-router git endpoint can't
+    /// be used to OOM the shared control plane.
+    git_pack_permits: Arc<tokio::sync::Semaphore>,
+    /// Projects whose git-push build was deferred because a build was already
+    /// running; drained (rebuilding the latest tip) when the deploy lock frees.
+    pending_git_pushes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Deserialize)]
@@ -157,6 +164,8 @@ impl AppState {
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
+            git_pack_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PACKS)),
+            pending_git_pushes: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -276,10 +285,6 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             "/projects/{id}/repo/git-token",
             post(mint_git_token).delete(revoke_git_token),
         )
-        .route(
-            "/projects/{id}/repo/webhook-secret",
-            post(rotate_webhook_secret),
-        )
         .route("/projects/{id}/logs", get(get_project_logs))
         .route("/projects/{id}/deployments", get(list_deployments))
         .route("/projects/{id}/rollback", post(rollback))
@@ -306,10 +311,10 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/login", post(login))
         .route("/health", get(api_health));
 
-    // Connected-repo build triggers (build · D). These self-authenticate (git
-    // HTTP Basic per-project token / webhook HMAC), so they must NOT sit behind
-    // the Bearer `require_auth` layer, and they carry no `DefaultBodyLimit` —
-    // `git-receive-pack` enforces its own streamed pack cap.
+    // Connected-repo build trigger (build · D). Self-authenticates via an HTTP
+    // Basic per-project git-push token, so it must NOT sit behind the Bearer
+    // `require_auth` layer, and it carries no `DefaultBodyLimit` —
+    // `git-receive-pack` enforces its own streamed pack cap + concurrency bound.
     let triggers = Router::new()
         .route("/git/{id}/info/refs", get(git_info_refs))
         .route("/git/{id}/git-receive-pack", post(git_receive_pack));
@@ -806,6 +811,16 @@ async fn delete_project(
                     let _ = state.store.purge_usage(&id);
                     let _ = state.store.remove_quota(&id);
                     let _ = state.store.remove_quota_status(&id);
+                    // Reap the git-push credential + bare repo so a recreated
+                    // project of the same slug can't inherit a prior tenant's
+                    // token or pushed objects (the auth tenant-check is the
+                    // primary guard; this is cleanup + disk reclaim).
+                    let _ = state.store.delete_repo_trigger(&id);
+                    let _ = tokio::fs::remove_dir_all(crate::git_http::bare_repo_path(
+                        data_dir(&state),
+                        &id,
+                    ))
+                    .await;
                     // Release all claimed hostnames so they can't be taken over
                     // or left dangling in the routing maps.
                     if let Ok(domains) = state.store.list_domains_for_project(&id) {
@@ -938,14 +953,10 @@ fn require_project_owner(
     }
 }
 
-// -- Connected-repo build triggers: credential management (build · D) --
-
-/// Keep the current webhook secret plus one previous, so a rotation has a grace
-/// window where in-flight deliveries signed with the old secret still verify.
-const WEBHOOK_SECRETS_KEPT: usize = 2;
+// -- Connected-repo build trigger: git-push credential management (build · D) --
 
 /// The control-plane API origin (`https://api.{apex}`), where the `/git/{id}`
-/// and `/projects/{id}/hooks/push` trigger endpoints live.
+/// push endpoint lives.
 fn api_base_url(state: &AppState) -> String {
     format!("https://api.{}", state.platform_domain)
 }
@@ -959,21 +970,11 @@ struct GitTokenResponse {
 }
 
 #[derive(Serialize)]
-struct WebhookSecretResponse {
-    /// The new signing secret — shown ONCE.
-    secret: String,
-    /// Where the connected forge should POST push events.
-    webhook_url: String,
-}
-
-#[derive(Serialize)]
 struct RepoTriggerStatusResponse {
     git_token_configured: bool,
     git_token_created_at: Option<u64>,
-    webhook_secrets: usize,
     /// Token-less push URL (the tenant supplies the token via Basic auth).
     push_url: String,
-    webhook_url: String,
 }
 
 /// `POST /projects/{id}/repo/git-token` — mint (or rotate) the per-project
@@ -984,9 +985,10 @@ async fn mint_git_token(
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_project_owner(&state, &tenant, &id) {
-        return e.into_response();
-    }
+    let project = match require_project_owner(&state, &tenant, &id) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
     let token = auth::generate_git_token();
     let mut cfg = state
         .store
@@ -995,6 +997,7 @@ async fn mint_git_token(
         .flatten()
         .unwrap_or_default();
     cfg.project_id = id.clone();
+    cfg.tenant_id = project.tenant_id;
     cfg.git_token_fingerprint = Some(auth::token_fingerprint(&token));
     cfg.git_token_created_at = auth::timestamp();
     if let Err(e) = state.store.save_repo_trigger(&cfg) {
@@ -1031,46 +1034,8 @@ async fn revoke_git_token(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// `POST /projects/{id}/repo/webhook-secret` — rotate the webhook signing
-/// secret. Returns the new secret once; the previous one stays valid for a grace
-/// window so in-flight deliveries don't break.
-async fn rotate_webhook_secret(
-    State(state): State<Arc<AppState>>,
-    Extension(tenant): Extension<Tenant>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    if let Err(e) = require_project_owner(&state, &tenant, &id) {
-        return e.into_response();
-    }
-    let secret = auth::generate_webhook_secret();
-    let mut cfg = state
-        .store
-        .get_repo_trigger(&id)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    cfg.project_id = id.clone();
-    cfg.webhook_secrets.insert(
-        0,
-        WebhookSecret {
-            secret: secret.clone(),
-            created_at: auth::timestamp(),
-        },
-    );
-    cfg.webhook_secrets.truncate(WEBHOOK_SECRETS_KEPT);
-    if let Err(e) = state.store.save_repo_trigger(&cfg) {
-        return internal_error(e);
-    }
-    let webhook_url = format!("{}/projects/{id}/hooks/push", api_base_url(&state));
-    (
-        StatusCode::CREATED,
-        Json(WebhookSecretResponse { secret, webhook_url }),
-    )
-        .into_response()
-}
-
-/// `GET /projects/{id}/repo` — report which triggers are configured (never
-/// returns the token or secrets themselves).
+/// `GET /projects/{id}/repo` — report whether the git-push token is configured
+/// (never returns the token itself).
 async fn get_repo_trigger_status(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
@@ -1090,9 +1055,7 @@ async fn get_repo_trigger_status(
         Json(RepoTriggerStatusResponse {
             git_token_configured: cfg.git_token_fingerprint.is_some(),
             git_token_created_at: (cfg.git_token_created_at != 0).then_some(cfg.git_token_created_at),
-            webhook_secrets: cfg.webhook_secrets.len(),
             push_url: format!("{}/git/{id}", api_base_url(&state)),
-            webhook_url: format!("{}/projects/{id}/hooks/push", api_base_url(&state)),
         }),
     )
         .into_response()
@@ -1103,6 +1066,11 @@ async fn get_repo_trigger_status(
 /// The branch whose pushes trigger a build. Pushing any other branch updates the
 /// bare repo but is a no-op for the build pipeline (design §9 / map gotcha).
 const GIT_PUSH_TRIGGER_BRANCH: &str = "main";
+
+/// Max concurrent `git-receive-pack` bodies in flight across the control plane.
+/// Each can buffer up to `PACK_MAX_BYTES`, so this caps git-push memory; excess
+/// pushes get a fast 503 rather than queueing (and holding) more memory.
+const MAX_CONCURRENT_PACKS: usize = 4;
 
 /// Per-project on-host state root (`{deploy_dir}/..`), where the git bare repos
 /// live under `git/`. Mirrors the derivation in `get_project_usage`.
@@ -1125,21 +1093,38 @@ fn basic_auth_token(headers: &HeaderMap) -> Option<String> {
     Some(pass.to_string())
 }
 
-/// Validate the presented git-push token against THIS project's stored
-/// fingerprint. Looking up by the path `{id}` (not by token) is O(1) and means a
-/// token minted for a different project simply won't match — satisfying the
-/// "Y-scoped token pushing to X is rejected" requirement (§9). `ct_eq` keeps the
-/// fingerprint compare constant-time.
+/// True if `id` is a well-formed project slug (the invariant `create_project`
+/// enforces). Rejecting anything else keeps a crafted `{id}` (`..`, encoded `/`)
+/// from ever reaching the bare-repo path join, independent of the auth gate.
+fn is_valid_project_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 63
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Validate the presented git-push token for `project_id`. Three gates, in order:
+/// the project must currently exist, its current owner must match the tenant that
+/// minted the token (so a credential record outliving a delete/recreate of the
+/// same slug can't authenticate a different tenant — cross-tenant takeover), and
+/// the token fingerprint must match (constant-time). Looking up by the path `{id}`
+/// (not by token) is O(1) and rejects a token minted for a different project.
 fn git_authenticated(state: &AppState, project_id: &str, headers: &HeaderMap) -> bool {
-    let Some(stored_fp) = state
-        .store
-        .get_repo_trigger(project_id)
-        .ok()
-        .flatten()
-        .and_then(|c| c.git_token_fingerprint)
-    else {
+    if !is_valid_project_id(project_id) {
+        return false;
+    }
+    let Some(cfg) = state.store.get_repo_trigger(project_id).ok().flatten() else {
         return false;
     };
+    let Some(stored_fp) = cfg.git_token_fingerprint else {
+        return false;
+    };
+    // The project must exist now and still be owned by the token's tenant.
+    let Ok(Some(project)) = state.store.get_project(project_id) else {
+        return false;
+    };
+    if project.tenant_id.is_none() || project.tenant_id != cfg.tenant_id {
+        return false;
+    }
     let Some(token) = basic_auth_token(headers) else {
         return false;
     };
@@ -1160,6 +1145,14 @@ fn git_unauthorized() -> Response {
         "git authentication required",
     )
         .into_response()
+}
+
+/// 500 for the git endpoints that logs the real cause (which can include the
+/// host `data_dir` path or git stderr) but returns a generic body, so a failing
+/// push doesn't disclose host internals to an authenticated tenant.
+fn git_internal_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %e, "git endpoint internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
 }
 
 enum BodyReadError {
@@ -1218,6 +1211,11 @@ async fn git_info_refs(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    // Auth first, so every unauthorized request gets a uniform 401 (and git's
+    // initial unauthenticated probe is challenged into retrying with creds).
+    if !git_authenticated(&state, &id, &headers) {
+        return git_unauthorized();
+    }
     if params.get("service").map(String::as_str) != Some("git-receive-pack") {
         return (
             StatusCode::FORBIDDEN,
@@ -1225,12 +1223,9 @@ async fn git_info_refs(
         )
             .into_response();
     }
-    if !git_authenticated(&state, &id, &headers) {
-        return git_unauthorized();
-    }
     let repo = crate::git_http::bare_repo_path(data_dir(&state), &id);
     if let Err(e) = crate::git_http::ensure_bare_repo(&repo).await {
-        return internal_error(e);
+        return git_internal_error(e);
     }
     match crate::git_http::advertise_refs(&repo).await {
         Ok(body) => (
@@ -1260,9 +1255,19 @@ async fn git_receive_pack(
     if !git_authenticated(&state, &id, &headers) {
         return git_unauthorized();
     }
+    // Bound concurrent in-flight packs (each buffers up to PACK_MAX_BYTES) before
+    // reading anything, so a flood of pushes can't OOM the shared control plane.
+    let Ok(_permit) = state.git_pack_permits.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            "too many concurrent pushes, retry shortly",
+        )
+            .into_response();
+    };
     let repo = crate::git_http::bare_repo_path(data_dir(&state), &id);
     if let Err(e) = crate::git_http::ensure_bare_repo(&repo).await {
-        return internal_error(e);
+        return git_internal_error(e);
     }
 
     let input = match read_body_capped(&headers, body, crate::git_http::PACK_MAX_BYTES).await {
@@ -1285,11 +1290,12 @@ async fn git_receive_pack(
         return (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response();
     }
 
-    // Trigger a build only if this push advances the configured branch.
+    // Trigger a build only if this push advances the configured branch. The pack
+    // bytes are moved into `receive_pack` (no extra copy) and dropped after.
     let before = crate::git_http::branch_tip(&repo, GIT_PUSH_TRIGGER_BRANCH).await;
-    let result = match crate::git_http::receive_pack(&repo, &input).await {
+    let result = match crate::git_http::receive_pack(&repo, input).await {
         Ok(r) => r,
-        Err(e) => return internal_error(e),
+        Err(e) => return git_internal_error(e),
     };
     if let Some(commit) = crate::git_http::branch_tip(&repo, GIT_PUSH_TRIGGER_BRANCH).await
         && before.as_deref() != Some(commit.as_str())
@@ -1312,8 +1318,13 @@ async fn git_receive_pack(
 }
 
 /// Archive the pushed tip and start a build, off the git response path. A push
-/// always succeeds at the git layer; if the build can't start (another build
-/// running, over quota) that's logged, not surfaced mid-protocol.
+/// always succeeds at the git layer; the build runs asynchronously.
+///
+/// If a build is already running (`Locked`), the push is *not* dropped: the
+/// project is marked pending and [`drain_pending_git_push`] rebuilds the latest
+/// tip when that build finishes. Without this, the ref has already advanced, so
+/// re-pushing the same commit would be a no-op (`before == commit`) and prod
+/// would silently stay on the old build.
 fn spawn_git_push_build(state: Arc<AppState>, id: String, repo: PathBuf, commit: String) {
     tokio::spawn(async move {
         let targz = match crate::git_http::archive_commit_targz(&repo, &commit).await {
@@ -1328,7 +1339,12 @@ fn spawn_git_push_build(state: Arc<AppState>, id: String, repo: PathBuf, commit:
                 tracing::info!(project = %id, build_id, commit = %commit, "git-push triggered build")
             }
             Err(StartBuildError::Locked) => {
-                tracing::warn!(project = %id, "git-push: build skipped (deploy/build in progress)")
+                state
+                    .pending_git_pushes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id.clone());
+                tracing::info!(project = %id, commit = %commit, "git-push: build in progress; queued a rebuild of the latest tip")
             }
             Err(StartBuildError::OverQuota(m)) => {
                 tracing::warn!(project = %id, reason = %m, "git-push: build skipped (over quota)")
@@ -1341,6 +1357,26 @@ fn spawn_git_push_build(state: Arc<AppState>, id: String, repo: PathBuf, commit:
             }
         }
     });
+}
+
+/// After a build finishes (deploy lock now free), if a git push was deferred for
+/// this project, rebuild its current tip — coalescing any pushes that arrived
+/// while the lock was held into a single rebuild of the newest commit.
+async fn drain_pending_git_push(state: Arc<AppState>, id: String) {
+    let pending = state
+        .pending_git_pushes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+    if !pending {
+        return;
+    }
+    let repo = crate::git_http::bare_repo_path(data_dir(&state), &id);
+    if let Some(commit) = crate::git_http::branch_tip(&repo, GIT_PUSH_TRIGGER_BRANCH).await {
+        // spawn_git_push_build re-queues if it's *still* locked (a new build
+        // grabbed the lock first); that build will drain again on completion.
+        spawn_git_push_build(state, id, repo, commit);
+    }
 }
 
 /// `POST /projects/{id}/build` — the one build-pipeline intake funnel. Accepts a
@@ -1410,7 +1446,7 @@ impl StartBuildError {
 }
 
 /// The one build-pipeline funnel shared by every trigger (CLI `POST /build`,
-/// git-push, webhook): enforce the pre-build 402 gate, serialize per project,
+/// git-push): enforce the pre-build 402 gate, serialize per project,
 /// allocate a build id, persist a `Queued` record, and spawn the background job.
 /// Ownership/authentication is the caller's responsibility. Returns the new
 /// build id. The `DeployLockGuard` is moved into the spawned task and releases
@@ -1475,9 +1511,14 @@ fn start_build_job(
     let state_bg = state.clone();
     let id_bg = id.to_string();
     tokio::spawn(async move {
-        // Released on completion OR panic-unwind of the build task.
-        let _guard = guard;
-        run_build_job(state_bg, &id_bg, build_id, source_tar_gz).await;
+        {
+            // Released on completion OR panic-unwind of the build task.
+            let _guard = guard;
+            run_build_job(state_bg.clone(), &id_bg, build_id, source_tar_gz).await;
+        }
+        // Lock is free now: rebuild the latest tip if a git push was deferred
+        // while this build held the lock (coalesced; no-op otherwise).
+        drain_pending_git_push(state_bg, id_bg).await;
     });
 
     Ok(build_id)

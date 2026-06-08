@@ -19,7 +19,7 @@ const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
 const QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("quotas");
 const QUOTA_STATUS: TableDefinition<&str, &[u8]> = TableDefinition::new("quota_status");
 /// Per-project connected-repo trigger credentials (build · D): the git-push
-/// token fingerprint + rotatable webhook secrets. Kept out of the app-`SECRETS`
+/// token fingerprint, bound to the owning tenant. Kept out of the app-`SECRETS`
 /// table (those are tenant env vars) so the two never leak into each other.
 const REPO_TRIGGERS: TableDefinition<&str, &[u8]> = TableDefinition::new("repo_triggers");
 
@@ -73,27 +73,21 @@ pub struct Secret {
     pub value: String,
 }
 
-/// One webhook HMAC secret with its mint time, so rotation can retire old
-/// secrets after a grace window (newest first in [`RepoTriggerConfig`]).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebhookSecret {
-    pub secret: String,
-    pub created_at: u64,
-}
-
 /// Per-project connected-repo build-trigger credentials (build · D). Stored
 /// once per project in the `REPO_TRIGGERS` table. Absent until the tenant mints
-/// a git-push token or a webhook secret.
+/// a git-push token via `jkbase repo connect`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoTriggerConfig {
     pub project_id: String,
+    /// The tenant that minted the token. Authentication re-checks this against
+    /// the project's *current* owner, so a record that outlives a delete/recreate
+    /// of the same project slug can't authenticate a different tenant's push.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     /// SHA-256 (hex) of the per-project git-push token, or `None` if not minted.
     /// The plaintext token is shown once at mint time and never stored.
     pub git_token_fingerprint: Option<String>,
     pub git_token_created_at: u64,
-    /// Rotatable webhook HMAC secrets, newest first (current + not-yet-retired).
-    #[serde(default)]
-    pub webhook_secrets: Vec<WebhookSecret>,
 }
 
 /// Metadata for one immutable deployment of a project. The artifacts live on
