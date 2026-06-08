@@ -762,6 +762,8 @@ async fn build_one_target_inner(
         gateway_ip,
         egress_proxy,
         lang_hint: language.clone(),
+        // Flat for now; flip to true when the host layered collection lands.
+        export_layered: false,
         fetch_deadline: deps.fetch_deadline,
         seal,
     };
@@ -1524,6 +1526,7 @@ esac
             gateway_ip: Some(net.gateway.clone()),
             egress_proxy: Some(net.proxy_url()),
             lang_hint: None,
+            export_layered: false,
             fetch_deadline: Duration::from_secs(20),
             seal: Some(make_seal(lease.tap.clone())),
         };

@@ -92,9 +92,20 @@ impl Buildpack for BunBuildpack {
 
         // The app layer is the built source tree (+ node_modules). The Bun binary
         // and glibc come from the shared base/runtime layer, not here.
+        //
+        // Root the tree at /app (= working_dir): overlayfs cannot relocate a
+        // lowerdir, so the app content must PHYSICALLY live at /app inside the app
+        // layer image for the runtime overlay to land it there. Move the workspace
+        // under <layers>/app/app (cheap same-fs rename; both are on /scratch).
+        let app_layer_root = ctx.layers_dir.join("app");
+        let app_at = app_layer_root.join("app");
+        std::fs::create_dir_all(&app_layer_root)
+            .with_context(|| format!("creating app layer root {}", app_layer_root.display()))?;
+        std::fs::rename(ctx.app_dir, &app_at)
+            .with_context(|| format!("rooting workspace at {}", app_at.display()))?;
         let app_layer = Layer {
             name: "app".to_string(),
-            path: ctx.app_dir.to_path_buf(),
+            path: app_layer_root,
             types: LayerTypes {
                 build: false,
                 launch: true,

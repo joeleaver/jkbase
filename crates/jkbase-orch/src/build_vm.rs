@@ -129,6 +129,9 @@ pub struct BuildVmConfig {
     /// Language hint (e.g. `"bun"`) for the in-VM lifecycle's detect, passed via
     /// the kernel cmdline (`jkbase.lang=`). `None` → the guest auto-detects.
     pub lang_hint: Option<String>,
+    /// Request the layered artifact (content-addressed erofs layers + index.json)
+    /// instead of the flat `rootfs.tar.gz` — passed as `jkbase.export=layered`.
+    pub export_layered: bool,
     /// Max wall-time the FETCH phase may hold the network before the host
     /// force-seals — even if the guest never signals fetch-complete (so a hostile
     /// build gets the network for at most this long).
@@ -378,6 +381,9 @@ impl BuildVm {
         {
             // Safe token only (it lands verbatim on the kernel cmdline).
             boot_args.push_str(&format!(" jkbase.lang={lang}"));
+        }
+        if config.export_layered {
+            boot_args.push_str(" jkbase.export=layered");
         }
         client
             .set_boot_source(&BootSource {
