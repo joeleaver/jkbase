@@ -1,0 +1,36 @@
+# jkbase guest-kernel additions for the B2 layered runtime (WS0).
+#
+# Merged on top of Firecracker's recommended microVM config (which provides the
+# virtio/boot/ext4 essentials), then resolved with `make olddefconfig`. These are
+# the capabilities the pinned 4.14 dev kernel lacked and that the erofs/composefs
+# layered runtime needs. See ~/.claude/plans/bubbly-brewing-popcorn.md (WS0) and
+# the b2-build-rescope memory.
+
+# --- erofs: the content-addressed read-only layer format (lowerdirs) ---
+CONFIG_EROFS_FS=y
+CONFIG_EROFS_FS_ZIP=y
+CONFIG_EROFS_FS_ZIP_LZMA=y
+CONFIG_EROFS_FS_ZIP_ZSTD=y
+CONFIG_EROFS_FS_XATTR=y
+CONFIG_EROFS_FS_SECURITY=y
+CONFIG_EROFS_FS_POSIX_ACL=y
+
+# --- overlayfs: guest-side composition of base + app layers ---
+CONFIG_OVERLAY_FS=y
+CONFIG_OVERLAY_FS_REDIRECT_DIR=y
+CONFIG_OVERLAY_FS_METACOPY=y
+
+# --- fs-verity: kernel-enforced integrity of trusted base layers (composefs) ---
+# (overlayfs fs-verity validation is compiled in when OVERLAY_FS + FS_VERITY are
+#  both present on >=6.6 — that is the reason for the kernel bump.)
+CONFIG_FS_VERITY=y
+CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y
+
+# --- dm-verity: whole-image integrity fallback ---
+CONFIG_MD=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_VERITY=y
+
+# --- squashfs kept available (ext4-per-layer / squashfs fallback paths) ---
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_ZSTD=y
