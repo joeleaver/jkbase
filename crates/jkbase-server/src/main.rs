@@ -619,9 +619,11 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 /// Remove every per-project on-disk artifact (content image, data disk, snapshot,
 /// run dir, hosting tree, build workspace). Best-effort; absent paths are ignored.
 async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
-    let _ =
-        tokio::fs::remove_file(data_dir.join("content-images").join(format!("{project_id}.ext4")))
-            .await;
+    let content_images = data_dir.join("content-images");
+    let _ = tokio::fs::remove_file(content_images.join(format!("{project_id}.ext4"))).await;
+    // The metadata image's paired layer-attach sidecar.
+    let _ = tokio::fs::remove_file(content_images.join(format!("{project_id}.ext4.layers.json")))
+        .await;
     // Data disk: legacy `.ext4` plus the loop-managed `.img` + its holder record.
     let disks = data_dir.join("data-disks");
     for f in [format!("{project_id}.ext4"), format!("{project_id}.img"), format!("{project_id}.holder")] {
@@ -1245,8 +1247,6 @@ async fn wake_project_inner(
         .data_dir
         .join("content-images")
         .join(format!("{project_id}.ext4"));
-    let content_dir = plat.data_dir.join("hosting").join(project_id).join("live");
-    let store_dir = plat.data_dir.join("baselayers");
 
     // Whether this project has a data disk, plus clones of the RWO substrate so the
     // fence (below) can run AFTER dropping the platform lock. data_disk_path is set
@@ -1257,17 +1257,12 @@ async fn wake_project_inner(
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
 
-    // Re-resolve the erofs layer attach order for the cold-boot fallback (restore
-    // re-derives drives from the snapshot, so this only matters when restore fails).
-    // verify=false: the blobs were verified at deploy and are immutable. Non-fatal —
-    // a failure here must not block the restore path, which doesn't need it.
-    let layer_paths = match layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, false) {
-        Ok(plan) => plan.layer_paths,
-        Err(e) => {
-            tracing::warn!(project = %project_id, error = %e, "layer plan for wake failed; cold-boot fallback may lack layers");
-            Vec::new()
-        }
-    };
+    // The erofs layer attach order for the cold-boot fallback (restore re-derives
+    // drives from the snapshot, so this only matters when restore fails/misses). Read
+    // the sidecar PAIRED with the metadata image — NOT a recompute from `live`, which
+    // can drift from the (last successfully built) image's baked `_layers.json` and
+    // mis-assign device letters. Absent ⇒ legacy/static image with no layers.
+    let layer_paths = layer_plan::read_layer_paths(&metadata_image_path);
 
     let mut config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
