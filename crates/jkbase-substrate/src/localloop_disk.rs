@@ -103,10 +103,14 @@ impl LocalLoop {
     }
 
     fn write_holder(&self, id: &str, h: &Holder) -> Result<()> {
-        std::fs::write(
-            self.holder_path(id),
-            format!("{}\n{}\n{}\n{}", h.pid, h.epoch, h.source_id, h.loop_dev),
-        )?;
+        // Write atomically (temp + rename) so a crash mid-write never leaves a
+        // truncated holder that `read_holder` would parse as "no holder" — which
+        // would make the next attach skip the exclusivity/liveness gate.
+        let body = format!("{}\n{}\n{}\n{}", h.pid, h.epoch, h.source_id, h.loop_dev);
+        let dest = self.holder_path(id);
+        let tmp = self.dir.join(format!("{id}.holder.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &dest)?;
         Ok(())
     }
 }

@@ -378,6 +378,7 @@ async fn main() -> Result<()> {
 
     // Reconcile state and build the domain map BEFORE the proxy serves traffic,
     // or apex/www/console would 404 in the gap.
+    reap_orphan_firecrackers_on_boot().await;
     cleanup_orphans(&platform).await;
     reconcile_orphans_on_boot(&platform).await;
     backfill_domains(&platform, &domain_map).await;
@@ -540,26 +541,45 @@ async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
 /// snapshot, and remove every on-disk artifact. Best-effort + idempotent — any
 /// step that fails is reconciled by `reconcile_orphans_on_boot` on the next boot.
 async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>) -> Result<()> {
-    let mut plat = platform.lock().await;
-    if let Some(mut vm) = plat.vms.remove(project_id) {
-        let _ = vm.stop().await;
-    }
-    // Release the data-disk lease + destroy the disk (detach loop device, remove the
-    // image + holder record) as part of reaping the project.
-    if let Some(token) = plat.disk_tokens.remove(project_id) {
-        let ls = plat.lease.clone();
-        let _ = ls.release(&token).await;
-    }
-    {
-        let dd = plat.data_disk.clone();
-        let _ = dd.destroy(project_id).await;
-    }
-    plat.vm_states.remove(project_id);
-    let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
-    let _ = plat.store.remove_snapshot_meta(project_id);
-    let _ = plat.store.remove_vm_allocation(project_id);
-    let data_dir = plat.data_dir.clone();
-    drop(plat);
+    // Reap under the platform lock, but only once no wake/hibernate is mid-flight for
+    // this project: those drop the lock during the slow VM op, and destroying the disk
+    // under a live restoring VM would free a loop device another project could reuse
+    // (silent corruption). Wait it out (bounded ~30s), then do stop + release + destroy
+    // in ONE locked section so a new wake can't interleave (it needs the lock to set
+    // Waking).
+    let (alloc, data_dir) = {
+        let mut attempt = 0;
+        loop {
+            let mut plat = platform.lock().await;
+            if attempt < 150
+                && matches!(
+                    plat.vm_states.get(project_id),
+                    Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
+                )
+            {
+                drop(plat);
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            if let Some(mut vm) = plat.vms.remove(project_id) {
+                let _ = vm.stop().await;
+            }
+            // Release the data-disk lease + destroy the disk (detach loop device,
+            // remove the image + holder record) as part of reaping the project.
+            if let Some(token) = plat.disk_tokens.remove(project_id) {
+                let ls = plat.lease.clone();
+                let _ = ls.release(&token).await;
+            }
+            let dd = plat.data_disk.clone();
+            let _ = dd.destroy(project_id).await;
+            plat.vm_states.remove(project_id);
+            let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+            let _ = plat.store.remove_snapshot_meta(project_id);
+            let _ = plat.store.remove_vm_allocation(project_id);
+            break (alloc, plat.data_dir.clone());
+        }
+    };
 
     // Kill any leaked Firecracker that outlived the handle, then drop its TAP.
     let _ = tokio::process::Command::new("pkill")
@@ -590,6 +610,19 @@ async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
     }
 }
 
+/// Reap every runtime Firecracker left over from a previous (crashed/restarted) server
+/// BEFORE we wake any project. On a fresh start `vms` is empty, so any running runtime
+/// microVM is an orphan we no longer own — and a surviving writer, combined with a wake
+/// that preempts a now-stale holder record, would put two writers on one data disk.
+/// The server re-boots/re-restores the projects it should run. (Build VMs run jailed
+/// and none are in flight at boot.)
+async fn reap_orphan_firecrackers_on_boot() {
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-9", "-f", "firecracker-v1.15.1-x86_64"])
+        .status()
+        .await;
+}
+
 /// Boot-time sweep for projects deleted but left with artifacts behind (a teardown
 /// that failed midway, or a project removed before teardown existed). For every
 /// per-project image/dir whose name is NOT a currently registered project, drop the
@@ -607,20 +640,54 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     // Collect each directory's entries up front: removing files while iterating a
     // live read_dir handle skips entries (the kernel readdir cursor shifts under
     // the deletions), so a single pass would reap only a subset of the orphans.
-    for sub in ["content-images", "data-disks"] {
-        let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
-            continue;
-        };
-        let entries: Vec<_> = entries.flatten().collect();
-        for entry in entries {
+    // content-images: `{id}.ext4`.
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("content-images")) {
+        for entry in entries.flatten().collect::<Vec<_>>() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(id) = name.strip_suffix(".ext4") else {
-                continue;
-            };
+            let Some(id) = name.strip_suffix(".ext4") else { continue };
             if !registered.contains(id) {
                 let _ = std::fs::remove_file(entry.path());
-                info!(project = %id, artifact = %sub, "reaped orphaned artifact");
+                info!(project = %id, artifact = "content-images", "reaped orphaned artifact");
             }
+        }
+    }
+    // data-disks: loop-managed `{id}.img` + its `{id}.holder` record (+ legacy
+    // `{id}.ext4`). Detach any loop device still bound to an orphan image before
+    // removing it, so deleted projects can't leak loop devices that another project
+    // would later reuse.
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("data-disks")) {
+        for entry in entries.flatten().collect::<Vec<_>>() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(id) = name
+                .strip_suffix(".img")
+                .or_else(|| name.strip_suffix(".holder"))
+                .or_else(|| name.strip_suffix(".ext4"))
+            else {
+                continue;
+            };
+            if registered.contains(id) {
+                continue;
+            }
+            let path = entry.path();
+            if name.ends_with(".img")
+                && let Ok(out) = tokio::process::Command::new("losetup")
+                    .args(["-j", &path.to_string_lossy()])
+                    .output()
+                    .await
+            {
+                for dev in String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|l| l.split(':').next())
+                    .filter(|d| !d.is_empty())
+                {
+                    let _ = tokio::process::Command::new("losetup")
+                        .args(["-d", dev])
+                        .status()
+                        .await;
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+            info!(project = %id, artifact = "data-disks", "reaped orphaned artifact");
         }
     }
     for sub in ["hosting", "run", "snapshots"] {
@@ -750,13 +817,15 @@ async fn handle_deploy(
             // Capture any final log lines before the old agent goes away.
             shipper.ship(project_id, &alloc.ip).await;
         }
-        old_vm.stop().await?;
-        // Release the old VM's data-disk hold before re-fencing it for the new VM.
-        if let Some(token) = plat.disk_tokens.remove(project_id) {
-            let dd = plat.data_disk.clone();
-            let ls = plat.lease.clone();
-            release_data_disk(&dd, &ls, project_id, token).await;
-        }
+        let _ = old_vm.stop().await;
+    }
+    // Release the old VM's data-disk hold (if any) before re-fencing for the new VM —
+    // UNCONDITIONALLY: a stop() error or a missing VM handle must not leak the lease
+    // (which would then fail the re-fence below with LeaseHeld and brick the redeploy).
+    if let Some(token) = plat.disk_tokens.remove(project_id) {
+        let dd = plat.data_disk.clone();
+        let ls = plat.lease.clone();
+        release_data_disk(&dd, &ls, project_id, token).await;
     }
 
     let content_dir = plat.data_dir.join("hosting").join(project_id).join("live");
@@ -793,22 +862,21 @@ async fn handle_deploy(
 
     // Fence the data disk read-write-once for projects that declare volumes (or
     // already have a disk): acquire the lease + attach via the RWO provider,
-    // preempting any prior writer. The returned host block device replaces the old
-    // raw-file attach, so every write goes through the exclusivity gate.
-    let data_disk_path = {
+    // preempting any prior writer. Held by an RAII guard until the VM is up, so a
+    // boot failure releases the lease instead of bricking the project.
+    let disk_guard = {
         let has_volumes = check_project_has_volumes(&plat.data_dir, project_id);
         let has_disk = has_volumes || plat.data_disk.exists(project_id).await.unwrap_or(false);
         if has_disk {
             let dd = plat.data_disk.clone();
             let ls = plat.lease.clone();
             let hid = plat.host_id.clone();
-            let (dev, token) = fence_data_disk(&dd, &ls, &hid, project_id).await?;
-            plat.disk_tokens.insert(project_id.to_string(), token);
-            Some(dev)
+            Some(fence_data_disk(&dd, &ls, &hid, project_id).await?)
         } else {
             None
         }
     };
+    let data_disk_path = disk_guard.as_ref().map(|g| g.device());
 
     let config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
@@ -826,15 +894,18 @@ async fn handle_deploy(
     };
 
     let runtime_dir = plat.data_dir.join("run");
+    // If start fails, `disk_guard` drops here and releases the lease + disk.
     let vm = VmInstance::start(project_id, &config, &runtime_dir).await?;
 
-    // Record Firecracker's PID as the data-disk writer so a future attach's liveness
-    // check tracks the real writer (the microVM) rather than this server process.
-    if let Some(token) = plat.disk_tokens.get(project_id).cloned()
-        && let Some(pid) = vm.pid()
-    {
-        let dd = plat.data_disk.clone();
-        let _ = dd.set_writer_pid(project_id, &token, pid).await;
+    // VM is up: record Firecracker's PID as the data-disk writer (so a future attach's
+    // liveness check tracks the real writer, not this server), then DISARM the guard
+    // and hand the token to disk_tokens for teardown-time release.
+    if let Some(guard) = disk_guard {
+        if let Some(pid) = vm.pid() {
+            let dd = plat.data_disk.clone();
+            let _ = dd.set_writer_pid(project_id, guard.token(), pid).await;
+        }
+        plat.disk_tokens.insert(project_id.to_string(), guard.disarm());
     }
 
     plat.vms.insert(project_id.to_string(), vm);
@@ -970,6 +1041,17 @@ async fn hibernate_project(
         };
 
     let mut plat = platform.lock().await;
+
+    // The VM is down (hibernate killed the FC); release its data-disk hold NOW —
+    // before persisting snapshot meta — so a persistence error can't leak the lease
+    // (which would wedge the project in Hibernating + LeaseHeld on the next wake). The
+    // image file persists; the next wake re-fences + the restore patches the drive.
+    if let Some(token) = plat.disk_tokens.remove(project_id) {
+        let dd = plat.data_disk.clone();
+        let ls = plat.lease.clone();
+        release_data_disk(&dd, &ls, project_id, token).await;
+    }
+
     let meta = SnapshotMeta {
         project_id: project_id.to_string(),
         snapshot_path: snapshot_path.to_string_lossy().to_string(),
@@ -991,15 +1073,6 @@ async fn hibernate_project(
     // Keep TAP device and VmAllocation for fast restore
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Hibernated);
-
-    // The VM is down; release its data-disk hold (detach the loop device, release the
-    // lease) so the next wake re-fences cleanly — re-acquiring + attach_rwo, which the
-    // restore path patches the data drive onto. The image file persists.
-    if let Some(token) = plat.disk_tokens.remove(project_id) {
-        let dd = plat.data_disk.clone();
-        let ls = plat.lease.clone();
-        release_data_disk(&dd, &ls, project_id, token).await;
-    }
 
     info!(project = %project_id, "VM hibernated");
     Ok(())
@@ -1146,14 +1219,17 @@ async fn wake_project_inner(
     // bypassing the gate — only ever writes through the exclusivity attach. The
     // restore path patches the data drive to this fenced device; refuse→cold-boot
     // (reap + retry, else error) lives in fence_data_disk. None when no data disk.
-    let disk_token = if has_disk {
-        let (dev, token) = fence_data_disk(&dd, &ls, &hid, project_id).await?;
-        config.data_disk_path = Some(dev);
-        Some(token)
+    let disk_guard = if has_disk {
+        let g = fence_data_disk(&dd, &ls, &hid, project_id).await?;
+        config.data_disk_path = Some(g.device());
+        Some(g)
     } else {
         None
     };
 
+    // From here, any `?` (restore/start/wait_for_agent failure) drops `disk_guard`,
+    // which releases the lease + detaches the disk — so a failed wake never bricks the
+    // project with a leaked lease.
     let vm = if let Some(ref meta) = snap_meta {
         let snap_path = PathBuf::from(&meta.snapshot_path);
         let mem_path = PathBuf::from(&meta.mem_file_path);
@@ -1197,14 +1273,25 @@ async fn wake_project_inner(
     wait_for_agent(&alloc.ip).await?;
 
     let mut plat = platform.lock().await;
-    // Record Firecracker's PID as the data-disk writer + hold the fence token for the
-    // VM's lifetime (released on hibernate/stop).
-    if let Some(token) = disk_token {
+
+    // Re-validate the project still exists before committing the VM. handle_teardown
+    // waits out our `Waking` state, so a delete can't race the body above — but a
+    // delete that landed BEFORE we set Waking would leave us booting a ghost. If so,
+    // abort: dropping `vm` SIGKILLs the FC and dropping the armed `disk_guard` releases
+    // the lease + disk.
+    if plat.store.get_project(project_id).ok().flatten().is_none() {
+        plat.vm_states.remove(project_id);
+        anyhow::bail!("project {project_id} was deleted during wake; aborting");
+    }
+
+    // Record Firecracker's PID as the data-disk writer, then DISARM the guard and hold
+    // the token for the VM's lifetime (released on hibernate/stop/teardown).
+    if let Some(guard) = disk_guard {
         if let Some(pid) = vm.pid() {
             let dd2 = plat.data_disk.clone();
-            let _ = dd2.set_writer_pid(project_id, &token, pid).await;
+            let _ = dd2.set_writer_pid(project_id, guard.token(), pid).await;
         }
-        plat.disk_tokens.insert(project_id.to_string(), token);
+        plat.disk_tokens.insert(project_id.to_string(), guard.disarm());
     }
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
@@ -1408,39 +1495,116 @@ async fn reap_firecracker(project_id: &str) {
         .await;
 }
 
+/// RAII hold on a fenced data disk for a VM's **boot window**. [`fence_data_disk`]
+/// returns it ARMED (lease acquired + disk attached). If it is dropped before
+/// [`disarm`](DiskLeaseGuard::disarm) — i.e. the boot failed on any `?`
+/// (`VmInstance::start`/`restore_from_snapshot`/`wait_for_agent`) — it asynchronously
+/// detaches the disk + releases the lease, so a failed boot can NEVER leak the lease
+/// (a leak would brick the project with `LeaseHeld`/`RwoUnsafe` until the server
+/// restarts). On success the caller `disarm`s it and stores the token in `disk_tokens`
+/// for teardown-time release.
+struct DiskLeaseGuard {
+    data_disk: Arc<dyn DataDiskProvider>,
+    lease: Arc<dyn Lease>,
+    project_id: String,
+    token: FenceToken,
+    device: PathBuf,
+    armed: bool,
+}
+
+impl DiskLeaseGuard {
+    fn device(&self) -> PathBuf {
+        self.device.clone()
+    }
+    fn token(&self) -> &FenceToken {
+        &self.token
+    }
+    /// Success path: stop auto-releasing and hand back the token to record in
+    /// `disk_tokens` (which the teardown/hibernate paths release).
+    fn disarm(mut self) -> FenceToken {
+        self.armed = false;
+        self.token.clone()
+    }
+}
+
+impl Drop for DiskLeaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        warn!(project = %self.project_id, "data-disk boot guard dropped before activation — detaching + releasing lease");
+        let (dd, ls, id, tok) = (
+            self.data_disk.clone(),
+            self.lease.clone(),
+            self.project_id.clone(),
+            self.token.clone(),
+        );
+        tokio::spawn(async move {
+            let _ = dd.detach(&id).await;
+            let _ = ls.release(&tok).await;
+        });
+    }
+}
+
 /// Acquire the data-disk lease + attach the disk **read-write-once**, fencing any
-/// prior writer. Returns the host block device to hand to Firecracker plus the fence
-/// token to hold for the VM's lifetime. On `RwoUnsafe` (a prior writer still proven
-/// alive) it reaps a stale Firecracker for the project and retries once; if still
-/// unsafe it errors, so the caller never boots a second writer onto the same disk.
+/// prior writer, and return an armed [`DiskLeaseGuard`]. On `RwoUnsafe` (a prior
+/// writer still proven alive) it reaps a stale Firecracker for the project and retries
+/// once; if still unsafe it errors. The lease is held from `acquire` onward, so if
+/// `ensure`/`attach` fail this releases it before returning (no leak on the
+/// acquire→attach window); after a successful attach the returned guard owns the
+/// release until the caller `disarm`s it.
 async fn fence_data_disk(
     data_disk: &Arc<dyn DataDiskProvider>,
     lease: &Arc<dyn Lease>,
     host_id: &str,
     project_id: &str,
-) -> Result<(PathBuf, FenceToken)> {
+) -> Result<DiskLeaseGuard> {
     let token = lease
         .acquire(project_id, host_id, DISK_LEASE_TTL)
         .await
         .map_err(|e| anyhow::anyhow!("lease acquire for {project_id}: {e}"))?;
+    let device = match fence_attach(data_disk, project_id, &token).await {
+        Ok(d) => d,
+        Err(e) => {
+            // Lease was acquired but the disk couldn't be attached — release it.
+            let _ = data_disk.detach(project_id).await;
+            let _ = lease.release(&token).await;
+            return Err(e);
+        }
+    };
+    Ok(DiskLeaseGuard {
+        data_disk: data_disk.clone(),
+        lease: lease.clone(),
+        project_id: project_id.to_string(),
+        token,
+        device,
+        armed: true,
+    })
+}
+
+async fn fence_attach(
+    data_disk: &Arc<dyn DataDiskProvider>,
+    project_id: &str,
+    token: &FenceToken,
+) -> Result<PathBuf> {
     data_disk
         .ensure(project_id, DATA_DISK_MIB * 1024 * 1024)
         .await
         .map_err(|e| anyhow::anyhow!("ensure data disk {project_id}: {e}"))?;
-    let device = match data_disk.attach_rwo(project_id, &token).await {
+    let device = match data_disk.attach_rwo(project_id, token).await {
         Ok(d) => d,
         Err(SubstrateError::RwoUnsafe { .. }) => {
             warn!(project = %project_id, "data disk held by a live prior writer; reaping stale Firecracker and retrying attach");
             reap_firecracker(project_id).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             data_disk
-                .attach_rwo(project_id, &token)
+                .attach_rwo(project_id, token)
                 .await
                 .map_err(|e| anyhow::anyhow!("attach_rwo after reap {project_id}: {e}"))?
         }
         Err(e) => return Err(anyhow::anyhow!("attach_rwo {project_id}: {e}")),
     };
-    Ok((device.path, token))
+    Ok(device.path)
 }
 
 /// Release a project's data disk: detach the device + release the lease so another
