@@ -20,6 +20,9 @@ contents:
     - ld-linux
     - ca-certificates-bundle
     - tzdata
+    # /bin/sh + coreutils: `bun run <script>` (and most runtimes) shell out to run
+    # the package.json start script; without a shell the launch errors MissingShell.
+    - busybox
 
 archs:
   - x86_64
