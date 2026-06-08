@@ -4,17 +4,18 @@ use crate::store::{
     BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, Project, Store,
 };
 use jkbase_common::routing::DomainTarget;
-use axum::body::Bytes;
-use axum::extract::{Path, State, Request};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::extract::DefaultBodyLimit;
 use axum::{Extension, Json, Router};
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -91,6 +92,13 @@ pub struct AppState {
     /// `std::sync::Mutex` (critical sections never await) so [`DeployLockGuard`]
     /// can release on `Drop` — a panicking spawned build task can't leak the lock.
     deploy_locks: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Bounds concurrent in-flight `git-receive-pack` bodies (each buffers up to
+    /// `PACK_MAX_BYTES`) so the unauthenticated-at-the-router git endpoint can't
+    /// be used to OOM the shared control plane.
+    git_pack_permits: Arc<tokio::sync::Semaphore>,
+    /// Projects whose git-push build was deferred because a build was already
+    /// running; drained (rebuilding the latest tip) when the deploy lock frees.
+    pending_git_pushes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +164,8 @@ impl AppState {
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
+            git_pack_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PACKS)),
+            pending_git_pushes: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -267,6 +277,14 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(list_secrets).post(set_secret),
         )
         .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
+        .route(
+            "/projects/{id}/repo",
+            get(get_repo_trigger_status),
+        )
+        .route(
+            "/projects/{id}/repo/git-token",
+            post(mint_git_token).delete(revoke_git_token),
+        )
         .route("/projects/{id}/logs", get(get_project_logs))
         .route("/projects/{id}/deployments", get(list_deployments))
         .route("/projects/{id}/rollback", post(rollback))
@@ -293,9 +311,18 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/login", post(login))
         .route("/health", get(api_health));
 
+    // Connected-repo build trigger (build · D). Self-authenticates via an HTTP
+    // Basic per-project git-push token, so it must NOT sit behind the Bearer
+    // `require_auth` layer, and it carries no `DefaultBodyLimit` —
+    // `git-receive-pack` enforces its own streamed pack cap + concurrency bound.
+    let triggers = Router::new()
+        .route("/git/{id}/info/refs", get(git_info_refs))
+        .route("/git/{id}/git-receive-pack", post(git_receive_pack));
+
     Router::new()
         .merge(authenticated)
         .merge(public)
+        .merge(triggers)
         .layer(cors)
         .with_state(state)
 }
@@ -784,6 +811,16 @@ async fn delete_project(
                     let _ = state.store.purge_usage(&id);
                     let _ = state.store.remove_quota(&id);
                     let _ = state.store.remove_quota_status(&id);
+                    // Reap the git-push credential + bare repo so a recreated
+                    // project of the same slug can't inherit a prior tenant's
+                    // token or pushed objects (the auth tenant-check is the
+                    // primary guard; this is cleanup + disk reclaim).
+                    let _ = state.store.delete_repo_trigger(&id);
+                    let _ = tokio::fs::remove_dir_all(crate::git_http::bare_repo_path(
+                        data_dir(&state),
+                        &id,
+                    ))
+                    .await;
                     // Release all claimed hostnames so they can't be taken over
                     // or left dangling in the routing maps.
                     if let Ok(domains) = state.store.list_domains_for_project(&id) {
@@ -916,6 +953,432 @@ fn require_project_owner(
     }
 }
 
+// -- Connected-repo build trigger: git-push credential management (build · D) --
+
+/// The control-plane API origin (`https://api.{apex}`), where the `/git/{id}`
+/// push endpoint lives.
+fn api_base_url(state: &AppState) -> String {
+    format!("https://api.{}", state.platform_domain)
+}
+
+#[derive(Serialize)]
+struct GitTokenResponse {
+    /// The plaintext push token — shown ONCE; jkbase keeps only its fingerprint.
+    token: String,
+    /// Ready-to-use remote with the token embedded: `git push <push_url> main`.
+    push_url: String,
+}
+
+#[derive(Serialize)]
+struct RepoTriggerStatusResponse {
+    git_token_configured: bool,
+    git_token_created_at: Option<u64>,
+    /// Token-less push URL (the tenant supplies the token via Basic auth).
+    push_url: String,
+}
+
+/// `POST /projects/{id}/repo/git-token` — mint (or rotate) the per-project
+/// git-push token. The plaintext is returned once; only its SHA-256 fingerprint
+/// is stored. Rotating invalidates the previous token immediately.
+async fn mint_git_token(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let project = match require_project_owner(&state, &tenant, &id) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let token = auth::generate_git_token();
+    let mut cfg = state
+        .store
+        .get_repo_trigger(&id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    cfg.project_id = id.clone();
+    cfg.tenant_id = project.tenant_id;
+    cfg.git_token_fingerprint = Some(auth::token_fingerprint(&token));
+    cfg.git_token_created_at = auth::timestamp();
+    if let Err(e) = state.store.save_repo_trigger(&cfg) {
+        return internal_error(e);
+    }
+    let push_url = format!(
+        "{}/git/{id}",
+        api_base_url(&state).replace("https://", &format!("https://jkbase:{token}@"))
+    );
+    (StatusCode::CREATED, Json(GitTokenResponse { token, push_url })).into_response()
+}
+
+/// `DELETE /projects/{id}/repo/git-token` — revoke the git-push token.
+async fn revoke_git_token(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    let mut cfg = state
+        .store
+        .get_repo_trigger(&id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    cfg.project_id = id.clone();
+    cfg.git_token_fingerprint = None;
+    cfg.git_token_created_at = 0;
+    if let Err(e) = state.store.save_repo_trigger(&cfg) {
+        return internal_error(e);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /projects/{id}/repo` — report whether the git-push token is configured
+/// (never returns the token itself).
+async fn get_repo_trigger_status(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    let cfg = state
+        .store
+        .get_repo_trigger(&id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(RepoTriggerStatusResponse {
+            git_token_configured: cfg.git_token_fingerprint.is_some(),
+            git_token_created_at: (cfg.git_token_created_at != 0).then_some(cfg.git_token_created_at),
+            push_url: format!("{}/git/{id}", api_base_url(&state)),
+        }),
+    )
+        .into_response()
+}
+
+// -- Smart-HTTP git server: `git push jkbase main` build trigger (build · D) --
+
+/// The branch whose pushes trigger a build. Pushing any other branch updates the
+/// bare repo but is a no-op for the build pipeline (design §9 / map gotcha).
+const GIT_PUSH_TRIGGER_BRANCH: &str = "main";
+
+/// Max concurrent `git-receive-pack` bodies in flight across the control plane.
+/// Each can buffer up to `PACK_MAX_BYTES`, so this caps git-push memory; excess
+/// pushes get a fast 503 rather than queueing (and holding) more memory.
+const MAX_CONCURRENT_PACKS: usize = 4;
+
+/// Per-project on-host state root (`{deploy_dir}/..`), where the git bare repos
+/// live under `git/`. Mirrors the derivation in `get_project_usage`.
+fn data_dir(state: &AppState) -> &FsPath {
+    state.deploy_dir.parent().unwrap_or(&state.deploy_dir)
+}
+
+/// Extract the token a git client sends as the HTTP Basic password (any
+/// username; git puts the credential in the password field).
+fn basic_auth_token(headers: &HeaderMap) -> Option<String> {
+    use base64::Engine as _;
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let b64 = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let creds = String::from_utf8(decoded).ok()?;
+    let (_user, pass) = creds.split_once(':')?;
+    Some(pass.to_string())
+}
+
+/// True if `id` is a well-formed project slug (the invariant `create_project`
+/// enforces). Rejecting anything else keeps a crafted `{id}` (`..`, encoded `/`)
+/// from ever reaching the bare-repo path join, independent of the auth gate.
+fn is_valid_project_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 63
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Validate the presented git-push token for `project_id`. Three gates, in order:
+/// the project must currently exist, its current owner must match the tenant that
+/// minted the token (so a credential record outliving a delete/recreate of the
+/// same slug can't authenticate a different tenant — cross-tenant takeover), and
+/// the token fingerprint must match (constant-time). Looking up by the path `{id}`
+/// (not by token) is O(1) and rejects a token minted for a different project.
+fn git_authenticated(state: &AppState, project_id: &str, headers: &HeaderMap) -> bool {
+    if !is_valid_project_id(project_id) {
+        return false;
+    }
+    let Some(cfg) = state.store.get_repo_trigger(project_id).ok().flatten() else {
+        return false;
+    };
+    let Some(stored_fp) = cfg.git_token_fingerprint else {
+        return false;
+    };
+    // The project must exist now and still be owned by the token's tenant.
+    let Ok(Some(project)) = state.store.get_project(project_id) else {
+        return false;
+    };
+    if project.tenant_id.is_none() || project.tenant_id != cfg.tenant_id {
+        return false;
+    }
+    let Some(token) = basic_auth_token(headers) else {
+        return false;
+    };
+    ct_eq(
+        auth::token_fingerprint(&token).as_bytes(),
+        stored_fp.as_bytes(),
+    )
+}
+
+/// 401 with `WWW-Authenticate` so a git client (re)sends Basic credentials.
+fn git_unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            "Basic realm=\"jkbase\"",
+        )],
+        "git authentication required",
+    )
+        .into_response()
+}
+
+/// 500 for the git endpoints that logs the real cause (which can include the
+/// host `data_dir` path or git stderr) but returns a generic body, so a failing
+/// push doesn't disclose host internals to an authenticated tenant.
+fn git_internal_error(e: impl std::fmt::Display) -> Response {
+    tracing::error!(error = %e, "git endpoint internal error");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+enum BodyReadError {
+    TooLarge,
+    Io,
+}
+
+/// Read a request body fully but abort past `cap` bytes (pack-bomb DoS — §9:
+/// the generous `/build` body limit doesn't bound a streamed receive). If the
+/// body is `Content-Encoding: gzip`, decompress with the SAME cap on the output
+/// so a gzip bomb can't expand past the limit either.
+async fn read_body_capped(
+    headers: &HeaderMap,
+    body: Body,
+    cap: usize,
+) -> Result<Vec<u8>, BodyReadError> {
+    let mut collected = Vec::new();
+    let mut body = body;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| BodyReadError::Io)?;
+        if let Ok(data) = frame.into_data() {
+            if collected.len() + data.len() > cap {
+                return Err(BodyReadError::TooLarge);
+            }
+            collected.extend_from_slice(&data);
+        }
+    }
+
+    let is_gzip = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("gzip"))
+        .unwrap_or(false);
+    if !is_gzip {
+        return Ok(collected);
+    }
+
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(&collected[..])
+        .take(cap as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|_| BodyReadError::Io)?;
+    if out.len() > cap {
+        return Err(BodyReadError::TooLarge);
+    }
+    Ok(out)
+}
+
+/// `GET /git/{id}/info/refs?service=git-receive-pack` — the push handshake. We
+/// only serve `git-receive-pack` (pushes); clone/fetch (`git-upload-pack`) is not
+/// offered.
+async fn git_info_refs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    // Auth first, so every unauthorized request gets a uniform 401 (and git's
+    // initial unauthenticated probe is challenged into retrying with creds).
+    if !git_authenticated(&state, &id, &headers) {
+        return git_unauthorized();
+    }
+    if params.get("service").map(String::as_str) != Some("git-receive-pack") {
+        return (
+            StatusCode::FORBIDDEN,
+            "only git-receive-pack (push) is supported",
+        )
+            .into_response();
+    }
+    let repo = crate::git_http::bare_repo_path(data_dir(&state), &id);
+    if let Err(e) = crate::git_http::ensure_bare_repo(&repo).await {
+        return git_internal_error(e);
+    }
+    match crate::git_http::advertise_refs(&repo).await {
+        Ok(body) => (
+            StatusCode::OK,
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-git-receive-pack-advertisement",
+                ),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(e) => internal_error(e),
+    }
+}
+
+/// `POST /git/{id}/git-receive-pack` — receive the push, then (if the trigger
+/// branch advanced) snapshot its tip and funnel it into a build.
+async fn git_receive_pack(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !git_authenticated(&state, &id, &headers) {
+        return git_unauthorized();
+    }
+    // Bound concurrent in-flight packs (each buffers up to PACK_MAX_BYTES) before
+    // reading anything, so a flood of pushes can't OOM the shared control plane.
+    let Ok(_permit) = state.git_pack_permits.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "5")],
+            "too many concurrent pushes, retry shortly",
+        )
+            .into_response();
+    };
+    let repo = crate::git_http::bare_repo_path(data_dir(&state), &id);
+    if let Err(e) = crate::git_http::ensure_bare_repo(&repo).await {
+        return git_internal_error(e);
+    }
+
+    let input = match read_body_capped(&headers, body, crate::git_http::PACK_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "pack exceeds the {} byte limit",
+                    crate::git_http::PACK_MAX_BYTES
+                ),
+            )
+                .into_response();
+        }
+        Err(BodyReadError::Io) => {
+            return (StatusCode::BAD_REQUEST, "failed to read request body").into_response();
+        }
+    };
+    if let Err(e) = crate::git_http::check_pack_object_count(&input) {
+        return (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response();
+    }
+
+    // Trigger a build only if this push advances the configured branch. The pack
+    // bytes are moved into `receive_pack` (no extra copy) and dropped after.
+    let before = crate::git_http::branch_tip(&repo, GIT_PUSH_TRIGGER_BRANCH).await;
+    let result = match crate::git_http::receive_pack(&repo, input).await {
+        Ok(r) => r,
+        Err(e) => return git_internal_error(e),
+    };
+    if let Some(commit) = crate::git_http::branch_tip(&repo, GIT_PUSH_TRIGGER_BRANCH).await
+        && before.as_deref() != Some(commit.as_str())
+    {
+        spawn_git_push_build(state.clone(), id.clone(), repo.clone(), commit);
+    }
+
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/x-git-receive-pack-result",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        result,
+    )
+        .into_response()
+}
+
+/// Archive the pushed tip and start a build, off the git response path. A push
+/// always succeeds at the git layer; the build runs asynchronously.
+///
+/// If a build is already running (`Locked`), the push is *not* dropped: the
+/// project is marked pending and [`drain_pending_git_push`] rebuilds the latest
+/// tip when that build finishes. Without this, the ref has already advanced, so
+/// re-pushing the same commit would be a no-op (`before == commit`) and prod
+/// would silently stay on the old build.
+fn spawn_git_push_build(state: Arc<AppState>, id: String, repo: PathBuf, commit: String) {
+    tokio::spawn(async move {
+        let targz = match crate::git_http::archive_commit_targz(&repo, &commit).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(project = %id, error = %e, "git-push: archive failed");
+                return;
+            }
+        };
+        match start_build_job(&state, &id, targz) {
+            Ok(build_id) => {
+                tracing::info!(project = %id, build_id, commit = %commit, "git-push triggered build")
+            }
+            Err(StartBuildError::Locked) => {
+                state
+                    .pending_git_pushes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(id.clone());
+                tracing::info!(project = %id, commit = %commit, "git-push: build in progress; queued a rebuild of the latest tip")
+            }
+            Err(StartBuildError::OverQuota(m)) => {
+                tracing::warn!(project = %id, reason = %m, "git-push: build skipped (over quota)")
+            }
+            Err(StartBuildError::NotEnabled) => {
+                tracing::warn!(project = %id, "git-push: build pipeline not enabled")
+            }
+            Err(StartBuildError::Internal(m)) => {
+                tracing::error!(project = %id, error = %m, "git-push: failed to start build")
+            }
+        }
+    });
+}
+
+/// After a build finishes (deploy lock now free), if a git push was deferred for
+/// this project, rebuild its current tip — coalescing any pushes that arrived
+/// while the lock was held into a single rebuild of the newest commit.
+async fn drain_pending_git_push(state: Arc<AppState>, id: String) {
+    let pending = state
+        .pending_git_pushes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&id);
+    if !pending {
+        return;
+    }
+    let repo = crate::git_http::bare_repo_path(data_dir(&state), &id);
+    if let Some(commit) = crate::git_http::branch_tip(&repo, GIT_PUSH_TRIGGER_BRANCH).await {
+        // spawn_git_push_build re-queues if it's *still* locked (a new build
+        // grabbed the lock first); that build will drain again on completion.
+        spawn_git_push_build(state, id, repo, commit);
+    }
+}
+
 /// `POST /projects/{id}/build` — the one build-pipeline intake funnel. Accepts a
 /// gzipped source tarball, registers a build job, and fans out per-target build
 /// VMs asynchronously (design §4/§12). Returns 202 immediately; the client polls
@@ -930,14 +1393,72 @@ async fn build(
     if let Err(e) = require_project_owner(&state, &tenant, &id) {
         return e.into_response();
     }
-    if state.build_callback.is_none() {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(ErrorResponse {
-                error: "server-side build pipeline is not enabled".to_string(),
+    match start_build_job(&state, &id, body.to_vec()) {
+        Ok(build_id) => (
+            StatusCode::ACCEPTED,
+            Json(BuildStartedResponse {
+                build_id,
+                project_id: id,
             }),
         )
-            .into_response();
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Why the shared build funnel refused to start a job.
+enum StartBuildError {
+    /// The server-side build pipeline isn't enabled (`build_callback` is None).
+    NotEnabled,
+    /// The project is at its build-minute cap (pre-build 402 gate).
+    OverQuota(String),
+    /// A deploy/build/rollback is already running for this project.
+    Locked,
+    /// A store error allocating/persisting the build record.
+    Internal(String),
+}
+
+impl StartBuildError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            StartBuildError::NotEnabled => (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse {
+                    error: "server-side build pipeline is not enabled".to_string(),
+                }),
+            )
+                .into_response(),
+            StartBuildError::OverQuota(msg) => (
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ErrorResponse { error: msg }),
+            )
+                .into_response(),
+            StartBuildError::Locked => (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "a deploy or build is already in progress".to_string(),
+                }),
+            )
+                .into_response(),
+            StartBuildError::Internal(msg) => internal_error(msg),
+        }
+    }
+}
+
+/// The one build-pipeline funnel shared by every trigger (CLI `POST /build`,
+/// git-push): enforce the pre-build 402 gate, serialize per project,
+/// allocate a build id, persist a `Queued` record, and spawn the background job.
+/// Ownership/authentication is the caller's responsibility. Returns the new
+/// build id. The `DeployLockGuard` is moved into the spawned task and releases
+/// on drop — including on panic-unwind, so a wedged build can't lock the project
+/// forever.
+fn start_build_job(
+    state: &Arc<AppState>,
+    id: &str,
+    source_tar_gz: Vec<u8>,
+) -> Result<u64, StartBuildError> {
+    if state.build_callback.is_none() {
+        return Err(StartBuildError::NotEnabled);
     }
 
     // Pre-build 402 gate: a project already at its build-minute cap can't launch
@@ -948,55 +1469,30 @@ async fn build(
         let month_start = crate::store::month_start_epoch(auth::timestamp());
         let used = state
             .store
-            .sum_month_to_date(&id, month_start)
+            .sum_month_to_date(id, month_start)
             .map(|m| m.build_seconds)
             .unwrap_or(0);
         let cap = state
             .store
-            .get_quota(&id)
+            .get_quota(id)
             .map(|q| q.build_seconds_per_month)
             .unwrap_or(crate::store::DEFAULT_QUOTA.build_seconds_per_month);
         if used >= cap {
-            return (
-                StatusCode::PAYMENT_REQUIRED,
-                Json(ErrorResponse {
-                    error: format!(
-                        "build-minute quota exceeded: {used} of {cap} build-seconds used this month"
-                    ),
-                }),
-            )
-                .into_response();
+            return Err(StartBuildError::OverQuota(format!(
+                "build-minute quota exceeded: {used} of {cap} build-seconds used this month"
+            )));
         }
     }
 
-    // Serialize against concurrent deploys/builds for this project. The guard is
-    // moved into the spawned build task and releases the lock on drop — including
-    // if that task unwinds, so a panicking build can't wedge the project.
-    let Some(guard) = DeployLockGuard::try_acquire(&state, &id) else {
-        return (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "a deploy or build is already in progress".to_string(),
-            }),
-        )
-            .into_response();
-    };
+    let guard = DeployLockGuard::try_acquire(state, id).ok_or(StartBuildError::Locked)?;
 
-    let build_id = match state.store.next_build_id(&id) {
-        Ok(n) => n,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
+    let build_id = state
+        .store
+        .next_build_id(id)
+        .map_err(|e| StartBuildError::Internal(e.to_string()))?;
     let now = auth::timestamp();
     let rec = BuildRecord {
-        project_id: id.clone(),
+        project_id: id.to_string(),
         build_id,
         phase: BuildPhase::Queued,
         targets: Vec::new(),
@@ -1007,33 +1503,25 @@ async fn build(
         created_at: now,
         updated_at: now,
     };
-    if let Err(e) = state.store.save_build(&rec) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response();
-    }
+    state
+        .store
+        .save_build(&rec)
+        .map_err(|e| StartBuildError::Internal(e.to_string()))?;
 
     let state_bg = state.clone();
-    let id_bg = id.clone();
-    let source = body.to_vec();
+    let id_bg = id.to_string();
     tokio::spawn(async move {
-        // Released on completion OR panic-unwind of the build task.
-        let _guard = guard;
-        run_build_job(state_bg, &id_bg, build_id, source).await;
+        {
+            // Released on completion OR panic-unwind of the build task.
+            let _guard = guard;
+            run_build_job(state_bg.clone(), &id_bg, build_id, source_tar_gz).await;
+        }
+        // Lock is free now: rebuild the latest tip if a git push was deferred
+        // while this build held the lock (coalesced; no-op otherwise).
+        drain_pending_git_push(state_bg, id_bg).await;
     });
 
-    (
-        StatusCode::ACCEPTED,
-        Json(BuildStartedResponse {
-            build_id,
-            project_id: id,
-        }),
-    )
-        .into_response()
+    Ok(build_id)
 }
 
 /// Re-read the latest build record, apply `f`, stamp `updated_at`, and persist.

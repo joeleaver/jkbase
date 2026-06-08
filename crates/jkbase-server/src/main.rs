@@ -614,6 +614,9 @@ async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
     for dir in ["snapshots", "run", "hosting", "builds"] {
         let _ = tokio::fs::remove_dir_all(data_dir.join(dir).join(project_id)).await;
     }
+    // Per-project git bare repo (build·D push-to-deploy): `git/{id}.git`.
+    let _ =
+        tokio::fs::remove_dir_all(data_dir.join("git").join(format!("{project_id}.git"))).await;
 }
 
 /// Reap every runtime Firecracker left over from a previous (crashed/restarted) server
@@ -709,6 +712,21 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             if !registered.contains(&id) {
                 let _ = std::fs::remove_dir_all(entry.path());
                 info!(project = %id, artifact = %sub, "reaped orphaned dir");
+            }
+        }
+    }
+    // git bare repos (build·D push-to-deploy): `git/{id}.git` dirs. Reaps the
+    // bare repo (and its credential's pushed objects) when a delete-time cleanup
+    // was missed, so a recreated slug can't inherit them.
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("git")) {
+        for entry in entries.flatten().collect::<Vec<_>>() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_suffix(".git") else {
+                continue;
+            };
+            if !registered.contains(id) {
+                let _ = std::fs::remove_dir_all(entry.path());
+                info!(project = %id, artifact = "git", "reaped orphaned bare repo");
             }
         }
     }
