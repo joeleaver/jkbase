@@ -1661,107 +1661,10 @@ esac
     #[tokio::test]
     #[ignore = "needs KVM + root + baked bun.ext4; set JKB_DATA + JKB_FC_RELEASE"]
     async fn bun_server_build_through_orchestrator() {
-        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
-            eprintln!("skip: set JKB_DATA");
-            return;
-        };
-        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
-            eprintln!("skip: set JKB_FC_RELEASE");
-            return;
-        };
-        let toolchain_dir = data.join("toolchains");
-        if !toolchain_dir.join("bun.ext4").exists() {
-            eprintln!("skip: {}/bun.ext4 not baked", toolchain_dir.display());
-            return;
-        }
-        // Flat rung only needs a bootable kernel; prefer the 6.12 LTS image.
-        let kernel = {
-            let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
-        };
-
-        // Fixture: a single Bun server, no Dockerfile, no deps. `language="bun"`
-        // is the authoritative detect hint (forwarded as `jkbase.lang=bun`).
-        let src = data.join("bun-fixture-src");
-        let _ = std::fs::remove_dir_all(&src);
-        write(
-            src.join("jkbase.toml"),
-            r#"
-[project]
-name = "bunfix"
-[servers.api]
-source = "./server"
-language = "bun"
-port = 3000
-"#,
-        );
-        write(
-            src.join("server/server.ts"),
-            "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-        );
-        write(
-            src.join("server/package.json"),
-            "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
-        );
-
-        let mut tarbuf = Vec::new();
-        {
-            let enc = flate2::write::GzEncoder::new(&mut tarbuf, flate2::Compression::fast());
-            let mut tb = tar::Builder::new(enc);
-            tb.append_dir_all(".", &src).unwrap();
-            tb.into_inner().unwrap().finish().unwrap();
-        }
-
-        let store = Store::open(&data.join("onbox-bun.redb")).unwrap();
+        let Some(fx) = bun_pipeline_build("bunfix", 1).await else { return };
+        let staged = &fx.staged;
+        let store = &fx.store;
         let (project_id, build_id) = ("bunfix", 1u64);
-        store
-            .save_build(&BuildRecord {
-                project_id: project_id.into(),
-                build_id,
-                phase: BuildPhase::Building,
-                targets: vec![],
-                log_tail: String::new(),
-                phase_timings_ms: Default::default(),
-                deployed_version: None,
-                error: None,
-                source_commit: None,
-                created_at: now(),
-                updated_at: now(),
-            })
-            .unwrap();
-
-        let deps = Arc::new(BuildDeps {
-            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
-            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
-            kernel_path: kernel,
-            data_dir: data.clone(),
-            deploy_dir: data.join("hosting"),
-            toolchain_dir,
-            store: store.clone(),
-            chroot_base: data.join("bj-bun"),
-            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
-            parent_cgroup: "jkbase-build".into(),
-            uid: 100_000,
-            gid: 100_000,
-            timeout: Duration::from_secs(120),
-            vcpu_count: 2,
-            mem_size_mib: 1024,
-            cgroup_pids_max: 512,
-            // Headroom above the 1 GiB guest so the bun build is not host-OOM-killed.
-            cgroup_mem_max_bytes: 1536 * 1024 * 1024,
-            cgroup_cpu_max: "200000 100000".into(),
-            scratch_size_bytes: 256 * 1024 * 1024,
-            output_size_bytes: 64 * 1024 * 1024,
-            console_log_max_bytes: 1024 * 1024,
-            max_concurrent: 1,
-            net: None,
-            fetch_deadline: Duration::from_secs(120),
-        });
-        std::fs::create_dir_all(&deps.chroot_base).unwrap();
-
-        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
-            .await
-            .expect("bun server build should succeed");
 
         // Layered server artifact assembled into the deploy shape: NO flat tarball;
         // instead a content-addressed app erofs blob under _layers/.
@@ -1805,7 +1708,272 @@ port = 3000
             .build_seconds;
         assert!(billed >= 1, "expected ≥1 build-second, got {billed}");
 
-        let _ = std::fs::remove_dir_all(&staged);
+        let _ = std::fs::remove_dir_all(staged);
         println!("PASS: run_project_build drove bun.ext4 -> layered app erofs blob + launch manifest");
+    }
+
+    /// Everything the on-box pipeline tests share after a successful build.
+    struct BuildFixture {
+        data: PathBuf,
+        fc_release: PathBuf,
+        kernel: PathBuf,
+        store: Store,
+        staged: PathBuf,
+    }
+
+    /// Shared build half: resolve the env, write a single no-dep Bun server fixture,
+    /// and drive it through `run_project_build`. Returns `None` (with an explanatory
+    /// eprintln) when the environment isn't provisioned, so callers skip cleanly.
+    async fn bun_pipeline_build(project_id: &str, build_id: u64) -> Option<BuildFixture> {
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return None;
+        };
+        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_FC_RELEASE");
+            return None;
+        };
+        let toolchain_dir = data.join("toolchains");
+        if !toolchain_dir.join("bun.ext4").exists() {
+            eprintln!("skip: {}/bun.ext4 not baked", toolchain_dir.display());
+            return None;
+        }
+        // Layered runtime needs the 6.12 LTS kernel (erofs/overlay/pivot_root).
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+        };
+
+        // Fixture: a single Bun server, no Dockerfile, no deps. `language="bun"`
+        // is the authoritative detect hint (forwarded as `jkbase.lang=bun`).
+        let src = data.join(format!("bun-fixture-src-{project_id}"));
+        let _ = std::fs::remove_dir_all(&src);
+        write(
+            src.join("jkbase.toml"),
+            r#"
+[project]
+name = "bunfix"
+[servers.api]
+source = "./server"
+language = "bun"
+port = 3000
+[routes."/"]
+service = "server"
+name = "api"
+"#,
+        );
+        write(
+            src.join("server/server.ts"),
+            "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+        );
+        write(
+            src.join("server/package.json"),
+            "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+        );
+
+        let mut tarbuf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarbuf, flate2::Compression::fast());
+            let mut tb = tar::Builder::new(enc);
+            tb.append_dir_all(".", &src).unwrap();
+            tb.into_inner().unwrap().finish().unwrap();
+        }
+
+        let store = Store::open(&data.join("onbox-bun.redb")).unwrap();
+        store
+            .save_build(&BuildRecord {
+                project_id: project_id.into(),
+                build_id,
+                phase: BuildPhase::Building,
+                targets: vec![],
+                log_tail: String::new(),
+                phase_timings_ms: Default::default(),
+                deployed_version: None,
+                error: None,
+                source_commit: None,
+                created_at: now(),
+                updated_at: now(),
+            })
+            .unwrap();
+
+        let deps = Arc::new(BuildDeps {
+            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            data_dir: data.clone(),
+            deploy_dir: data.join("hosting"),
+            toolchain_dir,
+            store: store.clone(),
+            chroot_base: data.join("bj-bun"),
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+            parent_cgroup: "jkbase-build".into(),
+            uid: 100_000,
+            gid: 100_000,
+            timeout: Duration::from_secs(120),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            cgroup_pids_max: 512,
+            // Headroom above the 1 GiB guest so the bun build is not host-OOM-killed.
+            cgroup_mem_max_bytes: 1536 * 1024 * 1024,
+            cgroup_cpu_max: "200000 100000".into(),
+            scratch_size_bytes: 256 * 1024 * 1024,
+            output_size_bytes: 64 * 1024 * 1024,
+            console_log_max_bytes: 1024 * 1024,
+            max_concurrent: 1,
+            net: None,
+            fetch_deadline: Duration::from_secs(120),
+        });
+        std::fs::create_dir_all(&deps.chroot_base).unwrap();
+
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+            .await
+            .expect("bun server build should succeed");
+
+        Some(BuildFixture { data, fc_release, kernel, store, staged })
+    }
+
+    async fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
+        let status = tokio::process::Command::new(cmd).args(args).status().await?;
+        if !status.success() {
+            return Err(std::io::Error::other(format!("{cmd} {args:?} failed ({status})")));
+        }
+        Ok(())
+    }
+
+    /// Poll a raw HTTP/1.0 GET until a 200, returning the trimmed body.
+    async fn poll_http_200(ip: &str, port: u16, timeout: Duration) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Ok(mut s) = tokio::net::TcpStream::connect((ip, port)).await {
+                let _ = s.write_all(b"GET / HTTP/1.0\r\nHost: jkbase\r\n\r\n").await;
+                let mut buf = Vec::new();
+                if s.read_to_end(&mut buf).await.is_ok() {
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some((head, body)) = text.split_once("\r\n\r\n")
+                        && head.lines().next().is_some_and(|l| l.contains(" 200 "))
+                    {
+                        return Some(body.trim().to_string());
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        None
+    }
+
+    /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun
+    /// server is built through `run_project_build` (→ a layered app erofs blob),
+    /// the host resolves the layer plan + bakes the metadata image
+    /// (`compute_layer_plan` + `build_metadata_image`), and the **real
+    /// `jkbase-agent` runtime VM** boots with the metadata image + base/runtime/app
+    /// erofs layers → the agent composes the per-server overlay + pivot_root → bun
+    /// serves → HTTP 200. This is the first proof that the BUILT app layer (not a
+    /// hand-rolled one) composes with the shared store layers and serves through the
+    /// production runtime path.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_BASELAYERS=/abs/.firecracker/baselayers \
+    ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       <test-bin> --ignored --nocapture bun_layered_pipeline_to_http_200
+    ///
+    /// Needs everything `bun_server_build_through_orchestrator` needs, plus the
+    /// populated baselayers store (`JKB_BASELAYERS`, default `$JKB_DATA/baselayers`)
+    /// and the musl agent binary (`JKB_AGENT`). Uses a point-to-point tap
+    /// (172.31.0.1/24), sidestepping the dev-box jkbr0 bridge quirk.
+    #[tokio::test]
+    #[ignore = "full pipeline: needs KVM + root + bun.ext4 + baselayers + musl agent"]
+    async fn bun_layered_pipeline_to_http_200() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Some(fx) = bun_pipeline_build("bunpipe", 1).await else { return };
+
+        let store_dir = std::env::var("JKB_BASELAYERS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| fx.data.join("baselayers"));
+        if !store_dir.join("platform.json").exists() {
+            eprintln!("skip: no baselayers store at {}", store_dir.display());
+            return;
+        }
+        let Ok(agent_bin) = std::env::var("JKB_AGENT").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
+            return;
+        };
+        if !agent_bin.exists() {
+            eprintln!("skip: agent binary {} missing", agent_bin.display());
+            return;
+        }
+
+        // Host glue under test: resolve + verify the layer plan and bake the metadata
+        // image (device map + manifest + _layers.json) — treating the staged build as
+        // the deployment dir.
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, true)
+            .expect("compute layer plan from the built deployment");
+        assert!(
+            !plan.layer_paths.is_empty(),
+            "a layered server must resolve >=1 erofs layer (got {})",
+            plan.layer_paths.len()
+        );
+        assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
+
+        let meta_img = fx.data.join("pipe-metadata.ext4");
+        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &meta_img)
+            .expect("build the metadata image");
+
+        // Agent base rootfs: the musl agent as PID1 + the mount skeleton (mount-free).
+        let rootfs_stage = fx.data.join("pipe-vda-stage");
+        let _ = std::fs::remove_dir_all(&rootfs_stage);
+        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
+            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+        }
+        std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = rootfs_stage.join("sbin/init");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let rootfs_img = fx.data.join("pipe-vda.ext4");
+        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+
+        // Point-to-point tap (host .1, guest .2) — avoids the jkbr0 bridge quirk.
+        let tap = "jkpipetap";
+        let _ = sh("ip", &["link", "del", tap]).await;
+        sh("ip", &["tuntap", "add", "dev", tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", "172.31.0.1/24", "dev", tap]).await.unwrap();
+        sh("ip", &["link", "set", tap, "up"]).await.unwrap();
+
+        // Boot the REAL runtime VM via the production VmInstance::start path.
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.to_string()),
+            guest_mac: Some("AA:FC:00:00:31:03".to_string()),
+            guest_ip: Some("172.31.0.2".to_string()),
+            gateway_ip: Some("172.31.0.1".to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = fx.data.join("pipe-run");
+        let mut vm = VmInstance::start("bunpipe", &config, &runtime_dir)
+            .await
+            .expect("runtime VM should start");
+
+        let res = poll_http_200("172.31.0.2", 80, Duration::from_secs(45)).await;
+
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", tap]).await;
+
+        let body = res.expect("agent should proxy HTTP 200 from the layered bun server");
+        assert_eq!(body, "ok");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: build -> layered collection -> metadata image -> real agent runtime -> HTTP 200 ({body:?})");
     }
 }

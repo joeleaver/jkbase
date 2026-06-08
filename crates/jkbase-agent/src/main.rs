@@ -273,10 +273,20 @@ async fn main() -> Result<()> {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
         // The metadata image carries _layers.json describing this boot's device
         // assignment: the data-disk device and each server's erofs overlay stack.
-        let runtime_layers = load_runtime_layers(&serve_dir);
-        mount_data_disk(runtime_layers.as_ref().and_then(|rl| rl.data_device.as_deref()));
-        if let Some(rl) = &runtime_layers {
-            layer_map = mount_layers(rl);
+        match load_runtime_layers(&serve_dir) {
+            Some(rl) => {
+                // Layered image: mount the data disk only if the host mapped one
+                // (the fixed /dev/vdc slot is now a layer, not a data disk), then
+                // compose the erofs layer stack.
+                if let Some(dev) = rl.data_device.as_deref() {
+                    mount_data_disk(Some(dev));
+                }
+                layer_map = mount_layers(&rl);
+            }
+            None => {
+                // Legacy flat content image: data disk at the fixed /dev/vdc slot.
+                mount_data_disk(None);
+            }
         }
     }
 
