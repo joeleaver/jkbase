@@ -12,7 +12,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
@@ -115,7 +115,13 @@ async fn serve_http(port: u16, shared: Arc<SharedState>) -> Result<()> {
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            // with_upgrades(): keep driving the connection after a 101 so a
+            // proxied WebSocket (or other Upgrade) can reclaim the raw stream.
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades()
+                .await
+            {
                 error!(error = %e, "proxy connection error");
             }
         });
@@ -141,7 +147,11 @@ async fn serve_https(port: u16, acceptor: TlsAcceptor, shared: Arc<SharedState>)
             };
             let io = TokioIo::new(tls_stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades()
+                .await
+            {
                 error!(error = %e, "HTTPS connection error");
             }
         });
@@ -329,9 +339,161 @@ fn not_found(project_id: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// Did the client ask to switch protocols (e.g. a WebSocket handshake)?
+/// `Connection: Upgrade` + an `Upgrade:` token, per RFC 9110 §7.8.
+fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
+    let connection_upgrade = headers
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .unwrap_or(false);
+    connection_upgrade && headers.contains_key(hyper::header::UPGRADE)
+}
+
+/// Drive the backend client connection. When the request may upgrade, the
+/// connection future must run `with_upgrades()` so the raw stream can be
+/// reclaimed from the 101 response; otherwise the plain future is fine.
+fn spawn_backend_conn<B>(
+    conn: hyper::client::conn::http1::Connection<TokioIo<tokio::net::TcpStream>, B>,
+    upgrade: bool,
+) where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if upgrade {
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+    } else {
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+}
+
+/// If no bytes flow in either direction for this long, a spliced upgrade
+/// (WebSocket, etc.) is torn down. Active traffic — including WebSocket
+/// ping/pong keepalives — resets the timer, so legitimate long-lived
+/// connections are unaffected; only abandoned or deliberately-idle sockets are
+/// reaped. Without this, a peer that completes the handshake and then stalls
+/// would pin two fds plus two relay tasks on the *shared* edge proxy forever.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Splice two upgraded byte streams together, reaping the relay if it goes idle
+/// for [`RELAY_IDLE_TIMEOUT`]. This replaces a bare `copy_bidirectional`, which
+/// only returns once *both* directions close and so never reaps a wedged
+/// half-open connection.
+async fn relay_bidirectional<A, B>(client: A, backend: B)
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
+    let activity = Arc::new(tokio::sync::Notify::new());
+
+    let to_backend = {
+        let activity = activity.clone();
+        async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match client_rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if backend_wr.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        activity.notify_one();
+                    }
+                }
+            }
+            // Propagate the half-close so the other side sees EOF.
+            let _ = backend_wr.shutdown().await;
+        }
+    };
+
+    let to_client = {
+        let activity = activity.clone();
+        async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match backend_rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if client_wr.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        activity.notify_one();
+                    }
+                }
+            }
+            let _ = client_wr.shutdown().await;
+        }
+    };
+
+    // The idle watchdog: each loop resets when either pump signals traffic, and
+    // fires only after a full idle window with no activity.
+    let idle = async {
+        loop {
+            tokio::select! {
+                _ = activity.notified() => {}
+                _ = tokio::time::sleep(RELAY_IDLE_TIMEOUT) => break,
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = async { tokio::join!(to_backend, to_client) } => {}
+        _ = idle => info!("upgrade relay idle timeout; closing"),
+    }
+}
+
+/// A backend answered `101 Switching Protocols`. Splice the two upgraded byte
+/// streams together once both ends complete, and return the 101 verbatim so
+/// hyper finishes the client-side switch (it only does this because the
+/// listener runs `serve_connection(...).with_upgrades()`).
+///
+/// `client_upgrade` is the `OnUpgrade` captured from the inbound request BEFORE
+/// its body was moved into the backend request — capturing it afterward is too
+/// late, the extension is gone.
+fn relay_upgrade(
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    mut backend_resp: Response<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    let backend_upgrade = hyper::upgrade::on(&mut backend_resp);
+    match client_upgrade {
+        Some(client_upgrade) => {
+            tokio::spawn(async move {
+                match tokio::join!(client_upgrade, backend_upgrade) {
+                    (Ok(client), Ok(backend)) => {
+                        relay_bidirectional(TokioIo::new(client), TokioIo::new(backend)).await;
+                    }
+                    (c, b) => error!(
+                        client_err = ?c.err(),
+                        backend_err = ?b.err(),
+                        "protocol upgrade failed; dropping connection"
+                    ),
+                }
+            });
+        }
+        // Backend switched protocols but the client never asked to: nothing to
+        // splice to. Return the 101 anyway; hyper has no upgrade to fulfil.
+        None => error!("backend sent 101 without a client upgrade request"),
+    }
+
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (key, value) in backend_resp.headers() {
+        builder = builder.header(key, value);
+    }
+    builder.body(Full::new(Bytes::new())).unwrap()
+}
+
 async fn forward_to_api(
     api_addr: &str,
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
     let path = req
         .uri()
@@ -340,10 +502,13 @@ async fn forward_to_api(
         .unwrap_or("/");
     let uri = format!("http://{api_addr}{path}");
 
+    let upgrade = is_upgrade_request(req.headers());
+    let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
+
     let stream = tokio::net::TcpStream::connect(api_addr).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::spawn(conn);
+    spawn_backend_conn(conn, upgrade);
 
     let mut builder = Request::builder().method(req.method()).uri(&uri);
     for (key, value) in req.headers() {
@@ -355,6 +520,9 @@ async fn forward_to_api(
     let proxy_req = builder.body(req.into_body()).unwrap();
 
     let resp = sender.send_request(proxy_req).await?;
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(relay_upgrade(client_upgrade, resp));
+    }
     let status = resp.status();
     let headers = resp.headers().clone();
     let body = resp.into_body().collect().await?.to_bytes();
@@ -369,7 +537,7 @@ async fn forward_to_api(
 async fn forward_request(
     backend_ip: &str,
     site: Option<&str>,
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
     let path_and_query = req
         .uri()
@@ -378,10 +546,14 @@ async fn forward_request(
         .unwrap_or("/");
     let uri = format!("http://{}:{}{}", backend_ip, 80, path_and_query);
 
+    // Capture the client-side upgrade future before the body is consumed below.
+    let upgrade = is_upgrade_request(req.headers());
+    let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
+
     let stream = tokio::net::TcpStream::connect(format!("{backend_ip}:80")).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::spawn(conn);
+    spawn_backend_conn(conn, upgrade);
 
     let mut builder = Request::builder().method(req.method()).uri(&uri);
     for (key, value) in req.headers() {
@@ -397,6 +569,9 @@ async fn forward_request(
     let proxy_req = builder.body(req.into_body()).unwrap();
 
     let resp = sender.send_request(proxy_req).await?;
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(relay_upgrade(client_upgrade, resp));
+    }
     let status = resp.status();
     let headers = resp.headers().clone();
     let body = resp.into_body().collect().await?.to_bytes();
@@ -442,6 +617,55 @@ mod tests {
             extract_subdomain("custom.example.com", "jkbase.app"),
             Some("custom.example.com".to_string())
         );
+    }
+
+    fn upgrade_headers(connection: Option<&str>, upgrade: Option<&str>) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        if let Some(c) = connection {
+            h.insert(hyper::header::CONNECTION, c.parse().unwrap());
+        }
+        if let Some(u) = upgrade {
+            h.insert(hyper::header::UPGRADE, u.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn detects_websocket_upgrade() {
+        // Bare `Connection: Upgrade` + an Upgrade header.
+        assert!(is_upgrade_request(&upgrade_headers(
+            Some("Upgrade"),
+            Some("websocket")
+        )));
+        // The comma-list form real browsers send (`keep-alive, Upgrade`).
+        assert!(is_upgrade_request(&upgrade_headers(
+            Some("keep-alive, Upgrade"),
+            Some("websocket")
+        )));
+        // Token match is case-insensitive.
+        assert!(is_upgrade_request(&upgrade_headers(
+            Some("upgrade"),
+            Some("WebSocket")
+        )));
+    }
+
+    #[test]
+    fn rejects_non_upgrade_requests() {
+        // No upgrade signalling at all.
+        assert!(!is_upgrade_request(&upgrade_headers(None, None)));
+        // Connection has the token but the Upgrade header is missing.
+        assert!(!is_upgrade_request(&upgrade_headers(Some("Upgrade"), None)));
+        // Upgrade header present but Connection never lists the token.
+        assert!(!is_upgrade_request(&upgrade_headers(
+            Some("keep-alive"),
+            Some("websocket")
+        )));
+        // Full-token match, not substring: `upgrade-insecure-requests` as a
+        // Connection token must NOT count as an upgrade.
+        assert!(!is_upgrade_request(&upgrade_headers(
+            Some("upgrade-insecure-requests"),
+            Some("websocket")
+        )));
     }
 
     // The apex and "www" both map to the "www" landing project's host-key.
