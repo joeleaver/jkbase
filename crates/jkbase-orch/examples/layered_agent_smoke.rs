@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const TAP: &str = "jkagenttap";
-const HOST_IP: &str = "172.31.0.1";
-const GUEST_IP: &str = "172.31.0.2";
-const GUEST_MAC: &str = "AA:FC:00:00:31:02";
+// 172.30.x point-to-point (clear of the persistent build bridge jkbuild0 @ 172.31.x).
+const HOST_IP: &str = "172.30.0.1";
+const GUEST_IP: &str = "172.30.0.2";
+const GUEST_MAC: &str = "AA:FC:00:00:30:02";
 const AGENT_PORT: u16 = 80;
 
 const SERVER_TS: &str = r#"const port = Number(process.env.PORT) || 3000;

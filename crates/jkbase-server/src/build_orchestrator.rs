@@ -1661,7 +1661,7 @@ esac
     #[tokio::test]
     #[ignore = "needs KVM + root + baked bun.ext4; set JKB_DATA + JKB_FC_RELEASE"]
     async fn bun_server_build_through_orchestrator() {
-        let Some(fx) = bun_pipeline_build("bunfix", 1).await else { return };
+        let Some(fx) = bun_pipeline_build("bunfix", 1, false).await else { return };
         let staged = &fx.staged;
         let store = &fx.store;
         let (project_id, build_id) = ("bunfix", 1u64);
@@ -1721,10 +1721,16 @@ esac
         staged: PathBuf,
     }
 
-    /// Shared build half: resolve the env, write a single no-dep Bun server fixture,
-    /// and drive it through `run_project_build`. Returns `None` (with an explanatory
-    /// eprintln) when the environment isn't provisioned, so callers skip cleanly.
-    async fn bun_pipeline_build(project_id: &str, build_id: u64) -> Option<BuildFixture> {
+    /// Shared build half: resolve the env, write a Bun server fixture, and drive it
+    /// through `run_project_build`. `networked` switches to a fixture WITH a real npm
+    /// dependency (`ms`) and wires the isolated build network + egress proxy, so
+    /// `bun install` must fetch through the proxy (fetch-then-seal). Returns `None`
+    /// (with an explanatory eprintln) when the environment isn't provisioned.
+    async fn bun_pipeline_build(
+        project_id: &str,
+        build_id: u64,
+        networked: bool,
+    ) -> Option<BuildFixture> {
         let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
             eprintln!("skip: set JKB_DATA");
             return None;
@@ -1762,14 +1768,25 @@ service = "server"
 name = "api"
 "#,
         );
-        write(
-            src.join("server/server.ts"),
-            "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-        );
-        write(
-            src.join("server/package.json"),
-            "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
-        );
+        // Networked: the server imports a real npm dep (`ms`) and uses it in the
+        // response, so a 200 proves `bun install` fetched it through the proxy AND
+        // the app runs with it. Offline: a no-dep server.
+        let (server_ts, package_json) = if networked {
+            // Two deps with a TRANSITIVE edge (debug → ms): proves a multi-package
+            // resolution tree fetches through the proxy, not just one leaf. Both are
+            // imported at runtime, so a 200 means the whole tree installed.
+            (
+                "import ms from \"ms\";\nimport createDebug from \"debug\";\nconst log = createDebug(\"app\");\nconst port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { log(\"req\"); return new Response(\"ok \" + ms(60000) + \"\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+            )
+        } else {
+            (
+                "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+            )
+        };
+        write(src.join("server/server.ts"), server_ts);
+        write(src.join("server/package.json"), package_json);
 
         let mut tarbuf = Vec::new();
         {
@@ -1796,6 +1813,34 @@ name = "api"
             })
             .unwrap();
 
+        // Networked builds need the isolated build bridge + the egress proxy: build
+        // VMs can reach ONLY 172.31.0.1:3128 (JKBUILD firewall). The orchestrator
+        // leases a TAP off `net` and wires the proxy + seal per target. Provision
+        // first: sudo tools/setup-build-net.sh.
+        let net = if networked {
+            match tokio::net::TcpListener::bind("172.31.0.1:3128").await {
+                Ok(listener) => {
+                    tokio::spawn(crate::egress::serve(
+                        listener,
+                        Arc::new(crate::egress::EgressConfig::with_default_allowlist()),
+                    ));
+                    Some(Arc::new(BuildNet::new(
+                        "jkbuild0".into(),
+                        "172.31.0.1".into(),
+                        3128,
+                        100_000,
+                        8,
+                    )))
+                }
+                Err(e) => {
+                    eprintln!("skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
         let deps = Arc::new(BuildDeps {
             jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
             firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
@@ -1820,8 +1865,10 @@ name = "api"
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            net: None,
-            fetch_deadline: Duration::from_secs(120),
+            net,
+            // Real `bun install` over the network needs more headroom than the
+            // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
+            fetch_deadline: Duration::from_secs(if networked { 180 } else { 120 }),
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -1862,6 +1909,106 @@ name = "api"
         None
     }
 
+    /// Resolve the runtime-boot env (baselayers store + musl agent) shared by the
+    /// pipeline acceptance tests, or `None` (with a skip note) if unset.
+    fn resolve_runtime_env(fx: &BuildFixture) -> Option<(PathBuf, PathBuf)> {
+        let store_dir = std::env::var("JKB_BASELAYERS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| fx.data.join("baselayers"));
+        if !store_dir.join("platform.json").exists() {
+            eprintln!("skip: no baselayers store at {}", store_dir.display());
+            return None;
+        }
+        let agent_bin = match std::env::var("JKB_AGENT").map(PathBuf::from) {
+            Ok(p) if p.exists() => p,
+            Ok(p) => {
+                eprintln!("skip: agent binary {} missing", p.display());
+                return None;
+            }
+            Err(_) => {
+                eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
+                return None;
+            }
+        };
+        Some((store_dir, agent_bin))
+    }
+
+    /// Boot the real `jkbase-agent` runtime VM for `fx`'s built deployment over a
+    /// point-to-point tap and return the body it serves at `/`. `tag` namespaces the
+    /// on-disk artifacts + tap; the caller picks a subnet clear of jkbuild0 (172.31.x).
+    #[allow(clippy::too_many_arguments)]
+    async fn boot_layered_and_curl(
+        fx: &BuildFixture,
+        store_dir: &Path,
+        agent_bin: &Path,
+        tag: &str,
+        host_ip: &str,
+        guest_ip: &str,
+        guest_mac: &str,
+    ) -> Option<String> {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        // Host glue under test: resolve the layer plan + bake the metadata image,
+        // treating the staged build as the deployment dir.
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, store_dir, false, true)
+            .expect("compute layer plan from the built deployment");
+        assert!(!plan.layer_paths.is_empty(), "a layered server must resolve >=1 erofs layer");
+        assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
+
+        let meta_img = fx.data.join(format!("{tag}-metadata.ext4"));
+        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &meta_img)
+            .expect("build the metadata image");
+
+        // Agent base rootfs: the musl agent as PID1 + the mount skeleton (mount-free).
+        let rootfs_stage = fx.data.join(format!("{tag}-vda-stage"));
+        let _ = std::fs::remove_dir_all(&rootfs_stage);
+        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
+            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+        }
+        std::fs::copy(agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = rootfs_stage.join("sbin/init");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let rootfs_img = fx.data.join(format!("{tag}-vda.ext4"));
+        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+
+        // Point-to-point tap (clear of jkbuild0's 172.31.x).
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = fx.data.join(format!("{tag}-run"));
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("runtime VM should start");
+
+        let res = poll_http_200(guest_ip, 80, Duration::from_secs(45)).await;
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        res
+    }
+
     /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun
     /// server is built through `run_project_build` (→ a layered app erofs blob),
     /// the host resolves the layer plan + bakes the metadata image
@@ -1885,95 +2032,47 @@ name = "api"
     #[tokio::test]
     #[ignore = "full pipeline: needs KVM + root + bun.ext4 + baselayers + musl agent"]
     async fn bun_layered_pipeline_to_http_200() {
-        use jkbase_orch::vm::{VmConfig, VmInstance};
-
-        let Some(fx) = bun_pipeline_build("bunpipe", 1).await else { return };
-
-        let store_dir = std::env::var("JKB_BASELAYERS")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| fx.data.join("baselayers"));
-        if !store_dir.join("platform.json").exists() {
-            eprintln!("skip: no baselayers store at {}", store_dir.display());
-            return;
-        }
-        let Ok(agent_bin) = std::env::var("JKB_AGENT").map(PathBuf::from) else {
-            eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
-            return;
-        };
-        if !agent_bin.exists() {
-            eprintln!("skip: agent binary {} missing", agent_bin.display());
-            return;
-        }
-
-        // Host glue under test: resolve + verify the layer plan and bake the metadata
-        // image (device map + manifest + _layers.json) — treating the staged build as
-        // the deployment dir.
-        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, true)
-            .expect("compute layer plan from the built deployment");
-        assert!(
-            !plan.layer_paths.is_empty(),
-            "a layered server must resolve >=1 erofs layer (got {})",
-            plan.layer_paths.len()
-        );
-        assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
-
-        let meta_img = fx.data.join("pipe-metadata.ext4");
-        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &meta_img)
-            .expect("build the metadata image");
-
-        // Agent base rootfs: the musl agent as PID1 + the mount skeleton (mount-free).
-        let rootfs_stage = fx.data.join("pipe-vda-stage");
-        let _ = std::fs::remove_dir_all(&rootfs_stage);
-        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
-            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
-        }
-        std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let p = rootfs_stage.join("sbin/init");
-            let mut perm = std::fs::metadata(&p).unwrap().permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&p, perm).unwrap();
-        }
-        let rootfs_img = fx.data.join("pipe-vda.ext4");
-        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
-
-        // Point-to-point tap (host .1, guest .2) — avoids the jkbr0 bridge quirk.
-        let tap = "jkpipetap";
-        let _ = sh("ip", &["link", "del", tap]).await;
-        sh("ip", &["tuntap", "add", "dev", tap, "mode", "tap"]).await.unwrap();
-        sh("ip", &["addr", "add", "172.31.0.1/24", "dev", tap]).await.unwrap();
-        sh("ip", &["link", "set", tap, "up"]).await.unwrap();
-
-        // Boot the REAL runtime VM via the production VmInstance::start path.
-        let config = VmConfig {
-            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
-            kernel_path: fx.kernel.clone(),
-            rootfs_path: rootfs_img.clone(),
-            metadata_image_path: Some(meta_img.clone()),
-            layer_paths: plan.layer_paths.clone(),
-            data_disk_path: None,
-            vcpu_count: 2,
-            mem_size_mib: 1024,
-            tap_device: Some(tap.to_string()),
-            guest_mac: Some("AA:FC:00:00:31:03".to_string()),
-            guest_ip: Some("172.31.0.2".to_string()),
-            gateway_ip: Some("172.31.0.1".to_string()),
-            vsock_cid: None,
-        };
-        let runtime_dir = fx.data.join("pipe-run");
-        let mut vm = VmInstance::start("bunpipe", &config, &runtime_dir)
-            .await
-            .expect("runtime VM should start");
-
-        let res = poll_http_200("172.31.0.2", 80, Duration::from_secs(45)).await;
-
-        let _ = vm.stop().await;
-        let _ = sh("ip", &["link", "del", tap]).await;
-
-        let body = res.expect("agent should proxy HTTP 200 from the layered bun server");
+        let Some(fx) = bun_pipeline_build("bunpipe", 1, false).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "pipe", "172.30.0.1", "172.30.0.2", "AA:FC:00:00:30:02",
+        )
+        .await
+        .expect("agent should proxy HTTP 200 from the layered bun server");
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
         println!("PASS: build -> layered collection -> metadata image -> real agent runtime -> HTTP 200 ({body:?})");
+    }
+
+    /// Networked — the real-dependency proof. A Bun server importing `ms` is built
+    /// through `run_project_build` with the isolated build network + egress proxy, so
+    /// `bun install` MUST fetch `ms` through the proxy (fetch-then-seal), then the
+    /// layered runtime serves a response computed with `ms` → HTTP 200 "ok 1m". The
+    /// 200 proves the dependency was fetched through the proxy AND the app runs with
+    /// it. This is the gate before any non-trivial app can be deployed.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once: provision jkbuild0 + the firewall
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture bun_networked_pipeline_to_http_200
+    ///
+    /// Needs everything `bun_layered_pipeline_to_http_200` needs, PLUS outbound
+    /// internet and the provisioned build bridge (`sudo tools/setup-build-net.sh`).
+    #[tokio::test]
+    #[ignore = "networked pipeline: + internet + provisioned build bridge (setup-build-net.sh)"]
+    async fn bun_networked_pipeline_to_http_200() {
+        let Some(fx) = bun_pipeline_build("bunnet", 1, true).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "netpipe", "172.28.0.1", "172.28.0.2", "AA:FC:00:00:28:02",
+        )
+        .await
+        .expect("agent should serve 200 using the proxy-fetched `ms` dependency");
+        assert_eq!(
+            body, "ok 1m",
+            "response uses ms(60000)=1m — proves `ms` was fetched through the egress proxy and runs"
+        );
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: networked bun install (ms via egress proxy, sealed) -> layered runtime -> HTTP 200 ({body:?})");
     }
 }
