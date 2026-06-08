@@ -94,6 +94,31 @@ struct Args {
     #[arg(long, default_value = "3128")]
     build_proxy_port: u16,
 
+    /// Build-VM scratch drive size (MiB): the CoW overlay upper that holds every
+    /// write a build makes — source copy, `node_modules`, compiler output, the
+    /// staged rootfs. npm/Bun apps blow the original 512 MiB, so the default is
+    /// larger; raise it for heavy dependency trees. Costs disk per concurrent
+    /// build, not steady-state.
+    #[arg(long, default_value = "2048", env = "JKBASE_BUILD_SCRATCH_MIB")]
+    build_scratch_mib: u64,
+
+    /// Build-VM output drive size (MiB), and the hard cap on a single emitted
+    /// artifact (rootfs.tar.gz / .wasm) via `fsize`. The original 128 MiB is too
+    /// small for a server rootfs carrying a language runtime.
+    #[arg(long, default_value = "512", env = "JKBASE_BUILD_OUTPUT_MIB")]
+    build_output_mib: u64,
+
+    /// Build-VM RAM (MiB). Backs each concurrent build VM, so multiply by
+    /// max-concurrent for the host-RAM cost. The cgroup memory cap is set to
+    /// this + 512 MiB headroom.
+    #[arg(long, default_value = "1536", env = "JKBASE_BUILD_MEM_MIB")]
+    build_mem_mib: u32,
+
+    /// Hard wall-clock timeout (seconds) for one build VM. A cold `bun install` +
+    /// bundle can exceed the original 600s on first build.
+    #[arg(long, default_value = "900", env = "JKBASE_BUILD_TIMEOUT_SECS")]
+    build_timeout_secs: u64,
+
     /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
     /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
     /// platform defaults and target any project. Unset (default) = no admin path:
@@ -324,14 +349,14 @@ async fn main() -> Result<()> {
         parent_cgroup: "jkbase-build".to_string(),
         uid: build_uid,
         gid: build_uid,
-        timeout: Duration::from_secs(600),
+        timeout: Duration::from_secs(args.build_timeout_secs),
         vcpu_count: 2,
-        mem_size_mib: 1024,
+        mem_size_mib: args.build_mem_mib,
         cgroup_pids_max: 512,
-        cgroup_mem_max_bytes: 1536 * 1024 * 1024,
+        cgroup_mem_max_bytes: (args.build_mem_mib as u64 + 512) * 1024 * 1024,
         cgroup_cpu_max: "200000 100000".to_string(),
-        scratch_size_bytes: 512 * 1024 * 1024,
-        output_size_bytes: 128 * 1024 * 1024,
+        scratch_size_bytes: args.build_scratch_mib * 1024 * 1024,
+        output_size_bytes: args.build_output_mib * 1024 * 1024,
         console_log_max_bytes: 1024 * 1024,
         max_concurrent: 4,
         net: build_net,
