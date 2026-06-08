@@ -55,7 +55,8 @@ async fn main() -> anyhow::Result<()> {
         // Generic rootfs that boots to a console and stays alive (the jkbase rootfs
         // init exits without the full platform), so we have a stable VM to snapshot.
         rootfs_path: base.join("bionic.rootfs.ext4"),
-        content_image_path: None,
+        metadata_image_path: None,
+        layer_paths: Vec::new(),
         data_disk_path: Some(PathBuf::from(dev)),
         vcpu_count: 1,
         mem_size_mib: 128,

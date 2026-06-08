@@ -23,7 +23,7 @@
 //! output names are contract. Richer toolchains (CNB for servers,
 //! cargo-component for functions) are B2 and keep this contract unchanged.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use jkbase_common::config::ProjectConfig;
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
@@ -762,8 +762,10 @@ async fn build_one_target_inner(
         gateway_ip,
         egress_proxy,
         lang_hint: language.clone(),
-        // Flat for now; flip to true when the host layered collection lands.
-        export_layered: false,
+        // Layered: the in-VM exporter emits the app erofs layer + index.json; the
+        // host collection arm (below) dumps + sha256-verifies it. The runtime
+        // overlays it on the shared base/runtime layers.
+        export_layered: true,
         fetch_deadline: deps.fetch_deadline,
         seal,
     };
@@ -825,23 +827,106 @@ async fn build_one_target_inner(
             }
         }
         TargetKind::Server => {
-            let rootfs_dest = staged.join("_servers").join(format!("{}.tar.gz", spec.name));
-            if !build_output::dump_file(&output_img, "/rootfs.tar.gz", &rootfs_dest)? {
-                bail!("server build produced no /rootfs.tar.gz artifact");
-            }
-            let built = read_built_manifest(&output_img, workspace, &tag)?;
-            let server_cfg = config
-                .servers
-                .get(&spec.name)
-                .ok_or_else(|| anyhow::anyhow!("server '{}' missing from config", spec.name))?;
-            let manifest =
-                server_cfg.manifest_value(built.cmd, built.env, &built.working_dir);
-            let json = serde_json::to_string_pretty(&manifest)?;
-            std::fs::write(staged.join("_servers").join(format!("{}.json", spec.name)), json)?;
+            collect_layered_server(&output_img, staged, workspace, &tag, config, spec)?;
         }
     }
 
     Ok(log_tail)
+}
+
+/// Collect a layered server build: read `/layers/index.json`, dump + sha256-verify
+/// the (untrusted) app erofs layer into the deployment's `_layers/`, and write the
+/// server manifest augmented with the layer refs the host deploy path needs
+/// (`app_layer` filename + `runtime` language). The shared base/runtime layers are
+/// injected host-side by digest, not carried in the tenant's build output.
+fn collect_layered_server(
+    output_img: &Path,
+    staged: &Path,
+    workspace: &Path,
+    tag: &str,
+    config: &ProjectConfig,
+    spec: &TargetSpec,
+) -> Result<()> {
+    // Read the layered index the in-VM exporter wrote.
+    let index_tmp = workspace.join(format!("{tag}.index.json"));
+    if !build_output::dump_file(output_img, jkbuild_types::out::INDEX, &index_tmp)? {
+        bail!("server build produced no {} (expected a layered export)", jkbuild_types::out::INDEX);
+    }
+    let index: jkbuild_types::Index = serde_json::from_slice(&std::fs::read(&index_tmp)?)
+        .context("parse layers/index.json from the build output")?;
+    let _ = std::fs::remove_file(&index_tmp);
+
+    // The buildpack emits exactly one app layer (base/runtime are host-injected).
+    let app = index
+        .layers
+        .iter()
+        .find(|l| l.role == jkbuild_types::LayerRole::App)
+        .ok_or_else(|| anyhow::anyhow!("layered build has no app layer in index.json"))?;
+    ensure!(app.media == "erofs", "unexpected app layer media {:?}", app.media);
+
+    // The blob filename becomes a dest path — it is fully attacker-controlled, so
+    // bound it to `sha256-<64hex>.erofs` (no separators, no traversal).
+    let file = app.file.clone();
+    ensure!(is_safe_blob_filename(&file), "unsafe app layer filename {file:?}");
+
+    let layers_dir = staged.join("_layers");
+    std::fs::create_dir_all(&layers_dir)?;
+    let blob_dest = layers_dir.join(&file);
+    if !build_output::dump_file(output_img, &format!("/layers/{file}"), &blob_dest)? {
+        bail!("layered build missing blob {file} referenced by index.json");
+    }
+
+    // sha256-verify the dumped blob against the index digest (all tenants untrusted).
+    let want = app.digest.strip_prefix("sha256:").unwrap_or(&app.digest);
+    let got = sha256_hex(&blob_dest)?;
+    ensure!(
+        got.eq_ignore_ascii_case(want),
+        "app layer digest mismatch: index {want}, dumped blob {got}"
+    );
+
+    // Server manifest: build-derived cmd/env/working_dir overlaid with the
+    // jkbase.toml port/health_check/volumes, augmented with the layer refs.
+    let built = read_built_manifest(output_img, workspace, tag)?;
+    let server_cfg = config
+        .servers
+        .get(&spec.name)
+        .ok_or_else(|| anyhow::anyhow!("server '{}' missing from config", spec.name))?;
+    let mut manifest = server_cfg.manifest_value(built.cmd, built.env, &built.working_dir);
+    if let Some(obj) = manifest.as_object_mut() {
+        obj.insert("app_layer".to_string(), serde_json::Value::String(file));
+        obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
+        let runtime = spec.language.clone().unwrap_or_else(|| "bun".to_string());
+        obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
+    }
+    let json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(staged.join("_servers").join(format!("{}.json", spec.name)), json)?;
+    Ok(())
+}
+
+/// A content-addressed erofs blob filename: `sha256-<64hex>.erofs`, no separators.
+fn is_safe_blob_filename(f: &str) -> bool {
+    const PRE: &str = "sha256-";
+    const SUF: &str = ".erofs";
+    f.len() == PRE.len() + 64 + SUF.len()
+        && f.starts_with(PRE)
+        && f.ends_with(SUF)
+        && f[PRE.len()..f.len() - SUF.len()]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+}
+
+fn sha256_hex(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).with_context(|| format!("hash {}", path.display()))?;
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
 }
 
 /// Read the build-derived `/manifest.json` (server targets), or defaults if absent.
@@ -1678,10 +1763,12 @@ port = 3000
             .await
             .expect("bun server build should succeed");
 
-        // Flat server artifact assembled into the deploy shape.
-        assert!(staged.join("_servers/api.tar.gz").exists(), "api rootfs tarball");
+        // Layered server artifact assembled into the deploy shape: NO flat tarball;
+        // instead a content-addressed app erofs blob under _layers/.
+        assert!(!staged.join("_servers/api.tar.gz").exists(), "no flat tarball in layered mode");
 
-        // Manifest = jkbuild launch contract + jkbase.toml port.
+        // Manifest = jkbuild launch contract + jkbase.toml port + the layer refs the
+        // host deploy path needs (app_layer filename + runtime language).
         let mani: serde_json::Value =
             serde_json::from_slice(&std::fs::read(staged.join("_servers/api.json")).unwrap())
                 .unwrap();
@@ -1693,6 +1780,19 @@ port = 3000
         );
         assert_eq!(mani["working_dir"], "/app");
         assert_eq!(mani["env"]["NODE_ENV"], "production");
+        assert_eq!(mani["runtime"], "bun", "runtime language recorded for host injection");
+        let app_layer = mani["app_layer"].as_str().expect("app_layer recorded");
+        assert!(
+            app_layer.starts_with("sha256-") && app_layer.ends_with(".erofs"),
+            "app_layer is a content-addressed erofs blob name: {app_layer}"
+        );
+        // The dumped + sha256-verified app blob is staged under _layers/.
+        assert!(staged.join("_layers").join(app_layer).exists(), "app erofs blob staged");
+        assert_eq!(
+            mani["app_digest"].as_str().map(|d| d.replace("sha256:", "sha256-") + ".erofs").as_deref(),
+            Some(app_layer),
+            "app_digest matches the blob filename"
+        );
 
         // Per-target progress + billing recorded.
         let rec = store.get_build(project_id, build_id).unwrap().unwrap();
@@ -1706,6 +1806,6 @@ port = 3000
         assert!(billed >= 1, "expected ≥1 build-second, got {billed}");
 
         let _ = std::fs::remove_dir_all(&staged);
-        println!("PASS: run_project_build drove bun.ext4 -> flat server artifact + launch manifest");
+        println!("PASS: run_project_build drove bun.ext4 -> layered app erofs blob + launch manifest");
     }
 }

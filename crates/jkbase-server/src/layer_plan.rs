@@ -1,0 +1,365 @@
+//! Host-side layered-runtime wiring: resolve a deployment's erofs layer blobs and
+//! build the per-project **metadata** image the runtime VM boots with.
+//!
+//! A layered server's root is an overlay of `lowerdir=app:runtime:base`:
+//! `base` is the shared Wolfi/glibc platform layer (`baselayers/platform.json`),
+//! `runtime` the shared per-language runtime layer (e.g. bun) from the same store,
+//! and `app` the per-server tenant layer — built in the build VM and dumped to
+//! `deployments/v{N}/_layers/sha256-<hex>.erofs`.
+//!
+//! [`compute_layer_plan`] resolves these to host blob paths (verifying sha256 — all
+//! tenants are untrusted) and computes the Firecracker device assignment that
+//! [`crate::`]`vm` attaches (rootfs=vda, metadata=vdb, layers=vdc.., data last).
+//! [`build_metadata_image`] bakes the resulting `_layers.json` device map plus the
+//! deployment's manifests/static-sites/functions into a read-only ext4 image (no
+//! mount, no root — `mkfs.ext4 -d`, threat-model P0-3).
+
+use anyhow::{ensure, Context, Result};
+use jkbase_common::layers::{RuntimeLayers, ServerLayers};
+use jkbase_orch::build_image::build_ro_ext4_from_dir;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// The resolved attach order + the device map the agent reads.
+#[derive(Debug, Clone)]
+pub struct LayerPlan {
+    /// erofs blob host paths to attach RO as `vdc..`, in this exact order
+    /// (base, distinct runtimes, per-server apps).
+    pub layer_paths: Vec<PathBuf>,
+    /// The host→agent device map baked into the metadata image as `_layers.json`.
+    pub runtime_layers: RuntimeLayers,
+}
+
+impl LayerPlan {
+    /// A plan with no layers (static/function-only project), optionally with a data
+    /// disk at the first post-metadata slot.
+    pub fn empty(has_data_disk: bool) -> Self {
+        let mut rl = RuntimeLayers::new();
+        if has_data_disk {
+            rl.data_device = Some(device_node(2));
+        }
+        Self { layer_paths: Vec::new(), runtime_layers: rl }
+    }
+}
+
+/// `platform.json` shape (subset we consume): the shared base + per-language runtime
+/// layer descriptors in `baselayers/`.
+#[derive(Debug, Deserialize)]
+struct PlatformManifest {
+    base: LayerDesc,
+    #[serde(default)]
+    runtimes: BTreeMap<String, LayerDesc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LayerDesc {
+    digest: String,
+    file: String,
+}
+
+/// The layer-relevant fields the build orchestrator augments each server manifest
+/// with. The runtime agent's `ServerManifest` ignores them (extra fields).
+#[derive(Debug, Deserialize)]
+struct ServerLayerInfo {
+    #[serde(default)]
+    app_layer: Option<String>,
+    #[serde(default)]
+    app_digest: Option<String>,
+    #[serde(default)]
+    runtime: Option<String>,
+}
+
+struct BlobRef {
+    path: PathBuf,
+    digest: String,
+}
+
+/// Guest device node for the i-th virtio-blk drive (PUT order): 0→vda, 1→vdb, ….
+/// Single-letter only (vda..vdz); the caller bounds the layer count so this never
+/// overflows.
+fn device_node(i: usize) -> String {
+    debug_assert!(i < 26, "device index {i} exceeds vdz");
+    format!("/dev/vd{}", (b'a' + (i as u8 % 26)) as char)
+}
+
+/// `sha256-<64hex>.erofs`, no path separators — the filename becomes a dest path.
+fn is_safe_layer_filename(f: &str) -> bool {
+    const PRE: &str = "sha256-";
+    const SUF: &str = ".erofs";
+    f.len() == PRE.len() + 64 + SUF.len()
+        && f.starts_with(PRE)
+        && f.ends_with(SUF)
+        && f[PRE.len()..f.len() - SUF.len()]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+}
+
+fn filename_to_digest(f: &str) -> String {
+    let hex = f
+        .strip_prefix("sha256-")
+        .and_then(|s| s.strip_suffix(".erofs"))
+        .unwrap_or(f);
+    format!("sha256:{hex}")
+}
+
+fn sha256_hex(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).with_context(|| format!("hash {}", path.display()))?;
+    let out = hasher.finalize();
+    let mut s = String::with_capacity(64);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    Ok(s)
+}
+
+fn read_platform(store_dir: &Path) -> Result<PlatformManifest> {
+    let path = store_dir.join("platform.json");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read layer store manifest {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Resolve a deployment's layered servers into an ordered list of erofs blob paths
+/// to attach plus the per-server device map. `has_data_disk` reserves the post-layer
+/// device for the (RW) data disk. When `verify`, every blob's sha256 is checked
+/// against its digest before it can be attached to a tenant VM (do this on cold-boot
+/// deploy; skip it on wake, where the blobs were already verified and are immutable).
+///
+/// A deployment with no layered servers (static/function-only) yields an empty plan.
+pub fn compute_layer_plan(
+    deployment_dir: &Path,
+    store_dir: &Path,
+    has_data_disk: bool,
+    verify: bool,
+) -> Result<LayerPlan> {
+    // Gather layered servers, sorted by name for a deterministic device assignment
+    // (so cold-boot deploy and wake agree on the same `_layers.json`).
+    let servers_dir = deployment_dir.join("_servers");
+    let mut servers: Vec<(String, ServerLayerInfo)> = Vec::new();
+    if servers_dir.is_dir() {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&servers_dir)
+            .with_context(|| format!("read {}", servers_dir.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        paths.sort();
+        for p in paths {
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let info: ServerLayerInfo = serde_json::from_slice(&std::fs::read(&p)?)
+                .with_context(|| format!("parse server manifest {}", p.display()))?;
+            if info.app_layer.is_some() {
+                servers.push((name, info));
+            }
+        }
+    }
+
+    if servers.is_empty() {
+        return Ok(LayerPlan::empty(has_data_disk));
+    }
+
+    let platform = read_platform(store_dir)?;
+
+    // Ordered, deduplicated blob list: base, distinct runtimes (sorted), apps.
+    let mut order: Vec<BlobRef> = Vec::new();
+    let mut runtime_idx: BTreeMap<String, usize> = BTreeMap::new();
+    let mut app_idx: BTreeMap<String, usize> = BTreeMap::new();
+
+    let base_dev_idx = order.len();
+    order.push(BlobRef {
+        path: store_dir.join(&platform.base.file),
+        digest: platform.base.digest.clone(),
+    });
+
+    let mut langs: Vec<String> = servers
+        .iter()
+        .map(|(_, s)| s.runtime.clone().unwrap_or_else(|| "bun".to_string()))
+        .collect();
+    langs.sort();
+    langs.dedup();
+    for lang in &langs {
+        let desc = platform
+            .runtimes
+            .get(lang)
+            .ok_or_else(|| anyhow::anyhow!("no platform runtime layer for language '{lang}'"))?;
+        runtime_idx.insert(lang.clone(), order.len());
+        order.push(BlobRef {
+            path: store_dir.join(&desc.file),
+            digest: desc.digest.clone(),
+        });
+    }
+
+    for (name, s) in &servers {
+        let file = s.app_layer.as_ref().expect("filtered to Some above");
+        ensure!(
+            is_safe_layer_filename(file),
+            "unsafe app layer filename {file:?} for server '{name}'"
+        );
+        let digest = s
+            .app_digest
+            .clone()
+            .unwrap_or_else(|| filename_to_digest(file));
+        app_idx.insert(name.clone(), order.len());
+        order.push(BlobRef {
+            path: deployment_dir.join("_layers").join(file),
+            digest,
+        });
+    }
+
+    // Bound the device assignment to single-letter nodes (vda..vdz): rootfs(0),
+    // metadata(1), the blobs, then the data disk.
+    let needed = 2 + order.len() + usize::from(has_data_disk);
+    ensure!(
+        needed <= 26,
+        "deployment needs {needed} virtio drives (>26); too many layers for single-letter device nodes"
+    );
+
+    // Resolve + verify, building the attach order.
+    let mut layer_paths = Vec::with_capacity(order.len());
+    for b in &order {
+        ensure!(b.path.exists(), "layer blob missing: {}", b.path.display());
+        if verify {
+            let want = b.digest.strip_prefix("sha256:").unwrap_or(&b.digest);
+            let got = sha256_hex(&b.path)?;
+            ensure!(
+                got.eq_ignore_ascii_case(want),
+                "layer digest mismatch for {}: want {want}, got {got}",
+                b.path.display()
+            );
+        }
+        layer_paths.push(b.path.clone());
+    }
+
+    // Device map: blob order_idx → vd[c+order_idx] (rootfs=vda, metadata=vdb).
+    let dev = |order_idx: usize| device_node(2 + order_idx);
+    let mut runtime_layers = RuntimeLayers::new();
+    for (name, s) in &servers {
+        let lang = s.runtime.clone().unwrap_or_else(|| "bun".to_string());
+        let app_dev = dev(app_idx[name]);
+        let runtime_dev = dev(runtime_idx[&lang]);
+        let base_dev = dev(base_dev_idx);
+        runtime_layers.servers.insert(
+            name.clone(),
+            ServerLayers {
+                // overlay lowerdir order: app first, base last.
+                layers: vec![app_dev, runtime_dev, base_dev],
+            },
+        );
+    }
+    if has_data_disk {
+        runtime_layers.data_device = Some(device_node(2 + layer_paths.len()));
+    }
+
+    Ok(LayerPlan { layer_paths, runtime_layers })
+}
+
+/// Build the per-project metadata image: the deployment tree (manifests, routes,
+/// sites, functions) **minus the erofs blobs** (those attach as drives), plus the
+/// host-written `_layers.json` device map. Read-only ext4, built mount-free.
+pub fn build_metadata_image(deployment_dir: &Path, plan: &LayerPlan, out: &Path) -> Result<()> {
+    let stage = out.with_extension("stage");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage)?;
+
+    // Copy the deployment tree except `_layers/` (the erofs blobs are attached as
+    // drives, not carried in the metadata filesystem).
+    copy_dir_except(deployment_dir, &stage, "_layers")
+        .with_context(|| format!("stage metadata from {}", deployment_dir.display()))?;
+
+    // Bake the device map the agent reads at boot.
+    let layers_json = serde_json::to_vec_pretty(&plan.runtime_layers)?;
+    std::fs::write(stage.join(RuntimeLayers::FILE), layers_json)?;
+
+    if out.exists() {
+        std::fs::remove_file(out)?;
+    }
+    build_ro_ext4_from_dir(&stage, out, 8)
+        .with_context(|| format!("mkfs metadata image {}", out.display()))?;
+    let _ = std::fs::remove_dir_all(&stage);
+    Ok(())
+}
+
+/// Recursively copy `src` → `dst`, skipping a top-level entry named `skip_top`.
+fn copy_dir_except(src: &Path, dst: &Path, skip_top: &str) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(skip_top) {
+            continue;
+        }
+        copy_entry(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn copy_entry(from: &Path, to: &Path) -> Result<()> {
+    let ft = std::fs::symlink_metadata(from)?.file_type();
+    if ft.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_entry(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if ft.is_symlink() {
+        let target = std::fs::read_link(from)?;
+        let _ = std::fs::remove_file(to);
+        std::os::unix::fs::symlink(target, to)?;
+    } else {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_filename() {
+        let hex = "a".repeat(64);
+        assert!(is_safe_layer_filename(&format!("sha256-{hex}.erofs")));
+        assert!(!is_safe_layer_filename("sha256-xyz.erofs"));
+        assert!(!is_safe_layer_filename("../escape.erofs"));
+        assert!(!is_safe_layer_filename(&format!("sha256-{hex}.tar")));
+        assert!(!is_safe_layer_filename("sha256-/etc/passwd.erofs"));
+    }
+
+    #[test]
+    fn device_nodes() {
+        assert_eq!(device_node(0), "/dev/vda");
+        assert_eq!(device_node(1), "/dev/vdb");
+        assert_eq!(device_node(2), "/dev/vdc");
+        assert_eq!(device_node(4), "/dev/vde");
+    }
+
+    #[test]
+    fn filename_digest_roundtrip() {
+        let hex = "b".repeat(64);
+        let f = format!("sha256-{hex}.erofs");
+        assert_eq!(filename_to_digest(&f), format!("sha256:{hex}"));
+    }
+
+    #[test]
+    fn empty_plan_for_no_servers() {
+        let dir = std::env::temp_dir().join(format!("lp-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("_servers")).unwrap();
+        let plan = compute_layer_plan(&dir, &dir, false, false).unwrap();
+        assert!(plan.layer_paths.is_empty());
+        assert!(plan.runtime_layers.servers.is_empty());
+        assert!(plan.runtime_layers.data_device.is_none());
+
+        let plan = compute_layer_plan(&dir, &dir, true, false).unwrap();
+        assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vdc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

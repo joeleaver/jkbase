@@ -13,8 +13,10 @@ jkbase-proxy = { workspace = true }
 jkbase-control = { workspace = true }
 jkbase-orch = { workspace = true }
 jkbase-substrate = { workspace = true }
+jkbuild-types = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

@@ -1717,6 +1717,32 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// (`do_deploy`) and the build pipeline, so both get the identical tail: server
 /// rootfs pre-extract → storage-quota gate → atomic `live` swap → reconcile
 /// domains/schedules → record history + prune → deploy callback (boot runtime).
+/// Collect the distinct app-layer digests (`sha256:<hex>`) a deployment references,
+/// from each `_servers/<name>.json`'s `app_digest` field (written by the layered
+/// build collection). Recorded on the deployment so a future content-store GC knows
+/// what each retained version pins.
+fn collect_app_layer_digests(deploy_path: &std::path::Path) -> Vec<String> {
+    let servers_dir = deploy_path.join("_servers");
+    let mut digests: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&servers_dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json")
+                && let Ok(bytes) = std::fs::read(&path)
+                && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(d) = v.get("app_digest").and_then(|d| d.as_str())
+            {
+                let d = d.to_string();
+                if !digests.contains(&d) {
+                    digests.push(d);
+                }
+            }
+        }
+    }
+    digests.sort();
+    digests
+}
+
 async fn activate_deployment(
     state: &AppState,
     project: &mut Project,
@@ -1807,11 +1833,13 @@ async fn activate_deployment(
     reconcile_deploy_schedules(state, project, &deploy_path);
 
     // Record version history and prune old artifacts so disk usage stays bounded.
+    // `layer_digests` pins the tenant app-layer digests this version references (for
+    // future content-store GC; shared base/runtime layers are platform-owned).
     state.store.save_deployment(&crate::store::DeploymentMeta {
         project_id: project.id.clone(),
         version,
         created_at: auth::timestamp(),
-        layer_digests: Vec::new(),
+        layer_digests: collect_app_layer_digests(&deploy_path),
     })?;
     prune_deployments(state, &project.id, version);
 
