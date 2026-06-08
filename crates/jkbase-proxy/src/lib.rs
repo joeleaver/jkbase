@@ -115,7 +115,13 @@ async fn serve_http(port: u16, shared: Arc<SharedState>) -> Result<()> {
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            // with_upgrades(): keep driving the connection after a 101 so a
+            // proxied WebSocket (or other Upgrade) can reclaim the raw stream.
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades()
+                .await
+            {
                 error!(error = %e, "proxy connection error");
             }
         });
@@ -141,7 +147,11 @@ async fn serve_https(port: u16, acceptor: TlsAcceptor, shared: Arc<SharedState>)
             };
             let io = TokioIo::new(tls_stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(io, svc)
+                .with_upgrades()
+                .await
+            {
                 error!(error = %e, "HTTPS connection error");
             }
         });
@@ -329,9 +339,89 @@ fn not_found(project_id: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// Did the client ask to switch protocols (e.g. a WebSocket handshake)?
+/// `Connection: Upgrade` + an `Upgrade:` token, per RFC 9110 §7.8.
+fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
+    let connection_upgrade = headers
+        .get(hyper::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .unwrap_or(false);
+    connection_upgrade && headers.contains_key(hyper::header::UPGRADE)
+}
+
+/// Drive the backend client connection. When the request may upgrade, the
+/// connection future must run `with_upgrades()` so the raw stream can be
+/// reclaimed from the 101 response; otherwise the plain future is fine.
+fn spawn_backend_conn<B>(
+    conn: hyper::client::conn::http1::Connection<TokioIo<tokio::net::TcpStream>, B>,
+    upgrade: bool,
+) where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if upgrade {
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+    } else {
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+}
+
+/// A backend answered `101 Switching Protocols`. Splice the two upgraded byte
+/// streams together once both ends complete, and return the 101 verbatim so
+/// hyper finishes the client-side switch (it only does this because the
+/// listener runs `serve_connection(...).with_upgrades()`).
+///
+/// `client_upgrade` is the `OnUpgrade` captured from the inbound request BEFORE
+/// its body was moved into the backend request — capturing it afterward is too
+/// late, the extension is gone.
+fn relay_upgrade(
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    mut backend_resp: Response<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    let backend_upgrade = hyper::upgrade::on(&mut backend_resp);
+    match client_upgrade {
+        Some(client_upgrade) => {
+            tokio::spawn(async move {
+                match tokio::join!(client_upgrade, backend_upgrade) {
+                    (Ok(client), Ok(backend)) => {
+                        let mut client = TokioIo::new(client);
+                        let mut backend = TokioIo::new(backend);
+                        if let Err(e) =
+                            tokio::io::copy_bidirectional(&mut client, &mut backend).await
+                        {
+                            // Half-close / reset is the normal way a socket ends.
+                            info!(error = %e, "upgrade relay closed");
+                        }
+                    }
+                    (c, b) => error!(
+                        client_err = ?c.err(),
+                        backend_err = ?b.err(),
+                        "protocol upgrade failed; dropping connection"
+                    ),
+                }
+            });
+        }
+        // Backend switched protocols but the client never asked to: nothing to
+        // splice to. Return the 101 anyway; hyper has no upgrade to fulfil.
+        None => error!("backend sent 101 without a client upgrade request"),
+    }
+
+    let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
+    for (key, value) in backend_resp.headers() {
+        builder = builder.header(key, value);
+    }
+    builder.body(Full::new(Bytes::new())).unwrap()
+}
+
 async fn forward_to_api(
     api_addr: &str,
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
     let path = req
         .uri()
@@ -340,10 +430,13 @@ async fn forward_to_api(
         .unwrap_or("/");
     let uri = format!("http://{api_addr}{path}");
 
+    let upgrade = is_upgrade_request(req.headers());
+    let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
+
     let stream = tokio::net::TcpStream::connect(api_addr).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::spawn(conn);
+    spawn_backend_conn(conn, upgrade);
 
     let mut builder = Request::builder().method(req.method()).uri(&uri);
     for (key, value) in req.headers() {
@@ -355,6 +448,9 @@ async fn forward_to_api(
     let proxy_req = builder.body(req.into_body()).unwrap();
 
     let resp = sender.send_request(proxy_req).await?;
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(relay_upgrade(client_upgrade, resp));
+    }
     let status = resp.status();
     let headers = resp.headers().clone();
     let body = resp.into_body().collect().await?.to_bytes();
@@ -369,7 +465,7 @@ async fn forward_to_api(
 async fn forward_request(
     backend_ip: &str,
     site: Option<&str>,
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>> {
     let path_and_query = req
         .uri()
@@ -378,10 +474,14 @@ async fn forward_request(
         .unwrap_or("/");
     let uri = format!("http://{}:{}{}", backend_ip, 80, path_and_query);
 
+    // Capture the client-side upgrade future before the body is consumed below.
+    let upgrade = is_upgrade_request(req.headers());
+    let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
+
     let stream = tokio::net::TcpStream::connect(format!("{backend_ip}:80")).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-    tokio::spawn(conn);
+    spawn_backend_conn(conn, upgrade);
 
     let mut builder = Request::builder().method(req.method()).uri(&uri);
     for (key, value) in req.headers() {
@@ -397,6 +497,9 @@ async fn forward_request(
     let proxy_req = builder.body(req.into_body()).unwrap();
 
     let resp = sender.send_request(proxy_req).await?;
+    if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(relay_upgrade(client_upgrade, resp));
+    }
     let status = resp.status();
     let headers = resp.headers().clone();
     let body = resp.into_body().collect().await?.to_bytes();
