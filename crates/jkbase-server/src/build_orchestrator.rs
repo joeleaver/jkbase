@@ -1772,17 +1772,19 @@ name = "api"
         // response, so a 200 proves `bun install` fetched it through the proxy AND
         // the app runs with it. Offline: a no-dep server.
         let (server_ts, package_json) = if networked {
-            // Two deps with a TRANSITIVE edge (debug → ms): proves a multi-package
-            // resolution tree fetches through the proxy, not just one leaf. Both are
-            // imported at runtime, so a 200 means the whole tree installed.
+            // Two prod deps with a TRANSITIVE edge (debug → ms) prove a multi-package
+            // tree fetches through the proxy; both are imported at runtime, so a 200
+            // means the whole tree installed. A `typescript` devDependency proves the
+            // lean-layer prune: it must be installed for the build but ABSENT from the
+            // app layer.
             (
                 "import ms from \"ms\";\nimport createDebug from \"debug\";\nconst log = createDebug(\"app\");\nconst port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { log(\"req\"); return new Response(\"ok \" + ms(60000) + \"\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"devDependencies\": { \"typescript\": \"^5.6.0\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
             )
         } else {
             (
                 "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.1.45\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
             )
         };
         write(src.join("server/server.ts"), server_ts);
@@ -2063,6 +2065,11 @@ name = "api"
     async fn bun_networked_pipeline_to_http_200() {
         let Some(fx) = bun_pipeline_build("bunnet", 1, true).await else { return };
         let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+
+        // Lean-layer proof: the built app erofs carries the PRODUCTION deps (ms, debug)
+        // but NOT the dev dep (typescript) — pruned out of the runtime layer.
+        assert_app_layer_pruned(&fx.staged).await;
+
         let body = boot_layered_and_curl(
             &fx, &store_dir, &agent_bin, "netpipe", "172.28.0.1", "172.28.0.2", "AA:FC:00:00:28:02",
         )
@@ -2073,6 +2080,31 @@ name = "api"
             "response uses ms(60000)=1m — proves `ms` was fetched through the egress proxy and runs"
         );
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: networked bun install (ms via egress proxy, sealed) -> layered runtime -> HTTP 200 ({body:?})");
+        println!("PASS: networked bun install (ms+debug via proxy, sealed) + lean prune (no typescript) -> layered runtime -> HTTP 200 ({body:?})");
+    }
+
+    /// Mount the staged app erofs layer and assert the lean prune kept production deps
+    /// (ms, debug) and dropped the dev dep (typescript).
+    async fn assert_app_layer_pruned(staged: &Path) {
+        let layers_dir = staged.join("_layers");
+        let app_erofs = std::fs::read_dir(&layers_dir)
+            .expect("_layers dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "erofs"))
+            .expect("app erofs layer present");
+        let mnt = staged.join("_probe-mnt");
+        let _ = std::fs::create_dir_all(&mnt);
+        sh("mount", &["-t", "erofs", "-o", "ro,loop", app_erofs.to_str().unwrap(), mnt.to_str().unwrap()])
+            .await
+            .expect("mount app erofs");
+        let nm = mnt.join("app/node_modules");
+        let present = |p: &str| nm.join(p).exists();
+        let (has_ms, has_debug, has_ts) = (present("ms"), present("debug"), present("typescript"));
+        let _ = sh("umount", &[mnt.to_str().unwrap()]).await;
+        let _ = std::fs::remove_dir_all(&mnt);
+        assert!(has_ms, "production dep `ms` must be in the app layer");
+        assert!(has_debug, "production dep `debug` must be in the app layer");
+        assert!(!has_ts, "dev dep `typescript` must be PRUNED from the app layer");
     }
 }
