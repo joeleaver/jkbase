@@ -539,13 +539,13 @@ async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// Re-discipline the guest wall clock on demand by forcing `chronyc makestep`. The
-/// host POSTs this right after resuming a restored snapshot — the guest clock is
-/// frozen at snapshot time, so it lags by the paused duration; stepping it now
-/// (rather than waiting for chrony's next poll) means the first request after wake
-/// already sees correct time.
+/// Re-discipline the guest wall clock on demand by stepping CLOCK_REALTIME straight
+/// to the host's PTP time. The host POSTs this right after resuming a restored
+/// snapshot — the guest clock is frozen at snapshot time, so it lags by the paused
+/// duration; stepping it now (rather than waiting for chrony's next poll) means the
+/// first request after wake already sees correct time. chrony keeps disciplining.
 async fn resync_clock_response(_req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-    let r = clock::resync_now().await;
+    let r = clock::resync_now();
     if r.ok {
         info!(detail = %r.detail, "clock resynced (chronyc makestep)");
     } else {

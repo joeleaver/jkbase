@@ -20,13 +20,18 @@
 //! resumes a restored snapshot so the correction is *instant* — the first request
 //! after wake already sees correct time.
 
+use std::fs::OpenOptions;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::process::Stdio;
+use std::os::unix::io::AsRawFd;
 use std::time::Duration;
 use tokio::process::Command;
 
 const CHRONYD: &str = "/usr/sbin/chronyd";
-const CHRONYC: &str = "/usr/bin/chronyc";
+/// The KVM-backed PTP device (`ptp_kvm` registers it). chrony reads it as a refclock
+/// for steady-state discipline; [`resync_now`] reads it directly for the instant
+/// resume step.
+const PTP_DEVICE: &str = "/dev/ptp0";
 /// chrony's writable runtime dir (driftfile + command socket). `/run` is a tmpfs
 /// the agent mounts, so this is recreated each boot.
 const CHRONY_RUNDIR: &str = "/run/chrony";
@@ -75,27 +80,81 @@ pub struct ResyncResult {
     pub detail: String,
 }
 
-/// Force chrony to step the clock to its PTP reference immediately (`chronyc
-/// makestep`). The host calls this right after resuming a restored snapshot so the
-/// resume jump is corrected at once rather than on chrony's next poll.
-pub async fn resync_now() -> ResyncResult {
-    match Command::new(CHRONYC)
-        .args(["-n", "makestep"])
-        .stdin(Stdio::null())
-        .output()
-        .await
-    {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            // chronyc prints "200 OK" when the daemon accepts the command.
-            let ok = out.status.success() && stdout.contains("200 OK");
-            let detail = format!("{}{}", stdout.trim(), stderr.trim());
-            ResyncResult { ok, detail }
+/// Step `CLOCK_REALTIME` directly to the host's UTC, read from the KVM PTP device,
+/// for an INSTANT resume correction. The host calls this right after resuming a
+/// restored snapshot: the guest clock is frozen at snapshot time, and chrony (poll 1)
+/// would auto-correct within a couple of seconds, but reading the PHC and stepping
+/// here makes the very first post-wake request see correct time.
+///
+/// This is a single one-shot step; chrony remains the continuous disciplinarian and
+/// accommodates it — whichever lands first wins and the other is a no-op (if this
+/// step lands first, chrony's next sample just sees a correct clock; if chrony's own
+/// makestep lands first, this re-reads the PHC and steps ~0). Needs `CAP_SYS_TIME`
+/// (the agent is the VM's uid-0 PID 1).
+pub fn resync_now() -> ResyncResult {
+    let reference = match read_ptp_utc() {
+        Ok(ts) => ts,
+        Err(e) => {
+            return ResyncResult {
+                ok: false,
+                detail: format!("PHC read failed: {e}"),
+            };
         }
-        Err(e) => ResyncResult {
+    };
+    let before = now_realtime().tv_sec;
+    if let Err(e) = step_realtime(&reference) {
+        // EPERM here means the process lacks CAP_SYS_TIME (not PID 1 / not root).
+        return ResyncResult {
             ok: false,
-            detail: format!("failed to run chronyc: {e}"),
-        },
+            detail: format!("clock_settime failed: {e}"),
+        };
     }
+    // `tv_sec` is the libc time_t; keep the subtraction in that type (no cast, and
+    // don't name the deprecated alias) so it stays clean under -D warnings.
+    let stepped = reference.tv_sec - before;
+    ResyncResult {
+        ok: true,
+        detail: format!("stepped CLOCK_REALTIME to PHC ({stepped:+} s)"),
+    }
+}
+
+/// `man clock_getres(2)`, "Dynamic clocks":
+/// `FD_TO_CLOCKID(fd) = ((~(clockid_t)(fd) << 3) | CLOCKFD)`, `CLOCKFD = 3`.
+fn fd_to_clockid(fd: i32) -> libc::clockid_t {
+    ((!(fd as libc::clockid_t)) << 3) | 3
+}
+
+/// Read the host's wall clock (UTC / `CLOCK_REALTIME`) from the KVM PTP device.
+/// Verified against the v6.12 kernel: `ptp_kvm`'s `KVM_HC_CLOCK_PAIRING(WALLCLOCK)`
+/// returns the host's `CLOCK_REALTIME` — UTC, NOT TAI, so no leap-second offset.
+fn read_ptp_utc() -> io::Result<libc::timespec> {
+    // The dynamic clock id is only valid while the fd is open — keep `f` alive until
+    // AFTER clock_gettime (dropping it first would yield EINVAL).
+    let f = OpenOptions::new().read(true).write(true).open(PTP_DEVICE)?;
+    let clkid = fd_to_clockid(f.as_raw_fd());
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(clkid, &mut ts) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(f);
+    Ok(ts)
+}
+
+fn now_realtime() -> libc::timespec {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    ts
+}
+
+fn step_realtime(ts: &libc::timespec) -> io::Result<()> {
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, ts) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
