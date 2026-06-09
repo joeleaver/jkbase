@@ -62,8 +62,9 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 # ─────────────────────────────────────────────────────────────────────────────
 # Flags
 # ─────────────────────────────────────────────────────────────────────────────
-CHECK=0 YES=0 FORCE=0 VERBOSE=0 JOBS="" STAGE=""
+CHECK=0 YES=0 FORCE=0 VERBOSE=0 DEEP=0 JOBS="" STAGE=""
 ONLY="" SKIP=""
+POSITIONAL=()    # non-flag args (e.g. a `test` filter)
 declare -A RAN  # stage -> OK|SKIP|FAIL|WOULD (for the summary)
 
 parse_flags() {
@@ -75,11 +76,13 @@ parse_flags() {
             -y|--yes) YES=1 ;;
             --force) FORCE=1 ;;
             -v|--verbose) VERBOSE=1 ;;
+            --deep) DEEP=1 ;;
             --jobs) JOBS="$2"; shift ;;
             --only) ONLY="$2"; shift ;;
             --skip) SKIP="$2"; shift ;;
             -h|--help) usage; exit 0 ;;
-            *) err "unknown flag: $1"; usage; exit 2 ;;
+            -*) err "unknown flag: $1"; usage; exit 2 ;;
+            *) POSITIONAL+=("$1") ;;
         esac
         shift
     done
@@ -442,9 +445,9 @@ cmd_doctor() {
     else
         warn "build net not up (or 3129 missing) — run \`tools/dev net\`"
     fi
-    if [ "${1:-}" = "--deep" ]; then
+    if [ "$DEEP" = 1 ]; then
         banner "doctor --deep: boot smoke"
-        warn "(--deep micro-boot smoke: run \`tools/dev test\` for the full build→HTTP 200 acceptance)"
+        warn "(--deep boot smoke: run \`tools/dev test\` for the full build→HTTP 200 acceptance — incl. dockerfile_pipeline_to_http_200)"
     fi
     if [ "$fails" -gt 0 ]; then err "doctor: $fails artifact check(s) failed — run \`tools/dev all\`"; return 1; fi
     ok "doctor: end-state complete"
@@ -455,15 +458,27 @@ cmd_doctor() {
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_test() {
     banner "test (on-box acceptance)"
-    local env_args=(
-        JKB_DATA="$FC_DIR"
-        JKB_FC_RELEASE="$RELEASE_DIR"
-        JKB_BASELAYERS="$BASELAYERS_DIR"
-        JKB_AGENT="$AGENT_BIN"
-    )
-    say "Running on-box acceptance tests (sudo; needs net up for networked variants)…"
+    # Compile the test binary AS THE USER (cargo under sudo would resolve root's
+    # rustup + pollute target/ ownership), then run just the binary under sudo.
+    say "Compiling the test binary (as $USER)…"
+    local testbin
+    testbin="$(cargo test -p jkbase-server --no-run --message-format=json 2>/dev/null \
+        | python3 -c 'import json,sys
+for l in sys.stdin:
+    try: m=json.loads(l)
+    except Exception: continue
+    if m.get("reason")=="compiler-artifact" and m.get("target",{}).get("name")=="jkbase-server" and m.get("profile",{}).get("test") and m.get("executable"):
+        print(m["executable"])' | tail -1)"
+    [ -n "$testbin" ] && [ -x "$testbin" ] || die "could not locate the jkbase-server test binary"
+    local filter="${1:-}"
+    say "Running on-box acceptance tests under sudo (needs \`tools/dev net\` for networked variants)…"
     sudo_warmup
-    sudo env "${env_args[@]}" "$HOME/.cargo/bin/cargo" test -p jkbase-server -- --ignored --nocapture "${@:-}"
+    sudo env \
+        JKB_DATA="$FC_DIR" \
+        JKB_FC_RELEASE="$RELEASE_DIR" \
+        JKB_BASELAYERS="$BASELAYERS_DIR" \
+        JKB_AGENT="$AGENT_BIN" \
+        "$testbin" --ignored --nocapture --test-threads=1 $filter
     RAN[test]=OK
 }
 
@@ -500,8 +515,8 @@ main() {
         baselayers) cmd_baselayers ;;
         net)        cmd_net ;;
         all)        cmd_all ;;
-        doctor)     shift; cmd_doctor "${1:-}" ;;
-        test)       shift; cmd_test "$@" ;;
+        doctor)     cmd_doctor ;;
+        test)       cmd_test "${POSITIONAL[@]:-}" ;;
         *)          err "unknown stage: $STAGE"; usage; exit 2 ;;
     esac
 }
