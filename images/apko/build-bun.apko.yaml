@@ -25,6 +25,20 @@ contents:
     - ca-certificates-bundle
     - busybox # sh + mount/umount/cp/nc/reboot for the lifecycle's shell-outs
     - erofs-utils # mkfs.erofs for the layered exporter
+    # Real Node.js — BUILD-TIME ONLY (this toolchain image; NOT the runtime layer).
+    # JS build tooling (Vite/Rollup/Babel) is Node-native. `bun run build` honours a
+    # tool's `#!/usr/bin/env node` shebang and delegates to real node when it's on
+    # PATH; without node, bun runs the tool on its own runtime and hits genuine
+    # resolver bugs — e.g. vite-plugin-solid statically imports `solid-refresh/babel`,
+    # which under the bun runtime fails `Cannot find module '../dist/babel.cjs' from ''`
+    # (reproduces ONLY under bun, fully offline; real node resolves it). Aliasing
+    # node->bun does NOT help — the bug is bun's engine, not the name. The deployed
+    # server still runs on bun; node is borrowed only for the hermetic compile step.
+    # Pinned to the Active-LTS major for reproducible builds (Wolfi ships
+    # nodejs-16..26); bump deliberately. npm/npx are intentionally omitted — under the
+    # Bun buildpack, install is `bun install` and tool bins (vite, …) run directly via
+    # their node shebang; add Wolfi `npm` only if a tenant build genuinely needs it.
+    - nodejs-24
     # - composefs        # mkcomposefs (file-level dedup; enable once confirmed in Wolfi)
     # Native node-gyp modules (deferred): add build-base gcc glibc-dev python3
     # pkgconf here when that support lands.

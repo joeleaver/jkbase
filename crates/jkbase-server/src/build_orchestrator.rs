@@ -1673,7 +1673,7 @@ esac
     #[tokio::test]
     #[ignore = "needs KVM + root + baked bun.ext4; set JKB_DATA + JKB_FC_RELEASE"]
     async fn bun_server_build_through_orchestrator() {
-        let Some(fx) = bun_pipeline_build("bunfix", 1, false).await else { return };
+        let Some(fx) = bun_pipeline_build("bunfix", 1, Workload::OfflineNoDep).await else { return };
         let staged = &fx.staged;
         let store = &fx.store;
         let (project_id, build_id) = ("bunfix", 1u64);
@@ -1733,15 +1733,34 @@ esac
         staged: PathBuf,
     }
 
-    /// Shared build half: resolve the env, write a Bun server fixture, and drive it
-    /// through `run_project_build`. `networked` switches to a fixture WITH a real npm
-    /// dependency (`ms`) and wires the isolated build network + egress proxy, so
-    /// `bun install` must fetch through the proxy (fetch-then-seal). Returns `None`
-    /// (with an explanatory eprintln) when the environment isn't provisioned.
+    /// Which fixture + network wiring `bun_pipeline_build` drives.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Workload {
+        /// No deps, no build script — the offline rung (no bridge/proxy/seal).
+        OfflineNoDep,
+        /// Workspace monorepo with transitive deps + a dev dep to prune (fetch-then-seal).
+        NetworkedMonorepo,
+        /// A Solid/Vite app whose `bun run build` (`vite build`) only resolves
+        /// solid-refresh's babel plugin when the toolchain ships real `node` — the
+        /// regression guard for the bun-runtime resolver bug (`Cannot find module
+        /// '../dist/babel.cjs'`). `bun run build` delegates vite's node-shebang bin to
+        /// node when node is on PATH; without node it runs vite on bun's engine + fails.
+        NetworkedSolidVite,
+    }
+    impl Workload {
+        fn networked(self) -> bool {
+            !matches!(self, Workload::OfflineNoDep)
+        }
+    }
+
+    /// Shared build half: resolve the env, write a fixture, and drive it through
+    /// `run_project_build`. Networked workloads wire the isolated build network +
+    /// egress proxy so `bun install` must fetch through the proxy (fetch-then-seal).
+    /// Returns `None` (with an explanatory eprintln) when the env isn't provisioned.
     async fn bun_pipeline_build(
         project_id: &str,
         build_id: u64,
-        networked: bool,
+        workload: Workload,
     ) -> Option<BuildFixture> {
         let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
             eprintln!("skip: set JKB_DATA");
@@ -1780,32 +1799,69 @@ service = "server"
 name = "api"
 "#,
         );
-        // Networked: a WORKSPACE monorepo (root `workspaces` + a member) with a real
-        // transitive dep tree (debug → ms) AND root devDeps (typescript) — the exact
-        // shape that broke the production-prune staging (`Workspace not found`). The
-        // server imports ms+debug at runtime so a 200 proves the tree installed
-        // through the proxy and runs; the prune must drop typescript from the app
-        // layer without tripping over the workspace. Offline: a plain no-dep server.
-        let (server_ts, package_json) = if networked {
-            (
-                "import ms from \"ms\";\nimport createDebug from \"debug\";\nconst log = createDebug(\"app\");\nconst port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { log(\"req\"); return new Response(\"ok \" + ms(60000) + \"\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"workspaces\": [\"packages/*\"],\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"devDependencies\": { \"typescript\": \"^5.6.0\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
-            )
-        } else {
-            (
-                "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
-            )
-        };
-        write(src.join("server/server.ts"), server_ts);
-        write(src.join("server/package.json"), package_json);
-        if networked {
-            // A trivial workspace member so the root manifest's `workspaces` glob
-            // resolves — the production-prune staging must handle this in-place.
-            write(
-                src.join("server/packages/lib/package.json"),
-                "{ \"name\": \"@bunfix/lib\", \"version\": \"1.0.0\" }\n",
-            );
+        // Per-workload fixture under `server/` (all are a single `[servers.api]`,
+        // language=bun; they differ in what the build must do):
+        match workload {
+            // Offline rung: a plain no-dep Bun server, no build script.
+            Workload::OfflineNoDep => {
+                write(
+                    src.join("server/server.ts"),
+                    "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+            }
+            // A WORKSPACE monorepo (root `workspaces` + a member) with a real transitive
+            // dep tree (debug → ms) AND root devDeps (typescript) — the exact shape that
+            // broke the production-prune staging (`Workspace not found`). The server
+            // imports ms+debug at runtime so a 200 proves the tree installed through the
+            // proxy and runs; the prune must drop typescript from the app layer.
+            Workload::NetworkedMonorepo => {
+                write(
+                    src.join("server/server.ts"),
+                    "import ms from \"ms\";\nimport createDebug from \"debug\";\nconst log = createDebug(\"app\");\nconst port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { log(\"req\"); return new Response(\"ok \" + ms(60000) + \"\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"workspaces\": [\"packages/*\"],\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"devDependencies\": { \"typescript\": \"^5.6.0\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+                // A trivial workspace member so the root manifest's `workspaces` glob
+                // resolves — the production-prune staging must handle this in-place.
+                write(
+                    src.join("server/packages/lib/package.json"),
+                    "{ \"name\": \"@bunfix/lib\", \"version\": \"1.0.0\" }\n",
+                );
+            }
+            // A minimal Solid SPA: `solid()` in the vite config STATICALLY imports
+            // `solid-refresh/babel` at plugin-load (every build, dev or prod), so even
+            // this trivial `vite build` trips bun's resolver bug UNLESS real `node` runs
+            // vite. `bun run build` honours vite's `#!/usr/bin/env node` shebang and
+            // delegates to the toolchain node; the build then completes fully offline
+            // (post-seal). Asserted by `assert_app_layer_has_dist`.
+            Workload::NetworkedSolidVite => {
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"solidfix\",\n  \"private\": true,\n  \"type\": \"module\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"dependencies\": { \"solid-js\": \"^1.9.4\" },\n  \"devDependencies\": { \"vite\": \"^6.0.11\", \"vite-plugin-solid\": \"^2.11.1\" },\n  \"scripts\": { \"build\": \"vite build\", \"start\": \"bun run server.ts\" }\n}\n",
+                );
+                write(
+                    src.join("server/vite.config.ts"),
+                    "import solid from \"vite-plugin-solid\";\nimport { defineConfig } from \"vite\";\nexport default defineConfig({ plugins: [solid()] });\n",
+                );
+                write(
+                    src.join("server/index.html"),
+                    "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>solidfix</title></head>\n<body><div id=\"root\"></div><script type=\"module\" src=\"/src/index.tsx\"></script></body></html>\n",
+                );
+                write(
+                    src.join("server/src/index.tsx"),
+                    "import { render } from \"solid-js/web\";\nfunction App() {\n  return <div>hello solid</div>;\n}\nconst root = document.getElementById(\"root\");\nif (root) render(() => <App />, root);\n",
+                );
+                write(
+                    src.join("server/server.ts"),
+                    "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                );
+            }
         }
 
         let mut tarbuf = Vec::new();
@@ -1837,7 +1893,7 @@ name = "api"
         // VMs can reach ONLY 172.31.0.1:3128 (JKBUILD firewall). The orchestrator
         // leases a TAP off `net` and wires the proxy + seal per target. Provision
         // first: sudo tools/setup-build-net.sh.
-        let net = if networked {
+        let net = if workload.networked() {
             match tokio::net::TcpListener::bind("172.31.0.1:3128").await {
                 Ok(listener) => {
                     tokio::spawn(crate::egress::serve(
@@ -1888,7 +1944,7 @@ name = "api"
             net,
             // Real `bun install` over the network needs more headroom than the
             // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
-            fetch_deadline: Duration::from_secs(if networked { 180 } else { 120 }),
+            fetch_deadline: Duration::from_secs(if workload.networked() { 180 } else { 120 }),
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2052,7 +2108,7 @@ name = "api"
     #[tokio::test]
     #[ignore = "full pipeline: needs KVM + root + bun.ext4 + baselayers + musl agent"]
     async fn bun_layered_pipeline_to_http_200() {
-        let Some(fx) = bun_pipeline_build("bunpipe", 1, false).await else { return };
+        let Some(fx) = bun_pipeline_build("bunpipe", 1, Workload::OfflineNoDep).await else { return };
         let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
         let body = boot_layered_and_curl(
             &fx, &store_dir, &agent_bin, "pipe", "172.30.0.1", "172.30.0.2", "AA:FC:00:00:30:02",
@@ -2081,7 +2137,7 @@ name = "api"
     #[tokio::test]
     #[ignore = "networked pipeline: + internet + provisioned build bridge (setup-build-net.sh)"]
     async fn bun_networked_pipeline_to_http_200() {
-        let Some(fx) = bun_pipeline_build("bunnet", 1, true).await else { return };
+        let Some(fx) = bun_pipeline_build("bunnet", 1, Workload::NetworkedMonorepo).await else { return };
         let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
 
         // Lean-layer proof: the built app erofs carries the PRODUCTION deps (ms, debug)
@@ -2124,5 +2180,59 @@ name = "api"
         assert!(has_ms, "production dep `ms` must be in the app layer");
         assert!(has_debug, "production dep `debug` must be in the app layer");
         assert!(!has_ts, "dev dep `typescript` must be PRUNED from the app layer");
+    }
+
+    /// Networked Solid/Vite regression guard. A minimal Solid SPA is built through
+    /// `run_project_build`; its `bun run build` (`vite build`) loads `vite-plugin-solid`,
+    /// which statically imports `solid-refresh/babel`. Under the BUN runtime that
+    /// resolves to `Cannot find module '../dist/babel.cjs' from ''` (a bun resolver
+    /// bug) — but `bun run build` delegates vite's `#!/usr/bin/env node` bin to real
+    /// node when the toolchain (`bun.ext4`) ships it, so the build completes fully
+    /// offline (post-seal). Without `node` in the toolchain this build FAILS — this is
+    /// the guard against regressing the `nodejs` apk in build-bun.apko.yaml.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once: provision jkbuild0 + the firewall
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… \
+    ///       <test-bin> --ignored --nocapture bun_networked_solid_vite_build
+    ///
+    /// Needs KVM + root + outbound internet + the provisioned build bridge. Build half
+    /// only — no runtime boot, so baselayers/agent are not required.
+    #[tokio::test]
+    #[ignore = "networked: + internet + provisioned build bridge (setup-build-net.sh); regression guard — needs `node` in bun.ext4"]
+    async fn bun_networked_solid_vite_build() {
+        let Some(fx) = bun_pipeline_build("bunsolid", 1, Workload::NetworkedSolidVite).await else {
+            return;
+        };
+        // `run_project_build` returning Ok already means `vite build` ran to completion
+        // (a failed build bails the compile phase); this asserts the bundle physically
+        // landed in the app layer.
+        assert_app_layer_has_dist(&fx.staged).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: networked Solid/Vite `bun run build` delegated to node -> dist/ in the app layer");
+    }
+
+    /// Mount the staged app erofs layer and assert the Vite build output landed at
+    /// `app/dist/index.html` (proves `bun run build` produced a bundle, not just exit 0).
+    async fn assert_app_layer_has_dist(staged: &Path) {
+        let layers_dir = staged.join("_layers");
+        let app_erofs = std::fs::read_dir(&layers_dir)
+            .expect("_layers dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "erofs"))
+            .expect("app erofs layer present");
+        let mnt = staged.join("_probe-dist-mnt");
+        let _ = std::fs::create_dir_all(&mnt);
+        sh("mount", &["-t", "erofs", "-o", "ro,loop", app_erofs.to_str().unwrap(), mnt.to_str().unwrap()])
+            .await
+            .expect("mount app erofs");
+        let has_dist = mnt.join("app/dist/index.html").exists();
+        let _ = sh("umount", &[mnt.to_str().unwrap()]).await;
+        let _ = std::fs::remove_dir_all(&mnt);
+        assert!(
+            has_dist,
+            "vite build output app/dist/index.html must be in the app layer (proves `bun run build` ran under node)"
+        );
     }
 }

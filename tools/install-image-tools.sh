@@ -44,7 +44,10 @@ if [ "${MELANGE:-0}" = "1" ]; then
         "https://github.com/chainguard-dev/melange/releases/download/v${MELANGE_VER}/melange_${MELANGE_VER}_linux_amd64.tar.gz"
 fi
 
-# Baked Bun binary (standard x64/AVX2; fixes the baseline solid-refresh/Vite bug).
+# Baked Bun binary (standard x64/AVX2). NB the solid-refresh/Vite build failure is
+# NOT an AVX2/baseline issue (standard bun reproduces it) — it's a bun *runtime*
+# resolver bug; the fix is real `nodejs` in the build toolchain (build-bun.apko.yaml),
+# which `bun run build` delegates Vite to via its node shebang. See that file's note.
 bun_zip="$(mktemp -d)/bun.zip"
 echo "[install] bun $BUN_VER (standard) -> $ASSET_DIR/bun"
 curl -fSL -o "$bun_zip" \
