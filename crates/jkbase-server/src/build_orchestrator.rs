@@ -246,6 +246,13 @@ pub struct BuildNet {
     subnet_prefix: String,
     uid: u32,
     free_slots: Mutex<Vec<u8>>,
+    /// Serializes ALL JKBUILD mutations (install/clear of per-lease rules) within
+    /// this process. Builds fan out concurrently (semaphore-bounded) and each touches
+    /// iptables, so without this two acquires/releases could interleave their rule
+    /// edits. Paired with `iptables -w` (which serializes against OTHER processes —
+    /// e.g. the ExecStartPre firewall script — via the xtables lock), this makes the
+    /// revoke path reliable rather than silently fail-open on lock contention.
+    fw_lock: Mutex<()>,
 }
 
 /// A leased build-network slot (its TAP + guest IP/MAC); returned via [`BuildNet::release`].
@@ -287,6 +294,7 @@ impl BuildNet {
             subnet_prefix,
             uid,
             free_slots: Mutex::new(free_slots),
+            fw_lock: Mutex::new(()),
         }
     }
 
@@ -334,6 +342,7 @@ impl BuildNet {
         // unchanged.
         let mut any_egress = false;
         if let Some(any_port) = self.proxy_any_port {
+            let _fw = self.fw_lock.lock().await;
             self.clear_any_egress(&guest_ip, any_port).await;
             if allow_any_egress {
                 if let Err(e) = self.install_any_egress(&guest_ip, any_port).await {
@@ -361,6 +370,7 @@ impl BuildNet {
         if lease.any_egress
             && let Some(any_port) = self.proxy_any_port
         {
+            let _fw = self.fw_lock.lock().await;
             self.clear_any_egress(&lease.guest_ip, any_port).await;
         }
         let _ = run_ip(&["link", "delete", &lease.tap]).await;
@@ -387,11 +397,15 @@ impl BuildNet {
 
     /// Remove EVERY JKBUILD rule granting `guest_ip` the public-any port (there may
     /// be a stale one from a crashed lease on the same, since-reused slot).
-    /// Idempotent: loops until `iptables -D` reports no matching rule.
+    /// Idempotent: loops until `iptables -D` reports no matching rule. `-w` makes the
+    /// "no match" verdict trustworthy — without it, losing the xtables lock to a
+    /// concurrent edit returns the same nonzero exit as "rule absent", which would
+    /// silently leave a stale grant installed (a fail-open in the revoke path). Call
+    /// under `fw_lock` so this process's own edits never contend.
     async fn clear_any_egress(&self, guest_ip: &str, any_port: u16) {
         let spec = self.any_egress_rule(guest_ip, any_port);
         for _ in 0..64 {
-            let mut args = vec!["-D".to_string(), "JKBUILD".to_string()];
+            let mut args = vec!["-w".to_string(), "-D".to_string(), "JKBUILD".to_string()];
             args.extend(spec.iter().cloned());
             let removed = tokio::process::Command::new("iptables")
                 .args(&args)
@@ -406,9 +420,16 @@ impl BuildNet {
     }
 
     /// Grant ONE dockerfile-build guest IP reach to the public-any proxy. Inserted
-    /// at the top of JKBUILD so it precedes the chain's terminal DROP.
+    /// at the top of JKBUILD so it precedes the chain's terminal DROP. `-w` waits for
+    /// the xtables lock instead of failing the build on contention. Call under
+    /// `fw_lock`.
     async fn install_any_egress(&self, guest_ip: &str, any_port: u16) -> Result<()> {
-        let mut args = vec!["-I".to_string(), "JKBUILD".to_string(), "1".to_string()];
+        let mut args = vec![
+            "-w".to_string(),
+            "-I".to_string(),
+            "JKBUILD".to_string(),
+            "1".to_string(),
+        ];
         args.extend(self.any_egress_rule(guest_ip, any_port));
         let status = tokio::process::Command::new("iptables")
             .args(&args)
@@ -474,8 +495,8 @@ impl BuildNet {
         }
         // FATAL: the isolation rules. Without these a build VM could reach the host
         // / other VMs / the internet — refuse to run builds at all.
-        let input_hook = ["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
-        let fwd_drop = ["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
+        let input_hook = ["-w", "-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
+        let fwd_drop = ["-w", "-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
         for check in [input_hook, fwd_drop] {
             let ok = tokio::process::Command::new("iptables")
                 .args(check)
@@ -498,7 +519,7 @@ impl BuildNet {
         // this only trips on a truly source-unrestricted rule.)
         if let Some(any) = self.proxy_any_port {
             let blanket = [
-                "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
+                "-w", "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
                 "--dport", &any.to_string(), "-j", "ACCEPT",
             ];
             let present = tokio::process::Command::new("iptables")
@@ -521,7 +542,7 @@ impl BuildNet {
         // fail at fetch (fail-safe), so surface it loudly but don't refuse to start
         // (and never outage the runtime over an iptables rule-form mismatch).
         let proxy_accept = [
-            "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
+            "-w", "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
             "--dport", &self.proxy_port.to_string(), "-j", "ACCEPT",
         ];
         let ok = tokio::process::Command::new("iptables")
@@ -858,6 +879,23 @@ async fn build_one_target_inner(
                 deps.toolchain_dir.display()
             )
         })?;
+
+    // A `builder = "dockerfile"` build MUST resolve to the real dockerfile toolchain
+    // (buildah &c.). `select_toolchain` falls back through `<kind>.ext4`/`default.ext4`
+    // when `dockerfile.ext4` is absent — but a busybox passthrough can't build a
+    // Dockerfile, and (critically) we must NOT hand that fallback VM the public-any
+    // (:3129) egress grant keyed on the raw builder flag: that would arm broad egress
+    // for a build the operator never provisioned the feature for. Fail clearly here so
+    // `is_dockerfile` past this point implies the dockerfile toolchain actually ran.
+    let resolved_dockerfile =
+        toolchain.file_name().and_then(|s| s.to_str()) == Some("dockerfile.ext4");
+    if is_dockerfile && !resolved_dockerfile {
+        bail!(
+            "builder = \"dockerfile\" requires the dockerfile build toolchain \
+             (dockerfile.ext4), which is not provisioned in {}",
+            deps.toolchain_dir.display()
+        );
+    }
 
     let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
     let source_img = workspace.join(format!("{tag}.source.img"));

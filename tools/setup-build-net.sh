@@ -54,19 +54,21 @@ fi
 
 # 2. Firewall. A dedicated JKBUILD chain (flushed + rebuilt each run, so the rules
 # are idempotent) gates everything arriving from the build bridge.
-iptables -N JKBUILD 2>/dev/null || iptables -F JKBUILD
+# -w on every call: jkbase-server mutates JKBUILD (per-VM grants) concurrently with
+# this ExecStartPre run, so wait for the xtables lock instead of racing it.
+iptables -w -N JKBUILD 2>/dev/null || iptables -w -F JKBUILD
 #   allow → the narrow allowlist egress proxy on the gateway (safe for every build),
 #   drop everything else to the host. The public-any (dockerfile) proxy is NOT opened
 #   here: jkbase-server inserts a per-source ACCEPT for one dockerfile VM's guest IP
 #   above this DROP for the life of that build, so broad egress is scoped per-VM.
-iptables -A JKBUILD -p tcp -d "$GW_IP" --dport "$PROXY_PORT" -j ACCEPT
-iptables -A JKBUILD -j DROP
+iptables -w -A JKBUILD -p tcp -d "$GW_IP" --dport "$PROXY_PORT" -j ACCEPT
+iptables -w -A JKBUILD -j DROP
 # Hook host-bound traffic from the build bridge through JKBUILD (insert once).
-iptables -C INPUT -i "$BRIDGE" -j JKBUILD 2>/dev/null \
-    || iptables -I INPUT 1 -i "$BRIDGE" -j JKBUILD
+iptables -w -C INPUT -i "$BRIDGE" -j JKBUILD 2>/dev/null \
+    || iptables -w -I INPUT 1 -i "$BRIDGE" -j JKBUILD
 # Drop ALL forwarding from the build bridge: no internet, no other subnets/VMs.
-iptables -C FORWARD -i "$BRIDGE" -j DROP 2>/dev/null \
-    || iptables -I FORWARD 1 -i "$BRIDGE" -j DROP
+iptables -w -C FORWARD -i "$BRIDGE" -j DROP 2>/dev/null \
+    || iptables -w -I FORWARD 1 -i "$BRIDGE" -j DROP
 
 # 3. IPv6: the proxy is IPv4-only, so there is nothing to allow over v6 — disable
 # IPv6 on the bridge and drop all v6 from it. (Build VMs also boot ipv6.disable=1
