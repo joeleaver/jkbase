@@ -1154,6 +1154,34 @@ impl Store {
         Ok(existed)
     }
 
+    /// Remove ALL of a project's secrets (project teardown). The compound key is
+    /// `{project_id}:{key}`, and the `:` separator makes the prefix exact — project
+    /// `forumall` never matches `forumall2:*`. Returns the number removed. Without
+    /// this, a recreated project of the same slug would inherit a prior tenant's
+    /// secrets (which the deploy path injects into the container env).
+    pub fn delete_all_secrets(&self, project_id: &str) -> Result<usize> {
+        let prefix = format!("{project_id}:");
+        let txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut table = txn.open_table(SECRETS)?;
+            // Collect first: redb forbids mutating the table while its iterator is live.
+            let keys: Vec<String> = table
+                .iter()?
+                .filter_map(|e| e.ok())
+                .map(|(k, _)| k.value().to_string())
+                .filter(|k| k.starts_with(&prefix))
+                .collect();
+            for k in keys {
+                if table.remove(k.as_str())?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
     // -- Connected-repo build triggers (build · D) --
 
     /// Load a project's repo-trigger credentials, or `None` if it has none yet.
@@ -1228,6 +1256,26 @@ mod tests {
             created_at: version, // arbitrary but ordered
             layer_digests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn delete_all_secrets_purges_only_the_target_project() {
+        let (store, path) = tmp_db();
+        store.set_secret("forumall", "DOMAIN", "forumall.jkbase.app").unwrap();
+        store.set_secret("forumall", "DATA_DIR", "/data").unwrap();
+        // A slug that shares a prefix must NOT be swept (the ':' separator is exact).
+        store.set_secret("forumall2", "OTHER", "keep").unwrap();
+        store.set_secret("other", "X", "keep").unwrap();
+
+        let removed = store.delete_all_secrets("forumall").unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.list_secrets("forumall").unwrap().is_empty());
+        assert_eq!(store.list_secrets("forumall2").unwrap().len(), 1, "prefix boundary");
+        assert_eq!(store.list_secrets("other").unwrap().len(), 1);
+        // Idempotent.
+        assert_eq!(store.delete_all_secrets("forumall").unwrap(), 0);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
