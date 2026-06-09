@@ -14,12 +14,14 @@
 # Defaults: jkbuild0  172.31.0.1/24  3128  3129
 #
 # PROXY_ANY_PORT is the SECOND egress proxy — public-any mode (allowlist bypassed,
-# SSRF pin retained) — used only by `builder = "dockerfile"` builds, whose
-# FROM/RUN need broad egress. Both proxies enforce the IP pin (no private/metadata/
-# control-plane), so opening the second port widens only the set of PUBLIC hosts a
-# sandboxed VM may reach, not control-plane reachability. Set it equal to
-# PROXY_PORT to disable the second proxy (single-rule firewall, dockerfile builds
-# then share the narrow allowlist).
+# SSRF pin retained) — used only by `builder = "dockerfile"` builds, whose FROM/RUN
+# need broad egress. Both proxies enforce the IP pin (no private/metadata/control-
+# plane), so it only widens the set of PUBLIC hosts a sandboxed VM may reach. This
+# script does NOT open that port to the bridge: jkbase-server grants it per-source
+# to ONE dockerfile build VM's guest IP at a time (and revokes it when the build
+# ends), so a hostile non-dockerfile build can't reach broad egress by ignoring its
+# assigned proxy. The arg is informational here; pass the same value to
+# `jkbase-server --build-proxy-any-port` to enable the public-any proxy at all.
 set -euo pipefail
 
 BRIDGE="${1:-jkbuild0}"
@@ -53,12 +55,11 @@ fi
 # 2. Firewall. A dedicated JKBUILD chain (flushed + rebuilt each run, so the rules
 # are idempotent) gates everything arriving from the build bridge.
 iptables -N JKBUILD 2>/dev/null || iptables -F JKBUILD
-#   allow → the egress proxy on the gateway, drop everything else to the host.
+#   allow → the narrow allowlist egress proxy on the gateway (safe for every build),
+#   drop everything else to the host. The public-any (dockerfile) proxy is NOT opened
+#   here: jkbase-server inserts a per-source ACCEPT for one dockerfile VM's guest IP
+#   above this DROP for the life of that build, so broad egress is scoped per-VM.
 iptables -A JKBUILD -p tcp -d "$GW_IP" --dport "$PROXY_PORT" -j ACCEPT
-#   allow → the public-any (dockerfile-build) proxy, when distinct from PROXY_PORT.
-if [ "$PROXY_ANY_PORT" != "$PROXY_PORT" ]; then
-    iptables -A JKBUILD -p tcp -d "$GW_IP" --dport "$PROXY_ANY_PORT" -j ACCEPT
-fi
 iptables -A JKBUILD -j DROP
 # Hook host-bound traffic from the build bridge through JKBUILD (insert once).
 iptables -C INPUT -i "$BRIDGE" -j JKBUILD 2>/dev/null \
@@ -82,7 +83,7 @@ if command -v ip6tables >/dev/null 2>&1; then
 fi
 
 if [ "$PROXY_ANY_PORT" != "$PROXY_PORT" ]; then
-    echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (allowlist proxy) + ${GW_IP}:${PROXY_ANY_PORT} (dockerfile public-any proxy)"
+    echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (allowlist proxy); ${GW_IP}:${PROXY_ANY_PORT} (dockerfile public-any proxy) is granted per-VM by jkbase-server, not opened here"
 else
     echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (egress proxy)"
 fi

@@ -254,6 +254,10 @@ pub struct NetLease {
     tap: String,
     guest_ip: String,
     mac: String,
+    /// Whether this lease was granted a per-source ACCEPT to the public-any
+    /// (dockerfile) egress proxy port, so [`BuildNet::release`] revokes exactly
+    /// what [`BuildNet::acquire`] installed.
+    any_egress: bool,
 }
 
 impl BuildNet {
@@ -301,7 +305,14 @@ impl BuildNet {
 
     /// Lease a slot and bring up its TAP — owned by the build uid (so the jailed
     /// firecracker can open it) and mastered to the build bridge.
-    pub async fn acquire(&self) -> Result<NetLease> {
+    ///
+    /// `allow_any_egress` (dockerfile builds) grants THIS lease's guest IP — and
+    /// only it — a per-source firewall rule to the public-any egress proxy. The
+    /// firewall opens the public-any port to no one by default, so a hostile
+    /// non-dockerfile build can't ignore its assigned narrow proxy and reach broad
+    /// egress directly: the in-guest `jkbase.proxy=` boot-arg is only a hint, and
+    /// the guest is untrusted, so the network layer is the real boundary.
+    pub async fn acquire(&self, allow_any_egress: bool) -> Result<NetLease> {
         let slot = {
             let mut slots = self.free_slots.lock().await;
             slots
@@ -315,19 +326,99 @@ impl BuildNet {
             self.free_slots.lock().await.push(slot);
             return Err(e);
         }
+        // Per-VM public-any scoping. Slots (hence guest IPs) are reused, so a
+        // crashed dockerfile lease could leave a stale grant that a later
+        // non-dockerfile lease on the same IP would inherit — always clear first,
+        // then grant only for a dockerfile lease. A no-op when the public-any proxy
+        // is unconfigured (`proxy_any_port` None), so non-activated boxes are
+        // unchanged.
+        let mut any_egress = false;
+        if let Some(any_port) = self.proxy_any_port {
+            self.clear_any_egress(&guest_ip, any_port).await;
+            if allow_any_egress {
+                if let Err(e) = self.install_any_egress(&guest_ip, any_port).await {
+                    // Fail closed: roll back the TAP + slot rather than boot a VM
+                    // that can't reach the proxy it was told to use.
+                    let _ = run_ip(&["link", "delete", &tap]).await;
+                    self.free_slots.lock().await.push(slot);
+                    return Err(e);
+                }
+                any_egress = true;
+            }
+        }
         Ok(NetLease {
             slot,
             tap,
             guest_ip,
             mac,
+            any_egress,
         })
     }
 
     /// Tear the leased TAP down (idempotent — the seal may already have deleted
-    /// it) and return its slot to the pool.
+    /// it), revoke any per-lease public-any egress grant, and return the slot.
     pub async fn release(&self, lease: NetLease) {
+        if lease.any_egress
+            && let Some(any_port) = self.proxy_any_port
+        {
+            self.clear_any_egress(&lease.guest_ip, any_port).await;
+        }
         let _ = run_ip(&["link", "delete", &lease.tap]).await;
         self.free_slots.lock().await.push(lease.slot);
+    }
+
+    /// The JKBUILD rule spec (sans verb) granting ONE guest IP reach to the
+    /// public-any (dockerfile) egress proxy port. Kept exact so the `-I` (install)
+    /// and `-D` (revoke) forms match the same rule.
+    fn any_egress_rule(&self, guest_ip: &str, any_port: u16) -> Vec<String> {
+        vec![
+            "-s".into(),
+            guest_ip.to_string(),
+            "-p".into(),
+            "tcp".into(),
+            "-d".into(),
+            self.gateway.clone(),
+            "--dport".into(),
+            any_port.to_string(),
+            "-j".into(),
+            "ACCEPT".into(),
+        ]
+    }
+
+    /// Remove EVERY JKBUILD rule granting `guest_ip` the public-any port (there may
+    /// be a stale one from a crashed lease on the same, since-reused slot).
+    /// Idempotent: loops until `iptables -D` reports no matching rule.
+    async fn clear_any_egress(&self, guest_ip: &str, any_port: u16) {
+        let spec = self.any_egress_rule(guest_ip, any_port);
+        for _ in 0..64 {
+            let mut args = vec!["-D".to_string(), "JKBUILD".to_string()];
+            args.extend(spec.iter().cloned());
+            let removed = tokio::process::Command::new("iptables")
+                .args(&args)
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !removed {
+                break;
+            }
+        }
+    }
+
+    /// Grant ONE dockerfile-build guest IP reach to the public-any proxy. Inserted
+    /// at the top of JKBUILD so it precedes the chain's terminal DROP.
+    async fn install_any_egress(&self, guest_ip: &str, any_port: u16) -> Result<()> {
+        let mut args = vec!["-I".to_string(), "JKBUILD".to_string(), "1".to_string()];
+        args.extend(self.any_egress_rule(guest_ip, any_port));
+        let status = tokio::process::Command::new("iptables")
+            .args(&args)
+            .status()
+            .await
+            .context("install per-lease public-any egress rule")?;
+        if !status.success() {
+            bail!("iptables -I JKBUILD (per-lease public-any egress) failed for {guest_ip}");
+        }
+        Ok(())
     }
 
     async fn setup_tap(&self, tap: &str) -> Result<()> {
@@ -398,34 +489,52 @@ impl BuildNet {
                 );
             }
         }
-        // WARN-only: the proxy-port ACCEPT rules are about FUNCTIONALITY (can a build
-        // reach the egress proxy), not isolation — a missing one makes builds fail at
-        // fetch (fail-safe), so surface it loudly but don't refuse to start (and never
-        // outage the runtime over an iptables rule-form mismatch).
-        let proxy_accept = |port: u16| -> Vec<String> {
-            vec![
-                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
-                "-d".into(), self.gateway.clone(), "--dport".into(), port.to_string(),
-                "-j".into(), "ACCEPT".into(),
-            ]
-        };
-        let mut want = vec![self.proxy_port];
+        // FATAL (only when the public-any proxy is configured): a *blanket*
+        // (any-source) ACCEPT for the public-any port means EVERY build VM can reach
+        // broad egress — exactly the hole the per-lease scoping closes. A lingering
+        // old `setup-build-net.sh` that opens it to all sources would silently defeat
+        // the isolation, so refuse to start if such a rule is present. (The per-lease
+        // grants carry `-s <guest_ip>`, which `-C` without `-s` will NOT match, so
+        // this only trips on a truly source-unrestricted rule.)
         if let Some(any) = self.proxy_any_port {
-            want.push(any);
-        }
-        for port in want {
-            let ok = tokio::process::Command::new("iptables")
-                .args(proxy_accept(port))
+            let blanket = [
+                "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
+                "--dport", &any.to_string(), "-j", "ACCEPT",
+            ];
+            let present = tokio::process::Command::new("iptables")
+                .args(blanket)
                 .status()
                 .await
                 .map(|s| s.success())
                 .unwrap_or(false);
-            if !ok {
-                warn!(
-                    gateway = %self.gateway, port,
-                    "build firewall: no ACCEPT rule for the egress proxy port — builds will get no egress; run `sudo tools/setup-build-net.sh`"
+            if present {
+                bail!(
+                    "build firewall opens the public-any proxy port {any} to ALL build VMs \
+                     (source-unrestricted ACCEPT in JKBUILD) — this defeats per-dockerfile-VM \
+                     egress scoping. Re-sync + re-run `sudo tools/setup-build-net.sh` (it no \
+                     longer adds a blanket rule for this port)."
                 );
             }
+        }
+        // WARN-only: the narrow allowlist proxy ACCEPT is about FUNCTIONALITY (can a
+        // build reach the egress proxy), not isolation — a missing one makes builds
+        // fail at fetch (fail-safe), so surface it loudly but don't refuse to start
+        // (and never outage the runtime over an iptables rule-form mismatch).
+        let proxy_accept = [
+            "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
+            "--dport", &self.proxy_port.to_string(), "-j", "ACCEPT",
+        ];
+        let ok = tokio::process::Command::new("iptables")
+            .args(proxy_accept)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            warn!(
+                gateway = %self.gateway, port = self.proxy_port,
+                "build firewall: no ACCEPT rule for the egress proxy port — builds will get no egress; run `sudo tools/setup-build-net.sh`"
+            );
         }
         Ok(())
     }
@@ -799,7 +908,11 @@ async fn build_one_target_inner(
     // Lease an isolated TAP when a build network is configured, so this VM can
     // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
     let lease = match &deps.net {
-        Some(net) => Some(net.acquire().await.context("acquire build network")?),
+        Some(net) => Some(
+            net.acquire(is_dockerfile)
+                .await
+                .context("acquire build network")?,
+        ),
         None => None,
     };
     let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
@@ -1430,6 +1543,21 @@ mod tests {
     }
 
     #[test]
+    fn per_lease_any_egress_rule_is_source_scoped() {
+        // The per-lease grant pins BOTH the source guest IP and the gateway:port, so
+        // it admits exactly one VM to the public-any proxy — and `-C` without `-s`
+        // (verify_firewall's blanket-rule check) cannot match it.
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8);
+        assert_eq!(
+            net.any_egress_rule("172.31.0.5", 3129),
+            vec![
+                "-s", "172.31.0.5", "-p", "tcp", "-d", "172.31.0.1", "--dport", "3129",
+                "-j", "ACCEPT",
+            ]
+        );
+    }
+
+    #[test]
     fn dockerfile_relpath_strips_source_prefix() {
         assert_eq!(dockerfile_relpath("./api/Dockerfile", "./api"), "Dockerfile");
         assert_eq!(dockerfile_relpath("Dockerfile", "."), "Dockerfile");
@@ -1776,7 +1904,7 @@ esac
         build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
 
         let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
-        let lease = net.acquire().await.expect("acquire build net");
+        let lease = net.acquire(false).await.expect("acquire build net");
         let release = format!("/sys/class/net/{}", lease.tap); // for diagnostics only
         eprintln!("leased tap={} ip={} ({release})", lease.tap, lease.guest_ip);
 
