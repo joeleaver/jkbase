@@ -168,11 +168,24 @@ Secrets are scoped to the project from your `jkbase.toml` (or pass `--project`).
 
 ## Push-to-deploy
 
+Deploy straight from your machine — `connect` only mints a token and adds a local
+`jkbase` remote (it touches `.git/config`, nothing tracked):
+
 ```bash
-jkbase repo connect       # mints a scoped git-push token, adds a `jkbase` remote,
-                          # and writes a GitHub Actions workflow
-git push                  # GitHub Actions pushes to jkbase → build → deploy
-jkbase repo disconnect    # revoke the token, sever the remote
+jkbase repo connect          # mint a push token + add the local `jkbase` remote
+git push jkbase main         # build + deploy
+```
+
+Prefer CI? Opt into a GitHub Actions workflow explicitly (it writes a *tracked*
+file, so it's never a surprise side effect):
+
+```bash
+jkbase repo github           # scaffold .github/workflows/jkbase-deploy.yml — then commit it
+#   set the token from `repo connect` as the JKBASE_GIT_TOKEN repo secret, and
+#   every push deploys via Actions.
+
+jkbase repo token            # re-mint the token (revokes the old one)
+jkbase repo disconnect       # revoke the token + remove the remote
 ```
 
 ---
@@ -195,7 +208,9 @@ jkbase repo disconnect    # revoke the token, sever the remote
 | `jkbase quota [--set-storage-gib N]` | Show / restrict per-project quotas |
 | `jkbase secret set\|list\|rm` | Manage secrets |
 | `jkbase domain add\|verify\|list\|rm` | Manage custom domains |
-| `jkbase repo connect\|disconnect` | Push-to-deploy via GitHub Actions |
+| `jkbase repo connect` | Mint a push token + add a local `jkbase` remote (local only) |
+| `jkbase repo github` | Scaffold a GitHub Actions deploy workflow (opt-in; writes a tracked file) |
+| `jkbase repo token\|disconnect` | Re-mint / revoke the git-push token |
 
 Every command takes `--api URL` (default `https://api.jkbase.app`); the token can also come from `$JKBASE_TOKEN`.
 
