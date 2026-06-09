@@ -381,8 +381,8 @@ impl BuildNet {
                 self.bridge
             );
         }
-        let input_hook = vec!["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
-        let fwd_drop = vec!["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
+        let input_hook = ["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
+        let fwd_drop = ["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
         let mut checks: Vec<Vec<String>> = vec![
             input_hook.iter().map(|s| s.to_string()).collect(),
             fwd_drop.iter().map(|s| s.to_string()).collect(),
