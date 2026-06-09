@@ -245,6 +245,7 @@ pub struct BuildNet {
     pub proxy_any_port: Option<u16>,
     subnet_prefix: String,
     uid: u32,
+    pool_size: u8,
     free_slots: Mutex<Vec<u8>>,
     /// Serializes ALL JKBUILD mutations (install/clear of per-lease rules) within
     /// this process. Builds fan out concurrently (semaphore-bounded) and each touches
@@ -293,6 +294,7 @@ impl BuildNet {
             proxy_any_port,
             subnet_prefix,
             uid,
+            pool_size,
             free_slots: Mutex::new(free_slots),
             fw_lock: Mutex::new(()),
         }
@@ -559,6 +561,71 @@ impl BuildNet {
         }
         Ok(())
     }
+
+    /// Install the L2 source-guard that makes the per-lease `-s <ip>` :3129 grant
+    /// un-spoofable. Build VMs share one bridge with the gateway, and bridge port
+    /// isolation only blocks VM↔VM — a hostile guest can still emit frames toward the
+    /// gateway bearing ANOTHER VM's source IP, which an iptables `-s` rule would
+    /// honour (defeating per-dockerfile-VM scoping). ebtables sees the real L2 ingress
+    /// TAP (no br_netfilter / physdev needed), so we pin each slot's TAP to its
+    /// assigned source MAC + IPv4 source + ARP source: a frame on `jkbld<N>` not
+    /// bearing slot N's identity is dropped before iptables ever sees it.
+    ///
+    /// Static per-slot (ebtables accepts rules for not-yet-created TAPs), so there is
+    /// no per-build L2 churn. Idempotent (re-flushes + repopulates on each startup).
+    /// No-op — and no ebtables dependency exercised — when the public-any proxy is
+    /// unconfigured, so non-activated boxes are unchanged. FAIL-CLOSED when activated:
+    /// running the per-VM :3129 scoping without this guard is the spoofable state, so
+    /// refuse to start if it can't be installed.
+    pub async fn ensure_source_guard(&self) -> Result<()> {
+        if self.proxy_any_port.is_none() {
+            return Ok(());
+        }
+        // (Re)create the chain empty for idempotency (ignore "already exists").
+        let _ = run_ebtables(&["-t", "filter", "-N", SOURCE_GUARD_CHAIN]).await;
+        run_ebtables(&["-t", "filter", "-F", SOURCE_GUARD_CHAIN])
+            .await
+            .context(
+                "flush ebtables source-guard chain (is `ebtables` installed? it is \
+                 required when --build-proxy-any-port is set)",
+            )?;
+        for slot in 1..=self.pool_size {
+            let tap = format!("jkbld{slot}");
+            let ip = format!("{}.{}", self.subnet_prefix, slot as u16 + 1);
+            let mac = format!("AA:FC:00:1F:00:{slot:02X}");
+            // DROP frames on this TAP not bearing slot N's source MAC / IPv4 src / ARP src.
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "!", "-s",
+                mac.as_str(), "-j", "DROP",
+            ])
+            .await?;
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "IPv4",
+                "!", "--ip-src", ip.as_str(), "-j", "DROP",
+            ])
+            .await?;
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "ARP",
+                "!", "--arp-ip-src", ip.as_str(), "-j", "DROP",
+            ])
+            .await?;
+        }
+        // Hook into the L2 INPUT (frames to the gateway/host) + FORWARD (VM↔VM, already
+        // isolated — defense in depth) paths, once each. Rules match `-i jkbld*`, so
+        // frames from the runtime bridge fall straight through with no effect.
+        for hook in ["INPUT", "FORWARD"] {
+            if !ebtables_ok(&["-t", "filter", "-C", hook, "-j", SOURCE_GUARD_CHAIN]).await {
+                run_ebtables(&["-t", "filter", "-I", hook, "-j", SOURCE_GUARD_CHAIN])
+                    .await
+                    .with_context(|| format!("hook source-guard into ebtables {hook}"))?;
+            }
+        }
+        info!(
+            pool = self.pool_size,
+            "build L2 source-guard installed (per-VM source IP/MAC pinning)"
+        );
+        Ok(())
+    }
 }
 
 /// Month-to-date build-seconds used vs the project's monthly cap, or `None` on a
@@ -581,6 +648,34 @@ async fn run_ip(args: &[&str]) -> Result<()> {
         bail!("ip {args:?} failed: {status}");
     }
     Ok(())
+}
+
+/// The ebtables (L2/bridge filter) chain holding the per-VM source-guard rules.
+const SOURCE_GUARD_CHAIN: &str = "JKBUILD_SG";
+
+/// Run an ebtables command, erroring on failure. ebtables is only invoked by this
+/// process (the firewall script stays iptables-only), so `fw_lock` / startup
+/// single-threading already serialize edits — no `--concurrent` needed.
+async fn run_ebtables(args: &[&str]) -> Result<()> {
+    let status = tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .context("spawn ebtables")?;
+    if !status.success() {
+        bail!("ebtables {args:?} failed: {status}");
+    }
+    Ok(())
+}
+
+/// True iff the ebtables command succeeds — for `-C` existence checks; never errors.
+async fn ebtables_ok(args: &[&str]) -> bool {
+    tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// The host seal action: delete the build VM's TAP so its COMPILE phase is

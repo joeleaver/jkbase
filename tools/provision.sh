@@ -49,6 +49,7 @@ sudo apt-get install -y -qq \
     fail2ban \
     jq \
     iptables \
+    ebtables \
     busybox-static \
     e2fsprogs \
     flex bison libelf-dev bc libncurses-dev \

@@ -331,9 +331,13 @@ async fn main() -> Result<()> {
         None
     };
     // Fail closed: with --build-net we MUST NOT run attacker-controlled build VMs
-    // unless their isolation firewall is actually provisioned + present.
+    // unless their isolation firewall is actually provisioned + present. When the
+    // public-any (:3129) proxy is active, also install the L2 source-guard that pins
+    // each build VM to its own source IP/MAC — without it the per-lease :3129 grant
+    // is spoofable (a hostile non-dockerfile VM could forge a dockerfile VM's IP).
     if let Some(net) = &build_net {
         net.verify_firewall().await?;
+        net.ensure_source_guard().await?;
     }
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
