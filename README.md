@@ -279,4 +279,6 @@ Because "all tenants are untrusted" is a load-bearing assumption here, not a slo
 
 ## License
 
-No `LICENSE` file yet, so for now: "ask nicely." One will land before this goes anywhere serious.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option — the standard Rust permissive combo. Use whichever suits you.
+
+Unless you state otherwise, any contribution you intentionally submit for inclusion shall be dual-licensed as above, with no additional terms.
