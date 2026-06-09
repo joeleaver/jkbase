@@ -325,7 +325,12 @@ impl Drop for TempCleanup {
 /// UNIQUE temp paths and published by a SINGLE atomic rename, so a concurrent or
 /// orphaned build can never leave a half-written or stage-colliding image, and the
 /// device map + attach order are always published together (no desync window).
-pub fn build_metadata_image(deployment_dir: &Path, plan: &LayerPlan, out: &Path) -> Result<()> {
+pub fn build_metadata_image(
+    deployment_dir: &Path,
+    plan: &LayerPlan,
+    secrets: &BTreeMap<String, String>,
+    out: &Path,
+) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
     let base = out.file_name().and_then(|n| n.to_str()).unwrap_or("metadata.ext4");
     let uniq = format!(
@@ -343,6 +348,17 @@ pub fn build_metadata_image(deployment_dir: &Path, plan: &LayerPlan, out: &Path)
     // drives, not carried in the metadata filesystem).
     copy_dir_except(deployment_dir, &stage, "_layers")
         .with_context(|| format!("stage metadata from {}", deployment_dir.display()))?;
+
+    // Inject the project's runtime secrets into each layered server's env — in the
+    // PER-VM metadata image ONLY (the on-disk deployment artifact stays secret-free,
+    // and secrets refresh on every cold-boot/deploy). The `_servers/*.json` files are
+    // never static-servable (the agent's serve_dir fallthrough blocks `_`-prefixed
+    // entries), and the agent applies PORT/HOME/HOSTNAME/PATH authoritatively, so a
+    // secret can never reach those reserved vars.
+    if !secrets.is_empty() {
+        inject_secrets(&stage.join("_servers"), secrets)
+            .context("inject project secrets into server manifests")?;
+    }
 
     // Bake the device map the agent reads at boot...
     std::fs::write(
@@ -399,6 +415,44 @@ fn copy_entry(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Env vars the platform sets authoritatively per server (see the agent's
+/// `apply_server_env`). A project secret must never override these — `PORT` would
+/// break routing, `PATH`/`HOME`/`HOSTNAME` the runtime — so they are filtered out at
+/// injection (defense-in-depth; the agent also re-applies them last).
+const RESERVED_ENV: &[&str] = &["PORT", "HOME", "HOSTNAME", "PATH"];
+
+/// Merge project `secrets` into every `_servers/*.json` manifest's `env`, in place on
+/// the staged copy. Secrets override build-time env (e.g. `NODE_ENV`) on conflict;
+/// reserved platform keys are skipped. A manifest lacking an `env` object gets one.
+fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Result<()> {
+    if !servers_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(servers_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("parse server manifest {}", path.display()))?;
+        let Some(obj) = manifest.as_object_mut() else {
+            continue;
+        };
+        let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
+        let Some(env) = env.as_object_mut() else {
+            continue;
+        };
+        for (k, v) in secrets {
+            if RESERVED_ENV.contains(&k.as_str()) {
+                continue;
+            }
+            env.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +465,60 @@ mod tests {
         assert!(!is_safe_layer_filename("../escape.erofs"));
         assert!(!is_safe_layer_filename(&format!("sha256-{hex}.tar")));
         assert!(!is_safe_layer_filename("sha256-/etc/passwd.erofs"));
+    }
+
+    #[test]
+    fn inject_secrets_merges_env_and_filters_reserved() {
+        let dir = std::env::temp_dir().join(format!("ls-secrets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let servers = dir.join("_servers");
+        std::fs::create_dir_all(&servers).unwrap();
+        // A server manifest as the buildpack writes it (env = NODE_ENV only).
+        std::fs::write(
+            servers.join("app.json"),
+            r#"{"port":3000,"cmd":["/opt/bun/bin/bun","run","start"],"env":{"NODE_ENV":"production"}}"#,
+        )
+        .unwrap();
+
+        let mut secrets = BTreeMap::new();
+        secrets.insert("DOMAIN".to_string(), "forumall.jkbase.app".to_string());
+        secrets.insert("NODE_ENV".to_string(), "staging".to_string()); // overrides build env
+        secrets.insert("PORT".to_string(), "9999".to_string()); // reserved → filtered
+        secrets.insert("PATH".to_string(), "/evil".to_string()); // reserved → filtered
+
+        inject_secrets(&servers, &secrets).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(servers.join("app.json")).unwrap()).unwrap();
+        let env = v["env"].as_object().unwrap();
+        assert_eq!(env["DOMAIN"], "forumall.jkbase.app");
+        assert_eq!(env["NODE_ENV"], "staging", "secret overrides build-time env");
+        assert!(!env.contains_key("PORT"), "reserved PORT must be filtered");
+        assert!(!env.contains_key("PATH"), "reserved PATH must be filtered");
+        // cmd/port preserved.
+        assert_eq!(v["port"], 3000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inject_secrets_creates_env_and_noops_without_dir() {
+        // Missing _servers dir is a no-op, not an error.
+        let missing = std::env::temp_dir().join(format!("ls-nosrv-{}", std::process::id()));
+        let mut secrets = BTreeMap::new();
+        secrets.insert("X".to_string(), "y".to_string());
+        inject_secrets(&missing.join("_servers"), &secrets).unwrap();
+
+        // A manifest with no `env` gets one created.
+        let dir = std::env::temp_dir().join(format!("ls-noenv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let servers = dir.join("_servers");
+        std::fs::create_dir_all(&servers).unwrap();
+        std::fs::write(servers.join("app.json"), r#"{"port":3000,"cmd":["x"]}"#).unwrap();
+        inject_secrets(&servers, &secrets).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(servers.join("app.json")).unwrap()).unwrap();
+        assert_eq!(v["env"]["X"], "y");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -394,6 +394,14 @@ fn generate_boot_id() -> String {
 /// `extra_path` (e.g. the bun bin dir) is appended to PATH when set.
 fn apply_server_env(std_cmd: &mut std::process::Command, manifest: &ServerManifest, extra_path: &str) {
     std_cmd.env_clear();
+    // Tenant/build-supplied env FIRST (build-time `NODE_ENV` + host-injected project
+    // secrets), so the platform-reserved vars below always win: a project secret must
+    // not be able to clobber PORT (breaks the routing contract) or PATH/HOME/HOSTNAME
+    // (breaks the runtime). The host already filters reserved keys at injection; this
+    // ordering is the authoritative backstop against any manifest env.
+    for (key, value) in &manifest.env {
+        std_cmd.env(key, value);
+    }
     std_cmd.env("PORT", manifest.port.to_string());
     std_cmd.env("HOME", "/root");
     std_cmd.env("HOSTNAME", "0.0.0.0");
@@ -404,9 +412,6 @@ fn apply_server_env(std_cmd: &mut std::process::Command, manifest: &ServerManife
         format!("{base_path}:{extra_path}")
     };
     std_cmd.env("PATH", path);
-    for (key, value) in &manifest.env {
-        std_cmd.env(key, value);
-    }
     std_cmd.stdout(Stdio::piped());
     std_cmd.stderr(Stdio::piped());
 }
@@ -808,5 +813,37 @@ mod tests {
         assert_eq!(all.last().unwrap().seq as usize, MAX_LOG_LINES + 50);
         let recent = sup.get_logs_since((MAX_LOG_LINES + 48) as u64).await;
         assert_eq!(recent.len(), 2);
+    }
+
+    #[test]
+    fn apply_server_env_reserved_vars_win_over_manifest_env() {
+        let mut env = HashMap::new();
+        env.insert("DOMAIN".to_string(), "forumall.jkbase.app".to_string());
+        env.insert("NODE_ENV".to_string(), "production".to_string());
+        // A hostile/buggy manifest (or a project secret) tries to clobber reserved vars.
+        env.insert("PORT".to_string(), "9999".to_string());
+        env.insert("PATH".to_string(), "/evil".to_string());
+        let manifest = ServerManifest {
+            port: 3000,
+            cmd: vec!["/opt/bun/bin/bun".into(), "run".into(), "start".into()],
+            env,
+            working_dir: Some("/app".into()),
+            health_check: None,
+            volumes: vec![],
+        };
+        let mut cmd = std::process::Command::new("true");
+        apply_server_env(&mut cmd, &manifest, "/opt/bun/bin");
+        let envs: HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        // Injected env/secret reaches the container...
+        assert_eq!(envs.get("DOMAIN").map(String::as_str), Some("forumall.jkbase.app"));
+        assert_eq!(envs.get("NODE_ENV").map(String::as_str), Some("production"));
+        // ...but the platform sets the reserved vars authoritatively (manifest loses).
+        assert_eq!(envs.get("PORT").map(String::as_str), Some("3000"), "platform PORT wins");
+        assert_ne!(envs.get("PATH").map(String::as_str), Some("/evil"), "platform PATH wins");
+        assert!(envs.get("PATH").is_some_and(|p| p.contains("/opt/bun/bin")));
+        assert_eq!(envs.get("HOME").map(String::as_str), Some("/root"));
     }
 }
