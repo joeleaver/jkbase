@@ -381,29 +381,11 @@ impl BuildNet {
                 self.bridge
             );
         }
+        // FATAL: the isolation rules. Without these a build VM could reach the host
+        // / other VMs / the internet — refuse to run builds at all.
         let input_hook = ["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
         let fwd_drop = ["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
-        let mut checks: Vec<Vec<String>> = vec![
-            input_hook.iter().map(|s| s.to_string()).collect(),
-            fwd_drop.iter().map(|s| s.to_string()).collect(),
-        ];
-        // The JKBUILD chain must actually ACCEPT each proxy port the orchestrator
-        // hands to VMs — otherwise a build (esp. a dockerfile build pointed at the
-        // public-any port) silently gets zero egress and dies at fetch. Assert each
-        // port we'll use is open, not just that the chain exists.
-        let dport = self.proxy_port.to_string();
-        let proxy_accept = |port: &str| -> Vec<String> {
-            vec![
-                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
-                "-d".into(), self.gateway.clone(), "--dport".into(), port.into(),
-                "-j".into(), "ACCEPT".into(),
-            ]
-        };
-        checks.push(proxy_accept(&dport));
-        if let Some(any) = self.proxy_any_port {
-            checks.push(proxy_accept(&any.to_string()));
-        }
-        for check in &checks {
+        for check in [input_hook, fwd_drop] {
             let ok = tokio::process::Command::new("iptables")
                 .args(check)
                 .status()
@@ -412,7 +394,36 @@ impl BuildNet {
                 .unwrap_or(false);
             if !ok {
                 bail!(
-                    "build firewall rule missing ({check:?}) — run `sudo tools/setup-build-net.sh`"
+                    "build firewall isolation rule missing ({check:?}) — run `sudo tools/setup-build-net.sh`"
+                );
+            }
+        }
+        // WARN-only: the proxy-port ACCEPT rules are about FUNCTIONALITY (can a build
+        // reach the egress proxy), not isolation — a missing one makes builds fail at
+        // fetch (fail-safe), so surface it loudly but don't refuse to start (and never
+        // outage the runtime over an iptables rule-form mismatch).
+        let proxy_accept = |port: u16| -> Vec<String> {
+            vec![
+                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
+                "-d".into(), self.gateway.clone(), "--dport".into(), port.to_string(),
+                "-j".into(), "ACCEPT".into(),
+            ]
+        };
+        let mut want = vec![self.proxy_port];
+        if let Some(any) = self.proxy_any_port {
+            want.push(any);
+        }
+        for port in want {
+            let ok = tokio::process::Command::new("iptables")
+                .args(proxy_accept(port))
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                warn!(
+                    gateway = %self.gateway, port,
+                    "build firewall: no ACCEPT rule for the egress proxy port — builds will get no egress; run `sudo tools/setup-build-net.sh`"
                 );
             }
         }

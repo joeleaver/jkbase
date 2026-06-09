@@ -97,11 +97,12 @@ struct Args {
 
     /// Port of the SECOND egress proxy — public-any mode (allowlist bypassed, SSRF
     /// pin retained) — used only by `builder = "dockerfile"` builds (their FROM/RUN
-    /// need broad egress). Set equal to `--build-proxy-port` to disable it (then
-    /// dockerfile builds share the narrow allowlist proxy). Must match the
-    /// PROXY_ANY_PORT passed to tools/setup-build-net.sh.
-    #[arg(long, default_value = "3129")]
-    build_proxy_any_port: u16,
+    /// need broad egress). OPT-IN: unset (default) = no public-any proxy, so a box's
+    /// egress posture is unchanged until an operator deliberately enables it. To
+    /// turn it on, set this (e.g. 3129) AND pass the same PROXY_ANY_PORT to
+    /// tools/setup-build-net.sh so the firewall opens it.
+    #[arg(long)]
+    build_proxy_any_port: Option<u16>,
 
     /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
     /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
@@ -322,7 +323,7 @@ async fn main() -> Result<()> {
             args.build_bridge.clone(),
             args.build_gateway.clone(),
             args.build_proxy_port,
-            Some(args.build_proxy_any_port),
+            args.build_proxy_any_port, // None (default) = no public-any proxy
             build_uid,
             64, // concurrent build-network slots
         )))
@@ -476,10 +477,14 @@ async fn main() -> Result<()> {
             }
         });
         // The SECOND proxy — public-any (allowlist bypassed, SSRF pin retained) —
-        // for dockerfile builds. Only spun up with --build-net and a distinct port;
-        // the build firewall opens this port too (tools/setup-build-net.sh).
-        if args.build_net && args.build_proxy_any_port != args.build_proxy_port {
-            let any_addr = format!("{}:{}", args.build_gateway, args.build_proxy_any_port);
+        // for dockerfile builds. OPT-IN: only when --build-proxy-any-port is set to a
+        // distinct port AND --build-net is on; the firewall must open it too
+        // (tools/setup-build-net.sh <…> <PROXY_ANY_PORT>).
+        if let Some(any_port) = args.build_proxy_any_port
+            && args.build_net
+            && any_port != args.build_proxy_port
+        {
+            let any_addr = format!("{}:{}", args.build_gateway, any_port);
             let any_cfg = Arc::new(egress::EgressConfig::allow_any_public());
             tokio::spawn(async move {
                 match tokio::net::TcpListener::bind(&any_addr).await {

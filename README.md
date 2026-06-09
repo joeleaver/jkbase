@@ -254,7 +254,9 @@ sudo bash tools/setup-bridge.sh    # the runtime network bridge (jkbr0), once pe
   --data-dir   /var/lib/jkbase \
   --fc-dir     .firecracker \
   --agent-bin  target/x86_64-unknown-linux-musl/release/jkbase-agent \
-  --build-net                       # builds fetch deps through the fenced egress proxy
+  --build-net \                     # builds fetch deps through the fenced egress proxy
+  --build-proxy-any-port 3129       # opt-in: enables `builder = "dockerfile"` builds
+                                    #   (`tools/dev net` already opened 3129 in the firewall)
 
 jkbase init you@example.com --api http://127.0.0.1:9090   # bootstrap your local platform
 ```
