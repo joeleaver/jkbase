@@ -211,7 +211,26 @@ fn append_source(
         let name_str = name.to_string_lossy();
         let ft = entry.file_type()?;
         if ft.is_symlink() {
-            continue;
+            // Preserve symlinks AS symlinks. Skipping them silently dropped any
+            // symlink in the source (so it never reached the build/deploy — symlinks
+            // "didn't survive"); the server's untar already recreates them. Store the
+            // literal target; the build/runtime resolves it.
+            let rel = path.strip_prefix(root)?;
+            let target = std::fs::read_link(&path)?;
+            let mut header = tar::Header::new_gnu();
+            if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                let mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                header.set_mtime(mtime);
+            }
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            header.set_size(0);
+            tar.append_link(&mut header, rel, &target)?;
         } else if ft.is_dir() {
             if EXCLUDED_DIRS.contains(&name_str.as_ref()) {
                 continue;
@@ -232,4 +251,49 @@ fn slug(name: &str) -> String {
         .collect::<String>()
         .trim_matches('-')
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tar_source_preserves_symlinks() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let src = std::env::temp_dir().join(format!("jkb-tarsym-src-{nanos}"));
+        let out = std::env::temp_dir().join(format!("jkb-tarsym-out-{nanos}"));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("real.txt"), b"hello").unwrap();
+        // A same-dir symlink and a relative (../) symlink — both must survive.
+        std::os::unix::fs::symlink("real.txt", src.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink("../real.txt", src.join("sub").join("up.txt")).unwrap();
+
+        let tarball = tar_source(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let dec = flate2::read::GzDecoder::new(&tarball[..]);
+        tar::Archive::new(dec).unpack(&out).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(out.join("link.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link.txt should round-trip as a symlink, not be dropped"
+        );
+        assert_eq!(
+            std::fs::read_link(out.join("link.txt")).unwrap(),
+            Path::new("real.txt")
+        );
+        assert_eq!(
+            std::fs::read_link(out.join("sub").join("up.txt")).unwrap(),
+            Path::new("../real.txt")
+        );
+        assert_eq!(std::fs::read(out.join("real.txt")).unwrap(), b"hello");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&out);
+    }
 }
