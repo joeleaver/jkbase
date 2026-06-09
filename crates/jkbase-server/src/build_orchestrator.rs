@@ -1014,10 +1014,32 @@ async fn build_one_target_inner(
         BuildOutcome::TimedOut => {
             bail!("build timed out after {}s\n{}", deps.timeout.as_secs(), log_str())
         }
-        BuildOutcome::Crashed { code, signal } => bail!(
-            "build VM crashed (code={code:?}, signal={signal:?}) — likely cgroup OOM-kill or panic\n{}",
-            log_str()
-        ),
+        BuildOutcome::Crashed { code, signal } => {
+            // Firecracker's RLIMIT_FSIZE is process-wide: a guest write past the
+            // scratch/output budget SIGXFSZ-kills the VM (signal 25 on Linux). Give
+            // the tenant an actionable "ran out of build space" instead of an opaque
+            // crash that reads like an OOM/panic.
+            const SIGXFSZ: i32 = 25;
+            if signal == Some(SIGXFSZ) {
+                let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
+                let hint = if is_dockerfile {
+                    " — the image or its intermediate layers are too large; trim the build (fewer/smaller layers, multi-stage, prune caches)"
+                } else {
+                    " — try `builder = \"dockerfile\"` (a much larger build budget) or trim dependencies"
+                };
+                bail!(
+                    "build exceeded its disk budget (scratch {} / output {}){}\n{}",
+                    gib(scratch_size_bytes),
+                    gib(output_size_bytes),
+                    hint,
+                    log_str()
+                );
+            }
+            bail!(
+                "build VM crashed (code={code:?}, signal={signal:?}) — likely cgroup OOM-kill or panic\n{}",
+                log_str()
+            )
+        }
     }
 
     let status = build_output::read_status(&output_img)?;
