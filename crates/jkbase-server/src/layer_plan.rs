@@ -350,8 +350,9 @@ pub fn build_metadata_image(
         .with_context(|| format!("stage metadata from {}", deployment_dir.display()))?;
 
     // Inject the project's runtime secrets into each layered server's env — in the
-    // PER-VM metadata image ONLY (the on-disk deployment artifact stays secret-free,
-    // and secrets refresh on every cold-boot/deploy). The `_servers/*.json` files are
+    // PER-VM metadata image ONLY (the on-disk deployment artifact stays secret-free).
+    // This image is rebuilt on deploy; wake/restore reuse the existing image, so the
+    // injected secrets are as of the last deploy. The `_servers/*.json` files are
     // never static-servable (the agent's serve_dir fallthrough blocks `_`-prefixed
     // entries), and the agent applies PORT/HOME/HOSTNAME/PATH authoritatively, so a
     // secret can never reach those reserved vars.
@@ -443,7 +444,18 @@ fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Res
             continue;
         };
         for (k, v) in secrets {
-            if RESERVED_ENV.contains(&k.as_str()) {
+            // Skip reserved platform keys, and any key/value that would make the
+            // agent's `Command::env` fail at spawn (a NUL anywhere, or an empty key /
+            // a key containing '='). A bad secret must degrade to "that one var is
+            // dropped", never abort the VM's server startup (which is shared by every
+            // server in the project). The set_secret API also rejects these, but this
+            // is the load-bearing guard for already-stored or future inputs.
+            if RESERVED_ENV.contains(&k.as_str())
+                || k.is_empty()
+                || k.contains('=')
+                || k.contains('\0')
+                || v.contains('\0')
+            {
                 continue;
             }
             env.insert(k.clone(), serde_json::Value::String(v.clone()));
@@ -485,6 +497,10 @@ mod tests {
         secrets.insert("NODE_ENV".to_string(), "staging".to_string()); // overrides build env
         secrets.insert("PORT".to_string(), "9999".to_string()); // reserved → filtered
         secrets.insert("PATH".to_string(), "/evil".to_string()); // reserved → filtered
+        secrets.insert("BAD=KEY".to_string(), "x".to_string()); // '=' in key → skipped
+        secrets.insert(String::new(), "x".to_string()); // empty key → skipped
+        secrets.insert("NUL_VAL".to_string(), "a\0b".to_string()); // NUL value → skipped
+        secrets.insert("NUL\0KEY".to_string(), "x".to_string()); // NUL key → skipped
 
         inject_secrets(&servers, &secrets).unwrap();
 
@@ -495,6 +511,13 @@ mod tests {
         assert_eq!(env["NODE_ENV"], "staging", "secret overrides build-time env");
         assert!(!env.contains_key("PORT"), "reserved PORT must be filtered");
         assert!(!env.contains_key("PATH"), "reserved PATH must be filtered");
+        // Spawn-breaking keys/values are dropped (never reach the agent's Command::env).
+        assert!(!env.contains_key("BAD=KEY"), "key with '=' must be skipped");
+        assert!(!env.contains_key("NUL_VAL"), "value with NUL must be skipped");
+        assert!(
+            env.keys().all(|k| !k.is_empty() && !k.contains('\0')),
+            "empty/NUL keys must be skipped"
+        );
         // cmd/port preserved.
         assert_eq!(v["port"], 3000);
         let _ = std::fs::remove_dir_all(&dir);

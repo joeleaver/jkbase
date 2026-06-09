@@ -912,8 +912,10 @@ async fn handle_deploy(
     let rootfs_path = plat.base_rootfs_path.clone();
     let runtime_dir = data_dir.join("run");
     // Project secrets → merged into each server's runtime env in the per-project
-    // metadata image below (read here under the platform lock; refreshed on every
-    // cold-boot/deploy, so a secret change takes effect on the next deploy/restart).
+    // metadata image below (read here under the platform lock). That image is rebuilt
+    // ONLY on deploy; wake/restore reuse the last-deployed image (a restored live
+    // process can't be re-env'd), so a secret change takes effect on the next DEPLOY,
+    // not on an idle wake/restart.
     let secrets: std::collections::BTreeMap<String, String> = plat
         .store
         .list_secrets(project_id)
