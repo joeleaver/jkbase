@@ -9,6 +9,12 @@
 # matching tools/build-toolchain.sh / build_image.rs.
 #
 # Usage: tools/build-image.sh [--config images/apko/build-bun.apko.yaml] [--out PATH]
+#
+# INJECT_BUN=1 (default) bakes the bun binary at /opt/bun/bin/bun (bun toolchain).
+# Set INJECT_BUN=0 for toolchains that carry their own runtime — e.g. the dockerfile
+# escape-hatch image, whose buildah-built image IS the runtime:
+#   INJECT_BUN=0 CONFIG=images/apko/build-dockerfile.apko.yaml \
+#     OUT=.firecracker/toolchains/dockerfile.ext4 tools/build-image.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,16 +23,17 @@ OUT="${OUT:-$REPO_ROOT/.firecracker/toolchains/bun.ext4}"
 WORK="${WORK:-$REPO_ROOT/.firecracker/work/image-$(basename "${OUT%.ext4}")}"
 BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
 INIT_BIN="${INIT_BIN:-$REPO_ROOT/target/x86_64-unknown-linux-musl/release/jkbuild-init}"
+INJECT_BUN="${INJECT_BUN:-1}"
 export PATH="$HOME/.local/bin:$PATH"
 
 command -v apko >/dev/null || {
     echo "apko not found — run tools/install-image-tools.sh" >&2
     exit 1
 }
-[ -f "$BUN_BIN" ] || {
+if [ "$INJECT_BUN" = "1" ] && [ ! -f "$BUN_BIN" ]; then
     echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2
     exit 1
-}
+fi
 if [ ! -f "$INIT_BIN" ]; then
     echo "[build-image] building jkbuild-init (musl-static)"
     (cd "$REPO_ROOT" && cargo build -p jkbuild --bin jkbuild-init \
@@ -55,9 +62,11 @@ for layer in $layers; do
         tar xz -C "$STAGE" --no-same-owner --exclude='dev/*' --exclude='./dev/*'
 done
 
-echo "[build-image] injecting jkbuild-init, bun, mountpoints, busybox applets"
+echo "[build-image] injecting jkbuild-init, mountpoints, busybox applets$([ "$INJECT_BUN" = "1" ] && echo ", bun")"
 install -Dm0755 "$INIT_BIN" "$STAGE/sbin/init"
-install -Dm0755 "$BUN_BIN" "$STAGE/opt/bun/bin/bun"
+if [ "$INJECT_BUN" = "1" ]; then
+    install -Dm0755 "$BUN_BIN" "$STAGE/opt/bun/bin/bun"
+fi
 # The RO root can't mkdir at boot — pre-create everything the lifecycle mounts.
 mkdir -p "$STAGE"/{scratch,src,out,cache,newroot,work,proc,sys,dev,tmp,bin,sbin}
 # Ensure the applets jkbuild-init shells out to resolve to busybox.
@@ -85,4 +94,4 @@ mkdir -p "$(dirname "$OUT")"
 truncate -s "${size_kib}K" "$OUT"
 mkfs.ext4 -F -q -O ^has_journal -d "$STAGE" "$OUT"
 chmod 0444 "$OUT"
-echo "[build-image] done: $OUT ($(du -h "$OUT" | cut -f1)); init=/sbin/init=jkbuild-init, /opt/bun/bin/bun present"
+echo "[build-image] done: $OUT ($(du -h "$OUT" | cut -f1)); init=/sbin/init=jkbuild-init$([ "$INJECT_BUN" = "1" ] && echo ", /opt/bun/bin/bun present")"

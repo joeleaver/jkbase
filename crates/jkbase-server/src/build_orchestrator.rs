@@ -40,6 +40,17 @@ const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
 /// Combined build-log tail kept in the build record (per-target logs concatenated).
 const LOG_TAIL_CAP: usize = 64 * 1024;
+
+/// Minimum scratch/output drive sizes for a `builder = "dockerfile"` build. A
+/// Dockerfile build stores, on the scratch drive, the pulled base-image layers +
+/// the container-storage overlay + the `buildah mount` merged rootfs + the erofs
+/// blob — far more than a thin buildpack app layer — and the output blob is a full
+/// self-contained image rootfs. The thin-buildpack defaults (≈4 GiB scratch /
+/// 1 GiB output) SIGXFSZ-kill a `FROM node:20` + `npm ci` build opaquely, so
+/// dockerfile builds get materially more room (the backing files are sparse, so an
+/// unused budget costs little). Tunable upward via the BuildDeps defaults.
+const DOCKERFILE_MIN_SCRATCH_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
+const DOCKERFILE_MIN_OUTPUT_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
 /// Per-target log slice pulled from the output drive into the record.
 const TARGET_LOG_CAP: usize = 16 * 1024;
 
@@ -732,6 +743,17 @@ async fn build_one_target_inner(
     let source_img = workspace.join(format!("{tag}.source.img"));
     let output_img = workspace.join(format!("{tag}.output.img"));
 
+    // Dockerfile builds need a much bigger scratch/output budget (base layers +
+    // container overlay + merged mount + image blob) than a thin buildpack layer.
+    let (scratch_size_bytes, output_size_bytes) = if is_dockerfile {
+        (
+            deps.scratch_size_bytes.max(DOCKERFILE_MIN_SCRATCH_BYTES),
+            deps.output_size_bytes.max(DOCKERFILE_MIN_OUTPUT_BYTES),
+        )
+    } else {
+        (deps.scratch_size_bytes, deps.output_size_bytes)
+    };
+
     // RO source drive built from the subdir in userspace — no mount (P0-3).
     build_ro_ext4_from_dir(&source_path, &source_img, 16)
         .with_context(|| format!("build source image for '{}'", spec.name))?;
@@ -788,9 +810,9 @@ async fn build_one_target_inner(
         kernel_path: deps.kernel_path.clone(),
         toolchain_rootfs: toolchain,
         source_drive: source_img.clone(),
-        scratch_size_bytes: deps.scratch_size_bytes,
+        scratch_size_bytes,
         output_drive: output_img.clone(),
-        output_size_bytes: deps.output_size_bytes,
+        output_size_bytes,
         cache_drive: None,
         vcpu_count: deps.vcpu_count,
         mem_size_mib: deps.mem_size_mib,
@@ -809,7 +831,7 @@ async fn build_one_target_inner(
         // (a 64 MiB cap with a 256 MiB scratch SIGXFSZ-kills any real build that
         // writes past 64 MiB of scratch). The artifact size is already bounded by
         // the fixed output-drive size. NB: include the cache image when wired.
-        fsize_limit_bytes: Some(deps.scratch_size_bytes.max(deps.output_size_bytes)),
+        fsize_limit_bytes: Some(scratch_size_bytes.max(output_size_bytes)),
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
