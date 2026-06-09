@@ -29,6 +29,10 @@ pub enum WakeError {
     OverQuota(String),
     /// Transient (still starting up / restore in progress). Surfaced as 503.
     Unavailable(String),
+    /// Registered, but it has no deployable content (artifacts gone) — it can never
+    /// wake until the owner redeploys. Surfaced as 503 with a clear message and NO
+    /// retry encouragement, so the proxy doesn't loop forever on "starting up".
+    Gone(String),
 }
 
 pub type WakeCallback = Arc<
@@ -308,6 +312,18 @@ async fn proxy_request(
                 .header("Content-Type", "text/plain")
                 .header("Retry-After", "5")
                 .body(Full::new(Bytes::from("project is starting up, please retry")))
+                .unwrap())
+        }
+        Err(WakeError::Gone(reason)) => {
+            // No deployable content — don't pretend it's "starting up" (it never will
+            // be) and don't send a short Retry-After that makes clients hammer.
+            info!(project = %project_id, %reason, "refusing wake: project has no deployment");
+            Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "text/plain")
+                .body(Full::new(Bytes::from(
+                    "This project has no active deployment. Redeploy it to bring it back online.",
+                )))
                 .unwrap())
         }
     }
