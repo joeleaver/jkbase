@@ -42,10 +42,11 @@ cargo build --release -p jkbase-agent --target x86_64-unknown-linux-musl 2>&1 | 
 # /sbin/init) so the agent's chrony-based guest clock discipline ships with this
 # deploy. The server runs as root via systemd and can't reach the deploy user's
 # apko, so we build the artifact here (as the deploy user) and the server consumes
-# it. apko isn't a base-OS package; install it once if missing (the guard makes
-# this a no-op on every subsequent deploy).
+# it. apko isn't a base-OS package; ensure-apko.sh installs just apko if missing
+# (idempotent). We use it rather than install-image-tools.sh, which also fetches bun
+# and so needs `unzip` — absent on a minimal server box.
 export PATH="$HOME/.local/bin:$PATH"
-command -v apko >/dev/null || ./tools/install-image-tools.sh
+./tools/ensure-apko.sh
 echo "Building runtime rootfs (apko Wolfi + chrony + agent)..."
 AGENT_BIN="$HOME/jkbase/target/x86_64-unknown-linux-musl/release/jkbase-agent" \
     OUT=/var/jkbase/base-rootfs.ext4 ./tools/build-runtime-rootfs.sh
