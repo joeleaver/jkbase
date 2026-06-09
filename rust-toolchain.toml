@@ -7,3 +7,5 @@
 channel = "1.95.0"
 targets = ["x86_64-unknown-linux-musl", "wasm32-wasip1"]
 profile = "minimal"
+# clippy + rustfmt on top of the minimal profile (CI + local lint/format).
+components = ["clippy", "rustfmt"]

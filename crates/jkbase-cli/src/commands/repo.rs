@@ -1,13 +1,14 @@
 //! `jkbase repo` — wire up push-to-deploy (build · D, connected-repo via CI).
 //!
 //! Two deliberately-separate concerns:
-//!   * `connect`  — mint a per-project git-push token + add a local `jkbase` git
-//!                  remote. LOCAL ONLY: it touches `.git/config` and the platform,
-//!                  nothing tracked. `git push jkbase main` then deploys.
-//!   * `github`   — scaffold a GitHub Actions workflow (a TRACKED file under
-//!                  `.github/workflows/`). Opt-in by design: writing CD config that
-//!                  a routine `git add -A` would commit + activate must be an
-//!                  explicit request, never a side effect of `connect`.
+//!
+//! - `connect` — mint a per-project git-push token + add a local `jkbase` git
+//!   remote. LOCAL ONLY: it touches `.git/config` and the platform, nothing
+//!   tracked. `git push jkbase main` then deploys.
+//! - `github` — scaffold a GitHub Actions workflow (a TRACKED file under
+//!   `.github/workflows/`). Opt-in by design: writing CD config that a routine
+//!   `git add -A` would commit + activate must be an explicit request, never a
+//!   side effect of `connect`.
 
 use anyhow::Context;
 use clap::Subcommand;
