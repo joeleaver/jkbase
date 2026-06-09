@@ -2032,7 +2032,7 @@ name = "api"
         assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
 
         let meta_img = fx.data.join(format!("{tag}-metadata.ext4"));
-        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &meta_img)
+        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &Default::default(), &meta_img)
             .expect("build the metadata image");
 
         // Agent base rootfs: the musl agent as PID1 + the mount skeleton (mount-free).

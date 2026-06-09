@@ -2492,6 +2492,33 @@ async fn set_secret(
         }
     }
 
+    // Validate before storing: secrets become container env vars, so the key must be a
+    // conventional env-var name and neither field may contain a NUL (which would make
+    // the runtime's `Command::env` fail at spawn). The runtime also defends itself
+    // (inject_secrets skips bad keys), but reject here so the caller gets a clear error.
+    let key = req.key.as_str();
+    let key_ok = !key.is_empty()
+        && key.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !key_ok {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("invalid secret key '{key}': must match [A-Za-z_][A-Za-z0-9_]*"),
+            }),
+        )
+            .into_response();
+    }
+    if req.value.contains('\0') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "secret value must not contain a NUL byte".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
     match state.store.set_secret(&id, &req.key, &req.value) {
         Ok(()) => {
             info!(project = %id, key = %req.key, "secret set");

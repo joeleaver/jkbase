@@ -911,6 +911,16 @@ async fn handle_deploy(
     let kernel_path = plat.kernel_path.clone();
     let rootfs_path = plat.base_rootfs_path.clone();
     let runtime_dir = data_dir.join("run");
+    // Project secrets → merged into each server's runtime env in the per-project
+    // metadata image below (read here under the platform lock). That image is rebuilt
+    // ONLY on deploy; wake/restore reuse the last-deployed image (a restored live
+    // process can't be re-env'd), so a secret change takes effect on the next DEPLOY,
+    // not on an idle wake/restart.
+    let secrets: std::collections::BTreeMap<String, String> = plat
+        .store
+        .list_secrets(project_id)
+        .map(|v| v.into_iter().map(|s| (s.key, s.value)).collect())
+        .unwrap_or_default();
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -930,7 +940,7 @@ async fn handle_deploy(
             // verify=true: cold-boot deploy re-checks every tenant + platform blob's
             // sha256 before it can be attached to a VM.
             let plan = layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, true)?;
-            layer_plan::build_metadata_image(&content_dir, &plan, &out)?;
+            layer_plan::build_metadata_image(&content_dir, &plan, &secrets, &out)?;
             Ok(plan)
         })
         .await
