@@ -228,6 +228,10 @@ pub struct BuildNet {
     pub bridge: String,
     pub gateway: String,
     pub proxy_port: u16,
+    /// The public-any egress proxy port (allowlist bypassed, SSRF pin retained),
+    /// used only by `builder = "dockerfile"` builds. `None` (or equal to
+    /// `proxy_port`) → dockerfile builds share the narrow allowlist proxy.
+    pub proxy_any_port: Option<u16>,
     subnet_prefix: String,
     uid: u32,
     free_slots: Mutex<Vec<u8>>,
@@ -243,18 +247,28 @@ pub struct NetLease {
 
 impl BuildNet {
     /// `pool_size` concurrent slots → guest IPs `<subnet>.2 ..= .(1+pool_size)`.
-    pub fn new(bridge: String, gateway: String, proxy_port: u16, uid: u32, pool_size: u8) -> Self {
+    pub fn new(
+        bridge: String,
+        gateway: String,
+        proxy_port: u16,
+        proxy_any_port: Option<u16>,
+        uid: u32,
+        pool_size: u8,
+    ) -> Self {
         let subnet_prefix = {
             let mut parts: Vec<&str> = gateway.split('.').collect();
             parts.truncate(3);
             parts.join(".")
         };
+        // A distinct port enables the public-any proxy; equal/absent disables it.
+        let proxy_any_port = proxy_any_port.filter(|p| *p != proxy_port);
         // Reversed so pop() hands out ascending slot numbers.
         let free_slots: Vec<u8> = (1..=pool_size).rev().collect();
         Self {
             bridge,
             gateway,
             proxy_port,
+            proxy_any_port,
             subnet_prefix,
             uid,
             free_slots: Mutex::new(free_slots),
@@ -263,6 +277,15 @@ impl BuildNet {
 
     pub fn proxy_url(&self) -> String {
         format!("http://{}:{}", self.gateway, self.proxy_port)
+    }
+
+    /// The egress proxy URL to hand a build VM. Dockerfile builds get the public-any
+    /// proxy (when configured); everything else gets the narrow allowlist proxy.
+    pub fn proxy_url_for(&self, is_dockerfile: bool) -> String {
+        match (is_dockerfile, self.proxy_any_port) {
+            (true, Some(port)) => format!("http://{}:{}", self.gateway, port),
+            _ => self.proxy_url(),
+        }
     }
 
     /// Lease a slot and bring up its TAP — owned by the build uid (so the jailed
@@ -349,9 +372,29 @@ impl BuildNet {
         }
         let input_hook = vec!["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
         let fwd_drop = vec!["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
-        for check in [input_hook, fwd_drop] {
+        let mut checks: Vec<Vec<String>> = vec![
+            input_hook.iter().map(|s| s.to_string()).collect(),
+            fwd_drop.iter().map(|s| s.to_string()).collect(),
+        ];
+        // The JKBUILD chain must actually ACCEPT each proxy port the orchestrator
+        // hands to VMs — otherwise a build (esp. a dockerfile build pointed at the
+        // public-any port) silently gets zero egress and dies at fetch. Assert each
+        // port we'll use is open, not just that the chain exists.
+        let dport = self.proxy_port.to_string();
+        let proxy_accept = |port: &str| -> Vec<String> {
+            vec![
+                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
+                "-d".into(), self.gateway.clone(), "--dport".into(), port.into(),
+                "-j".into(), "ACCEPT".into(),
+            ]
+        };
+        checks.push(proxy_accept(&dport));
+        if let Some(any) = self.proxy_any_port {
+            checks.push(proxy_accept(&any.to_string()));
+        }
+        for check in &checks {
             let ok = tokio::process::Command::new("iptables")
-                .args(&check)
+                .args(check)
                 .status()
                 .await
                 .map(|s| s.success())
@@ -733,7 +776,7 @@ async fn build_one_target_inner(
                 Some(l.mac.clone()),
                 Some(l.guest_ip.clone()),
                 Some(net.gateway.clone()),
-                Some(net.proxy_url()),
+                Some(net.proxy_url_for(is_dockerfile)),
                 Some(make_seal(l.tap.clone())),
             ),
             _ => (None, None, None, None, None, None),
@@ -1336,6 +1379,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_url_selects_public_any_only_for_dockerfile() {
+        // With a distinct any-port, dockerfile builds get it; others get the narrow proxy.
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8);
+        assert_eq!(net.proxy_url_for(false), "http://172.31.0.1:3128");
+        assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3129");
+        assert_eq!(net.proxy_any_port, Some(3129));
+
+        // any-port == proxy_port disables the second proxy (dockerfile shares narrow).
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3128), 100_000, 8);
+        assert_eq!(net.proxy_any_port, None);
+        assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3128");
+
+        // No any-port → dockerfile falls back to the narrow proxy.
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
+        assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3128");
+    }
+
+    #[test]
     fn dockerfile_relpath_strips_source_prefix() {
         assert_eq!(dockerfile_relpath("./api/Dockerfile", "./api"), "Dockerfile");
         assert_eq!(dockerfile_relpath("Dockerfile", "."), "Dockerfile");
@@ -1681,7 +1742,7 @@ esac
         let output_img = workspace.join("output.img");
         build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
 
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, 100_000, 8);
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
         let lease = net.acquire().await.expect("acquire build net");
         let release = format!("/sys/class/net/{}", lease.tap); // for diagnostics only
         eprintln!("leased tap={} ip={} ({release})", lease.tap, lease.guest_ip);
@@ -2001,6 +2062,7 @@ name = "api"
                         "jkbuild0".into(),
                         "172.31.0.1".into(),
                         3128,
+                        None,
                         100_000,
                         8,
                     )))

@@ -10,13 +10,22 @@
 # Idempotent. Run as root before the server (the systemd unit can ExecStartPre
 # this); local dev users run it once per boot.
 #
-#   sudo tools/setup-build-net.sh [BRIDGE] [GATEWAY_CIDR] [PROXY_PORT]
-# Defaults: jkbuild0  172.31.0.1/24  3128
+#   sudo tools/setup-build-net.sh [BRIDGE] [GATEWAY_CIDR] [PROXY_PORT] [PROXY_ANY_PORT]
+# Defaults: jkbuild0  172.31.0.1/24  3128  3129
+#
+# PROXY_ANY_PORT is the SECOND egress proxy — public-any mode (allowlist bypassed,
+# SSRF pin retained) — used only by `builder = "dockerfile"` builds, whose
+# FROM/RUN need broad egress. Both proxies enforce the IP pin (no private/metadata/
+# control-plane), so opening the second port widens only the set of PUBLIC hosts a
+# sandboxed VM may reach, not control-plane reachability. Set it equal to
+# PROXY_PORT to disable the second proxy (single-rule firewall, dockerfile builds
+# then share the narrow allowlist).
 set -euo pipefail
 
 BRIDGE="${1:-jkbuild0}"
 GW_CIDR="${2:-172.31.0.1/24}"
 PROXY_PORT="${3:-3128}"
+PROXY_ANY_PORT="${4:-3129}"
 GW_IP="${GW_CIDR%/*}"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -43,6 +52,10 @@ fi
 iptables -N JKBUILD 2>/dev/null || iptables -F JKBUILD
 #   allow → the egress proxy on the gateway, drop everything else to the host.
 iptables -A JKBUILD -p tcp -d "$GW_IP" --dport "$PROXY_PORT" -j ACCEPT
+#   allow → the public-any (dockerfile-build) proxy, when distinct from PROXY_PORT.
+if [ "$PROXY_ANY_PORT" != "$PROXY_PORT" ]; then
+    iptables -A JKBUILD -p tcp -d "$GW_IP" --dport "$PROXY_ANY_PORT" -j ACCEPT
+fi
 iptables -A JKBUILD -j DROP
 # Hook host-bound traffic from the build bridge through JKBUILD (insert once).
 iptables -C INPUT -i "$BRIDGE" -j JKBUILD 2>/dev/null \
@@ -65,4 +78,8 @@ if command -v ip6tables >/dev/null 2>&1; then
         || ip6tables -I FORWARD 1 -i "$BRIDGE" -j DROP
 fi
 
-echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (egress proxy)"
+if [ "$PROXY_ANY_PORT" != "$PROXY_PORT" ]; then
+    echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (allowlist proxy) + ${GW_IP}:${PROXY_ANY_PORT} (dockerfile public-any proxy)"
+else
+    echo "build network ready: VMs on $BRIDGE may reach ONLY ${GW_IP}:${PROXY_PORT} (egress proxy)"
+fi

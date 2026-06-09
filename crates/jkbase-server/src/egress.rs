@@ -151,23 +151,45 @@ pub fn pick_safe_addr<I: IntoIterator<Item = SocketAddr>>(addrs: I) -> Option<So
     addrs.into_iter().find(|a| ip_is_public(a.ip()))
 }
 
-/// Configuration for the egress proxy: the host allowlist.
+/// Configuration for the egress proxy: the host allowlist and its mode.
 pub struct EgressConfig {
     pub allowlist: Vec<String>,
+    /// When true, bypass the hostname ALLOWLIST — any PUBLIC host on port 80/443
+    /// is reachable. Used ONLY for the dedicated `builder = "dockerfile"` proxy,
+    /// whose VMs run arbitrary `FROM`/`RUN` that need broad egress. The SSRF pin
+    /// is NOT bypassed: `ip_is_public`/`pick_safe_addr` still reject private/
+    /// metadata/link-local on every hop, the port stays 80/443-only, and the
+    /// per-VM firewall still pins each VM to exactly this one proxy. The control
+    /// plane's protection is the sealed VM + SSRF pin + firewall — never the
+    /// allowlist — so widening to public-any does not weaken control-plane
+    /// isolation, only the set of *public* hosts a sandboxed VM may reach.
+    pub allow_any: bool,
 }
 
 impl EgressConfig {
     pub fn with_default_allowlist() -> Self {
         Self {
             allowlist: DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
+            allow_any: false,
+        }
+    }
+
+    /// Public-any mode for the dockerfile-build proxy (allowlist bypassed, SSRF
+    /// pin retained). See [`EgressConfig::allow_any`].
+    pub fn allow_any_public() -> Self {
+        Self {
+            allowlist: Vec::new(),
+            allow_any: true,
         }
     }
 }
 
-/// Allowlist the host, resolve it *here*, and pin to a safe public address.
-/// Returns the address to connect to, or a [`Deny`] reason.
+/// Allowlist the host (unless in public-any mode), resolve it *here*, and pin to a
+/// safe public address. Returns the address to connect to, or a [`Deny`] reason.
 async fn resolve_pinned(host: &str, port: u16, cfg: &EgressConfig) -> Result<SocketAddr, Deny> {
-    if !host_allowed(host, &cfg.allowlist) {
+    // The allowlist is the ONLY thing public-any mode bypasses; everything below
+    // (port restriction + SSRF address pin) applies unconditionally.
+    if !cfg.allow_any && !host_allowed(host, &cfg.allowlist) {
         return Err(Deny::HostNotAllowed);
     }
     // Only the fetch protocols — never relay to SSH/SMTP/etc. on an allowed host.
@@ -186,7 +208,7 @@ async fn resolve_pinned(host: &str, port: u16, cfg: &EgressConfig) -> Result<Soc
 /// Serve the egress proxy on `listener` until the task is dropped. Each accepted
 /// connection is handled independently.
 pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
-    info!(allowlist = cfg.allowlist.len(), "egress proxy listening");
+    info!(allowlist = cfg.allowlist.len(), allow_any = cfg.allow_any, "egress proxy listening");
     let sem = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
         let (client, peer) = match listener.accept().await {
@@ -496,6 +518,37 @@ mod tests {
         assert_eq!(
             resolve_pinned("crates.io", 8080, &cfg).await,
             Err(Deny::HostNotAllowed)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pinned_allow_any_bypasses_allowlist_but_not_ssrf() {
+        let cfg = EgressConfig::allow_any_public();
+        // Public-any mode: an off-allowlist host is NOT HostNotAllowed (it gets to
+        // DNS — here it resolves to a private/link-local literal, so the SSRF pin
+        // still rejects it). The point: the allowlist no longer denies, but the
+        // SSRF address pin and port restriction still hold.
+        assert_eq!(
+            resolve_pinned("169.254.169.254", 443, &cfg).await,
+            Err(Deny::NoSafeAddr),
+            "metadata IP must be rejected by the SSRF pin even in public-any mode"
+        );
+        assert_eq!(
+            resolve_pinned("10.0.0.1", 80, &cfg).await,
+            Err(Deny::NoSafeAddr),
+            "private IP must be rejected by the SSRF pin"
+        );
+        // Non-fetch ports are still refused regardless of mode.
+        assert_eq!(
+            resolve_pinned("example.com", 22, &cfg).await,
+            Err(Deny::HostNotAllowed),
+            "non-80/443 port refused even in public-any mode"
+        );
+        // A public IP literal on a fetch port is allowed (no allowlist gate).
+        assert_eq!(
+            resolve_pinned("93.184.216.34", 443, &cfg).await,
+            Ok("93.184.216.34:443".parse().unwrap()),
+            "a public address is reachable in public-any mode"
         );
     }
 
