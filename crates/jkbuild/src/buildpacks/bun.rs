@@ -24,6 +24,23 @@ use std::process::Command;
 /// not include `/opt/bun/bin`, so the launch `cmd[0]` has to be absolute.
 pub const BUN_BIN: &str = "/opt/bun/bin/bun";
 
+/// Directory holding the baked bun binary.
+const BUN_DIR: &str = "/opt/bun/bin";
+
+/// A bun `Command` with `/opt/bun/bin` on `PATH`. The build VM's default `PATH`
+/// does not include it, so a script run via `bun run build` that re-invokes a bare
+/// `bun` (e.g. a monorepo `bun run --filter '*' build`, or any nested `bun` in a
+/// package script) would otherwise fail with "command not found". We run bun by its
+/// absolute path, but its CHILDREN inherit `PATH` — so it must carry the bun dir.
+fn bun_command() -> Command {
+    let mut cmd = Command::new(BUN_BIN);
+    cmd.env(
+        "PATH",
+        format!("{BUN_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+    );
+    cmd
+}
+
 pub struct BunBuildpack;
 
 impl Buildpack for BunBuildpack {
@@ -42,7 +59,7 @@ impl Buildpack for BunBuildpack {
         std::fs::create_dir_all(&bun_cache).ok();
 
         // 1. Full install — the build (compile) needs the dev deps (vite, etc.).
-        let mut cmd = Command::new(BUN_BIN);
+        let mut cmd = bun_command();
         cmd.arg("install");
         // `--frozen-lockfile` requires a lockfile to exist; only enforce it when
         // one is present (a lockfile-less project still installs reproducibly
@@ -75,7 +92,7 @@ impl Buildpack for BunBuildpack {
         // Offline (post-seal): run an optional build script. Network is gone, so
         // a `bun run build` that tries to fetch will fail here by design.
         if has_build_script(ctx.app_dir) {
-            let status = Command::new(BUN_BIN)
+            let status = bun_command()
                 .arg("run")
                 .arg("build")
                 .current_dir(ctx.app_dir)
@@ -92,10 +109,12 @@ impl Buildpack for BunBuildpack {
         // playwright/typescript tooling, which can dwarf the actual app.
         swap_in_production_modules(ctx)?;
 
-        let command = resolve_launch_command(ctx.app_dir).context(
-            "could not determine a start command: add a `start` script to package.json \
-             or a server entrypoint (server.ts/index.ts)",
-        )?;
+        // May be empty when no start script / server entrypoint is derivable (e.g. a
+        // monorepo whose start lives in a workspace). That is NOT fatal here: the host
+        // can supply a `command = [...]` override from jkbase.toml — which the
+        // in-VM buildpack can't see — and fails the deploy with a clear error there if
+        // neither a derived nor an overridden command exists.
+        let command = resolve_launch_command(ctx.app_dir).unwrap_or_default();
 
         let mut env = std::collections::BTreeMap::new();
         env.insert("NODE_ENV".to_string(), "production".to_string());
@@ -279,55 +298,74 @@ fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
 /// Sibling dir (next to the workspace, on the same scratch fs) holding the
 /// pre-staged production `node_modules`. Both fetch and compile derive it identically.
 fn prod_modules_dir(ctx: &BuildContext) -> std::path::PathBuf {
-    ctx.app_dir
-        .parent()
-        .unwrap_or(ctx.app_dir)
-        .join("jkbuild-prod-modules")
+    ctx.app_dir.parent().unwrap_or(ctx.app_dir).join("jkbuild-prod-modules")
 }
 
-/// Build a PRODUCTION-only `node_modules` in a sibling dir while the network is up
-/// (fetch phase), from the same manifest + lockfile, so the offline compile can swap
-/// it into the app layer. The cache is already warm from the full install, so this is
-/// fast. Drops dev deps (and their dev-only transitive subtrees) deterministically.
+fn full_modules_dir(ctx: &BuildContext) -> std::path::PathBuf {
+    ctx.app_dir.parent().unwrap_or(ctx.app_dir).join("jkbuild-full-modules")
+}
+
+/// Build a PRODUCTION-only `node_modules` while the network is up (fetch phase), so
+/// the offline compile can swap it into the app layer. Runs the production install
+/// **in-place in the real workspace** — NOT in an isolated dir — because a Bun
+/// workspace monorepo (`"workspaces": [...]`) needs its member package.jsons present
+/// or `bun install --production` aborts with `Workspace not found`. We rename the
+/// full tree aside (it's needed for the offline build), do a clean production
+/// install, save that, then restore the full tree. The cache is already warm from
+/// the full install, so both moves + the reinstall are fast. (Bun hoists deps to the
+/// root `node_modules`, so managing the root tree captures the bulk; member dirs are
+/// symlinks/.bin.)
 fn stage_production_modules(ctx: &BuildContext, bun_cache: &Path) -> Result<()> {
-    let prod = prod_modules_dir(ctx);
-    let _ = std::fs::remove_dir_all(&prod);
-    std::fs::create_dir_all(&prod).with_context(|| format!("create {}", prod.display()))?;
-    // Same manifest + lockfile → the same production resolution.
-    std::fs::copy(ctx.app_dir.join("package.json"), prod.join("package.json"))
-        .context("copy package.json for production staging")?;
-    for lf in ["bun.lock", "bun.lockb"] {
-        let src = ctx.app_dir.join(lf);
-        if src.exists() {
-            std::fs::copy(&src, prod.join(lf)).with_context(|| format!("copy {lf}"))?;
-        }
+    let app_nm = ctx.app_dir.join("node_modules");
+    let full_save = full_modules_dir(ctx);
+    let prod_save = prod_modules_dir(ctx);
+    let _ = std::fs::remove_dir_all(&full_save);
+    let _ = std::fs::remove_dir_all(&prod_save);
+
+    // 1. Set the full (dev-incl.) tree aside for the offline build.
+    if app_nm.exists() {
+        std::fs::rename(&app_nm, &full_save).context("save full node_modules")?;
     }
-    let mut cmd = Command::new(BUN_BIN);
+    // 2. Clean production install IN-PLACE (workspace members present → resolves).
+    let mut cmd = bun_command();
     cmd.arg("install").arg("--production");
     if has_lockfile(ctx.app_dir) {
         cmd.arg("--frozen-lockfile");
     }
-    cmd.current_dir(&prod).env("BUN_INSTALL_CACHE_DIR", bun_cache);
+    cmd.current_dir(ctx.app_dir).env("BUN_INSTALL_CACHE_DIR", bun_cache);
     apply_proxy(&mut cmd, ctx);
     let status = cmd
         .status()
-        .with_context(|| format!("spawning `{BUN_BIN} install --production` (staging)"))?;
+        .with_context(|| format!("spawning `{BUN_BIN} install --production` (in-place)"))?;
     if !status.success() {
-        anyhow::bail!("staging production node_modules failed: {status}");
+        // Restore the full tree so the build can still proceed (degraded: a bloated
+        // but correct layer) rather than leaving the workspace with no node_modules.
+        if full_save.exists() && !app_nm.exists() {
+            let _ = std::fs::rename(&full_save, &app_nm);
+        }
+        anyhow::bail!("production install failed: {status}");
+    }
+    // 3. Save the production tree, then restore the full tree for the build.
+    if app_nm.exists() {
+        std::fs::rename(&app_nm, &prod_save).context("save production node_modules")?;
+    }
+    if full_save.exists() {
+        std::fs::rename(&full_save, &app_nm).context("restore full node_modules")?;
     }
     Ok(())
 }
 
 /// Swap the pre-staged production `node_modules` into the workspace, replacing the
-/// full (dev-incl.) tree the build used. No-op when nothing was staged (no dev deps).
+/// full (dev-incl.) tree the build used. `prod_modules_dir` IS the saved production
+/// `node_modules` (renamed aside during fetch). No-op when nothing was staged.
 fn swap_in_production_modules(ctx: &BuildContext) -> Result<()> {
-    let prod_nm = prod_modules_dir(ctx).join("node_modules");
-    if !prod_nm.exists() {
+    let prod_save = prod_modules_dir(ctx);
+    if !prod_save.exists() {
         return Ok(());
     }
     let app_nm = ctx.app_dir.join("node_modules");
     let _ = std::fs::remove_dir_all(&app_nm);
-    std::fs::rename(&prod_nm, &app_nm)
+    std::fs::rename(&prod_save, &app_nm)
         .with_context(|| format!("swap production node_modules into {}", app_nm.display()))?;
     Ok(())
 }

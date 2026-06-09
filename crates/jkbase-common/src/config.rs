@@ -91,6 +91,13 @@ pub struct ServerConfig {
     pub health_check: Option<HealthCheckConfig>,
     #[serde(default)]
     pub volumes: Vec<VolumeConfig>,
+    /// Explicit launch command override (argv). When set, it REPLACES the
+    /// buildpack-derived start command — for monorepos (whose start may live in a
+    /// workspace) or any app whose start isn't auto-derivable without a root `start`
+    /// script. `cmd[0]` must be absolute (e.g. `/opt/bun/bin/bun`); the runtime
+    /// clears the environment, so it can't rely on `PATH`.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 impl ServerConfig {
@@ -311,6 +318,31 @@ pub struct ResolvedSite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_command_override_parses_and_defaults_none() {
+        let cfg: ProjectConfig = toml::from_str(
+            r#"
+            [project]
+            name = "demo"
+            [servers.web]
+            source = "."
+            language = "bun"
+            port = 3000
+            command = ["/opt/bun/bin/bun", "run", "--filter", "web", "start"]
+            [servers.api]
+            source = "./api"
+            language = "bun"
+            port = 4000
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.servers["web"].command.as_deref(),
+            Some(&["/opt/bun/bin/bun".to_string(), "run".into(), "--filter".into(), "web".into(), "start".into()][..])
+        );
+        assert!(cfg.servers["api"].command.is_none(), "command defaults to None");
+    }
 
     #[test]
     fn site_domain_round_trips_and_resolves() {

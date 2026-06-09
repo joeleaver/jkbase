@@ -891,7 +891,19 @@ fn collect_layered_server(
         .servers
         .get(&spec.name)
         .ok_or_else(|| anyhow::anyhow!("server '{}' missing from config", spec.name))?;
-    let mut manifest = server_cfg.manifest_value(built.cmd, built.env, &built.working_dir);
+    // The jkbase.toml `command` override wins over the buildpack-derived start; the
+    // override also covers apps where no start is auto-derivable (the buildpack now
+    // leaves an empty cmd rather than failing). If there is NO command from either
+    // source, fail here — clearly — rather than ship a server that can't launch.
+    let cmd = server_cfg.command.clone().unwrap_or(built.cmd);
+    if cmd.is_empty() {
+        bail!(
+            "server '{0}' has no start command: add a `start` script to its package.json, \
+             a server entrypoint (server.ts/index.ts), or `command = [\"...\"]` under [servers.{0}]",
+            spec.name
+        );
+    }
+    let mut manifest = server_cfg.manifest_value(cmd, built.env, &built.working_dir);
     if let Some(obj) = manifest.as_object_mut() {
         obj.insert("app_layer".to_string(), serde_json::Value::String(file));
         obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
@@ -1768,18 +1780,16 @@ service = "server"
 name = "api"
 "#,
         );
-        // Networked: the server imports a real npm dep (`ms`) and uses it in the
-        // response, so a 200 proves `bun install` fetched it through the proxy AND
-        // the app runs with it. Offline: a no-dep server.
+        // Networked: a WORKSPACE monorepo (root `workspaces` + a member) with a real
+        // transitive dep tree (debug → ms) AND root devDeps (typescript) — the exact
+        // shape that broke the production-prune staging (`Workspace not found`). The
+        // server imports ms+debug at runtime so a 200 proves the tree installed
+        // through the proxy and runs; the prune must drop typescript from the app
+        // layer without tripping over the workspace. Offline: a plain no-dep server.
         let (server_ts, package_json) = if networked {
-            // Two prod deps with a TRANSITIVE edge (debug → ms) prove a multi-package
-            // tree fetches through the proxy; both are imported at runtime, so a 200
-            // means the whole tree installed. A `typescript` devDependency proves the
-            // lean-layer prune: it must be installed for the build but ABSENT from the
-            // app layer.
             (
                 "import ms from \"ms\";\nimport createDebug from \"debug\";\nconst log = createDebug(\"app\");\nconst port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { log(\"req\"); return new Response(\"ok \" + ms(60000) + \"\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
-                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"devDependencies\": { \"typescript\": \"^5.6.0\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"workspaces\": [\"packages/*\"],\n  \"dependencies\": { \"ms\": \"^2.1.3\", \"debug\": \"^4.3.4\" },\n  \"devDependencies\": { \"typescript\": \"^5.6.0\" },\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
             )
         } else {
             (
@@ -1789,6 +1799,14 @@ name = "api"
         };
         write(src.join("server/server.ts"), server_ts);
         write(src.join("server/package.json"), package_json);
+        if networked {
+            // A trivial workspace member so the root manifest's `workspaces` glob
+            // resolves — the production-prune staging must handle this in-place.
+            write(
+                src.join("server/packages/lib/package.json"),
+                "{ \"name\": \"@bunfix/lib\", \"version\": \"1.0.0\" }\n",
+            );
+        }
 
         let mut tarbuf = Vec::new();
         {
