@@ -235,6 +235,18 @@ fn mount_early() {
     mount_log("sysfs", "/sys", "sysfs", 0);
     mount_log("devtmpfs", "/dev", "devtmpfs", 0);
     mount_log("tmpfs", "/tmp", "tmpfs", 0);
+    // Writable /run + /var: container tooling (buildah/crun/netavark) writes locks,
+    // runtime state, and a blob cache under /run, /var/cache, /var/tmp, /var/lib —
+    // but the toolchain root is mounted read-only. tmpfs over both gives the
+    // dockerfile buildpack writable scratch there (its real storage is on the big
+    // scratch drive via buildah --root). Harmless for the bun toolchain, which
+    // doesn't touch them. The toolchain's own /var content isn't needed at build time.
+    mount_log("tmpfs", "/run", "tmpfs", 0);
+    let _ = std::fs::create_dir_all("/run/lock");
+    mount_log("tmpfs", "/var", "tmpfs", 0);
+    for d in ["/var/tmp", "/var/cache", "/var/lib"] {
+        let _ = std::fs::create_dir_all(d);
+    }
     for dir in [SRC, OUT, CACHE, "/scratch"] {
         let _ = std::fs::create_dir_all(dir);
     }

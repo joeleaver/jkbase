@@ -68,7 +68,7 @@ if [ "$INJECT_BUN" = "1" ]; then
     install -Dm0755 "$BUN_BIN" "$STAGE/opt/bun/bin/bun"
 fi
 # The RO root can't mkdir at boot — pre-create everything the lifecycle mounts.
-mkdir -p "$STAGE"/{scratch,src,out,cache,newroot,work,proc,sys,dev,tmp,bin,sbin}
+mkdir -p "$STAGE"/{scratch,src,out,cache,newroot,work,proc,sys,dev,tmp,run,var,bin,sbin}
 # Ensure the applets jkbuild-init shells out to resolve to busybox.
 bb=""
 for cand in usr/bin/busybox bin/busybox usr/sbin/busybox; do
