@@ -289,7 +289,14 @@ impl Drop for NetLease {
         {
             let spec = self.net.any_egress_rule(&self.guest_ip, any_port);
             for _ in 0..8 {
-                let mut args = vec!["-w".to_string(), "-D".to_string(), "JKBUILD".to_string()];
+                // Bounded `-w 5`: Drop is blocking + uncancellable, so a contended
+                // xtables lock must not pin this worker thread indefinitely.
+                let mut args = vec![
+                    "-w".to_string(),
+                    "5".to_string(),
+                    "-D".to_string(),
+                    "JKBUILD".to_string(),
+                ];
                 args.extend(spec.iter().cloned());
                 let removed = std::process::Command::new("iptables")
                     .args(&args)
@@ -640,6 +647,15 @@ impl BuildNet {
             let ip = format!("{}.{}", self.subnet_prefix, slot as u16 + 1);
             let mac = format!("AA:FC:00:1F:00:{slot:02X}");
             // DROP frames on this TAP not bearing slot N's source MAC / IPv4 src / ARP src.
+            // First, DROP any 802.1Q VLAN-tagged frame outright: `-p IPv4`/`-p ARP` match
+            // the OUTER ethertype, so a tagged frame (0x8100) would skip the IP/ARP source
+            // pins. Build VMs have no VLAN use case, so this closes that bypass at the
+            // source rather than relying on the host never decapsulating VLAN tags.
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "802_1Q",
+                "-j", "DROP",
+            ])
+            .await?;
             run_ebtables(&[
                 "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "!", "-s",
                 mac.as_str(), "-j", "DROP",

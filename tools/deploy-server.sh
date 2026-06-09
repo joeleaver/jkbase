@@ -89,6 +89,15 @@ sudo cp "$HOME/jkbase/tools/setup-build-cgroup.sh" /usr/local/bin/jkbase-build-c
 sudo cp "$HOME/jkbase/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
 sudo chmod +x /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-build-net.sh
 
+# ebtables is required when --build-proxy-any-port is active (the server's L2
+# source-guard, ensure_source_guard, fails closed without it). provision.sh installs
+# it on fresh boxes; guarantee it here too so deploying this branch to a box
+# provisioned before that line can't self-brick at startup.
+if ! command -v ebtables >/dev/null 2>&1; then
+    echo "Installing ebtables (build source-guard dependency)..."
+    sudo apt-get install -y -qq ebtables
+fi
+
 echo "Restarting service..."
 sudo systemctl restart jkbase
 
