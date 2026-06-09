@@ -246,7 +246,9 @@ pub struct BuildNet {
     subnet_prefix: String,
     uid: u32,
     pool_size: u8,
-    free_slots: Mutex<Vec<u8>>,
+    // std (not tokio) Mutex: the critical sections are tiny pop/push with no await,
+    // and NetLease's Drop safety-net must return the slot synchronously.
+    free_slots: std::sync::Mutex<Vec<u8>>,
     /// Serializes ALL JKBUILD mutations (install/clear of per-lease rules) within
     /// this process. Builds fan out concurrently (semaphore-bounded) and each touches
     /// iptables, so without this two acquires/releases could interleave their rule
@@ -258,6 +260,8 @@ pub struct BuildNet {
 
 /// A leased build-network slot (its TAP + guest IP/MAC); returned via [`BuildNet::release`].
 pub struct NetLease {
+    /// Back-reference for the `Drop` safety-net (return the slot, revoke the grant).
+    net: Arc<BuildNet>,
     slot: u8,
     tap: String,
     guest_ip: String,
@@ -266,6 +270,44 @@ pub struct NetLease {
     /// (dockerfile) egress proxy port, so [`BuildNet::release`] revokes exactly
     /// what [`BuildNet::acquire`] installed.
     any_egress: bool,
+    /// Set by the explicit async [`BuildNet::release`] so `Drop` doesn't double-clean.
+    released: bool,
+}
+
+impl Drop for NetLease {
+    fn drop(&mut self) {
+        if self.released {
+            return; // the explicit async release already cleaned up.
+        }
+        // Safety net: a panic or runtime cancellation skipped the explicit release.
+        // Best-effort BLOCKING cleanup so a dropped build can't leak its slot
+        // (pool-exhaustion DoS) or its :3129 grant. No fw_lock (can't .await in Drop);
+        // each `iptables -w -D` is atomic under the xtables lock, enough for a
+        // single-rule revoke.
+        if self.any_egress
+            && let Some(any_port) = self.net.proxy_any_port
+        {
+            let spec = self.net.any_egress_rule(&self.guest_ip, any_port);
+            for _ in 0..8 {
+                let mut args = vec!["-w".to_string(), "-D".to_string(), "JKBUILD".to_string()];
+                args.extend(spec.iter().cloned());
+                let removed = std::process::Command::new("iptables")
+                    .args(&args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !removed {
+                    break;
+                }
+            }
+        }
+        let _ = std::process::Command::new("ip")
+            .args(["link", "delete", &self.tap])
+            .status();
+        if let Ok(mut slots) = self.net.free_slots.lock() {
+            slots.push(self.slot);
+        }
+    }
 }
 
 impl BuildNet {
@@ -295,7 +337,7 @@ impl BuildNet {
             subnet_prefix,
             uid,
             pool_size,
-            free_slots: Mutex::new(free_slots),
+            free_slots: std::sync::Mutex::new(free_slots),
             fw_lock: Mutex::new(()),
         }
     }
@@ -322,9 +364,9 @@ impl BuildNet {
     /// non-dockerfile build can't ignore its assigned narrow proxy and reach broad
     /// egress directly: the in-guest `jkbase.proxy=` boot-arg is only a hint, and
     /// the guest is untrusted, so the network layer is the real boundary.
-    pub async fn acquire(&self, allow_any_egress: bool) -> Result<NetLease> {
+    pub async fn acquire(self: &Arc<Self>, allow_any_egress: bool) -> Result<NetLease> {
         let slot = {
-            let mut slots = self.free_slots.lock().await;
+            let mut slots = self.free_slots.lock().unwrap();
             slots
                 .pop()
                 .ok_or_else(|| anyhow::anyhow!("build network pool exhausted"))?
@@ -333,7 +375,7 @@ impl BuildNet {
         let guest_ip = format!("{}.{}", self.subnet_prefix, slot as u16 + 1);
         let mac = format!("AA:FC:00:1F:00:{slot:02X}");
         if let Err(e) = self.setup_tap(&tap).await {
-            self.free_slots.lock().await.push(slot);
+            self.free_slots.lock().unwrap().push(slot);
             return Err(e);
         }
         // Per-VM public-any scoping. Slots (hence guest IPs) are reused, so a
@@ -351,24 +393,27 @@ impl BuildNet {
                     // Fail closed: roll back the TAP + slot rather than boot a VM
                     // that can't reach the proxy it was told to use.
                     let _ = run_ip(&["link", "delete", &tap]).await;
-                    self.free_slots.lock().await.push(slot);
+                    self.free_slots.lock().unwrap().push(slot);
                     return Err(e);
                 }
                 any_egress = true;
             }
         }
         Ok(NetLease {
+            net: Arc::clone(self),
             slot,
             tap,
             guest_ip,
             mac,
             any_egress,
+            released: false,
         })
     }
 
     /// Tear the leased TAP down (idempotent — the seal may already have deleted
-    /// it), revoke any per-lease public-any egress grant, and return the slot.
-    pub async fn release(&self, lease: NetLease) {
+    /// it), revoke any per-lease public-any egress grant, and return the slot. Marks
+    /// the lease released so its `Drop` safety-net is a no-op.
+    pub async fn release(&self, mut lease: NetLease) {
         if lease.any_egress
             && let Some(any_port) = self.proxy_any_port
         {
@@ -376,7 +421,8 @@ impl BuildNet {
             self.clear_any_egress(&lease.guest_ip, any_port).await;
         }
         let _ = run_ip(&["link", "delete", &lease.tap]).await;
-        self.free_slots.lock().await.push(lease.slot);
+        self.free_slots.lock().unwrap().push(lease.slot);
+        lease.released = true;
     }
 
     /// The JKBUILD rule spec (sans verb) granting ONE guest IP reach to the
@@ -2058,7 +2104,14 @@ esac
         let output_img = workspace.join("output.img");
         build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
 
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
+        let net = Arc::new(BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            None,
+            100_000,
+            8,
+        ));
         let lease = net.acquire(false).await.expect("acquire build net");
         let release = format!("/sys/class/net/{}", lease.tap); // for diagnostics only
         eprintln!("leased tap={} ip={} ({release})", lease.tap, lease.guest_ip);
