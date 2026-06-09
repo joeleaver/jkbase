@@ -62,9 +62,10 @@ name = "my-app"
 public = "./dist"
 spa = true
 
-# Server container
+# Server — zero-config build from source (no Dockerfile needed; language is
+# auto-detected). Use `builder = "dockerfile"` to bring your own Dockerfile.
 [servers.api]
-dockerfile = "./Dockerfile"
+source = "./server"
 port = 8080
 health_check = { path = "/health", interval = "10s", timeout = "5s" }
 volumes = [{ name = "data", mount = "/app/data" }]
@@ -98,16 +99,25 @@ public = "./blog/out"
 prefix = "/blog"
 ```
 
-### Server containers
+### Servers
 
-Run a Docker container alongside your static site. The container runs inside the project's microVM with its own port and optional persistent storage:
+Run a server alongside your static site, inside the project's microVM with its own port and optional persistent storage. By default the platform **builds from source** — push raw code, no Dockerfile and no docker/toolchain on your machine; the language is auto-detected (Bun is the lead language):
 
 ```toml
 [servers.api]
-dockerfile = "./Dockerfile"
+source = "./server"
 port = 8080
 health_check = { path = "/health", interval = "10s", timeout = "5s" }
 volumes = [{ name = "data", mount = "/app/data" }]
+```
+
+**Bring your own Dockerfile** (escape hatch) — the platform builds it *server-side* and runs the resulting image as a self-contained server. Omit `language` (the image carries its own runtime); `dockerfile` defaults to `<source>/Dockerfile`; `port` stays authoritative for routing:
+
+```toml
+[servers.api]
+builder = "dockerfile"
+dockerfile = "./Dockerfile"
+port = 8080
 ```
 
 Volumes persist across deploys.

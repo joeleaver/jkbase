@@ -16,7 +16,10 @@ port = 8080
 health_check = { path = "/health", interval = "10s", timeout = "5s" }
 volumes = [{ name = "data", mount = "/app/data" }]
 
-# Bring-your-own container is a kept fallback, not a requirement:
+# Bring-your-own Dockerfile is a supported escape hatch, not a requirement. The
+# platform builds it SERVER-SIDE (no docker on your machine) and runs the resulting
+# image. `language` must be omitted (the image carries its own runtime); `dockerfile`
+# defaults to <source>/Dockerfile. `port` is still authoritative for routing.
 #   [servers.api]
 #   builder = "dockerfile"
 #   dockerfile = "./Dockerfile"
