@@ -132,6 +132,13 @@ pub struct BuildVmConfig {
     /// Request the layered artifact (content-addressed erofs layers + index.json)
     /// instead of the flat `rootfs.tar.gz` — passed as `jkbase.export=layered`.
     pub export_layered: bool,
+    /// Build strategy override for the in-VM lifecycle's detect, passed via the
+    /// kernel cmdline (`jkbase.builder=`). `Some("dockerfile")` forces the
+    /// Dockerfile escape-hatch buildpack; `None` → normal language detection.
+    pub builder_hint: Option<String>,
+    /// Dockerfile path relative to `/src`, passed via `jkbase.dockerfile=` when
+    /// `builder = "dockerfile"`. `None` → the buildpack defaults to `Dockerfile`.
+    pub dockerfile: Option<String>,
     /// Max wall-time the FETCH phase may hold the network before the host
     /// force-seals — even if the guest never signals fetch-complete (so a hostile
     /// build gets the network for at most this long).
@@ -384,6 +391,19 @@ impl BuildVm {
         }
         if config.export_layered {
             boot_args.push_str(" jkbase.export=layered");
+        }
+        if let Some(builder) = &config.builder_hint
+            && !builder.is_empty()
+            && builder.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            boot_args.push_str(&format!(" jkbase.builder={builder}"));
+        }
+        if let Some(df) = &config.dockerfile
+            && is_safe_cmdline_path(df)
+        {
+            // Path token (may contain '/' and '.'); validated to stay a single,
+            // shell-meta-free kernel cmdline token.
+            boot_args.push_str(&format!(" jkbase.dockerfile={df}"));
         }
         client
             .set_boot_source(&BootSource {
@@ -701,9 +721,35 @@ async fn drain_into<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// A Dockerfile path is safe to land verbatim on the kernel cmdline iff it is a
+/// single token of path-y characters only: alphanumerics plus `._-/`, non-empty,
+/// no leading `/` or `-`, and no `..` traversal. Anything else (spaces, quotes,
+/// shell metacharacters) is rejected so it cannot inject extra cmdline tokens.
+fn is_safe_cmdline_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('-')
+        && !p.contains("..")
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_cmdline_path_accepts_paths_rejects_injection() {
+        assert!(is_safe_cmdline_path("Dockerfile"));
+        assert!(is_safe_cmdline_path("docker/Dockerfile"));
+        assert!(is_safe_cmdline_path("svc/api.Dockerfile"));
+        assert!(!is_safe_cmdline_path("")); // empty
+        assert!(!is_safe_cmdline_path("/etc/passwd")); // absolute
+        assert!(!is_safe_cmdline_path("../escape/Dockerfile")); // traversal
+        assert!(!is_safe_cmdline_path("a b/Dockerfile")); // space => extra token
+        assert!(!is_safe_cmdline_path("Dockerfile;rm -rf")); // shell meta
+        assert!(!is_safe_cmdline_path("-rf")); // leading dash => flag
+    }
 
     #[test]
     fn bounded_log_caps_and_marks_once() {

@@ -24,7 +24,7 @@
 //! cargo-component for functions) are B2 and keep this contract unchanged.
 
 use anyhow::{bail, ensure, Context, Result};
-use jkbase_common::config::ProjectConfig;
+use jkbase_common::config::{Builder, ProjectConfig};
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
@@ -410,6 +410,11 @@ struct TargetSpec {
     /// Source subdir, relative to the unpacked source root.
     source_subdir: String,
     language: Option<String>,
+    /// Build strategy (`auto` buildpack detect, or the `dockerfile` escape hatch).
+    builder: Builder,
+    /// Dockerfile path relative to `source_subdir` (i.e. relative to `/src` in the
+    /// VM), for `builder = "dockerfile"`. `None` otherwise.
+    dockerfile: Option<String>,
 }
 
 /// Build-derived server manifest fields (the `cmd`/`env`/`working_dir` half of a
@@ -654,16 +659,25 @@ async fn build_one_target_inner(
             spec.name
         );
     }
-    // Resolve the language: the explicit jkbase.toml hint, else a cheap host-side
-    // sniff of the source (the in-VM lifecycle does the authoritative detect).
-    let language = detect_language(&source_path, spec.language.as_deref());
+    // Dockerfile builds pick the dedicated `dockerfile` toolchain image (buildah &c.)
+    // and do NOT language-detect (a Dockerfile carries its own runtime). The in-VM
+    // lifecycle is steered by `jkbase.builder`, not `jkbase.lang`.
+    let is_dockerfile = spec.builder == Builder::Dockerfile;
+    let (toolchain_lang, lang_hint): (Option<String>, Option<String>) = if is_dockerfile {
+        (Some("dockerfile".to_string()), None)
+    } else {
+        // Resolve the language: the explicit jkbase.toml hint, else a cheap host-side
+        // sniff of the source (the in-VM lifecycle does the authoritative detect).
+        let l = detect_language(&source_path, spec.language.as_deref());
+        (l.clone(), l)
+    };
     let toolchain = deps
-        .select_toolchain(spec.kind, language.as_deref())
+        .select_toolchain(spec.kind, toolchain_lang.as_deref())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no toolchain image for {}{} in {}",
                 kind_name(spec.kind),
-                language
+                toolchain_lang
                     .as_deref()
                     .map(|l| format!("/{l}"))
                     .unwrap_or_default(),
@@ -761,11 +775,14 @@ async fn build_one_target_inner(
         guest_ip,
         gateway_ip,
         egress_proxy,
-        lang_hint: language.clone(),
+        lang_hint,
         // Layered: the in-VM exporter emits the app erofs layer + index.json; the
         // host collection arm (below) dumps + sha256-verifies it. The runtime
-        // overlays it on the shared base/runtime layers.
+        // overlays it on the shared base/runtime layers (or, for a dockerfile build,
+        // runs the single self-contained app layer with no base/runtime).
         export_layered: true,
+        builder_hint: is_dockerfile.then(|| "dockerfile".to_string()),
+        dockerfile: spec.dockerfile.clone(),
         fetch_deadline: deps.fetch_deadline,
         seal,
     };
@@ -907,7 +924,14 @@ fn collect_layered_server(
     if let Some(obj) = manifest.as_object_mut() {
         obj.insert("app_layer".to_string(), serde_json::Value::String(file));
         obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
-        let runtime = spec.language.clone().unwrap_or_else(|| "bun".to_string());
+        // A dockerfile build is a single self-contained image layer — mark it so the
+        // host layer plan runs it standalone (no base/runtime stack) and the agent
+        // honours the image's own env. Otherwise it's a language runtime layer.
+        let runtime = if spec.builder == Builder::Dockerfile {
+            crate::layer_plan::IMAGE_SELF_RUNTIME.to_string()
+        } else {
+            spec.language.clone().unwrap_or_else(|| "bun".to_string())
+        };
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
     }
     let json = serde_json::to_string_pretty(&manifest)?;
@@ -1011,6 +1035,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         if !path_ok(sd) {
             bail!("server '{name}' source {sd:?} must be a relative path inside the project (no '..' or absolute)");
         }
+        // builder = auto|dockerfile, and (for dockerfile) language/dockerfile coherence.
+        s.validate(name)?;
+        // The Dockerfile must live inside the project tree (it becomes a /src path).
+        if s.builder()? == Builder::Dockerfile {
+            let df = s.dockerfile_path();
+            if !path_ok(&df) {
+                bail!("server '{name}' dockerfile {df:?} must be a relative path inside the project (no '..' or absolute)");
+            }
+        }
     }
     for (name, site) in &config.sites {
         if !path_ok(&site.public) {
@@ -1033,19 +1066,45 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             kind: TargetKind::Function,
             source_subdir: f.source.clone(),
             language: f.language.clone(),
+            builder: Builder::Auto, // functions take the wasm path, never a Dockerfile
+            dockerfile: None,
         });
     }
     for (name, s) in &config.servers {
+        // `builder` was validated at intake (see run_inner); default to Auto on the
+        // (already-rejected) error path rather than panicking here.
+        let builder = s.builder().unwrap_or(Builder::Auto);
+        let dockerfile = (builder == Builder::Dockerfile)
+            .then(|| dockerfile_relpath(&s.dockerfile_path(), s.source_dir()));
         specs.push(TargetSpec {
             name: name.clone(),
             kind: TargetKind::Server,
             source_subdir: s.source_dir().to_string(),
             language: s.language.clone(),
+            builder,
+            dockerfile,
         });
     }
     // Deterministic order regardless of HashMap iteration.
     specs.sort_by(|a, b| (kind_name(a.kind), &a.name).cmp(&(kind_name(b.kind), &b.name)));
     specs
+}
+
+/// The Dockerfile path RELATIVE to the build VM's `/src` (which is mounted from the
+/// server's `source_dir`). `dockerfile_path` is relative to the project root, so we
+/// strip the `source_dir` prefix. Both are normalised (leading `./` removed). When
+/// the Dockerfile isn't under `source_dir` (a misconfig), the path is returned
+/// unchanged and the in-VM buildpack surfaces a clear "Dockerfile not found" error.
+fn dockerfile_relpath(dockerfile_path: &str, source_dir: &str) -> String {
+    let df = dockerfile_path.trim_start_matches("./");
+    let sd = source_dir.trim_start_matches("./").trim_end_matches('/');
+    if sd.is_empty() || sd == "." {
+        return df.to_string();
+    }
+    df.strip_prefix(sd)
+        .map(|r| r.trim_start_matches('/'))
+        .unwrap_or(df)
+        .to_string()
 }
 
 fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
@@ -1248,6 +1307,42 @@ mod tests {
         assert_eq!(specs[0].language.as_deref(), Some("rust"));
         assert_eq!(specs[2].kind, TargetKind::Server);
         assert_eq!(specs[2].source_subdir, "./server");
+        // Buildpack (auto) servers carry no dockerfile.
+        assert_eq!(specs[2].builder, Builder::Auto);
+        assert!(specs[2].dockerfile.is_none());
+    }
+
+    #[test]
+    fn enumerate_dockerfile_server_carries_relpath_and_builder() {
+        // builder = "dockerfile" with the Dockerfile under the source dir → the
+        // TargetSpec carries Builder::Dockerfile and the /src-relative path.
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\ndockerfile = \"./api/Dockerfile\"\nport = 3000\n",
+        )
+        .unwrap();
+        let specs = enumerate_targets(&cfg);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].builder, Builder::Dockerfile);
+        assert_eq!(specs[0].source_subdir, "./api"); // /src = ./api
+        assert_eq!(specs[0].dockerfile.as_deref(), Some("Dockerfile")); // relative to /src
+
+        // Explicit source + nested dockerfile → relpath strips the source prefix.
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\nsource = \".\"\ndockerfile = \"docker/api.Dockerfile\"\nport = 3000\n",
+        )
+        .unwrap();
+        let specs = enumerate_targets(&cfg);
+        assert_eq!(specs[0].dockerfile.as_deref(), Some("docker/api.Dockerfile"));
+    }
+
+    #[test]
+    fn dockerfile_relpath_strips_source_prefix() {
+        assert_eq!(dockerfile_relpath("./api/Dockerfile", "./api"), "Dockerfile");
+        assert_eq!(dockerfile_relpath("Dockerfile", "."), "Dockerfile");
+        assert_eq!(dockerfile_relpath("docker/Dockerfile", "."), "docker/Dockerfile");
+        assert_eq!(dockerfile_relpath("svc/sub/Dockerfile", "svc"), "sub/Dockerfile");
+        // Dockerfile not under the source dir (misconfig) → returned unchanged.
+        assert_eq!(dockerfile_relpath("other/Dockerfile", "svc"), "other/Dockerfile");
     }
 
     #[test]
@@ -1624,6 +1719,8 @@ esac
             egress_proxy: Some(net.proxy_url()),
             lang_hint: None,
             export_layered: false,
+            builder_hint: None,
+            dockerfile: None,
             fetch_deadline: Duration::from_secs(20),
             seal: Some(make_seal(lease.tap.clone())),
         };
