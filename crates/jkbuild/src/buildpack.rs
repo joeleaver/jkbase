@@ -48,6 +48,11 @@ pub struct DetectContext<'a> {
     /// Optional `language=` hint from `jkbase.toml`, passed in via the kernel
     /// cmdline (`jkbase.lang=`). An explicit hint overrides heuristic detection.
     pub language_hint: Option<&'a str>,
+    /// Explicit build strategy from `jkbase.toml` (`jkbase.builder=`):
+    /// `Some("dockerfile")` forces the Dockerfile escape hatch (and language
+    /// buildpacks must stand down); `None`/`Some("auto")` = normal buildpack
+    /// detection.
+    pub builder_hint: Option<&'a str>,
 }
 
 /// Mutable context threaded through [`Buildpack::fetch`] and
@@ -65,6 +70,9 @@ pub struct BuildContext<'a> {
     pub env: BuildEnv,
     /// Egress proxy URL during the fetch phase (`None` once sealed / offline).
     pub proxy: Option<String>,
+    /// Dockerfile path relative to `app_dir` for `builder = "dockerfile"`
+    /// (`jkbase.dockerfile=`). `None` → the buildpack defaults to `Dockerfile`.
+    pub dockerfile: Option<String>,
 }
 
 /// What a buildpack's build produces. The exporter turns this into `/out`.
