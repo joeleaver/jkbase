@@ -547,7 +547,7 @@ async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
 async fn resync_clock_response(_req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
     let r = clock::resync_now();
     if r.ok {
-        info!(detail = %r.detail, "clock resynced (chronyc makestep)");
+        info!(detail = %r.detail, "clock resynced (direct PHC step)");
     } else {
         error!(detail = %r.detail, "clock resync failed");
     }
