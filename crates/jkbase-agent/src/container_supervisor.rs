@@ -390,28 +390,57 @@ fn generate_boot_id() -> String {
     format!("{nanos:x}-{}", std::process::id())
 }
 
+const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// Apply the per-server env every server process gets, plus its manifest env.
 /// `extra_path` (e.g. the bun bin dir) is appended to PATH when set.
-fn apply_server_env(std_cmd: &mut std::process::Command, manifest: &ServerManifest, extra_path: &str) {
+///
+/// `image_self` marks a self-contained image server (the `builder = "dockerfile"`
+/// escape hatch): it carries its own userland, so the image's own `PATH`/`HOME`/
+/// `HOSTNAME` (from the OCI config, in `manifest.env`) must WIN — we only supply a
+/// default when the image left one unset, and the `/opt/bun` PATH append is
+/// irrelevant. `PORT` stays platform-authoritative in BOTH modes (the routing
+/// contract), applied last so no manifest env can clobber it. For the normal
+/// (layered) path, the platform sets PATH/HOME/HOSTNAME authoritatively as before.
+fn apply_server_env(
+    std_cmd: &mut std::process::Command,
+    manifest: &ServerManifest,
+    extra_path: &str,
+    image_self: bool,
+) {
     std_cmd.env_clear();
     // Tenant/build-supplied env FIRST (build-time `NODE_ENV` + host-injected project
-    // secrets), so the platform-reserved vars below always win: a project secret must
-    // not be able to clobber PORT (breaks the routing contract) or PATH/HOME/HOSTNAME
-    // (breaks the runtime). The host already filters reserved keys at injection; this
-    // ordering is the authoritative backstop against any manifest env.
+    // secrets), so the platform-reserved vars below win where they apply. The host
+    // already filters reserved keys (PORT/HOME/HOSTNAME/PATH) out of secret injection,
+    // so a secret can never reach the reserved set — only the BUILD (e.g. an image's
+    // OCI Env) populates PATH/HOME here, which is exactly what image_self honours.
     for (key, value) in &manifest.env {
         std_cmd.env(key, value);
     }
+    // PORT is the routing contract — authoritative in every mode, applied last.
     std_cmd.env("PORT", manifest.port.to_string());
-    std_cmd.env("HOME", "/root");
-    std_cmd.env("HOSTNAME", "0.0.0.0");
-    let base_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    let path = if extra_path.is_empty() {
-        base_path.to_string()
+
+    if image_self {
+        // Honour the image's own userland; default only what it didn't set.
+        if !manifest.env.contains_key("HOME") {
+            std_cmd.env("HOME", "/root");
+        }
+        if !manifest.env.contains_key("HOSTNAME") {
+            std_cmd.env("HOSTNAME", "0.0.0.0");
+        }
+        if !manifest.env.contains_key("PATH") {
+            std_cmd.env("PATH", BASE_PATH);
+        }
     } else {
-        format!("{base_path}:{extra_path}")
-    };
-    std_cmd.env("PATH", path);
+        std_cmd.env("HOME", "/root");
+        std_cmd.env("HOSTNAME", "0.0.0.0");
+        let path = if extra_path.is_empty() {
+            BASE_PATH.to_string()
+        } else {
+            format!("{BASE_PATH}:{extra_path}")
+        };
+        std_cmd.env("PATH", path);
+    }
     std_cmd.stdout(Stdio::piped());
     std_cmd.stderr(Stdio::piped());
 }
@@ -468,7 +497,7 @@ fn spawn_server_chroot(
     if manifest.cmd.len() > 1 {
         std_cmd.args(&manifest.cmd[1..]);
     }
-    apply_server_env(&mut std_cmd, manifest, "");
+    apply_server_env(&mut std_cmd, manifest, "", false);
 
     unsafe {
         std_cmd.pre_exec(move || {
@@ -576,7 +605,11 @@ fn spawn_server_layered(
     if manifest.cmd.len() > 1 {
         std_cmd.args(&manifest.cmd[1..]);
     }
-    apply_server_env(&mut std_cmd, manifest, "/opt/bun/bin");
+    // A single lowerdir is a self-contained image (image/self): no shared base/
+    // runtime beneath it, so honour the image's own PATH/HOME and skip /opt/bun.
+    let image_self = lowerdirs.len() == 1;
+    let extra_path = if image_self { "" } else { "/opt/bun/bin" };
+    apply_server_env(&mut std_cmd, manifest, extra_path, image_self);
 
     unsafe {
         std_cmd.pre_exec(move || setup.enter());
@@ -832,7 +865,7 @@ mod tests {
             volumes: vec![],
         };
         let mut cmd = std::process::Command::new("true");
-        apply_server_env(&mut cmd, &manifest, "/opt/bun/bin");
+        apply_server_env(&mut cmd, &manifest, "/opt/bun/bin", false);
         let envs: HashMap<String, String> = cmd
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
@@ -845,5 +878,56 @@ mod tests {
         assert_ne!(envs.get("PATH").map(String::as_str), Some("/evil"), "platform PATH wins");
         assert!(envs.get("PATH").is_some_and(|p| p.contains("/opt/bun/bin")));
         assert_eq!(envs.get("HOME").map(String::as_str), Some("/root"));
+    }
+
+    #[test]
+    fn apply_server_env_image_self_honours_image_path_home_but_forces_port() {
+        // An image/self server's OCI Env (in manifest.env) owns PATH/HOME; PORT is
+        // still platform-authoritative. (Secrets can't reach PATH/HOME — the host
+        // filters reserved keys at injection — so manifest.env here is the image's.)
+        let mut env = HashMap::new();
+        env.insert("PATH".to_string(), "/usr/local/bin:/sbin:/bin".to_string());
+        env.insert("HOME".to_string(), "/home/node".to_string());
+        env.insert("NODE_ENV".to_string(), "production".to_string());
+        env.insert("PORT".to_string(), "9999".to_string()); // image's EXPOSE/Env loses to platform
+        let manifest = ServerManifest {
+            port: 3000,
+            cmd: vec!["/usr/local/bin/node".into(), "server.js".into()],
+            env,
+            working_dir: Some("/app".into()),
+            health_check: None,
+            volumes: vec![],
+        };
+        let mut cmd = std::process::Command::new("true");
+        apply_server_env(&mut cmd, &manifest, "", true);
+        let envs: HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        // The image's own PATH/HOME win (NOT clobbered, no /opt/bun appended).
+        assert_eq!(envs.get("PATH").map(String::as_str), Some("/usr/local/bin:/sbin:/bin"));
+        assert_eq!(envs.get("HOME").map(String::as_str), Some("/home/node"));
+        assert!(!envs["PATH"].contains("/opt/bun"), "no bun PATH for an image server");
+        // PORT remains the routing contract regardless of mode.
+        assert_eq!(envs.get("PORT").map(String::as_str), Some("3000"), "platform PORT wins");
+        assert_eq!(envs.get("NODE_ENV").map(String::as_str), Some("production"));
+
+        // And when the image sets NO PATH/HOME, the platform defaults fill in.
+        let manifest2 = ServerManifest {
+            port: 3000,
+            cmd: vec!["/server".into()],
+            env: HashMap::new(),
+            working_dir: None,
+            health_check: None,
+            volumes: vec![],
+        };
+        let mut cmd2 = std::process::Command::new("true");
+        apply_server_env(&mut cmd2, &manifest2, "", true);
+        let envs2: HashMap<String, String> = cmd2
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(envs2.get("HOME").map(String::as_str), Some("/root"));
+        assert_eq!(envs2.get("PATH").map(String::as_str), Some(BASE_PATH));
     }
 }
