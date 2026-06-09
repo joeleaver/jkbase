@@ -811,6 +811,10 @@ async fn delete_project(
                     let _ = state.store.purge_usage(&id);
                     let _ = state.store.remove_quota(&id);
                     let _ = state.store.remove_quota_status(&id);
+                    // Purge the project's secrets so a recreated project of the same
+                    // slug can't inherit them — the deploy path injects secrets into the
+                    // container env, so a stale secret would leak to a new tenant.
+                    let _ = state.store.delete_all_secrets(&id);
                     // Reap the git-push credential + bare repo so a recreated
                     // project of the same slug can't inherit a prior tenant's
                     // token or pushed objects (the auth tenant-check is the
