@@ -179,24 +179,28 @@ impl ProjectConfig {
         }
 
         if sites.is_empty() {
-            let public = self
-                .hosting
-                .as_ref()
-                .and_then(|h| h.public.as_deref())
-                .unwrap_or(".")
-                .to_string();
-            let spa = self
-                .hosting
-                .as_ref()
-                .and_then(|h| h.spa)
-                .unwrap_or(false);
-            sites.push(ResolvedSite {
-                name: "default".to_string(),
-                public,
-                spa,
-                prefix: "/".to_string(),
-                domain: None,
-            });
+            // Synthesize a default static site from [hosting]. With NO [hosting] AND no
+            // [sites], a SERVER app (declares [servers]) has no static site of its own —
+            // every path is routed to the container, and defaulting `public` to "."
+            // would package the entire source tree as a static image. A static-only
+            // deploy (no servers) keeps the zero-config default: serve the repo root.
+            let synthesize = self.hosting.is_some() || self.servers.is_empty();
+            if synthesize {
+                let public = self
+                    .hosting
+                    .as_ref()
+                    .and_then(|h| h.public.as_deref())
+                    .unwrap_or(".")
+                    .to_string();
+                let spa = self.hosting.as_ref().and_then(|h| h.spa).unwrap_or(false);
+                sites.push(ResolvedSite {
+                    name: "default".to_string(),
+                    public,
+                    spa,
+                    prefix: "/".to_string(),
+                    domain: None,
+                });
+            }
         }
 
         // Sort by prefix length descending (longest match first)
@@ -388,6 +392,36 @@ mod tests {
         // No [build] block -> None.
         let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
         assert!(bare.build.is_none());
+    }
+
+    #[test]
+    fn server_app_without_hosting_has_no_default_static_site() {
+        // A server app with NO [hosting]/[sites]: no static site is synthesized, so the
+        // source tree is never packaged as a static image (the catch-all route sends
+        // everything to the container).
+        let server: ProjectConfig =
+            toml::from_str("[project]\nname = \"app\"\n[servers.app]\nport = 3000\n").unwrap();
+        assert!(server.resolved_sites().is_empty(), "server app gets no default static site");
+        assert!(!server.is_multi_site());
+        assert!(server.sites_json().is_none());
+
+        // A static-only deploy (no servers, no hosting) KEEPS the zero-config default:
+        // serve the repo root.
+        let static_only: ProjectConfig = toml::from_str("[project]\nname = \"s\"\n").unwrap();
+        let sites = static_only.resolved_sites();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].public, ".");
+        assert_eq!(sites[0].name, "default");
+
+        // Explicit [hosting] always synthesizes the default site, even with servers
+        // present (so existing www/console/forumall configs are unaffected).
+        let with_hosting: ProjectConfig = toml::from_str(
+            "[project]\nname = \"h\"\n[servers.app]\nport = 3000\n[hosting]\npublic = \"./public\"\n",
+        )
+        .unwrap();
+        let sites = with_hosting.resolved_sites();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].public, "./public");
     }
 
     #[test]
