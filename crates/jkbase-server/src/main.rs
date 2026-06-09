@@ -1391,6 +1391,13 @@ async fn wake_project_inner(
 
     wait_for_agent(&alloc.ip).await?;
 
+    // A restored snapshot resumes with its wall clock frozen at snapshot time, so
+    // it lags by the whole hibernation; a cold boot's tsc clock is undisciplined.
+    // Nudge the agent to re-read its KVM PTP reference and step CLOCK_REALTIME now,
+    // so the first request after wake sees correct time instead of waiting for the
+    // agent's periodic discipline tick. Best-effort — never fail a wake on this.
+    resync_clock_agent(&alloc.ip).await;
+
     let mut plat = platform.lock().await;
 
     // Re-validate the project still exists before committing the VM. handle_teardown
@@ -2165,6 +2172,27 @@ async fn sync_agent(ip: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ask the agent to step the guest wall clock to its PTP reference now (the agent
+/// runs `chronyc makestep`). Used after wake/restore so a restored snapshot — whose
+/// clock is frozen at snapshot time — corrects instantly instead of on chrony's
+/// next poll. Best-effort and bounded: a clock nudge must never block a wake.
+async fn resync_clock_agent(ip: &str) {
+    let send = async {
+        let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await.ok()?;
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
+        tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri(format!("http://{ip}:80/_jkbase/resync-clock"))
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .ok()?;
+        let _ = sender.send_request(req).await;
+        Some(())
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(3), send).await;
 }
 
 async fn wait_for_agent(ip: &str) -> Result<()> {

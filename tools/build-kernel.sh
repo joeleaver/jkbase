@@ -59,7 +59,8 @@ make olddefconfig
 # Fail loudly if any must-have capability didn't make it into the resolved config.
 missing=0
 for sym in CONFIG_EROFS_FS CONFIG_OVERLAY_FS CONFIG_FS_VERITY CONFIG_DM_VERITY \
-    CONFIG_SQUASHFS CONFIG_VIRTIO_BLK CONFIG_EXT4_FS CONFIG_USER_NS CONFIG_FUSE_FS; do
+    CONFIG_SQUASHFS CONFIG_VIRTIO_BLK CONFIG_EXT4_FS CONFIG_USER_NS CONFIG_FUSE_FS \
+    CONFIG_PTP_1588_CLOCK_KVM; do
     if ! grep -q "^${sym}=y" .config; then
         echo "[build-kernel] ERROR: ${sym}=y missing after olddefconfig" >&2
         missing=1

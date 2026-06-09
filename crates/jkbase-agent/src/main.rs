@@ -1,3 +1,4 @@
+mod clock;
 mod container_supervisor;
 mod function_runtime;
 mod static_server;
@@ -28,6 +29,8 @@ fn mount_filesystems() {
         ("/sys", "sysfs", "sysfs"),
         ("/dev", "devtmpfs", "devtmpfs"),
         ("/tmp", "tmpfs", "tmpfs"),
+        // chrony's writable runtime dir (driftfile + command socket) lives here.
+        ("/run", "tmpfs", "tmpfs"),
     ];
 
     for (target, fstype, source) in &mounts {
@@ -259,6 +262,16 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt::init();
 
+    // Discipline the guest wall clock against the host's KVM PTP device via chrony
+    // (refclock PHC /dev/ptp0): it corrects the free-running-tsc frequency error and
+    // any offset with no network. As PID 1 we own supervising chronyd. The
+    // hibernate/resume jump is corrected instantly on demand via POST
+    // /_jkbase/resync-clock (chronyc makestep), fired by the host after it resumes a
+    // restored snapshot. See clock.rs.
+    if is_pid1() {
+        clock::start_chrony();
+    }
+
     let serve_dir = PathBuf::from(
         std::env::var("JKBASE_SERVE_DIR").unwrap_or_else(|_| "/srv/www".to_string()),
     );
@@ -444,6 +457,10 @@ async fn handle_request(
             .unwrap());
     }
 
+    if path == "/_jkbase/resync-clock" {
+        return Ok(resync_clock_response(req).await);
+    }
+
     if path == "/_jkbase/logs" || path.starts_with("/_jkbase/logs?") {
         return Ok(logs_response(&state, &req).await);
     }
@@ -519,6 +536,26 @@ async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
         .body(Full::new(Bytes::from(
             serde_json::to_vec_pretty(&body).unwrap(),
         )))
+        .unwrap()
+}
+
+/// Re-discipline the guest wall clock on demand by forcing `chronyc makestep`. The
+/// host POSTs this right after resuming a restored snapshot — the guest clock is
+/// frozen at snapshot time, so it lags by the paused duration; stepping it now
+/// (rather than waiting for chrony's next poll) means the first request after wake
+/// already sees correct time.
+async fn resync_clock_response(_req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+    let r = clock::resync_now().await;
+    if r.ok {
+        info!(detail = %r.detail, "clock resynced (chronyc makestep)");
+    } else {
+        error!(detail = %r.detail, "clock resync failed");
+    }
+    let body = serde_json::json!({ "ok": r.ok, "detail": r.detail });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
         .unwrap()
 }
 

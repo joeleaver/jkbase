@@ -42,3 +42,15 @@ CONFIG_SQUASHFS_ZSTD=y
 # them as must-haves). ---
 CONFIG_USER_NS=y
 CONFIG_FUSE_FS=y
+
+# --- KVM PTP clock: the guest's host-disciplined wall-clock reference. ptp_kvm
+# registers /dev/ptp0 ("KVM virtual PTP"); the agent reads the host's UTC from it
+# (KVM_HC_CLOCK_PAIRING, no network) to correct both the free-running-tsc drift of
+# running in a VM and the hibernate/resume time jump. The Firecracker baseline
+# enables these today, but pin them so a baseline change can't silently drop the
+# guest's ONLY time source (build-kernel.sh also asserts CONFIG_PTP_1588_CLOCK_KVM).
+# NOTE: we deliberately do NOT pin `clocksource=kvm-clock` on the cmdline — that
+# opts into a documented Firecracker restore regression (monotonic clock jumps on
+# resume); the guest stays on the auto-selected tsc and the agent disciplines it. ---
+CONFIG_PTP_1588_CLOCK=y
+CONFIG_PTP_1588_CLOCK_KVM=y
