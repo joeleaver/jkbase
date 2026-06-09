@@ -245,15 +245,76 @@ pub struct BuildNet {
     pub proxy_any_port: Option<u16>,
     subnet_prefix: String,
     uid: u32,
-    free_slots: Mutex<Vec<u8>>,
+    pool_size: u8,
+    // std (not tokio) Mutex: the critical sections are tiny pop/push with no await,
+    // and NetLease's Drop safety-net must return the slot synchronously.
+    free_slots: std::sync::Mutex<Vec<u8>>,
+    /// Serializes ALL JKBUILD mutations (install/clear of per-lease rules) within
+    /// this process. Builds fan out concurrently (semaphore-bounded) and each touches
+    /// iptables, so without this two acquires/releases could interleave their rule
+    /// edits. Paired with `iptables -w` (which serializes against OTHER processes —
+    /// e.g. the ExecStartPre firewall script — via the xtables lock), this makes the
+    /// revoke path reliable rather than silently fail-open on lock contention.
+    fw_lock: Mutex<()>,
 }
 
 /// A leased build-network slot (its TAP + guest IP/MAC); returned via [`BuildNet::release`].
 pub struct NetLease {
+    /// Back-reference for the `Drop` safety-net (return the slot, revoke the grant).
+    net: Arc<BuildNet>,
     slot: u8,
     tap: String,
     guest_ip: String,
     mac: String,
+    /// Whether this lease was granted a per-source ACCEPT to the public-any
+    /// (dockerfile) egress proxy port, so [`BuildNet::release`] revokes exactly
+    /// what [`BuildNet::acquire`] installed.
+    any_egress: bool,
+    /// Set by the explicit async [`BuildNet::release`] so `Drop` doesn't double-clean.
+    released: bool,
+}
+
+impl Drop for NetLease {
+    fn drop(&mut self) {
+        if self.released {
+            return; // the explicit async release already cleaned up.
+        }
+        // Safety net: a panic or runtime cancellation skipped the explicit release.
+        // Best-effort BLOCKING cleanup so a dropped build can't leak its slot
+        // (pool-exhaustion DoS) or its :3129 grant. No fw_lock (can't .await in Drop);
+        // each `iptables -w -D` is atomic under the xtables lock, enough for a
+        // single-rule revoke.
+        if self.any_egress
+            && let Some(any_port) = self.net.proxy_any_port
+        {
+            let spec = self.net.any_egress_rule(&self.guest_ip, any_port);
+            for _ in 0..8 {
+                // Bounded `-w 5`: Drop is blocking + uncancellable, so a contended
+                // xtables lock must not pin this worker thread indefinitely.
+                let mut args = vec![
+                    "-w".to_string(),
+                    "5".to_string(),
+                    "-D".to_string(),
+                    "JKBUILD".to_string(),
+                ];
+                args.extend(spec.iter().cloned());
+                let removed = std::process::Command::new("iptables")
+                    .args(&args)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !removed {
+                    break;
+                }
+            }
+        }
+        let _ = std::process::Command::new("ip")
+            .args(["link", "delete", &self.tap])
+            .status();
+        if let Ok(mut slots) = self.net.free_slots.lock() {
+            slots.push(self.slot);
+        }
+    }
 }
 
 impl BuildNet {
@@ -282,7 +343,9 @@ impl BuildNet {
             proxy_any_port,
             subnet_prefix,
             uid,
-            free_slots: Mutex::new(free_slots),
+            pool_size,
+            free_slots: std::sync::Mutex::new(free_slots),
+            fw_lock: Mutex::new(()),
         }
     }
 
@@ -301,9 +364,16 @@ impl BuildNet {
 
     /// Lease a slot and bring up its TAP — owned by the build uid (so the jailed
     /// firecracker can open it) and mastered to the build bridge.
-    pub async fn acquire(&self) -> Result<NetLease> {
+    ///
+    /// `allow_any_egress` (dockerfile builds) grants THIS lease's guest IP — and
+    /// only it — a per-source firewall rule to the public-any egress proxy. The
+    /// firewall opens the public-any port to no one by default, so a hostile
+    /// non-dockerfile build can't ignore its assigned narrow proxy and reach broad
+    /// egress directly: the in-guest `jkbase.proxy=` boot-arg is only a hint, and
+    /// the guest is untrusted, so the network layer is the real boundary.
+    pub async fn acquire(self: &Arc<Self>, allow_any_egress: bool) -> Result<NetLease> {
         let slot = {
-            let mut slots = self.free_slots.lock().await;
+            let mut slots = self.free_slots.lock().unwrap();
             slots
                 .pop()
                 .ok_or_else(|| anyhow::anyhow!("build network pool exhausted"))?
@@ -312,22 +382,119 @@ impl BuildNet {
         let guest_ip = format!("{}.{}", self.subnet_prefix, slot as u16 + 1);
         let mac = format!("AA:FC:00:1F:00:{slot:02X}");
         if let Err(e) = self.setup_tap(&tap).await {
-            self.free_slots.lock().await.push(slot);
+            self.free_slots.lock().unwrap().push(slot);
             return Err(e);
         }
+        // Per-VM public-any scoping. Slots (hence guest IPs) are reused, so a
+        // crashed dockerfile lease could leave a stale grant that a later
+        // non-dockerfile lease on the same IP would inherit — always clear first,
+        // then grant only for a dockerfile lease. A no-op when the public-any proxy
+        // is unconfigured (`proxy_any_port` None), so non-activated boxes are
+        // unchanged.
+        let mut any_egress = false;
+        if let Some(any_port) = self.proxy_any_port {
+            let _fw = self.fw_lock.lock().await;
+            self.clear_any_egress(&guest_ip, any_port).await;
+            if allow_any_egress {
+                if let Err(e) = self.install_any_egress(&guest_ip, any_port).await {
+                    // Fail closed: roll back the TAP + slot rather than boot a VM
+                    // that can't reach the proxy it was told to use.
+                    let _ = run_ip(&["link", "delete", &tap]).await;
+                    self.free_slots.lock().unwrap().push(slot);
+                    return Err(e);
+                }
+                any_egress = true;
+            }
+        }
         Ok(NetLease {
+            net: Arc::clone(self),
             slot,
             tap,
             guest_ip,
             mac,
+            any_egress,
+            released: false,
         })
     }
 
     /// Tear the leased TAP down (idempotent — the seal may already have deleted
-    /// it) and return its slot to the pool.
-    pub async fn release(&self, lease: NetLease) {
+    /// it), revoke any per-lease public-any egress grant, and return the slot. Marks
+    /// the lease released so its `Drop` safety-net is a no-op.
+    pub async fn release(&self, mut lease: NetLease) {
+        if lease.any_egress
+            && let Some(any_port) = self.proxy_any_port
+        {
+            let _fw = self.fw_lock.lock().await;
+            self.clear_any_egress(&lease.guest_ip, any_port).await;
+        }
         let _ = run_ip(&["link", "delete", &lease.tap]).await;
-        self.free_slots.lock().await.push(lease.slot);
+        self.free_slots.lock().unwrap().push(lease.slot);
+        lease.released = true;
+    }
+
+    /// The JKBUILD rule spec (sans verb) granting ONE guest IP reach to the
+    /// public-any (dockerfile) egress proxy port. Kept exact so the `-I` (install)
+    /// and `-D` (revoke) forms match the same rule.
+    fn any_egress_rule(&self, guest_ip: &str, any_port: u16) -> Vec<String> {
+        vec![
+            "-s".into(),
+            guest_ip.to_string(),
+            "-p".into(),
+            "tcp".into(),
+            "-d".into(),
+            self.gateway.clone(),
+            "--dport".into(),
+            any_port.to_string(),
+            "-j".into(),
+            "ACCEPT".into(),
+        ]
+    }
+
+    /// Remove EVERY JKBUILD rule granting `guest_ip` the public-any port (there may
+    /// be a stale one from a crashed lease on the same, since-reused slot).
+    /// Idempotent: loops until `iptables -D` reports no matching rule. `-w` makes the
+    /// "no match" verdict trustworthy — without it, losing the xtables lock to a
+    /// concurrent edit returns the same nonzero exit as "rule absent", which would
+    /// silently leave a stale grant installed (a fail-open in the revoke path). Call
+    /// under `fw_lock` so this process's own edits never contend.
+    async fn clear_any_egress(&self, guest_ip: &str, any_port: u16) {
+        let spec = self.any_egress_rule(guest_ip, any_port);
+        for _ in 0..64 {
+            let mut args = vec!["-w".to_string(), "-D".to_string(), "JKBUILD".to_string()];
+            args.extend(spec.iter().cloned());
+            let removed = tokio::process::Command::new("iptables")
+                .args(&args)
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !removed {
+                break;
+            }
+        }
+    }
+
+    /// Grant ONE dockerfile-build guest IP reach to the public-any proxy. Inserted
+    /// at the top of JKBUILD so it precedes the chain's terminal DROP. `-w` waits for
+    /// the xtables lock instead of failing the build on contention. Call under
+    /// `fw_lock`.
+    async fn install_any_egress(&self, guest_ip: &str, any_port: u16) -> Result<()> {
+        let mut args = vec![
+            "-w".to_string(),
+            "-I".to_string(),
+            "JKBUILD".to_string(),
+            "1".to_string(),
+        ];
+        args.extend(self.any_egress_rule(guest_ip, any_port));
+        let status = tokio::process::Command::new("iptables")
+            .args(&args)
+            .status()
+            .await
+            .context("install per-lease public-any egress rule")?;
+        if !status.success() {
+            bail!("iptables -I JKBUILD (per-lease public-any egress) failed for {guest_ip}");
+        }
+        Ok(())
     }
 
     async fn setup_tap(&self, tap: &str) -> Result<()> {
@@ -383,8 +550,8 @@ impl BuildNet {
         }
         // FATAL: the isolation rules. Without these a build VM could reach the host
         // / other VMs / the internet — refuse to run builds at all.
-        let input_hook = ["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
-        let fwd_drop = ["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
+        let input_hook = ["-w", "-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
+        let fwd_drop = ["-w", "-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
         for check in [input_hook, fwd_drop] {
             let ok = tokio::process::Command::new("iptables")
                 .args(check)
@@ -398,35 +565,127 @@ impl BuildNet {
                 );
             }
         }
-        // WARN-only: the proxy-port ACCEPT rules are about FUNCTIONALITY (can a build
-        // reach the egress proxy), not isolation — a missing one makes builds fail at
-        // fetch (fail-safe), so surface it loudly but don't refuse to start (and never
-        // outage the runtime over an iptables rule-form mismatch).
-        let proxy_accept = |port: u16| -> Vec<String> {
-            vec![
-                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
-                "-d".into(), self.gateway.clone(), "--dport".into(), port.to_string(),
-                "-j".into(), "ACCEPT".into(),
-            ]
-        };
-        let mut want = vec![self.proxy_port];
+        // FATAL (only when the public-any proxy is configured): a *blanket*
+        // (any-source) ACCEPT for the public-any port means EVERY build VM can reach
+        // broad egress — exactly the hole the per-lease scoping closes. A lingering
+        // old `setup-build-net.sh` that opens it to all sources would silently defeat
+        // the isolation, so refuse to start if such a rule is present. (The per-lease
+        // grants carry `-s <guest_ip>`, which `-C` without `-s` will NOT match, so
+        // this only trips on a truly source-unrestricted rule.)
         if let Some(any) = self.proxy_any_port {
-            want.push(any);
-        }
-        for port in want {
-            let ok = tokio::process::Command::new("iptables")
-                .args(proxy_accept(port))
+            let blanket = [
+                "-w", "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
+                "--dport", &any.to_string(), "-j", "ACCEPT",
+            ];
+            let present = tokio::process::Command::new("iptables")
+                .args(blanket)
                 .status()
                 .await
                 .map(|s| s.success())
                 .unwrap_or(false);
-            if !ok {
-                warn!(
-                    gateway = %self.gateway, port,
-                    "build firewall: no ACCEPT rule for the egress proxy port — builds will get no egress; run `sudo tools/setup-build-net.sh`"
+            if present {
+                bail!(
+                    "build firewall opens the public-any proxy port {any} to ALL build VMs \
+                     (source-unrestricted ACCEPT in JKBUILD) — this defeats per-dockerfile-VM \
+                     egress scoping. Re-sync + re-run `sudo tools/setup-build-net.sh` (it no \
+                     longer adds a blanket rule for this port)."
                 );
             }
         }
+        // WARN-only: the narrow allowlist proxy ACCEPT is about FUNCTIONALITY (can a
+        // build reach the egress proxy), not isolation — a missing one makes builds
+        // fail at fetch (fail-safe), so surface it loudly but don't refuse to start
+        // (and never outage the runtime over an iptables rule-form mismatch).
+        let proxy_accept = [
+            "-w", "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
+            "--dport", &self.proxy_port.to_string(), "-j", "ACCEPT",
+        ];
+        let ok = tokio::process::Command::new("iptables")
+            .args(proxy_accept)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            warn!(
+                gateway = %self.gateway, port = self.proxy_port,
+                "build firewall: no ACCEPT rule for the egress proxy port — builds will get no egress; run `sudo tools/setup-build-net.sh`"
+            );
+        }
+        Ok(())
+    }
+
+    /// Install the L2 source-guard that makes the per-lease `-s <ip>` :3129 grant
+    /// un-spoofable. Build VMs share one bridge with the gateway, and bridge port
+    /// isolation only blocks VM↔VM — a hostile guest can still emit frames toward the
+    /// gateway bearing ANOTHER VM's source IP, which an iptables `-s` rule would
+    /// honour (defeating per-dockerfile-VM scoping). ebtables sees the real L2 ingress
+    /// TAP (no br_netfilter / physdev needed), so we pin each slot's TAP to its
+    /// assigned source MAC + IPv4 source + ARP source: a frame on `jkbld<N>` not
+    /// bearing slot N's identity is dropped before iptables ever sees it.
+    ///
+    /// Static per-slot (ebtables accepts rules for not-yet-created TAPs), so there is
+    /// no per-build L2 churn. Idempotent (re-flushes + repopulates on each startup).
+    /// No-op — and no ebtables dependency exercised — when the public-any proxy is
+    /// unconfigured, so non-activated boxes are unchanged. FAIL-CLOSED when activated:
+    /// running the per-VM :3129 scoping without this guard is the spoofable state, so
+    /// refuse to start if it can't be installed.
+    pub async fn ensure_source_guard(&self) -> Result<()> {
+        if self.proxy_any_port.is_none() {
+            return Ok(());
+        }
+        // (Re)create the chain empty for idempotency (ignore "already exists").
+        let _ = run_ebtables(&["-t", "filter", "-N", SOURCE_GUARD_CHAIN]).await;
+        run_ebtables(&["-t", "filter", "-F", SOURCE_GUARD_CHAIN])
+            .await
+            .context(
+                "flush ebtables source-guard chain (is `ebtables` installed? it is \
+                 required when --build-proxy-any-port is set)",
+            )?;
+        for slot in 1..=self.pool_size {
+            let tap = format!("jkbld{slot}");
+            let ip = format!("{}.{}", self.subnet_prefix, slot as u16 + 1);
+            let mac = format!("AA:FC:00:1F:00:{slot:02X}");
+            // DROP frames on this TAP not bearing slot N's source MAC / IPv4 src / ARP src.
+            // First, DROP any 802.1Q VLAN-tagged frame outright: `-p IPv4`/`-p ARP` match
+            // the OUTER ethertype, so a tagged frame (0x8100) would skip the IP/ARP source
+            // pins. Build VMs have no VLAN use case, so this closes that bypass at the
+            // source rather than relying on the host never decapsulating VLAN tags.
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "802_1Q",
+                "-j", "DROP",
+            ])
+            .await?;
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "!", "-s",
+                mac.as_str(), "-j", "DROP",
+            ])
+            .await?;
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "IPv4",
+                "!", "--ip-src", ip.as_str(), "-j", "DROP",
+            ])
+            .await?;
+            run_ebtables(&[
+                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "ARP",
+                "!", "--arp-ip-src", ip.as_str(), "-j", "DROP",
+            ])
+            .await?;
+        }
+        // Hook into the L2 INPUT (frames to the gateway/host) + FORWARD (VM↔VM, already
+        // isolated — defense in depth) paths, once each. Rules match `-i jkbld*`, so
+        // frames from the runtime bridge fall straight through with no effect.
+        for hook in ["INPUT", "FORWARD"] {
+            if !ebtables_ok(&["-t", "filter", "-C", hook, "-j", SOURCE_GUARD_CHAIN]).await {
+                run_ebtables(&["-t", "filter", "-I", hook, "-j", SOURCE_GUARD_CHAIN])
+                    .await
+                    .with_context(|| format!("hook source-guard into ebtables {hook}"))?;
+            }
+        }
+        info!(
+            pool = self.pool_size,
+            "build L2 source-guard installed (per-VM source IP/MAC pinning)"
+        );
         Ok(())
     }
 }
@@ -451,6 +710,34 @@ async fn run_ip(args: &[&str]) -> Result<()> {
         bail!("ip {args:?} failed: {status}");
     }
     Ok(())
+}
+
+/// The ebtables (L2/bridge filter) chain holding the per-VM source-guard rules.
+const SOURCE_GUARD_CHAIN: &str = "JKBUILD_SG";
+
+/// Run an ebtables command, erroring on failure. ebtables is only invoked by this
+/// process (the firewall script stays iptables-only), so `fw_lock` / startup
+/// single-threading already serialize edits — no `--concurrent` needed.
+async fn run_ebtables(args: &[&str]) -> Result<()> {
+    let status = tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .context("spawn ebtables")?;
+    if !status.success() {
+        bail!("ebtables {args:?} failed: {status}");
+    }
+    Ok(())
+}
+
+/// True iff the ebtables command succeeds — for `-C` existence checks; never errors.
+async fn ebtables_ok(args: &[&str]) -> bool {
+    tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// The host seal action: delete the build VM's TAP so its COMPILE phase is
@@ -750,6 +1037,23 @@ async fn build_one_target_inner(
             )
         })?;
 
+    // A `builder = "dockerfile"` build MUST resolve to the real dockerfile toolchain
+    // (buildah &c.). `select_toolchain` falls back through `<kind>.ext4`/`default.ext4`
+    // when `dockerfile.ext4` is absent — but a busybox passthrough can't build a
+    // Dockerfile, and (critically) we must NOT hand that fallback VM the public-any
+    // (:3129) egress grant keyed on the raw builder flag: that would arm broad egress
+    // for a build the operator never provisioned the feature for. Fail clearly here so
+    // `is_dockerfile` past this point implies the dockerfile toolchain actually ran.
+    let resolved_dockerfile =
+        toolchain.file_name().and_then(|s| s.to_str()) == Some("dockerfile.ext4");
+    if is_dockerfile && !resolved_dockerfile {
+        bail!(
+            "builder = \"dockerfile\" requires the dockerfile build toolchain \
+             (dockerfile.ext4), which is not provisioned in {}",
+            deps.toolchain_dir.display()
+        );
+    }
+
     let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
     let source_img = workspace.join(format!("{tag}.source.img"));
     let output_img = workspace.join(format!("{tag}.output.img"));
@@ -799,7 +1103,11 @@ async fn build_one_target_inner(
     // Lease an isolated TAP when a build network is configured, so this VM can
     // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
     let lease = match &deps.net {
-        Some(net) => Some(net.acquire().await.context("acquire build network")?),
+        Some(net) => Some(
+            net.acquire(is_dockerfile)
+                .await
+                .context("acquire build network")?,
+        ),
         None => None,
     };
     let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
@@ -901,10 +1209,32 @@ async fn build_one_target_inner(
         BuildOutcome::TimedOut => {
             bail!("build timed out after {}s\n{}", deps.timeout.as_secs(), log_str())
         }
-        BuildOutcome::Crashed { code, signal } => bail!(
-            "build VM crashed (code={code:?}, signal={signal:?}) — likely cgroup OOM-kill or panic\n{}",
-            log_str()
-        ),
+        BuildOutcome::Crashed { code, signal } => {
+            // Firecracker's RLIMIT_FSIZE is process-wide: a guest write past the
+            // scratch/output budget SIGXFSZ-kills the VM (signal 25 on Linux). Give
+            // the tenant an actionable "ran out of build space" instead of an opaque
+            // crash that reads like an OOM/panic.
+            const SIGXFSZ: i32 = 25;
+            if signal == Some(SIGXFSZ) {
+                let gib = |b: u64| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64);
+                let hint = if is_dockerfile {
+                    " — the image or its intermediate layers are too large; trim the build (fewer/smaller layers, multi-stage, prune caches)"
+                } else {
+                    " — try `builder = \"dockerfile\"` (a much larger build budget) or trim dependencies"
+                };
+                bail!(
+                    "build exceeded its disk budget (scratch {} / output {}){}\n{}",
+                    gib(scratch_size_bytes),
+                    gib(output_size_bytes),
+                    hint,
+                    log_str()
+                );
+            }
+            bail!(
+                "build VM crashed (code={code:?}, signal={signal:?}) — likely cgroup OOM-kill or panic\n{}",
+                log_str()
+            )
+        }
     }
 
     let status = build_output::read_status(&output_img)?;
@@ -1430,6 +1760,21 @@ mod tests {
     }
 
     #[test]
+    fn per_lease_any_egress_rule_is_source_scoped() {
+        // The per-lease grant pins BOTH the source guest IP and the gateway:port, so
+        // it admits exactly one VM to the public-any proxy — and `-C` without `-s`
+        // (verify_firewall's blanket-rule check) cannot match it.
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8);
+        assert_eq!(
+            net.any_egress_rule("172.31.0.5", 3129),
+            vec![
+                "-s", "172.31.0.5", "-p", "tcp", "-d", "172.31.0.1", "--dport", "3129",
+                "-j", "ACCEPT",
+            ]
+        );
+    }
+
+    #[test]
     fn dockerfile_relpath_strips_source_prefix() {
         assert_eq!(dockerfile_relpath("./api/Dockerfile", "./api"), "Dockerfile");
         assert_eq!(dockerfile_relpath("Dockerfile", "."), "Dockerfile");
@@ -1775,8 +2120,15 @@ esac
         let output_img = workspace.join("output.img");
         build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
 
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
-        let lease = net.acquire().await.expect("acquire build net");
+        let net = Arc::new(BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            None,
+            100_000,
+            8,
+        ));
+        let lease = net.acquire(false).await.expect("acquire build net");
         let release = format!("/sys/class/net/{}", lease.tap); // for diagnostics only
         eprintln!("leased tap={} ip={} ({release})", lease.tap, lease.guest_ip);
 

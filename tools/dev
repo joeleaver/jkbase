@@ -418,7 +418,7 @@ cmd_net() {
     sudo_warmup
     run_or_capture sudo "$REPO_ROOT/tools/setup-build-net.sh" jkbuild0 172.31.0.1/24 3128 3129 || die "build-net setup failed"
     run_or_capture sudo "$REPO_ROOT/tools/setup-build-cgroup.sh" || die "build-cgroup setup failed"
-    ok "build network up: VMs reach 172.31.0.1:3128 (allowlist) + :3129 (dockerfile public-any); cgroup delegated"
+    ok "build network up: VMs reach 172.31.0.1:3128 (allowlist); :3129 (dockerfile public-any) is granted per-VM at build time; cgroup delegated"
     RAN[net]=OK
 }
 
@@ -440,11 +440,14 @@ cmd_doctor() {
     chk_art "toolchain dockerfile.ext4" "test -f '$TOOLCHAIN_DIR/dockerfile.ext4'"
     chk_art "baselayers platform.json" "test -f '$BASELAYERS_DIR/platform.json'"
     if baselayers_orphans_present; then err "✗ baselayers has orphan blobs (run \`tools/dev baselayers\`)"; fails=$((fails+1)); else ok "baselayers no orphans"; fi
-    # Net (per-boot) — report, don't hard-fail the whole doctor.
-    if sudo -n iptables -C JKBUILD -p tcp -d 172.31.0.1 --dport 3129 -j ACCEPT 2>/dev/null; then
-        ok "build firewall: 3129 (dockerfile public-any) open"
+    # Net (per-boot) — report, don't hard-fail the whole doctor. The 3128 allowlist
+    # ACCEPT is the always-present static rule; the public-any (3129) port is granted
+    # per dockerfile VM at build time (source-scoped, not a blanket rule), so there's
+    # nothing static to check for it here.
+    if sudo -n iptables -C JKBUILD -p tcp -d 172.31.0.1 --dport 3128 -j ACCEPT 2>/dev/null; then
+        ok "build firewall: JKBUILD up (3128 allowlist; 3129 granted per dockerfile VM)"
     else
-        warn "build net not up (or 3129 missing) — run \`tools/dev net\`"
+        warn "build net not up — run \`tools/dev net\`"
     fi
     if [ "$DEEP" = 1 ]; then
         banner "doctor --deep: boot smoke"

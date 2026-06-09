@@ -318,12 +318,34 @@ async fn main() -> Result<()> {
     // reach only the egress proxy on the gateway; the firewall from
     // tools/setup-build-net.sh enforces it. `None` → offline builds.
     let build_uid = 100_000u32;
+    // Bind the public-any (:3129) egress proxy listener BEFORE arming the firewall
+    // scoping, so the per-VM :3129 grant is never opened toward a port nothing is
+    // listening on (firewall posture stays consistent with the live service). OPT-IN:
+    // only with --build-net + a distinct --build-proxy-any-port. Held to serve below.
+    let public_any_proxy = if let Some(any_port) = args.build_proxy_any_port
+        && args.build_net
+        && any_port != args.build_proxy_port
+    {
+        let any_addr = format!("{}:{}", args.build_gateway, any_port);
+        match tokio::net::TcpListener::bind(&any_addr).await {
+            Ok(listener) => Some((any_port, any_addr, listener)),
+            Err(e) => {
+                tracing::error!(error = %e, addr = %any_addr,
+                    "failed to bind public-any egress proxy — dockerfile builds get no broad egress");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Arm the per-VM scoping only for the port we actually bound.
+    let effective_any_port = public_any_proxy.as_ref().map(|(p, _, _)| *p);
     let build_net = if args.build_net {
         Some(Arc::new(build_orchestrator::BuildNet::new(
             args.build_bridge.clone(),
             args.build_gateway.clone(),
             args.build_proxy_port,
-            args.build_proxy_any_port, // None (default) = no public-any proxy
+            effective_any_port, // armed only if the :3129 listener actually bound
             build_uid,
             64, // concurrent build-network slots
         )))
@@ -331,9 +353,13 @@ async fn main() -> Result<()> {
         None
     };
     // Fail closed: with --build-net we MUST NOT run attacker-controlled build VMs
-    // unless their isolation firewall is actually provisioned + present.
+    // unless their isolation firewall is actually provisioned + present. When the
+    // public-any (:3129) proxy is active, also install the L2 source-guard that pins
+    // each build VM to its own source IP/MAC — without it the per-lease :3129 grant
+    // is spoofable (a hostile non-dockerfile VM could forge a dockerfile VM's IP).
     if let Some(net) = &build_net {
         net.verify_firewall().await?;
+        net.ensure_source_guard().await?;
     }
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
@@ -476,26 +502,13 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        // The SECOND proxy — public-any (allowlist bypassed, SSRF pin retained) —
-        // for dockerfile builds. OPT-IN: only when --build-proxy-any-port is set to a
-        // distinct port AND --build-net is on; the firewall must open it too
-        // (tools/setup-build-net.sh <…> <PROXY_ANY_PORT>).
-        if let Some(any_port) = args.build_proxy_any_port
-            && args.build_net
-            && any_port != args.build_proxy_port
-        {
-            let any_addr = format!("{}:{}", args.build_gateway, any_port);
+        // The SECOND proxy — public-any (allowlist bypassed, SSRF pin retained) — for
+        // dockerfile builds. Already bound above (bind-before-arm); just serve it.
+        if let Some((_, any_addr, listener)) = public_any_proxy {
             let any_cfg = Arc::new(egress::EgressConfig::allow_any_public());
             tokio::spawn(async move {
-                match tokio::net::TcpListener::bind(&any_addr).await {
-                    Ok(listener) => {
-                        info!(addr = %any_addr, "public-any egress proxy starting (dockerfile builds)");
-                        egress::serve(listener, any_cfg).await;
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, addr = %any_addr, "failed to bind public-any egress proxy")
-                    }
-                }
+                info!(addr = %any_addr, "public-any egress proxy starting (dockerfile builds)");
+                egress::serve(listener, any_cfg).await;
             });
         }
     }

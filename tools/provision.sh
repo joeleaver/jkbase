@@ -49,6 +49,7 @@ sudo apt-get install -y -qq \
     fail2ban \
     jq \
     iptables \
+    ebtables \
     busybox-static \
     e2fsprogs \
     flex bison libelf-dev bc libncurses-dev \
@@ -239,7 +240,14 @@ if [ ! -f /var/jkbase/.env ]; then
     echo "# ACME_EMAIL=" | sudo tee -a /var/jkbase/.env > /dev/null
 fi
 
-# Create systemd service with TLS
+# Create systemd service with TLS.
+#   --build-net           : isolated jkbuild0 bridge + JKBUILD firewall (fail-closed).
+#   --build-proxy-any-port: the SECOND egress proxy on :3129 (allowlist bypassed,
+#       SSRF pin retained) for `builder = "dockerfile"` builds. Safe to default-on
+#       because the firewall opens :3129 to NO build VM blanket — jkbase-server grants
+#       it per-source to one dockerfile VM's guest IP for the life of that build, so a
+#       hostile non-dockerfile build can't reach broad egress. (Requires bun.ext4 +
+#       dockerfile.ext4 toolchains + baselayers baked under /var/jkbase; see below.)
 sudo tee /etc/systemd/system/jkbase.service > /dev/null << SERVICE
 [Unit]
 Description=jkbase platform server
@@ -262,7 +270,8 @@ ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --domain jkbase.app \
     --tls \
     --https-port 443 \
-    --build-net
+    --build-net \
+    --build-proxy-any-port 3129
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
