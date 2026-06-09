@@ -49,6 +49,12 @@ impl Buildpack for BunBuildpack {
     }
 
     fn detect(&self, ctx: &DetectContext) -> Decision {
+        // An explicit Dockerfile build claims the tree; language buildpacks stand
+        // down so a repo with both a Dockerfile and a package.json builds the
+        // Dockerfile the user asked for.
+        if ctx.builder_hint == Some("dockerfile") {
+            return Decision::Fail;
+        }
         detect_decision(ctx.app_dir, ctx.language_hint)
     }
 

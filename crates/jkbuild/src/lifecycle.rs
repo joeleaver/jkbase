@@ -75,9 +75,11 @@ pub fn run() -> Result<i32> {
     let cmdline = read_cmdline();
     let proxy = parse_cmdline_value(&cmdline, "jkbase.proxy");
     let lang = parse_cmdline_value(&cmdline, "jkbase.lang");
+    let builder = parse_cmdline_value(&cmdline, "jkbase.builder");
+    let dockerfile = parse_cmdline_value(&cmdline, "jkbase.dockerfile");
     let mode = ExportMode::from_cmdline(&cmdline);
 
-    let result = drive(proxy, lang.as_deref(), mode);
+    let result = drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode);
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
@@ -95,7 +97,13 @@ pub fn run() -> Result<i32> {
 
 /// The phase machine, independent of PID1/reboot scaffolding so it can be reasoned
 /// about (and, later, driven from an on-box harness).
-fn drive(proxy: Option<String>, lang: Option<&str>, mode: ExportMode) -> Result<()> {
+fn drive(
+    proxy: Option<String>,
+    lang: Option<&str>,
+    builder: Option<&str>,
+    dockerfile: Option<String>,
+    mode: ExportMode,
+) -> Result<()> {
     // 1. detect against /src (read-only source).
     let registry = buildpacks::registry();
     let chosen = registry
@@ -104,6 +112,7 @@ fn drive(proxy: Option<String>, lang: Option<&str>, mode: ExportMode) -> Result<
             let d = bp.detect(&DetectContext {
                 app_dir: Path::new(SRC),
                 language_hint: lang,
+                builder_hint: builder,
             });
             if d.is_pass() {
                 Some((d.confidence(), bp))
@@ -126,6 +135,7 @@ fn drive(proxy: Option<String>, lang: Option<&str>, mode: ExportMode) -> Result<
         cache_dir: Path::new(CACHE),
         env: BuildEnv::new(),
         proxy: proxy.clone(),
+        dockerfile,
     };
     std::fs::create_dir_all(LAYERS).ok();
 

@@ -24,7 +24,7 @@
 //! cargo-component for functions) are B2 and keep this contract unchanged.
 
 use anyhow::{bail, ensure, Context, Result};
-use jkbase_common::config::ProjectConfig;
+use jkbase_common::config::{Builder, ProjectConfig};
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
@@ -40,6 +40,17 @@ const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
 /// Combined build-log tail kept in the build record (per-target logs concatenated).
 const LOG_TAIL_CAP: usize = 64 * 1024;
+
+/// Minimum scratch/output drive sizes for a `builder = "dockerfile"` build. A
+/// Dockerfile build stores, on the scratch drive, the pulled base-image layers +
+/// the container-storage overlay + the `buildah mount` merged rootfs + the erofs
+/// blob — far more than a thin buildpack app layer — and the output blob is a full
+/// self-contained image rootfs. The thin-buildpack defaults (≈4 GiB scratch /
+/// 1 GiB output) SIGXFSZ-kill a `FROM node:20` + `npm ci` build opaquely, so
+/// dockerfile builds get materially more room (the backing files are sparse, so an
+/// unused budget costs little). Tunable upward via the BuildDeps defaults.
+const DOCKERFILE_MIN_SCRATCH_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
+const DOCKERFILE_MIN_OUTPUT_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
 /// Per-target log slice pulled from the output drive into the record.
 const TARGET_LOG_CAP: usize = 16 * 1024;
 
@@ -228,6 +239,10 @@ pub struct BuildNet {
     pub bridge: String,
     pub gateway: String,
     pub proxy_port: u16,
+    /// The public-any egress proxy port (allowlist bypassed, SSRF pin retained),
+    /// used only by `builder = "dockerfile"` builds. `None` (or equal to
+    /// `proxy_port`) → dockerfile builds share the narrow allowlist proxy.
+    pub proxy_any_port: Option<u16>,
     subnet_prefix: String,
     uid: u32,
     free_slots: Mutex<Vec<u8>>,
@@ -243,18 +258,28 @@ pub struct NetLease {
 
 impl BuildNet {
     /// `pool_size` concurrent slots → guest IPs `<subnet>.2 ..= .(1+pool_size)`.
-    pub fn new(bridge: String, gateway: String, proxy_port: u16, uid: u32, pool_size: u8) -> Self {
+    pub fn new(
+        bridge: String,
+        gateway: String,
+        proxy_port: u16,
+        proxy_any_port: Option<u16>,
+        uid: u32,
+        pool_size: u8,
+    ) -> Self {
         let subnet_prefix = {
             let mut parts: Vec<&str> = gateway.split('.').collect();
             parts.truncate(3);
             parts.join(".")
         };
+        // A distinct port enables the public-any proxy; equal/absent disables it.
+        let proxy_any_port = proxy_any_port.filter(|p| *p != proxy_port);
         // Reversed so pop() hands out ascending slot numbers.
         let free_slots: Vec<u8> = (1..=pool_size).rev().collect();
         Self {
             bridge,
             gateway,
             proxy_port,
+            proxy_any_port,
             subnet_prefix,
             uid,
             free_slots: Mutex::new(free_slots),
@@ -263,6 +288,15 @@ impl BuildNet {
 
     pub fn proxy_url(&self) -> String {
         format!("http://{}:{}", self.gateway, self.proxy_port)
+    }
+
+    /// The egress proxy URL to hand a build VM. Dockerfile builds get the public-any
+    /// proxy (when configured); everything else gets the narrow allowlist proxy.
+    pub fn proxy_url_for(&self, is_dockerfile: bool) -> String {
+        match (is_dockerfile, self.proxy_any_port) {
+            (true, Some(port)) => format!("http://{}:{}", self.gateway, port),
+            _ => self.proxy_url(),
+        }
     }
 
     /// Lease a slot and bring up its TAP — owned by the build uid (so the jailed
@@ -347,11 +381,31 @@ impl BuildNet {
                 self.bridge
             );
         }
-        let input_hook = vec!["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
-        let fwd_drop = vec!["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
-        for check in [input_hook, fwd_drop] {
+        let input_hook = ["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
+        let fwd_drop = ["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
+        let mut checks: Vec<Vec<String>> = vec![
+            input_hook.iter().map(|s| s.to_string()).collect(),
+            fwd_drop.iter().map(|s| s.to_string()).collect(),
+        ];
+        // The JKBUILD chain must actually ACCEPT each proxy port the orchestrator
+        // hands to VMs — otherwise a build (esp. a dockerfile build pointed at the
+        // public-any port) silently gets zero egress and dies at fetch. Assert each
+        // port we'll use is open, not just that the chain exists.
+        let dport = self.proxy_port.to_string();
+        let proxy_accept = |port: &str| -> Vec<String> {
+            vec![
+                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
+                "-d".into(), self.gateway.clone(), "--dport".into(), port.into(),
+                "-j".into(), "ACCEPT".into(),
+            ]
+        };
+        checks.push(proxy_accept(&dport));
+        if let Some(any) = self.proxy_any_port {
+            checks.push(proxy_accept(&any.to_string()));
+        }
+        for check in &checks {
             let ok = tokio::process::Command::new("iptables")
-                .args(&check)
+                .args(check)
                 .status()
                 .await
                 .map(|s| s.success())
@@ -410,6 +464,11 @@ struct TargetSpec {
     /// Source subdir, relative to the unpacked source root.
     source_subdir: String,
     language: Option<String>,
+    /// Build strategy (`auto` buildpack detect, or the `dockerfile` escape hatch).
+    builder: Builder,
+    /// Dockerfile path relative to `source_subdir` (i.e. relative to `/src` in the
+    /// VM), for `builder = "dockerfile"`. `None` otherwise.
+    dockerfile: Option<String>,
 }
 
 /// Build-derived server manifest fields (the `cmd`/`env`/`working_dir` half of a
@@ -654,16 +713,25 @@ async fn build_one_target_inner(
             spec.name
         );
     }
-    // Resolve the language: the explicit jkbase.toml hint, else a cheap host-side
-    // sniff of the source (the in-VM lifecycle does the authoritative detect).
-    let language = detect_language(&source_path, spec.language.as_deref());
+    // Dockerfile builds pick the dedicated `dockerfile` toolchain image (buildah &c.)
+    // and do NOT language-detect (a Dockerfile carries its own runtime). The in-VM
+    // lifecycle is steered by `jkbase.builder`, not `jkbase.lang`.
+    let is_dockerfile = spec.builder == Builder::Dockerfile;
+    let (toolchain_lang, lang_hint): (Option<String>, Option<String>) = if is_dockerfile {
+        (Some("dockerfile".to_string()), None)
+    } else {
+        // Resolve the language: the explicit jkbase.toml hint, else a cheap host-side
+        // sniff of the source (the in-VM lifecycle does the authoritative detect).
+        let l = detect_language(&source_path, spec.language.as_deref());
+        (l.clone(), l)
+    };
     let toolchain = deps
-        .select_toolchain(spec.kind, language.as_deref())
+        .select_toolchain(spec.kind, toolchain_lang.as_deref())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no toolchain image for {}{} in {}",
                 kind_name(spec.kind),
-                language
+                toolchain_lang
                     .as_deref()
                     .map(|l| format!("/{l}"))
                     .unwrap_or_default(),
@@ -674,6 +742,17 @@ async fn build_one_target_inner(
     let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
     let source_img = workspace.join(format!("{tag}.source.img"));
     let output_img = workspace.join(format!("{tag}.output.img"));
+
+    // Dockerfile builds need a much bigger scratch/output budget (base layers +
+    // container overlay + merged mount + image blob) than a thin buildpack layer.
+    let (scratch_size_bytes, output_size_bytes) = if is_dockerfile {
+        (
+            deps.scratch_size_bytes.max(DOCKERFILE_MIN_SCRATCH_BYTES),
+            deps.output_size_bytes.max(DOCKERFILE_MIN_OUTPUT_BYTES),
+        )
+    } else {
+        (deps.scratch_size_bytes, deps.output_size_bytes)
+    };
 
     // RO source drive built from the subdir in userspace — no mount (P0-3).
     build_ro_ext4_from_dir(&source_path, &source_img, 16)
@@ -719,7 +798,7 @@ async fn build_one_target_inner(
                 Some(l.mac.clone()),
                 Some(l.guest_ip.clone()),
                 Some(net.gateway.clone()),
-                Some(net.proxy_url()),
+                Some(net.proxy_url_for(is_dockerfile)),
                 Some(make_seal(l.tap.clone())),
             ),
             _ => (None, None, None, None, None, None),
@@ -731,9 +810,9 @@ async fn build_one_target_inner(
         kernel_path: deps.kernel_path.clone(),
         toolchain_rootfs: toolchain,
         source_drive: source_img.clone(),
-        scratch_size_bytes: deps.scratch_size_bytes,
+        scratch_size_bytes,
         output_drive: output_img.clone(),
-        output_size_bytes: deps.output_size_bytes,
+        output_size_bytes,
         cache_drive: None,
         vcpu_count: deps.vcpu_count,
         mem_size_mib: deps.mem_size_mib,
@@ -752,7 +831,7 @@ async fn build_one_target_inner(
         // (a 64 MiB cap with a 256 MiB scratch SIGXFSZ-kills any real build that
         // writes past 64 MiB of scratch). The artifact size is already bounded by
         // the fixed output-drive size. NB: include the cache image when wired.
-        fsize_limit_bytes: Some(deps.scratch_size_bytes.max(deps.output_size_bytes)),
+        fsize_limit_bytes: Some(scratch_size_bytes.max(output_size_bytes)),
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
@@ -761,11 +840,14 @@ async fn build_one_target_inner(
         guest_ip,
         gateway_ip,
         egress_proxy,
-        lang_hint: language.clone(),
+        lang_hint,
         // Layered: the in-VM exporter emits the app erofs layer + index.json; the
         // host collection arm (below) dumps + sha256-verifies it. The runtime
-        // overlays it on the shared base/runtime layers.
+        // overlays it on the shared base/runtime layers (or, for a dockerfile build,
+        // runs the single self-contained app layer with no base/runtime).
         export_layered: true,
+        builder_hint: is_dockerfile.then(|| "dockerfile".to_string()),
+        dockerfile: spec.dockerfile.clone(),
         fetch_deadline: deps.fetch_deadline,
         seal,
     };
@@ -907,7 +989,14 @@ fn collect_layered_server(
     if let Some(obj) = manifest.as_object_mut() {
         obj.insert("app_layer".to_string(), serde_json::Value::String(file));
         obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
-        let runtime = spec.language.clone().unwrap_or_else(|| "bun".to_string());
+        // A dockerfile build is a single self-contained image layer — mark it so the
+        // host layer plan runs it standalone (no base/runtime stack) and the agent
+        // honours the image's own env. Otherwise it's a language runtime layer.
+        let runtime = if spec.builder == Builder::Dockerfile {
+            crate::layer_plan::IMAGE_SELF_RUNTIME.to_string()
+        } else {
+            spec.language.clone().unwrap_or_else(|| "bun".to_string())
+        };
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
     }
     let json = serde_json::to_string_pretty(&manifest)?;
@@ -1011,6 +1100,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         if !path_ok(sd) {
             bail!("server '{name}' source {sd:?} must be a relative path inside the project (no '..' or absolute)");
         }
+        // builder = auto|dockerfile, and (for dockerfile) language/dockerfile coherence.
+        s.validate(name)?;
+        // The Dockerfile must live inside the project tree (it becomes a /src path).
+        if s.builder()? == Builder::Dockerfile {
+            let df = s.dockerfile_path();
+            if !path_ok(&df) {
+                bail!("server '{name}' dockerfile {df:?} must be a relative path inside the project (no '..' or absolute)");
+            }
+        }
     }
     for (name, site) in &config.sites {
         if !path_ok(&site.public) {
@@ -1033,19 +1131,45 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             kind: TargetKind::Function,
             source_subdir: f.source.clone(),
             language: f.language.clone(),
+            builder: Builder::Auto, // functions take the wasm path, never a Dockerfile
+            dockerfile: None,
         });
     }
     for (name, s) in &config.servers {
+        // `builder` was validated at intake (see run_inner); default to Auto on the
+        // (already-rejected) error path rather than panicking here.
+        let builder = s.builder().unwrap_or(Builder::Auto);
+        let dockerfile = (builder == Builder::Dockerfile)
+            .then(|| dockerfile_relpath(&s.dockerfile_path(), s.source_dir()));
         specs.push(TargetSpec {
             name: name.clone(),
             kind: TargetKind::Server,
             source_subdir: s.source_dir().to_string(),
             language: s.language.clone(),
+            builder,
+            dockerfile,
         });
     }
     // Deterministic order regardless of HashMap iteration.
     specs.sort_by(|a, b| (kind_name(a.kind), &a.name).cmp(&(kind_name(b.kind), &b.name)));
     specs
+}
+
+/// The Dockerfile path RELATIVE to the build VM's `/src` (which is mounted from the
+/// server's `source_dir`). `dockerfile_path` is relative to the project root, so we
+/// strip the `source_dir` prefix. Both are normalised (leading `./` removed). When
+/// the Dockerfile isn't under `source_dir` (a misconfig), the path is returned
+/// unchanged and the in-VM buildpack surfaces a clear "Dockerfile not found" error.
+fn dockerfile_relpath(dockerfile_path: &str, source_dir: &str) -> String {
+    let df = dockerfile_path.trim_start_matches("./");
+    let sd = source_dir.trim_start_matches("./").trim_end_matches('/');
+    if sd.is_empty() || sd == "." {
+        return df.to_string();
+    }
+    df.strip_prefix(sd)
+        .map(|r| r.trim_start_matches('/'))
+        .unwrap_or(df)
+        .to_string()
 }
 
 fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
@@ -1248,6 +1372,60 @@ mod tests {
         assert_eq!(specs[0].language.as_deref(), Some("rust"));
         assert_eq!(specs[2].kind, TargetKind::Server);
         assert_eq!(specs[2].source_subdir, "./server");
+        // Buildpack (auto) servers carry no dockerfile.
+        assert_eq!(specs[2].builder, Builder::Auto);
+        assert!(specs[2].dockerfile.is_none());
+    }
+
+    #[test]
+    fn enumerate_dockerfile_server_carries_relpath_and_builder() {
+        // builder = "dockerfile" with the Dockerfile under the source dir → the
+        // TargetSpec carries Builder::Dockerfile and the /src-relative path.
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\ndockerfile = \"./api/Dockerfile\"\nport = 3000\n",
+        )
+        .unwrap();
+        let specs = enumerate_targets(&cfg);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].builder, Builder::Dockerfile);
+        assert_eq!(specs[0].source_subdir, "./api"); // /src = ./api
+        assert_eq!(specs[0].dockerfile.as_deref(), Some("Dockerfile")); // relative to /src
+
+        // Explicit source + nested dockerfile → relpath strips the source prefix.
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\nsource = \".\"\ndockerfile = \"docker/api.Dockerfile\"\nport = 3000\n",
+        )
+        .unwrap();
+        let specs = enumerate_targets(&cfg);
+        assert_eq!(specs[0].dockerfile.as_deref(), Some("docker/api.Dockerfile"));
+    }
+
+    #[test]
+    fn proxy_url_selects_public_any_only_for_dockerfile() {
+        // With a distinct any-port, dockerfile builds get it; others get the narrow proxy.
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8);
+        assert_eq!(net.proxy_url_for(false), "http://172.31.0.1:3128");
+        assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3129");
+        assert_eq!(net.proxy_any_port, Some(3129));
+
+        // any-port == proxy_port disables the second proxy (dockerfile shares narrow).
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3128), 100_000, 8);
+        assert_eq!(net.proxy_any_port, None);
+        assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3128");
+
+        // No any-port → dockerfile falls back to the narrow proxy.
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
+        assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3128");
+    }
+
+    #[test]
+    fn dockerfile_relpath_strips_source_prefix() {
+        assert_eq!(dockerfile_relpath("./api/Dockerfile", "./api"), "Dockerfile");
+        assert_eq!(dockerfile_relpath("Dockerfile", "."), "Dockerfile");
+        assert_eq!(dockerfile_relpath("docker/Dockerfile", "."), "docker/Dockerfile");
+        assert_eq!(dockerfile_relpath("svc/sub/Dockerfile", "svc"), "sub/Dockerfile");
+        // Dockerfile not under the source dir (misconfig) → returned unchanged.
+        assert_eq!(dockerfile_relpath("other/Dockerfile", "svc"), "other/Dockerfile");
     }
 
     #[test]
@@ -1586,7 +1764,7 @@ esac
         let output_img = workspace.join("output.img");
         build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
 
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, 100_000, 8);
+        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
         let lease = net.acquire().await.expect("acquire build net");
         let release = format!("/sys/class/net/{}", lease.tap); // for diagnostics only
         eprintln!("leased tap={} ip={} ({release})", lease.tap, lease.guest_ip);
@@ -1624,6 +1802,8 @@ esac
             egress_proxy: Some(net.proxy_url()),
             lang_hint: None,
             export_layered: false,
+            builder_hint: None,
+            dockerfile: None,
             fetch_deadline: Duration::from_secs(20),
             seal: Some(make_seal(lease.tap.clone())),
         };
@@ -1904,6 +2084,7 @@ name = "api"
                         "jkbuild0".into(),
                         "172.31.0.1".into(),
                         3128,
+                        None,
                         100_000,
                         8,
                     )))

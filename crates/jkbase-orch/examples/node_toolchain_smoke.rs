@@ -115,6 +115,8 @@ async fn main() -> anyhow::Result<()> {
         egress_proxy: None,
         lang_hint: Some("bun".to_string()),
         export_layered: false,
+        builder_hint: None,
+        dockerfile: None,
         fetch_deadline: Duration::from_secs(120),
         seal: None,
     };

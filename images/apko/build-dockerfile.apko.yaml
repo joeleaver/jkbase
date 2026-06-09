@@ -1,0 +1,45 @@
+# Build-VM toolchain image for the `builder = "dockerfile"` escape hatch.
+#
+# apko assembles a reproducible Wolfi (glibc) rootfs from pinned apks. Unlike the
+# bun image, this one carries a rootless-capable OCI image builder (buildah) so the
+# in-VM DockerfileBuildpack can `buildah build` a user-authored Dockerfile, then
+# `buildah mount`/`inspect` the result. tools/build-image.sh injects jkbuild-init
+# as /sbin/init and `mkfs.ext4 -d`'s the tree into `dockerfile.ext4` (userspace, no
+# mount; threat-model P0-3). select_toolchain picks `dockerfile.ext4` for a server
+# with `builder = "dockerfile"`. Build it with:
+#
+#   INJECT_BUN=0 CONFIG=images/apko/build-dockerfile.apko.yaml \
+#     OUT=.firecracker/toolchains/dockerfile.ext4 tools/build-image.sh
+#
+# IMPORTANT (verified against the live Wolfi APKINDEX): `buildah`'s apk deps are
+# only libc/gpgme/seccomp — it does NOT pull an OCI runtime, a signature policy, or
+# an overlay helper. Ship buildah alone and every RUN/FROM fails ("no valid runtime"
+# / "signature policy: file does not exist"). So crun, fuse-overlayfs, and
+# containers-common are listed EXPLICITLY below; do not remove them.
+#
+# Pin: commit the apko.lock.json apko emits (`--lockfile`) so rebuilds are
+# bitwise-reproducible.
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - glibc
+    - ld-linux
+    - ca-certificates-bundle
+    - busybox # sh + coreutils the lifecycle / buildah shell out to
+    - erofs-utils # mkfs.erofs for the layered exporter
+    # --- container build toolchain (all REQUIRED; see note above) ---
+    - buildah # builds the user Dockerfile, flattens + inspects the image
+    - crun # OCI runtime for RUN steps — NOT a buildah apk dep, list it
+    - fuse-overlayfs # overlay storage fallback when native overlay is refused
+    - containers-common # /etc/containers/{policy.json,storage.conf,registries.conf}
+
+archs:
+  - x86_64
+
+# NOTE: /sbin/init (the static musl jkbuild-init) is injected by
+# tools/build-image.sh after apko. No bun binary is injected (INJECT_BUN=0): a
+# Dockerfile build carries its own runtime in the resulting image.

@@ -95,6 +95,14 @@ struct Args {
     #[arg(long, default_value = "3128")]
     build_proxy_port: u16,
 
+    /// Port of the SECOND egress proxy — public-any mode (allowlist bypassed, SSRF
+    /// pin retained) — used only by `builder = "dockerfile"` builds (their FROM/RUN
+    /// need broad egress). Set equal to `--build-proxy-port` to disable it (then
+    /// dockerfile builds share the narrow allowlist proxy). Must match the
+    /// PROXY_ANY_PORT passed to tools/setup-build-net.sh.
+    #[arg(long, default_value = "3129")]
+    build_proxy_any_port: u16,
+
     /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
     /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
     /// platform defaults and target any project. Unset (default) = no admin path:
@@ -314,6 +322,7 @@ async fn main() -> Result<()> {
             args.build_bridge.clone(),
             args.build_gateway.clone(),
             args.build_proxy_port,
+            Some(args.build_proxy_any_port),
             build_uid,
             64, // concurrent build-network slots
         )))
@@ -466,6 +475,24 @@ async fn main() -> Result<()> {
                 }
             }
         });
+        // The SECOND proxy — public-any (allowlist bypassed, SSRF pin retained) —
+        // for dockerfile builds. Only spun up with --build-net and a distinct port;
+        // the build firewall opens this port too (tools/setup-build-net.sh).
+        if args.build_net && args.build_proxy_any_port != args.build_proxy_port {
+            let any_addr = format!("{}:{}", args.build_gateway, args.build_proxy_any_port);
+            let any_cfg = Arc::new(egress::EgressConfig::allow_any_public());
+            tokio::spawn(async move {
+                match tokio::net::TcpListener::bind(&any_addr).await {
+                    Ok(listener) => {
+                        info!(addr = %any_addr, "public-any egress proxy starting (dockerfile builds)");
+                        egress::serve(listener, any_cfg).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, addr = %any_addr, "failed to bind public-any egress proxy")
+                    }
+                }
+            });
+        }
     }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));

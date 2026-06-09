@@ -100,6 +100,16 @@ pub struct ServerConfig {
     pub command: Option<Vec<String>>,
 }
 
+/// Resolved build strategy for a `[servers.*]` target. `Auto` runs zero-config
+/// buildpack detection; `Dockerfile` is the gated escape hatch — the platform
+/// builds a user-supplied Dockerfile *server-side* (in the build VM) and runs the
+/// resulting image as a single self-contained runtime layer (`image/self`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Builder {
+    Auto,
+    Dockerfile,
+}
+
 impl ServerConfig {
     /// The build source subdir: explicit `source`, else the Dockerfile's parent
     /// directory (legacy manifests), else the project root (`.`).
@@ -111,6 +121,48 @@ impl ServerConfig {
             return Path::new(df).parent().and_then(|p| p.to_str()).unwrap_or(".");
         }
         "."
+    }
+
+    /// Resolve the `builder` field to a [`Builder`]. Defaults to `Auto` when
+    /// omitted; errors on an unrecognised value (previously this was silently
+    /// ignored — a footgun where `builder = "dockerfile"` got a buildpack build).
+    pub fn builder(&self) -> Result<Builder> {
+        match self.builder.as_deref().map(str::trim) {
+            None | Some("") | Some("auto") => Ok(Builder::Auto),
+            Some("dockerfile") => Ok(Builder::Dockerfile),
+            Some(other) => anyhow::bail!(
+                "unknown builder {other:?} (expected \"auto\" or \"dockerfile\")"
+            ),
+        }
+    }
+
+    /// The Dockerfile path (relative to the source tree root) for
+    /// `builder = "dockerfile"`: the explicit `dockerfile` field, else
+    /// `<source_dir>/Dockerfile`.
+    pub fn dockerfile_path(&self) -> String {
+        if let Some(df) = self.dockerfile.as_deref() {
+            return df.to_string();
+        }
+        match self.source_dir() {
+            "." => "Dockerfile".to_string(),
+            dir => format!("{}/Dockerfile", dir.trim_end_matches('/')),
+        }
+    }
+
+    /// Validate the build-strategy fields for this server. Run at deploy
+    /// preflight. File existence (the Dockerfile actually being present) is
+    /// checked where the source tree is available — the CLI and the build VM.
+    pub fn validate(&self, server_name: &str) -> Result<()> {
+        let builder = self.builder()?;
+        if builder == Builder::Dockerfile && self.language.is_some() {
+            // A Dockerfile carries its own runtime; a language hint would key a
+            // platform runtime layer that the single self-contained image must
+            // not stack. Mutually exclusive — almost certainly a misconfig.
+            anyhow::bail!(
+                "[servers.{server_name}]: `language` is not valid with `builder = \"dockerfile\"` (the image carries its own runtime)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -507,5 +559,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.servers["api"].source_dir(), "./api");
+    }
+
+    #[test]
+    fn builder_resolves_and_validates() {
+        // Default (omitted) and explicit "auto" both resolve to Auto.
+        let cfg: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"./web\"\nport = 8000\n").unwrap();
+        let web = &cfg.servers["web"];
+        assert_eq!(web.builder().unwrap(), Builder::Auto);
+        web.validate("web").unwrap();
+
+        // Explicit dockerfile builder.
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\ndockerfile = \"./api/Dockerfile\"\nport = 3000\n",
+        )
+        .unwrap();
+        let api = &cfg.servers["api"];
+        assert_eq!(api.builder().unwrap(), Builder::Dockerfile);
+        assert_eq!(api.dockerfile_path(), "./api/Dockerfile");
+        api.validate("api").unwrap();
+
+        // Dockerfile path defaults to <source_dir>/Dockerfile when unspecified.
+        let cfg: ProjectConfig =
+            toml::from_str("[servers.api]\nbuilder = \"dockerfile\"\nsource = \"./svc\"\nport = 3000\n")
+                .unwrap();
+        assert_eq!(cfg.servers["api"].dockerfile_path(), "./svc/Dockerfile");
+        let cfg: ProjectConfig =
+            toml::from_str("[servers.api]\nbuilder = \"dockerfile\"\nport = 3000\n").unwrap();
+        assert_eq!(cfg.servers["api"].dockerfile_path(), "Dockerfile");
+
+        // Unknown builder is rejected (no longer silently ignored).
+        let cfg: ProjectConfig =
+            toml::from_str("[servers.api]\nbuilder = \"podman\"\nport = 3000\n").unwrap();
+        assert!(cfg.servers["api"].builder().is_err());
+
+        // builder = "dockerfile" + language hint is mutually exclusive.
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\nlanguage = \"node\"\nport = 3000\n",
+        )
+        .unwrap();
+        assert!(cfg.servers["api"].validate("api").is_err());
     }
 }
