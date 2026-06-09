@@ -33,6 +33,12 @@ pub enum ProjectState {
     Active,
     Stopped,
     Hibernated,
+    /// Registered, but its deployable artifacts (content image / hosting content,
+    /// and any snapshot) are gone — so it can never wake. Set by the boot reconcile
+    /// and the wake gate; cleared by a successful (re)deploy. The proxy serves a
+    /// clear "needs redeploy" instead of looping on "starting up".
+    #[serde(rename = "needs_redeploy")]
+    NeedsRedeploy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

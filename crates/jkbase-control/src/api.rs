@@ -1817,9 +1817,16 @@ async fn activate_deployment(
         .into());
     }
 
-    let live_link = state.deploy_dir.join(&project.id).join("live");
-    let _ = tokio::fs::remove_file(&live_link).await;
-    tokio::fs::symlink(&deploy_path, &live_link).await?;
+    // Atomically repoint `live`: symlink to a temp name then rename over it (rename is
+    // atomic on the same dir). A plain remove+symlink leaves a window where `live` is
+    // absent, which a concurrent wake reads as "no deployed content" and would wrongly
+    // mark the project NeedsRedeploy.
+    let proj_dir = state.deploy_dir.join(&project.id);
+    let live_link = proj_dir.join("live");
+    let tmp_link = proj_dir.join(".live.swap");
+    let _ = tokio::fs::remove_file(&tmp_link).await;
+    tokio::fs::symlink(&deploy_path, &tmp_link).await?;
+    tokio::fs::rename(&tmp_link, &live_link).await?;
 
     project.current_version = Some(version);
     project.state = crate::store::ProjectState::Active;
@@ -2218,10 +2225,15 @@ async fn do_rollback(
     deploy_path: &std::path::Path,
     target: u64,
 ) -> anyhow::Result<()> {
-    // Atomically repoint `live` at the target version (same swap as a deploy).
-    let live_link = state.deploy_dir.join(&project.id).join("live");
-    let _ = tokio::fs::remove_file(&live_link).await;
-    tokio::fs::symlink(deploy_path, &live_link).await?;
+    // Atomically repoint `live` at the target version: symlink to a temp name then
+    // rename over it (rename is atomic; a remove+symlink leaves a no-`live` window
+    // that a concurrent wake would misread as "no deployed content").
+    let proj_dir = state.deploy_dir.join(&project.id);
+    let live_link = proj_dir.join("live");
+    let tmp_link = proj_dir.join(".live.swap");
+    let _ = tokio::fs::remove_file(&tmp_link).await;
+    tokio::fs::symlink(deploy_path, &tmp_link).await?;
+    tokio::fs::rename(&tmp_link, &live_link).await?;
 
     project.current_version = Some(target);
     project.state = crate::store::ProjectState::Active;

@@ -802,6 +802,33 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
 /// each deployed project's primary subdomain and any legacy `project.domains` into
 /// the DOMAINS registry as Active (trusted prod data — no re-verification), then
 /// loads all Active domains into the map so hosts resolve before traffic arrives.
+/// Whether a registered project can actually be woken: it needs EITHER cold-boot
+/// content (`hosting/{id}/live`) OR a restorable snapshot (snapshot + mem files
+/// present) atop its metadata image (`content-images/{id}.ext4`). When neither holds,
+/// its deployable artifacts were removed out-of-band (e.g. an over-aggressive cleanup)
+/// and it can only come back via a redeploy — see [`ProjectState::NeedsRedeploy`].
+fn project_can_wake(data_dir: &Path, store: &Store, project_id: &str) -> bool {
+    if data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .is_dir()
+    {
+        return true; // can cold-boot from the deployed content
+    }
+    let content_image = data_dir
+        .join("content-images")
+        .join(format!("{project_id}.ext4"))
+        .is_file();
+    let snapshot_ok = store
+        .get_snapshot_meta(project_id)
+        .ok()
+        .flatten()
+        .map(|m| Path::new(&m.snapshot_path).exists() && Path::new(&m.mem_file_path).exists())
+        .unwrap_or(false);
+    content_image && snapshot_ok // can restore from snapshot
+}
+
 async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &DomainMap) {
     let active = {
         let mut plat = platform.lock().await;
@@ -819,12 +846,38 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
             }
             match project.state {
                 ProjectState::Active | ProjectState::Hibernated => {
-                    plat.vm_states
-                        .insert(project.id.clone(), VmLifecycle::Hibernated);
-                    if project.state == ProjectState::Active {
+                    // Reconcile a registered project whose deployable artifacts were
+                    // removed out-of-band: it would otherwise be registered for wake and
+                    // loop the proxy on "starting up" forever. Mark it NeedsRedeploy so
+                    // the proxy serves a clear message; still grandfather its domains so
+                    // the user gets that message (not a 404). A redeploy clears it.
+                    let data_dir = plat.data_dir.clone();
+                    if !project_can_wake(&data_dir, &plat.store, &project.id) {
+                        warn!(
+                            project = %project.id,
+                            "registered project has no deployable artifacts (content + snapshot gone) — marking needs-redeploy"
+                        );
                         let mut p = project.clone();
-                        p.state = ProjectState::Hibernated;
+                        p.state = ProjectState::NeedsRedeploy;
                         let _ = plat.store.update_project(&p);
+                        // Drop the dangling snapshot pointer so nothing tries to restore it.
+                        let _ = plat.store.remove_snapshot_meta(&project.id);
+                    } else {
+                        plat.vm_states
+                            .insert(project.id.clone(), VmLifecycle::Hibernated);
+                        if project.state == ProjectState::Active {
+                            let mut p = project.clone();
+                            p.state = ProjectState::Hibernated;
+                            let _ = plat.store.update_project(&p);
+                        }
+                        // Clear a stale snapshot pointer (snapshot file gone but content
+                        // present) so wake cold-boots cleanly from content instead of
+                        // attempting a doomed restore.
+                        if let Ok(Some(meta)) = plat.store.get_snapshot_meta(&project.id)
+                            && !Path::new(&meta.snapshot_path).exists()
+                        {
+                            let _ = plat.store.remove_snapshot_meta(&project.id);
+                        }
                     }
 
                     let tenant_id = project.tenant_id.clone().unwrap_or_default();
@@ -835,7 +888,17 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
                         grandfather_domain(&plat.store, host, &project.id, &tenant_id);
                     }
                 }
-                ProjectState::Stopped => {}
+                ProjectState::NeedsRedeploy | ProjectState::Stopped => {
+                    // NeedsRedeploy: still grandfather domains so the proxy can serve the
+                    // clear "redeploy" message rather than a 404; don't register for wake.
+                    if project.state == ProjectState::NeedsRedeploy {
+                        let tenant_id = project.tenant_id.clone().unwrap_or_default();
+                        grandfather_domain(&plat.store, &project.id, &project.id, &tenant_id);
+                        for host in &project.domains {
+                            grandfather_domain(&plat.store, host, &project.id, &tenant_id);
+                        }
+                    }
+                }
             }
         }
 
@@ -1221,6 +1284,23 @@ async fn wake_project(
                         .unwrap_or_else(|| "over quota".to_string()),
                 ));
             }
+        // Authoritative gate: a registered project with no deployable artifacts can
+        // never wake (cold-boot content + snapshot both gone). Persist NeedsRedeploy
+        // and surface a clear "redeploy" rather than looping the proxy on the
+        // transient "starting up" path. The boot reconcile marks these too; this also
+        // catches a project whose artifacts go missing while the server is up.
+        if !project_can_wake(&plat.data_dir, &plat.store, project_id) {
+            if let Ok(Some(mut proj)) = plat.store.get_project(project_id)
+                && proj.state != ProjectState::NeedsRedeploy
+            {
+                proj.state = ProjectState::NeedsRedeploy;
+                let _ = plat.store.update_project(&proj);
+                let _ = plat.store.remove_snapshot_meta(project_id);
+            }
+            return Err(jkbase_proxy::WakeError::Gone(
+                "no deployable content — redeploy to bring it back".to_string(),
+            ));
+        }
     }
     wake_project_inner(project_id, platform, routing, domain_map, shipper)
         .await
@@ -2244,5 +2324,55 @@ mod tests {
         // Window with no occurrence yields nothing (a daily cron over one minute).
         let none = due_since(&parse_unix_5field("0 0 * * *").unwrap(), base, base + 60);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn project_can_wake_requires_content_or_restorable_snapshot() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkbase-cw-{nanos}"));
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let store = Store::open(&root.join("s.redb")).unwrap();
+        let snap_meta = |id: &str, sp: PathBuf, mp: PathBuf| SnapshotMeta {
+            project_id: id.into(),
+            snapshot_path: sp.to_string_lossy().into_owned(),
+            mem_file_path: mp.to_string_lossy().into_owned(),
+            created_at: 0,
+            vcpu_count: 1,
+            mem_size_mib: 1024,
+        };
+
+        // Nothing on disk, no snapshot → cannot wake.
+        assert!(!project_can_wake(&data, &store, "p"));
+
+        // Cold-boot content present (hosting/{id}/live) → can wake.
+        std::fs::create_dir_all(data.join("hosting").join("p").join("live")).unwrap();
+        assert!(project_can_wake(&data, &store, "p"));
+
+        // Content image + a snapshot whose files BOTH exist → can restore → can wake.
+        std::fs::create_dir_all(data.join("content-images")).unwrap();
+        std::fs::write(data.join("content-images").join("q.ext4"), b"x").unwrap();
+        let qsnap = data.join("snapshots").join("q");
+        std::fs::create_dir_all(&qsnap).unwrap();
+        std::fs::write(qsnap.join("snapshot"), b"s").unwrap();
+        std::fs::write(qsnap.join("mem"), b"m").unwrap();
+        store
+            .save_snapshot_meta(&snap_meta("q", qsnap.join("snapshot"), qsnap.join("mem")))
+            .unwrap();
+        assert!(project_can_wake(&data, &store, "q"));
+
+        // nlnwt's failure mode: a content image present but the snapshot files are gone
+        // and there's no cold-boot content → CANNOT wake (needs redeploy).
+        std::fs::write(data.join("content-images").join("r.ext4"), b"x").unwrap();
+        let rsnap = data.join("snapshots").join("r");
+        store
+            .save_snapshot_meta(&snap_meta("r", rsnap.join("snapshot"), rsnap.join("mem")))
+            .unwrap();
+        assert!(!project_can_wake(&data, &store, "r"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
