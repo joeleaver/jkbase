@@ -358,13 +358,14 @@ cmd_toolchains() {
     bake_image default "$TOOLCHAIN_DIR/default.ext4" \
         "$(sha_str "rb:$(sha_file "$REPO_ROOT/tools/build-runner.sh"):bb:$busybox")" \
         env BUSYBOX="$busybox" "$REPO_ROOT/tools/build-toolchain.sh" "$TOOLCHAIN_DIR/default.ext4"
-    # bun.ext4 (apko bun image + baked bun + jkbuild-init)
+    # bun.ext4 (apko bun image + baked bun + jkbuild-init). Stamp on the LOCKFILE
+    # (the real pin) + config + init + bun, so a lock regen or any input rebakes.
     bake_image bun "$TOOLCHAIN_DIR/bun.ext4" \
-        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-bun.apko.yaml"):init:$init_sha:bun:$bun_sha")" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-bun.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-bun.apko.lock.json"):init:$init_sha:bun:$bun_sha")" \
         env INJECT_BUN=1 CONFIG="$REPO_ROOT/images/apko/build-bun.apko.yaml" OUT="$TOOLCHAIN_DIR/bun.ext4" "$REPO_ROOT/tools/build-image.sh"
     # dockerfile.ext4 (buildah toolchain; INJECT_BUN=0; the builder=dockerfile feature)
     bake_image dockerfile "$TOOLCHAIN_DIR/dockerfile.ext4" \
-        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.yaml"):init:$init_sha")" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.lock.json"):init:$init_sha")" \
         env INJECT_BUN=0 CONFIG="$REPO_ROOT/images/apko/build-dockerfile.apko.yaml" OUT="$TOOLCHAIN_DIR/dockerfile.ext4" "$REPO_ROOT/tools/build-image.sh"
     RAN[toolchains]=OK
 }
@@ -384,7 +385,7 @@ baselayers_orphans_present() {
 cmd_baselayers() {
     banner "baselayers"
     local bun_sha; bun_sha="$(sha_file "$ASSET_DIR/bun")"
-    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):bun:$bun_sha:bunver:$BUN_VER")"
+    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.lock.json"):bun:$bun_sha:bunver:$BUN_VER")"
     if [ -f "$BASELAYERS_DIR/platform.json" ] && fresh baselayers "$desired" && ! baselayers_orphans_present; then
         verdict "baselayers present + stamp matches + no orphans — SKIP"; RAN[baselayers]=SKIP; return 0
     fi

@@ -45,7 +45,13 @@ mkdir -p "$WORK/stage"
 STAGE="$WORK/stage"
 
 echo "[build-image] apko build $CONFIG"
-apko build "$CONFIG" jkbase-toolchain:latest "$WORK/oci.tar" --arch x86_64 >/dev/null
+# Use the committed lockfile when present so the package set is reproducible
+# (the Wolfi repo is rolling; an unlocked build drifts). Regenerate with:
+#   apko lock "$CONFIG" --arch x86_64 --output "${CONFIG%.yaml}.lock.json"
+LOCK="${CONFIG%.yaml}.lock.json"
+lock_arg=()
+[ -f "$LOCK" ] && lock_arg=(--lockfile "$LOCK")
+apko build "$CONFIG" jkbase-toolchain:latest "$WORK/oci.tar" --arch x86_64 "${lock_arg[@]}" >/dev/null
 
 echo "[build-image] extracting rootfs layers"
 # docker-archive: manifest.json lists ordered layer tarballs; apply in order.
