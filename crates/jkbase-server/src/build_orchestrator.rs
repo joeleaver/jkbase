@@ -129,13 +129,21 @@ pub fn detect_language(source_path: &Path, hint: Option<&str>) -> Option<String>
         return Some(h.to_string());
     }
     let has = |f: &str| source_path.join(f).exists();
+    // Bun first — its markers are specific (a bun project also carries package.json).
     if has("bun.lockb") || has("bun.lock") || has("bunfig.toml") {
         return Some("bun".to_string());
     }
-    if let Ok(pkg) = std::fs::read_to_string(source_path.join("package.json"))
-        && pkg.contains("bun@")
-    {
-        return Some("bun".to_string());
+    if let Ok(pkg) = std::fs::read_to_string(source_path.join("package.json")) {
+        if pkg.contains("bun@") {
+            return Some("bun".to_string());
+        }
+        // Any other package.json is a Node project (npm/pnpm/yarn). The in-VM
+        // buildpack does the authoritative detect + picks the package manager.
+        return Some("node".to_string());
+    }
+    // A Cargo.toml (and no JS manifest above) is a Rust project.
+    if has("Cargo.toml") {
+        return Some("rust".to_string());
     }
     None
 }
@@ -1250,7 +1258,15 @@ async fn build_one_target_inner(
             }
         }
         TargetKind::Server => {
-            collect_layered_server(&output_img, staged, workspace, &tag, config, spec)?;
+            collect_layered_server(
+                &output_img,
+                staged,
+                workspace,
+                &tag,
+                config,
+                spec,
+                toolchain_lang.as_deref(),
+            )?;
         }
     }
 
@@ -1269,6 +1285,9 @@ fn collect_layered_server(
     tag: &str,
     config: &ProjectConfig,
     spec: &TargetSpec,
+    // The language the host resolved for this target (explicit jkbase.toml hint or
+    // the cheap source sniff) — keys the shared runtime layer the app stacks on.
+    resolved_language: Option<&str>,
 ) -> Result<()> {
     // Read the layered index the in-VM exporter wrote.
     let index_tmp = workspace.join(format!("{tag}.index.json"));
@@ -1332,11 +1351,17 @@ fn collect_layered_server(
         obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
         // A dockerfile build is a single self-contained image layer — mark it so the
         // host layer plan runs it standalone (no base/runtime stack) and the agent
-        // honours the image's own env. Otherwise it's a language runtime layer.
+        // honours the image's own env. Otherwise it's a language runtime layer keyed
+        // by the RESOLVED language (not the raw jkbase.toml hint, which is usually
+        // absent for an auto-detected node/rust app — that would mis-stamp it "bun"
+        // and the layer plan would attach the bun runtime under a node/rust binary).
         let runtime = if spec.builder == Builder::Dockerfile {
             crate::layer_plan::IMAGE_SELF_RUNTIME.to_string()
         } else {
-            spec.language.clone().unwrap_or_else(|| "bun".to_string())
+            resolved_language
+                .map(str::to_string)
+                .or_else(|| spec.language.clone())
+                .unwrap_or_else(|| "bun".to_string())
         };
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
     }
@@ -1855,6 +1880,15 @@ mod tests {
         // package.json declaring bun as the package manager also counts.
         std::fs::write(dir.join("package.json"), r#"{"packageManager":"bun@1.1.34"}"#).unwrap();
         assert_eq!(detect_language(&dir, None).as_deref(), Some("bun"));
+
+        // A non-bun package.json sniffs as Node (npm/pnpm/yarn).
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("node"));
+        std::fs::remove_file(dir.join("package.json")).unwrap();
+
+        // A Cargo.toml (no JS manifest) sniffs as Rust.
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("rust"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
