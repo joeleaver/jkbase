@@ -1,0 +1,27 @@
+# The shared Rust RUNTIME layer (the per-language overlay between the tenant app
+# binary and the shared Wolfi base). A default `cargo build` binary is glibc-dynamic
+# and links the C-runtime unwinder `libgcc_s.so.1`, which the base (glibc + ld-linux
+# only) does not carry. This layer supplies exactly that — it is tiny.
+#
+# apko pulls `libgcc`'s closure (glibc, …); tools/build-base-layer.sh DELTAs the
+# rootfs against the shared base stage, so after the delta the layer is effectively
+# just `libgcc_s.so.1` (everything else is identical to base and dropped). One copy
+# shared across every Rust tenant.
+#
+# C++-linking crates (cc with -lstdc++) would additionally need libstdc++ at
+# runtime — a deliberate v1 omission (add it here if a real app needs it). A
+# pure-Rust web app (axum/hyper/tokio + rustls) needs only libgcc_s + glibc.
+#
+# Built into a content-addressed erofs blob by tools/build-base-layer.sh and
+# recorded under `runtimes.rust` in the layer store's platform.json.
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - libgcc
+
+archs:
+  - x86_64
