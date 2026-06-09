@@ -2174,17 +2174,11 @@ async fn sync_agent(ip: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ask the agent to re-discipline the guest wall clock (used after wake/restore).
-/// We pass the host's current time as `unix_nanos`: the agent prefers reading its
-/// KVM PTP device (host UTC, exact) and only uses this fallback if /dev/ptp0 is
-/// unavailable. Best-effort and bounded — a clock nudge must never block a wake.
+/// Ask the agent to step the guest wall clock to its PTP reference now (the agent
+/// runs `chronyc makestep`). Used after wake/restore so a restored snapshot — whose
+/// clock is frozen at snapshot time — corrects instantly instead of on chrony's
+/// next poll. Best-effort and bounded: a clock nudge must never block a wake.
 async fn resync_clock_agent(ip: &str) {
-    let unix_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
-    let body = format!("{{\"unix_nanos\":{unix_nanos}}}");
-
     let send = async {
         let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await.ok()?;
         let io = hyper_util::rt::TokioIo::new(stream);
@@ -2193,8 +2187,7 @@ async fn resync_clock_agent(ip: &str) {
         let req = hyper::Request::builder()
             .method("POST")
             .uri(format!("http://{ip}:80/_jkbase/resync-clock"))
-            .header("content-type", "application/json")
-            .body(http_body_util::Full::<hyper::body::Bytes>::new(body.into()))
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
             .ok()?;
         let _ = sender.send_request(req).await;
         Some(())

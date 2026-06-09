@@ -1,0 +1,27 @@
+# Runtime VM rootfs userland: the minimal Wolfi (glibc) base the jkbase-agent runs
+# on as PID 1. Unlike the old hand-built single-static-binary rootfs (which carried
+# no userland and so could not run a time daemon), this ships chrony so the agent
+# can discipline the guest wall clock from the KVM PTP device (refclock PHC
+# /dev/ptp0) — the canonical Firecracker time-sync path. chrony corrects both the
+# free-running-tsc frequency error of running in a VM AND the hibernate/resume jump.
+#
+# The agent (static musl) is injected as /sbin/init by tools/build-runtime-rootfs.sh
+# after apko, along with /etc/chrony.conf and the mountpoint dirs (the root boots
+# read-only). This file only assembles the userland. chronyd is run as root
+# (`-u root`) by the agent, so no chrony user account is needed here.
+#
+# Pin: commit the apko.lock.json apko emits (`apko lock`) so rebuilds are
+# bitwise-reproducible (the Wolfi repo is rolling).
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - glibc # chrony is a glibc binary
+    - ld-linux # dynamic loader for chrony
+    - chrony # NTP/PTP client; refclock PHC disciplines the guest clock
+
+archs:
+  - x86_64

@@ -1,198 +1,101 @@
-//! Guest wall-clock discipline.
+//! Guest wall-clock discipline via chrony + the KVM PTP device.
 //!
-//! A Firecracker microVM has two sources of wall-clock error, both of which this
-//! module corrects with no network and no NTP daemon:
+//! A Firecracker microVM drifts two ways, both observed: (1) the guest runs on the
+//! free-running `tsc` clocksource (kvm-clock is available but auto-deselected; we
+//! deliberately do NOT pin `clocksource=kvm-clock`, which opts into a documented
+//! Firecracker restore regression where the *monotonic* clock jumps on resume), so
+//! an undisciplined, calibration-derived TSC accumulates offset; (2) a snapshot
+//! freezes the guest clock, so a restored VM resumes behind by the paused duration.
 //!
-//!  1. **Running in a VM.** The guest auto-selects the free-running `tsc`
-//!     clocksource (kvm-clock is available but deselected; we deliberately do NOT
-//!     pin `clocksource=kvm-clock` — that opts into a documented Firecracker
-//!     restore regression where the *monotonic* clock jumps on resume). An
-//!     undisciplined, calibration-derived TSC drifts (ppm-level) with nothing to
-//!     correct the accumulated offset.
-//!  2. **Hibernate / resume.** A snapshot freezes the guest clock; on restore the
-//!     VM resumes with its wall-clock continuing from the snapshot instant, so it
-//!     is behind by the entire paused duration (seconds … hours).
+//! The canonical Firecracker fix is chrony disciplined by the KVM-backed PTP device
+//! (`/dev/ptp0`, "KVM virtual PTP"). chrony reads the host's UTC from the PHC with
+//! cheap paravirt calls — no network — and corrects both the TSC *frequency* error
+//! and the offset (measured ~12 ppm on the dev box, held to sub-microsecond). The
+//! agent is the VM's PID 1, so it owns starting and supervising chronyd; we run it
+//! as root (`-u root`, no privilege drop) since the VM is single-tenant and chronyd
+//! runs in the agent's init context, never exposed to tenant code.
 //!
-//! The fix is the canonical Firecracker answer — discipline `CLOCK_REALTIME`
-//! against the host via the KVM-backed PTP device — but implemented in-agent
-//! (a ~chrony-lite) rather than by shipping chrony, to keep the runtime image
-//! minimal and to give the host precise control over the resume re-sync.
-//!
-//! `ptp_kvm` registers `/dev/ptp0` ("KVM virtual PTP"). Reading it via
-//! `clock_gettime` on its dynamic POSIX clock id issues `KVM_HC_CLOCK_PAIRING`
-//! (WALLCLOCK), which the host services from `tk->xtime_sec` — i.e. the host's
-//! `CLOCK_REALTIME` in **UTC** (verified against the v6.12 kernel source; it is
-//! NOT TAI, so no leap-second offset is applied).
-//!
-//! Stepping/slewing `CLOCK_REALTIME` requires `CAP_SYS_TIME`, which the agent has
-//! as the VM's uid-0 PID 1.
+//! For the hibernate/resume jump, chrony's `makestep` would step on its next poll,
+//! but the host calls [`resync_now`] (POST `/_jkbase/resync-clock`) right after it
+//! resumes a restored snapshot so the correction is *instant* — the first request
+//! after wake already sees correct time.
 
-use std::fs::OpenOptions;
-use std::io;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::process::Command;
 
-/// The KVM-backed PTP hardware clock that `ptp_kvm` registers.
-const PTP_DEVICE: &str = "/dev/ptp0";
+const CHRONYD: &str = "/usr/sbin/chronyd";
+const CHRONYC: &str = "/usr/bin/chronyc";
+/// chrony's writable runtime dir (driftfile + command socket). `/run` is a tmpfs
+/// the agent mounts, so this is recreated each boot.
+const CHRONY_RUNDIR: &str = "/run/chrony";
 
-/// Above this magnitude we hard-step `CLOCK_REALTIME`; at or below it we slew.
-///
-/// Mirrors chrony's `makestep`: a hibernate/resume jump (minutes–hours) MUST be
-/// stepped — slewing it at the kernel's ~1/12 max rate would take many times the
-/// offset in wall time. Steady-state ppm drift (and small *backward* corrections,
-/// which a hard step would make most damaging) is slewed instead, so the wall
-/// clock stays continuous. 500 ms sits well above realistic inter-pass drift (so
-/// we never step on noise) yet bounds the worst-case slew to ~6 s.
-const STEP_THRESHOLD_NS: i128 = 500_000_000;
-
-/// How often the background loop disciplines the clock against the PTP reference.
-/// The free-running tsc drifts only ppm-level, so the per-pass correction is tiny;
-/// the explicit host-triggered re-sync (after resume) is what makes a wake instant.
-const DISCIPLINE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Outcome of one discipline pass, for logging / the control endpoint's response.
-pub struct ResyncResult {
-    /// `"ptp"` when read from `/dev/ptp0`, `"host"` when the PTP device was
-    /// unavailable and we fell back to a host-provided timestamp.
-    pub source: &'static str,
-    /// Signed `reference − guest` offset in nanoseconds (how far behind/ahead the
-    /// guest clock was before correction).
-    pub offset_ns: i128,
-    /// True if we hard-stepped (large offset), false if we slewed.
-    pub stepped: bool,
-}
-
-/// `man clock_getres(2)`, "Dynamic clocks":
-/// `#define FD_TO_CLOCKID(fd) ((~(clockid_t)(fd) << 3) | CLOCKFD)`, `CLOCKFD = 3`.
-fn fd_to_clockid(fd: i32) -> libc::clockid_t {
-    ((!(fd as libc::clockid_t)) << 3) | 3
-}
-
-fn now_realtime() -> io::Result<libc::timespec> {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) } != 0 {
-        return Err(io::Error::last_os_error());
+/// Prepare chrony's runtime dir and start a supervised chronyd that disciplines
+/// `CLOCK_REALTIME` from the baked `/etc/chrony.conf` (`refclock PHC /dev/ptp0`).
+/// Call once at startup, only as PID 1 (chronyd needs CAP_SYS_TIME, and there is
+/// nothing to discipline in a non-VM context).
+pub fn start_chrony() {
+    // chrony refuses a command-socket dir more permissive than 0750 (it would
+    // otherwise disable the socket, and `chronyc makestep` could not reach it).
+    if let Err(e) = std::fs::create_dir_all(CHRONY_RUNDIR) {
+        tracing::error!(error = %e, dir = CHRONY_RUNDIR, "failed to create chrony run dir; clock will drift");
+        return;
     }
-    Ok(ts)
-}
-
-/// Read the host's wall clock (UTC / `CLOCK_REALTIME`) from the KVM PTP device.
-fn read_ptp_utc() -> io::Result<libc::timespec> {
-    // The dynamic clock id is only valid while the fd is open — keep `f` alive
-    // until AFTER `clock_gettime` (dropping it first would yield EINVAL).
-    let f = OpenOptions::new().read(true).write(true).open(PTP_DEVICE)?;
-    let clkid = fd_to_clockid(f.as_raw_fd());
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    if unsafe { libc::clock_gettime(clkid, &mut ts) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    drop(f);
-    Ok(ts)
-}
-
-fn ts_to_ns(ts: &libc::timespec) -> i128 {
-    ts.tv_sec as i128 * 1_000_000_000 + ts.tv_nsec as i128
-}
-
-/// Build a `timespec` from a positive UNIX-epoch nanosecond count (the host's
-/// clock, supplied as the fallback reference). The remainder is non-negative.
-fn ns_to_ts(unix_ns: i128) -> libc::timespec {
-    // `as _` infers each field's width from the (target-specific) struct so the
-    // syscall struct always matches the linked libc ABI (musl's time_t width).
-    libc::timespec {
-        tv_sec: (unix_ns / 1_000_000_000) as _,
-        tv_nsec: (unix_ns % 1_000_000_000) as _,
-    }
-}
-
-/// Hard-set `CLOCK_REALTIME` to an absolute UTC reference. Needs `CAP_SYS_TIME`.
-fn step_realtime(ts: &libc::timespec) -> io::Result<()> {
-    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, ts) } != 0 {
-        // EPERM => missing CAP_SYS_TIME (not PID 1 / not root).
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// One-shot relative offset injection (slew, not step) via
-/// `clock_adjtime(ADJ_SETOFFSET | ADJ_NANO)`. `tv_usec` carries NANOSECONDS here
-/// (because `ADJ_NANO`) and must be non-negative, so a negative offset is
-/// normalized into `(tv_sec, tv_usec)` with a non-negative sub-second part.
-fn slew_offset(offset_ns: i128) -> io::Result<()> {
-    let mut sec = (offset_ns / 1_000_000_000) as i64;
-    let mut nsec = (offset_ns % 1_000_000_000) as i64;
-    if nsec < 0 {
-        sec -= 1;
-        nsec += 1_000_000_000;
+    if let Err(e) =
+        std::fs::set_permissions(CHRONY_RUNDIR, std::fs::Permissions::from_mode(0o750))
+    {
+        tracing::warn!(error = %e, "failed to chmod chrony run dir 0750; command socket may be disabled");
     }
 
-    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
-    tx.modes = (libc::ADJ_SETOFFSET | libc::ADJ_NANO) as _;
-    tx.time = libc::timeval {
-        tv_sec: sec as _,
-        tv_usec: nsec as _,
-    };
-    // clock_adjtime returns the clock state (>= 0) on success; only -1 is an error.
-    if unsafe { libc::clock_adjtime(libc::CLOCK_REALTIME, &mut tx) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Discipline the guest `CLOCK_REALTIME` toward a reference time once.
-///
-/// Prefers the KVM PTP device (host UTC, no network). If `/dev/ptp0` is
-/// unavailable it falls back to `fallback_unix_ns` (the host's clock, pushed over
-/// the control channel) so a resume re-sync still works even on a kernel without
-/// the PTP device. Steps large offsets, slews small ones.
-pub fn resync(fallback_unix_ns: Option<i128>) -> io::Result<ResyncResult> {
-    // Read the guest clock first, then the reference as close as possible to the
-    // step, so the offset reflects the instant we correct.
-    let now = now_realtime()?;
-    let (reference, source) = match read_ptp_utc() {
-        Ok(ts) => (ts, "ptp"),
-        Err(e) => match fallback_unix_ns {
-            Some(ns) => (ns_to_ts(ns), "host"),
-            None => return Err(e),
-        },
-    };
-
-    let offset_ns = ts_to_ns(&reference) - ts_to_ns(&now);
-    let stepped = offset_ns.unsigned_abs() > STEP_THRESHOLD_NS as u128;
-    if stepped {
-        step_realtime(&reference)?;
-    } else {
-        slew_offset(offset_ns)?;
-    }
-    Ok(ResyncResult {
-        source,
-        offset_ns,
-        stepped,
-    })
-}
-
-/// Spawn the background discipline loop. Best-effort: a failed pass (e.g. PTP
-/// device missing) is logged and retried on the next tick, never fatal.
-pub fn spawn_discipline_loop() {
+    // Supervise: chronyd should never exit, but if it does, restart it so the clock
+    // doesn't silently start drifting for the rest of the VM's life.
     tokio::spawn(async {
         loop {
-            tokio::time::sleep(DISCIPLINE_INTERVAL).await;
-            match resync(None) {
-                Ok(r) => {
-                    // Only worth a line when the correction was non-trivial.
-                    if r.stepped || r.offset_ns.unsigned_abs() > 1_000_000 {
-                        tracing::debug!(
-                            source = r.source,
-                            offset_ms = (r.offset_ns / 1_000_000) as i64,
-                            stepped = r.stepped,
-                            "clock disciplined"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "clock discipline pass failed");
-                }
+            tracing::info!("starting chronyd (refclock PHC /dev/ptp0)");
+            // `-d` keeps chronyd in the foreground (so we can supervise it);
+            // `-u root` skips the privilege drop. Logs inherit stdio -> console.
+            let result = Command::new(CHRONYD)
+                .args(["-u", "root", "-f", "/etc/chrony.conf", "-d"])
+                .kill_on_drop(true)
+                .status()
+                .await;
+            match result {
+                Ok(status) => tracing::error!(?status, "chronyd exited; restarting in 2s"),
+                Err(e) => tracing::error!(error = %e, "failed to spawn chronyd; retrying in 2s"),
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
+}
+
+/// Result of an on-demand resync, reported back to the host.
+pub struct ResyncResult {
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Force chrony to step the clock to its PTP reference immediately (`chronyc
+/// makestep`). The host calls this right after resuming a restored snapshot so the
+/// resume jump is corrected at once rather than on chrony's next poll.
+pub async fn resync_now() -> ResyncResult {
+    match Command::new(CHRONYC)
+        .args(["-n", "makestep"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // chronyc prints "200 OK" when the daemon accepts the command.
+            let ok = out.status.success() && stdout.contains("200 OK");
+            let detail = format!("{}{}", stdout.trim(), stderr.trim());
+            ResyncResult { ok, detail }
+        }
+        Err(e) => ResyncResult {
+            ok: false,
+            detail: format!("failed to run chronyc: {e}"),
+        },
+    }
 }

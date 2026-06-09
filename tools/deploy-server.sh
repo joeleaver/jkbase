@@ -38,8 +38,17 @@ cargo build --release -p jkbase-server -p jkbase-cli 2>&1 | tail -3
 echo "Building jkbase-agent (musl)..."
 cargo build --release -p jkbase-agent --target x86_64-unknown-linux-musl 2>&1 | tail -3
 
-# Delete base rootfs so it gets rebuilt with the new agent on next start
-sudo rm -f /var/jkbase/base-rootfs.ext4
+# Rebuild the runtime rootfs (apko Wolfi userland + chrony + the new agent as
+# /sbin/init) so the agent's chrony-based guest clock discipline ships with this
+# deploy. The server runs as root via systemd and can't reach the deploy user's
+# apko, so we build the artifact here (as the deploy user) and the server consumes
+# it. apko isn't a base-OS package; install it once if missing (the guard makes
+# this a no-op on every subsequent deploy).
+export PATH="$HOME/.local/bin:$PATH"
+command -v apko >/dev/null || ./tools/install-image-tools.sh
+echo "Building runtime rootfs (apko Wolfi + chrony + agent)..."
+AGENT_BIN="$HOME/jkbase/target/x86_64-unknown-linux-musl/release/jkbase-agent" \
+    OUT=/var/jkbase/base-rootfs.ext4 ./tools/build-runtime-rootfs.sh
 
 # Clean stale loop mounts from any previous failed content image builds
 echo "Cleaning stale mounts..."

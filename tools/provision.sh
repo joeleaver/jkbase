@@ -178,6 +178,16 @@ JKBASE_DIR="$HOME/jkbase"
 sudo mkdir -p /var/jkbase
 sudo chown "$(whoami):$(whoami)" /var/jkbase
 
+# Prebuild the runtime VM rootfs (apko Wolfi userland + chrony + the agent as
+# /sbin/init) into the data dir. The server runs as root via systemd and can't
+# reach the deploy user's apko, so it consumes this prebuilt artifact on first
+# start. apko isn't a base-OS package; install it once if missing (idempotent).
+export PATH="$HOME/.local/bin:$PATH"
+command -v apko >/dev/null || "$JKBASE_DIR/tools/install-image-tools.sh"
+echo "Building runtime rootfs (apko Wolfi + chrony + agent)..."
+AGENT_BIN="$JKBASE_DIR/target/x86_64-unknown-linux-musl/release/jkbase-agent" \
+    OUT=/var/jkbase/base-rootfs.ext4 "$JKBASE_DIR/tools/build-runtime-rootfs.sh"
+
 # Create bridge setup script
 sudo tee /usr/local/bin/jkbase-bridge.sh > /dev/null << 'BRIDGE'
 #!/bin/bash

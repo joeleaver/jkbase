@@ -29,6 +29,8 @@ fn mount_filesystems() {
         ("/sys", "sysfs", "sysfs"),
         ("/dev", "devtmpfs", "devtmpfs"),
         ("/tmp", "tmpfs", "tmpfs"),
+        // chrony's writable runtime dir (driftfile + command socket) lives here.
+        ("/run", "tmpfs", "tmpfs"),
     ];
 
     for (target, fstype, source) in &mounts {
@@ -260,23 +262,14 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt::init();
 
-    // Discipline the guest wall clock against the host's KVM PTP device. As PID 1
-    // (uid 0) we hold CAP_SYS_TIME; /dev is devtmpfs so /dev/ptp0 is present once
-    // ptp_kvm registers. An immediate sync corrects the cold-boot offset; the loop
-    // then holds it against the free-running tsc drift. The hibernate/resume jump
-    // is additionally corrected on demand via POST /_jkbase/resync-clock, which the
-    // host fires right after it resumes a restored snapshot. See clock.rs.
+    // Discipline the guest wall clock against the host's KVM PTP device via chrony
+    // (refclock PHC /dev/ptp0): it corrects the free-running-tsc frequency error and
+    // any offset with no network. As PID 1 we own supervising chronyd. The
+    // hibernate/resume jump is corrected instantly on demand via POST
+    // /_jkbase/resync-clock (chronyc makestep), fired by the host after it resumes a
+    // restored snapshot. See clock.rs.
     if is_pid1() {
-        match clock::resync(None) {
-            Ok(r) => info!(
-                source = r.source,
-                offset_ms = (r.offset_ns / 1_000_000) as i64,
-                stepped = r.stepped,
-                "initial clock sync"
-            ),
-            Err(e) => error!(error = %e, "initial clock sync failed (/dev/ptp0 unavailable?)"),
-        }
-        clock::spawn_discipline_loop();
+        clock::start_chrony();
     }
 
     let serve_dir = PathBuf::from(
@@ -546,44 +539,19 @@ async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// Re-discipline the guest wall clock on demand. The host POSTs this right after
-/// resuming a restored snapshot — the guest clock is frozen at snapshot time, so
-/// it lags by the paused duration and the agent must step it forward immediately
-/// (rather than waiting for the next periodic discipline tick). The optional
-/// `{"unix_nanos": <i64>}` body is a fallback reference used only if the KVM PTP
-/// device is unavailable; normally the agent reads the host's UTC from /dev/ptp0.
-async fn resync_clock_response(req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-    let fallback = req
-        .into_body()
-        .collect()
-        .await
-        .ok()
-        .map(|b| b.to_bytes())
-        .filter(|b| !b.is_empty())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| v.get("unix_nanos").and_then(|n| n.as_i64()))
-        .map(|n| n as i128);
-
-    let body = match clock::resync(fallback) {
-        Ok(r) => {
-            info!(
-                source = r.source,
-                offset_ms = (r.offset_ns / 1_000_000) as i64,
-                stepped = r.stepped,
-                "clock resynced on request"
-            );
-            serde_json::json!({
-                "ok": true,
-                "source": r.source,
-                "offset_ns": r.offset_ns as i64,
-                "stepped": r.stepped,
-            })
-        }
-        Err(e) => {
-            error!(error = %e, "clock resync failed");
-            serde_json::json!({ "ok": false, "error": e.to_string() })
-        }
-    };
+/// Re-discipline the guest wall clock on demand by forcing `chronyc makestep`. The
+/// host POSTs this right after resuming a restored snapshot — the guest clock is
+/// frozen at snapshot time, so it lags by the paused duration; stepping it now
+/// (rather than waiting for chrony's next poll) means the first request after wake
+/// already sees correct time.
+async fn resync_clock_response(_req: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+    let r = clock::resync_now().await;
+    if r.ok {
+        info!(detail = %r.detail, "clock resynced (chronyc makestep)");
+    } else {
+        error!(detail = %r.detail, "clock resync failed");
+    }
+    let body = serde_json::json!({ "ok": r.ok, "detail": r.detail });
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
