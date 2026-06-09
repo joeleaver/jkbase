@@ -75,6 +75,18 @@ struct BlobRef {
     digest: String,
 }
 
+/// Sentinel `runtime` value marking a server whose App layer is a self-contained
+/// rootfs (the `builder = "dockerfile"` escape hatch). Such a server runs as a
+/// SINGLE overlay lowerdir with no shared base/runtime beneath it — it carries its
+/// own libc, init, and entrypoint. The build orchestrator stamps this into the
+/// server manifest's `runtime` field; the agent keys non-clobbering env on it.
+pub const IMAGE_SELF_RUNTIME: &str = "image/self";
+
+/// Whether a server's App layer is self-contained (single-layer image/self mode).
+fn is_self_contained(s: &ServerLayerInfo) -> bool {
+    s.runtime.as_deref() == Some(IMAGE_SELF_RUNTIME)
+}
+
 /// Guest device node for the i-th virtio-blk drive (PUT order): 0→vda, 1→vdb, ….
 /// Single-letter only (vda..vdz); the caller bounds the layer count so this never
 /// overflows.
@@ -167,35 +179,53 @@ pub fn compute_layer_plan(
         return Ok(LayerPlan::empty(has_data_disk));
     }
 
-    let platform = read_platform(store_dir)?;
+    // Self-contained "image/self" servers (the dockerfile escape hatch) are a single
+    // App layer that IS the whole rootfs — its own libc/init/entrypoint — so they
+    // skip the shared base + per-language runtime layers entirely. Layered servers
+    // (bun &c.) stack `app:runtime:base`.
+    let any_layered = servers.iter().any(|(_, s)| !is_self_contained(s));
+
+    // Only read/require the platform base+runtime store when a layered server needs
+    // it — an all-image/self deployment has no platform dependency at all.
+    let platform = if any_layered {
+        Some(read_platform(store_dir)?)
+    } else {
+        None
+    };
 
     // Ordered, deduplicated blob list: base, distinct runtimes (sorted), apps.
     let mut order: Vec<BlobRef> = Vec::new();
     let mut runtime_idx: BTreeMap<String, usize> = BTreeMap::new();
     let mut app_idx: BTreeMap<String, usize> = BTreeMap::new();
 
-    let base_dev_idx = order.len();
-    order.push(BlobRef {
-        path: store_dir.join(&platform.base.file),
-        digest: platform.base.digest.clone(),
-    });
-
-    let mut langs: Vec<String> = servers
-        .iter()
-        .map(|(_, s)| s.runtime.clone().unwrap_or_else(|| "bun".to_string()))
-        .collect();
-    langs.sort();
-    langs.dedup();
-    for lang in &langs {
-        let desc = platform
-            .runtimes
-            .get(lang)
-            .ok_or_else(|| anyhow::anyhow!("no platform runtime layer for language '{lang}'"))?;
-        runtime_idx.insert(lang.clone(), order.len());
+    let mut base_dev_idx: Option<usize> = None;
+    if let Some(platform) = &platform {
+        base_dev_idx = Some(order.len());
         order.push(BlobRef {
-            path: store_dir.join(&desc.file),
-            digest: desc.digest.clone(),
+            path: store_dir.join(&platform.base.file),
+            digest: platform.base.digest.clone(),
         });
+
+        // Runtimes are keyed only by LAYERED servers' languages — an image/self
+        // server's `runtime` sentinel must never be looked up as a platform runtime.
+        let mut langs: Vec<String> = servers
+            .iter()
+            .filter(|(_, s)| !is_self_contained(s))
+            .map(|(_, s)| s.runtime.clone().unwrap_or_else(|| "bun".to_string()))
+            .collect();
+        langs.sort();
+        langs.dedup();
+        for lang in &langs {
+            let desc = platform
+                .runtimes
+                .get(lang)
+                .ok_or_else(|| anyhow::anyhow!("no platform runtime layer for language '{lang}'"))?;
+            runtime_idx.insert(lang.clone(), order.len());
+            order.push(BlobRef {
+                path: store_dir.join(&desc.file),
+                digest: desc.digest.clone(),
+            });
+        }
     }
 
     for (name, s) in &servers {
@@ -243,17 +273,18 @@ pub fn compute_layer_plan(
     let dev = |order_idx: usize| device_node(2 + order_idx);
     let mut runtime_layers = RuntimeLayers::new();
     for (name, s) in &servers {
-        let lang = s.runtime.clone().unwrap_or_else(|| "bun".to_string());
         let app_dev = dev(app_idx[name]);
-        let runtime_dev = dev(runtime_idx[&lang]);
-        let base_dev = dev(base_dev_idx);
-        runtime_layers.servers.insert(
-            name.clone(),
-            ServerLayers {
-                // overlay lowerdir order: app first, base last.
-                layers: vec![app_dev, runtime_dev, base_dev],
-            },
-        );
+        let layers = if is_self_contained(s) {
+            // Single self-contained lowerdir — the image is the whole tree.
+            vec![app_dev]
+        } else {
+            // overlay lowerdir order: app first, base last.
+            let lang = s.runtime.clone().unwrap_or_else(|| "bun".to_string());
+            let runtime_dev = dev(runtime_idx[&lang]);
+            let base_dev = dev(base_dev_idx.expect("layered server requires a base layer"));
+            vec![app_dev, runtime_dev, base_dev]
+        };
+        runtime_layers.servers.insert(name.clone(), ServerLayers { layers });
     }
     if has_data_disk {
         runtime_layers.data_device = Some(device_node(2 + layer_paths.len()));
@@ -616,6 +647,105 @@ mod tests {
 
         // Data disk attaches after the 3 layers: vd(c+3) = vdf.
         assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vdf"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn single_layer_for_image_self_server() {
+        // An image/self server is a single self-contained App layer: no base, no
+        // runtime, no platform.json dependency. The device map is [app] only, and
+        // the data disk attaches right after the lone app layer.
+        let root = std::env::temp_dir().join(format!("lp-self-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store"); // intentionally has NO platform.json
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+        std::fs::write(
+            deploy.join("_servers/web.json"),
+            format!(r#"{{"app_layer":"{app_f}","runtime":"image/self","port":8080}}"#),
+        )
+        .unwrap();
+
+        // No platform.json is read because there are no layered servers.
+        let plan = compute_layer_plan(&deploy, &store, true, false).unwrap();
+
+        // Exactly one blob attaches (the app), at vdc.
+        assert_eq!(plan.layer_paths.len(), 1);
+        assert!(plan.layer_paths[0].ends_with(&app_f), "vdc = app");
+
+        // The overlay is a single lowerdir — the whole image rootfs.
+        let s = &plan.runtime_layers.servers["web"];
+        assert_eq!(s.layers, vec!["/dev/vdc"]);
+
+        // Data disk attaches right after: vd(c+1) = vdd.
+        assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vdd"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mixed_layered_and_image_self_servers() {
+        // A bun (layered) server and an image/self server in one deployment: base +
+        // runtime are present (the bun server needs them); the image/self server is
+        // app-only; both app layers attach after the shared base/runtime.
+        let root = std::env::temp_dir().join(format!("lp-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+
+        let base_f = format!("sha256-{}.erofs", "a".repeat(64));
+        let rt_f = format!("sha256-{}.erofs", "b".repeat(64));
+        let api_app = format!("sha256-{}.erofs", "c".repeat(64));
+        let web_app = format!("sha256-{}.erofs", "d".repeat(64));
+        std::fs::write(store.join(&base_f), b"base").unwrap();
+        std::fs::write(store.join(&rt_f), b"rt").unwrap();
+        std::fs::write(deploy.join("_layers").join(&api_app), b"api").unwrap();
+        std::fs::write(deploy.join("_layers").join(&web_app), b"web").unwrap();
+        std::fs::write(
+            store.join("platform.json"),
+            format!(
+                r#"{{"base":{{"digest":"sha256:{a}","file":"{base_f}"}},"runtimes":{{"bun":{{"digest":"sha256:{b}","file":"{rt_f}"}}}}}}"#,
+                a = "a".repeat(64),
+                b = "b".repeat(64),
+            ),
+        )
+        .unwrap();
+        // Sorted by name: api (bun) then web (image/self).
+        std::fs::write(
+            deploy.join("_servers/api.json"),
+            format!(r#"{{"app_layer":"{api_app}","runtime":"bun","port":3000}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_servers/web.json"),
+            format!(r#"{{"app_layer":"{web_app}","runtime":"image/self","port":8080}}"#),
+        )
+        .unwrap();
+
+        let plan = compute_layer_plan(&deploy, &store, false, false).unwrap();
+
+        // Attach order: base(vdc), bun-rt(vdd), api-app(vde), web-app(vdf).
+        assert_eq!(plan.layer_paths.len(), 4);
+        assert!(plan.layer_paths[0].ends_with(&base_f));
+        assert!(plan.layer_paths[1].ends_with(&rt_f));
+        assert!(plan.layer_paths[2].ends_with(&api_app));
+        assert!(plan.layer_paths[3].ends_with(&web_app));
+
+        // api stacks app:runtime:base; web is app-only.
+        assert_eq!(
+            plan.runtime_layers.servers["api"].layers,
+            vec!["/dev/vde", "/dev/vdd", "/dev/vdc"]
+        );
+        assert_eq!(plan.runtime_layers.servers["web"].layers, vec!["/dev/vdf"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }
