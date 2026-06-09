@@ -110,8 +110,6 @@ pub enum Command {
     /// Connect a repo for push-to-deploy (git push / GitHub Actions)
     #[command(subcommand)]
     Repo(repo::RepoCommand),
-    /// Start local development environment
-    Dev,
 }
 
 #[derive(Subcommand)]
@@ -282,10 +280,6 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Secret(cmd) => run_secret(cmd).await,
         Command::Domain(cmd) => run_domain(cmd).await,
         Command::Repo(cmd) => repo::run(cmd).await,
-        Command::Dev => {
-            println!("Starting local development environment...");
-            Ok(())
-        }
     }
 }
 

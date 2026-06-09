@@ -381,29 +381,11 @@ impl BuildNet {
                 self.bridge
             );
         }
+        // FATAL: the isolation rules. Without these a build VM could reach the host
+        // / other VMs / the internet — refuse to run builds at all.
         let input_hook = ["-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
         let fwd_drop = ["-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
-        let mut checks: Vec<Vec<String>> = vec![
-            input_hook.iter().map(|s| s.to_string()).collect(),
-            fwd_drop.iter().map(|s| s.to_string()).collect(),
-        ];
-        // The JKBUILD chain must actually ACCEPT each proxy port the orchestrator
-        // hands to VMs — otherwise a build (esp. a dockerfile build pointed at the
-        // public-any port) silently gets zero egress and dies at fetch. Assert each
-        // port we'll use is open, not just that the chain exists.
-        let dport = self.proxy_port.to_string();
-        let proxy_accept = |port: &str| -> Vec<String> {
-            vec![
-                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
-                "-d".into(), self.gateway.clone(), "--dport".into(), port.into(),
-                "-j".into(), "ACCEPT".into(),
-            ]
-        };
-        checks.push(proxy_accept(&dport));
-        if let Some(any) = self.proxy_any_port {
-            checks.push(proxy_accept(&any.to_string()));
-        }
-        for check in &checks {
+        for check in [input_hook, fwd_drop] {
             let ok = tokio::process::Command::new("iptables")
                 .args(check)
                 .status()
@@ -412,7 +394,36 @@ impl BuildNet {
                 .unwrap_or(false);
             if !ok {
                 bail!(
-                    "build firewall rule missing ({check:?}) — run `sudo tools/setup-build-net.sh`"
+                    "build firewall isolation rule missing ({check:?}) — run `sudo tools/setup-build-net.sh`"
+                );
+            }
+        }
+        // WARN-only: the proxy-port ACCEPT rules are about FUNCTIONALITY (can a build
+        // reach the egress proxy), not isolation — a missing one makes builds fail at
+        // fetch (fail-safe), so surface it loudly but don't refuse to start (and never
+        // outage the runtime over an iptables rule-form mismatch).
+        let proxy_accept = |port: u16| -> Vec<String> {
+            vec![
+                "-C".into(), "JKBUILD".into(), "-p".into(), "tcp".into(),
+                "-d".into(), self.gateway.clone(), "--dport".into(), port.to_string(),
+                "-j".into(), "ACCEPT".into(),
+            ]
+        };
+        let mut want = vec![self.proxy_port];
+        if let Some(any) = self.proxy_any_port {
+            want.push(any);
+        }
+        for port in want {
+            let ok = tokio::process::Command::new("iptables")
+                .args(proxy_accept(port))
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !ok {
+                warn!(
+                    gateway = %self.gateway, port,
+                    "build firewall: no ACCEPT rule for the egress proxy port — builds will get no egress; run `sudo tools/setup-build-net.sh`"
                 );
             }
         }
@@ -2415,5 +2426,160 @@ name = "api"
             has_dist,
             "vite build output app/dist/index.html must be in the app layer (proves `bun run build` ran under node)"
         );
+    }
+
+    /// Build a user Dockerfile SERVER-SIDE through `run_project_build` with the
+    /// dockerfile toolchain + the isolated build net. The Dockerfile's `FROM`
+    /// pulls through the 3129 PUBLIC-ANY proxy (Docker Hub is NOT on the
+    /// allowlist), its `RUN` exercises crun, and buildah flattens the image into
+    /// ONE self-contained `image/self` erofs layer. Returns the staged deployment.
+    async fn dockerfile_pipeline_build(project_id: &str, build_id: u64) -> Option<BuildFixture> {
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return None;
+        };
+        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_FC_RELEASE");
+            return None;
+        };
+        let toolchain_dir = data.join("toolchains");
+        if !toolchain_dir.join("dockerfile.ext4").exists() {
+            eprintln!("skip: {}/dockerfile.ext4 not baked (run `tools/dev toolchains`)", toolchain_dir.display());
+            return None;
+        }
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+        };
+
+        // Fixture: ONE server built from a user Dockerfile. The image serves "ok" on
+        // $PORT (the platform routing contract). builder="dockerfile" → image/self.
+        let src = data.join(format!("df-fixture-src-{project_id}"));
+        let _ = std::fs::remove_dir_all(&src);
+        write(src.join("jkbase.toml"), "[project]\nname = \"dffix\"\n[servers.api]\nbuilder = \"dockerfile\"\ndockerfile = \"./svc/Dockerfile\"\nport = 8080\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n");
+        // FROM (pull via 3129) + RUN (crun) + COPY + a relative CMD (resolved via the
+        // image's own PATH — exercises the image/self non-clobbering env path).
+        write(src.join("svc/Dockerfile"), "FROM python:3.12-alpine\nRUN echo built-in-vm > /built.txt\nCOPY server.py /server.py\nCMD [\"python3\", \"/server.py\"]\n");
+        write(src.join("svc/server.py"), "import os, http.server, socketserver\nport = int(os.environ.get('PORT', '8080'))\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'ok')\n    def log_message(self, *a):\n        pass\nsocketserver.TCPServer(('0.0.0.0', port), H).serve_forever()\n");
+
+        let mut tarbuf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarbuf, flate2::Compression::fast());
+            let mut tb = tar::Builder::new(enc);
+            tb.append_dir_all(".", &src).unwrap();
+            tb.into_inner().unwrap().finish().unwrap();
+        }
+
+        let store = Store::open(&data.join("onbox-df.redb")).unwrap();
+        store
+            .save_build(&BuildRecord {
+                project_id: project_id.into(),
+                build_id,
+                phase: BuildPhase::Building,
+                targets: vec![],
+                log_tail: String::new(),
+                phase_timings_ms: Default::default(),
+                deployed_version: None,
+                error: None,
+                source_commit: None,
+                created_at: now(),
+                updated_at: now(),
+            })
+            .unwrap();
+
+        // Dockerfile FROM/RUN need broad egress → the 3129 PUBLIC-ANY proxy. Bind
+        // BOTH 3128 (allowlist) + 3129 (allow_any); BuildNet with the any-port routes
+        // the dockerfile target to 3129 (proxy_url_for). Requires `sudo tools/dev net`.
+        let net = {
+            let allow = match tokio::net::TcpListener::bind("172.31.0.1:3128").await {
+                Ok(l) => l,
+                Err(e) => { eprintln!("skip: cannot bind 172.31.0.1:3128 ({e}); run `sudo tools/dev net`"); return None; }
+            };
+            let any = match tokio::net::TcpListener::bind("172.31.0.1:3129").await {
+                Ok(l) => l,
+                Err(e) => { eprintln!("skip: cannot bind 172.31.0.1:3129 ({e}); run `sudo tools/dev net`"); return None; }
+            };
+            tokio::spawn(crate::egress::serve(allow, Arc::new(crate::egress::EgressConfig::with_default_allowlist())));
+            tokio::spawn(crate::egress::serve(any, Arc::new(crate::egress::EgressConfig::allow_any_public())));
+            Some(Arc::new(BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8)))
+        };
+
+        let deps = Arc::new(BuildDeps {
+            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            data_dir: data.clone(),
+            deploy_dir: data.join("hosting"),
+            toolchain_dir,
+            store: store.clone(),
+            chroot_base: data.join("bj-df"),
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+            parent_cgroup: "jkbase-build".into(),
+            uid: 100_000,
+            gid: 100_000,
+            timeout: Duration::from_secs(600),
+            vcpu_count: 2,
+            mem_size_mib: 2048, // buildah pull+flatten needs more than a thin bun build
+            cgroup_pids_max: 1024,
+            cgroup_mem_max_bytes: 2560 * 1024 * 1024,
+            cgroup_cpu_max: "200000 100000".into(),
+            // The orchestrator bumps these to the dockerfile floor (16 GiB / 6 GiB).
+            scratch_size_bytes: 256 * 1024 * 1024,
+            output_size_bytes: 64 * 1024 * 1024,
+            console_log_max_bytes: 1024 * 1024,
+            max_concurrent: 1,
+            net,
+            fetch_deadline: Duration::from_secs(300),
+        });
+        std::fs::create_dir_all(&deps.chroot_base).unwrap();
+
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+            .await
+            .expect("dockerfile server build should succeed");
+        Some(BuildFixture { data, fc_release, kernel, store, staged })
+    }
+
+    /// Assert the dockerfile build produced exactly ONE app erofs layer and the
+    /// server manifest is marked image/self (single-layer runtime, no base/runtime).
+    async fn assert_image_self_single_layer(staged: &Path) {
+        let layers: Vec<_> = std::fs::read_dir(staged.join("_layers"))
+            .expect("_layers dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "erofs"))
+            .collect();
+        assert_eq!(layers.len(), 1, "a dockerfile build is ONE self-contained app layer");
+        let mani: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged.join("_servers/api.json")).unwrap()).unwrap();
+        assert_eq!(mani["runtime"], "image/self", "dockerfile server runtime must be image/self");
+    }
+
+    /// The dockerfile-builder acceptance proof: a user Dockerfile is built
+    /// server-side (buildah `FROM` via the 3129 public-any proxy + a `RUN` via crun),
+    /// flattened into ONE image/self erofs layer, and the layered runtime boots it as
+    /// a single lowerdir (the image's own python entrypoint, resolved via the image's
+    /// PATH) → HTTP 200. End-to-end proof of `builder = "dockerfile"` on B2.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/dev net   # jkbuild0 + firewall (3128+3129) + cgroup
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture dockerfile_pipeline_to_http_200
+    ///
+    /// Needs KVM + root + dockerfile.ext4 + baselayers + the musl agent + outbound
+    /// internet + the provisioned build bridge (`sudo tools/dev net`).
+    #[tokio::test]
+    #[ignore = "dockerfile pipeline: KVM + root + dockerfile.ext4 + baselayers + agent + internet + `sudo tools/dev net`"]
+    async fn dockerfile_pipeline_to_http_200() {
+        let Some(fx) = dockerfile_pipeline_build("dfpipe", 1).await else { return };
+        assert_image_self_single_layer(&fx.staged).await;
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "dfpipe", "172.27.0.1", "172.27.0.2", "AA:FC:00:00:27:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the dockerfile-built image/self server");
+        assert_eq!(body, "ok", "the image's own python entrypoint serves 'ok' on $PORT");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: builder=dockerfile (buildah FROM via 3129 public-any + RUN via crun) -> single image/self erofs layer -> runtime -> HTTP 200 ({body:?})");
     }
 }

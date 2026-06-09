@@ -84,6 +84,11 @@ impl Buildpack for DockerfileBuildpack {
             // the constrained guest; we are already root inside the sealed VM.
             .arg("--isolation")
             .arg("chroot")
+            // host networking: RUN steps share the VM's net namespace and reach the
+            // egress proxy via HTTP_PROXY — no netavark/CNI bridge (which needs the
+            // read-only /run/lock + a netavark binary we don't ship).
+            .arg("--network")
+            .arg("host")
             // native overlay (the guest kernel has OVERLAY_FS); buildah falls back
             // to fuse-overlayfs (also baked in) if the driver rejects it.
             .arg("--storage-driver")
@@ -229,10 +234,20 @@ fn storage_dirs(ctx: &BuildContext) -> (PathBuf, PathBuf) {
     )
 }
 
-/// A `buildah` command pinned to the in-VM scratch storage root/runroot.
+/// A `buildah` command pinned to the in-VM scratch storage root/runroot, with
+/// TMPDIR/HOME redirected onto the scratch drive: the toolchain rootfs is mounted
+/// READ-ONLY, so buildah's default `/var/tmp` build-context overlay (and any
+/// $HOME state) must live on the writable scratch fs instead.
 fn buildah(root: &Path, runroot: &Path) -> Command {
+    // root = <scratch>/containers/storage → scratch is two parents up.
+    let scratch = root.parent().and_then(|p| p.parent()).unwrap_or(root);
+    let tmp = scratch.join("tmp");
+    let home = scratch.join("home");
+    let _ = std::fs::create_dir_all(&tmp);
+    let _ = std::fs::create_dir_all(&home);
     let mut cmd = Command::new("buildah");
     cmd.arg("--root").arg(root).arg("--runroot").arg(runroot);
+    cmd.env("TMPDIR", &tmp).env("HOME", &home);
     cmd
 }
 
@@ -248,11 +263,23 @@ fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
     }
 }
 
-/// Run a command to completion, failing on non-zero exit.
+/// Run a command to completion, capturing combined output so a failure surfaces
+/// the tool's actual error (buildah's stderr otherwise vanishes to the VM console).
 fn run(what: &str, mut cmd: Command) -> Result<()> {
-    let status = cmd.status().with_context(|| format!("spawning `{what}`"))?;
-    if !status.success() {
-        anyhow::bail!("{what} failed: {status}");
+    use std::io::Write;
+    let out = cmd.output().with_context(|| format!("spawning `{what}`"))?;
+    // Stream output to the console too (so a successful build still logs progress).
+    let _ = std::io::stderr().write_all(&out.stderr);
+    if !out.status.success() {
+        let tail: String = {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            combined.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+        };
+        anyhow::bail!("{what} failed: {}\n{}", out.status, tail);
     }
     Ok(())
 }

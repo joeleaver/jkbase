@@ -14,6 +14,10 @@ members = [
     "crates/jkbuild-types",
 ]
 
+# Shared package metadata; crates opt in with `license.workspace = true`.
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
 [workspace.dependencies]
 jkbase-common = { path = "crates/jkbase-common" }
 jkbase-proxy = { path = "crates/jkbase-proxy" }

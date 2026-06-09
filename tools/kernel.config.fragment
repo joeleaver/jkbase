@@ -34,3 +34,11 @@ CONFIG_DM_VERITY=y
 # --- squashfs kept available (ext4-per-layer / squashfs fallback paths) ---
 CONFIG_SQUASHFS=y
 CONFIG_SQUASHFS_ZSTD=y
+
+# --- user namespaces + FUSE: required by the in-VM `builder = "dockerfile"`
+# toolchain (buildah/crun, and fuse-overlayfs as the overlay fallback). The
+# Firecracker baseline config happens to enable these today, but force them here
+# so a baseline change can never silently drop them (build-kernel.sh also asserts
+# them as must-haves). ---
+CONFIG_USER_NS=y
+CONFIG_FUSE_FS=y

@@ -1,6 +1,14 @@
-//! `jkbase repo` — wire up push-to-deploy: mint a per-project git-push token, set
-//! up a local `jkbase` git remote, and generate a GitHub Actions workflow that
-//! `git push`es to jkbase on every commit (build · D, connected-repo via CI).
+//! `jkbase repo` — wire up push-to-deploy (build · D, connected-repo via CI).
+//!
+//! Two deliberately-separate concerns:
+//!
+//! - `connect` — mint a per-project git-push token + add a local `jkbase` git
+//!   remote. LOCAL ONLY: it touches `.git/config` and the platform, nothing
+//!   tracked. `git push jkbase main` then deploys.
+//! - `github` — scaffold a GitHub Actions workflow (a TRACKED file under
+//!   `.github/workflows/`). Opt-in by design: writing CD config that a routine
+//!   `git add -A` would commit + activate must be an explicit request, never a
+//!   side effect of `connect`.
 
 use anyhow::Context;
 use clap::Subcommand;
@@ -11,9 +19,23 @@ use super::resolve_project_id;
 
 #[derive(Subcommand)]
 pub enum RepoCommand {
-    /// Mint a git-push token, add a local `jkbase` remote, and generate a GitHub
-    /// Actions deploy workflow. Push to GitHub → CI pushes to jkbase → build.
+    /// Mint a git-push token + add a local `jkbase` git remote (local only —
+    /// touches .git/config + the platform, nothing tracked). Then
+    /// `git push jkbase main` deploys. For GitHub Actions CI, see `jkbase repo github`.
     Connect {
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+        /// Don't add/update the local `jkbase` git remote (just mint + print the token).
+        #[arg(long)]
+        no_remote: bool,
+    },
+    /// Scaffold a GitHub Actions push-to-deploy workflow. Writes a TRACKED file
+    /// (.github/workflows/jkbase-deploy.yml) — opt-in by design; commit it yourself.
+    Github {
         /// Project name (inferred from jkbase.toml if not specified)
         #[arg(long)]
         project: Option<String>,
@@ -23,9 +45,6 @@ pub enum RepoCommand {
         /// Print the workflow to stdout instead of writing it into the repo.
         #[arg(long)]
         print: bool,
-        /// Don't add/update the local `jkbase` git remote.
-        #[arg(long)]
-        no_remote: bool,
     },
     /// Re-mint the git-push token (immediately revokes the previous one).
     Token {
@@ -48,9 +67,9 @@ pub async fn run(cmd: RepoCommand) -> anyhow::Result<()> {
         RepoCommand::Connect {
             project,
             api,
-            print,
             no_remote,
-        } => connect(project, api, print, no_remote).await,
+        } => connect(project, api, no_remote).await,
+        RepoCommand::Github { project, api, print } => github(project, api, print),
         RepoCommand::Token { project, api } => rotate_token(project, api).await,
         RepoCommand::Disconnect { project, api } => disconnect(project, api).await,
     }
@@ -88,45 +107,60 @@ async fn mint_token(api: &str, project_id: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("API response missing token"))
 }
 
-async fn connect(
-    project: Option<String>,
-    api: String,
-    print: bool,
-    no_remote: bool,
-) -> anyhow::Result<()> {
+async fn connect(project: Option<String>, api: String, no_remote: bool) -> anyhow::Result<()> {
     let project_id = resolve_project_id(project)?;
     let (scheme, host) = split_origin(&api)?;
     let push_token = mint_token(&api, &project_id).await?;
 
     // Local `jkbase` remote (token embedded for frictionless `git push jkbase main`).
+    // This is the ONLY filesystem effect, and it's confined to .git/config — never
+    // a tracked file.
     if !no_remote && in_git_repo() {
         let remote_url = format!("{scheme}://jkbase:{push_token}@{host}/git/{project_id}");
         set_remote("jkbase", &remote_url)?;
         println!("✓ local git remote `jkbase` → {scheme}://{host}/git/{project_id}");
-        println!("  (the token is stored in .git/config; use --no-remote to skip this)");
+        println!("  (token stored in .git/config; deploy with: git push jkbase main)");
+    } else {
+        println!("git-push token for '{project_id}' (shown once):\n  {push_token}");
+        println!(
+            "  remote URL: {scheme}://jkbase:<token>@{host}/git/{project_id}  (deploy: git push <remote> HEAD:main)"
+        );
     }
 
-    // GitHub Actions workflow (token comes from a repo secret, never committed).
+    println!("\nThis token is shown once — save it if you'll need it again (`jkbase repo token` re-mints).");
+    println!("Want GitHub Actions push-to-deploy? Run `jkbase repo github` to scaffold the workflow");
+    println!("(it writes a tracked file, so it's opt-in), and set the token above as the");
+    println!("JKBASE_GIT_TOKEN repo secret.");
+    Ok(())
+}
+
+/// Scaffold the GitHub Actions deploy workflow. Opt-in + offline: it writes a
+/// tracked file (`.github/workflows/jkbase-deploy.yml`) the user then commits;
+/// the token comes from the `JKBASE_GIT_TOKEN` repo secret (set from `repo connect`),
+/// never inlined here.
+fn github(project: Option<String>, api: String, print: bool) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let (scheme, host) = split_origin(&api)?;
     let workflow = render_workflow(scheme, host, &project_id);
+
     if print {
-        println!("\n--- .github/workflows/jkbase-deploy.yml ---\n{workflow}");
+        println!("--- .github/workflows/jkbase-deploy.yml ---\n{workflow}");
     } else if in_git_repo() {
         let path = Path::new(".github/workflows/jkbase-deploy.yml");
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).context("create .github/workflows")?;
         }
         std::fs::write(path, &workflow).context("write workflow file")?;
-        println!("✓ wrote {}", path.display());
+        println!("✓ wrote {} (review + commit it to activate CI)", path.display());
     } else {
-        println!("\n--- add .github/workflows/jkbase-deploy.yml ---\n{workflow}");
+        println!("(not in a git repo) add this as .github/workflows/jkbase-deploy.yml:\n\n{workflow}");
     }
 
     println!("\nFinish setup in GitHub:");
     println!("  1. Repo → Settings → Secrets and variables → Actions → New repository secret");
     println!("     Name:  JKBASE_GIT_TOKEN");
-    println!("     Value: {push_token}");
+    println!("     Value: the token from `jkbase repo connect` (or `jkbase repo token`)");
     println!("  2. Commit .github/workflows/jkbase-deploy.yml and push.");
-    println!("\nThis token is shown once. From your laptop you can also: git push jkbase main");
     Ok(())
 }
 

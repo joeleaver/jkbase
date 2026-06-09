@@ -61,7 +61,13 @@ pack_layer() {
 
 # --- base layer (apko run-base → Wolfi rootfs) ---
 echo "[base] apko build $BASE_CONFIG"
-apko build "$BASE_CONFIG" jkbase-run-base:latest "$WORK/base-oci.tar" --arch x86_64 >/dev/null
+# Reproducible package set via the committed lockfile when present (rolling Wolfi
+# repo otherwise drifts the base-layer digest run to run). Regenerate with:
+#   apko lock "$BASE_CONFIG" --arch x86_64 --output "${BASE_CONFIG%.yaml}.lock.json"
+BASE_LOCK="${BASE_CONFIG%.yaml}.lock.json"
+base_lock_arg=()
+[ -f "$BASE_LOCK" ] && base_lock_arg=(--lockfile "$BASE_LOCK")
+apko build "$BASE_CONFIG" jkbase-run-base:latest "$WORK/base-oci.tar" --arch x86_64 "${base_lock_arg[@]}" >/dev/null
 BASE_STAGE="$WORK/base-stage"
 mkdir -p "$BASE_STAGE"
 # docker-archive: apply the ordered layer tarballs (skip device nodes — non-root).

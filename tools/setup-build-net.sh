@@ -25,7 +25,10 @@ set -euo pipefail
 BRIDGE="${1:-jkbuild0}"
 GW_CIDR="${2:-172.31.0.1/24}"
 PROXY_PORT="${3:-3128}"
-PROXY_ANY_PORT="${4:-3129}"
+# Default: NO second port (== PROXY_PORT disables it), so the public-any proxy is
+# opt-in — a box's egress posture is unchanged unless an operator passes a distinct
+# PROXY_ANY_PORT here AND to jkbase-server's --build-proxy-any-port.
+PROXY_ANY_PORT="${4:-$PROXY_PORT}"
 GW_IP="${GW_CIDR%/*}"
 
 if [ "$(id -u)" -ne 0 ]; then

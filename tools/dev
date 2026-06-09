@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# jkbase local-dev bring-up — one robust, idempotent, pin-aware dispatcher.
+#
+# Takes a fresh KVM-capable Debian/Ubuntu box from a git checkout to "can build
+# AND run a real app locally + run the on-box acceptance tests". Replaces the
+# pile of hand-stitched tools/*.sh + implicit env/ordering that nobody (not even
+# the maintainers) had codified.
+#
+#   tools/dev <stage> [flags]
+#
+# Stages (run in order under `all`):
+#   preflight    host capability checks (read-only; the doctor's core)
+#   deps         install/verify system packages (apt) + rust musl/wasi targets   [root]
+#   assets       download+verify pinned Firecracker release, bun, apko
+#   rust         cargo build host bins + the musl agent + jkbuild-init
+#   kernel       build (or adopt) the 6.12 guest kernel                          [long]
+#   toolchains   bake default.ext4, bun.ext4, dockerfile.ext4
+#   baselayers   bake the shared base+bun erofs layers + platform.json           [root]
+#   net          provision the build bridge + firewall (3128+3129) + cgroup      [root, per-boot]
+#   all          preflight→deps→assets→rust→kernel→toolchains→baselayers  (NOT net)
+#   doctor       assert the end-state; --deep also boots a micro-VM + checks links
+#   test         run the on-box acceptance gauntlet (sets the JKB_* env for you)
+#
+# Flags:
+#   -n, --check     dry-run: print per-stage verdicts, mutate nothing
+#   -y, --yes       non-interactive (assume yes to apt installs / prompts)
+#       --force     ignore freshness; rebuild the stage's artifacts
+#       --only a,b  run only these stages (upstream detects still run)
+#       --skip a,b  run `all` minus these
+#       --jobs N    override nproc for the kernel build
+#   -v, --verbose   stream wrapped-script output (default: capture, tail on fail)
+#
+# Idempotent + pin-aware: each stage detects "already done" by a version/content
+# stamp (not just file-exists), so a re-run is cheap and a changed input (apko
+# config, kernel fragment, rust source) correctly forces a rebuild.
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pinned constants — the single source of truth for versions. Override via env.
+# ─────────────────────────────────────────────────────────────────────────────
+FC_VERSION="${FC_VERSION:-1.15.1}"
+FC_ARCH="${FC_ARCH:-x86_64}"
+KVER="${KVER:-6.12.92}"
+BUN_VER="${BUN_VER:-1.3.14}"
+APKO_VER="${APKO_VER:-1.2.16}"
+# bun release zip sha256 (linux-x64). Empty = unverified (warned). Pin when known:
+BUN_SHA256="${BUN_SHA256:-}"
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FC_DIR="$REPO_ROOT/.firecracker"
+TOOLCHAIN_DIR="$FC_DIR/toolchains"
+BASELAYERS_DIR="$FC_DIR/baselayers"
+ASSET_DIR="$FC_DIR/assets"
+RELEASE_DIR="$FC_DIR/release-v${FC_VERSION}-${FC_ARCH}"
+KERNEL_OUT="$FC_DIR/vmlinux-${KVER}.bin"
+STAMP_DIR="$FC_DIR/.dev"
+AGENT_BIN="$REPO_ROOT/target/x86_64-unknown-linux-musl/release/jkbase-agent"
+INIT_BIN="$REPO_ROOT/target/x86_64-unknown-linux-musl/release/jkbuild-init"
+
+MUSL_TARGET="x86_64-unknown-linux-musl"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Flags
+# ─────────────────────────────────────────────────────────────────────────────
+CHECK=0 YES=0 FORCE=0 VERBOSE=0 DEEP=0 JOBS="" STAGE=""
+ONLY="" SKIP=""
+POSITIONAL=()    # non-flag args (e.g. a `test` filter)
+declare -A RAN  # stage -> OK|SKIP|FAIL|WOULD (for the summary)
+
+parse_flags() {
+    [ $# -ge 1 ] || { usage; exit 2; }
+    STAGE="$1"; shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--check) CHECK=1 ;;
+            -y|--yes) YES=1 ;;
+            --force) FORCE=1 ;;
+            -v|--verbose) VERBOSE=1 ;;
+            --deep) DEEP=1 ;;
+            --jobs) JOBS="$2"; shift ;;
+            --only) ONLY="$2"; shift ;;
+            --skip) SKIP="$2"; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) err "unknown flag: $1"; usage; exit 2 ;;
+            *) POSITIONAL+=("$1") ;;
+        esac
+        shift
+    done
+}
+
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output helpers
+# ─────────────────────────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+    C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[36m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_0=""
+fi
+say()    { printf '%s\n' "$*"; }
+warn()   { printf '%s%s%s\n' "$C_Y" "$*" "$C_0" >&2; }
+err()    { printf '%s%s%s\n' "$C_R" "$*" "$C_0" >&2; }
+ok()     { printf '%s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+banner() { printf '\n%s══ %s ══%s\n' "$C_B" "$*" "$C_0"; }
+verdict(){ printf '   %s%s%s\n' "$C_D" "$*" "$C_0"; }
+die()    { err "ERROR: $*"; exit 1; }
+
+# Run a command, capturing output unless --verbose; on failure show the tail.
+# NB: capture $? immediately after the command — a false `if cmd; then; fi` with
+# no else resets $? to 0, which would mask the real failure code.
+run_or_capture() {
+    if [ "$VERBOSE" = 1 ]; then
+        "$@"
+        return $?
+    fi
+    local log rc; log="$(mktemp)"
+    "$@" >"$log" 2>&1; rc=$?
+    if [ "$rc" -eq 0 ]; then rm -f "$log"; return 0; fi
+    err "command failed (rc=$rc): $*"
+    err "── last 20 lines ──"
+    tail -n 20 "$log" >&2
+    rm -f "$log"
+    return "$rc"
+}
+
+# sudo with a background keep-alive so a long non-interactive run doesn't stall
+# waiting for a password mid-stage. Call once before any privileged stage.
+SUDO_KEEPALIVE_PID=""
+sudo_warmup() {
+    if ! sudo -n true 2>/dev/null; then
+        if [ "$YES" = 1 ]; then
+            die "passwordless sudo required for this stage (run \`sudo -v\` first, or this stage interactively)"
+        fi
+        say "This stage needs sudo; you may be prompted."
+        sudo -v || die "sudo required"
+    fi
+    if [ -z "$SUDO_KEEPALIVE_PID" ]; then
+        ( while true; do sudo -n true 2>/dev/null || exit; sleep 50; done ) &
+        SUDO_KEEPALIVE_PID=$!
+        trap 'kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true' EXIT
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stamp helpers — content/version freshness, stored under .firecracker/.dev/
+# ─────────────────────────────────────────────────────────────────────────────
+# A binary safe to run as PID1 in a VM: no dynamic loader. musl emits either
+# "statically linked" or "static-pie linked"; both are fine, "dynamically linked" is not.
+is_static() { file "$1" 2>/dev/null | grep -Eq 'static-pie linked|statically linked'; }
+sha_file() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+sha_str()  { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+stamp_get() { cat "$STAMP_DIR/$1.stamp" 2>/dev/null || true; }
+stamp_set() { mkdir -p "$STAMP_DIR"; printf '%s' "$2" >"$STAMP_DIR/$1.stamp"; }
+# fresh <name> <desired>: true if the artifact's recorded stamp equals <desired>
+# (and --force is off).
+fresh() { [ "$FORCE" != 1 ] && [ "$(stamp_get "$1")" = "$2" ]; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage list helpers
+# ─────────────────────────────────────────────────────────────────────────────
+ALL_STAGES=(preflight deps assets rust kernel toolchains baselayers)
+in_csv() { case ",$1," in *",$2,"*) return 0 ;; *) return 1 ;; esac; }
+# selected: should this stage actually ACT (vs only run as an upstream detect)?
+selected() {
+    local s="$1"
+    [ -n "$ONLY" ] && { in_csv "$ONLY" "$s" && return 0 || return 1; }
+    [ -n "$SKIP" ] && in_csv "$SKIP" "$s" && return 1
+    return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# preflight — read-only host capability checks (also doctor's core)
+# ─────────────────────────────────────────────────────────────────────────────
+PREFLIGHT_FAILS=0
+chk()  { if "$@" >/dev/null 2>&1; then ok "$CHK_MSG"; else err "✗ $CHK_MSG"; PREFLIGHT_FAILS=$((PREFLIGHT_FAILS+1)); fi; }
+need() { CHK_MSG="$2"; chk eval "$1"; }
+
+cmd_preflight() {
+    banner "preflight"
+    PREFLIGHT_FAILS=0
+    # Distro: apt-resolved host tooling — Debian/Ubuntu only (the Wolfi images are
+    # portable, the bake tooling is not). Hard-fail loudly rather than limp.
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        case " ${ID:-} ${ID_LIKE:-} " in
+            *" debian "*|*" ubuntu "*) ok "distro: ${ID:-?} (debian-family)" ;;
+            *) err "✗ distro ${ID:-?} unsupported — local dev needs Debian/Ubuntu (apt). The baked images are portable; the host bake tooling is not."; PREFLIGHT_FAILS=$((PREFLIGHT_FAILS+1)) ;;
+        esac
+    else
+        err "✗ /etc/os-release missing — cannot verify Debian/Ubuntu"; PREFLIGHT_FAILS=$((PREFLIGHT_FAILS+1))
+    fi
+    need 'test -w /dev/kvm' "/dev/kvm writable by $USER (KVM usable)"
+    need 'sudo -n true' "passwordless sudo (or warm \`sudo -v\`)"
+    need 'test -f /sys/fs/cgroup/cgroup.controllers' "cgroup v2 present"
+    need 'command -v cargo' "rust/cargo on PATH"
+    need "rustup target list --installed 2>/dev/null | grep -qx $MUSL_TARGET" "rust musl target ($MUSL_TARGET)"
+    need 'command -v apko' "apko on PATH (run: tools/dev assets)"
+    # Bake/runtime binaries the stages + wrapped scripts assume present:
+    for b in flex bison bc unzip file python3 iptables debugfs mkfs.erofs mkfs.ext4; do
+        CHK_MSG="$b present"; chk command -v "$b"
+    done
+    need 'pkg-config --exists libelf || test -e /usr/include/libelf.h' "libelf dev headers (kernel build)"
+    # busybox-static for default.ext4:
+    need 'command -v busybox' "busybox present (default.ext4 bake)"
+    # ~/.local/bin on PATH (apko lives there):
+    case ":$PATH:" in *":$HOME/.local/bin:"*) ok "~/.local/bin on PATH" ;; *) warn "~/.local/bin not on PATH — add: export PATH=\$HOME/.local/bin:\$PATH" ;; esac
+    # Disk headroom (kernel build tree ~2.2 GB):
+    local free_kib; free_kib="$(df -Pk "$REPO_ROOT" | awk 'NR==2{print $4}')"
+    if [ "${free_kib:-0}" -ge $((8*1024*1024)) ]; then ok "disk: $((free_kib/1024/1024)) GiB free"; else warn "low disk: $((free_kib/1024/1024)) GiB free (kernel build wants ~8 GiB)"; fi
+
+    if [ "$PREFLIGHT_FAILS" -gt 0 ]; then
+        err "preflight: $PREFLIGHT_FAILS hard check(s) failed — run \`tools/dev deps\` (and relogin for the kvm group) then retry"
+        return 1
+    fi
+    ok "preflight: all hard checks passed"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# deps — apt packages + rust targets + kvm group (root)
+# ─────────────────────────────────────────────────────────────────────────────
+APT_PKGS=(build-essential musl-tools pkg-config libssl-dev git curl jq iptables
+    busybox-static e2fsprogs unzip python3 file ca-certificates
+    flex bison libelf-dev bc libncurses-dev
+    erofs-utils fsverity)
+
+cmd_deps() {
+    banner "deps"
+    if [ "$CHECK" = 1 ]; then verdict "WOULD apt-get install: ${APT_PKGS[*]}; rustup targets musl+wasip1; usermod -aG kvm"; RAN[deps]=WOULD; return 0; fi
+    command -v apt-get >/dev/null || die "deps requires apt-get (Debian/Ubuntu)"
+    sudo_warmup
+    say "Installing apt packages (${#APT_PKGS[@]})…"
+    run_or_capture sudo apt-get update -qq || die "apt-get update failed"
+    local yflag=(-y); [ "$YES" = 1 ] || yflag=()
+    run_or_capture sudo apt-get install -q "${yflag[@]}" "${APT_PKGS[@]}" || die "apt install failed"
+    command -v rustup >/dev/null || die "rustup not found — install it (https://rustup.rs) then re-run \`tools/dev deps\`"
+    rustup target add "$MUSL_TARGET" wasm32-wasip1 >/dev/null 2>&1 || true
+    sudo usermod -aG kvm "$USER" 2>/dev/null || true
+    ok "deps installed (relogin if you were just added to the kvm group)"
+    RAN[deps]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# assets — pinned Firecracker release + apko + bun
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_assets() {
+    banner "assets"
+    local fc_bin="$RELEASE_DIR/firecracker-v${FC_VERSION}-${FC_ARCH}"
+    local need_fc=1 need_tools=1
+    [ -x "$fc_bin" ] && need_fc=0
+    { command -v apko >/dev/null && [ -f "$ASSET_DIR/bun" ]; } && need_tools=0
+    if [ "$need_fc" = 0 ] && [ "$need_tools" = 0 ] && [ "$FORCE" != 1 ]; then
+        verdict "Firecracker v$FC_VERSION + apko + bun present — SKIP"; RAN[assets]=SKIP; return 0
+    fi
+    if [ "$CHECK" = 1 ]; then verdict "WOULD fetch FC v$FC_VERSION (need_fc=$need_fc) + apko $APKO_VER + bun $BUN_VER (need_tools=$need_tools)"; RAN[assets]=WOULD; return 0; fi
+    if [ "$need_fc" = 1 ] || [ "$FORCE" = 1 ]; then
+        run_or_capture env FC_VERSION="$FC_VERSION" FC_ARCH="$FC_ARCH" FC_DIR="$FC_DIR" \
+            "$REPO_ROOT/tools/fetch-firecracker.sh" || die "Firecracker fetch failed"
+    fi
+    if [ "$need_tools" = 1 ] || [ "$FORCE" = 1 ]; then
+        [ -n "$BUN_SHA256" ] || warn "BUN_SHA256 unset — bun download will not be checksum-verified (pin it in tools/dev)"
+        run_or_capture env APKO_VER="$APKO_VER" BUN_VER="$BUN_VER" BUN_SHA256="$BUN_SHA256" \
+            "$REPO_ROOT/tools/install-image-tools.sh" || die "install-image-tools failed"
+        # A prior root run may have left bun root-owned; normalize so non-root bakes work.
+        [ -f "$ASSET_DIR/bun" ] && [ ! -O "$ASSET_DIR/bun" ] && { sudo_warmup; sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/bun"; }
+    fi
+    ok "assets ready (FC v$FC_VERSION, apko, bun $BUN_VER)"
+    RAN[assets]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# rust — host bins + musl agent + jkbuild-init. cargo owns incrementality.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_rust() {
+    banner "rust"
+    if [ "$CHECK" = 1 ]; then verdict "WOULD cargo build jkbase-server,jkbase-cli (host) + jkbase-agent,jkbuild-init (musl)"; RAN[rust]=WOULD; return 0; fi
+    say "cargo build (host: jkbase-server, jkbase-cli)…"
+    run_or_capture cargo build --release -p jkbase-server -p jkbase-cli || die "host build failed"
+    say "cargo build (musl: jkbase-agent — wasmtime/musl, the heavy link)…"
+    run_or_capture cargo build --release -p jkbase-agent --target "$MUSL_TARGET" || die "agent (musl) build failed"
+    say "cargo build (musl: jkbuild-init)…"
+    run_or_capture cargo build --release -p jkbuild --bin jkbuild-init --target "$MUSL_TARGET" || die "jkbuild-init build failed"
+    # Defensive: the agent/init are PID1 in a VM — a dynamic link = no loader = no boot.
+    is_static "$AGENT_BIN" || die "jkbase-agent is NOT statically linked (musl link regression)"
+    is_static "$INIT_BIN"  || die "jkbuild-init is NOT statically linked"
+    ok "rust binaries built (agent + init statically linked)"
+    RAN[rust]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kernel — build OR adopt the 6.12 guest kernel (capability-aware)
+# ─────────────────────────────────────────────────────────────────────────────
+KERNEL_MUSTHAVE=(CONFIG_EROFS_FS CONFIG_OVERLAY_FS CONFIG_FS_VERITY CONFIG_DM_VERITY CONFIG_VIRTIO_BLK CONFIG_EXT4_FS CONFIG_USER_NS CONFIG_FUSE_FS)
+kernel_desired_stamp() { echo "${KVER}:$(sha_file "$REPO_ROOT/tools/kernel.config.fragment")"; }
+# Does a built kernel's resolved .config (in the build tree) satisfy the must-haves?
+kernel_config_ok() {
+    local cfg="$FC_DIR/kernel-build/linux-${KVER}/.config"
+    [ -f "$cfg" ] || return 1
+    local s; for s in "${KERNEL_MUSTHAVE[@]}"; do grep -q "^${s}=y" "$cfg" || return 1; done
+    return 0
+}
+adopt_kernel_symlink() {
+    # Point the legacy name at the erofs-capable 6.12 kernel (two on-box tests read
+    # vmlinux.bin directly; provision ships a 6.1 there that can't mount erofs).
+    ln -sfn "$(basename "$KERNEL_OUT")" "$FC_DIR/vmlinux.bin"
+}
+cmd_kernel() {
+    banner "kernel"
+    local desired; desired="$(kernel_desired_stamp)"
+    if [ -f "$KERNEL_OUT" ] && fresh kernel "$desired"; then
+        verdict "kernel $KVER present + stamp matches — SKIP"; [ "$CHECK" = 1 ] || adopt_kernel_symlink; RAN[kernel]=SKIP; return 0
+    fi
+    # Adopt a present, capability-satisfying kernel without a 15-min rebuild
+    # (the box may carry a hand-built 6.12 from before tools/dev existed).
+    if [ -f "$KERNEL_OUT" ] && [ "$FORCE" != 1 ] && kernel_config_ok; then
+        if [ "$CHECK" = 1 ]; then verdict "kernel $KVER present + has all must-haves — WOULD ADOPT"; RAN[kernel]=WOULD; return 0; fi
+        verdict "kernel $KVER present + has all must-haves (${KERNEL_MUSTHAVE[*]}) — ADOPT"
+        stamp_set kernel "$desired"; adopt_kernel_symlink; RAN[kernel]=OK; return 0
+    fi
+    if [ "$CHECK" = 1 ]; then verdict "WOULD build kernel $KVER (LONG ~10-15 min)"; RAN[kernel]=WOULD; return 0; fi
+    say "Building guest kernel $KVER (this is the long pole, ~10–15 min)…"
+    run_or_capture env KVER="$KVER" ${JOBS:+JOBS=$JOBS} "$REPO_ROOT/tools/build-kernel.sh" || die "kernel build failed"
+    [ -f "$KERNEL_OUT" ] || die "kernel build did not produce $KERNEL_OUT"
+    kernel_config_ok || die "built kernel is missing a must-have config symbol"
+    stamp_set kernel "$desired"; adopt_kernel_symlink
+    ok "kernel $KVER built + adopted (vmlinux.bin → $(basename "$KERNEL_OUT"))"
+    RAN[kernel]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# toolchains — bake default.ext4, bun.ext4, dockerfile.ext4
+# ─────────────────────────────────────────────────────────────────────────────
+# Stale toolchains would ship an old jkbuild-init, so ensure rust is fresh first.
+ensure_init() { [ -x "$INIT_BIN" ] || { CHECK=0 cmd_rust; }; }
+bake_image() { # <name> <out> <stamp_input> <build-cmd...>
+    local name="$1" out="$2" stampval="$3"; shift 3
+    if [ -f "$out" ] && fresh "tc_$name" "$stampval"; then verdict "$name present + stamp matches — SKIP"; return 0; fi
+    if [ "$CHECK" = 1 ]; then verdict "WOULD bake $name"; return 0; fi
+    say "baking $name…"
+    run_or_capture "$@" || die "$name bake failed"
+    [ -f "$out" ] || die "$name bake produced no $out"
+    stamp_set "tc_$name" "$stampval"
+    ok "$name baked"
+}
+cmd_toolchains() {
+    banner "toolchains"
+    ensure_init
+    # A past `sudo` bake can leave root-owned cruft in work/ + assets/ that
+    # build-image.sh's `rm -rf $WORK` (non-root) can't clear → the bake silently
+    # reuses a stale stage. Normalize ownership first (only if foreign-owned).
+    if [ "$CHECK" != 1 ] && find "$FC_DIR/work" "$ASSET_DIR" ! -user "$(id -un)" -print -quit 2>/dev/null | grep -q .; then
+        sudo_warmup; sudo chown -R "$(id -u):$(id -g)" "$FC_DIR/work" "$ASSET_DIR" 2>/dev/null || true
+    fi
+    local init_sha; init_sha="$(sha_file "$INIT_BIN")"
+    local bun_sha; bun_sha="$(sha_file "$ASSET_DIR/bun")"
+    local busybox; busybox="$(command -v busybox || echo /usr/bin/busybox)"
+    # default.ext4 (busybox passthrough; init = build-runner.sh)
+    bake_image default "$TOOLCHAIN_DIR/default.ext4" \
+        "$(sha_str "rb:$(sha_file "$REPO_ROOT/tools/build-runner.sh"):bb:$busybox")" \
+        env BUSYBOX="$busybox" "$REPO_ROOT/tools/build-toolchain.sh" "$TOOLCHAIN_DIR/default.ext4"
+    # bun.ext4 (apko bun image + baked bun + jkbuild-init). Stamp on the LOCKFILE
+    # (the real pin) + config + init + bun, so a lock regen or any input rebakes.
+    bake_image bun "$TOOLCHAIN_DIR/bun.ext4" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-bun.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-bun.apko.lock.json"):init:$init_sha:bun:$bun_sha")" \
+        env INJECT_BUN=1 CONFIG="$REPO_ROOT/images/apko/build-bun.apko.yaml" OUT="$TOOLCHAIN_DIR/bun.ext4" "$REPO_ROOT/tools/build-image.sh"
+    # dockerfile.ext4 (buildah toolchain; INJECT_BUN=0; the builder=dockerfile feature)
+    bake_image dockerfile "$TOOLCHAIN_DIR/dockerfile.ext4" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.lock.json"):init:$init_sha")" \
+        env INJECT_BUN=0 CONFIG="$REPO_ROOT/images/apko/build-dockerfile.apko.yaml" OUT="$TOOLCHAIN_DIR/dockerfile.ext4" "$REPO_ROOT/tools/build-image.sh"
+    RAN[toolchains]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# baselayers — shared base+bun erofs layers + platform.json (root)
+# ─────────────────────────────────────────────────────────────────────────────
+baselayers_orphans_present() {
+    [ -f "$BASELAYERS_DIR/platform.json" ] || return 1
+    local f keep; keep="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["base"]["file"]);[print(r["file"]) for r in d.get("runtimes",{}).values()]' "$BASELAYERS_DIR/platform.json" 2>/dev/null)"
+    for f in "$BASELAYERS_DIR"/sha256-*.erofs; do
+        [ -e "$f" ] || continue
+        grep -qxF "$(basename "$f")" <<<"$keep" || return 0
+    done
+    return 1
+}
+cmd_baselayers() {
+    banner "baselayers"
+    local bun_sha; bun_sha="$(sha_file "$ASSET_DIR/bun")"
+    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.lock.json"):bun:$bun_sha:bunver:$BUN_VER")"
+    if [ -f "$BASELAYERS_DIR/platform.json" ] && fresh baselayers "$desired" && ! baselayers_orphans_present; then
+        verdict "baselayers present + stamp matches + no orphans — SKIP"; RAN[baselayers]=SKIP; return 0
+    fi
+    if [ "$CHECK" = 1 ]; then verdict "WOULD bake baselayers (base + bun erofs) + prune orphans"; RAN[baselayers]=WOULD; return 0; fi
+    sudo_warmup
+    # Normalize ownership BEFORE the wrapped script: the store may hold root-owned
+    # 0444 blobs from a prior root bake that `install` (non-root) can't overwrite.
+    [ -d "$BASELAYERS_DIR" ] && sudo chown -R "$(id -u):$(id -g)" "$BASELAYERS_DIR"
+    [ -f "$ASSET_DIR/bun" ] && sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/bun"
+    run_or_capture env BUN_VER="$BUN_VER" "$REPO_ROOT/tools/build-base-layer.sh" || die "baselayers bake failed"
+    # Prune orphan blobs (content-addressing leaves the prior set behind on a rebuild).
+    local keep; keep="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["base"]["file"]);[print(r["file"]) for r in d.get("runtimes",{}).values()]' "$BASELAYERS_DIR/platform.json")"
+    local f
+    for f in "$BASELAYERS_DIR"/sha256-*.erofs; do
+        [ -e "$f" ] || continue
+        if ! grep -qxF "$(basename "$f")" <<<"$keep"; then say "  pruning orphan $(basename "$f")"; sudo rm -f "$f"; fi
+    done
+    sudo chown -R "$(id -u):$(id -g)" "$BASELAYERS_DIR"
+    stamp_set baselayers "$desired"
+    ok "baselayers baked + pruned to the referenced set"
+    RAN[baselayers]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# net — build bridge + firewall (3128 allowlist + 3129 public-any) + cgroup (root, per-boot)
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_net() {
+    banner "net (per-boot, root)"
+    if [ "$CHECK" = 1 ]; then verdict "WOULD: setup-build-net.sh (3128+3129) + setup-build-cgroup.sh"; RAN[net]=WOULD; return 0; fi
+    sudo_warmup
+    run_or_capture sudo "$REPO_ROOT/tools/setup-build-net.sh" jkbuild0 172.31.0.1/24 3128 3129 || die "build-net setup failed"
+    run_or_capture sudo "$REPO_ROOT/tools/setup-build-cgroup.sh" || die "build-cgroup setup failed"
+    ok "build network up: VMs reach 172.31.0.1:3128 (allowlist) + :3129 (dockerfile public-any); cgroup delegated"
+    RAN[net]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# doctor — assert end-state. --deep boots a micro-VM + checks links/firewall.
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_doctor() {
+    cmd_preflight || true
+    banner "doctor: artifacts"
+    local fails=0
+    chk_art() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else err "✗ $1"; fails=$((fails+1)); fi; }
+    chk_art "Firecracker v$FC_VERSION" "test -x '$RELEASE_DIR/firecracker-v${FC_VERSION}-${FC_ARCH}'"
+    chk_art "guest kernel $KVER" "test -f '$KERNEL_OUT'"
+    chk_art "vmlinux.bin → $KVER (erofs-capable)" "test \"\$(readlink '$FC_DIR/vmlinux.bin')\" = '$(basename "$KERNEL_OUT")'"
+    chk_art "musl agent (static)" "is_static '$AGENT_BIN'"
+    chk_art "jkbuild-init (static)" "is_static '$INIT_BIN'"
+    chk_art "toolchain default.ext4" "test -f '$TOOLCHAIN_DIR/default.ext4'"
+    chk_art "toolchain bun.ext4" "test -f '$TOOLCHAIN_DIR/bun.ext4'"
+    chk_art "toolchain dockerfile.ext4" "test -f '$TOOLCHAIN_DIR/dockerfile.ext4'"
+    chk_art "baselayers platform.json" "test -f '$BASELAYERS_DIR/platform.json'"
+    if baselayers_orphans_present; then err "✗ baselayers has orphan blobs (run \`tools/dev baselayers\`)"; fails=$((fails+1)); else ok "baselayers no orphans"; fi
+    # Net (per-boot) — report, don't hard-fail the whole doctor.
+    if sudo -n iptables -C JKBUILD -p tcp -d 172.31.0.1 --dport 3129 -j ACCEPT 2>/dev/null; then
+        ok "build firewall: 3129 (dockerfile public-any) open"
+    else
+        warn "build net not up (or 3129 missing) — run \`tools/dev net\`"
+    fi
+    if [ "$DEEP" = 1 ]; then
+        banner "doctor --deep: boot smoke"
+        warn "(--deep boot smoke: run \`tools/dev test\` for the full build→HTTP 200 acceptance — incl. dockerfile_pipeline_to_http_200)"
+    fi
+    if [ "$fails" -gt 0 ]; then err "doctor: $fails artifact check(s) failed — run \`tools/dev all\`"; return 1; fi
+    ok "doctor: end-state complete"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# test — on-box acceptance gauntlet (sets the JKB_* env the #[ignore] tests need)
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_test() {
+    banner "test (on-box acceptance)"
+    # Compile the test binary AS THE USER (cargo under sudo would resolve root's
+    # rustup + pollute target/ ownership), then run just the binary under sudo.
+    say "Compiling the test binary (as $USER)…"
+    local testbin
+    testbin="$(cargo test -p jkbase-server --no-run --message-format=json 2>/dev/null \
+        | python3 -c 'import json,sys
+for l in sys.stdin:
+    try: m=json.loads(l)
+    except Exception: continue
+    if m.get("reason")=="compiler-artifact" and m.get("target",{}).get("name")=="jkbase-server" and m.get("profile",{}).get("test") and m.get("executable"):
+        print(m["executable"])' | tail -1)"
+    [ -n "$testbin" ] && [ -x "$testbin" ] || die "could not locate the jkbase-server test binary"
+    local filter="${1:-}"
+    say "Running on-box acceptance tests under sudo (needs \`tools/dev net\` for networked variants)…"
+    sudo_warmup
+    sudo env \
+        JKB_DATA="$FC_DIR" \
+        JKB_FC_RELEASE="$RELEASE_DIR" \
+        JKB_BASELAYERS="$BASELAYERS_DIR" \
+        JKB_AGENT="$AGENT_BIN" \
+        "$testbin" --ignored --nocapture --test-threads=1 $filter
+    RAN[test]=OK
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# all — durable artifacts (NOT net; that's per-boot)
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_all() {
+    cmd_preflight || die "preflight failed — fix the above (likely \`tools/dev deps\`) then re-run"
+    local s
+    for s in deps assets rust kernel toolchains baselayers; do
+        if selected "$s"; then "cmd_$s"; else verdict "(skipped: $s)"; fi
+    done
+    print_summary
+}
+
+print_summary() {
+    banner "summary"
+    local s
+    for s in "${ALL_STAGES[@]}"; do printf '   %-12s %s\n' "$s" "${RAN[$s]:-—}"; done
+    say ""
+    say "Next: relogin if just added to kvm group → \`tools/dev net\` (per boot) → \`tools/dev doctor\` → \`tools/dev test\`"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+main() {
+    parse_flags "$@"
+    case "$STAGE" in
+        preflight)  cmd_preflight ;;
+        deps)       cmd_deps ;;
+        assets)     cmd_assets ;;
+        rust)       cmd_rust ;;
+        kernel)     cmd_kernel ;;
+        toolchains) cmd_toolchains ;;
+        baselayers) cmd_baselayers ;;
+        net)        cmd_net ;;
+        all)        cmd_all ;;
+        doctor)     cmd_doctor ;;
+        test)       cmd_test "${POSITIONAL[@]:-}" ;;
+        *)          err "unknown stage: $STAGE"; usage; exit 2 ;;
+    esac
+}
+main "$@"

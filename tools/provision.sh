@@ -50,7 +50,10 @@ sudo apt-get install -y -qq \
     jq \
     iptables \
     busybox-static \
-    e2fsprogs
+    e2fsprogs \
+    flex bison libelf-dev bc libncurses-dev \
+    unzip file python3 \
+    erofs-utils fsverity
 
 echo "[2b/7] Installing Docker..."
 if ! command -v docker &>/dev/null; then
@@ -100,37 +103,12 @@ fi
 echo "System setup complete."
 REMOTE_SETUP
 
-# Phase 2: Firecracker
-echo ""
-echo "--- Phase 2: Firecracker ---"
-ssh "$TARGET" "bash -s" << REMOTE_FC
-set -euo pipefail
-
-FC_DIR="\$HOME/.firecracker"
-mkdir -p "\$FC_DIR"
-
-if [ ! -f "\$FC_DIR/release-v${FC_VERSION}-${FC_ARCH}/firecracker-v${FC_VERSION}-${FC_ARCH}" ]; then
-    echo "Downloading Firecracker v${FC_VERSION}..."
-    cd "\$FC_DIR"
-    curl -sLO "https://github.com/firecracker-microvm/firecracker/releases/download/v${FC_VERSION}/firecracker-v${FC_VERSION}-${FC_ARCH}.tgz"
-    tar -xzf "firecracker-v${FC_VERSION}-${FC_ARCH}.tgz"
-    rm -f "firecracker-v${FC_VERSION}-${FC_ARCH}.tgz"
-    echo "Firecracker installed."
-else
-    echo "Firecracker v${FC_VERSION} already installed."
-fi
-
-if [ ! -f "\$FC_DIR/vmlinux.bin" ]; then
-    echo "Downloading kernel image (6.1)..."
-    cd "\$FC_DIR"
-    curl -sLo vmlinux.bin "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/${FC_ARCH}/vmlinux-6.1.155"
-    echo "Kernel image downloaded."
-else
-    echo "Kernel image already present."
-fi
-
-echo "Firecracker setup complete."
-REMOTE_FC
+# Phase 2: Firecracker + the guest kernel are set up in Phase 3, AFTER the clone,
+# so they reuse the maintained in-repo tooling (tools/fetch-firecracker.sh +
+# tools/build-kernel.sh) — one source of truth shared with local dev (tools/dev).
+# (The old inline Phase 2 downloaded a 6.1 kernel that CANNOT mount erofs, so the
+# B2 layered runtime never worked from a fresh provision; the 6.12 kernel had to
+# be placed by hand. Phase 3 now builds the correct 6.12 kernel.)
 
 # Phase 3: Clone and build jkbase
 echo ""
@@ -157,8 +135,35 @@ cargo build --release -p jkbase-server -p jkbase-cli 2>&1 | tail -3
 echo "Building jkbase-agent (musl)..."
 cargo build --release -p jkbase-agent --target x86_64-unknown-linux-musl 2>&1 | tail -3
 
+echo "Building jkbuild-init (musl, build-VM PID1)..."
+cargo build --release -p jkbuild --bin jkbuild-init --target x86_64-unknown-linux-musl 2>&1 | tail -3
+
+# Firecracker release — shared fetch+verify with local dev (one source of truth).
+echo "Fetching Firecracker (shared tools/fetch-firecracker.sh)..."
+FC_DIR="$HOME/.firecracker" tools/fetch-firecracker.sh
+
+# Guest kernel: build the 6.12 erofs/overlay/verity kernel the B2 layered runtime
+# REQUIRES (the old 6.1 download could not mount erofs). Idempotent: skips if the
+# built kernel already has the must-have config symbols. ~10-15 min on first run.
+KOUT="$HOME/.firecracker/vmlinux-6.12.92.bin"
+KCFG="$HOME/.firecracker/kernel-build/linux-6.12.92/.config"
+need_kernel=1
+if [ -f "$KOUT" ] && [ -f "$KCFG" ] && \
+   grep -q "^CONFIG_EROFS_FS=y" "$KCFG" && grep -q "^CONFIG_OVERLAY_FS=y" "$KCFG"; then
+    need_kernel=0
+fi
+if [ "$need_kernel" = 1 ]; then
+    echo "Building the 6.12 guest kernel (erofs/overlay/verity; ~10-15 min)..."
+    OUT="$KOUT" tools/build-kernel.sh 2>&1 | tail -5
+fi
+# Adopt it as vmlinux.bin (the name the server + tests resolve).
+ln -sfn "vmlinux-6.12.92.bin" "$HOME/.firecracker/vmlinux.bin"
+
 echo "Build complete."
-ls -lh target/release/jkbase-server target/release/jkbase target/x86_64-unknown-linux-musl/release/jkbase-agent
+ls -lh target/release/jkbase-server target/release/jkbase \
+    target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    target/x86_64-unknown-linux-musl/release/jkbuild-init \
+    "$HOME/.firecracker/vmlinux.bin"
 REMOTE_BUILD
 
 # Phase 4: Setup systemd service and network
@@ -195,31 +200,12 @@ fi
 BRIDGE
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
 
-# Build cgroup provisioner (ExecStartPre, reboot-surviving). Build VMs run under
-# the jailer in leaf cgroups beneath /sys/fs/cgroup/jkbase-build; that parent must
-# exist with +cpu +memory +pids delegated or a hostile build's memory.max never
-# applies and it can drive HOST OOM (threat model: all tenants untrusted). The
-# server also does this best-effort at startup, but provisioning it here makes it
-# explicit, loud, and independent of the binary. Best-effort/exit 0: a cgroup
-# hiccup must never block the runtime from starting.
-sudo tee /usr/local/bin/jkbase-build-cgroup.sh > /dev/null << 'CGROUP'
-#!/bin/bash
-WANT="+cpu +memory +pids"
-ROOT=/sys/fs/cgroup
-PARENT="$ROOT/jkbase-build"
-# Delegate controllers down from the root so children can receive them.
-echo "$WANT" > "$ROOT/cgroup.subtree_control" 2>/dev/null || true
-mkdir -p "$PARENT" 2>/dev/null || true
-if ! echo "$WANT" > "$PARENT/cgroup.subtree_control" 2>/dev/null; then
-    echo "jkbase-build-cgroup: WARNING could not delegate '$WANT' to $PARENT" >&2
-fi
-have="$(cat "$PARENT/cgroup.subtree_control" 2>/dev/null || true)"
-case "$have" in
-    *memory*) echo "jkbase-build-cgroup: ready ($have)" ;;
-    *) echo "jkbase-build-cgroup: WARNING memory controller NOT delegated — build OOM containment is OFF ($have)" >&2 ;;
-esac
-exit 0
-CGROUP
+# Build cgroup provisioner (ExecStartPre, per-boot). Build VMs run under the jailer
+# in leaf cgroups beneath /sys/fs/cgroup/jkbase-build; that parent must exist with
+# +cpu +memory +pids delegated or a hostile build's memory.max never applies and it
+# can drive HOST OOM (threat model: all tenants untrusted). Install the maintained
+# in-repo script (one source of truth, shared with local dev's `tools/dev net`).
+sudo cp "$JKBASE_DIR/tools/setup-build-cgroup.sh" /usr/local/bin/jkbase-build-cgroup.sh
 sudo chmod +x /usr/local/bin/jkbase-build-cgroup.sh
 
 # Isolated build network provisioner (ExecStartPre, reboot-surviving). Creates the
