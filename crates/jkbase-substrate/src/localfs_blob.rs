@@ -156,6 +156,16 @@ impl BlobStore for LocalFsBlobStore {
         out.sort();
         Ok(out)
     }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let p = self.resolve(key)?;
+        match tokio::fs::remove_file(&p).await {
+            Ok(()) => Ok(()),
+            // Idempotent: absent is success (the post-condition "key is gone" holds).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl Backend for LocalFsBlobStore {
@@ -239,6 +249,27 @@ mod tests {
         assert!(matches!(
             bs.get_to_file("nope", &base.join("o")).await,
             Err(SubstrateError::NotFound(_))
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_and_is_idempotent() {
+        let base = tmp("del");
+        let bs = LocalFsBlobStore::open(base.join("store")).unwrap();
+        let src = base.join("src");
+        write(&src, b"bytes").await;
+        bs.put_file("a/b.bin", &src).await.unwrap();
+        assert!(bs.head("a/b.bin").await.unwrap().is_some());
+        bs.delete("a/b.bin").await.unwrap();
+        assert!(bs.head("a/b.bin").await.unwrap().is_none());
+        // Idempotent: deleting an absent key is success, not an error.
+        bs.delete("a/b.bin").await.unwrap();
+        bs.delete("never/existed").await.unwrap();
+        // Traversal is still rejected.
+        assert!(matches!(
+            bs.delete("../escape").await,
+            Err(SubstrateError::Backend(_))
         ));
         let _ = std::fs::remove_dir_all(&base);
     }

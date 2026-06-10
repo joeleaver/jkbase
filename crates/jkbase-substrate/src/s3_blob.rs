@@ -27,7 +27,7 @@ use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjPath;
-use object_store::{GetOptions, ObjectStore};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -180,6 +180,16 @@ impl BlobStore for S3CompatBlobStore {
         }
         out.sort();
         Ok(out)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let path = obj_path(key)?;
+        match self.store.delete(&path).await {
+            Ok(()) => Ok(()),
+            // Idempotent: absent is success (matches LocalFsBlobStore semantics).
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(map_err(e)),
+        }
     }
 }
 
