@@ -150,7 +150,16 @@ struct ParsedReq {
 }
 
 /// Parse a buffered HTTP/1.x request head (everything up to and excluding the final
-/// CRLFCRLF). Returns `None` on a malformed start line.
+/// CRLFCRLF). Returns `None` on ANY malformed/ambiguous request — the caller then
+/// 400s and CLOSES, so being strict here is safe and is a security control, not a
+/// nicety. Strictness enforced:
+///  - **origin-form request-target only** (`/...`, not `//...`): blocks authority
+///    rehoming via userinfo/host in the target (e.g. `@10.0.0.1/x`, `//evil/x`,
+///    `:6379/x`) that would otherwise reach `format!("https://{host}{path}")` and
+///    bypass the SSRF IP-pin (the BLOCKER).
+///  - **no obsolete line folding** (a header line starting with SP/TAB).
+///  - **no Content-Length/Transfer-Encoding ambiguity** (duplicate CL, non-numeric
+///    CL, or CL+TE together): request-smuggling desync vectors.
 fn parse_request_head(head: &[u8]) -> Option<ParsedReq> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
@@ -159,20 +168,30 @@ fn parse_request_head(head: &[u8]) -> Option<ParsedReq> {
     let method = parts.next()?.to_string();
     let path = parts.next()?.to_string();
     let version = parts.next()?; // e.g. HTTP/1.1
-    if method.is_empty() || path.is_empty() || !version.starts_with("HTTP/") {
+    if method.is_empty() || !version.starts_with("HTTP/") {
+        return None;
+    }
+    // Origin-form only: a single leading '/'. Reject authority/absolute forms and the
+    // `//` (network-path) form that `url` would re-host on.
+    if !path.starts_with('/') || path.starts_with("//") {
         return None;
     }
     // HTTP/1.1 defaults to keep-alive; HTTP/1.0 defaults to close.
     let mut keep_alive = version == "HTTP/1.1";
     let mut host = None;
+    let mut content_length_seen = false;
+    let mut transfer_encoding_seen = false;
     let mut has_body = false;
     for line in lines {
         if line.is_empty() {
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
+        // Obsolete line folding (a continuation starting with whitespace) is a
+        // classic smuggling vector — reject the whole request.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return None;
+        }
+        let (name, value) = line.split_once(':')?;
         let name = name.trim().to_ascii_lowercase();
         let value = value.trim();
         match name.as_str() {
@@ -184,10 +203,26 @@ fn parse_request_head(head: &[u8]) -> Option<ParsedReq> {
                     keep_alive = true;
                 }
             }
-            "content-length" if value.parse::<u64>().unwrap_or(0) > 0 => has_body = true,
-            "transfer-encoding" => has_body = true,
+            "content-length" => {
+                if content_length_seen {
+                    return None; // duplicate CL — ambiguous
+                }
+                content_length_seen = true;
+                let n: u64 = value.parse().ok()?; // non-numeric CL — reject
+                if n > 0 {
+                    has_body = true;
+                }
+            }
+            "transfer-encoding" => {
+                transfer_encoding_seen = true;
+                has_body = true;
+            }
             _ => {}
         }
+    }
+    // CL and TE together is the canonical smuggling ambiguity.
+    if content_length_seen && transfer_encoding_seen {
+        return None;
     }
     Some(ParsedReq {
         method,
@@ -252,6 +287,11 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
+/// A header value is safe to emit iff it carries no CR/LF/NUL (no response splitting).
+fn header_safe(v: &str) -> bool {
+    !v.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+}
+
 /// Write a full HTTP/1.1 response (status line + headers + Content-Length-framed body)
 /// to `w`. `head_only` suppresses the body (HEAD). Always emits Content-Length, so the
 /// connection stays framed and keep-alive-safe.
@@ -272,13 +312,16 @@ async fn write_response<W: AsyncWrite + Unpin>(
         reason_phrase(resp.status)
     ));
     head.push_str(&format!("Content-Length: {len}\r\n"));
-    if let Some(ct) = &resp.content_type {
+    // Defense in depth (reqwest's HeaderValue::to_str already rejects CR/LF on the
+    // relay path): never emit a header whose value carries a CR/LF/NUL, so a relayed
+    // upstream value can't split the response / inject headers regardless of source.
+    if let Some(ct) = resp.content_type.as_deref().filter(|v| header_safe(v)) {
         head.push_str(&format!("Content-Type: {ct}\r\n"));
     }
-    if let Some(ce) = &resp.content_encoding {
+    if let Some(ce) = resp.content_encoding.as_deref().filter(|v| header_safe(v)) {
         head.push_str(&format!("Content-Encoding: {ce}\r\n"));
     }
-    for (k, v) in &resp.extra {
+    for (k, v) in resp.extra.iter().filter(|(_, v)| header_safe(v)) {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str(if keep_alive {
@@ -428,12 +471,12 @@ impl MirrorTls {
                 None
             };
             if let Some(r) = resp {
-                let ka = req.keep_alive && r.status != 421;
-                write_response(&mut *tls, r, head_only, ka).await?;
-                if !ka {
-                    return Ok(());
-                }
-                continue;
+                // ANY error response force-CLOSES the connection. We never drain a
+                // request body, so a kept-alive connection after a body-announcing or
+                // otherwise-rejected request would desync (the unread body would be
+                // parsed as the next request). Closing is the only safe resync.
+                write_response(&mut *tls, r, head_only, false).await?;
+                return Ok(());
             }
 
             let response = match self.get_or_fetch(host, &req.path, upstream).await {
@@ -484,12 +527,13 @@ impl MirrorTls {
                 content_encoding,
             } => {
                 let digest_key = digest_key(&digest);
-                // Atomic, content-addressed, dedup-on-name: never overwrites.
+                // Atomic, content-addressed, dedup-on-name: never overwrites. `tmp` is
+                // a TempGuard — it removes the staging file when this arm returns,
+                // whether the store call succeeds or fails.
                 self.store
-                    .put_if_absent_file(&digest_key, &tmp)
+                    .put_if_absent_file(&digest_key, tmp.path())
                     .await
                     .map_err(|e| anyhow::anyhow!("store blob: {e}"))?;
-                let _ = tokio::fs::remove_file(&tmp).await;
                 if class != Class::Disallowed {
                     let entry = IndexEntry {
                         digest: digest.clone(),
@@ -584,6 +628,14 @@ impl MirrorTls {
         path: &str,
     ) -> Result<Fetched> {
         let url = format!("https://{host}{path}");
+        // Defense in depth behind parse_request_head's origin-form check: the parsed
+        // URL's host+port MUST be exactly the pinned host:443 the SSRF gate vetted. If
+        // a `path` ever rehomes the authority/port, refuse BEFORE any send so nothing
+        // is fetched or stored (I-5). reqwest re-exports `url::Url`.
+        let parsed = reqwest::Url::parse(&url).context("parse upstream url")?;
+        if parsed.host_str() != Some(host) || parsed.port_or_known_default() != Some(443) {
+            bail!("mirror url host/port mismatch (rehoming attempt): {url}");
+        }
         self.upstream_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut resp = upstream.get(&url).send().await.context("upstream send")?;
@@ -592,17 +644,17 @@ impl MirrorTls {
         let content_encoding = header_str(&resp, reqwest::header::CONTENT_ENCODING);
 
         if status == 200 {
-            let tmp = self.tmp_path();
-            if let Some(parent) = tmp.parent() {
+            // TempGuard removes the partial download on EVERY early return below.
+            let tmp = TempGuard::new(self.tmp_path());
+            if let Some(parent) = tmp.path().parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let mut f = tokio::fs::File::create(&tmp).await?;
+            let mut f = tokio::fs::File::create(tmp.path()).await?;
             let mut hasher = Sha256::new();
             let mut total: u64 = 0;
             while let Some(chunk) = resp.chunk().await.context("upstream body")? {
                 total += chunk.len() as u64;
                 if total > MAX_ARTIFACT_BYTES {
-                    let _ = tokio::fs::remove_file(&tmp).await;
                     bail!("artifact exceeds {MAX_ARTIFACT_BYTES} bytes");
                 }
                 hasher.update(&chunk);
@@ -662,9 +714,17 @@ impl MirrorTls {
 
     async fn read_index(&self, url_key: &str) -> Result<Option<IndexEntry>> {
         match tokio::fs::read(self.index_path(url_key)).await {
-            Ok(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).context("parse index entry")?,
-            )),
+            Ok(bytes) => {
+                let entry: IndexEntry =
+                    serde_json::from_slice(&bytes).context("parse index entry")?;
+                // A corrupt entry (bad digest shape) must NEVER reach digest_key's
+                // `&digest[..2]` slice — treat it as a miss so the URL re-fetches.
+                if !is_sha256_hex(&entry.digest) {
+                    tracing::warn!(url_key, "mirror index entry has malformed digest; ignoring");
+                    return Ok(None);
+                }
+                Ok(Some(entry))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -699,7 +759,7 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// Outcome of an upstream fetch.
 enum Fetched {
     Artifact {
-        tmp: PathBuf,
+        tmp: TempGuard,
         digest: String,
         content_type: Option<String>,
         content_encoding: Option<String>,
@@ -712,7 +772,37 @@ enum Fetched {
     },
 }
 
-/// Content-address blob key: `<aa>/<hex>` (2-char fan-out).
+/// Removes its path on drop unless disarmed — guarantees a mirror download temp is
+/// cleaned on EVERY path (mid-stream error, store failure, or success), so a hostile
+/// abort near disk-full can't orphan up-to-cap files. Best-effort sync remove.
+struct TempGuard(Option<PathBuf>);
+
+impl TempGuard {
+    fn new(p: PathBuf) -> Self {
+        Self(Some(p))
+    }
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("temp guard path taken")
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// True iff `s` is exactly 64 ASCII-hex chars (a well-formed sha256). Guards the
+/// `&digest[..2]` shard slice against a panic on a short/multibyte digest read back
+/// from a corrupt on-disk index entry.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Content-address blob key: `<aa>/<hex>` (2-char fan-out). Caller must pass a
+/// validated 64-hex digest (see [`is_sha256_hex`]).
 fn digest_key(digest: &str) -> String {
     format!("{}/{}", &digest[..2], digest)
 }
@@ -792,6 +882,49 @@ mod tests {
     fn digest_key_shards() {
         let d = "abcd1234".to_string() + &"0".repeat(56);
         assert_eq!(digest_key(&d), format!("ab/{d}"));
+    }
+
+    #[test]
+    fn parse_rejects_authority_rehoming_targets() {
+        // THE SSRF blocker: only origin-form `/...` targets are accepted. Anything that
+        // `url` would re-host on must be rejected (-> None -> 400 + close).
+        for bad in [
+            "GET @169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: registry.npmjs.org",
+            "GET :6379/x HTTP/1.1\r\nHost: registry.npmjs.org",
+            "GET //evil.example.com/x HTTP/1.1\r\nHost: registry.npmjs.org",
+            "GET  @169.254.169.254/x HTTP/1.1\r\nHost: registry.npmjs.org", // leading space -> empty path token
+            "GET https://evil/x HTTP/1.1\r\nHost: registry.npmjs.org",
+        ] {
+            assert!(
+                parse_request_head(bad.as_bytes()).is_none(),
+                "must reject authority-rehoming target: {bad:?}"
+            );
+        }
+        // A legitimate origin-form target still parses.
+        assert!(parse_request_head(b"GET /lodash/-/x.tgz HTTP/1.1\r\nHost: registry.npmjs.org").is_some());
+    }
+
+    #[test]
+    fn parse_rejects_smuggling_ambiguity() {
+        // Duplicate Content-Length.
+        assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 5").is_none());
+        // Content-Length + Transfer-Encoding together.
+        assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nTransfer-Encoding: chunked").is_none());
+        // Non-numeric Content-Length.
+        assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: abc").is_none());
+        // Obsolete line folding (continuation starting with whitespace).
+        assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\n  folded: y").is_none());
+    }
+
+    #[test]
+    fn header_safety_and_digest_validation() {
+        assert!(header_safe("application/octet-stream"));
+        assert!(!header_safe("x\r\nInjected: 1"));
+        assert!(!header_safe("x\nq"));
+        assert!(is_sha256_hex(&"a".repeat(64)));
+        assert!(!is_sha256_hex(&"a".repeat(63))); // too short
+        assert!(!is_sha256_hex("d")); // would panic &d[..2]
+        assert!(!is_sha256_hex(&("g".to_string() + &"0".repeat(63)))); // non-hex
     }
 
     #[test]
