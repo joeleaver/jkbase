@@ -236,10 +236,16 @@ fn cargo_command(bin: &str, cargo_home: &Path) -> Command {
     cmd
 }
 
+/// Run a build subprocess, capturing its output so a failure surfaces the actual
+/// cargo/rustc error in the build log the tenant sees — not just an exit code.
 fn run(mut cmd: Command, what: &str) -> Result<()> {
-    let status = cmd.status().with_context(|| format!("spawning `{what}`"))?;
-    if !status.success() {
-        anyhow::bail!("`{what}` failed: {status}");
+    let out = cmd.output().with_context(|| format!("spawning `{what}`"))?;
+    if !out.status.success() {
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        let lines: Vec<&str> = combined.lines().collect();
+        let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+        anyhow::bail!("`{what}` failed: {}\n--- output (tail) ---\n{}", out.status, tail);
     }
     Ok(())
 }

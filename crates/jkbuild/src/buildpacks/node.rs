@@ -366,14 +366,31 @@ fn node_command(bin: &str, home: &Path) -> Command {
     cmd
 }
 
+/// Run a build subprocess, capturing its output so a failure surfaces the actual
+/// tool error (npm/pnpm/yarn) in the build log the tenant sees — not just an exit
+/// code. The output is buffered in-VM and only the tail is kept on failure.
 fn run(mut cmd: Command, what: &str) -> Result<()> {
-    let status = cmd
-        .status()
+    let out = cmd
+        .output()
         .with_context(|| format!("spawning `{what}`"))?;
-    if !status.success() {
-        anyhow::bail!("`{what}` failed: {status}");
+    if !out.status.success() {
+        anyhow::bail!(
+            "`{what}` failed: {}\n--- output (tail) ---\n{}",
+            out.status,
+            output_tail(&out.stdout, &out.stderr)
+        );
     }
     Ok(())
+}
+
+/// Last ~40 lines of combined stdout+stderr, line-based so it never slices a
+/// multibyte char.
+fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut combined = String::from_utf8_lossy(stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(stderr));
+    let lines: Vec<&str> = combined.lines().collect();
+    let start = lines.len().saturating_sub(40);
+    lines[start..].join("\n")
 }
 
 fn read_package_json(app_dir: &Path) -> Option<serde_json::Value> {
