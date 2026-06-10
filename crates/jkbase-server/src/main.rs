@@ -4,6 +4,7 @@ mod egress;
 mod layer_plan;
 mod log_shipper;
 mod metering;
+mod mirror;
 
 use anyhow::{Context, Result};
 use clap::Parser;
