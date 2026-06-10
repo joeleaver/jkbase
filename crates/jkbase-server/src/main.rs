@@ -1,3 +1,4 @@
+mod build_ca;
 mod build_orchestrator;
 mod egress;
 mod layer_plan;
@@ -185,6 +186,24 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
+
+    // Bootstrap subcommand: `jkbase-server gen-build-ca [<dir>]` materializes the
+    // shared build-mirror CA (ca.key + ca.crt) and exits, so the toolchain bake can
+    // inject the public cert before the server proper ever runs. Detected before
+    // Args::parse() so it does not require the full run-time args (--fc-dir, etc.).
+    if std::env::args().nth(1).as_deref() == Some("gen-build-ca") {
+        let dir = std::env::args()
+            .nth(2)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/jkbase").join("build-ca"));
+        build_ca::BuildCa::load_or_generate(&dir)?;
+        println!(
+            "build-mirror CA ready: key={} cert={}",
+            dir.join("ca.key").display(),
+            dir.join("ca.crt").display()
+        );
+        return Ok(());
+    }
 
     tracing_subscriber::fmt::init();
 
