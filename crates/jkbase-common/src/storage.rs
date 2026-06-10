@@ -61,6 +61,20 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
         total = total.saturating_add(md.blocks().saturating_mul(512));
     }
 
+    // Build cache drives: per-`(project,language)` sparse warm-cache images under
+    // `buildcache/{id}/`. Bill ACTUAL blocks (sparse, grows on demand) like the data
+    // disk. (Transiently moved into the jail during a build, so it may not be counted
+    // then; quota is checked at build intake and the image returns afterwards.)
+    if let Ok(entries) = std::fs::read_dir(data_dir.join("buildcache").join(project_id)) {
+        for e in entries.flatten() {
+            if let Ok(md) = e.metadata()
+                && md.is_file()
+            {
+                total = total.saturating_add(md.blocks().saturating_mul(512));
+            }
+        }
+    }
+
     // The single deployment version being billed (live, or the one being
     // deployed). Excludes other retained versions; never follows symlinks.
     total = total.saturating_add(dir_bytes(deployment_dir));

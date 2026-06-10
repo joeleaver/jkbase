@@ -393,6 +393,10 @@ async fn main() -> Result<()> {
         max_concurrent: 4,
         net: build_net,
         fetch_deadline: Duration::from_secs(600),
+        cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        // Per-(project,language) warm cache image (vde): sparse 4 GiB logical, grows
+        // on demand, billed by actual blocks against the project storage quota.
+        cache_size_bytes: 4096 * 1024 * 1024,
     });
     // The jail chroot base + toolchain dir must exist on the data-dir fs.
     let _ = std::fs::create_dir_all(&build_deps.chroot_base);
@@ -677,7 +681,11 @@ async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
     for f in [format!("{project_id}.ext4"), format!("{project_id}.img"), format!("{project_id}.holder")] {
         let _ = tokio::fs::remove_file(disks.join(f)).await;
     }
-    for dir in ["snapshots", "run", "hosting", "builds"] {
+    for dir in ["snapshots", "run", "hosting", "builds", "buildcache"] {
+        // `buildcache/{id}/` holds the per-(project,language) warm-cache images.
+        // Purge on delete so a recreated same-name project can't inherit the prior
+        // tenant's cache (same isolation rule as secrets/data — the project id IS the
+        // slug, so a reused name would otherwise read another tenant's build cache).
         let _ = tokio::fs::remove_dir_all(data_dir.join(dir).join(project_id)).await;
     }
     // Per-project git bare repo (build·D push-to-deploy): `git/{id}.git`.
