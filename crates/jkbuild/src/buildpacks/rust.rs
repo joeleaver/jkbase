@@ -3,8 +3,10 @@
 //! detect keys off `Cargo.toml`; `fetch` runs `cargo fetch` (network up, via the
 //! egress proxy) with `CARGO_HOME` on the per-project cache drive so the registry +
 //! git caches survive across builds; `compile` runs `cargo build --release
-//! --offline` and extracts the resulting binary into the app layer rooted at
-//! `/app`; launch is the absolute binary path.
+//! --offline`, then ships the app tree (data files, models, seed DBs, config, an
+//! entrypoint script — everything except `target/` and `.git`) plus the built
+//! binary into the app layer rooted at `/app`; launch is the absolute binary path
+//! (or a `command = [...]` override such as an entrypoint script).
 //!
 //! Linking model: the default (glibc) target produces a dynamically-linked binary
 //! needing glibc (from the shared BASE layer) + `libgcc_s` (from the small shared
@@ -103,29 +105,12 @@ impl Buildpack for RustBuildpack {
             );
         }
 
-        // App layer rooted at /app (overlayfs can't relocate a lowerdir, so the
-        // content must physically live at /app). Copy EVERY built binary in, so a
-        // jkbase.toml `command = ["/app/<name>"]` override (which the in-VM buildpack
-        // can't see) can name any of them; the DEFAULT launch is the preferred binary
-        // (root [package].name / [[bin]]), else the only one, else the first by name.
+        // App layer rooted at /app: the app tree (assets + an entrypoint) plus the
+        // built binary.
+        let default_bin = choose_default(&bins, preferred_bin(ctx.app_dir).as_deref());
         let app_layer_root = ctx.layers_dir.join("app");
         let app_at = app_layer_root.join("app");
-        std::fs::create_dir_all(&app_at)
-            .with_context(|| format!("creating app layer dir {}", app_at.display()))?;
-        for (_name, src) in &bins {
-            let fname = src.file_name().ok_or_else(|| {
-                anyhow::anyhow!("binary path has no filename: {}", src.display())
-            })?;
-            let dest = app_at.join(fname);
-            std::fs::copy(src, &dest)
-                .with_context(|| format!("copy binary {} -> {}", src.display(), dest.display()))?;
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&dest)?.permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&dest, perm)?;
-        }
-
-        let default_bin = choose_default(&bins, preferred_bin(ctx.app_dir).as_deref());
+        assemble_app_layer(ctx.app_dir, &app_at, &bins)?;
 
         let app_layer = Layer {
             name: "app".to_string(),
@@ -238,6 +223,55 @@ fn choose_default(bins: &[(String, PathBuf)], preferred: Option<&str>) -> String
     }
     // `bins` is sorted by name (BTreeMap), so [0] is the deterministic first.
     bins[0].0.clone()
+}
+
+/// Ship the app's tree + the built binaries into `app_at` (the layer's `/app`).
+///
+/// Overlayfs can't relocate a lowerdir, so the runtime content must physically live
+/// at `/app`. We ship the whole app tree — data files, models, seed DBs, templates,
+/// config, an entrypoint script — alongside the binary, mirroring how the node
+/// buildpack ships its tree. A real Rust service routinely reads baked assets at
+/// runtime; a binary-only image would be missing them, and an entrypoint script
+/// would have nowhere to live. Only build artifacts (`target/`, gigabytes) and VCS
+/// metadata (`.git`) are excluded — never needed at runtime. With the tree shipped,
+/// `command = ["/app/entrypoint.sh"]` (base ships `/bin/sh`) can seed a writable
+/// `[volumes]` mount, export env, then exec the binary.
+///
+/// Pure filesystem ops (no cargo), so it is unit-testable.
+fn assemble_app_layer(app_dir: &Path, app_at: &Path, bins: &[(String, PathBuf)]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(app_at)
+        .with_context(|| format!("creating app layer dir {}", app_at.display()))?;
+    // Move every top-level entry except the build/VCS dirs into /app (cheap same-fs
+    // rename; both are on /scratch). Permissions, symlinks, and a committed-executable
+    // entrypoint are preserved.
+    const EXCLUDE: &[&str] = &["target", ".git"];
+    for entry in std::fs::read_dir(app_dir)
+        .with_context(|| format!("read app dir {}", app_dir.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        if EXCLUDE.iter().any(|e| name.as_os_str() == std::ffi::OsStr::new(e)) {
+            continue;
+        }
+        std::fs::rename(entry.path(), app_at.join(&name))
+            .with_context(|| format!("ship {} into the app layer", entry.path().display()))?;
+    }
+    // Place the built binaries (they live under the excluded `target/`). A binary
+    // whose name collides with a shipped file overwrites it with the executable.
+    for (_name, src) in bins {
+        let fname = src
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("binary path has no filename: {}", src.display()))?;
+        let dest = app_at.join(fname);
+        let _ = std::fs::remove_file(&dest);
+        std::fs::copy(src, &dest)
+            .with_context(|| format!("copy binary {} -> {}", src.display(), dest.display()))?;
+        let mut perm = std::fs::metadata(&dest)?.permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&dest, perm)?;
+    }
+    Ok(())
 }
 
 /// A cargo `Command` with a deterministic build `PATH` + `CARGO_HOME` on the cache
@@ -371,6 +405,39 @@ mod tests {
     fn parse_bin_artifacts_empty_for_library_only() {
         let stream = r#"{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}"#;
         assert!(parse_bin_artifacts(stream.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn assemble_app_layer_ships_assets_and_binary_excludes_build_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir().unwrap();
+        let app = d.path().join("workspace");
+        // A realistic tree: source, a committed entrypoint, a data asset, plus the
+        // build dir and VCS metadata that must NOT ship.
+        write(&app, "Cargo.toml", "[package]\nname=\"svc\"\n");
+        write(&app, "src/main.rs", "fn main() {}");
+        write(&app, "data/seed.txt", "asset-payload");
+        write(&app, "entrypoint.sh", "#!/bin/sh\nexec /app/svc\n");
+        write(&app, "target/release/junk", "build artifact");
+        write(&app, ".git/config", "[core]");
+        // The built binary lives under the excluded target/ (cargo reports its path).
+        write(&app, "target/release/svc", "\x7fELF-binary");
+        let bins = vec![("svc".to_string(), app.join("target/release/svc"))];
+
+        let app_at = d.path().join("layer/app");
+        assemble_app_layer(&app, &app_at, &bins).unwrap();
+
+        // Assets + source + entrypoint shipped.
+        assert_eq!(fs::read_to_string(app_at.join("data/seed.txt")).unwrap(), "asset-payload");
+        assert!(app_at.join("src/main.rs").exists());
+        assert!(app_at.join("Cargo.toml").exists());
+        assert!(app_at.join("entrypoint.sh").exists());
+        // Binary placed + executable.
+        assert!(app_at.join("svc").exists());
+        assert_eq!(fs::metadata(app_at.join("svc")).unwrap().permissions().mode() & 0o111, 0o111);
+        // Build artifacts + VCS metadata excluded.
+        assert!(!app_at.join("target").exists(), "target/ must not ship");
+        assert!(!app_at.join(".git").exists(), ".git must not ship");
     }
 
     #[test]

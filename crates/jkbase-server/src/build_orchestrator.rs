@@ -2793,6 +2793,80 @@ name = "api"
         println!("PASS: rust(tiny_http) build -> layered collection -> rust runtime layer -> HTTP 200 ({body:?})");
     }
 
+    /// Build a Rust app that ships a DATA ASSET + an ENTRYPOINT script (the
+    /// real-world shape the buildpack must support — e.g. an app baking ML models /
+    /// seed data and seeding a volume on first boot). The binary reads
+    /// `/app/data/greeting.txt` (only present if the buildpack ships assets) + the
+    /// `SEED_MARKER` env (only set if the entrypoint ran), so a correct body proves
+    /// BOTH the asset shipped AND `command = ["/bin/sh", "/app/entrypoint.sh"]` ran
+    /// and exec'd the binary.
+    async fn rust_assets_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("rust-assets-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write(
+            src.join("jkbase.toml"),
+            "[project]\nname = \"rustassets\"\n\n[servers.api]\nsource = \"./server\"\nlanguage = \"rust\"\nport = 3000\ncommand = [\"/bin/sh\", \"/app/entrypoint.sh\"]\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n",
+        );
+        write(
+            src.join("server/Cargo.toml"),
+            "[package]\nname = \"assetfix\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntiny_http = \"0.12\"\n",
+        );
+        write(
+            src.join("server/src/main.rs"),
+            "fn main() {\n    let port: u16 = std::env::var(\"PORT\").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);\n    let greeting = std::fs::read_to_string(\"/app/data/greeting.txt\").unwrap_or_else(|_| \"MISSING\".into());\n    let marker = std::env::var(\"SEED_MARKER\").unwrap_or_else(|_| \"NOENV\".into());\n    let body = format!(\"{}-{}\\n\", greeting.trim(), marker);\n    let server = tiny_http::Server::http((\"0.0.0.0\", port)).unwrap();\n    println!(\"listening on {port}\");\n    for req in server.incoming_requests() {\n        let _ = req.respond(tiny_http::Response::from_string(body.clone()));\n    }\n}\n",
+        );
+        // The baked asset the binary reads at runtime (only present if shipped).
+        write(src.join("server/data/greeting.txt"), "asset-ok\n");
+        // The entrypoint: seed env (a stand-in for the real seed-volume/export work),
+        // then exec the binary. Ships as a normal file; run via `sh` (no +x needed).
+        write(
+            src.join("server/entrypoint.sh"),
+            "#!/bin/sh\nexport SEED_MARKER=seeded\nexec /app/assetfix\n",
+        );
+        networked_lang_build(
+            "rustassets",
+            "onbox-rustassets.redb",
+            "rust.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                scratch_mib: 2048,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 240,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Rust assets + entrypoint acceptance: build → ship the data asset + entrypoint
+    /// into the app layer → runtime → the entrypoint runs, sets env, exec's the
+    /// binary, which reads the baked asset → HTTP 200 "asset-ok-seeded". Proves the
+    /// fix for the binary-only app layer (assets now ship) AND that a `command=`
+    /// entrypoint can seed env + exec.
+    ///
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture rust_assets_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "rust assets pipeline: needs KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
+    async fn rust_assets_pipeline_to_http_200() {
+        let Some(fx) = rust_assets_build(1).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "rusta", "172.25.0.1", "172.25.0.2", "AA:FC:00:00:25:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the rust server reading a baked asset via its entrypoint");
+        assert_eq!(body, "asset-ok-seeded", "asset must ship (asset-ok) AND entrypoint must run (seeded)");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: rust assets+entrypoint build -> app layer with assets -> entrypoint exec -> HTTP 200 ({body:?})");
+    }
+
     async fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
         let status = tokio::process::Command::new(cmd).args(args).status().await?;
         if !status.success() {
