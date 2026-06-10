@@ -1358,9 +1358,13 @@ fn collect_layered_server(
         let runtime = if spec.builder == Builder::Dockerfile {
             crate::layer_plan::IMAGE_SELF_RUNTIME.to_string()
         } else {
+            // Filter empties so a `language = ""` in jkbase.toml can't stamp an empty
+            // runtime (which would fail compute_layer_plan with "no platform runtime
+            // layer for language ''").
             resolved_language
+                .filter(|l| !l.is_empty())
                 .map(str::to_string)
-                .or_else(|| spec.language.clone())
+                .or_else(|| spec.language.clone().filter(|l| !l.is_empty()))
                 .unwrap_or_else(|| "bun".to_string())
         };
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));

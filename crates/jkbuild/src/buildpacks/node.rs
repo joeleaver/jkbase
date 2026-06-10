@@ -99,6 +99,10 @@ impl PackageManager {
             PackageManager::Npm => vec!["install", "--omit=dev"],
             PackageManager::Pnpm if has_lock => vec!["install", "--prod", "--frozen-lockfile"],
             PackageManager::Pnpm => vec!["install", "--prod"],
+            // `--production` is the v1 prod-prune; keep the resolve deterministic with
+            // `--frozen-lockfile` when a lockfile exists (same as the full install) so
+            // the SHIPPED tree can't drift to a different graph than the audited one.
+            PackageManager::Yarn if has_lock => vec!["install", "--production", "--frozen-lockfile"],
             PackageManager::Yarn => vec!["install", "--production"],
         }
     }
@@ -323,8 +327,20 @@ pub fn resolve_launch_command(app_dir: &Path) -> Option<Vec<String>> {
 /// and only simple whitespace-split tokens (no shell operators).
 fn parse_bare_node_command(script: &str) -> Option<Vec<String>> {
     let script = script.trim();
-    // Refuse anything with shell composition — we exec argv directly, no shell.
-    if script.contains(['&', '|', ';', '>', '<', '`', '$', '(', ')']) {
+    // A package-manager `start` runs via `sh -c`, so the authored semantics include
+    // quoting, globbing, comments, env-assignment, and substitution. We exec argv
+    // DIRECTLY (no shell), so any token carrying shell-significant punctuation can't
+    // be reproduced faithfully — bail (→ the caller falls through to the safe
+    // entry-file heuristics / the `command =` override) rather than mis-split it
+    // into a wrong argv. Only a plain `node <args…>` of bare tokens is accepted.
+    const SHELL_META: &[char] = &[
+        '&', '|', ';', '>', '<', '`', '$', '(', ')', // composition / redirection / subst
+        '\'', '"', '\\', // quoting / escaping
+        '#', // comment
+        '*', '?', '[', ']', '{', '}', // globbing / brace expansion
+        '~', '!', // home / history expansion
+    ];
+    if script.contains(SHELL_META) {
         return None;
     }
     let mut toks = script.split_whitespace();
@@ -486,7 +502,10 @@ fn stage_production_modules(
     if !status.success() {
         // Restore the full tree so the build can still proceed (degraded: a bloated
         // but correct layer) rather than leaving the tree with no node_modules.
-        if full_save.exists() && !app_nm.exists() {
+        // `npm ci` deletes node_modules first and may leave a PARTIAL tree on
+        // failure, so restore unconditionally (drop any partial, move the full back).
+        if full_save.exists() {
+            let _ = std::fs::remove_dir_all(&app_nm);
             let _ = std::fs::rename(&full_save, &app_nm);
         }
         anyhow::bail!("production install failed: {status}");
@@ -606,6 +625,10 @@ mod tests {
             vec!["install", "--frozen-lockfile"]
         );
         assert_eq!(PackageManager::Yarn.prod_install_args(false), vec!["install", "--production"]);
+        assert_eq!(
+            PackageManager::Yarn.prod_install_args(true),
+            vec!["install", "--production", "--frozen-lockfile"]
+        );
     }
 
     #[test]
@@ -632,13 +655,25 @@ mod tests {
 
     #[test]
     fn launch_rejects_shell_composed_start() {
-        // A start script with shell operators must NOT be parsed (we exec argv, no shell).
+        // A start script with shell operators/expansion must NOT be parsed (we exec
+        // argv directly, no shell) — bail so the caller falls through to a safe entry.
         assert_eq!(parse_bare_node_command("node a.js && node b.js"), None);
-        assert_eq!(parse_bare_node_command("NODE_ENV=production node a.js"), None);
+        assert_eq!(parse_bare_node_command("NODE_ENV=production node a.js"), None); // leader != node
         assert_eq!(parse_bare_node_command("node"), None); // no script ⇒ would hang
+        // Quoting / comments / globs would be mis-split by naive whitespace tokenizing.
+        assert_eq!(parse_bare_node_command("node \"my server.js\""), None);
+        assert_eq!(parse_bare_node_command("node app.js # prod"), None);
+        assert_eq!(parse_bare_node_command("node app.js --flag='a b'"), None);
+        assert_eq!(parse_bare_node_command("node ./dist/*.js"), None);
+        assert_eq!(parse_bare_node_command("node ~/app.js"), None);
+        // Plain bare-token invocations (incl. `--flag=value` with no quotes) are fine.
         assert_eq!(
             parse_bare_node_command("node --enable-source-maps server.js"),
             Some(vec![NODE_BIN.into(), "--enable-source-maps".into(), "server.js".into()])
+        );
+        assert_eq!(
+            parse_bare_node_command("node --max-old-space-size=512 dist/index.js"),
+            Some(vec![NODE_BIN.into(), "--max-old-space-size=512".into(), "dist/index.js".into()])
         );
     }
 

@@ -66,42 +66,66 @@ impl Buildpack for RustBuildpack {
 
         // Offline (post-seal) release build. `--offline` makes a build that tries to
         // touch the network fail here by design (every dep was fetched above).
+        // `--message-format=json-render-diagnostics` streams machine-readable artifact
+        // records on stdout — so we learn the EXACT binary paths cargo produced, even
+        // under a custom target/target-dir or a multi-binary workspace — while errors
+        // still render to stderr for the build log.
         let mut cmd = cargo_command("cargo", &cargo_home);
-        cmd.arg("build").arg("--release").arg("--offline");
+        cmd.arg("build")
+            .arg("--release")
+            .arg("--offline")
+            .arg("--message-format=json-render-diagnostics");
         if has_lock {
             cmd.arg("--locked");
         }
         cmd.current_dir(ctx.app_dir);
-        run(cmd, "cargo build --release")?;
+        let out = cmd
+            .output()
+            .context("spawning `cargo build --release`")?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let lines: Vec<&str> = err.lines().collect();
+            let tail = lines[lines.len().saturating_sub(40)..].join("\n");
+            anyhow::bail!(
+                "`cargo build --release` failed: {}\n--- output (tail) ---\n{}",
+                out.status,
+                tail
+            );
+        }
 
-        // Locate the produced binary. The workspace target dir is at the build root
-        // (we run cargo from /scratch/workspace); release bins land directly in
-        // target/release (deps/build/examples are subdirs we skip).
-        let target_release = ctx.app_dir.join("target").join("release");
-        let preferred = preferred_bin(ctx.app_dir);
-        let binary = discover_binary(&target_release, preferred.as_deref())?;
-        let bin_name = binary
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("binary path has no filename: {}", binary.display()))?
-            .to_string();
+        // Exactly the binaries cargo built (name → absolute path), from its own
+        // artifact records — no filesystem guessing about where target/ lives.
+        let bins = parse_bin_artifacts(&out.stdout);
+        if bins.is_empty() {
+            anyhow::bail!(
+                "`cargo build --release` produced no binary — a library-only crate has \
+                 nothing to run; add a `[[bin]]` target (src/main.rs) or a server entrypoint"
+            );
+        }
 
-        // App layer = JUST the binary, rooted at /app (overlayfs can't relocate a
-        // lowerdir, so it must physically live at /app). The binary is the whole
-        // tenant artifact; glibc + libgcc_s come from the base/runtime layers.
+        // App layer rooted at /app (overlayfs can't relocate a lowerdir, so the
+        // content must physically live at /app). Copy EVERY built binary in, so a
+        // jkbase.toml `command = ["/app/<name>"]` override (which the in-VM buildpack
+        // can't see) can name any of them; the DEFAULT launch is the preferred binary
+        // (root [package].name / [[bin]]), else the only one, else the first by name.
         let app_layer_root = ctx.layers_dir.join("app");
         let app_at = app_layer_root.join("app");
         std::fs::create_dir_all(&app_at)
             .with_context(|| format!("creating app layer dir {}", app_at.display()))?;
-        let dest = app_at.join(&bin_name);
-        std::fs::copy(&binary, &dest)
-            .with_context(|| format!("copy binary {} -> {}", binary.display(), dest.display()))?;
-        {
+        for (_name, src) in &bins {
+            let fname = src.file_name().ok_or_else(|| {
+                anyhow::anyhow!("binary path has no filename: {}", src.display())
+            })?;
+            let dest = app_at.join(fname);
+            std::fs::copy(src, &dest)
+                .with_context(|| format!("copy binary {} -> {}", src.display(), dest.display()))?;
             use std::os::unix::fs::PermissionsExt;
             let mut perm = std::fs::metadata(&dest)?.permissions();
             perm.set_mode(0o755);
             std::fs::set_permissions(&dest, perm)?;
         }
+
+        let default_bin = choose_default(&bins, preferred_bin(ctx.app_dir).as_deref());
 
         let app_layer = Layer {
             name: "app".to_string(),
@@ -118,7 +142,7 @@ impl Buildpack for RustBuildpack {
             layers: vec![app_layer],
             processes: vec![Process {
                 r#type: "web".to_string(),
-                command: vec![format!("/app/{bin_name}")],
+                command: vec![format!("/app/{default_bin}")],
                 default: true,
             }],
             env: std::collections::BTreeMap::new(),
@@ -168,58 +192,52 @@ pub fn preferred_bin(app_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Find the single release binary in `target/release`, or the one matching
-/// `preferred`. Skips cargo's bookkeeping (`*.d`, dotfiles) and the subdirectories
-/// (`deps/`, `build/`, `examples/`, `incremental/`, `.fingerprint/`). Errors
-/// actionably on zero (library-only crate) or an ambiguous multi-binary build.
-fn discover_binary(target_release: &Path, preferred: Option<&str>) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    if !target_release.is_dir() {
-        anyhow::bail!(
-            "no {} after `cargo build` — did the build produce a binary?",
-            target_release.display()
-        );
-    }
-    let mut bins: Vec<(String, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(target_release)
-        .with_context(|| format!("read {}", target_release.display()))?
-    {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+/// Parse cargo's `--message-format=json` stream (one JSON object per line) into the
+/// set of `bin` artifacts it produced: `target.name` → the absolute `executable`
+/// path. Deduplicated by name (a target can be reported more than once; the record
+/// carrying `executable` wins). Non-bin / library artifacts (null `executable`) and
+/// non-artifact messages are ignored.
+fn parse_bin_artifacts(stdout: &[u8]) -> Vec<(String, PathBuf)> {
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    for line in stdout.split(|b| *b == b'\n') {
+        if line.is_empty() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || name.ends_with(".d") {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
             continue;
         }
-        if entry.metadata()?.permissions().mode() & 0o111 == 0 {
-            continue; // not executable (e.g. a stray data file)
+        let is_bin = v
+            .get("target")
+            .and_then(|t| t.get("kind"))
+            .and_then(|k| k.as_array())
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("bin")));
+        if !is_bin {
+            continue;
         }
-        bins.push((name, entry.path()));
+        let exe = v.get("executable").and_then(|e| e.as_str());
+        let name = v.get("target").and_then(|t| t.get("name")).and_then(|n| n.as_str());
+        if let (Some(exe), Some(name)) = (exe, name) {
+            by_name.insert(name.to_string(), PathBuf::from(exe));
+        }
     }
+    by_name.into_iter().collect()
+}
 
-    if let Some(pref) = preferred
-        && let Some((_, p)) = bins.iter().find(|(n, _)| n == pref)
+/// Pick the default launch binary among those built: the `preferred` name (root
+/// `[package].name` / `[[bin]]`) when present, else the only one, else the first by
+/// name (deterministic; a `command = [...]` override can still select any other,
+/// since all built binaries are copied into the app layer).
+fn choose_default(bins: &[(String, PathBuf)], preferred: Option<&str>) -> String {
+    if let Some(p) = preferred
+        && bins.iter().any(|(n, _)| n == p)
     {
-        return Ok(p.clone());
+        return p.to_string();
     }
-    match bins.len() {
-        0 => anyhow::bail!(
-            "`cargo build --release` produced no binary in {} — a library-only crate \
-             has nothing to run; add a `[[bin]]` target (src/main.rs) or a server entrypoint",
-            target_release.display()
-        ),
-        1 => Ok(bins.pop().unwrap().1),
-        _ => {
-            let mut names: Vec<&str> = bins.iter().map(|(n, _)| n.as_str()).collect();
-            names.sort_unstable();
-            anyhow::bail!(
-                "`cargo build --release` produced multiple binaries ({}); pick one with a single \
-                 `[[bin]]` in Cargo.toml or set `command = [\"/app/<name>\"]` under the server in jkbase.toml",
-                names.join(", ")
-            )
-        }
-    }
+    // `bins` is sorted by name (BTreeMap), so [0] is the deterministic first.
+    bins[0].0.clone()
 }
 
 /// A cargo `Command` with a deterministic build `PATH` + `CARGO_HOME` on the cache
@@ -267,7 +285,6 @@ fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn write(dir: &Path, name: &str, contents: &str) {
@@ -276,14 +293,6 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(p, contents).unwrap();
-    }
-
-    fn write_exec(dir: &Path, name: &str) {
-        let p = dir.join(name);
-        fs::write(&p, b"\x7fELF").unwrap();
-        let mut perm = fs::metadata(&p).unwrap().permissions();
-        perm.set_mode(0o755);
-        fs::set_permissions(&p, perm).unwrap();
     }
 
     #[test]
@@ -337,43 +346,44 @@ mod tests {
     }
 
     #[test]
-    fn discover_single_binary() {
-        let d = tempdir().unwrap();
-        let rel = d.path();
-        write_exec(rel, "server");
-        write(rel, "server.d", "deps");
-        fs::create_dir_all(rel.join("deps")).unwrap();
-        let got = discover_binary(rel, None).unwrap();
-        assert_eq!(got.file_name().unwrap(), "server");
+    fn parse_bin_artifacts_extracts_bins_ignores_libs_and_noise() {
+        // A realistic cargo --message-format=json stream: a lib artifact (null
+        // executable), a build-script message, then two bin artifacts.
+        let stream = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}"#, "\n",
+            r#"{"reason":"build-script-executed","package_id":"x"}"#, "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"server","kind":["bin"]},"executable":"/scratch/workspace/target/release/server"}"#, "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"worker","kind":["bin"]},"executable":"/scratch/workspace/target/x86_64-unknown-linux-gnu/release/worker"}"#, "\n",
+            r#"{"reason":"build-finished","success":true}"#, "\n",
+        );
+        let bins = parse_bin_artifacts(stream.as_bytes());
+        assert_eq!(bins.len(), 2);
+        let map: std::collections::BTreeMap<_, _> = bins.iter().cloned().collect();
+        assert_eq!(map["server"], PathBuf::from("/scratch/workspace/target/release/server"));
+        // The custom-target path is honoured verbatim (no FS guessing).
+        assert_eq!(
+            map["worker"],
+            PathBuf::from("/scratch/workspace/target/x86_64-unknown-linux-gnu/release/worker")
+        );
     }
 
     #[test]
-    fn discover_prefers_named_binary() {
-        let d = tempdir().unwrap();
-        let rel = d.path();
-        write_exec(rel, "server");
-        write_exec(rel, "tool");
-        let got = discover_binary(rel, Some("tool")).unwrap();
-        assert_eq!(got.file_name().unwrap(), "tool");
+    fn parse_bin_artifacts_empty_for_library_only() {
+        let stream = r#"{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}"#;
+        assert!(parse_bin_artifacts(stream.as_bytes()).is_empty());
     }
 
     #[test]
-    fn discover_errors_on_ambiguous_multi_binary() {
-        let d = tempdir().unwrap();
-        let rel = d.path();
-        write_exec(rel, "alpha");
-        write_exec(rel, "beta");
-        let err = discover_binary(rel, None).unwrap_err().to_string();
-        assert!(err.contains("multiple binaries"), "got: {err}");
-        assert!(err.contains("alpha") && err.contains("beta"));
-    }
-
-    #[test]
-    fn discover_errors_on_library_only() {
-        let d = tempdir().unwrap();
-        let rel = d.path();
-        write(rel, "libfoo.rlib", "x"); // not executable
-        let err = discover_binary(rel, None).unwrap_err().to_string();
-        assert!(err.contains("no binary"), "got: {err}");
+    fn choose_default_prefers_named_then_first() {
+        let bins = vec![
+            ("alpha".to_string(), PathBuf::from("/app/alpha")),
+            ("server".to_string(), PathBuf::from("/app/server")),
+        ];
+        // Preferred match wins.
+        assert_eq!(choose_default(&bins, Some("server")), "server");
+        // No preferred (virtual workspace) → first by name (deterministic).
+        assert_eq!(choose_default(&bins, None), "alpha");
+        // Preferred that wasn't built → fall back to first.
+        assert_eq!(choose_default(&bins, Some("ghost")), "alpha");
     }
 }

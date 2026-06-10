@@ -2,7 +2,7 @@
   "version": "v1",
   "config": {
     "name": "images/apko/run-rust.apko.yaml",
-    "checksum": "sha256-FUyWetYiWbDOsLkvtsZLbG779yn0A4WC7hWshlSc8+U="
+    "checksum": "sha256-OIzzjJHHt4EJ9ltAbUoD4RSdSkNVby7GJja+n3stNm8="
   },
   "contents": {
     "keyring": [

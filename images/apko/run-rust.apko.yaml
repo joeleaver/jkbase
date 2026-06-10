@@ -3,10 +3,12 @@
 # and links the C-runtime unwinder `libgcc_s.so.1`, which the base (glibc + ld-linux
 # only) does not carry. This layer supplies exactly that — it is tiny.
 #
-# apko pulls `libgcc`'s closure (glibc, …); tools/build-base-layer.sh DELTAs the
-# rootfs against the shared base stage, so after the delta the layer is effectively
-# just `libgcc_s.so.1` (everything else is identical to base and dropped). One copy
-# shared across every Rust tenant.
+# In practice the base layer's glibc/ld-linux closure ALREADY ships
+# /usr/lib/libgcc_s.so.1, so tools/build-base-layer.sh's delta against base drops it
+# too — this runtime layer ends up essentially EMPTY (a glibc-dynamic rust binary
+# runs on the base layer alone). It still exists so the host layer plan's
+# per-language runtime lookup resolves `rust` uniformly with bun/node; if a future
+# base stops shipping libgcc_s, this layer is where it would be reintroduced.
 #
 # C++-linking crates (cc with -lstdc++) would additionally need libstdc++ at
 # runtime — a deliberate v1 omission (add it here if a real app needs it). A

@@ -33,6 +33,32 @@ command -v mkfs.erofs >/dev/null || { echo "mkfs.erofs not found — apt-get ins
 command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync (runtime-layer delta)" >&2; exit 1; }
 [ -f "$BUN_BIN" ] || { echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2; exit 1; }
 
+# The delta + overlay scheme's load-bearing assumption: base and every per-language
+# runtime closure must link the SAME glibc/ld-linux/libgcc. Base's libs are what is
+# actually present at runtime (the runtimes' identical copies are delta'd out), so a
+# runtime lockfile that drifted to a newer ABI would link symbols base can't satisfy.
+# The four lockfiles are regenerated independently, so assert they agree before baking.
+python3 - "${BASE_CONFIG%.yaml}.lock.json" "${NODE_CONFIG%.yaml}.lock.json" "${RUST_CONFIG%.yaml}.lock.json" <<'PY' || { echo "[lib-check] runtime lockfiles disagree with base on glibc/ld-linux/libgcc — regenerate all run-*.apko.lock.json together" >&2; exit 1; }
+import json, sys
+LIBS = ("glibc", "ld-linux", "libgcc")
+def vers(path):
+    try: d = json.load(open(path))
+    except Exception: return None
+    pkgs = {p["name"]: p["version"] for p in d.get("contents", {}).get("packages", [])}
+    return {l: pkgs[l] for l in LIBS if l in pkgs}
+base = vers(sys.argv[1])
+if not base:
+    sys.exit(0)  # unlocked base build: nothing pinned to compare
+bad = False
+for name, path in (("node", sys.argv[2]), ("rust", sys.argv[3])):
+    rv = vers(path) or {}
+    for lib, v in rv.items():
+        if lib in base and base[lib] != v:
+            print(f"[lib-check] MISMATCH {lib}: base={base[lib]} {name}={v}", file=sys.stderr)
+            bad = True
+sys.exit(1 if bad else 0)
+PY
+
 rm -rf "$WORK"
 mkdir -p "$WORK" "$STORE"
 
@@ -90,8 +116,21 @@ build_runtime_layer() {
     local delta="$WORK/$name-delta"
     rm -rf "$delta"; mkdir -p "$delta"
     rsync -a --compare-dest="$BASE_STAGE/" "$full/" "$delta/"
-    # Prune the empty directory skeleton rsync leaves behind (the overlay gets dirs
-    # from the base layer); the language files keep their parent dirs (non-empty).
+    # The delta is this language's ADDITIONS over base. Strip files that base owns or
+    # that are build-only metadata, so the runtime layer never SHADOWS base with a
+    # stale/regressed copy and never ships dead weight:
+    #   - system identity (passwd/group/shadow): base declares the `app` account; a
+    #     runtime image without it would otherwise shadow base and drop that user.
+    #   - ld.so.cache: base's is the authoritative superset; ld.so path-search still
+    #     finds THIS layer's own libs, so a smaller per-runtime cache only regresses.
+    #   - apk db / sbom / apko metadata: build provenance, useless at runtime.
+    #   - C/C++ dev headers: build-time only (nodejs-minimal still bundles them).
+    rm -rf "$delta"/etc/passwd "$delta"/etc/group "$delta"/etc/shadow \
+           "$delta"/etc/ld.so.cache "$delta"/etc/apko.json "$delta"/etc/apk \
+           "$delta"/lib/apk "$delta"/usr/lib/apk "$delta"/var/lib/db/sbom \
+           "$delta"/usr/include 2>/dev/null || true
+    # Prune the empty directory skeleton rsync/strip leave behind (the overlay gets
+    # dirs from the base layer); language files keep their parent dirs (non-empty).
     find "$delta" -type d -empty -delete 2>/dev/null || true
     mkdir -p "$delta" # find may have removed the now-empty root on a no-op delta
     pack_layer "$delta" "$name"
@@ -132,7 +171,9 @@ BUN_DIGEST="$PACK_DIGEST"; BUN_FILE="$PACK_FILE"; BUN_SIZE="$PACK_SIZE"; BUN_VER
 build_runtime_layer "$NODE_CONFIG" "node"
 NODE_DIGEST="$PACK_DIGEST"; NODE_FILE="$PACK_FILE"; NODE_SIZE="$PACK_SIZE"; NODE_VERITY="$PACK_VERITY"
 
-# --- rust runtime layer (libgcc_s.so.1, delta'd against base) ---
+# --- rust runtime layer (intentionally near-empty: base already ships libgcc_s.so.1,
+#     so the delta drops it; the layer exists only to satisfy the layer plan's
+#     per-language runtime lookup — a glibc-dynamic rust binary runs on base alone). ---
 build_runtime_layer "$RUST_CONFIG" "rust"
 RUST_DIGEST="$PACK_DIGEST"; RUST_FILE="$PACK_FILE"; RUST_SIZE="$PACK_SIZE"; RUST_VERITY="$PACK_VERITY"
 
