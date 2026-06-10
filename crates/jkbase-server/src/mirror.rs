@@ -318,6 +318,10 @@ pub struct MirrorTls {
     root: PathBuf,
     /// Per-URL-key in-flight fetch locks (collapse duplicate concurrent misses).
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Cache hits served from the store (cross-tenant dedup wins).
+    hits: std::sync::atomic::AtomicU64,
+    /// Upstream fetches issued (cache misses). hit-rate = hits / (hits + fetches).
+    upstream_fetches: std::sync::atomic::AtomicU64,
 }
 
 impl MirrorTls {
@@ -334,7 +338,16 @@ impl MirrorTls {
             store,
             root,
             locks: Mutex::new(HashMap::new()),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            upstream_fetches: std::sync::atomic::AtomicU64::new(0),
         }))
+    }
+
+    /// `(hits, upstream_fetches)` — the cross-tenant dedup counters. hit-rate is
+    /// `hits / (hits + upstream_fetches)`.
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.hits.load(Relaxed), self.upstream_fetches.load(Relaxed))
     }
 
     /// Handle one MITM'd CONNECT: terminate TLS with a leaf for `host`, then serve a
@@ -358,17 +371,29 @@ impl MirrorTls {
                 return;
             }
         };
-        if let Err(e) = self.serve_loop(tls, &host, &upstream).await {
+        let mut tls = tls;
+        let result = self.serve_requests(&mut tls, host.clone(), &upstream).await;
+        // Send TLS close_notify so the client sees a clean EOF, not a truncation error.
+        let _ = tls.shutdown().await;
+        if let Err(e) = result {
             tracing::debug!(%host, error = %e, "mirror connection ended");
         }
+        let (hits, fetches) = self.stats();
+        tracing::debug!(%host, hits, upstream_fetches = fetches, "mirror connection closed");
     }
 
-    async fn serve_loop<S>(&self, mut tls: S, host: &str, upstream: &reqwest::Client) -> Result<()>
+    async fn serve_requests<S>(
+        &self,
+        tls: &mut S,
+        host: String,
+        upstream: &reqwest::Client,
+    ) -> Result<()>
     where
         S: AsyncReadExt + AsyncWrite + Unpin,
     {
+        let host = host.as_str();
         loop {
-            let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut tls)).await {
+            let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut *tls)).await {
                 Ok(Ok(Some(h))) => h,
                 Ok(Ok(None)) => return Ok(()), // clean EOF
                 Ok(Err(e)) => return Err(e),
@@ -376,7 +401,7 @@ impl MirrorTls {
             };
             let Some(req) = parse_request_head(&head) else {
                 let _ = write_response(
-                    &mut tls,
+                    &mut *tls,
                     MirrorResponse::error(400, "bad request"),
                     false,
                     false,
@@ -404,7 +429,7 @@ impl MirrorTls {
             };
             if let Some(r) = resp {
                 let ka = req.keep_alive && r.status != 421;
-                write_response(&mut tls, r, head_only, ka).await?;
+                write_response(&mut *tls, r, head_only, ka).await?;
                 if !ka {
                     return Ok(());
                 }
@@ -419,7 +444,7 @@ impl MirrorTls {
                 }
             };
             let keep_alive = req.keep_alive;
-            write_response(&mut tls, response, head_only, keep_alive).await?;
+            write_response(&mut *tls, response, head_only, keep_alive).await?;
             if !keep_alive {
                 return Ok(());
             }
@@ -519,13 +544,17 @@ impl MirrorTls {
         }
         let digest_key = digest_key(&entry.digest);
         match self.blob_path_len(&digest_key).await {
-            Ok((path, len)) => Ok(Some(MirrorResponse {
-                status: 200,
-                content_type: entry.content_type,
-                content_encoding: entry.content_encoding,
-                extra: Vec::new(),
-                body: ServeBody::File { path, len },
-            })),
+            Ok((path, len)) => {
+                self.hits
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(MirrorResponse {
+                    status: 200,
+                    content_type: entry.content_type,
+                    content_encoding: entry.content_encoding,
+                    extra: Vec::new(),
+                    body: ServeBody::File { path, len },
+                }))
+            }
             Err(_) => Ok(None), // index points at an evicted blob — treat as miss
         }
     }
@@ -555,6 +584,8 @@ impl MirrorTls {
         path: &str,
     ) -> Result<Fetched> {
         let url = format!("https://{host}{path}");
+        self.upstream_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut resp = upstream.get(&url).send().await.context("upstream send")?;
         let status = resp.status().as_u16();
         let content_type = header_str(&resp, reqwest::header::CONTENT_TYPE);
@@ -861,5 +892,88 @@ mod tests {
         let mut cur = std::io::Cursor::new(data.to_vec());
         let head = read_head(&mut cur).await.unwrap().unwrap();
         assert_eq!(head, b"GET / HTTP/1.1\r\nHost: a");
+    }
+
+    // THE dedup proof. Drives a real MITM'd fetch of an immutable npm tarball twice:
+    // the first MISSes (one real upstream fetch, cert-validated vs public webpki roots),
+    // the second HITs the shared store (no upstream) and serves byte-identical content
+    // — i.e. a second tenant fetching the same dep reuses the first's download. Also
+    // proves the runtime-issued leaf chains to the persisted CA over a real handshake.
+    #[tokio::test]
+    #[ignore = "needs outbound internet to registry.npmjs.org"]
+    async fn mirror_dedups_real_registry_fetch() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("jkb-mirror-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca_dir = dir.join("build-ca");
+        let ca = crate::build_ca::BuildCa::load_or_generate(&ca_dir).unwrap();
+        let ca_pem = std::fs::read(ca_dir.join("ca.crt")).unwrap();
+        let signer = Arc::new(crate::build_ca::CertSigner::new(ca));
+        let mirror = MirrorTls::new(&dir, signer).unwrap();
+
+        let host = "registry.npmjs.org";
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 443))
+            .await
+            .unwrap()
+            .collect();
+        let addr = crate::egress::pick_safe_addr(addrs).expect("a public npm addr");
+
+        // Client trusts ONLY the mirror CA — so a successful fetch proves the leaf chains.
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut &ca_pem[..]) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        async fn fetch(
+            mirror: &Arc<MirrorTls>,
+            client_cfg: &Arc<rustls::ClientConfig>,
+            host: &str,
+            addr: SocketAddr,
+            path: &str,
+        ) -> Vec<u8> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local = listener.local_addr().unwrap();
+            let m = mirror.clone();
+            let h = host.to_string();
+            let server = tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                m.handle_mitm(sock, h, addr).await;
+            });
+            let tcp = TcpStream::connect(local).await.unwrap();
+            let connector = tokio_rustls::TlsConnector::from(client_cfg.clone());
+            let sni = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+            let mut tls = connector.connect(sni, tcp).await.unwrap();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: test\r\nConnection: close\r\n\r\n"
+            );
+            tls.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            tls.read_to_end(&mut buf).await.unwrap();
+            let _ = server.await;
+            buf
+        }
+
+        let path = "/lodash/-/lodash-4.17.21.tgz"; // immutable npm tarball
+        let (h0, f0) = mirror.stats();
+        let r1 = fetch(&mirror, &client_cfg, host, addr, path).await;
+        let (_h1, f1) = mirror.stats();
+        let r2 = fetch(&mirror, &client_cfg, host, addr, path).await;
+        let (h2, f2) = mirror.stats();
+
+        assert!(
+            r1.starts_with(b"HTTP/1.1 200 OK"),
+            "first response not 200: {:?}",
+            String::from_utf8_lossy(&r1[..r1.len().min(64)])
+        );
+        assert_eq!(r1, r2, "served bytes must be identical across tenants");
+        assert_eq!(f1, f0 + 1, "first request must MISS -> exactly one upstream fetch");
+        assert_eq!(f2, f1, "second request must HIT -> NO second upstream fetch (dedup)");
+        assert_eq!(h2, h0 + 1, "second request must be served from the shared store");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
