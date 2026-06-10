@@ -44,7 +44,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
-use crate::build_ca::{CertSigner, host_is_mirrorable};
+use crate::build_ca::CertSigner;
 
 /// Max request-head size we will buffer (request line + headers).
 const MAX_REQ_HEAD: usize = 16 * 1024;
