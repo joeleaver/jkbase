@@ -13,10 +13,14 @@
 //!
 //!  1. Tenants can't write the store — build VMs are HTTP clients of this proxy;
 //!     only host code ([`MirrorTls`]) writes blobs.
-//!  2. The platform writes only content-verified real-upstream bytes — the upstream
-//!     leg validates the REAL registry cert against public webpki roots (reqwest's
-//!     default root store, NOT our build CA) and dials only the pre-pinned public IP
-//!     handed down from the egress SSRF gate (no re-resolve — invariant I-5).
+//!  2. The platform writes only AUTHENTICATED real-upstream bytes — the upstream leg
+//!     validates the REAL registry cert against public webpki roots (reqwest's default
+//!     root store, NOT our build CA) and dials only the pre-pinned public IP handed
+//!     down from the egress SSRF gate (no re-resolve — invariant I-5). This is TOFU
+//!     from an authenticated origin, not verification against an independently-known
+//!     publisher digest (no such universal digest exists pre-lockfile); the bytes are
+//!     content-addressed by their own sha256 and the AUTHORITATIVE integrity check is
+//!     the tenant's own lockfile re-verification (safety #4 below).
 //!  3. Content-addressing forbids aliasing — a blob is stored under `sha256(bytes)`,
 //!     and `put_if_absent` never overwrites; you cannot store bytes X under name
 //!     sha256(Y). This is the P0-2 cache-key-safety fix.
