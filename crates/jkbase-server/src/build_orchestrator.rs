@@ -2939,6 +2939,69 @@ name = "api"
         println!("PASS: rust assets+entrypoint build -> app layer with assets -> entrypoint exec -> HTTP 200 ({body:?})");
     }
 
+    /// Build a Rust app with a real NATIVE dynamic dependency (`openssl` →
+    /// openssl-sys, system/dynamic → links `libssl.so.3`/`libcrypto.so.3`). The
+    /// rust runtime layer + base ship NEITHER, so the only way this serves is if the
+    /// buildpack shipped the binary's native-lib closure into the app layer's
+    /// /usr/lib — the per-app fix for native FFI deps (vs polluting the shared layer).
+    async fn rust_native_lib_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("rust-native-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write_lang_manifest(&src, "rustnative", "rust");
+        write(
+            src.join("server/Cargo.toml"),
+            "[package]\nname = \"rustnative\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntiny_http = \"0.12\"\nopenssl = \"0.10\"\n",
+        );
+        // openssl::version::version() forces libssl/libcrypto to be LINKED and CALLED
+        // at runtime — so a missing native-lib closure fails the binary on startup.
+        write(
+            src.join("server/src/main.rs"),
+            "fn main() {\n    let port: u16 = std::env::var(\"PORT\").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);\n    let v = openssl::version::version();\n    let tag = v.split(' ').next().unwrap_or(\"?\");\n    let body = format!(\"native-ok {}\\n\", tag);\n    let server = tiny_http::Server::http((\"0.0.0.0\", port)).unwrap();\n    println!(\"listening on {port}\");\n    for req in server.incoming_requests() {\n        let _ = req.respond(tiny_http::Response::from_string(body.clone()));\n    }\n}\n",
+        );
+        networked_lang_build(
+            "rustnative",
+            "onbox-rustnative.redb",
+            "rust.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                scratch_mib: 2048,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 240,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Native-FFI acceptance: a Rust app linking openssl (libssl/libcrypto) builds →
+    /// the buildpack ships its native-lib closure into the app layer's /usr/lib →
+    /// the layered runtime (whose rust runtime layer + base carry NO openssl) serves
+    /// it → HTTP 200 "native-ok OpenSSL". Proves native deps ride the app layer, NOT
+    /// the shared rust runtime layer.
+    ///
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture rust_native_lib_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "rust native-lib pipeline: needs KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
+    async fn rust_native_lib_pipeline_to_http_200() {
+        let Some(fx) = rust_native_lib_build(1).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "rustn", "172.24.0.1", "172.24.0.2", "AA:FC:00:00:24:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from a rust server linking openssl via the per-app native-lib closure");
+        assert_eq!(body, "native-ok OpenSSL", "openssl (libssl/libcrypto) must be shipped into the app layer and resolve at runtime");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: rust native-FFI (openssl) build -> app-layer /usr/lib closure -> runtime -> HTTP 200 ({body:?})");
+    }
+
     async fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
         let status = tokio::process::Command::new(cmd).args(args).status().await?;
         if !status.success() {
