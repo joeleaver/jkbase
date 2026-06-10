@@ -48,8 +48,9 @@ use crate::build_ca::CertSigner;
 
 /// Max request-head size we will buffer (request line + headers).
 const MAX_REQ_HEAD: usize = 16 * 1024;
-/// Max size of a single cached 200 artifact body.
-const MAX_ARTIFACT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Max size of a single cached 200 artifact body. Registry packages/wheels/.crates are
+/// well under this; large app assets ship via the buildpack, not the registry mirror.
+const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 /// Max body we will buffer+relay for a non-200 upstream response (error pages, etc).
 const MAX_RELAY_BODY: usize = 1024 * 1024;
 /// Freshness window for mutable registry index/metadata. Immutable artifacts never
@@ -61,6 +62,15 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// Per-request idle read timeout on a kept-alive MITM connection.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// Cap on concurrent UPSTREAM fetches across the whole mirror, so a pipelined miss
+/// flood can't open hundreds of simultaneous (up to cap-sized) downloads at once.
+const MAX_UPSTREAM_CONCURRENCY: usize = 16;
+/// Max requests served on a single keep-alive MITM connection before we close it —
+/// bounds a pipelined-request flood on one connection slot.
+const MAX_REQUESTS_PER_CONN: u32 = 1024;
+/// When the per-URL in-flight lock map exceeds this, prune idle entries (those with no
+/// in-flight holder) so distinct-URL misses can't grow it without bound.
+const LOCKS_PRUNE_THRESHOLD: usize = 8192;
 
 // ---------------------------------------------------------------------------
 // Classification
@@ -365,6 +375,8 @@ pub struct MirrorTls {
     hits: std::sync::atomic::AtomicU64,
     /// Upstream fetches issued (cache misses). hit-rate = hits / (hits + fetches).
     upstream_fetches: std::sync::atomic::AtomicU64,
+    /// Bounds concurrent upstream fetches across the whole mirror.
+    fetch_sem: tokio::sync::Semaphore,
 }
 
 impl MirrorTls {
@@ -375,6 +387,9 @@ impl MirrorTls {
         let store = LocalFsBlobStore::open(root.join("blobs"))
             .map_err(|e| anyhow::anyhow!("open mirror blob store: {e}"))?;
         std::fs::create_dir_all(root.join("index")).context("create mirror index dir")?;
+        // Reap any download temps orphaned by a prior crash — no fetch is in flight at
+        // construction, so the whole tmp/ tree is safe to clear.
+        let _ = std::fs::remove_dir_all(root.join("tmp"));
         let acceptor = TlsAcceptor::from(signer.into_server_config());
         Ok(Arc::new(Self {
             acceptor,
@@ -383,6 +398,7 @@ impl MirrorTls {
             locks: Mutex::new(HashMap::new()),
             hits: std::sync::atomic::AtomicU64::new(0),
             upstream_fetches: std::sync::atomic::AtomicU64::new(0),
+            fetch_sem: tokio::sync::Semaphore::new(MAX_UPSTREAM_CONCURRENCY),
         }))
     }
 
@@ -435,7 +451,13 @@ impl MirrorTls {
         S: AsyncReadExt + AsyncWrite + Unpin,
     {
         let host = host.as_str();
+        let mut served: u32 = 0;
         loop {
+            // Bound requests per keep-alive connection (pipelined-flood guard).
+            served += 1;
+            if served > MAX_REQUESTS_PER_CONN {
+                return Ok(());
+            }
             let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut *tls)).await {
                 Ok(Ok(Some(h))) => h,
                 Ok(Ok(None)) => return Ok(()), // clean EOF
@@ -636,6 +658,13 @@ impl MirrorTls {
         if parsed.host_str() != Some(host) || parsed.port_or_known_default() != Some(443) {
             bail!("mirror url host/port mismatch (rehoming attempt): {url}");
         }
+        // Bound total concurrent upstream fetches. Held across send+stream so a flood
+        // of distinct misses can't open more than MAX_UPSTREAM_CONCURRENCY downloads.
+        let _permit = self
+            .fetch_sem
+            .acquire()
+            .await
+            .expect("fetch semaphore never closed");
         self.upstream_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut resp = upstream.get(&url).send().await.context("upstream send")?;
@@ -748,6 +777,13 @@ impl MirrorTls {
 
     async fn lock_for(&self, url_key: &str) -> Arc<Mutex<()>> {
         let mut map = self.locks.lock().await;
+        // Bound the map: when it grows past the threshold, drop idle entries (those the
+        // map alone holds — strong_count == 1). An in-flight fetch holds an extra clone
+        // (count > 1) and is retained, so this never breaks dedup. Removing an idle
+        // entry is safe: a later request simply re-creates it.
+        if map.len() > LOCKS_PRUNE_THRESHOLD {
+            map.retain(|_, l| Arc::strong_count(l) > 1);
+        }
         map.entry(url_key.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
