@@ -14,8 +14,8 @@
 #   assets       download+verify pinned Firecracker release, bun, apko
 #   rust         cargo build host bins + the musl agent + jkbuild-init
 #   kernel       build (or adopt) the 6.12 guest kernel                          [long]
-#   toolchains   bake default.ext4, bun.ext4, dockerfile.ext4
-#   baselayers   bake the shared base+bun erofs layers + platform.json           [root]
+#   toolchains   bake default/bun/dockerfile/node/rust .ext4 build images
+#   baselayers   bake base + bun/node/rust runtime erofs layers + platform.json  [root]
 #   net          provision the build bridge + firewall (3128+3129) + cgroup      [root, per-boot]
 #   all          preflight→deps→assets→rust→kernel→toolchains→baselayers  (NOT net)
 #   doctor       assert the end-state; --deep also boots a micro-VM + checks links
@@ -367,6 +367,14 @@ cmd_toolchains() {
     bake_image dockerfile "$TOOLCHAIN_DIR/dockerfile.ext4" \
         "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-dockerfile.apko.lock.json"):init:$init_sha")" \
         env INJECT_BUN=0 CONFIG="$REPO_ROOT/images/apko/build-dockerfile.apko.yaml" OUT="$TOOLCHAIN_DIR/dockerfile.ext4" "$REPO_ROOT/tools/build-image.sh"
+    # node.ext4 (apko node image + jkbuild-init; INJECT_BUN=0; npm/pnpm/yarn).
+    bake_image node "$TOOLCHAIN_DIR/node.ext4" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-node.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-node.apko.lock.json"):init:$init_sha")" \
+        env INJECT_BUN=0 CONFIG="$REPO_ROOT/images/apko/build-node.apko.yaml" OUT="$TOOLCHAIN_DIR/node.ext4" "$REPO_ROOT/tools/build-image.sh"
+    # rust.ext4 (apko rust image + jkbuild-init; INJECT_BUN=0; cargo).
+    bake_image rust "$TOOLCHAIN_DIR/rust.ext4" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-rust.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-rust.apko.lock.json"):init:$init_sha")" \
+        env INJECT_BUN=0 CONFIG="$REPO_ROOT/images/apko/build-rust.apko.yaml" OUT="$TOOLCHAIN_DIR/rust.ext4" "$REPO_ROOT/tools/build-image.sh"
     RAN[toolchains]=OK
 }
 
@@ -385,7 +393,7 @@ baselayers_orphans_present() {
 cmd_baselayers() {
     banner "baselayers"
     local bun_sha; bun_sha="$(sha_file "$ASSET_DIR/bun")"
-    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.lock.json"):bun:$bun_sha:bunver:$BUN_VER")"
+    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.lock.json"):node:$(sha_file "$REPO_ROOT/images/apko/run-node.apko.yaml"):nodelk:$(sha_file "$REPO_ROOT/images/apko/run-node.apko.lock.json"):rust:$(sha_file "$REPO_ROOT/images/apko/run-rust.apko.yaml"):rustlk:$(sha_file "$REPO_ROOT/images/apko/run-rust.apko.lock.json"):bun:$bun_sha:bunver:$BUN_VER")"
     if [ -f "$BASELAYERS_DIR/platform.json" ] && fresh baselayers "$desired" && ! baselayers_orphans_present; then
         verdict "baselayers present + stamp matches + no orphans — SKIP"; RAN[baselayers]=SKIP; return 0
     fi
@@ -438,7 +446,10 @@ cmd_doctor() {
     chk_art "toolchain default.ext4" "test -f '$TOOLCHAIN_DIR/default.ext4'"
     chk_art "toolchain bun.ext4" "test -f '$TOOLCHAIN_DIR/bun.ext4'"
     chk_art "toolchain dockerfile.ext4" "test -f '$TOOLCHAIN_DIR/dockerfile.ext4'"
+    chk_art "toolchain node.ext4" "test -f '$TOOLCHAIN_DIR/node.ext4'"
+    chk_art "toolchain rust.ext4" "test -f '$TOOLCHAIN_DIR/rust.ext4'"
     chk_art "baselayers platform.json" "test -f '$BASELAYERS_DIR/platform.json'"
+    chk_art "baselayers node+rust runtimes" "python3 -c 'import json,sys; d=json.load(open(\"$BASELAYERS_DIR/platform.json\")); sys.exit(0 if {\"node\",\"rust\"} <= set(d.get(\"runtimes\",{})) else 1)'"
     if baselayers_orphans_present; then err "✗ baselayers has orphan blobs (run \`tools/dev baselayers\`)"; fails=$((fails+1)); else ok "baselayers no orphans"; fi
     # Net (per-boot) — report, don't hard-fail the whole doctor. The 3128 allowlist
     # ACCEPT is the always-present static rule; the public-any (3129) port is granted

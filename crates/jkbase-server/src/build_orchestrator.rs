@@ -129,13 +129,21 @@ pub fn detect_language(source_path: &Path, hint: Option<&str>) -> Option<String>
         return Some(h.to_string());
     }
     let has = |f: &str| source_path.join(f).exists();
+    // Bun first — its markers are specific (a bun project also carries package.json).
     if has("bun.lockb") || has("bun.lock") || has("bunfig.toml") {
         return Some("bun".to_string());
     }
-    if let Ok(pkg) = std::fs::read_to_string(source_path.join("package.json"))
-        && pkg.contains("bun@")
-    {
-        return Some("bun".to_string());
+    if let Ok(pkg) = std::fs::read_to_string(source_path.join("package.json")) {
+        if pkg.contains("bun@") {
+            return Some("bun".to_string());
+        }
+        // Any other package.json is a Node project (npm/pnpm/yarn). The in-VM
+        // buildpack does the authoritative detect + picks the package manager.
+        return Some("node".to_string());
+    }
+    // A Cargo.toml (and no JS manifest above) is a Rust project.
+    if has("Cargo.toml") {
+        return Some("rust".to_string());
     }
     None
 }
@@ -1250,7 +1258,15 @@ async fn build_one_target_inner(
             }
         }
         TargetKind::Server => {
-            collect_layered_server(&output_img, staged, workspace, &tag, config, spec)?;
+            collect_layered_server(
+                &output_img,
+                staged,
+                workspace,
+                &tag,
+                config,
+                spec,
+                toolchain_lang.as_deref(),
+            )?;
         }
     }
 
@@ -1269,6 +1285,9 @@ fn collect_layered_server(
     tag: &str,
     config: &ProjectConfig,
     spec: &TargetSpec,
+    // The language the host resolved for this target (explicit jkbase.toml hint or
+    // the cheap source sniff) — keys the shared runtime layer the app stacks on.
+    resolved_language: Option<&str>,
 ) -> Result<()> {
     // Read the layered index the in-VM exporter wrote.
     let index_tmp = workspace.join(format!("{tag}.index.json"));
@@ -1332,11 +1351,21 @@ fn collect_layered_server(
         obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
         // A dockerfile build is a single self-contained image layer — mark it so the
         // host layer plan runs it standalone (no base/runtime stack) and the agent
-        // honours the image's own env. Otherwise it's a language runtime layer.
+        // honours the image's own env. Otherwise it's a language runtime layer keyed
+        // by the RESOLVED language (not the raw jkbase.toml hint, which is usually
+        // absent for an auto-detected node/rust app — that would mis-stamp it "bun"
+        // and the layer plan would attach the bun runtime under a node/rust binary).
         let runtime = if spec.builder == Builder::Dockerfile {
             crate::layer_plan::IMAGE_SELF_RUNTIME.to_string()
         } else {
-            spec.language.clone().unwrap_or_else(|| "bun".to_string())
+            // Filter empties so a `language = ""` in jkbase.toml can't stamp an empty
+            // runtime (which would fail compute_layer_plan with "no platform runtime
+            // layer for language ''").
+            resolved_language
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .or_else(|| spec.language.clone().filter(|l| !l.is_empty()))
+                .unwrap_or_else(|| "bun".to_string())
         };
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
     }
@@ -1855,6 +1884,15 @@ mod tests {
         // package.json declaring bun as the package manager also counts.
         std::fs::write(dir.join("package.json"), r#"{"packageManager":"bun@1.1.34"}"#).unwrap();
         assert_eq!(detect_language(&dir, None).as_deref(), Some("bun"));
+
+        // A non-bun package.json sniffs as Node (npm/pnpm/yarn).
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("node"));
+        std::fs::remove_file(dir.join("package.json")).unwrap();
+
+        // A Cargo.toml (no JS manifest) sniffs as Rust.
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("rust"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2497,6 +2535,262 @@ name = "api"
             .expect("bun server build should succeed");
 
         Some(BuildFixture { data, fc_release, kernel, store, staged })
+    }
+
+    /// Per-language build VM tuning (cargo wants more than `npm install`).
+    struct BuildTuning {
+        vcpu: u32,
+        guest_mem_mib: u32,
+        cgroup_mem_mib: u64,
+        cgroup_cpu_max: &'static str,
+        scratch_mib: u64,
+        output_mib: u64,
+        timeout_secs: u64,
+        fetch_deadline_secs: u64,
+    }
+
+    /// Generic NETWORKED pipeline build for the language buildpacks: tar `src`, run
+    /// it through the real `run_project_build` with the isolated build bridge + egress
+    /// proxy (so the buildpack must fetch deps through the proxy, fetch-then-seal),
+    /// and return the staged deployment. The source's `jkbase.toml` `language=` picks
+    /// `toolchain` via select_toolchain. Mirrors `bun_pipeline_build`'s networked arm.
+    async fn networked_lang_build(
+        project_id: &str,
+        redb: &str,
+        toolchain: &str,
+        src: &Path,
+        t: BuildTuning,
+        build_id: u64,
+    ) -> Option<BuildFixture> {
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return None;
+        };
+        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_FC_RELEASE");
+            return None;
+        };
+        let toolchain_dir = data.join("toolchains");
+        if !toolchain_dir.join(toolchain).exists() {
+            eprintln!("skip: {}/{toolchain} not baked", toolchain_dir.display());
+            return None;
+        }
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+        };
+
+        let mut tarbuf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarbuf, flate2::Compression::fast());
+            let mut tb = tar::Builder::new(enc);
+            tb.append_dir_all(".", src).unwrap();
+            tb.into_inner().unwrap().finish().unwrap();
+        }
+
+        let store = Store::open(&data.join(redb)).unwrap();
+        store
+            .save_build(&BuildRecord {
+                project_id: project_id.into(),
+                build_id,
+                phase: BuildPhase::Building,
+                targets: vec![],
+                log_tail: String::new(),
+                phase_timings_ms: Default::default(),
+                deployed_version: None,
+                error: None,
+                source_commit: None,
+                created_at: now(),
+                updated_at: now(),
+            })
+            .unwrap();
+
+        let net = match tokio::net::TcpListener::bind("172.31.0.1:3128").await {
+            Ok(listener) => {
+                tokio::spawn(crate::egress::serve(
+                    listener,
+                    Arc::new(crate::egress::EgressConfig::with_default_allowlist()),
+                ));
+                Some(Arc::new(BuildNet::new(
+                    "jkbuild0".into(),
+                    "172.31.0.1".into(),
+                    3128,
+                    None,
+                    100_000,
+                    8,
+                )))
+            }
+            Err(e) => {
+                eprintln!("skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`");
+                return None;
+            }
+        };
+
+        let deps = Arc::new(BuildDeps {
+            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            data_dir: data.clone(),
+            deploy_dir: data.join("hosting"),
+            toolchain_dir,
+            store: store.clone(),
+            chroot_base: data.join(format!("bj-{project_id}")),
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+            parent_cgroup: "jkbase-build".into(),
+            uid: 100_000,
+            gid: 100_000,
+            timeout: Duration::from_secs(t.timeout_secs),
+            vcpu_count: t.vcpu,
+            mem_size_mib: t.guest_mem_mib,
+            cgroup_pids_max: 1024,
+            cgroup_mem_max_bytes: t.cgroup_mem_mib * 1024 * 1024,
+            cgroup_cpu_max: t.cgroup_cpu_max.into(),
+            scratch_size_bytes: t.scratch_mib * 1024 * 1024,
+            output_size_bytes: t.output_mib * 1024 * 1024,
+            console_log_max_bytes: 1024 * 1024,
+            max_concurrent: 1,
+            net,
+            fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
+        });
+        std::fs::create_dir_all(&deps.chroot_base).unwrap();
+
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+            .await
+            .expect("language server build should succeed");
+
+        Some(BuildFixture { data, fc_release, kernel, store, staged })
+    }
+
+    /// Write the shared single-`api`-server jkbase.toml the boot helper expects
+    /// (it asserts a layered `api` server + routes `/`). `language` selects the
+    /// toolchain + the stamped runtime layer.
+    fn write_lang_manifest(src: &Path, name: &str, language: &str) {
+        write(
+            src.join("jkbase.toml"),
+            &format!(
+                "[project]\nname = \"{name}\"\n\n[servers.api]\nsource = \"./server\"\nlanguage = \"{language}\"\nport = 3000\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
+            ),
+        );
+    }
+
+    /// Build a tiny Express (Node) app through the pipeline: `npm install express`
+    /// MUST fetch through the proxy, then the node runtime layer serves it.
+    async fn node_express_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("node-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write_lang_manifest(&src, "nodefix", "node");
+        write(
+            src.join("server/package.json"),
+            "{\n  \"name\": \"nodefix\",\n  \"private\": true,\n  \"dependencies\": { \"express\": \"^4.21.0\" },\n  \"scripts\": { \"start\": \"node server.js\" }\n}\n",
+        );
+        write(
+            src.join("server/server.js"),
+            "const express = require(\"express\");\nconst app = express();\nconst port = Number(process.env.PORT) || 3000;\napp.get(\"/\", (_req, res) => res.send(\"ok\\n\"));\napp.listen(port, () => console.log(\"listening on \" + port));\n",
+        );
+        networked_lang_build(
+            "nodefix",
+            "onbox-node.redb",
+            "node.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 2,
+                guest_mem_mib: 1024,
+                cgroup_mem_mib: 1536,
+                cgroup_cpu_max: "200000 100000",
+                scratch_mib: 512,
+                output_mib: 64,
+                timeout_secs: 180,
+                fetch_deadline_secs: 180,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Build a tiny tiny_http (Rust) app through the pipeline: `cargo fetch` MUST
+    /// pull tiny_http + deps through the proxy, the offline release build links
+    /// glibc(base)+libgcc_s(rust runtime), and the layered runtime serves it.
+    async fn rust_tiny_http_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("rust-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write_lang_manifest(&src, "rustfix", "rust");
+        write(
+            src.join("server/Cargo.toml"),
+            "[package]\nname = \"rustfix\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntiny_http = \"0.12\"\n",
+        );
+        write(
+            src.join("server/src/main.rs"),
+            "fn main() {\n    let port: u16 = std::env::var(\"PORT\").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);\n    let server = tiny_http::Server::http((\"0.0.0.0\", port)).unwrap();\n    println!(\"listening on {port}\");\n    for req in server.incoming_requests() {\n        let _ = req.respond(tiny_http::Response::from_string(\"ok\\n\"));\n    }\n}\n",
+        );
+        networked_lang_build(
+            "rustfix",
+            "onbox-rust.redb",
+            "rust.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                // cargo release build of tiny_http + deps writes a big target/ dir.
+                scratch_mib: 2048,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 240,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Node acceptance: build → layered collection → metadata image → real agent
+    /// runtime (node runtime layer over base) → HTTP 200. Same env as the bun
+    /// pipeline test PLUS the `node.ext4` toolchain + the `node` runtime layer in
+    /// the baselayers store, and the provisioned build bridge (express is fetched).
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once: jkbuild0 + firewall
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture node_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "node pipeline: needs KVM + root + node.ext4 + node runtime layer + agent + build bridge"]
+    async fn node_pipeline_to_http_200() {
+        let Some(fx) = node_express_build(1).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "nodep", "172.27.0.1", "172.27.0.2", "AA:FC:00:00:27:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the layered express/node server");
+        assert_eq!(body, "ok");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: node(express) build -> layered collection -> node runtime layer -> HTTP 200 ({body:?})");
+    }
+
+    /// Rust acceptance: build → layered collection → metadata image → real agent
+    /// runtime (rust runtime layer = libgcc_s, over base = glibc) → HTTP 200. Proves
+    /// `cargo fetch` through the proxy, the glibc-dynamic binary, and that
+    /// app:rust-runtime:base composes + serves.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture rust_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "rust pipeline: needs KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
+    async fn rust_pipeline_to_http_200() {
+        let Some(fx) = rust_tiny_http_build(1).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "rustp", "172.26.0.1", "172.26.0.2", "AA:FC:00:00:26:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the layered tiny_http/rust server");
+        assert_eq!(body, "ok");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: rust(tiny_http) build -> layered collection -> rust runtime layer -> HTTP 200 ({body:?})");
     }
 
     async fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {

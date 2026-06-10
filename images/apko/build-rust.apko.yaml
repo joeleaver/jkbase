@@ -1,0 +1,49 @@
+# Build-VM toolchain image for Rust server builds (`cargo`).
+#
+# apko assembles a reproducible Wolfi (glibc) rootfs. tools/build-image.sh then
+# injects the jkbuild lifecycle (as /sbin/init) + the runner mountpoints and
+# `mkfs.ext4 -d`'s the tree into `rust.ext4` (userspace, no mount; threat-model
+# P0-3). select_toolchain picks `rust.ext4` for a server target detected/declared
+# as `language = "rust"` (a Cargo.toml sniffs as rust host-side).
+#
+# Build-time ONLY: the rust compiler + C toolchain + dev headers live here. The
+# deployed binary runs on the shared `run-base` (glibc) + the tiny `run-rust`
+# RUNTIME layer (libgcc_s) — the compiler never ships to runtime.
+#
+# Linking: the default target is glibc-dynamic; the binary links the toolchain's
+# glibc (same Wolfi glibc as the runtime base, so ABI-compatible) + libgcc_s. C-FFI
+# crates (openssl-sys, ring, …) build against the system libs here.
+#
+# Pin: commit the apko.lock.json apko emits (`--lockfile`) so rebuilds are
+# bitwise-reproducible (the Wolfi repo is rolling).
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - glibc
+    - ld-linux
+    - ca-certificates-bundle
+    - busybox # sh + mount/umount/cp/nc/reboot for the lifecycle's shell-outs
+    - erofs-utils # mkfs.erofs for the layered exporter
+    # The Rust toolchain (rustc + cargo + std). Wolfi versions rust as `rust-N.M`;
+    # pin the major.minor and bump deliberately. cargo is bundled in this package.
+    - rust-1.95
+    # C toolchain + linker: cargo links the final binary with `cc`, and crates with
+    # build scripts (cc/bindgen/native-sys) need a working C compiler.
+    - build-base
+    - pkgconf
+    # openssl headers — the single most common native dependency (openssl-sys). An
+    # app on rustls needs neither, but shipping them costs nothing at build time.
+    - openssl
+    - openssl-dev
+    # git deps (`git = "..."` in Cargo.toml) fetched via the git CLI through the proxy.
+    - git
+
+archs:
+  - x86_64
+
+# NOTE: /sbin/init (the static musl jkbuild-init) is injected by
+# tools/build-image.sh after apko (INJECT_BUN=0 — Rust carries no bun binary).

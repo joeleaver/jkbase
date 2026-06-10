@@ -254,7 +254,15 @@ fn mount_early() {
     mount_log("/dev/vdb", "/scratch", "ext4", 0);
     mount_log("/dev/vdc", SRC, "ext4", libc::MS_RDONLY);
     mount_log("/dev/vdd", OUT, "ext4", 0);
-    mount_log("/dev/vde", CACHE, "ext4", 0);
+    // The cache drive (vde) is optional. When the orchestrator attaches none, the
+    // ext4 mount fails and /cache would sit on the read-only toolchain root — but
+    // buildpacks need a WRITABLE cache (npm/cargo/pnpm error hard on an unwritable
+    // cache dir; bun silently falls back). Fall back to a tmpfs so /cache is always
+    // writable (ephemeral, per-build; a persistent vde cache drive is the wired
+    // follow-up). When vde IS attached the ext4 mount wins and the cache persists.
+    if mount("/dev/vde", CACHE, "ext4", 0).is_err() {
+        mount_log("tmpfs", CACHE, "tmpfs", 0);
+    }
 }
 
 fn mount_log(src: &str, target: &str, fstype: &str, flags: libc::c_ulong) {
