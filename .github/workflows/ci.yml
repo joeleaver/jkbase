@@ -47,6 +47,21 @@ jobs:
           fi
           echo "OK: no build-mirror CA reference in runtime image configs/builder"
 
+      # Upstream-leg trust isolation (invariant I-2): the mirror's reqwest client must
+      # validate REAL registry certs against PUBLIC webpki roots only. rustls-native-certs
+      # is already compiled in transitively (hyper-rustls), so a feature-unification that
+      # turned on reqwest's native-roots/native-tls would silently let the upstream leg
+      # trust the host OS store — which on a mirror host has the build CA appended. Fail
+      # if reqwest ever resolves with native roots.
+      - name: Mirror upstream leg uses webpki roots only (I-2)
+        run: |
+          if cargo tree -e features -p jkbase-server -i reqwest 2>/dev/null \
+               | grep -qE 'rustls-tls-native-roots|native-tls'; then
+            echo "::error::reqwest enabled native-roots/native-tls — I-2 (webpki-only upstream) at risk"
+            exit 1
+          fi
+          echo "OK: reqwest upstream TLS resolves against webpki roots only"
+
       # Runs the substrate neutrality grep gate + the trybuild role-trait
       # compile-fail check too. KVM/root/network-gated tests are #[ignore]d, so
       # they are skipped on the runner.

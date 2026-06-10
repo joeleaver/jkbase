@@ -196,11 +196,17 @@ impl EgressConfig {
         }
     }
 
-    /// Attach the package mirror (narrow proxy only). No-op intent in allow_any mode:
-    /// the MITM branch additionally requires `!allow_any`, so even if mis-set here the
-    /// dockerfile proxy can never terminate TLS.
+    /// Attach the package mirror (narrow proxy only). REFUSES to attach in allow_any
+    /// mode (I-4): the dockerfile public-any proxy must never be able to TLS-terminate,
+    /// so we drop the mirror here rather than rely solely on the `should_mirror` runtime
+    /// gate — a defense-in-depth invariant that survives future refactors.
     pub fn with_mirror(mut self, mirror: Option<Arc<MirrorTls>>) -> Self {
-        self.mirror = mirror;
+        if self.allow_any && mirror.is_some() {
+            tracing::error!("refusing to attach a mirror to an allow_any egress config (I-4)");
+            self.mirror = None;
+        } else {
+            self.mirror = mirror;
+        }
         self
     }
 }
@@ -237,6 +243,11 @@ fn should_mirror(cfg: &EgressConfig, host: &str, port: u16) -> bool {
 /// Serve the egress proxy on `listener` until the task is dropped. Each accepted
 /// connection is handled independently.
 pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
+    // I-4 invariant: a TLS-terminating mirror is never armed on an allow_any proxy.
+    debug_assert!(
+        !(cfg.allow_any && cfg.mirror.is_some()),
+        "I-4 violated: mirror attached to an allow_any egress config"
+    );
     info!(allowlist = cfg.allowlist.len(), allow_any = cfg.allow_any, "egress proxy listening");
     let sem = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
@@ -455,8 +466,10 @@ mod tests {
         // No mirror attached -> blind tunnel.
         let plain = EgressConfig::with_default_allowlist();
         assert!(!should_mirror(&plain, "registry.npmjs.org", 443));
-        // I-4: an allow_any (dockerfile) proxy NEVER MITMs, even if a mirror is set.
+        // I-4: an allow_any (dockerfile) proxy NEVER MITMs. with_mirror DROPS the mirror
+        // on an allow_any config (type-gate, not just the runtime should_mirror check).
         let any = EgressConfig::allow_any_public().with_mirror(Some(test_mirror("a")));
+        assert!(any.mirror.is_none(), "with_mirror must refuse on allow_any (I-4)");
         assert!(!should_mirror(&any, "registry.npmjs.org", 443));
     }
 

@@ -204,15 +204,28 @@ async fn main() -> Result<()> {
     // inject the public cert before the server proper ever runs. Detected before
     // Args::parse() so it does not require the full run-time args (--fc-dir, etc.).
     if std::env::args().nth(1).as_deref() == Some("gen-build-ca") {
-        let dir = std::env::args()
-            .nth(2)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/var/jkbase").join("build-ca"));
-        build_ca::BuildCa::load_or_generate(&dir)?;
+        // Resolve the CA dir consistently with the server's {data_dir}/build-ca so a
+        // mismatched default can't silently bake one CA while the server mints another:
+        //   1) an explicit positional dir, else
+        //   2) {--data-dir}/build-ca if --data-dir is on the command line, else
+        //   3) /var/jkbase/build-ca (the server's default data dir).
+        let argv: Vec<String> = std::env::args().collect();
+        let explicit = argv.get(2).filter(|a| !a.starts_with("--")).map(PathBuf::from);
+        let dir = explicit.unwrap_or_else(|| {
+            let data_dir = argv
+                .windows(2)
+                .find(|w| w[0] == "--data-dir")
+                .map(|w| PathBuf::from(&w[1]))
+                .unwrap_or_else(|| PathBuf::from("/var/jkbase"));
+            data_dir.join("build-ca")
+        });
+        let ca = build_ca::BuildCa::load_or_generate(&dir)?;
         println!(
-            "build-mirror CA ready: key={} cert={}",
+            "build-mirror CA ready ({}): key={} cert={} fingerprint={}",
+            if ca.generated { "generated" } else { "loaded existing" },
             dir.join("ca.key").display(),
-            dir.join("ca.crt").display()
+            dir.join("ca.crt").display(),
+            ca.fingerprint(),
         );
         return Ok(());
     }
@@ -531,15 +544,36 @@ async fn main() -> Result<()> {
         // rather than breaking builds.
         let mirror = if args.build_mirror {
             let ca_dir = data_dir.join("build-ca");
-            match build_ca::BuildCa::load_or_generate(&ca_dir)
-                .and_then(|ca| mirror::MirrorTls::new(&data_dir, Arc::new(build_ca::CertSigner::new(ca))))
-            {
-                Ok(m) => {
-                    info!(ca_dir = %ca_dir.display(), "build package mirror enabled (narrow proxy)");
-                    Some(m)
+            match build_ca::BuildCa::load_or_generate(&ca_dir) {
+                Ok(ca) => {
+                    let fp = ca.fingerprint();
+                    // A freshly generated CA means the operator skipped the
+                    // gen-build-ca + rebake step: the build toolchains do NOT trust this
+                    // CA, so every MITM'd registry handshake will fail. Warn loudly (we
+                    // still proceed dormant-safe: builds fall back to the real registry
+                    // cert path only if NOT mirrored — but mirrored hosts will break).
+                    if ca.generated {
+                        tracing::warn!(
+                            ca_dir = %ca_dir.display(), fingerprint = %fp,
+                            "build mirror enabled but a NEW CA was generated — toolchains must be \
+                             rebaked to trust it (run `jkbase-server gen-build-ca` then rebake), \
+                             else registry TLS will fail"
+                        );
+                    }
+                    match mirror::MirrorTls::new(&data_dir, Arc::new(build_ca::CertSigner::new(ca))) {
+                        Ok(m) => {
+                            info!(ca_dir = %ca_dir.display(), fingerprint = %fp,
+                                "build package mirror enabled (narrow proxy)");
+                            Some(m)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to init build mirror; serving blind tunnels");
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to init build mirror; serving blind tunnels");
+                    tracing::error!(error = %e, "failed to load build CA; serving blind tunnels");
                     None
                 }
             }

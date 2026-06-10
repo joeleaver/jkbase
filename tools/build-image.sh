@@ -109,7 +109,10 @@ if [ -n "${BUILD_CA_CERT:-}" ]; then
         printf '\n' >> "$bundle"
         cat "$BUILD_CA_CERT" >> "$bundle"
     else
-        echo "[build-image] WARN: $bundle absent; system-store tools won't trust the mirror CA" >&2
+        # Refuse to ship a CA-required toolchain whose system store can't trust the
+        # mirror — otherwise cargo/git/bun silently fail every registry TLS at runtime.
+        echo "[build-image] ERROR: $bundle absent; cannot bake mirror CA into the system store" >&2
+        exit 1
     fi
 fi
 

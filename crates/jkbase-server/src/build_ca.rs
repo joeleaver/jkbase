@@ -104,7 +104,9 @@ fn leaf_params(sni: &str) -> Result<CertificateParams> {
     ];
     p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let now = OffsetDateTime::now_utc();
-    p.not_before = now - Duration::hours(1);
+    // Anchor a full day in the past (matches the CA) so guest clock skew — a documented
+    // hazard on these VMs — doesn't reject every freshly-minted leaf.
+    p.not_before = now - Duration::days(1);
     p.not_after = now + Duration::days(LEAF_VALID_DAYS);
     Ok(p)
 }
@@ -114,6 +116,9 @@ fn leaf_params(sni: &str) -> Result<CertificateParams> {
 pub struct BuildCa {
     ca_key: KeyPair,
     issuer: Certificate,
+    /// True iff this call generated a brand-new CA (no `ca.key` was present). Lets the
+    /// caller warn that toolchains must be (re)baked to trust it.
+    pub generated: bool,
 }
 
 impl BuildCa {
@@ -123,9 +128,15 @@ impl BuildCa {
     pub fn load_or_generate(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("create build-ca dir {}", dir.display()))?;
+        // The dir holds a host-only secret — tighten it to owner-only.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
         let key_path = dir.join("ca.key");
         let crt_path = dir.join("ca.crt");
 
+        let mut generated = false;
         let ca_key = if key_path.exists() {
             let pem = std::fs::read_to_string(&key_path)
                 .with_context(|| format!("read {}", key_path.display()))?;
@@ -134,6 +145,7 @@ impl BuildCa {
             let kp = KeyPair::generate().context("generate CA key")?;
             write_secret(&key_path, kp.serialize_pem().as_bytes())
                 .with_context(|| format!("write {}", key_path.display()))?;
+            generated = true;
             kp
         };
 
@@ -149,7 +161,22 @@ impl BuildCa {
                 .with_context(|| format!("write {}", crt_path.display()))?;
         }
 
-        Ok(Self { ca_key, issuer })
+        Ok(Self {
+            ca_key,
+            issuer,
+            generated,
+        })
+    }
+
+    /// A short fingerprint of the CA (sha256 of the issuer cert DER, first 16 hex) for
+    /// operator-facing logs — so the baked toolchain CA and the running CA can be
+    /// eyeballed for a match.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.issuer.der());
+        let out = h.finalize();
+        out.iter().take(8).map(|b| format!("{b:02x}")).collect()
     }
 
     /// Sign a fresh leaf for `sni` and wrap it as a rustls [`CertifiedKey`].
@@ -233,19 +260,19 @@ impl ResolvesServerCert for CertSigner {
     }
 }
 
-/// Write a host-only secret with 0600 perms (owner read/write only).
+/// Write a host-only secret with 0600 perms, creating it fresh. `create_new` (O_EXCL)
+/// refuses to follow or clobber a pre-existing file/symlink at `path` — so a local
+/// attacker can't pre-plant a symlink to redirect the CA key write. Only ever called
+/// when the key is absent.
 fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
-    // Belt-and-suspenders: tighten perms even if the file pre-existed.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
