@@ -61,6 +61,53 @@ pub fn build_ro_ext4_from_dir(src_dir: &Path, out_path: &Path, headroom_mib: u64
     Ok(())
 }
 
+/// Create a persistent, build-uid-owned, RW ext4 cache image at `out_path` **if
+/// absent** (no-op when it already exists — that is what preserves the warm cache
+/// across builds). Unlike the scratch/output drives (which [`crate::jailer`]
+/// `fallocate`s non-sparse to bound host-ENOSPC from thin growth), the cache is
+/// long-lived and starts ~empty, so it is **sparse** (`truncate`, not `fallocate`):
+/// a fresh `node`/`cargo` cache costs real blocks, not a flat multi-GiB. Host-ENOSPC
+/// from cache growth is instead bounded by the build's `RLIMIT_FSIZE` + the project
+/// storage quota. No mount, no root (userspace `mke2fs`); owned by the build uid so
+/// the dropped guest mounts it read-write. No journal → clean RW mount.
+///
+/// NB callers MUST serialize creation/use per cache image (the orchestrator's
+/// per-`(project,language)` lock): `build_vm` *moves* this image into the jail and
+/// back, so two concurrent users of one path would race.
+pub fn build_empty_ext4(out_path: &Path, size_bytes: u64, uid: u32, gid: u32) -> Result<()> {
+    if out_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create cache image dir {}", parent.display()))?;
+    }
+    let status = std::process::Command::new("truncate")
+        .arg("-s")
+        .arg(size_bytes.to_string())
+        .arg(out_path)
+        .status()
+        .with_context(|| format!("run truncate for {}", out_path.display()))?;
+    if !status.success() {
+        bail!("truncate failed for {} ({status})", out_path.display());
+    }
+    let status = std::process::Command::new("mkfs.ext4")
+        .args(["-F", "-q", "-O", "^has_journal"])
+        .arg(out_path)
+        .status()
+        .with_context(|| {
+            format!("run mkfs.ext4 for {} (is e2fsprogs installed?)", out_path.display())
+        })?;
+    if !status.success() {
+        // Don't leave a half-formatted image that a later build would reuse.
+        let _ = std::fs::remove_file(out_path);
+        bail!("mkfs.ext4 failed for {} ({status})", out_path.display());
+    }
+    std::os::unix::fs::chown(out_path, Some(uid), Some(gid))
+        .with_context(|| format!("chown cache image {} to {uid}:{gid}", out_path.display()))?;
+    Ok(())
+}
+
 /// Apparent size of a directory tree in KiB, via `du -sk`.
 fn dir_size_kib(dir: &Path) -> Result<u64> {
     let out = std::process::Command::new("du")

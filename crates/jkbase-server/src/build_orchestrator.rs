@@ -92,6 +92,27 @@ pub struct BuildDeps {
     pub net: Option<Arc<BuildNet>>,
     /// Max time the FETCH phase may hold the network before the host force-seals.
     pub fetch_deadline: Duration,
+    /// Per-`(project,language)` locks serializing the shared warm-cache image:
+    /// `build_vm` MOVES the single image into the jail + back, so two concurrent
+    /// same-key targets would race the path. Entries created lazily; bounded by
+    /// project×language cardinality (never evicted). The `LogShipper::project_lock`
+    /// pattern.
+    pub cache_locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Sparse logical size of a per-`(project,language)` build cache image (`vde`);
+    /// grows on demand, billed by ACTUAL blocks against the project storage quota.
+    pub cache_size_bytes: u64,
+}
+
+/// Get-or-create the per-`(project,language)` cache lock (the `LogShipper::project_lock`
+/// pattern). Held across a target's `BuildVm::run` so the cache image is never
+/// moved into two jails at once.
+async fn cache_lock(deps: &BuildDeps, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    deps.cache_locks
+        .lock()
+        .await
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 impl BuildDeps {
@@ -1131,6 +1152,46 @@ async fn build_one_target_inner(
             _ => (None, None, None, None, None, None),
         };
 
+    // Per-`(project,language)` persistent warm cache (the `vde` drive): cargo
+    // registry/git, npm/pnpm/yarn stores, etc. survive across builds for fast
+    // rebuilds. Skipped for dockerfile builds (the image carries its own cache) and
+    // when no language resolves pre-boot (can't pick the per-language image — the
+    // guest's tmpfs `/cache` fallback covers that case). The image is moved into the
+    // jail + back by `build_vm`, so we hold the per-key lock across the whole target
+    // build to serialize same-`(project,language)` targets (rare: usually one server
+    // per language); cross-key and cross-project builds still run in parallel.
+    let cache_target = (!is_dockerfile)
+        .then_some(toolchain_lang.as_deref())
+        .flatten()
+        .map(sanitize)
+        .filter(|l| !l.is_empty());
+    let mut _cache_guard = None;
+    let cache_drive = if let Some(lang) = &cache_target {
+        let lock = cache_lock(deps, &format!("{project_id}/{lang}")).await;
+        _cache_guard = Some(lock.lock_owned().await);
+        let path = deps
+            .data_dir
+            .join("buildcache")
+            .join(project_id)
+            .join(format!("{lang}.img"));
+        // create-once under the lock (no concurrent creation).
+        match jkbase_orch::build_image::build_empty_ext4(
+            &path,
+            deps.cache_size_bytes,
+            deps.uid,
+            deps.gid,
+        ) {
+            Ok(()) => Some(path),
+            Err(e) => {
+                warn!(project = %project_id, lang = %lang, error = %e,
+                      "could not provision build cache image; building without a warm cache");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let cfg = BuildVmConfig {
         jailer_bin: deps.jailer_bin.clone(),
         firecracker_bin: deps.firecracker_bin.clone(),
@@ -1140,7 +1201,7 @@ async fn build_one_target_inner(
         scratch_size_bytes,
         output_drive: output_img.clone(),
         output_size_bytes,
-        cache_drive: None,
+        cache_drive: cache_drive.clone(),
         vcpu_count: deps.vcpu_count,
         mem_size_mib: deps.mem_size_mib,
         vsock_cid: None,
@@ -1157,8 +1218,13 @@ async fn build_one_target_inner(
         // LARGEST RW backing file it writes — the scratch drive, not just output
         // (a 64 MiB cap with a 256 MiB scratch SIGXFSZ-kills any real build that
         // writes past 64 MiB of scratch). The artifact size is already bounded by
-        // the fixed output-drive size. NB: include the cache image when wired.
-        fsize_limit_bytes: Some(scratch_size_bytes.max(output_size_bytes)),
+        // the fixed output-drive size; the cache image's logical size must be
+        // covered too when one is attached.
+        fsize_limit_bytes: Some(
+            scratch_size_bytes
+                .max(output_size_bytes)
+                .max(if cache_drive.is_some() { deps.cache_size_bytes } else { 0 }),
+        ),
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
@@ -2054,6 +2120,8 @@ public = "./public"
             max_concurrent: 2,
             net: None,
             fetch_deadline: Duration::from_secs(60),
+            cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            cache_size_bytes: 512 * 1024 * 1024,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2527,6 +2595,8 @@ name = "api"
             // Real `bun install` over the network needs more headroom than the
             // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
             fetch_deadline: Duration::from_secs(if workload.networked() { 180 } else { 120 }),
+            cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            cache_size_bytes: 1024 * 1024 * 1024,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2651,6 +2721,8 @@ name = "api"
             max_concurrent: 1,
             net,
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
+            cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            cache_size_bytes: 1024 * 1024 * 1024,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -3250,6 +3322,8 @@ name = "api"
             max_concurrent: 1,
             net,
             fetch_deadline: Duration::from_secs(300),
+            cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            cache_size_bytes: 512 * 1024 * 1024,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
