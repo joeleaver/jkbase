@@ -184,11 +184,7 @@ fn parse_request_head(head: &[u8]) -> Option<ParsedReq> {
                     keep_alive = true;
                 }
             }
-            "content-length" => {
-                if value.parse::<u64>().unwrap_or(0) > 0 {
-                    has_body = true;
-                }
-            }
+            "content-length" if value.parse::<u64>().unwrap_or(0) > 0 => has_body = true,
             "transfer-encoding" => has_body = true,
             _ => {}
         }

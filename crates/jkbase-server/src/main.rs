@@ -106,6 +106,17 @@ struct Args {
     #[arg(long)]
     build_proxy_any_port: Option<u16>,
 
+    /// Enable the cross-tenant package MIRROR on the narrow build proxy: CONNECTs to
+    /// package registries (crates.io/npm/PyPI) are TLS-terminated and served from a
+    /// shared content-addressed cache ({data_dir}/buildmirror), so an upstream package
+    /// is fetched once and reused by every tenant. OPT-IN and DORMANT by default — a
+    /// box's egress posture is unchanged until enabled. Requires the shared build CA at
+    /// {data_dir}/build-ca/ca.key AND build toolchains baked to trust it (run
+    /// `jkbase-server gen-build-ca` then rebake the toolchains). Only meaningful with
+    /// --build-net (the mirror rides the narrow proxy).
+    #[arg(long)]
+    build_mirror: bool,
+
     /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
     /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
     /// platform defaults and target any project. Unset (default) = no admin path:
@@ -514,7 +525,28 @@ async fn main() -> Result<()> {
         args.egress_addr.clone()
     };
     if let Some(egress_addr) = egress_addr {
-        let cfg = Arc::new(egress::EgressConfig::with_default_allowlist());
+        // Optionally attach the cross-tenant package mirror to the NARROW proxy only.
+        // Dormant unless --build-mirror; the public-any proxy below always stays
+        // mirror-less (I-4). On any init failure we log and fall back to blind tunnels
+        // rather than breaking builds.
+        let mirror = if args.build_mirror {
+            let ca_dir = data_dir.join("build-ca");
+            match build_ca::BuildCa::load_or_generate(&ca_dir)
+                .and_then(|ca| mirror::MirrorTls::new(&data_dir, Arc::new(build_ca::CertSigner::new(ca))))
+            {
+                Ok(m) => {
+                    info!(ca_dir = %ca_dir.display(), "build package mirror enabled (narrow proxy)");
+                    Some(m)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to init build mirror; serving blind tunnels");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cfg = Arc::new(egress::EgressConfig::with_default_allowlist().with_mirror(mirror));
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(&egress_addr).await {
                 Ok(listener) => {
