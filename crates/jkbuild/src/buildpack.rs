@@ -18,6 +18,23 @@ use anyhow::Result;
 use jkbuild_types::LayerRole;
 use std::path::{Path, PathBuf};
 
+/// Where the cross-tenant build-mirror CA cert is baked into a build toolchain (when
+/// the mirror is active; see jkbase-server's `build_ca`). cargo/git/bun-on-Linux read
+/// the OpenSSL system store (`ca-certificates.crt`, which the bake also appends the CA
+/// to), but Node-family tools ignore it — so node/bun additionally point
+/// `NODE_EXTRA_CA_CERTS` here. Absent when the mirror is dormant: then this is a no-op
+/// and TLS trust falls back to the baked public-CA bundle.
+pub const BUILD_MIRROR_CA_PATH: &str = "/etc/ssl/certs/jkbase-build-ca.crt";
+
+/// Trust the baked build-mirror CA for Node-family package managers, if present. Call
+/// only in a networked fetch phase (the CA is irrelevant offline). No-op when the file
+/// is absent, so dormant-mirror and offline builds are unaffected.
+pub fn apply_mirror_ca(cmd: &mut std::process::Command) {
+    if Path::new(BUILD_MIRROR_CA_PATH).exists() {
+        cmd.env("NODE_EXTRA_CA_CERTS", BUILD_MIRROR_CA_PATH);
+    }
+}
+
 /// Outcome of [`Buildpack::detect`]. `confidence` (0–100) lets the driver resolve
 /// ambiguous trees (e.g. a bare `package.json`): a higher-confidence buildpack
 /// wins. An explicit `language=` hint should yield max confidence.

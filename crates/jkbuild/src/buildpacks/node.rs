@@ -454,6 +454,8 @@ fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
             .env("https_proxy", proxy)
             .env("npm_config_proxy", proxy)
             .env("npm_config_https_proxy", proxy);
+        // Node ignores the OpenSSL store, so trust the mirror CA explicitly if baked.
+        crate::buildpack::apply_mirror_ca(cmd);
     }
 }
 

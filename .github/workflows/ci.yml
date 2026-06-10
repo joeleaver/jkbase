@@ -34,6 +34,19 @@ jobs:
       - name: Clippy (workspace, warnings = errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Build-mirror CA isolation (invariant I-3): the build-mirror CA is baked ONLY
+      # into BUILD toolchains (tools/build-image.sh). It must NEVER reach a runtime
+      # image — neither the runtime apko configs nor the runtime-layer builder may
+      # reference it, or a tenant app would trust a CA that can impersonate registries.
+      - name: Build-mirror CA never in runtime path (I-3)
+        run: |
+          if grep -RnE 'jkbase-build-ca|BUILD_CA_CERT' \
+               images/apko/run-*.apko.yaml tools/build-base-layer.sh; then
+            echo "::error::build-mirror CA referenced in a runtime image path (violates I-3)"
+            exit 1
+          fi
+          echo "OK: no build-mirror CA reference in runtime image configs/builder"
+
       # Runs the substrate neutrality grep gate + the trybuild role-trait
       # compile-fail check too. KVM/root/network-gated tests are #[ignore]d, so
       # they are skipped on the runner.
