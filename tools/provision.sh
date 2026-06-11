@@ -208,6 +208,18 @@ if [ -n "$PUB_IFACE" ]; then
     if ! iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PUB_IFACE" -j MASQUERADE
     fi
+    # MASQUERADE (nat POSTROUTING) only rewrites the source address; whether a
+    # packet is forwarded at all is decided by the filter FORWARD chain. On any
+    # host whose FORWARD policy is DROP — the default once Docker, ufw, firewalld,
+    # libvirt, or our own build-net rules are present — runtime-VM egress is
+    # silently dropped before NAT applies, despite the MASQUERADE above. Add an
+    # explicit ACCEPT for jkbr0 → uplink plus the established/related return path.
+    if ! iptables -C FORWARD -i "$BRIDGE" -o "$PUB_IFACE" -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i "$BRIDGE" -o "$PUB_IFACE" -j ACCEPT
+    fi
+    if ! iptables -C FORWARD -i "$PUB_IFACE" -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -i "$PUB_IFACE" -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    fi
 fi
 BRIDGE
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
