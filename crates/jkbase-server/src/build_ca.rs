@@ -67,7 +67,7 @@ const CA_COMMON_NAME: &str = "jkbase build mirror CA";
 const CA_ORG: &str = "jkbase";
 /// CA validity: 10 years, anchored a day in the past for clock-skew tolerance.
 const CA_VALID_DAYS: i64 = 3650;
-/// Leaf validity: 30 days, anchored an hour in the past for skew tolerance.
+/// Leaf validity: 30 days, anchored a day in the past for skew tolerance.
 const LEAF_VALID_DAYS: i64 = 30;
 
 /// Fixed CA certificate parameters. MUST be deterministic in everything that

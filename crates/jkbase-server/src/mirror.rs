@@ -418,6 +418,15 @@ impl MirrorTls {
     /// egress gate already vetted — the upstream leg dials EXACTLY this (I-5). Consumes
     /// `client`; logs and drops the connection on any error.
     pub async fn handle_mitm(self: Arc<Self>, client: TcpStream, host: String, addr: SocketAddr) {
+        // Canonicalize the CONNECT host to ASCII-lowercase once, here at the boundary, so
+        // the upstream `.resolve()` override key, the `https://{host}{path}` URL host, the
+        // `fetch_pinned` host/port assertion, and the inner `Host == host` guard all share
+        // one form. host_is_mirrorable/classify/host_ok already lowercase internally;
+        // without this, a mixed-case mirrorable CONNECT (e.g. `Registry.NPMJS.org`) makes
+        // `url::Url` lowercase the URL host and trip the assertion → spurious 502s on an
+        // otherwise-valid connection. Egress already vetted the host case-insensitively, so
+        // lowercasing it changes nothing security-relevant — it only removes the mismatch.
+        let host = host.to_ascii_lowercase();
         let tls = match self.acceptor.accept(client).await {
             Ok(s) => s,
             Err(e) => {

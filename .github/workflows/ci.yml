@@ -55,8 +55,17 @@ jobs:
       # if reqwest ever resolves with native roots.
       - name: Mirror upstream leg uses webpki roots only (I-2)
         run: |
-          if cargo tree -e features -p jkbase-server -i reqwest 2>/dev/null \
-               | grep -qE 'rustls-tls-native-roots|native-tls'; then
+          # Capture the feature tree once and FAIL CLOSED: if cargo tree errors or
+          # reqwest stops resolving (rename/removal/resolver change), an empty/garbled
+          # tree must abort, not silently pass. (A bare `... | grep -q` would pass on
+          # empty input.) Assert the tree both resolved AND still carries webpki-roots,
+          # THEN reject any native-roots/native-tls feature.
+          tree="$(cargo tree -e features -p jkbase-server -i reqwest)"
+          if ! printf '%s\n' "$tree" | grep -q 'rustls-tls-webpki-roots'; then
+            echo "::error::reqwest webpki-roots feature missing/unresolved — cannot verify I-2"
+            exit 1
+          fi
+          if printf '%s\n' "$tree" | grep -qE 'rustls-tls-native-roots|native-tls'; then
             echo "::error::reqwest enabled native-roots/native-tls — I-2 (webpki-only upstream) at risk"
             exit 1
           fi
