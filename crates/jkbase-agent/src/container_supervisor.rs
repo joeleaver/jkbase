@@ -531,6 +531,13 @@ fn spawn_server_chroot(
 /// tmpfs because the agent root is a read-only erofs/ext4 image.
 const LAYER_RUN_BASE: &str = "/tmp/jkbase-run";
 
+/// DNS resolvers written into each runtime container's `/etc/resolv.conf`. The runtime
+/// VM is NAT'd to the public internet (jkbr0), but the kernel `ip=` autoconfig carries
+/// no resolver and the minimal base image ships none — so without this an app can reach
+/// literal IPs but cannot resolve hostnames. Public resolvers (Cloudflare + Google);
+/// the runtime egress permits them (the bridge SSRF DROP only blocks link-local/RFC1918).
+const RUNTIME_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions edns0\n";
+
 /// Layered server: compose `lowerdir=app:runtime:base` over a tmpfs upper, then
 /// run the server in its own mount namespace pivoted into that composed root.
 /// This replaces chroot for the layered (erofs) runtime — each server gets a
@@ -561,6 +568,32 @@ fn spawn_server_layered(
     for d in [&upper, &work, &merged] {
         std::fs::create_dir_all(d)
             .with_context(|| format!("create overlay scratch {}", d.display()))?;
+    }
+
+    // A single lowerdir is a self-contained image (image/self = the `builder =
+    // "dockerfile"` / OCI case): it owns its full userland, possibly including a curated
+    // /etc/resolv.conf (custom resolver / search / ndots).
+    let image_self = lowerdirs.len() == 1;
+
+    // Give the container working DNS: write /etc/resolv.conf into the overlay UPPER dir,
+    // so it shadows the lower and appears in the merged root the child pivots into.
+    // Best-effort — a missing resolver degrades to literal-IP-only egress, not a server
+    // failure. EXCEPTION: for a self-contained image that ships its OWN resolv.conf,
+    // honour it rather than clobbering it with our public resolvers.
+    let lower_has_resolv = image_self
+        && lowerdirs
+            .first()
+            .map(|l| l.join("etc/resolv.conf").exists())
+            .unwrap_or(false);
+    if lower_has_resolv {
+        info!(server = %name, "image ships its own /etc/resolv.conf; not overriding");
+    } else {
+        let etc = upper.join("etc");
+        if let Err(e) = std::fs::create_dir_all(&etc)
+            .and_then(|()| std::fs::write(etc.join("resolv.conf"), RUNTIME_RESOLV_CONF))
+        {
+            warn!(server = %name, error = %e, "failed to write container resolv.conf; DNS may not resolve");
+        }
     }
 
     let working_dir = manifest
@@ -605,9 +638,8 @@ fn spawn_server_layered(
     if manifest.cmd.len() > 1 {
         std_cmd.args(&manifest.cmd[1..]);
     }
-    // A single lowerdir is a self-contained image (image/self): no shared base/
+    // image_self (a single self-contained lowerdir) computed above: no shared base/
     // runtime beneath it, so honour the image's own PATH/HOME and skip /opt/bun.
-    let image_self = lowerdirs.len() == 1;
     let extra_path = if image_self { "" } else { "/opt/bun/bin" };
     apply_server_env(&mut std_cmd, manifest, extra_path, image_self);
 

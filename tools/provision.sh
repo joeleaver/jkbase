@@ -190,38 +190,12 @@ echo "Building runtime rootfs (apko Wolfi + chrony + agent)..."
 AGENT_BIN="$JKBASE_DIR/target/x86_64-unknown-linux-musl/release/jkbase-agent" \
     OUT=/var/jkbase/base-rootfs.ext4 "$JKBASE_DIR/tools/build-runtime-rootfs.sh"
 
-# Create bridge setup script
-sudo tee /usr/local/bin/jkbase-bridge.sh > /dev/null << 'BRIDGE'
-#!/bin/bash
-BRIDGE="jkbr0"
-if ! ip link show "$BRIDGE" &>/dev/null; then
-    ip link add name "$BRIDGE" type bridge
-    ip addr add 172.16.0.1/24 dev "$BRIDGE"
-    ip link set "$BRIDGE" up
-fi
-
-echo 1 > /proc/sys/net/ipv4/ip_forward
-
-# NAT for VM internet access — detect the default route interface
-PUB_IFACE=$(ip route show default | awk '{print $5; exit}')
-if [ -n "$PUB_IFACE" ]; then
-    if ! iptables -t nat -C POSTROUTING -s 172.16.0.0/24 -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s 172.16.0.0/24 -o "$PUB_IFACE" -j MASQUERADE
-    fi
-    # MASQUERADE (nat POSTROUTING) only rewrites the source address; whether a
-    # packet is forwarded at all is decided by the filter FORWARD chain. On any
-    # host whose FORWARD policy is DROP — the default once Docker, ufw, firewalld,
-    # libvirt, or our own build-net rules are present — runtime-VM egress is
-    # silently dropped before NAT applies, despite the MASQUERADE above. Add an
-    # explicit ACCEPT for jkbr0 → uplink plus the established/related return path.
-    if ! iptables -C FORWARD -i "$BRIDGE" -o "$PUB_IFACE" -j ACCEPT 2>/dev/null; then
-        iptables -A FORWARD -i "$BRIDGE" -o "$PUB_IFACE" -j ACCEPT
-    fi
-    if ! iptables -C FORWARD -i "$PUB_IFACE" -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
-        iptables -A FORWARD -i "$PUB_IFACE" -o "$BRIDGE" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    fi
-fi
-BRIDGE
+# Runtime-VM bridge provisioner (ExecStartPre, per-boot). Installs the maintained
+# in-repo script (one source of truth, shared with local dev) rather than an inline
+# heredoc — so deploy-server.sh can re-sync rule changes to already-provisioned boxes.
+# It creates jkbr0, enables NAT'd egress to the public internet, and DROPS forwarding
+# from jkbr0 to link-local/cloud-metadata (SSRF guard; all tenants untrusted).
+sudo cp "$JKBASE_DIR/tools/setup-bridge.sh" /usr/local/bin/jkbase-bridge.sh
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
 
 # Build cgroup provisioner (ExecStartPre, per-boot). Build VMs run under the jailer

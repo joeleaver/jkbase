@@ -91,11 +91,19 @@ impl VmInstance {
             })
             .await?;
 
-        let mut boot_args = "console=ttyS0 reboot=k panic=1 pci=off ro".to_string();
+        // ipv6.disable=1: runtime egress is IPv4-only (no v6 NAT/forwarding on jkbr0),
+        // and the bridge SSRF DROP is IPv4 — so a live guest v6 stack would be an
+        // unguarded path to metadata/host. Disable it in the guest entirely (matches the
+        // build VMs); the host bridge/TAP also drop v6 as defense in depth.
+        let mut boot_args = "console=ttyS0 reboot=k panic=1 pci=off ro ipv6.disable=1".to_string();
         if let (Some(guest_ip), Some(gateway_ip)) = (&config.guest_ip, &config.gateway_ip) {
-            // Kernel IP autoconfiguration: ip=guest::gateway:netmask::iface:off
+            // Kernel IP autoconfiguration:
+            //   ip=client::gateway:netmask:hostname:iface:autoconf:dns0
+            // The trailing dns0 (1.1.1.1) populates /proc/net/pnp; the agent also writes
+            // an explicit /etc/resolv.conf for the container (the load-bearing path,
+            // since the app reads /etc/resolv.conf, not pnp).
             boot_args.push_str(&format!(
-                " ip={guest_ip}::{gateway_ip}:255.255.255.0::eth0:off"
+                " ip={guest_ip}::{gateway_ip}:255.255.255.0::eth0:off:1.1.1.1"
             ));
         }
 
