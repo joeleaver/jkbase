@@ -531,6 +531,13 @@ fn spawn_server_chroot(
 /// tmpfs because the agent root is a read-only erofs/ext4 image.
 const LAYER_RUN_BASE: &str = "/tmp/jkbase-run";
 
+/// DNS resolvers written into each runtime container's `/etc/resolv.conf`. The runtime
+/// VM is NAT'd to the public internet (jkbr0), but the kernel `ip=` autoconfig carries
+/// no resolver and the minimal base image ships none — so without this an app can reach
+/// literal IPs but cannot resolve hostnames. Public resolvers (Cloudflare + Google);
+/// the runtime egress permits them (the bridge SSRF DROP only blocks link-local/RFC1918).
+const RUNTIME_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions edns0\n";
+
 /// Layered server: compose `lowerdir=app:runtime:base` over a tmpfs upper, then
 /// run the server in its own mount namespace pivoted into that composed root.
 /// This replaces chroot for the layered (erofs) runtime — each server gets a
@@ -561,6 +568,17 @@ fn spawn_server_layered(
     for d in [&upper, &work, &merged] {
         std::fs::create_dir_all(d)
             .with_context(|| format!("create overlay scratch {}", d.display()))?;
+    }
+
+    // Give the container working DNS: write /etc/resolv.conf into the overlay UPPER
+    // dir, so it shadows any lower /etc/resolv.conf and appears in the merged root the
+    // child pivots into. Best-effort — a missing resolver degrades to literal-IP-only
+    // egress, not a server failure.
+    let etc = upper.join("etc");
+    if let Err(e) = std::fs::create_dir_all(&etc)
+        .and_then(|()| std::fs::write(etc.join("resolv.conf"), RUNTIME_RESOLV_CONF))
+    {
+        warn!(server = %name, error = %e, "failed to write container resolv.conf; DNS may not resolve");
     }
 
     let working_dir = manifest
