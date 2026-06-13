@@ -99,11 +99,12 @@ impl VmInstance {
         if let (Some(guest_ip), Some(gateway_ip)) = (&config.guest_ip, &config.gateway_ip) {
             // Kernel IP autoconfiguration:
             //   ip=client::gateway:netmask:hostname:iface:autoconf:dns0
-            // The trailing dns0 (1.1.1.1) populates /proc/net/pnp; the agent also writes
-            // an explicit /etc/resolv.conf for the container (the load-bearing path,
-            // since the app reads /etc/resolv.conf, not pnp).
+            // dns0 = the gateway, where the host runs a DNS forwarder (see
+            // tools/setup-bridge.sh); it populates /proc/net/pnp. The agent also writes
+            // an explicit /etc/resolv.conf pointed at the gateway (the load-bearing
+            // path, since the app reads /etc/resolv.conf, not pnp).
             boot_args.push_str(&format!(
-                " ip={guest_ip}::{gateway_ip}:255.255.255.0::eth0:off:1.1.1.1"
+                " ip={guest_ip}::{gateway_ip}:255.255.255.0::eth0:off:{gateway_ip}"
             ));
         }
 

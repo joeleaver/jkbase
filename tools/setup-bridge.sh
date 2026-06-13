@@ -87,4 +87,34 @@ if command -v ip6tables >/dev/null 2>&1; then
     fi
 fi
 
-echo "runtime bridge ready: $BRIDGE ($GW_CIDR) NAT'd to ${PUB_IFACE:-<no uplink>}; link-local/metadata forwarding dropped (RFC1918 egress allowed)"
+# Guest DNS via a GATEWAY forwarder. Tenant apps need a resolver, but many hosts (OVH,
+# for one) block outbound UDP/53 to public resolvers — so guests can't just use
+# 1.1.1.1. Instead, expose the host's already-working systemd-resolved on the bridge IP
+# (DNSStubListenerExtra) and open ONLY ${GW_IP}:53 from the bridge. Guests do UDP/53 to
+# the LOCAL gateway (always allowed) and the host forwards upstream however it can —
+# provider-agnostic, and it works for every DNS client (getaddrinfo, c-ares, Go, …),
+# not just glibc. The agent points each container's /etc/resolv.conf at ${GW_IP}.
+# (A non-systemd-resolved host should run some forwarder on ${GW_IP}:53 instead — the
+# only contract is "a resolver answers at the gateway".)
+for proto in udp tcp; do
+    if ! iptables -C INPUT -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT 2>/dev/null; then
+        iptables -I INPUT 1 -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT
+    fi
+done
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    want="# jkbase: answer guest DNS on the runtime bridge gateway (managed by setup-bridge.sh)
+[Resolve]
+DNSStubListenerExtra=${GW_IP}"
+    if [ "$(cat /etc/systemd/resolved.conf.d/jkbase-stub.conf 2>/dev/null)" != "$want" ]; then
+        printf '%s\n' "$want" > /etc/systemd/resolved.conf.d/jkbase-stub.conf
+    fi
+    # At boot systemd-resolved starts before this bridge exists, so its bind to
+    # ${GW_IP}:53 would have failed — (re)bind now the bridge is up. Restart only when
+    # it isn't already listening there, to avoid needless host-DNS blips.
+    if ! ss -ulnH 2>/dev/null | grep -q "${GW_IP}:53"; then
+        systemctl try-restart systemd-resolved 2>/dev/null || true
+    fi
+fi
+
+echo "runtime bridge ready: $BRIDGE ($GW_CIDR) NAT'd to ${PUB_IFACE:-<no uplink>}; link-local/metadata forwarding dropped (RFC1918 egress allowed); guest DNS via ${GW_IP}:53"
