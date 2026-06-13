@@ -1658,8 +1658,19 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
     if !exists {
         run_cmd("ip", &["tuntap", "add", "dev", tap_name, "mode", "tap"]).await?;
         run_cmd("ip", &["link", "set", tap_name, "master", "jkbr0"]).await?;
+        // Bridge port isolation: isolated ports cannot forward to each other at L2, so
+        // one tenant's runtime VM can't reach another's at 172.16.0.x on the shared
+        // bridge (the gateway/uplink — a non-isolated port — stays reachable, so egress
+        // is unaffected). Matches the build bridge's per-TAP isolation. Fail-closed:
+        // if the kernel can't apply it, the deploy fails rather than running a VM with
+        // cross-tenant L2 reachability.
+        run_cmd(
+            "ip",
+            &["link", "set", "dev", tap_name, "type", "bridge_slave", "isolated", "on"],
+        )
+        .await?;
         run_cmd("ip", &["link", "set", tap_name, "up"]).await?;
-        info!(tap_name, "tap device created");
+        info!(tap_name, "tap device created (bridge-port-isolated)");
     }
 
     Ok(())
