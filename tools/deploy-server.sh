@@ -80,7 +80,7 @@ sudo systemctl daemon-reload
 # without this, edits to the bridge/firewall/cgroup setup never reach an already-
 # provisioned box — it keeps running the old /usr/local/bin copies, so a security-
 # relevant change (e.g. the per-dockerfile-VM egress scoping, or the runtime-bridge
-# link-local/RFC1918 SSRF DROP) silently wouldn't take effect. Re-copied BEFORE the
+# link-local/metadata SSRF DROP) silently wouldn't take effect. Re-copied BEFORE the
 # restart so the next ExecStartPre runs the current rules. (jkbase-bridge.sh is now a
 # maintained standalone script — tools/setup-bridge.sh — carrying the full prod NAT +
 # FORWARD rules, so it IS safe to re-sync here, unlike the old dev-only stub.)

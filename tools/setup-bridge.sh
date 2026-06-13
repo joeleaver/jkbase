@@ -6,9 +6,9 @@
 # see tools/setup-build-net.sh). This script creates the bridge, enables forwarding +
 # MASQUERADE, opens the FORWARD path for jkbr0 → uplink (+ the established return path),
 # and — under the all-tenants-untrusted threat model — DROPS forwarding from jkbr0 to
-# host-INTERNAL targets (link-local / cloud-metadata 169.254.169.254 + RFC1918) so a
-# hostile app can't pivot off the public internet into the host's network or steal cloud
-# instance credentials.
+# link-local / cloud-metadata (169.254.169.254) so a hostile app can't steal cloud
+# instance credentials. (RFC1918 egress is left open for apps that need private
+# services; cross-tenant VM↔VM is blocked by per-TAP port isolation, not here.)
 #
 # This is the SINGLE SOURCE OF TRUTH for the runtime bridge: provision.sh installs it as
 # the systemd ExecStartPre /usr/local/bin/jkbase-bridge.sh, and deploy-server.sh re-syncs
@@ -49,18 +49,17 @@ if [ -n "$PUB_IFACE" ]; then
     fi
 
     # SSRF guard (threat model: all tenants untrusted). Runtime VMs are NAT'd to the
-    # public internet, but must NOT reach host-internal targets via the forward path:
-    # cloud metadata (169.254.169.254), the rest of link-local, and RFC1918. Insert
-    # these DROPs at the TOP of FORWARD so they precede the uplink ACCEPT below.
-    # VM → host-gateway (172.16.0.1) is INPUT, not FORWARD, so host services are
-    # governed separately; VM ↔ VM on the same bridge is L2-switched and gated by
-    # per-TAP port isolation, not here. Loosen the RFC1918 entries ONLY if a
-    # deployment legitimately needs private-network egress.
-    for net in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
-        if ! iptables -C FORWARD -i "$BRIDGE" -d "$net" -j DROP 2>/dev/null; then
-            iptables -I FORWARD 1 -i "$BRIDGE" -d "$net" -j DROP
-        fi
-    done
+    # public internet, but must NOT reach cloud metadata / the rest of link-local via
+    # the forward path (169.254.169.254 → instance-credential theft on a cloud host).
+    # DROP it at the TOP of FORWARD so it precedes the uplink ACCEPT below. RFC1918
+    # egress is deliberately LEFT OPEN so an app that legitimately needs a private-
+    # network service (e.g. a managed DB) still works; cross-tenant reach is handled by
+    # per-TAP bridge port isolation (VM↔VM, L2) — not here. (VM → host-gateway is
+    # INPUT, not FORWARD, so host services are governed separately.) To also fence off
+    # RFC1918, add `-d 10.0.0.0/8 -d 172.16.0.0/12 -d 192.168.0.0/16` DROPs here.
+    if ! iptables -C FORWARD -i "$BRIDGE" -d 169.254.0.0/16 -j DROP 2>/dev/null; then
+        iptables -I FORWARD 1 -i "$BRIDGE" -d 169.254.0.0/16 -j DROP
+    fi
 
     # MASQUERADE only rewrites the source; whether a packet is forwarded at all is
     # decided by the filter FORWARD chain, whose policy is DROP on any host with
@@ -74,4 +73,4 @@ if [ -n "$PUB_IFACE" ]; then
     fi
 fi
 
-echo "runtime bridge ready: $BRIDGE ($GW_CIDR) NAT'd to ${PUB_IFACE:-<no uplink>}; link-local + RFC1918 forwarding dropped"
+echo "runtime bridge ready: $BRIDGE ($GW_CIDR) NAT'd to ${PUB_IFACE:-<no uplink>}; link-local/metadata forwarding dropped (RFC1918 egress allowed)"

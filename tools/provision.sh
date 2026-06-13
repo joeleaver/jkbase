@@ -194,7 +194,7 @@ AGENT_BIN="$JKBASE_DIR/target/x86_64-unknown-linux-musl/release/jkbase-agent" \
 # in-repo script (one source of truth, shared with local dev) rather than an inline
 # heredoc — so deploy-server.sh can re-sync rule changes to already-provisioned boxes.
 # It creates jkbr0, enables NAT'd egress to the public internet, and DROPS forwarding
-# from jkbr0 to link-local/cloud-metadata + RFC1918 (SSRF guard; all tenants untrusted).
+# from jkbr0 to link-local/cloud-metadata (SSRF guard; all tenants untrusted).
 sudo cp "$JKBASE_DIR/tools/setup-bridge.sh" /usr/local/bin/jkbase-bridge.sh
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh
 
