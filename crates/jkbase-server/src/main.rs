@@ -117,6 +117,15 @@ struct Args {
     #[arg(long)]
     build_mirror: bool,
 
+    /// Ceiling (bytes) on the package mirror's content store. Once the cached blobs
+    /// exceed this, the mirror evicts least-recently-used artifacts (via the substrate
+    /// delete seam) back under the cap, so an untrusted tenant flooding the mirror with
+    /// distinct registry artifacts cannot fill {data_dir} (shared with redb/runtime
+    /// data) and DoS the host. Only consulted when --build-mirror is set; default 10 GiB.
+    /// Set well above a single artifact (per-blob cap is 1 GiB) for an effective cache.
+    #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
+    build_mirror_max_bytes: u64,
+
     /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
     /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
     /// platform defaults and target any project. Unset (default) = no admin path:
@@ -560,7 +569,11 @@ async fn main() -> Result<()> {
                              else registry TLS will fail"
                         );
                     }
-                    match mirror::MirrorTls::new(&data_dir, Arc::new(build_ca::CertSigner::new(ca))) {
+                    match mirror::MirrorTls::new(
+                        &data_dir,
+                        Arc::new(build_ca::CertSigner::new(ca)),
+                        args.build_mirror_max_bytes,
+                    ) {
                         Ok(m) => {
                             info!(ca_dir = %ca_dir.display(), fingerprint = %fp,
                                 "build package mirror enabled (narrow proxy)");

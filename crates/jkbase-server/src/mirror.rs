@@ -33,7 +33,7 @@
 //! .crate / registry index). Never opaque compiled output (that stays per-project on
 //! the cache-drive).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -381,12 +381,45 @@ pub struct MirrorTls {
     upstream_fetches: std::sync::atomic::AtomicU64,
     /// Bounds concurrent upstream fetches across the whole mirror.
     fetch_sem: tokio::sync::Semaphore,
+    /// Size accounting + LRU eviction state for the content store. Bounds total cached
+    /// bytes so an untrusted tenant flooding the mirror with distinct registry artifacts
+    /// cannot fill the shared {data_dir} and DoS the host.
+    accounting: Mutex<Accounting>,
+}
+
+/// Per-blob accounting record (keyed by `digest_key` = `<aa>/<hex>`).
+struct BlobAcct {
+    /// On-disk size in bytes.
+    size: u64,
+    /// Unix-seconds recency: seeded from file mtime at startup, refreshed to "now" on
+    /// every store/hit. Eviction removes the lowest-recency blobs first (LRU).
+    atime: u64,
+}
+
+/// The mirror store's size-accounting + LRU-eviction bookkeeping. Held behind a single
+/// async mutex; all maps are kept consistent under it. `total` is the sum of distinct
+/// blob sizes (dedup-aware — a blob counts once regardless of how many index URLs map to
+/// it). `fwd`/`refs` track the URL↔blob binding so evicting a blob also prunes the index
+/// entries that point at it (the index can never outlive the bytes).
+struct Accounting {
+    /// Eviction ceiling in bytes. When `total` exceeds it, evict LRU blobs down to ~90%.
+    cap: u64,
+    /// Sum of `blobs[*].size`.
+    total: u64,
+    /// `digest_key` → record. The set of currently-stored blobs.
+    blobs: HashMap<String, BlobAcct>,
+    /// `url_key` → `digest_key`. Forward index binding, so a mutable URL re-pointed at a
+    /// new digest correctly drops its reference to the old one.
+    fwd: HashMap<String, String>,
+    /// `digest_key` → set of `url_key`s that reference it. Drives index cleanup on evict.
+    refs: HashMap<String, HashSet<String>>,
 }
 
 impl MirrorTls {
     /// Build the mirror rooted at `{data_dir}/buildmirror`, using `signer` for per-SNI
-    /// leaf certs.
-    pub fn new(data_dir: &Path, signer: Arc<CertSigner>) -> Result<Arc<Self>> {
+    /// leaf certs. `max_bytes` is the content-store eviction ceiling (LRU back to ~90%
+    /// once exceeded) — the host-DoS backstop against a distinct-artifact flood.
+    pub fn new(data_dir: &Path, signer: Arc<CertSigner>, max_bytes: u64) -> Result<Arc<Self>> {
         let root = data_dir.join("buildmirror");
         let store = LocalFsBlobStore::open(root.join("blobs"))
             .map_err(|e| anyhow::anyhow!("open mirror blob store: {e}"))?;
@@ -395,6 +428,23 @@ impl MirrorTls {
         // construction, so the whole tmp/ tree is safe to clear.
         let _ = std::fs::remove_dir_all(root.join("tmp"));
         let acceptor = TlsAcceptor::from(signer.into_server_config());
+        // Seed the accounting from whatever a prior run left on disk so the cap is honored
+        // across restarts (a fresh process must not "forget" already-stored bytes).
+        let mut accounting = Accounting {
+            cap: max_bytes,
+            total: 0,
+            blobs: HashMap::new(),
+            fwd: HashMap::new(),
+            refs: HashMap::new(),
+        };
+        seed_blobs(&root.join("blobs"), &mut accounting);
+        seed_index(&root.join("index"), &mut accounting);
+        tracing::info!(
+            cap_bytes = max_bytes,
+            seeded_blobs = accounting.blobs.len(),
+            seeded_bytes = accounting.total,
+            "mirror store accounting seeded"
+        );
         Ok(Arc::new(Self {
             acceptor,
             store,
@@ -403,7 +453,112 @@ impl MirrorTls {
             hits: std::sync::atomic::AtomicU64::new(0),
             upstream_fetches: std::sync::atomic::AtomicU64::new(0),
             fetch_sem: tokio::sync::Semaphore::new(MAX_UPSTREAM_CONCURRENCY),
+            accounting: Mutex::new(accounting),
         }))
+    }
+
+    /// Record a stored blob (size `size` at `digest_key`) and evict LRU blobs if the
+    /// store is now over cap. An already-known blob is just touched (recency refreshed),
+    /// never double-counted. The just-stored key is excluded from this eviction pass, so
+    /// the blob we are about to serve can never be deleted out from under the response.
+    async fn account_blob(&self, digest_key: &str, size: u64) {
+        self.account_blob_at(digest_key, size, now_unix()).await
+    }
+
+    /// `account_blob` with an explicit recency stamp — the eviction core (a test seam so
+    /// LRU ordering can be exercised deterministically without sub-second timing).
+    async fn account_blob_at(&self, digest_key: &str, size: u64, atime: u64) {
+        let mut a = self.accounting.lock().await;
+        match a.blobs.get_mut(digest_key) {
+            Some(b) => {
+                b.atime = atime; // already counted — refresh recency only
+            }
+            None => {
+                a.total = a.total.saturating_add(size);
+                a.blobs.insert(digest_key.to_string(), BlobAcct { size, atime });
+            }
+        }
+        if a.total <= a.cap {
+            return;
+        }
+        // Over cap: evict the lowest-recency blobs (excluding the hot key) down to a 90%
+        // low-water mark (hysteresis, so we don't evict on every subsequent store).
+        let low_water = a.cap - a.cap / 10;
+        let mut candidates: Vec<(String, u64)> = a
+            .blobs
+            .iter()
+            .filter(|(k, _)| k.as_str() != digest_key)
+            .map(|(k, b)| (k.clone(), b.atime))
+            .collect();
+        candidates.sort_by_key(|(_, at)| *at);
+        let mut victims: Vec<(String, Vec<String>)> = Vec::new();
+        for (k, _) in candidates {
+            if a.total <= low_water {
+                break;
+            }
+            if let Some(b) = a.blobs.remove(&k) {
+                a.total = a.total.saturating_sub(b.size);
+                let urls: Vec<String> = a
+                    .refs
+                    .remove(&k)
+                    .map(|s| s.into_iter().collect())
+                    .unwrap_or_default();
+                for u in &urls {
+                    a.fwd.remove(u);
+                }
+                victims.push((k, urls));
+            }
+        }
+        drop(a); // release the lock before the (async, best-effort) disk deletes
+        if victims.is_empty() {
+            return;
+        }
+        let n = victims.len();
+        for (k, urls) in victims {
+            let _ = self.store.delete(&k).await; // idempotent; bytes already uncounted
+            for u in urls {
+                let _ = tokio::fs::remove_file(self.index_path(&u)).await;
+            }
+        }
+        tracing::info!(evicted = n, "mirror store over cap; evicted LRU blobs");
+    }
+
+    /// Record (or re-point) the index binding `url_key` → `digest_key` so a later
+    /// eviction of that blob also prunes this index entry. Handles the mutable-URL
+    /// rewrite case: if the URL previously bound a different blob, drop its stale ref.
+    async fn account_index(&self, url_key: &str, digest_key: &str) {
+        let mut a = self.accounting.lock().await;
+        if let Some(old) = a.fwd.insert(url_key.to_string(), digest_key.to_string())
+            && old != digest_key
+            && let Some(s) = a.refs.get_mut(&old)
+        {
+            s.remove(url_key);
+        }
+        a.refs
+            .entry(digest_key.to_string())
+            .or_default()
+            .insert(url_key.to_string());
+    }
+
+    /// Refresh a blob's recency on a cache hit (keeps hot artifacts from being evicted).
+    async fn touch_blob(&self, digest_key: &str) {
+        let now = now_unix();
+        let mut a = self.accounting.lock().await;
+        if let Some(b) = a.blobs.get_mut(digest_key) {
+            b.atime = now;
+        }
+    }
+
+    /// Drop a stale index entry (and its bookkeeping) whose blob is gone — called when a
+    /// hit finds the underlying blob was evicted, so the index never outlives the bytes.
+    async fn forget_index(&self, url_key: &str) {
+        let _ = tokio::fs::remove_file(self.index_path(url_key)).await;
+        let mut a = self.accounting.lock().await;
+        if let Some(dk) = a.fwd.remove(url_key)
+            && let Some(s) = a.refs.get_mut(&dk)
+        {
+            s.remove(url_key);
+        }
     }
 
     /// `(hits, upstream_fetches)` — the cross-tenant dedup counters. hit-rate is
@@ -569,6 +724,12 @@ impl MirrorTls {
                     .put_if_absent_file(&digest_key, tmp.path())
                     .await
                     .map_err(|e| anyhow::anyhow!("store blob: {e}"))?;
+                let (path, len) = self.blob_path_len(&digest_key).await?;
+                // Account the stored bytes + evict LRU blobs if now over cap. Before the
+                // index write so the ceiling is enforced even on the Disallowed path
+                // (which writes no index entry). The just-stored key is excluded from
+                // eviction, so the blob we are about to serve is never deleted here.
+                self.account_blob(&digest_key, len).await;
                 if class != Class::Disallowed {
                     let entry = IndexEntry {
                         digest: digest.clone(),
@@ -578,8 +739,8 @@ impl MirrorTls {
                         fetched_at: now_unix(),
                     };
                     self.write_index(&url_key, &entry).await?;
+                    self.account_index(&url_key, &digest_key).await;
                 }
-                let (path, len) = self.blob_path_len(&digest_key).await?;
                 Ok(MirrorResponse {
                     status: 200,
                     content_type,
@@ -626,6 +787,7 @@ impl MirrorTls {
             Ok((path, len)) => {
                 self.hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.touch_blob(&digest_key).await;
                 Ok(Some(MirrorResponse {
                     status: 200,
                     content_type: entry.content_type,
@@ -634,7 +796,12 @@ impl MirrorTls {
                     body: ServeBody::File { path, len },
                 }))
             }
-            Err(_) => Ok(None), // index points at an evicted blob — treat as miss
+            // Index points at an evicted blob: prune the stale entry (it must never
+            // outlive the bytes) and treat as a miss so the URL re-fetches.
+            Err(_) => {
+                self.forget_index(url_key).await;
+                Ok(None)
+            }
         }
     }
 
@@ -878,6 +1045,95 @@ fn sha256_hex_str(bytes: &[u8]) -> String {
     hex_of(h.finalize())
 }
 
+/// Unix-seconds modification time of a file, or 0 (treated as oldest → evicted first) if
+/// it can't be read — a safe default when seeding the LRU recency.
+fn mtime_unix(md: &std::fs::Metadata) -> u64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Seed blob size accounting by walking `blobs/<aa>/<hex>` left by a prior run, so the
+/// store cap is honored across restarts (a fresh process must not forget already-stored
+/// bytes). Recency is the file mtime — content-addressed blobs are write-once, so mtime ≈
+/// first-store time, a sound LRU seed. Non-digest names (temp siblings, strays) are
+/// skipped.
+fn seed_blobs(blobs_root: &Path, acct: &mut Accounting) {
+    let Ok(shards) = std::fs::read_dir(blobs_root) else {
+        return;
+    };
+    for shard in shards.flatten() {
+        if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let Ok(md) = f.metadata() else { continue };
+            if !md.is_file() {
+                continue;
+            }
+            let name = f.file_name();
+            let name = name.to_string_lossy();
+            // The file name is the full 64-hex digest; skip anything malformed.
+            if !is_sha256_hex(&name) {
+                continue;
+            }
+            acct.total = acct.total.saturating_add(md.len());
+            acct.blobs.insert(
+                digest_key(&name),
+                BlobAcct {
+                    size: md.len(),
+                    atime: mtime_unix(&md),
+                },
+            );
+        }
+    }
+}
+
+/// Seed the URL↔blob index bindings by walking `index/<aa>/<url_key>`, so a post-restart
+/// eviction still prunes the index entries of the blob it evicts. Corrupt/unreadable
+/// entries are skipped (they self-heal as misses on read).
+fn seed_index(index_root: &Path, acct: &mut Accounting) {
+    let Ok(shards) = std::fs::read_dir(index_root) else {
+        return;
+    };
+    for shard in shards.flatten() {
+        if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = f.file_name();
+            let url_key = name.to_string_lossy();
+            // url_key is a sha256 hex; skip temp siblings / strays.
+            if !is_sha256_hex(&url_key) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(f.path()) else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<IndexEntry>(&bytes) else {
+                continue;
+            };
+            if !is_sha256_hex(&entry.digest) {
+                continue;
+            }
+            let dk = digest_key(&entry.digest);
+            acct.fwd.insert(url_key.to_string(), dk.clone());
+            acct.refs.entry(dk).or_default().insert(url_key.to_string());
+        }
+    }
+}
+
 /// Read an HTTP request head (through the terminating CRLFCRLF) from `r`, bounded by
 /// [`MAX_REQ_HEAD`]. Returns `Ok(None)` on a clean EOF before any bytes.
 async fn read_head<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Option<Vec<u8>>> {
@@ -1076,6 +1332,112 @@ mod tests {
         assert_eq!(head, b"GET / HTTP/1.1\r\nHost: a");
     }
 
+    // The store-cap backstop: once cached bytes exceed the ceiling, the accounting must
+    // evict least-recently-used blobs (oldest recency first) back under the cap AND
+    // delete their bytes from disk — so an untrusted distinct-artifact flood can't fill
+    // {data_dir}. Uses the account_blob_at recency seam for deterministic LRU ordering.
+    #[tokio::test]
+    async fn store_cap_evicts_lru_and_bounds_total() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("jkb-mirror-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = crate::build_ca::BuildCa::load_or_generate(&dir.join("ca")).unwrap();
+        let signer = Arc::new(crate::build_ca::CertSigner::new(ca));
+        let cap = 300u64;
+        let mirror = MirrorTls::new(&dir, signer, cap).unwrap();
+
+        // Write a real 100-byte blob at its content-addressed path and register it with an
+        // explicit recency stamp so eviction order is deterministic.
+        async fn put(m: &Arc<MirrorTls>, tag: &str, atime: u64) -> String {
+            let dk = digest_key(&sha256_hex_str(tag.as_bytes()));
+            let path = m.root.join("blobs").join(&dk);
+            tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            tokio::fs::write(&path, vec![b'x'; 100]).await.unwrap();
+            m.account_blob_at(&dk, 100, atime).await;
+            dk
+        }
+
+        // Five 100-byte blobs, recency 1..=5 (blob1 oldest). 500 > cap 300, so the oldest
+        // are evicted down to the 270-byte low-water mark.
+        let mut keys = Vec::new();
+        for i in 1..=5u64 {
+            keys.push(put(&mirror, &format!("blob{i}"), i).await);
+        }
+
+        let a = mirror.accounting.lock().await;
+        assert!(a.total <= cap, "total {} must be <= cap {cap}", a.total);
+        assert!(
+            !a.blobs.contains_key(&keys[0]),
+            "oldest blob (recency 1) must be evicted"
+        );
+        assert!(
+            !a.blobs.contains_key(&keys[1]),
+            "second-oldest (recency 2) must be evicted"
+        );
+        assert!(
+            a.blobs.contains_key(&keys[4]),
+            "newest blob (recency 5) must be retained"
+        );
+        drop(a);
+
+        assert!(
+            !mirror.root.join("blobs").join(&keys[0]).exists(),
+            "evicted blob bytes must be removed from disk (delete seam exercised)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Eviction of a blob must also prune the index entries that point at it, so the index
+    // can never outlive the bytes (and a flood of distinct URLs can't grow the index
+    // unbounded behind the evicted blobs).
+    #[tokio::test]
+    async fn eviction_prunes_index_entries() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("jkb-mirror-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = crate::build_ca::BuildCa::load_or_generate(&dir.join("ca")).unwrap();
+        let signer = Arc::new(crate::build_ca::CertSigner::new(ca));
+        let cap = 250u64;
+        let mirror = MirrorTls::new(&dir, signer, cap).unwrap();
+
+        async fn put_with_index(m: &Arc<MirrorTls>, tag: &str, atime: u64) -> (String, String) {
+            let dk = digest_key(&sha256_hex_str(tag.as_bytes()));
+            let bp = m.root.join("blobs").join(&dk);
+            tokio::fs::create_dir_all(bp.parent().unwrap()).await.unwrap();
+            tokio::fs::write(&bp, vec![b'x'; 100]).await.unwrap();
+            let url_key = sha256_hex_str(format!("registry.npmjs.org/{tag}").as_bytes());
+            let entry = IndexEntry {
+                digest: dk.rsplit('/').next().unwrap().to_string(),
+                content_type: None,
+                content_encoding: None,
+                immutable: true,
+                fetched_at: now_unix(),
+            };
+            m.write_index(&url_key, &entry).await.unwrap();
+            m.account_blob_at(&dk, 100, atime).await;
+            m.account_index(&url_key, &dk).await;
+            (dk, url_key)
+        }
+
+        // 3 * 100 = 300 > cap 250 → the oldest blob is evicted; its index file must go too.
+        let (_d1, u1) = put_with_index(&mirror, "a", 1).await;
+        let (_d2, u2) = put_with_index(&mirror, "b", 2).await;
+        let (_d3, u3) = put_with_index(&mirror, "c", 3).await;
+
+        assert!(
+            !mirror.index_path(&u1).exists(),
+            "evicted blob's index entry must be pruned"
+        );
+        assert!(
+            mirror.index_path(&u3).exists(),
+            "retained blob's index entry must remain"
+        );
+        // u2 may or may not survive depending on the low-water cut; total must be bounded.
+        let _ = &u2;
+        assert!(mirror.accounting.lock().await.total <= cap);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // THE dedup proof. Drives a real MITM'd fetch of an immutable npm tarball twice:
     // the first MISSes (one real upstream fetch, cert-validated vs public webpki roots),
     // the second HITs the shared store (no upstream) and serves byte-identical content
@@ -1091,7 +1453,9 @@ mod tests {
         let ca = crate::build_ca::BuildCa::load_or_generate(&ca_dir).unwrap();
         let ca_pem = std::fs::read(ca_dir.join("ca.crt")).unwrap();
         let signer = Arc::new(crate::build_ca::CertSigner::new(ca));
-        let mirror = MirrorTls::new(&dir, signer).unwrap();
+        // Generous cap: the dedup proof stores one small tarball, so nothing is evicted
+        // between the MISS and the HIT.
+        let mirror = MirrorTls::new(&dir, signer, 1 << 30).unwrap();
 
         let host = "registry.npmjs.org";
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 443))

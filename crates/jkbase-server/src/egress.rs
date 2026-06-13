@@ -450,7 +450,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let ca = crate::build_ca::BuildCa::load_or_generate(&dir).unwrap();
         let signer = Arc::new(crate::build_ca::CertSigner::new(ca));
-        MirrorTls::new(&dir, signer).unwrap()
+        MirrorTls::new(&dir, signer, 1 << 30).unwrap()
     }
 
     #[test]
