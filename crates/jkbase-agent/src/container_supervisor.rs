@@ -531,12 +531,14 @@ fn spawn_server_chroot(
 /// tmpfs because the agent root is a read-only erofs/ext4 image.
 const LAYER_RUN_BASE: &str = "/tmp/jkbase-run";
 
-/// DNS resolvers written into each runtime container's `/etc/resolv.conf`. The runtime
-/// VM is NAT'd to the public internet (jkbr0), but the kernel `ip=` autoconfig carries
-/// no resolver and the minimal base image ships none — so without this an app can reach
-/// literal IPs but cannot resolve hostnames. Public resolvers (Cloudflare + Google);
-/// the runtime egress permits them (the bridge SSRF DROP only blocks link-local/RFC1918).
-const RUNTIME_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions edns0\n";
+/// DNS resolver written into each runtime container's `/etc/resolv.conf`: the runtime
+/// BRIDGE GATEWAY (172.16.0.1), where the host runs a DNS forwarder (systemd-resolved
+/// exposed on the bridge IP; see tools/setup-bridge.sh). Without this an app can reach
+/// literal IPs but cannot resolve hostnames. We point at the gateway rather than a
+/// public resolver because many hosts (e.g. OVH) block outbound UDP/53 to public
+/// resolvers — a UDP/53 query to the LOCAL gateway always works, and the host forwards
+/// upstream however it can (provider-agnostic, works for every DNS client).
+const RUNTIME_RESOLV_CONF: &str = "nameserver 172.16.0.1\noptions edns0\n";
 
 /// Layered server: compose `lowerdir=app:runtime:base` over a tmpfs upper, then
 /// run the server in its own mount namespace pivoted into that composed root.
