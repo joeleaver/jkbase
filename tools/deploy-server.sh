@@ -76,18 +76,19 @@ TimeoutStopSec=120
 DROPIN
 sudo systemctl daemon-reload
 
-# Re-sync the build-network ExecStartPre helpers from the repo. provision.sh
-# installs these once; without this, edits to the firewall/cgroup setup never reach
-# an already-provisioned box — it keeps running the old /usr/local/bin copies, so a
-# security-relevant change (e.g. the per-dockerfile-VM egress scoping) silently
-# wouldn't take effect. Re-copied BEFORE the restart so the next ExecStartPre runs
-# the current rules. (jkbase-bridge.sh is intentionally NOT re-synced: provision.sh
-# generates it inline with the prod MASQUERADE/ip_forward rules that the repo's
-# dev-only tools/setup-bridge.sh lacks — copying that would break runtime-VM egress.)
-echo "Re-syncing build-network helper scripts..."
+# Re-sync the ExecStartPre helpers from the repo. provision.sh installs these once;
+# without this, edits to the bridge/firewall/cgroup setup never reach an already-
+# provisioned box — it keeps running the old /usr/local/bin copies, so a security-
+# relevant change (e.g. the per-dockerfile-VM egress scoping, or the runtime-bridge
+# link-local/RFC1918 SSRF DROP) silently wouldn't take effect. Re-copied BEFORE the
+# restart so the next ExecStartPre runs the current rules. (jkbase-bridge.sh is now a
+# maintained standalone script — tools/setup-bridge.sh — carrying the full prod NAT +
+# FORWARD rules, so it IS safe to re-sync here, unlike the old dev-only stub.)
+echo "Re-syncing ExecStartPre helper scripts..."
+sudo cp "$HOME/jkbase/tools/setup-bridge.sh" /usr/local/bin/jkbase-bridge.sh
 sudo cp "$HOME/jkbase/tools/setup-build-cgroup.sh" /usr/local/bin/jkbase-build-cgroup.sh
 sudo cp "$HOME/jkbase/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
-sudo chmod +x /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-build-net.sh
+sudo chmod +x /usr/local/bin/jkbase-bridge.sh /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-build-net.sh
 
 # ebtables is required when --build-proxy-any-port is active (the server's L2
 # source-guard, ensure_source_guard, fails closed without it). provision.sh installs
