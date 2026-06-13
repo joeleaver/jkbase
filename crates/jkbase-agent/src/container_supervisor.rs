@@ -570,15 +570,30 @@ fn spawn_server_layered(
             .with_context(|| format!("create overlay scratch {}", d.display()))?;
     }
 
-    // Give the container working DNS: write /etc/resolv.conf into the overlay UPPER
-    // dir, so it shadows any lower /etc/resolv.conf and appears in the merged root the
-    // child pivots into. Best-effort — a missing resolver degrades to literal-IP-only
-    // egress, not a server failure.
-    let etc = upper.join("etc");
-    if let Err(e) = std::fs::create_dir_all(&etc)
-        .and_then(|()| std::fs::write(etc.join("resolv.conf"), RUNTIME_RESOLV_CONF))
-    {
-        warn!(server = %name, error = %e, "failed to write container resolv.conf; DNS may not resolve");
+    // A single lowerdir is a self-contained image (image/self = the `builder =
+    // "dockerfile"` / OCI case): it owns its full userland, possibly including a curated
+    // /etc/resolv.conf (custom resolver / search / ndots).
+    let image_self = lowerdirs.len() == 1;
+
+    // Give the container working DNS: write /etc/resolv.conf into the overlay UPPER dir,
+    // so it shadows the lower and appears in the merged root the child pivots into.
+    // Best-effort — a missing resolver degrades to literal-IP-only egress, not a server
+    // failure. EXCEPTION: for a self-contained image that ships its OWN resolv.conf,
+    // honour it rather than clobbering it with our public resolvers.
+    let lower_has_resolv = image_self
+        && lowerdirs
+            .first()
+            .map(|l| l.join("etc/resolv.conf").exists())
+            .unwrap_or(false);
+    if lower_has_resolv {
+        info!(server = %name, "image ships its own /etc/resolv.conf; not overriding");
+    } else {
+        let etc = upper.join("etc");
+        if let Err(e) = std::fs::create_dir_all(&etc)
+            .and_then(|()| std::fs::write(etc.join("resolv.conf"), RUNTIME_RESOLV_CONF))
+        {
+            warn!(server = %name, error = %e, "failed to write container resolv.conf; DNS may not resolve");
+        }
     }
 
     let working_dir = manifest
@@ -623,9 +638,8 @@ fn spawn_server_layered(
     if manifest.cmd.len() > 1 {
         std_cmd.args(&manifest.cmd[1..]);
     }
-    // A single lowerdir is a self-contained image (image/self): no shared base/
+    // image_self (a single self-contained lowerdir) computed above: no shared base/
     // runtime beneath it, so honour the image's own PATH/HOME and skip /opt/bun.
-    let image_self = lowerdirs.len() == 1;
     let extra_path = if image_self { "" } else { "/opt/bun/bin" };
     apply_server_env(&mut std_cmd, manifest, extra_path, image_self);
 

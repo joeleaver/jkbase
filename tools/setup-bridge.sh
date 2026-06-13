@@ -73,4 +73,18 @@ if [ -n "$PUB_IFACE" ]; then
     fi
 fi
 
+# IPv6: runtime egress is IPv4-only (no v6 NAT/forwarding), and the metadata DROP above
+# is v6-blind — so disable IPv6 on the bridge and DROP all v6 forwarding/input from it,
+# closing the v6 SSRF/metadata path. Guests also boot ipv6.disable=1; this is host-side
+# defense in depth, mirroring the build bridge (tools/setup-build-net.sh).
+sysctl -w "net.ipv6.conf.${BRIDGE}.disable_ipv6=1" >/dev/null 2>&1 || true
+if command -v ip6tables >/dev/null 2>&1; then
+    if ! ip6tables -C FORWARD -i "$BRIDGE" -j DROP 2>/dev/null; then
+        ip6tables -I FORWARD 1 -i "$BRIDGE" -j DROP
+    fi
+    if ! ip6tables -C INPUT -i "$BRIDGE" -j DROP 2>/dev/null; then
+        ip6tables -I INPUT 1 -i "$BRIDGE" -j DROP
+    fi
+fi
+
 echo "runtime bridge ready: $BRIDGE ($GW_CIDR) NAT'd to ${PUB_IFACE:-<no uplink>}; link-local/metadata forwarding dropped (RFC1918 egress allowed)"

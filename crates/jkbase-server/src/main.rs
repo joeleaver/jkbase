@@ -1657,21 +1657,36 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
 
     if !exists {
         run_cmd("ip", &["tuntap", "add", "dev", tap_name, "mode", "tap"]).await?;
-        run_cmd("ip", &["link", "set", tap_name, "master", "jkbr0"]).await?;
-        // Bridge port isolation: isolated ports cannot forward to each other at L2, so
-        // one tenant's runtime VM can't reach another's at 172.16.0.x on the shared
-        // bridge (the gateway/uplink — a non-isolated port — stays reachable, so egress
-        // is unaffected). Matches the build bridge's per-TAP isolation. Fail-closed:
-        // if the kernel can't apply it, the deploy fails rather than running a VM with
-        // cross-tenant L2 reachability.
-        run_cmd(
-            "ip",
-            &["link", "set", "dev", tap_name, "type", "bridge_slave", "isolated", "on"],
-        )
-        .await?;
-        run_cmd("ip", &["link", "set", tap_name, "up"]).await?;
-        info!(tap_name, "tap device created (bridge-port-isolated)");
+        info!(tap_name, "tap device created");
     }
+
+    // (Re)assert master + isolation + IPv6-off UNCONDITIONALLY — not only on fresh
+    // creation. A TAP that survives a restart/wake, or one created by an older binary
+    // (pre-isolation), must be brought to the current security posture rather than left
+    // at whatever it had; all of these are idempotent. Without this, every project
+    // already running when this fix first deploys would stay un-isolated.
+    run_cmd("ip", &["link", "set", tap_name, "master", "jkbr0"]).await?;
+    // Bridge port isolation: isolated ports cannot forward to each other at L2, so one
+    // tenant's runtime VM can't reach another's at 172.16.0.x on the shared bridge (the
+    // gateway/uplink — a non-isolated port — stays reachable, so egress is unaffected).
+    // Fail-closed: if the kernel can't apply it, the deploy fails rather than running a
+    // VM with cross-tenant L2 reachability. NB this is the isolation half only — an
+    // ebtables L2 source-guard (anti IP/MAC spoof, as the build bridge has) is a tracked
+    // follow-up; port isolation already blocks the high-value cross-tenant-hijack case.
+    run_cmd(
+        "ip",
+        &["link", "set", "dev", tap_name, "type", "bridge_slave", "isolated", "on"],
+    )
+    .await?;
+    // Disable IPv6 on the TAP so a guest can't pivot to metadata/host over v6 around the
+    // IPv4-only bridge SSRF DROP (defense in depth — runtime guests also boot
+    // ipv6.disable=1). Best-effort: the load-bearing guard is the guest-side disable.
+    let _ = run_cmd(
+        "sysctl",
+        &["-w", &format!("net.ipv6.conf.{tap_name}.disable_ipv6=1")],
+    )
+    .await;
+    run_cmd("ip", &["link", "set", tap_name, "up"]).await?;
 
     Ok(())
 }
