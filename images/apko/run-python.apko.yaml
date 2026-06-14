@@ -23,12 +23,8 @@ contents:
     - ca-certificates-bundle
     - python-3.12
 
-# Stable /usr/bin/python3 → the versioned interpreter (matches the build toolchain so
-# the buildpack's absolute PYTHON_BIN resolves at runtime).
-paths:
-  - path: /usr/bin/python3
-    type: symlink
-    source: /usr/bin/python3.12
+# NB: `python-3.12` already provides /usr/bin/python3, so the buildpack's absolute
+# PYTHON_BIN = /usr/bin/python3 resolves at runtime without an extra symlink.
 
 archs:
   - x86_64

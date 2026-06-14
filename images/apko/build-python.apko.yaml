@@ -37,13 +37,8 @@ contents:
     # git: some pip requirements are `git+https://…` specs.
     - git
 
-# A stable, version-independent /usr/bin/python3 so the buildpack's PYTHON_BIN and
-# `python3 -m pip` resolve regardless of the pinned minor. (Wolfi installs the
-# versioned /usr/bin/python3.12.)
-paths:
-  - path: /usr/bin/python3
-    type: symlink
-    source: /usr/bin/python3.12
+# NB: the `python-3.12` package already provides /usr/bin/python3 (→ python3.12), so
+# the buildpack's PYTHON_BIN = /usr/bin/python3 resolves without an extra symlink.
 
 archs:
   - x86_64
