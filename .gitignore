@@ -3,3 +3,5 @@
 .env
 /.playwright-mcp
 .claude/scheduled_tasks.lock
+# Stale SBOMs apko drops in the repo root during a toolchain/runtime-layer bake.
+/sbom-*.spdx.json
