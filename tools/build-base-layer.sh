@@ -7,10 +7,18 @@
 #
 # Each layer becomes a content-addressed erofs blob `sha256-<hex>.erofs` in the
 # host layer store, matching the in-VM app-layer exporter (mkfs.erofs -zlz4hc).
-# fs-verity is enabled best-effort (defense-in-depth); the load-bearing integrity
-# is the recorded sha256, which the host re-verifies before attaching a blob to a
-# tenant VM. A `platform.json` records the current base + per-language runtime
-# digests so the host can inject them ahead of the per-deploy app layer.
+# At the host level the load-bearing integrity is the recorded sha256, which the host
+# re-verifies before attaching a blob to a tenant VM (fs-verity on the store blob is
+# enabled best-effort as extra defense-in-depth). Each shared layer ALSO carries an
+# appended dm-verity Merkle tree, so the in-guest agent integrity-verifies every block
+# read at runtime (see pack_layer + crates/jkbase-agent/src/dmverity.rs). A `platform.json`
+# records the current base + per-language runtime digests + verity params so the host can
+# inject them ahead of the per-deploy app layer.
+#
+# COUPLING: stamping dm-verity into platform.json here REQUIRES the agent rootfs to ship
+# `veritysetup` (the run-agent image) — else the verity-mapped layers fail closed and no
+# layered server starts. tools/deploy-server.sh rebuilds the rootfs every deploy, so the
+# standard path stays coupled; don't bake verity here without also refreshing the rootfs.
 #
 # Host tooling (NOT in the VM): apko + erofs-utils (mkfs.erofs) + fsverity-utils.
 #   tools/install-image-tools.sh installs them.
@@ -70,22 +78,31 @@ mkdir -p "$WORK" "$STORE"
 pack_layer() {
     local stage="$1" name="$2"
     local tmp="$WORK/$name.erofs"
+    # Deterministic per-layer UUID (derived from the layer name) pinned into BOTH the
+    # erofs superblock (-U) and the dm-verity superblock (--uuid). Without this, mkfs.erofs
+    # embeds a RANDOM filesystem UUID and `veritysetup format` a RANDOM tree UUID, either of
+    # which churns the whole-blob sha256 (= the content address `sha256-<hex>.erofs`) on
+    # every bake — defeating the cross-tenant layer-store dedup that is a primary design
+    # driver. Same name -> same UUID -> a re-bake of unchanged content is byte-identical.
+    local uuid
+    uuid="$(printf '%s' "jkbase-layer-$name" | sha256sum | cut -c1-32 \
+        | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')"
     # -zlz4hc matches crates/jkbuild/src/export.rs::pack_layer_erofs; --all-root
-    # normalizes ownership; -T 0 (mtimes pinned) + --mkfs-time for a reproducible,
-    # content-stable blob. Run as root: the trusted base preserves Wolfi's intended
-    # perms (some dirs are non-readable to a non-owner), which root can still read.
-    sudo mkfs.erofs -zlz4hc --all-root -T 0 --mkfs-time "$tmp" "$stage" >/dev/null
+    # normalizes ownership; -T 0 (mtimes pinned) + --mkfs-time + -U (UUID pinned) for a
+    # reproducible, content-stable blob. Run as root: the trusted base preserves Wolfi's
+    # intended perms (some dirs are non-readable to a non-owner), which root can still read.
+    sudo mkfs.erofs -zlz4hc --all-root -T 0 --mkfs-time -U "$uuid" "$tmp" "$stage" >/dev/null
     sudo chown "$(id -u):$(id -g)" "$tmp"
 
     # --- dm-verity: append a Merkle hash tree so the in-guest agent can integrity-verify
     # EVERY block read of this SHARED layer (a poisoned base/runtime would hit every
     # tenant). The blob becomes one file `[ erofs data | hash tree ]`; the tree starts at
-    # the 4096-aligned data size (block-aligned per dm-verity). The salt is deterministic
-    # = sha256(erofs data) so the formatted blob stays a pure function of its content (no
-    # build-time randomness churning the content-addressed store). The host records
-    # root_hash/salt/data_size in platform.json; the guest pins root_hash at activation,
-    # which also covers the on-blob verity superblock (so its salt/geometry can't be
-    # forged). See crates/jkbase-agent/src/dmverity.rs.
+    # the 4096-aligned data size (block-aligned per dm-verity). Salt (= sha256(erofs data))
+    # and UUID (pinned above) are deterministic, so the formatted blob stays a pure function
+    # of its content — no build-time randomness churns the content-addressed store. The host
+    # records root_hash/salt/data_size in platform.json; the guest pins root_hash at
+    # activation, which also covers the on-blob verity superblock (so its salt/geometry/UUID
+    # can't be forged). See crates/jkbase-agent/src/dmverity.rs.
     local erofs_size data_size
     erofs_size="$(stat -c%s "$tmp")"
     data_size=$(( (erofs_size + 4095) / 4096 * 4096 ))
@@ -96,9 +113,12 @@ pack_layer() {
     PACK_DATA_SIZE="$data_size"
     PACK_ROOT_HASH="$(veritysetup format \
         --data-block-size=4096 --hash-block-size=4096 \
-        --hash-offset="$data_size" --salt="$PACK_SALT" \
+        --hash-offset="$data_size" --salt="$PACK_SALT" --uuid="$uuid" \
         "$tmp" "$tmp" | awk '/Root hash:/ {print $NF}')"
-    [ -n "$PACK_ROOT_HASH" ] || { echo "[$name] veritysetup format produced no root hash" >&2; exit 1; }
+    # Strict 64-hex guard: a parse drift (veritysetup format change, trailing annotation)
+    # must abort the bake, never record a truncated/wrong root that silently fails every
+    # layered server at boot.
+    [[ "$PACK_ROOT_HASH" =~ ^[0-9a-f]{64}$ ]] || { echo "[$name] veritysetup root hash not 64-hex: '$PACK_ROOT_HASH'" >&2; exit 1; }
 
     # Content address = sha256 of the WHOLE blob (erofs data + appended tree); this is
     # what the host re-verifies before attaching, composing with the guest's per-read

@@ -12,6 +12,15 @@
 //! Verification is **fail-closed**: a layer that declares a root hash but won't activate
 //! is an error, never a silent fall-through to an unverified mount.
 //!
+//! Note `veritysetup open` itself returns success even for a root-hash mismatch or a
+//! forged/tampered blob — dm-verity is a *lazy* verifier, so the mismatch only surfaces
+//! as EIO on the first read. So [`activate`] forces that read here (one block of the
+//! mapper node) and treats EIO as activation failure, making activation the real integrity
+//! boundary rather than relying on a downstream mount side effect. Blocks NOT read at
+//! activation are still verified on first access (a tampered block elsewhere → EIO when
+//! touched) — full eager scanning of the (small, host-built) shared layers is left out as
+//! a cost/benefit call.
+//!
 //! ## Layout
 //!
 //! Each verity'd layer blob is `[ erofs data | dm-verity hash tree ]` in one file (the
@@ -28,7 +37,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub use jkbase_common::layers::VerityParams;
 
@@ -36,6 +46,13 @@ pub use jkbase_common::layers::VerityParams;
 const VERITYSETUP: &str = "veritysetup";
 /// dm-verity (and the host's hash-tree build) use a 4096-byte block.
 const VERITY_BLOCK_SIZE: u64 = 4096;
+/// Wall-clock bound on a single `veritysetup` invocation. The agent runs this on the
+/// PID1 boot path with no init beneath it, so an unbounded `veritysetup` hang (DM lock,
+/// a slow virtio-blk backing a layer blob) would wedge the VM forever. On timeout the
+/// child is killed and the call fails — so a stuck layer fails closed (its server won't
+/// start layered) instead of bricking boot.
+const VERITY_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const VERITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// An active dm-verity mapping. Dropping it tears the mapping down (best-effort), so a
 /// failed mount never leaks a dm device. After the erofs mount holds the device, call
@@ -90,6 +107,42 @@ fn which_veritysetup() -> Option<PathBuf> {
     None
 }
 
+/// Run `cmd` to completion but never block longer than `timeout` — a hung `veritysetup`
+/// must not wedge PID1 at boot (see [`VERITY_OPEN_TIMEOUT`]). On timeout the child is
+/// killed and a `TimedOut` error returned so the caller fails closed. `veritysetup`'s
+/// output is tiny, so polling `try_wait` without draining the pipes can't deadlock (the
+/// pipe buffer never fills before the child exits).
+fn run_bounded(mut cmd: Command, timeout: Duration) -> io::Result<std::process::Output> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let start = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            // Reaped; wait_with_output reads the pipes to EOF and returns the cached status.
+            return child.wait_with_output();
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "veritysetup timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Force dm-verity to verify the device's first block. `veritysetup open` succeeds even
+/// on a root-hash mismatch / forged or tampered blob (dm-verity verifies lazily), so this
+/// read is what actually fails closed at activation: EIO ⇒ the mapped content does not
+/// match the pinned root. The erofs superblock lives in this first block, so this also
+/// covers the geometry the mount relies on.
+fn verify_first_block(node: &Path) -> io::Result<()> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(node)?;
+    let mut buf = [0u8; VERITY_BLOCK_SIZE as usize];
+    f.read_exact(&mut buf)?; // EIO if the verified content doesn't match the pinned root
+    Ok(())
+}
+
 /// Activate a dm-verity device named `name` over the block device `data_dev` (which
 /// holds erofs data followed by the verity hash tree at `params.data_size`), pinned to
 /// `params.root_hash`. Returns a handle whose `.path()` is `/dev/mapper/<name>` to mount
@@ -109,6 +162,24 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
     if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
         return Err(io::Error::other(format!("dm-verity: bad device name {name:?}")));
     }
+    // data_dev is host-generated (`/dev/vd[a-z]` from the layer plan), but it is the one
+    // field reaching the security-load-bearing exec, so validate it defensively: a real
+    // block device under /dev with no traversal. A future bug or a hand-edited metadata
+    // image then can't point veritysetup at an arbitrary host path.
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let under_dev = data_dev.starts_with("/dev/")
+            && !data_dev.components().any(|c| c == std::path::Component::ParentDir);
+        let is_block = std::fs::metadata(data_dev)
+            .map(|m| m.file_type().is_block_device())
+            .unwrap_or(false);
+        if !under_dev || !is_block {
+            return Err(io::Error::other(format!(
+                "dm-verity: {name}: refusing non-block device {}",
+                data_dev.display()
+            )));
+        }
+    }
     let tool = which_veritysetup()
         .ok_or_else(|| io::Error::other("dm-verity: veritysetup not found in the runtime image"))?;
 
@@ -119,15 +190,15 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
     // DM_DISABLE_UDEV=1: the runtime guest has NO udevd, so libdevmapper must create and
     // manage the `/dev/mapper/<name>` node itself (via devtmpfs) instead of blocking on a
     // udev cookie that nothing will ever post — the standard no-udev (initramfs) posture.
-    let out = Command::new(&tool)
-        .arg("open")
+    let mut cmd = Command::new(&tool);
+    cmd.arg("open")
         .arg(data_dev)
         .arg(name)
         .arg(data_dev)
         .arg(&params.root_hash)
         .arg(format!("--hash-offset={}", params.data_size))
-        .env("DM_DISABLE_UDEV", "1")
-        .output()?;
+        .env("DM_DISABLE_UDEV", "1");
+    let out = run_bounded(cmd, VERITY_OPEN_TIMEOUT)?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "dm-verity: veritysetup open {name} failed ({}): {}",
@@ -135,24 +206,33 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(VerityDevice {
+    let dev = VerityDevice {
         name: name.to_string(),
         node: PathBuf::from(format!("/dev/mapper/{name}")),
         armed: true,
-    })
+    };
+    // `open` succeeds even on a root-hash mismatch (dm-verity is lazy) — force the check
+    // now so activation is the real fail-closed gate. On EIO `dev` drops, tearing the
+    // mapping down.
+    verify_first_block(dev.path()).map_err(|e| {
+        io::Error::other(format!(
+            "dm-verity: {name} failed integrity verification \
+             (root-hash mismatch or tampered block): {e}"
+        ))
+    })?;
+    Ok(dev)
 }
 
-/// Tear down a verity mapping by name (`veritysetup close`). Best-effort.
+/// Tear down a verity mapping by name (`veritysetup close`). Best-effort, time-bounded so
+/// a hung teardown (invoked from `Drop` on the boot path) can't wedge PID1 either.
 pub fn close(name: &str) -> io::Result<()> {
     let tool = which_veritysetup()
         .ok_or_else(|| io::Error::other("dm-verity: veritysetup not found"))?;
     // DM_DISABLE_UDEV=1: mirror activation — no udevd in the guest, so libdevmapper
     // tears the node down directly rather than waiting on a udev cookie.
-    let _ = Command::new(&tool)
-        .arg("close")
-        .arg(name)
-        .env("DM_DISABLE_UDEV", "1")
-        .output()?;
+    let mut cmd = Command::new(&tool);
+    cmd.arg("close").arg(name).env("DM_DISABLE_UDEV", "1");
+    let _ = run_bounded(cmd, VERITY_CLOSE_TIMEOUT);
     Ok(())
 }
 

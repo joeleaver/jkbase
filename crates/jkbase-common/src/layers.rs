@@ -57,16 +57,25 @@ pub struct ServerLayers {
 /// `data_size` is both the erofs size and the tree's start offset.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerityParams {
-    /// hex sha256 dm-verity root hash.
+    /// hex sha256 dm-verity root hash — the trust anchor the agent pins at activation.
     pub root_hash: String,
-    /// hex salt the tree was built with.
+    /// hex salt the tree was built with. **Diagnostic only**: the agent does NOT pass it
+    /// to `veritysetup open` — the salt lives in the on-blob verity superblock (covered by
+    /// the pinned `root_hash`, so it can't be forged). Recorded for audit / re-format; not
+    /// a consumer-enforced trust input.
     pub salt: String,
-    /// erofs data size in bytes (4096-block-aligned) — where the hash tree begins.
+    /// erofs data size in bytes (4096-block-aligned) — where the hash tree begins. This IS
+    /// load-bearing: the agent passes it as `--hash-offset`.
     pub data_size: u64,
 }
 
 impl RuntimeLayers {
-    pub const SCHEMA: u32 = 1;
+    /// Contract version. **2** = the dm-verity era: a populated `verity` map MUST be
+    /// honoured (its layers activated through dm-verity, not mounted raw). The agent
+    /// refuses to mount layers from any image whose schema exceeds the version it knows,
+    /// so a future format can never be silently down-graded to unverified mounts by an
+    /// older-but-schema-aware agent (fail-closed). Bumped from 1 (pre-verity).
+    pub const SCHEMA: u32 = 2;
     /// Filename the host writes into the metadata image and the agent reads.
     pub const FILE: &'static str = "_layers.json";
 
@@ -102,7 +111,7 @@ mod tests {
         );
         let json = serde_json::to_string(&rl).unwrap();
         let back: RuntimeLayers = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.schema, 1);
+        assert_eq!(back.schema, RuntimeLayers::SCHEMA);
         assert_eq!(back.data_device.as_deref(), Some("/dev/vdf"));
         assert_eq!(back.servers["api"].layers, vec!["/dev/vde", "/dev/vdd", "/dev/vdc"]);
     }

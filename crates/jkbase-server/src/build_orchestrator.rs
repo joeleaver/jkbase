@@ -1439,11 +1439,24 @@ fn collect_layered_server(
             // Filter empties so a `language = ""` in jkbase.toml can't stamp an empty
             // runtime (which would fail compute_layer_plan with "no platform runtime
             // layer for language ''").
-            resolved_language
+            let r = resolved_language
                 .filter(|l| !l.is_empty())
                 .map(str::to_string)
                 .or_else(|| spec.language.clone().filter(|l| !l.is_empty()))
-                .unwrap_or_else(|| "bun".to_string())
+                .unwrap_or_else(|| "bun".to_string());
+            // `image/self` is a RESERVED host-only sentinel set solely by the Dockerfile
+            // branch above; it marks a self-contained single-layer rootfs that bypasses the
+            // shared base/runtime + dm-verity stack. A tenant must not be able to forge it
+            // via a jkbase.toml `language = "image/self"` hint (untrusted input → reserved
+            // control value). Reject it here; legitimate languages are never this string.
+            if r == crate::layer_plan::IMAGE_SELF_RUNTIME {
+                anyhow::bail!(
+                    "invalid language '{}' for server '{}': reserved platform value",
+                    r,
+                    spec.name
+                );
+            }
+            r
         };
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
     }

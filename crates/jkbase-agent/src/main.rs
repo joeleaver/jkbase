@@ -358,7 +358,21 @@ async fn main() -> Result<()> {
                 if let Some(dev) = rl.data_device.as_deref() {
                     mount_data_disk(Some(dev));
                 }
-                layer_map = mount_layers(&rl);
+                // Fail-closed on a newer-than-known contract: an image whose schema
+                // exceeds what this agent understands may carry integrity semantics
+                // (e.g. a verity map) we cannot honour, so refuse the layered mounts
+                // rather than silently mount them unverified. The data disk above is
+                // schema-independent and still mounts.
+                if rl.schema > RuntimeLayers::SCHEMA {
+                    eprintln!(
+                        "_layers.json schema {} is newer than this agent supports ({}); \
+                         refusing layered mounts (fail-closed)",
+                        rl.schema,
+                        RuntimeLayers::SCHEMA
+                    );
+                } else {
+                    layer_map = mount_layers(&rl);
+                }
             }
             None => {
                 // Legacy flat content image: data disk at the fixed /dev/vdc slot.
