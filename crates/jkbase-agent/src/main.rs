@@ -156,14 +156,41 @@ fn load_runtime_layers(serve_dir: &Path) -> Option<RuntimeLayers> {
     }
 }
 
+/// dm-verity mapper name for a layer block device (e.g. `/dev/vdc` → `jkverity-vdc`):
+/// stable, unique per device, and within `dmverity::activate`'s accepted name charset.
+fn verity_name(device: &str) -> String {
+    let base = Path::new(device)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("dev");
+    format!("jkverity-{base}")
+}
+
+/// Mount an erofs filesystem read-only from `source` (a raw block device or an
+/// activated `/dev/mapper` verity node) at `target`.
+fn mount_erofs_ro(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
+    let src = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("nul byte in source path"))?;
+    let tgt = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("nul byte in target path"))?;
+    let fst = CString::new("erofs").unwrap();
+    let ret = unsafe {
+        libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, ptr::null())
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Mount each distinct erofs layer block device read-only under /tmp/layers, and
 /// return `server name` → its ordered lowerdir mountpoints (app first, base last)
 /// for the supervisor to overlay. A server whose layers don't all mount is omitted
 /// (it won't be started layered).
 fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
-    use std::ffi::CString;
-    use std::ptr;
-
     let base = Path::new("/tmp/layers");
     let _ = std::fs::create_dir_all(base);
 
@@ -175,7 +202,27 @@ fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
         base.join(name)
     };
 
-    // Mount each distinct device exactly once.
+    // One clear diagnostic if integrity-enforced layers are declared but this guest
+    // can't activate dm-verity (no device-mapper / no veritysetup) — those layers then
+    // fail closed per-device below; this just names the root cause once up front.
+    if !rl.verity.is_empty() && !dmverity::available() {
+        eprintln!(
+            "dm-verity required by {} shared layer(s) but device-mapper/veritysetup is \
+             unavailable in this guest; verified layers will fail closed (their servers \
+             will not start layered)",
+            rl.verity.len()
+        );
+    }
+
+    // Mount each distinct device exactly once. A device listed in `rl.verity` is an
+    // integrity-enforced shared layer (the base / per-language runtime, whose poisoning
+    // would hit every tenant): activate a dm-verity mapping pinned to its host-computed
+    // root hash and mount erofs from the verified `/dev/mapper` node — a tampered block
+    // then returns EIO. This is FAIL-CLOSED: if verity activation or the verified mount
+    // fails we skip the layer (its server simply won't start layered), never falling
+    // through to an unverified direct mount. A device ABSENT from `rl.verity` (the
+    // per-tenant app layer — self-affecting + host-sha256-verified at attach — and any
+    // pre-verity image) is mounted erofs directly.
     let mut mounted: HashMap<String, PathBuf> = HashMap::new();
     for server in rl.servers.values() {
         for device in &server.layers {
@@ -188,21 +235,37 @@ fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
             }
             let mp = mountpoint_for(device);
             let _ = std::fs::create_dir_all(&mp);
-            let src = CString::new(device.as_bytes()).unwrap();
-            let tgt = CString::new(mp.to_string_lossy().as_bytes()).unwrap();
-            let fst = CString::new("erofs").unwrap();
-            let ret = unsafe {
-                libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, ptr::null())
-            };
-            if ret != 0 {
-                eprintln!(
-                    "failed to mount erofs {device} at {}: {}",
-                    mp.display(),
-                    std::io::Error::last_os_error()
-                );
-                continue;
+
+            if let Some(params) = rl.verity.get(device) {
+                let name = verity_name(device);
+                let dev = match dmverity::activate(&name, Path::new(device), params) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("dm-verity activation failed for {device}: {e}; layer skipped");
+                        continue;
+                    }
+                };
+                match mount_erofs_ro(dev.path(), &mp) {
+                    Ok(()) => {
+                        // The erofs mount now pins the mapping; disarm teardown-on-drop
+                        // so dropping the handle here can't tear down the live mount.
+                        dev.leak();
+                        mounted.insert(device.clone(), mp);
+                    }
+                    Err(e) => {
+                        // Mount failed: `dev` is still armed, so dropping it here tears
+                        // the verity mapping down — no leaked dm device.
+                        eprintln!(
+                            "failed to mount verified erofs {device} at {}: {e}",
+                            mp.display()
+                        );
+                    }
+                }
+            } else if let Err(e) = mount_erofs_ro(Path::new(device), &mp) {
+                eprintln!("failed to mount erofs {device} at {}: {e}", mp.display());
+            } else {
+                mounted.insert(device.clone(), mp);
             }
-            mounted.insert(device.clone(), mp);
         }
     }
 

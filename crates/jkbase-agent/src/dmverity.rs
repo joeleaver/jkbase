@@ -115,6 +115,10 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
     // `veritysetup open <data_dev> <name> <hash_dev> <root_hash> --hash-offset=<data_size>`.
     // data_dev == hash_dev (one blob); the salt + tree geometry come from the on-blob
     // superblock, but the trust anchor is the explicit, host-pinned root_hash.
+    //
+    // DM_DISABLE_UDEV=1: the runtime guest has NO udevd, so libdevmapper must create and
+    // manage the `/dev/mapper/<name>` node itself (via devtmpfs) instead of blocking on a
+    // udev cookie that nothing will ever post — the standard no-udev (initramfs) posture.
     let out = Command::new(&tool)
         .arg("open")
         .arg(data_dev)
@@ -122,6 +126,7 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
         .arg(data_dev)
         .arg(&params.root_hash)
         .arg(format!("--hash-offset={}", params.data_size))
+        .env("DM_DISABLE_UDEV", "1")
         .output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
@@ -141,7 +146,13 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
 pub fn close(name: &str) -> io::Result<()> {
     let tool = which_veritysetup()
         .ok_or_else(|| io::Error::other("dm-verity: veritysetup not found"))?;
-    let _ = Command::new(&tool).arg("close").arg(name).output()?;
+    // DM_DISABLE_UDEV=1: mirror activation — no udevd in the guest, so libdevmapper
+    // tears the node down directly rather than waiting on a udev cookie.
+    let _ = Command::new(&tool)
+        .arg("close")
+        .arg(name)
+        .env("DM_DISABLE_UDEV", "1")
+        .output()?;
     Ok(())
 }
 
