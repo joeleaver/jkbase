@@ -1,5 +1,6 @@
 mod clock;
 mod container_supervisor;
+mod dmverity;
 mod function_runtime;
 mod static_server;
 

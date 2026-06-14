@@ -32,6 +32,14 @@ pub struct RuntimeLayers {
     /// no layers (they should not exist — every built server is layered).
     #[serde(default)]
     pub servers: BTreeMap<String, ServerLayers>,
+    /// `layer device path` → dm-verity parameters, for the layers the host built with
+    /// an appended verity hash tree (the shared base + per-language runtime layers — a
+    /// poisoned shared layer would hit every tenant, so those are integrity-enforced).
+    /// A device ABSENT from this map carries no verity tree and is mounted directly: the
+    /// per-tenant app layer (self-affecting; host-sha256-verified at attach) and any
+    /// pre-verity deployment. Keyed by the same device strings used in `servers`.
+    #[serde(default)]
+    pub verity: BTreeMap<String, VerityParams>,
 }
 
 /// One server's overlay stack: erofs layer block devices in `lowerdir` order
@@ -40,6 +48,21 @@ pub struct RuntimeLayers {
 pub struct ServerLayers {
     /// erofs layer block devices, highest (app) first, lowest (base) last.
     pub layers: Vec<String>,
+}
+
+/// dm-verity parameters for one layer blob, computed by the host at build time and
+/// enforced by the in-guest agent (which activates a verity device over the block
+/// device and mounts erofs from it — a tampered block returns EIO). The hash tree lives
+/// at the end of the SAME content-addressed blob (`[ erofs data | hash tree ]`), so
+/// `data_size` is both the erofs size and the tree's start offset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerityParams {
+    /// hex sha256 dm-verity root hash.
+    pub root_hash: String,
+    /// hex salt the tree was built with.
+    pub salt: String,
+    /// erofs data size in bytes (4096-block-aligned) — where the hash tree begins.
+    pub data_size: u64,
 }
 
 impl RuntimeLayers {
@@ -52,6 +75,7 @@ impl RuntimeLayers {
             schema: Self::SCHEMA,
             data_device: None,
             servers: BTreeMap::new(),
+            verity: BTreeMap::new(),
         }
     }
 }
