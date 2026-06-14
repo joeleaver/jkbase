@@ -88,6 +88,34 @@ else
     echo "[build-image] WARN: busybox not found in image; lifecycle shell-outs may fail" >&2
 fi
 
+# Build-mirror CA (optional). When BUILD_CA_CERT points at the shared CA cert, bake it
+# into THIS build toolchain's trust store so the build tools accept the mirror's
+# TLS-terminated registry connections: append to the public bundle (cargo/git/bun via
+# the system store) AND drop the standalone PEM at the path node/bun read via
+# NODE_EXTRA_CA_CERTS. Set BUILD_CA_CERT only for the language toolchains (bun/node/
+# rust); the dockerfile toolchain uses the allow-any proxy (never MITM'd) so it needs
+# no CA. This step is in build-image.sh ONLY — runtime images are built by
+# tools/build-base-layer.sh, which has no CA step, so the CA can never leak into a
+# runtime trust store (invariant I-3).
+if [ -n "${BUILD_CA_CERT:-}" ]; then
+    if [ ! -f "$BUILD_CA_CERT" ]; then
+        echo "[build-image] BUILD_CA_CERT set but $BUILD_CA_CERT not found" >&2
+        exit 1
+    fi
+    echo "[build-image] injecting build-mirror CA from $BUILD_CA_CERT"
+    install -Dm0644 "$BUILD_CA_CERT" "$STAGE/etc/ssl/certs/jkbase-build-ca.crt"
+    bundle="$STAGE/etc/ssl/certs/ca-certificates.crt"
+    if [ -f "$bundle" ]; then
+        printf '\n' >> "$bundle"
+        cat "$BUILD_CA_CERT" >> "$bundle"
+    else
+        # Refuse to ship a CA-required toolchain whose system store can't trust the
+        # mirror — otherwise cargo/git/bun silently fail every registry TLS at runtime.
+        echo "[build-image] ERROR: $bundle absent; cannot bake mirror CA into the system store" >&2
+        exit 1
+    fi
+fi
+
 echo "[build-image] mkfs.ext4 -d (no mount)"
 # Wolfi ships /etc/shadow et al. mode 0000; rootless `mkfs.ext4 -d` can't read
 # them. Grant owner read so the userspace populate succeeds — runtime perms are

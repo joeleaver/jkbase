@@ -298,6 +298,8 @@ fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
             .env("HTTPS_PROXY", proxy)
             .env("http_proxy", proxy)
             .env("https_proxy", proxy);
+        // Bun honours NODE_EXTRA_CA_CERTS; trust the mirror CA explicitly if baked.
+        crate::buildpack::apply_mirror_ca(cmd);
     }
 }
 

@@ -239,6 +239,9 @@ pub trait BlobStore: Backend {
     async fn head(&self, key: &str) -> Result<Option<BlobMeta>>;
     /// Keys under `prefix`.
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Remove `key`. Idempotent: succeeds whether or not the key existed, so a
+    /// concurrent eviction racing another never errors on an already-gone blob.
+    async fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// R2 — exclusive ownership of a `scope` with a monotonic [`FenceToken`]. The token

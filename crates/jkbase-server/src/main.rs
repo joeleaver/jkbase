@@ -1,8 +1,10 @@
+mod build_ca;
 mod build_orchestrator;
 mod egress;
 mod layer_plan;
 mod log_shipper;
 mod metering;
+mod mirror;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -104,6 +106,26 @@ struct Args {
     #[arg(long)]
     build_proxy_any_port: Option<u16>,
 
+    /// Enable the cross-tenant package MIRROR on the narrow build proxy: CONNECTs to
+    /// package registries (crates.io/npm/PyPI) are TLS-terminated and served from a
+    /// shared content-addressed cache ({data_dir}/buildmirror), so an upstream package
+    /// is fetched once and reused by every tenant. OPT-IN and DORMANT by default — a
+    /// box's egress posture is unchanged until enabled. Requires the shared build CA at
+    /// {data_dir}/build-ca/ca.key AND build toolchains baked to trust it (run
+    /// `jkbase-server gen-build-ca` then rebake the toolchains). Only meaningful with
+    /// --build-net (the mirror rides the narrow proxy).
+    #[arg(long)]
+    build_mirror: bool,
+
+    /// Ceiling (bytes) on the package mirror's content store. Once the cached blobs
+    /// exceed this, the mirror evicts least-recently-used artifacts (via the substrate
+    /// delete seam) back under the cap, so an untrusted tenant flooding the mirror with
+    /// distinct registry artifacts cannot fill {data_dir} (shared with redb/runtime
+    /// data) and DoS the host. Only consulted when --build-mirror is set; default 10 GiB.
+    /// Set well above a single artifact (per-blob cap is 1 GiB) for an effective cache.
+    #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
+    build_mirror_max_bytes: u64,
+
     /// Platform-operator admin token. When set, a `POST /projects/{id}/quota`
     /// bearing `X-Admin-Token: <this>` may raise per-project limits ABOVE the
     /// platform defaults and target any project. Unset (default) = no admin path:
@@ -185,6 +207,37 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
+
+    // Bootstrap subcommand: `jkbase-server gen-build-ca [<dir>]` materializes the
+    // shared build-mirror CA (ca.key + ca.crt) and exits, so the toolchain bake can
+    // inject the public cert before the server proper ever runs. Detected before
+    // Args::parse() so it does not require the full run-time args (--fc-dir, etc.).
+    if std::env::args().nth(1).as_deref() == Some("gen-build-ca") {
+        // Resolve the CA dir consistently with the server's {data_dir}/build-ca so a
+        // mismatched default can't silently bake one CA while the server mints another:
+        //   1) an explicit positional dir, else
+        //   2) {--data-dir}/build-ca if --data-dir is on the command line, else
+        //   3) /var/jkbase/build-ca (the server's default data dir).
+        let argv: Vec<String> = std::env::args().collect();
+        let explicit = argv.get(2).filter(|a| !a.starts_with("--")).map(PathBuf::from);
+        let dir = explicit.unwrap_or_else(|| {
+            let data_dir = argv
+                .windows(2)
+                .find(|w| w[0] == "--data-dir")
+                .map(|w| PathBuf::from(&w[1]))
+                .unwrap_or_else(|| PathBuf::from("/var/jkbase"));
+            data_dir.join("build-ca")
+        });
+        let ca = build_ca::BuildCa::load_or_generate(&dir)?;
+        println!(
+            "build-mirror CA ready ({}): key={} cert={} fingerprint={}",
+            if ca.generated { "generated" } else { "loaded existing" },
+            dir.join("ca.key").display(),
+            dir.join("ca.crt").display(),
+            ca.fingerprint(),
+        );
+        return Ok(());
+    }
 
     tracing_subscriber::fmt::init();
 
@@ -494,7 +547,53 @@ async fn main() -> Result<()> {
         args.egress_addr.clone()
     };
     if let Some(egress_addr) = egress_addr {
-        let cfg = Arc::new(egress::EgressConfig::with_default_allowlist());
+        // Optionally attach the cross-tenant package mirror to the NARROW proxy only.
+        // Dormant unless --build-mirror; the public-any proxy below always stays
+        // mirror-less (I-4). On any init failure we log and fall back to blind tunnels
+        // rather than breaking builds.
+        let mirror = if args.build_mirror {
+            let ca_dir = data_dir.join("build-ca");
+            match build_ca::BuildCa::load_or_generate(&ca_dir) {
+                Ok(ca) => {
+                    let fp = ca.fingerprint();
+                    // A freshly generated CA means the operator skipped the
+                    // gen-build-ca + rebake step: the build toolchains do NOT trust this
+                    // CA, so every MITM'd registry handshake will fail. Warn loudly (we
+                    // still proceed dormant-safe: builds fall back to the real registry
+                    // cert path only if NOT mirrored — but mirrored hosts will break).
+                    if ca.generated {
+                        tracing::warn!(
+                            ca_dir = %ca_dir.display(), fingerprint = %fp,
+                            "build mirror enabled but a NEW CA was generated — toolchains must be \
+                             rebaked to trust it (run `jkbase-server gen-build-ca` then rebake), \
+                             else registry TLS will fail"
+                        );
+                    }
+                    match mirror::MirrorTls::new(
+                        &data_dir,
+                        Arc::new(build_ca::CertSigner::new(ca)),
+                        args.build_mirror_max_bytes,
+                    ) {
+                        Ok(m) => {
+                            info!(ca_dir = %ca_dir.display(), fingerprint = %fp,
+                                "build package mirror enabled (narrow proxy)");
+                            Some(m)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to init build mirror; serving blind tunnels");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to load build CA; serving blind tunnels");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let cfg = Arc::new(egress::EgressConfig::with_default_allowlist().with_mirror(mirror));
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(&egress_addr).await {
                 Ok(listener) => {

@@ -15,10 +15,13 @@
 //!    redirects (each hop the client follows is a fresh, independently-gated
 //!    request through the proxy).
 //!
-//! This card is the allowlist + SSRF layer. The TLS-terminating caching **mirror**
-//! (cross-tenant dedup) and **fetch-then-seal** (host tears the TAP down before
-//! the compile phase) are separate cards; HTTPS here is a CONNECT tunnel, not
-//! intercepted.
+//! This file is the allowlist + SSRF layer. On top of it, an optional TLS-terminating
+//! caching **mirror** ([`crate::mirror`]) is attached to the narrow proxy only: for a
+//! CONNECT to a package-registry host (and only those — [`host_is_mirrorable`]) the
+//! proxy MITMs the connection to serve cross-tenant-deduped, content-verified
+//! artifacts. Every other CONNECT — git-over-https, the dockerfile allow-any proxy,
+//! anything else — stays a blind tunnel. The SSRF allowlist+pin gate runs FIRST,
+//! unchanged, and the pinned address is the one the mirror dials (no re-resolve).
 
 use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -28,6 +31,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
+
+use crate::build_ca::host_is_mirrorable;
+use crate::mirror::MirrorTls;
 
 /// Max concurrent egress connections. Bounds task/FD use so a hostile build VM
 /// can't slowloris the shared server process to FD exhaustion.
@@ -164,6 +170,11 @@ pub struct EgressConfig {
     /// allowlist — so widening to public-any does not weaken control-plane
     /// isolation, only the set of *public* hosts a sandboxed VM may reach.
     pub allow_any: bool,
+    /// When set, CONNECTs to package-registry hosts ([`host_is_mirrorable`]) on 443
+    /// are TLS-terminated and served from the shared content cache. ALWAYS `None` in
+    /// `allow_any` mode — the dockerfile proxy never MITMs (invariant I-4). Everything
+    /// not mirrorable stays a blind tunnel regardless.
+    pub mirror: Option<Arc<MirrorTls>>,
 }
 
 impl EgressConfig {
@@ -171,6 +182,7 @@ impl EgressConfig {
         Self {
             allowlist: DEFAULT_ALLOWLIST.iter().map(|s| s.to_string()).collect(),
             allow_any: false,
+            mirror: None,
         }
     }
 
@@ -180,7 +192,22 @@ impl EgressConfig {
         Self {
             allowlist: Vec::new(),
             allow_any: true,
+            mirror: None,
         }
+    }
+
+    /// Attach the package mirror (narrow proxy only). REFUSES to attach in allow_any
+    /// mode (I-4): the dockerfile public-any proxy must never be able to TLS-terminate,
+    /// so we drop the mirror here rather than rely solely on the `should_mirror` runtime
+    /// gate — a defense-in-depth invariant that survives future refactors.
+    pub fn with_mirror(mut self, mirror: Option<Arc<MirrorTls>>) -> Self {
+        if self.allow_any && mirror.is_some() {
+            tracing::error!("refusing to attach a mirror to an allow_any egress config (I-4)");
+            self.mirror = None;
+        } else {
+            self.mirror = mirror;
+        }
+        self
     }
 }
 
@@ -205,9 +232,22 @@ async fn resolve_pinned(host: &str, port: u16, cfg: &EgressConfig) -> Result<Soc
     pick_safe_addr(addrs).ok_or(Deny::NoSafeAddr)
 }
 
+/// Whether a CONNECT should be TLS-terminated by the mirror rather than blind-tunneled.
+/// The single source of truth for the MITM gate: a mirror must be attached, the proxy
+/// must NOT be in allow_any mode (I-4), the port must be 443, and the host must be a
+/// known package registry ([`host_is_mirrorable`]). Pure so it can be unit-tested.
+fn should_mirror(cfg: &EgressConfig, host: &str, port: u16) -> bool {
+    cfg.mirror.is_some() && !cfg.allow_any && port == 443 && host_is_mirrorable(host)
+}
+
 /// Serve the egress proxy on `listener` until the task is dropped. Each accepted
 /// connection is handled independently.
 pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
+    // I-4 invariant: a TLS-terminating mirror is never armed on an allow_any proxy.
+    debug_assert!(
+        !(cfg.allow_any && cfg.mirror.is_some()),
+        "I-4 violated: mirror attached to an allow_any egress config"
+    );
     info!(allowlist = cfg.allowlist.len(), allow_any = cfg.allow_any, "egress proxy listening");
     let sem = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
@@ -304,6 +344,21 @@ async fn handle_conn(mut client: TcpStream, cfg: Arc<EgressConfig>) -> Result<()
         };
         match resolve_pinned(&host, port, &cfg).await {
             Ok(addr) => {
+                // MITM only for package registries on the narrow proxy (I-4). The SSRF
+                // gate above already vetted+pinned `addr`; the mirror dials exactly it
+                // (no re-resolve, I-5). Everything else is a blind tunnel.
+                if should_mirror(&cfg, &host, port) {
+                    let mirror = cfg
+                        .mirror
+                        .clone()
+                        .expect("should_mirror() guarantees mirror is present");
+                    client
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await?;
+                    info!(%host, %addr, "egress CONNECT mirror-MITM");
+                    mirror.handle_mitm(client, host, addr).await;
+                    return Ok(());
+                }
                 let mut upstream = TcpStream::connect(addr).await?;
                 client
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -387,6 +442,35 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    fn test_mirror(tag: &str) -> Arc<MirrorTls> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("jkb-egmir-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = crate::build_ca::BuildCa::load_or_generate(&dir).unwrap();
+        let signer = Arc::new(crate::build_ca::CertSigner::new(ca));
+        MirrorTls::new(&dir, signer, 1 << 30).unwrap()
+    }
+
+    #[test]
+    fn mirror_gate_is_registry_443_narrow_only() {
+        // Narrow proxy with a mirror: MITM exactly the registry hosts on 443.
+        let narrow = EgressConfig::with_default_allowlist().with_mirror(Some(test_mirror("n")));
+        assert!(should_mirror(&narrow, "registry.npmjs.org", 443));
+        assert!(should_mirror(&narrow, "static.crates.io", 443));
+        // Not a registry -> blind tunnel (git, etc.).
+        assert!(!should_mirror(&narrow, "github.com", 443));
+        // Wrong port -> never MITM.
+        assert!(!should_mirror(&narrow, "registry.npmjs.org", 80));
+        // No mirror attached -> blind tunnel.
+        let plain = EgressConfig::with_default_allowlist();
+        assert!(!should_mirror(&plain, "registry.npmjs.org", 443));
+        // I-4: an allow_any (dockerfile) proxy NEVER MITMs. with_mirror DROPS the mirror
+        // on an allow_any config (type-gate, not just the runtime should_mirror check).
+        let any = EgressConfig::allow_any_public().with_mirror(Some(test_mirror("a")));
+        assert!(any.mirror.is_none(), "with_mirror must refuse on allow_any (I-4)");
+        assert!(!should_mirror(&any, "registry.npmjs.org", 443));
     }
 
     #[test]
