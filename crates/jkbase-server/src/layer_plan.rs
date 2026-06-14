@@ -15,7 +15,7 @@
 //! mount, no root — `mkfs.ext4 -d`, threat-model P0-3).
 
 use anyhow::{ensure, Context, Result};
-use jkbase_common::layers::{RuntimeLayers, ServerLayers};
+use jkbase_common::layers::{RuntimeLayers, ServerLayers, VerityParams};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -56,6 +56,12 @@ struct PlatformManifest {
 struct LayerDesc {
     digest: String,
     file: String,
+    /// dm-verity parameters for this shared layer's blob, present when the build
+    /// appended a hash tree (the base + per-language runtimes — a poisoned shared layer
+    /// would hit every tenant). Absent ⇒ no tree; the agent mounts the layer directly
+    /// (it remains host-sha256-verified at attach via `digest`).
+    #[serde(default)]
+    verity: Option<VerityParams>,
 }
 
 /// The layer-relevant fields the build orchestrator augments each server manifest
@@ -73,6 +79,10 @@ struct ServerLayerInfo {
 struct BlobRef {
     path: PathBuf,
     digest: String,
+    /// dm-verity params for this blob — `Some` only for the shared base/runtime layers
+    /// (carried through to `_layers.json`); `None` for per-tenant app and image/self
+    /// layers, which the agent mounts directly.
+    verity: Option<VerityParams>,
 }
 
 /// Sentinel `runtime` value marking a server whose App layer is a self-contained
@@ -204,6 +214,7 @@ pub fn compute_layer_plan(
         order.push(BlobRef {
             path: store_dir.join(&platform.base.file),
             digest: platform.base.digest.clone(),
+            verity: platform.base.verity.clone(),
         });
 
         // Runtimes are keyed only by LAYERED servers' languages — an image/self
@@ -224,6 +235,7 @@ pub fn compute_layer_plan(
             order.push(BlobRef {
                 path: store_dir.join(&desc.file),
                 digest: desc.digest.clone(),
+                verity: desc.verity.clone(),
             });
         }
     }
@@ -242,6 +254,9 @@ pub fn compute_layer_plan(
         order.push(BlobRef {
             path: deployment_dir.join("_layers").join(file),
             digest,
+            // Per-tenant app layer: self-affecting, host-sha256-verified at attach, no
+            // verity tree → mounted directly by the agent.
+            verity: None,
         });
     }
 
@@ -285,6 +300,16 @@ pub fn compute_layer_plan(
             vec![app_dev, runtime_dev, base_dev]
         };
         runtime_layers.servers.insert(name.clone(), ServerLayers { layers });
+    }
+    // Carry the shared layers' dm-verity params into the device map, keyed by the SAME
+    // device strings the server overlay stacks reference (the agent activates a verity
+    // mapping for any device present here and mounts erofs from it, fail-closed). Only
+    // base + runtime blobs carry params; app/image-self blobs are absent → mounted
+    // directly. `order` is the attach order, so blob i lands on device vd(c+i) = dev(i).
+    for (i, b) in order.iter().enumerate() {
+        if let Some(v) = &b.verity {
+            runtime_layers.verity.insert(dev(i), v.clone());
+        }
     }
     if has_data_disk {
         runtime_layers.data_device = Some(device_node(2 + layer_paths.len()));
@@ -747,6 +772,96 @@ mod tests {
         );
         assert_eq!(plan.runtime_layers.servers["web"].layers, vec!["/dev/vdf"]);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn verity_params_propagate_to_device_map() {
+        // platform.json carrying dm-verity params on base + runtime must surface in the
+        // baked `_layers.json` verity map, keyed by the SAME device the overlay stack
+        // references. The per-tenant app layer carries no verity entry (mounted directly).
+        let root = std::env::temp_dir().join(format!("lp-verity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+
+        let base_f = format!("sha256-{}.erofs", "a".repeat(64));
+        let rt_f = format!("sha256-{}.erofs", "b".repeat(64));
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        std::fs::write(store.join(&base_f), b"base").unwrap();
+        std::fs::write(store.join(&rt_f), b"rt").unwrap();
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+
+        let base_root = "1".repeat(64);
+        let rt_root = "2".repeat(64);
+        let salt = "ab".repeat(32);
+        std::fs::write(
+            store.join("platform.json"),
+            format!(
+                r#"{{"base":{{"digest":"sha256:{a}","file":"{base_f}","verity":{{"root_hash":"{br}","salt":"{s}","data_size":8192}}}},"runtimes":{{"bun":{{"digest":"sha256:{b}","file":"{rt_f}","verity":{{"root_hash":"{rr}","salt":"{s}","data_size":4096}}}}}}}}"#,
+                a = "a".repeat(64),
+                b = "b".repeat(64),
+                br = base_root,
+                rr = rt_root,
+                s = salt,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_servers/api.json"),
+            format!(r#"{{"app_layer":"{app_f}","runtime":"bun","port":3000}}"#),
+        )
+        .unwrap();
+
+        let plan = compute_layer_plan(&deploy, &store, false, false).unwrap();
+
+        // Attach order [base(vdc), runtime(vdd), app(vde)] ⇒ verity keyed by vdc/vdd only.
+        let verity = &plan.runtime_layers.verity;
+        assert_eq!(verity.len(), 2, "base + runtime have verity; the app layer does not");
+        assert_eq!(verity["/dev/vdc"].root_hash, base_root);
+        assert_eq!(verity["/dev/vdc"].data_size, 8192);
+        assert_eq!(verity["/dev/vdd"].root_hash, rt_root);
+        assert_eq!(verity["/dev/vdd"].data_size, 4096);
+        assert!(!verity.contains_key("/dev/vde"), "app layer mounts directly (no verity)");
+
+        // Every verity key must be a device the server overlay actually stacks.
+        let stacked: std::collections::BTreeSet<&str> = plan
+            .runtime_layers
+            .servers["api"]
+            .layers
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        for dev in verity.keys() {
+            assert!(stacked.contains(dev.as_str()), "{dev} must be in the overlay stack");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_self_has_no_verity_map() {
+        // A self-contained image/self deployment reads no platform.json and so the baked
+        // device map carries no verity entries — the single app layer mounts directly.
+        let root = std::env::temp_dir().join(format!("lp-self-noverity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+        std::fs::write(
+            deploy.join("_servers/web.json"),
+            format!(r#"{{"app_layer":"{app_f}","runtime":"image/self","port":8080}}"#),
+        )
+        .unwrap();
+        let plan = compute_layer_plan(&deploy, &store, false, false).unwrap();
+        assert!(plan.runtime_layers.verity.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
