@@ -3243,22 +3243,35 @@ name = "api"
         crate::layer_plan::build_metadata_image(&fx.staged, &plan, &Default::default(), &meta_img)
             .expect("build the metadata image");
 
-        // Agent base rootfs: the musl agent as PID1 + the mount skeleton (mount-free).
-        let rootfs_stage = fx.data.join(format!("{tag}-vda-stage"));
-        let _ = std::fs::remove_dir_all(&rootfs_stage);
-        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
-            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
-        }
-        std::fs::copy(agent_bin, rootfs_stage.join("sbin/init")).unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let p = rootfs_stage.join("sbin/init");
-            let mut perm = std::fs::metadata(&p).unwrap().permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&p, perm).unwrap();
-        }
-        let rootfs_img = fx.data.join(format!("{tag}-vda.ext4"));
-        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+        // Agent base rootfs (vda). With JKB_ROOTFS set, boot the prebuilt apko rootfs
+        // verbatim — it carries the agent as /sbin/init AND `veritysetup`, which the
+        // dm-verity layers REQUIRE to activate in-guest (so the agent under test is the
+        // one baked into that rootfs; JKB_AGENT is not injected in this mode). Otherwise
+        // hand-roll a minimal static-agent rootfs with no userland — fine for plain
+        // (non-verity) layers, but it cannot activate verity, so a verity'd store would
+        // correctly fail closed under it.
+        let rootfs_img = if let Ok(prebuilt) = std::env::var("JKB_ROOTFS") {
+            let p = PathBuf::from(prebuilt);
+            assert!(p.exists(), "JKB_ROOTFS {} missing", p.display());
+            p
+        } else {
+            let rootfs_stage = fx.data.join(format!("{tag}-vda-stage"));
+            let _ = std::fs::remove_dir_all(&rootfs_stage);
+            for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
+                std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+            }
+            std::fs::copy(agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let p = rootfs_stage.join("sbin/init");
+                let mut perm = std::fs::metadata(&p).unwrap().permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(&p, perm).unwrap();
+            }
+            let rootfs_img = fx.data.join(format!("{tag}-vda.ext4"));
+            jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+            rootfs_img
+        };
 
         // Point-to-point tap (clear of jkbuild0's 172.31.x).
         let tap = format!("jk{tag}");
