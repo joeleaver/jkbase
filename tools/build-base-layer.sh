@@ -22,6 +22,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_CONFIG="${BASE_CONFIG:-$REPO_ROOT/images/apko/run-base.apko.yaml}"
 NODE_CONFIG="${NODE_CONFIG:-$REPO_ROOT/images/apko/run-node.apko.yaml}"
 RUST_CONFIG="${RUST_CONFIG:-$REPO_ROOT/images/apko/run-rust.apko.yaml}"
+PYTHON_CONFIG="${PYTHON_CONFIG:-$REPO_ROOT/images/apko/run-python.apko.yaml}"
 STORE="${STORE:-$REPO_ROOT/.firecracker/baselayers}"
 BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
 BUN_VER="${BUN_VER:-1.3.14}"
@@ -38,7 +39,7 @@ command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync
 # actually present at runtime (the runtimes' identical copies are delta'd out), so a
 # runtime lockfile that drifted to a newer ABI would link symbols base can't satisfy.
 # The four lockfiles are regenerated independently, so assert they agree before baking.
-python3 - "${BASE_CONFIG%.yaml}.lock.json" "${NODE_CONFIG%.yaml}.lock.json" "${RUST_CONFIG%.yaml}.lock.json" <<'PY' || { echo "[lib-check] runtime lockfiles disagree with base on glibc/ld-linux/libgcc — regenerate all run-*.apko.lock.json together" >&2; exit 1; }
+python3 - "${BASE_CONFIG%.yaml}.lock.json" "${NODE_CONFIG%.yaml}.lock.json" "${RUST_CONFIG%.yaml}.lock.json" "${PYTHON_CONFIG%.yaml}.lock.json" <<'PY' || { echo "[lib-check] runtime lockfiles disagree with base on glibc/ld-linux/libgcc — regenerate all run-*.apko.lock.json together" >&2; exit 1; }
 import json, sys
 LIBS = ("glibc", "ld-linux", "libgcc")
 def vers(path):
@@ -50,7 +51,7 @@ base = vers(sys.argv[1])
 if not base:
     sys.exit(0)  # unlocked base build: nothing pinned to compare
 bad = False
-for name, path in (("node", sys.argv[2]), ("rust", sys.argv[3])):
+for name, path in (("node", sys.argv[2]), ("rust", sys.argv[3]), ("python", sys.argv[4])):
     rv = vers(path) or {}
     for lib, v in rv.items():
         if lib in base and base[lib] != v:
@@ -177,6 +178,10 @@ NODE_DIGEST="$PACK_DIGEST"; NODE_FILE="$PACK_FILE"; NODE_SIZE="$PACK_SIZE"; NODE
 build_runtime_layer "$RUST_CONFIG" "rust"
 RUST_DIGEST="$PACK_DIGEST"; RUST_FILE="$PACK_FILE"; RUST_SIZE="$PACK_SIZE"; RUST_VERITY="$PACK_VERITY"
 
+# --- python runtime layer (CPython interpreter + stdlib closure, delta'd vs base) ---
+build_runtime_layer "$PYTHON_CONFIG" "python"
+PYTHON_DIGEST="$PACK_DIGEST"; PYTHON_FILE="$PACK_FILE"; PYTHON_SIZE="$PACK_SIZE"; PYTHON_VERITY="$PACK_VERITY"
+
 # --- platform manifest (host reads this to inject base + runtime ahead of the app) ---
 # `runtimes` is keyed by the server manifest's stamped `runtime` (= the resolved
 # build language: bun/node/rust); compute_layer_plan looks the language up here.
@@ -199,6 +204,10 @@ cat > "$STORE/platform.json" <<JSON
     "rust": {
       "name": "rust", "role": "runtime", "media": "erofs",
       "digest": "$RUST_DIGEST", "file": "$RUST_FILE", "size": $RUST_SIZE, "fs_verity": $RUST_VERITY
+    },
+    "python": {
+      "name": "python", "role": "runtime", "media": "erofs",
+      "digest": "$PYTHON_DIGEST", "file": "$PYTHON_FILE", "size": $PYTHON_SIZE, "fs_verity": $PYTHON_VERITY
     }
   }
 }
@@ -210,4 +219,5 @@ echo "  base         $BASE_DIGEST"
 echo "  bun-$BUN_VER $BUN_DIGEST"
 echo "  node         $NODE_DIGEST ($NODE_SIZE bytes)"
 echo "  rust         $RUST_DIGEST ($RUST_SIZE bytes)"
+echo "  python       $PYTHON_DIGEST ($PYTHON_SIZE bytes)"
 echo "  manifest     $STORE/platform.json"

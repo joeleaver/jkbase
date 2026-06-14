@@ -166,6 +166,20 @@ pub fn detect_language(source_path: &Path, hint: Option<&str>) -> Option<String>
     if has("Cargo.toml") {
         return Some("rust".to_string());
     }
+    // A go.mod is a Go project (checked before Python so a polyglot repo carrying both
+    // a go.mod and a stray requirements.txt resolves to the compiled language).
+    if has("go.mod") {
+        return Some("go".to_string());
+    }
+    // A Python dependency manifest (none of the above matched) is a Python project.
+    if has("requirements.txt")
+        || has("pyproject.toml")
+        || has("setup.py")
+        || has("setup.cfg")
+        || has("Pipfile")
+    {
+        return Some("python".to_string());
+    }
     None
 }
 
@@ -1959,6 +1973,20 @@ mod tests {
         // A Cargo.toml (no JS manifest) sniffs as Rust.
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         assert_eq!(detect_language(&dir, None).as_deref(), Some("rust"));
+        std::fs::remove_file(dir.join("Cargo.toml")).unwrap();
+
+        // A go.mod (no manifest above) sniffs as Go; it wins over a stray Python
+        // manifest (the compiled language owns a polyglot tree).
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(dir.join("requirements.txt"), "flask\n").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("go"));
+        std::fs::remove_file(dir.join("go.mod")).unwrap();
+
+        // A Python manifest alone (no go.mod / JS / Cargo) sniffs as Python.
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("python"));
+        std::fs::remove_file(dir.join("requirements.txt")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname='x'\n").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("python"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

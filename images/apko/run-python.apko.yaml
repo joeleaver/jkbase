@@ -1,0 +1,34 @@
+# The shared Python RUNTIME layer (the per-language overlay between the tenant app
+# layer and the shared Wolfi base). The CPython interpreter + its stdlib + library
+# closure — NOT pip / dev headers / a C toolchain (those are build-time only). One
+# copy is shared across every Python tenant on a given minor (storage + cold-start
+# dedup).
+#
+# `python-3.12` ships the full stdlib (ssl, sqlite3, …) the runtime needs. apko pulls
+# its closure (glibc, libssl, …); tools/build-base-layer.sh DELTAs the rootfs against
+# the shared base stage so the layer carries only the files NOT already in base (the
+# interpreter + its non-base libs), keeping glibc unduplicated. Keep the minor in step
+# with build-python.apko.yaml's `python-3.12`.
+#
+# Built into a content-addressed erofs blob by tools/build-base-layer.sh and recorded
+# under `runtimes.python` in the layer store's platform.json; the host attaches it
+# (RO) beneath every Python app's overlay.
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - ca-certificates-bundle
+    - python-3.12
+
+# Stable /usr/bin/python3 → the versioned interpreter (matches the build toolchain so
+# the buildpack's absolute PYTHON_BIN resolves at runtime).
+paths:
+  - path: /usr/bin/python3
+    type: symlink
+    source: /usr/bin/python3.12
+
+archs:
+  - x86_64
