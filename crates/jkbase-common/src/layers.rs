@@ -113,4 +113,21 @@ mod tests {
         assert!(rl.data_device.is_none());
         assert!(rl.servers.is_empty());
     }
+
+    #[test]
+    fn verity_map_round_trips_and_defaults_empty() {
+        // Absent `verity` ⇒ empty map (backcompat with pre-verity metadata images).
+        let rl: RuntimeLayers = serde_json::from_str(r#"{"schema":1,"servers":{}}"#).unwrap();
+        assert!(rl.verity.is_empty());
+        // Present ⇒ round-trips keyed by the layer device string.
+        let mut rl = RuntimeLayers::new();
+        rl.verity.insert(
+            "/dev/vdc".into(),
+            VerityParams { root_hash: "deadbeef".into(), salt: "cafe".into(), data_size: 8192 },
+        );
+        let json = serde_json::to_string(&rl).unwrap();
+        let back: RuntimeLayers = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.verity["/dev/vdc"], rl.verity["/dev/vdc"]);
+        assert_eq!(back.verity["/dev/vdc"].data_size, 8192);
+    }
 }
