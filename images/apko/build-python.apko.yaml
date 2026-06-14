@@ -4,8 +4,8 @@
 # injects the jkbuild lifecycle (as /sbin/init) + the runner mountpoints and
 # `mkfs.ext4 -d`'s the tree into `python.ext4` (userspace, no mount; threat-model
 # P0-3). select_toolchain picks `python.ext4` for a server target detected/declared
-# as `language = "python"` (a requirements.txt / pyproject.toml / setup.py / Pipfile
-# sniffs as python host-side).
+# as `language = "python"` (a requirements.txt / pyproject.toml / setup.py sniffs as
+# python host-side).
 #
 # Build-time ONLY: this image carries CPython + pip + a C toolchain (so sdists that
 # compile native extensions build). The deployed app runs on the lean `run-python`

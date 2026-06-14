@@ -171,13 +171,11 @@ pub fn detect_language(source_path: &Path, hint: Option<&str>) -> Option<String>
     if has("go.mod") {
         return Some("go".to_string());
     }
-    // A Python dependency manifest (none of the above matched) is a Python project.
-    if has("requirements.txt")
-        || has("pyproject.toml")
-        || has("setup.py")
-        || has("setup.cfg")
-        || has("Pipfile")
-    {
+    // A pip-installable Python manifest (none of the above matched) is a Python
+    // project. Markers match the in-VM buildpack's detect exactly (requirements.txt /
+    // pyproject.toml / setup.py) — a Pipfile-only or bare-setup.cfg tree is NOT claimed
+    // (pip can't build those; claiming them would ship a deps-less app).
+    if has("requirements.txt") || has("pyproject.toml") || has("setup.py") {
         return Some("python".to_string());
     }
     None

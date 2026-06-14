@@ -41,13 +41,21 @@ impl Buildpack for GoBuildpack {
     }
 
     fn fetch(&self, ctx: &mut BuildContext) -> Result<()> {
+        // A committed vendor/ tree is self-contained — the offline build uses it
+        // directly (`-mod=vendor`), so there is nothing to download.
+        if ctx.app_dir.join("vendor").join("modules.txt").exists() {
+            return Ok(());
+        }
         let (modcache, buildcache, gopath) = cache_dirs(ctx);
         for d in [&modcache, &buildcache, &gopath] {
             std::fs::create_dir_all(d).ok();
         }
-        // Download the module graph through the proxy. go.sum (when present) makes this
-        // checksum-verified; GOFLAGS=-mod=mod tolerates a missing go.sum on first fetch.
+        // Download the module graph through the proxy. Checksums are verified against
+        // the pinned GOSUMDB; `-mod=mod` here (fetch ONLY) lets `go mod download`
+        // settle a missing go.sum on a first build. The compile step does NOT inherit
+        // this (it uses build_mod_mode → readonly when go.sum exists).
         let mut cmd = go_command(ctx, &modcache, &buildcache, &gopath);
+        cmd.env("GOFLAGS", "-mod=mod");
         cmd.arg("mod").arg("download").arg("all");
         cmd.current_dir(ctx.app_dir);
         apply_proxy(&mut cmd, ctx);
@@ -73,10 +81,14 @@ impl Buildpack for GoBuildpack {
         // CGO off → a static binary that runs on base alone. -trimpath drops absolute
         // build paths (reproducible + no scratch-path leak). GOPROXY=off forces the
         // build offline — every module was fetched above, so a build that reaches for
-        // the network fails here by design (parity with `cargo build --offline`).
+        // the network fails here by design (parity with `cargo build --offline`). The
+        // -mod mode is readonly when a go.sum is committed (fail closed on lock drift),
+        // vendor when a vendor/ tree is committed, else mod for a first build.
         cmd.env("CGO_ENABLED", "0").env("GOPROXY", "off");
         cmd.arg("build")
             .arg("-trimpath")
+            .arg("-mod")
+            .arg(build_mod_mode(ctx.app_dir))
             .arg("-o")
             .arg(format!("{}/", bindir.display()))
             .arg("./...");
@@ -149,18 +161,35 @@ fn cache_dirs(ctx: &BuildContext) -> (PathBuf, PathBuf, PathBuf) {
     (root.join("mod"), root.join("build"), root.join("path"))
 }
 
-/// The module path's last element — the conventional binary name for a root
-/// `main.go`. `module github.com/acme/widget` → `widget`. `None` if unreadable.
+/// The module path's last element — the conventional binary name `go build` gives a
+/// root `main.go`. `module github.com/acme/widget` → `widget`. A `/vN` major-version
+/// suffix is stripped (go names the binary after the element BEFORE it), so
+/// `github.com/acme/widget/v2` → `widget`. `None` if unreadable.
 pub fn module_name(app_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(app_dir.join("go.mod")).ok()?;
     for line in raw.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("module ") {
             let path = rest.trim().trim_matches('"');
-            return path.rsplit('/').next().map(str::to_string).filter(|s| !s.is_empty());
+            let mut elems = path.rsplit('/').filter(|e| !e.is_empty());
+            let last = elems.next()?;
+            // A trailing `/vN` (N ≥ 2) is a major-version marker, not the binary name.
+            let name = if is_major_version(last) {
+                elems.next().unwrap_or(last)
+            } else {
+                last
+            };
+            return Some(name.to_string()).filter(|s| !s.is_empty());
         }
     }
     None
+}
+
+/// True for a Go semantic-import major-version path element: `v` followed by digits,
+/// e.g. `v2`, `v10` (but not `v0`/`v1`, which never appear as a path suffix).
+fn is_major_version(s: &str) -> bool {
+    s.strip_prefix('v')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n != "0" && n != "1")
 }
 
 /// The executables `go build -o <dir>/` produced (name → path), sorted by name for a
@@ -231,19 +260,36 @@ fn assemble_app_layer(app_dir: &Path, app_at: &Path, bins: &[(String, PathBuf)])
 }
 
 /// A `go` `Command` with a deterministic build `PATH` + caches on the cache drive.
-/// `GOFLAGS=-mod=mod` lets `go mod download` populate go.sum on a first build; the
-/// compile step pins `GOPROXY=off` to force offline.
+/// The `-mod` mode is set per phase by the caller (NOT globally), so the offline
+/// compile can fail closed against a complete go.sum instead of silently rewriting it.
+/// `GOSUMDB` is pinned (defense-in-depth: a global `GONOSUMDB`/`GOFLAGS` can't silently
+/// disable checksum-DB verification of fetched modules — a supply-chain control).
 fn go_command(_ctx: &BuildContext, modcache: &Path, buildcache: &Path, gopath: &Path) -> Command {
     let mut cmd = Command::new("go");
     cmd.env("PATH", BUILD_PATH)
         .env("GOMODCACHE", modcache)
         .env("GOCACHE", buildcache)
         .env("GOPATH", gopath)
-        .env("GOFLAGS", "-mod=mod")
+        .env("GOSUMDB", "sum.golang.org")
         // No telemetry/toolchain auto-download from a sealed/offline build VM.
         .env("GOTOOLCHAIN", "local")
         .env("GOTELEMETRY", "off");
     cmd
+}
+
+/// The `-mod` mode for the offline BUILD. A committed `vendor/` is honored (offline by
+/// construction); else a committed `go.sum` makes the build `readonly` so a drifted or
+/// incomplete checksum set FAILS rather than being silently rewritten (cargo `--locked`
+/// parity); a first build with neither uses `mod` to let the toolchain settle go.sum
+/// from the already-fetched module cache.
+fn build_mod_mode(app_dir: &Path) -> &'static str {
+    if app_dir.join("vendor").join("modules.txt").exists() {
+        "vendor"
+    } else if app_dir.join("go.sum").exists() {
+        "readonly"
+    } else {
+        "mod"
+    }
 }
 
 /// Run a build subprocess, capturing its output so a failure surfaces the actual
@@ -313,6 +359,21 @@ mod tests {
         let d2 = tempdir().unwrap();
         write(d2.path(), "go.mod", "module standalone\n");
         assert_eq!(module_name(d2.path()).as_deref(), Some("standalone"));
+    }
+
+    #[test]
+    fn module_name_strips_major_version_suffix() {
+        // go names the binary after the element BEFORE a /vN major-version marker.
+        let d = tempdir().unwrap();
+        write(d.path(), "go.mod", "module github.com/acme/widget/v2\n\ngo 1.22\n");
+        assert_eq!(module_name(d.path()).as_deref(), Some("widget"));
+        let d2 = tempdir().unwrap();
+        write(d2.path(), "go.mod", "module example.com/svc/v10\n");
+        assert_eq!(module_name(d2.path()).as_deref(), Some("svc"));
+        // v1 is never a path suffix → treated as a literal name (not stripped).
+        let d3 = tempdir().unwrap();
+        write(d3.path(), "go.mod", "module example.com/v1\n");
+        assert_eq!(module_name(d3.path()).as_deref(), Some("v1"));
     }
 
     #[test]

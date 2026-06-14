@@ -2,7 +2,7 @@
   "version": "v1",
   "config": {
     "name": "images/apko/build-python.apko.yaml",
-    "checksum": "sha256-U0f+Jr0bsWd7pv8lt2rd+BnAdJgttgp+fty+G1LoeBs="
+    "checksum": "sha256-+NMiwTMkzf3dJAhPvJHYIdG0GtdWq/fcrw+c4cTJKLk="
   },
   "contents": {
     "keyring": [
@@ -1011,41 +1011,41 @@
       },
       {
         "name": "ncurses-terminfo-base",
-        "url": "https://packages.wolfi.dev/os/x86_64/ncurses-terminfo-base-6.6.20260608-r0.apk",
-        "version": "6.6.20260608-r0",
+        "url": "https://packages.wolfi.dev/os/x86_64/ncurses-terminfo-base-6.6.20260613-r0.apk",
+        "version": "6.6.20260613-r0",
         "architecture": "x86_64",
         "signature": {
           "range": "",
           "checksum": ""
         },
         "control": {
-          "range": "bytes=0-8584",
-          "checksum": "sha1-lTCLYzv6P+6sHb50xy9AkGhrx5w="
+          "range": "bytes=0-8899",
+          "checksum": "sha1-CEaPCplGyfXSMLp4LsuldIu4bV0="
         },
         "data": {
-          "range": "bytes=8585-114836",
-          "checksum": "sha256-IgCuxL5sX+LdXBY1k3yQdIrq/Oztf3T5XoNxlYXqpE4="
+          "range": "bytes=8900-115141",
+          "checksum": "sha256-20Rp6PcvNL9F36S/K+FTc/pgrjCn+tg6S2rq2BWC0TA="
         },
-        "checksum": "Q1lTCLYzv6P+6sHb50xy9AkGhrx5w="
+        "checksum": "Q1CEaPCplGyfXSMLp4LsuldIu4bV0="
       },
       {
         "name": "ncurses",
-        "url": "https://packages.wolfi.dev/os/x86_64/ncurses-6.6.20260608-r0.apk",
-        "version": "6.6.20260608-r0",
+        "url": "https://packages.wolfi.dev/os/x86_64/ncurses-6.6.20260613-r0.apk",
+        "version": "6.6.20260613-r0",
         "architecture": "x86_64",
         "signature": {
           "range": "",
           "checksum": ""
         },
         "control": {
-          "range": "bytes=0-8704",
-          "checksum": "sha1-g7jNUlieVtFBHqv6f3UZ8NRyn34="
+          "range": "bytes=0-9016",
+          "checksum": "sha1-PVClx/8PodRdOgMHmy5A9bRPKNs="
         },
         "data": {
-          "range": "bytes=8705-464266",
-          "checksum": "sha256-dBeoc4GE5IJlVTSFU3KP17YB1R8jLVzq2kI/MSQvMvI="
+          "range": "bytes=9017-464576",
+          "checksum": "sha256-RyQMrgCHSX7JPmBSnOrWI60bcaxiDOjeI3xewtDhVKc="
         },
-        "checksum": "Q1g7jNUlieVtFBHqv6f3UZ8NRyn34="
+        "checksum": "Q1PVClx/8PodRdOgMHmy5A9bRPKNs="
       },
       {
         "name": "readline",

@@ -1,19 +1,39 @@
 //! The Python buildpack — `pip` over a glibc CPython toolchain.
 //!
-//! detect keys off `requirements.txt` / `pyproject.toml` / `setup.py` / `Pipfile`.
-//! `fetch` runs `pip install` (network up, through the egress proxy + mirror — both
-//! `pypi.org` and `files.pythonhosted.org` are mirror hosts, so wheels dedup across
-//! tenants) into a **vendored deps dir inside the app tree** (`.jkbase-deps`), so the
-//! runtime imports them via `PYTHONPATH` with no venv path-coupling. `compile` ships
-//! the whole app tree (source + the vendored deps + any assets/entrypoint) into the
-//! app layer rooted at `/app`; launch is a direct `python <entry>` (or a
-//! `command = [...]` override for console-script servers like gunicorn/uvicorn).
+//! detect keys off the manifests pip can actually install from — `requirements.txt`,
+//! `pyproject.toml`, or `setup.py` (detect and install agree exactly, so a claimed
+//! project never builds to an empty deps dir). `fetch` runs `pip install` (network up,
+//! through the egress proxy + mirror — both `pypi.org` and `files.pythonhosted.org`
+//! are mirror hosts, so wheels dedup across tenants) into a **vendored deps dir inside
+//! the app tree** (`.jkbase-deps`), so the runtime imports them via `PYTHONPATH` with
+//! no venv path-coupling. `compile` ships the whole app tree (source + the vendored
+//! deps + any assets/entrypoint) into the app layer rooted at `/app`; launch is a
+//! direct `python <entry>` (or a `command = [...]` override for console-script servers
+//! like gunicorn/uvicorn).
 //!
 //! Layer split mirrors node: the app layer carries source + `.jkbase-deps`; the
 //! CPython interpreter comes from the shared per-language RUNTIME layer; both stack
 //! over the shared Wolfi base (glibc). `pip` itself is build-time only — never in the
 //! runtime layer — so the launch resolves to the absolute interpreter, not a
 //! console-script wrapper, unless the app supplies a `command` override.
+//!
+//! ## v1 limitations
+//!
+//! - **Native-extension wheels with non-base shared libs.** A pure-Python app or a
+//!   wheel whose native `.so` only links libs in the run-python closure (CPython's own
+//!   deps: libssl, libffi, zlib, …) works. A wheel linking a lib that is NOT in that
+//!   closure (e.g. `psycopg2` → libpq, `Pillow` → libjpeg) builds fine but fails at
+//!   runtime with a missing-soname error — unlike the rust buildpack, this does not yet
+//!   ship a per-app native-lib closure into the app layer. Such an app should use a
+//!   pure-Python alternative (`psycopg2-binary` bundles its libs) or wait for the
+//!   closure-shipping follow-up. (Tracked; see rust.rs `ship_native_lib_closure`.)
+//! - **Integrity.** Unlike cargo `--locked` / npm `ci`, pip does NOT independently
+//!   re-verify an UN-hashed `requirements.txt` against a lockfile — so the package
+//!   mirror's per-tenant-lockfile re-verification (the 4th cross-tenant safety leg)
+//!   does not hold for an un-hashed Python build; the authenticated-origin TOFU (real
+//!   registry cert + SSRF-pin + content-addressing) is then the integrity guarantee.
+//!   When `requirements.txt` IS fully hashed, `fetch` passes `--require-hashes` so pip
+//!   fails closed on any mismatch.
 
 use crate::buildpack::{
     BuildContext, BuildOutput, Buildpack, Decision, DetectContext, Layer, LayerTypes, Process,
@@ -82,6 +102,14 @@ impl Buildpack for PythonBuildpack {
         match install {
             InstallSource::Requirements => {
                 cmd.arg("-r").arg("requirements.txt");
+                // If the lockfile carries hashes, fail closed: `--require-hashes` makes
+                // pip reject any package whose download doesn't match (and any
+                // un-hashed requirement). This is the Python analogue of cargo
+                // `--locked` / npm `ci` — the per-tenant integrity check the mirror's
+                // 4th safety leg otherwise can't provide for Python.
+                if requirements_are_hashed(ctx.app_dir) {
+                    cmd.arg("--require-hashes");
+                }
             }
             // pyproject.toml (PEP 517/621) or legacy setup.py: install the project
             // itself (which pulls its declared deps) into the vendored dir.
@@ -146,9 +174,12 @@ impl Buildpack for PythonBuildpack {
 }
 
 /// Detect whether this is a Python app, with a confidence the driver uses to resolve
-/// ambiguity. The markers (`requirements.txt`, `pyproject.toml`, `setup.py`,
-/// `Pipfile`) are Python-specific, so a strong signal; a bare entry file alone is not
-/// claimed (too ambiguous).
+/// ambiguity. The markers are exactly the manifests pip can install from
+/// (`requirements.txt`, `pyproject.toml`, `setup.py`) — so a claimed project always
+/// has something to install. NOT claimed: a `Pipfile`-only tree (pipenv's format, which
+/// pip can't consume) or a bare `setup.cfg` with no `setup.py`/`pyproject.toml` (not
+/// buildable on its own) — claiming those would silently build a deps-less app. A bare
+/// entry file alone is also too ambiguous to claim.
 pub fn detect_decision(app_dir: &Path, language_hint: Option<&str>) -> Decision {
     if language_hint == Some("python") {
         return Decision::pass(100);
@@ -156,12 +187,9 @@ pub fn detect_decision(app_dir: &Path, language_hint: Option<&str>) -> Decision 
     if matches!(language_hint, Some(h) if h != "python") {
         return Decision::Fail;
     }
-    // A real dependency manifest is the authoritative signal.
     if app_dir.join("requirements.txt").exists()
         || app_dir.join("pyproject.toml").exists()
         || app_dir.join("setup.py").exists()
-        || app_dir.join("setup.cfg").exists()
-        || app_dir.join("Pipfile").exists()
     {
         return Decision::pass(85);
     }
@@ -177,13 +205,20 @@ enum InstallSource {
     None,
 }
 
+/// True iff `requirements.txt` pins hashes (`--hash=…`), i.e. it is a locked file we
+/// can ask pip to verify fail-closed via `--require-hashes`.
+fn requirements_are_hashed(app_dir: &Path) -> bool {
+    std::fs::read_to_string(app_dir.join("requirements.txt"))
+        .map(|s| s.contains("--hash="))
+        .unwrap_or(false)
+}
+
 fn install_source(app_dir: &Path) -> InstallSource {
     if app_dir.join("requirements.txt").exists() {
         InstallSource::Requirements
-    } else if app_dir.join("pyproject.toml").exists()
-        || app_dir.join("setup.py").exists()
-        || app_dir.join("setup.cfg").exists()
-    {
+    } else if app_dir.join("pyproject.toml").exists() || app_dir.join("setup.py").exists() {
+        // A bare setup.cfg (no setup.py/pyproject.toml) is not pip-buildable, so it is
+        // not a Project source — detect_decision doesn't claim it either.
         InstallSource::Project
     } else {
         InstallSource::None
@@ -309,6 +344,34 @@ mod tests {
         write(d.path(), "app.py", "print('hi')\n");
         // A bare entry file with no manifest is too ambiguous to claim.
         assert!(!detect_decision(d.path(), None).is_pass());
+    }
+
+    #[test]
+    fn detect_rejects_unbuildable_markers() {
+        // A Pipfile (pipenv's format, which pip can't consume) must NOT be claimed —
+        // else the build would ship an empty .jkbase-deps and crash at runtime.
+        let d = tempdir().unwrap();
+        write(d.path(), "Pipfile", "[packages]\nflask = \"*\"\n");
+        assert!(!detect_decision(d.path(), None).is_pass());
+        assert_eq!(install_source(d.path()), InstallSource::None);
+        // A bare setup.cfg with no setup.py/pyproject.toml is not pip-buildable.
+        let d2 = tempdir().unwrap();
+        write(d2.path(), "setup.cfg", "[metadata]\nname = x\n");
+        assert!(!detect_decision(d2.path(), None).is_pass());
+        assert_eq!(install_source(d2.path()), InstallSource::None);
+    }
+
+    #[test]
+    fn requirements_hashed_detection() {
+        let d = tempdir().unwrap();
+        write(d.path(), "requirements.txt", "flask==3.0.0\n");
+        assert!(!requirements_are_hashed(d.path()));
+        write(
+            d.path(),
+            "requirements.txt",
+            "flask==3.0.0 --hash=sha256:abc123\n",
+        );
+        assert!(requirements_are_hashed(d.path()));
     }
 
     #[test]
