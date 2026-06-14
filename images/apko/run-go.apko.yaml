@@ -1,0 +1,23 @@
+# The shared Go RUNTIME layer (the per-language overlay between the tenant app layer
+# and the shared Wolfi base). Intentionally NEAR-EMPTY: the Go buildpack defaults to
+# CGO_ENABLED=0, producing a fully static binary that needs no shared libraries, so
+# this layer ships only `ca-certificates-bundle` (the system trust store a Go service
+# reads for outbound HTTPS at runtime). Everything else (the FHS skeleton, glibc) is
+# in the shared base; tools/build-base-layer.sh DELTAs this against base, so in
+# practice the layer carries just the cert bundle (if not already byte-identical to
+# base) and exists to satisfy the layer plan's per-language runtime lookup.
+#
+# Built into a content-addressed erofs blob by tools/build-base-layer.sh and recorded
+# under `runtimes.go` in the layer store's platform.json; the host attaches it (RO)
+# beneath every Go app's overlay.
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - ca-certificates-bundle
+
+archs:
+  - x86_64

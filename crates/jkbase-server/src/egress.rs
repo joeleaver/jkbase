@@ -56,6 +56,9 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     // Python
     "pypi.org",
     "files.pythonhosted.org",
+    // Go (module proxy + checksum DB; the build sets GOPROXY/GOSUMDB to these)
+    "proxy.golang.org",
+    "sum.golang.org",
     // Git deps
     "github.com",
     "codeload.github.com",

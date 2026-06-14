@@ -23,6 +23,7 @@ BASE_CONFIG="${BASE_CONFIG:-$REPO_ROOT/images/apko/run-base.apko.yaml}"
 NODE_CONFIG="${NODE_CONFIG:-$REPO_ROOT/images/apko/run-node.apko.yaml}"
 RUST_CONFIG="${RUST_CONFIG:-$REPO_ROOT/images/apko/run-rust.apko.yaml}"
 PYTHON_CONFIG="${PYTHON_CONFIG:-$REPO_ROOT/images/apko/run-python.apko.yaml}"
+GO_CONFIG="${GO_CONFIG:-$REPO_ROOT/images/apko/run-go.apko.yaml}"
 STORE="${STORE:-$REPO_ROOT/.firecracker/baselayers}"
 BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
 BUN_VER="${BUN_VER:-1.3.14}"
@@ -39,7 +40,7 @@ command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync
 # actually present at runtime (the runtimes' identical copies are delta'd out), so a
 # runtime lockfile that drifted to a newer ABI would link symbols base can't satisfy.
 # The four lockfiles are regenerated independently, so assert they agree before baking.
-python3 - "${BASE_CONFIG%.yaml}.lock.json" "${NODE_CONFIG%.yaml}.lock.json" "${RUST_CONFIG%.yaml}.lock.json" "${PYTHON_CONFIG%.yaml}.lock.json" <<'PY' || { echo "[lib-check] runtime lockfiles disagree with base on glibc/ld-linux/libgcc — regenerate all run-*.apko.lock.json together" >&2; exit 1; }
+python3 - "${BASE_CONFIG%.yaml}.lock.json" "${NODE_CONFIG%.yaml}.lock.json" "${RUST_CONFIG%.yaml}.lock.json" "${PYTHON_CONFIG%.yaml}.lock.json" "${GO_CONFIG%.yaml}.lock.json" <<'PY' || { echo "[lib-check] runtime lockfiles disagree with base on glibc/ld-linux/libgcc — regenerate all run-*.apko.lock.json together" >&2; exit 1; }
 import json, sys
 LIBS = ("glibc", "ld-linux", "libgcc")
 def vers(path):
@@ -51,7 +52,7 @@ base = vers(sys.argv[1])
 if not base:
     sys.exit(0)  # unlocked base build: nothing pinned to compare
 bad = False
-for name, path in (("node", sys.argv[2]), ("rust", sys.argv[3]), ("python", sys.argv[4])):
+for name, path in (("node", sys.argv[2]), ("rust", sys.argv[3]), ("python", sys.argv[4]), ("go", sys.argv[5])):
     rv = vers(path) or {}
     for lib, v in rv.items():
         if lib in base and base[lib] != v:
@@ -182,6 +183,11 @@ RUST_DIGEST="$PACK_DIGEST"; RUST_FILE="$PACK_FILE"; RUST_SIZE="$PACK_SIZE"; RUST
 build_runtime_layer "$PYTHON_CONFIG" "python"
 PYTHON_DIGEST="$PACK_DIGEST"; PYTHON_FILE="$PACK_FILE"; PYTHON_SIZE="$PACK_SIZE"; PYTHON_VERITY="$PACK_VERITY"
 
+# --- go runtime layer (near-empty: CGO_ENABLED=0 → static binary runs on base alone;
+#     the layer exists to satisfy the layer plan's per-language runtime lookup). ---
+build_runtime_layer "$GO_CONFIG" "go"
+GO_DIGEST="$PACK_DIGEST"; GO_FILE="$PACK_FILE"; GO_SIZE="$PACK_SIZE"; GO_VERITY="$PACK_VERITY"
+
 # --- platform manifest (host reads this to inject base + runtime ahead of the app) ---
 # `runtimes` is keyed by the server manifest's stamped `runtime` (= the resolved
 # build language: bun/node/rust); compute_layer_plan looks the language up here.
@@ -208,6 +214,10 @@ cat > "$STORE/platform.json" <<JSON
     "python": {
       "name": "python", "role": "runtime", "media": "erofs",
       "digest": "$PYTHON_DIGEST", "file": "$PYTHON_FILE", "size": $PYTHON_SIZE, "fs_verity": $PYTHON_VERITY
+    },
+    "go": {
+      "name": "go", "role": "runtime", "media": "erofs",
+      "digest": "$GO_DIGEST", "file": "$GO_FILE", "size": $GO_SIZE, "fs_verity": $GO_VERITY
     }
   }
 }
@@ -220,4 +230,5 @@ echo "  bun-$BUN_VER $BUN_DIGEST"
 echo "  node         $NODE_DIGEST ($NODE_SIZE bytes)"
 echo "  rust         $RUST_DIGEST ($RUST_SIZE bytes)"
 echo "  python       $PYTHON_DIGEST ($PYTHON_SIZE bytes)"
+echo "  go           $GO_DIGEST ($GO_SIZE bytes)"
 echo "  manifest     $STORE/platform.json"
