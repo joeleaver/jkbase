@@ -56,6 +56,11 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     // Python
     "pypi.org",
     "files.pythonhosted.org",
+    // Go: the module proxy + checksum DB the toolchain uses by default (GOPROXY +
+    // GOSUMDB). The buildpack pins GOSUMDB=sum.golang.org and leaves GOPROXY at its
+    // default for the fetch, forcing GOPROXY=off only for the offline compile.
+    "proxy.golang.org",
+    "sum.golang.org",
     // Git deps
     "github.com",
     "codeload.github.com",

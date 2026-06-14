@@ -166,6 +166,18 @@ pub fn detect_language(source_path: &Path, hint: Option<&str>) -> Option<String>
     if has("Cargo.toml") {
         return Some("rust".to_string());
     }
+    // A go.mod is a Go project (checked before Python so a polyglot repo carrying both
+    // a go.mod and a stray requirements.txt resolves to the compiled language).
+    if has("go.mod") {
+        return Some("go".to_string());
+    }
+    // A pip-installable Python manifest (none of the above matched) is a Python
+    // project. Markers match the in-VM buildpack's detect exactly (requirements.txt /
+    // pyproject.toml / setup.py) — a Pipfile-only or bare-setup.cfg tree is NOT claimed
+    // (pip can't build those; claiming them would ship a deps-less app).
+    if has("requirements.txt") || has("pyproject.toml") || has("setup.py") {
+        return Some("python".to_string());
+    }
     None
 }
 
@@ -1959,6 +1971,20 @@ mod tests {
         // A Cargo.toml (no JS manifest) sniffs as Rust.
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         assert_eq!(detect_language(&dir, None).as_deref(), Some("rust"));
+        std::fs::remove_file(dir.join("Cargo.toml")).unwrap();
+
+        // A go.mod (no manifest above) sniffs as Go; it wins over a stray Python
+        // manifest (the compiled language owns a polyglot tree).
+        std::fs::write(dir.join("go.mod"), "module x\n").unwrap();
+        std::fs::write(dir.join("requirements.txt"), "flask\n").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("go"));
+        std::fs::remove_file(dir.join("go.mod")).unwrap();
+
+        // A Python manifest alone (no go.mod / JS / Cargo) sniffs as Python.
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("python"));
+        std::fs::remove_file(dir.join("requirements.txt")).unwrap();
+        std::fs::write(dir.join("pyproject.toml"), "[project]\nname='x'\n").unwrap();
+        assert_eq!(detect_language(&dir, None).as_deref(), Some("python"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2863,6 +2889,128 @@ name = "api"
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
         println!("PASS: rust(tiny_http) build -> layered collection -> rust runtime layer -> HTTP 200 ({body:?})");
+    }
+
+    /// Build a tiny Python app through the pipeline: `pip install` MUST fetch the dep
+    /// through the proxy into `.jkbase-deps`, then the python runtime layer imports it
+    /// (PYTHONPATH=/app/.jkbase-deps) and serves. The server imports `six` (a vendored
+    /// dep) AND serves "ok"; if pip didn't vendor it or PYTHONPATH is wrong, the import
+    /// fails and there is no 200 — so a clean body proves the full fetch→vendor→import
+    /// path.
+    async fn python_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("python-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write_lang_manifest(&src, "pyfix", "python");
+        write(src.join("server/requirements.txt"), "six==1.16.0\n");
+        write(
+            src.join("server/server.py"),
+            "import os, six  # six is a vendored dep — import proves PYTHONPATH + pip\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\nport = int(os.environ.get(\"PORT\", \"3000\"))\nassert six.PY3\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200); self.end_headers(); self.wfile.write(b\"ok\\n\")\n    def log_message(self, *a):\n        pass\nprint(\"listening on\", port)\nHTTPServer((\"0.0.0.0\", port), H).serve_forever()\n",
+        );
+        networked_lang_build(
+            "pyfix",
+            "onbox-python.redb",
+            "python.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 2,
+                guest_mem_mib: 1024,
+                cgroup_mem_mib: 1536,
+                cgroup_cpu_max: "200000 100000",
+                scratch_mib: 768,
+                output_mib: 128,
+                timeout_secs: 240,
+                fetch_deadline_secs: 180,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Build a tiny Go app through the pipeline: `go mod download` MUST pull a module
+    /// through the proxy (proxy.golang.org / sum.golang.org allowlisted), the offline
+    /// `CGO_ENABLED=0` build links a static binary, and the near-empty go runtime layer
+    /// over base serves it. The app uses `github.com/google/uuid` (a fetched dep) +
+    /// net/http, so a 200 proves the module fetch + static build + runtime compose.
+    async fn go_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("go-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write_lang_manifest(&src, "gofix", "go");
+        write(
+            src.join("server/go.mod"),
+            "module gofix\n\ngo 1.22\n\nrequire github.com/google/uuid v1.6.0\n",
+        );
+        write(
+            src.join("server/main.go"),
+            "package main\n\nimport (\n\t\"fmt\"\n\t\"net/http\"\n\t\"os\"\n\n\t\"github.com/google/uuid\"\n)\n\nfunc main() {\n\t_ = uuid.New() // exercise the fetched dep\n\tport := os.Getenv(\"PORT\")\n\tif port == \"\" {\n\t\tport = \"3000\"\n\t}\n\thttp.HandleFunc(\"/\", func(w http.ResponseWriter, r *http.Request) {\n\t\tfmt.Fprintln(w, \"ok\")\n\t})\n\tfmt.Println(\"listening on\", port)\n\thttp.ListenAndServe(\"0.0.0.0:\"+port, nil)\n}\n",
+        );
+        networked_lang_build(
+            "gofix",
+            "onbox-go.redb",
+            "go.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                scratch_mib: 1536,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 240,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Python acceptance: build → layered collection → metadata image → real agent
+    /// runtime (python runtime layer = CPython, over base = glibc) → HTTP 200. Needs
+    /// `python.ext4` + the `python` runtime layer in the baselayers store.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture python_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "python pipeline: needs KVM + root + python.ext4 + python runtime layer + agent + build bridge"]
+    async fn python_pipeline_to_http_200() {
+        let Some(fx) = python_build(1).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "pyp", "172.25.0.1", "172.25.0.2", "AA:FC:00:00:25:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the layered python server");
+        assert_eq!(body, "ok");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: python(pip+six) build -> layered collection -> python runtime layer -> HTTP 200 ({body:?})");
+    }
+
+    /// Go acceptance: build → layered collection → metadata image → real agent runtime
+    /// (near-empty go runtime layer over base) → HTTP 200. Proves `go mod download`
+    /// through the proxy, the CGO_ENABLED=0 static binary, and that app:go-runtime:base
+    /// composes + serves. Needs `go.ext4` + the `go` runtime layer in the baselayers
+    /// store.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture go_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "go pipeline: needs KVM + root + go.ext4 + go runtime layer + agent + build bridge"]
+    async fn go_pipeline_to_http_200() {
+        let Some(fx) = go_build(1).await else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "gop", "172.24.0.1", "172.24.0.2", "AA:FC:00:00:24:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the layered go server");
+        assert_eq!(body, "ok");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: go(static+uuid) build -> layered collection -> go runtime layer -> HTTP 200 ({body:?})");
     }
 
     /// Build a Rust app that ships a DATA ASSET + an ENTRYPOINT script (the

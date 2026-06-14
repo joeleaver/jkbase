@@ -1,9 +1,11 @@
-//! Per-language buildpack modules. Bun is the lead language; Node and Rust follow
-//! on the same lifecycle (Python/Go later).
+//! Per-language buildpack modules. Bun is the lead language; Node, Rust, Python and
+//! Go follow on the same lifecycle.
 
 pub mod bun;
 pub mod dockerfile;
+pub mod go;
 pub mod node;
+pub mod python;
 pub mod rust;
 
 use crate::buildpack::Buildpack;
@@ -16,6 +18,8 @@ pub fn registry() -> Vec<Box<dyn Buildpack>> {
         Box::new(bun::BunBuildpack),
         Box::new(node::NodeBuildpack),
         Box::new(rust::RustBuildpack),
+        Box::new(python::PythonBuildpack),
+        Box::new(go::GoBuildpack),
         Box::new(dockerfile::DockerfileBuildpack),
     ]
 }

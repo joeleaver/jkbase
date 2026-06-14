@@ -1,0 +1,38 @@
+# Build-VM toolchain image for Go server builds (`go build`).
+#
+# apko assembles a reproducible Wolfi (glibc) rootfs. tools/build-image.sh then
+# injects the jkbuild lifecycle (as /sbin/init) + the runner mountpoints and
+# `mkfs.ext4 -d`'s the tree into `go.ext4` (userspace, no mount; threat-model P0-3).
+# select_toolchain picks `go.ext4` for a server target detected/declared as
+# `language = "go"` (a go.mod sniffs as go host-side).
+#
+# Build-time ONLY: this image carries the full Go toolchain. The buildpack defaults
+# to CGO_ENABLED=0, so the produced binary is statically linked and the deployed app
+# runs on the near-empty `run-go` RUNTIME layer over the shared base — no C toolchain
+# is needed here (cgo is a deliberate future opt-in).
+#
+# Pin: commit the apko.lock.json apko emits (`--lockfile`) so rebuilds are
+# bitwise-reproducible (the Wolfi repo is rolling).
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - glibc
+    - ld-linux
+    - ca-certificates-bundle
+    - busybox # sh + mount/umount/cp/nc/reboot for the lifecycle's shell-outs
+    - erofs-utils # mkfs.erofs for the layered exporter
+    # The Go toolchain. Pinned to the 1.24 minor; bump deliberately. GOTOOLCHAIN=local
+    # (set by the buildpack) prevents an auto-download of a different toolchain.
+    - go-1.24
+    # git: `go mod download` resolves VCS-direct (non-proxy) deps via the git CLI.
+    - git
+
+archs:
+  - x86_64
+
+# NOTE: /sbin/init (the static musl jkbuild-init) is injected by
+# tools/build-image.sh after apko (INJECT_BUN=0 — Go carries no bun binary).
