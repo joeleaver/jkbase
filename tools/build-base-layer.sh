@@ -33,6 +33,7 @@ export PATH="$HOME/.local/bin:$PATH"
 command -v apko >/dev/null || { echo "apko not found — run tools/install-image-tools.sh" >&2; exit 1; }
 command -v mkfs.erofs >/dev/null || { echo "mkfs.erofs not found — apt-get install erofs-utils" >&2; exit 1; }
 command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync (runtime-layer delta)" >&2; exit 1; }
+command -v veritysetup >/dev/null || { echo "veritysetup not found — apt-get install cryptsetup-bin (dm-verity hash tree)" >&2; exit 1; }
 [ -f "$BUN_BIN" ] || { echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2; exit 1; }
 
 # The delta + overlay scheme's load-bearing assumption: base and every per-language
@@ -65,6 +66,7 @@ rm -rf "$WORK"
 mkdir -p "$WORK" "$STORE"
 
 # pack <stage_dir> <name> -> sets globals PACK_DIGEST PACK_FILE PACK_SIZE PACK_VERITY
+#                                          PACK_ROOT_HASH PACK_SALT PACK_DATA_SIZE
 pack_layer() {
     local stage="$1" name="$2"
     local tmp="$WORK/$name.erofs"
@@ -74,6 +76,33 @@ pack_layer() {
     # perms (some dirs are non-readable to a non-owner), which root can still read.
     sudo mkfs.erofs -zlz4hc --all-root -T 0 --mkfs-time "$tmp" "$stage" >/dev/null
     sudo chown "$(id -u):$(id -g)" "$tmp"
+
+    # --- dm-verity: append a Merkle hash tree so the in-guest agent can integrity-verify
+    # EVERY block read of this SHARED layer (a poisoned base/runtime would hit every
+    # tenant). The blob becomes one file `[ erofs data | hash tree ]`; the tree starts at
+    # the 4096-aligned data size (block-aligned per dm-verity). The salt is deterministic
+    # = sha256(erofs data) so the formatted blob stays a pure function of its content (no
+    # build-time randomness churning the content-addressed store). The host records
+    # root_hash/salt/data_size in platform.json; the guest pins root_hash at activation,
+    # which also covers the on-blob verity superblock (so its salt/geometry can't be
+    # forged). See crates/jkbase-agent/src/dmverity.rs.
+    local erofs_size data_size
+    erofs_size="$(stat -c%s "$tmp")"
+    data_size=$(( (erofs_size + 4095) / 4096 * 4096 ))
+    # Zero-pad the erofs up to the 4096 boundary where the hash tree will live; erofs
+    # ignores the trailing padding (it reads only its own superblock-described blocks).
+    [ "$data_size" -gt "$erofs_size" ] && truncate -s "$data_size" "$tmp"
+    PACK_SALT="$(sha256sum "$tmp" | cut -d' ' -f1)"
+    PACK_DATA_SIZE="$data_size"
+    PACK_ROOT_HASH="$(veritysetup format \
+        --data-block-size=4096 --hash-block-size=4096 \
+        --hash-offset="$data_size" --salt="$PACK_SALT" \
+        "$tmp" "$tmp" | awk '/Root hash:/ {print $NF}')"
+    [ -n "$PACK_ROOT_HASH" ] || { echo "[$name] veritysetup format produced no root hash" >&2; exit 1; }
+
+    # Content address = sha256 of the WHOLE blob (erofs data + appended tree); this is
+    # what the host re-verifies before attaching, composing with the guest's per-read
+    # dm-verity check.
     local hex
     hex="$(sha256sum "$tmp" | cut -d' ' -f1)"
     PACK_DIGEST="sha256:$hex"
@@ -87,7 +116,7 @@ pack_layer() {
     else
         PACK_VERITY=false
     fi
-    echo "[layer] $name -> $PACK_FILE ($PACK_SIZE bytes, fs-verity=$PACK_VERITY)"
+    echo "[layer] $name -> $PACK_FILE ($PACK_SIZE bytes, fs-verity=$PACK_VERITY, dm-verity root=${PACK_ROOT_HASH:0:16}… data_size=$PACK_DATA_SIZE)"
 }
 
 # build_runtime_layer <apko_config> <layer_name> -> sets globals PACK_* via pack_layer.
@@ -161,6 +190,7 @@ done
 mkdir -p "$BASE_STAGE"/{proc,sys,dev,tmp,run,var,etc,app,opt}
 pack_layer "$BASE_STAGE" "wolfi-base"
 BASE_DIGEST="$PACK_DIGEST"; BASE_FILE="$PACK_FILE"; BASE_SIZE="$PACK_SIZE"; BASE_VERITY="$PACK_VERITY"
+BASE_RH="$PACK_ROOT_HASH"; BASE_SALT="$PACK_SALT"; BASE_DS="$PACK_DATA_SIZE"
 
 # --- bun runtime layer (just the bun binary) ---
 echo "[bun] staging /opt/bun/bin/bun (bun $BUN_VER)"
@@ -168,25 +198,30 @@ BUN_STAGE="$WORK/bun-stage"
 install -Dm0755 "$BUN_BIN" "$BUN_STAGE/opt/bun/bin/bun"
 pack_layer "$BUN_STAGE" "bun-$BUN_VER"
 BUN_DIGEST="$PACK_DIGEST"; BUN_FILE="$PACK_FILE"; BUN_SIZE="$PACK_SIZE"; BUN_VERITY="$PACK_VERITY"
+BUN_RH="$PACK_ROOT_HASH"; BUN_SALT="$PACK_SALT"; BUN_DS="$PACK_DATA_SIZE"
 
 # --- node runtime layer (node binary + lib closure, delta'd against base) ---
 build_runtime_layer "$NODE_CONFIG" "node"
 NODE_DIGEST="$PACK_DIGEST"; NODE_FILE="$PACK_FILE"; NODE_SIZE="$PACK_SIZE"; NODE_VERITY="$PACK_VERITY"
+NODE_RH="$PACK_ROOT_HASH"; NODE_SALT="$PACK_SALT"; NODE_DS="$PACK_DATA_SIZE"
 
 # --- rust runtime layer (intentionally near-empty: base already ships libgcc_s.so.1,
 #     so the delta drops it; the layer exists only to satisfy the layer plan's
 #     per-language runtime lookup — a glibc-dynamic rust binary runs on base alone). ---
 build_runtime_layer "$RUST_CONFIG" "rust"
 RUST_DIGEST="$PACK_DIGEST"; RUST_FILE="$PACK_FILE"; RUST_SIZE="$PACK_SIZE"; RUST_VERITY="$PACK_VERITY"
+RUST_RH="$PACK_ROOT_HASH"; RUST_SALT="$PACK_SALT"; RUST_DS="$PACK_DATA_SIZE"
 
 # --- python runtime layer (CPython interpreter + stdlib closure, delta'd vs base) ---
 build_runtime_layer "$PYTHON_CONFIG" "python"
 PYTHON_DIGEST="$PACK_DIGEST"; PYTHON_FILE="$PACK_FILE"; PYTHON_SIZE="$PACK_SIZE"; PYTHON_VERITY="$PACK_VERITY"
+PYTHON_RH="$PACK_ROOT_HASH"; PYTHON_SALT="$PACK_SALT"; PYTHON_DS="$PACK_DATA_SIZE"
 
 # --- go runtime layer (near-empty: CGO_ENABLED=0 → static binary runs on base alone;
 #     the layer exists to satisfy the layer plan's per-language runtime lookup). ---
 build_runtime_layer "$GO_CONFIG" "go"
 GO_DIGEST="$PACK_DIGEST"; GO_FILE="$PACK_FILE"; GO_SIZE="$PACK_SIZE"; GO_VERITY="$PACK_VERITY"
+GO_RH="$PACK_ROOT_HASH"; GO_SALT="$PACK_SALT"; GO_DS="$PACK_DATA_SIZE"
 
 # --- platform manifest (host reads this to inject base + runtime ahead of the app) ---
 # `runtimes` is keyed by the server manifest's stamped `runtime` (= the resolved
@@ -196,28 +231,34 @@ cat > "$STORE/platform.json" <<JSON
   "schema": 1,
   "base": {
     "name": "wolfi-base", "role": "base", "media": "erofs",
-    "digest": "$BASE_DIGEST", "file": "$BASE_FILE", "size": $BASE_SIZE, "fs_verity": $BASE_VERITY
+    "digest": "$BASE_DIGEST", "file": "$BASE_FILE", "size": $BASE_SIZE, "fs_verity": $BASE_VERITY,
+    "verity": { "root_hash": "$BASE_RH", "salt": "$BASE_SALT", "data_size": $BASE_DS }
   },
   "runtimes": {
     "bun": {
       "name": "bun-$BUN_VER", "role": "runtime", "media": "erofs",
-      "digest": "$BUN_DIGEST", "file": "$BUN_FILE", "size": $BUN_SIZE, "fs_verity": $BUN_VERITY
+      "digest": "$BUN_DIGEST", "file": "$BUN_FILE", "size": $BUN_SIZE, "fs_verity": $BUN_VERITY,
+      "verity": { "root_hash": "$BUN_RH", "salt": "$BUN_SALT", "data_size": $BUN_DS }
     },
     "node": {
       "name": "node", "role": "runtime", "media": "erofs",
-      "digest": "$NODE_DIGEST", "file": "$NODE_FILE", "size": $NODE_SIZE, "fs_verity": $NODE_VERITY
+      "digest": "$NODE_DIGEST", "file": "$NODE_FILE", "size": $NODE_SIZE, "fs_verity": $NODE_VERITY,
+      "verity": { "root_hash": "$NODE_RH", "salt": "$NODE_SALT", "data_size": $NODE_DS }
     },
     "rust": {
       "name": "rust", "role": "runtime", "media": "erofs",
-      "digest": "$RUST_DIGEST", "file": "$RUST_FILE", "size": $RUST_SIZE, "fs_verity": $RUST_VERITY
+      "digest": "$RUST_DIGEST", "file": "$RUST_FILE", "size": $RUST_SIZE, "fs_verity": $RUST_VERITY,
+      "verity": { "root_hash": "$RUST_RH", "salt": "$RUST_SALT", "data_size": $RUST_DS }
     },
     "python": {
       "name": "python", "role": "runtime", "media": "erofs",
-      "digest": "$PYTHON_DIGEST", "file": "$PYTHON_FILE", "size": $PYTHON_SIZE, "fs_verity": $PYTHON_VERITY
+      "digest": "$PYTHON_DIGEST", "file": "$PYTHON_FILE", "size": $PYTHON_SIZE, "fs_verity": $PYTHON_VERITY,
+      "verity": { "root_hash": "$PYTHON_RH", "salt": "$PYTHON_SALT", "data_size": $PYTHON_DS }
     },
     "go": {
       "name": "go", "role": "runtime", "media": "erofs",
-      "digest": "$GO_DIGEST", "file": "$GO_FILE", "size": $GO_SIZE, "fs_verity": $GO_VERITY
+      "digest": "$GO_DIGEST", "file": "$GO_FILE", "size": $GO_SIZE, "fs_verity": $GO_VERITY,
+      "verity": { "root_hash": "$GO_RH", "salt": "$GO_SALT", "data_size": $GO_DS }
     }
   }
 }

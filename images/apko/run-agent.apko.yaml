@@ -10,6 +10,12 @@
 # read-only). This file only assembles the userland. chronyd is run as root
 # (`-u root`) by the agent, so no chrony user account is needed here.
 #
+# cryptsetup ships `veritysetup`, which the agent shells out to (crates/jkbase-agent/
+# src/dmverity.rs) to activate dm-verity over the shared erofs runtime layers — the
+# kernel then Merkle-verifies every block read against the host-pinned root hash, so a
+# tampered shared layer returns EIO. (No udevd in the guest → the agent passes
+# DM_DISABLE_UDEV=1 so libdevmapper manages the /dev/mapper node itself.)
+#
 # Pin: commit the apko.lock.json apko emits (`apko lock`) so rebuilds are
 # bitwise-reproducible (the Wolfi repo is rolling).
 contents:
@@ -22,6 +28,7 @@ contents:
     - glibc # chrony is a glibc binary
     - ld-linux # dynamic loader for chrony
     - chrony # NTP/PTP client; refclock PHC disciplines the guest clock
+    - cryptsetup # ships veritysetup: dm-verity activation of the shared runtime layers
 
 archs:
   - x86_64
