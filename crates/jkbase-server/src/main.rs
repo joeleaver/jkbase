@@ -892,7 +892,13 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             // Orphaned atomic-write temp files (`{id}.holder.tmp.{pid}`) left by a crash
             // mid `write_holder`: always stale (a completed write renames into place), so
             // reap unconditionally — they carry no live identity to match `registered`.
-            if name.contains(".holder.tmp.") {
+            // Match the EXACT `.holder.tmp.<digits>` suffix, not a substring: a real disk
+            // ends in `.img`/`.holder`/`.ext4`, and a project id may itself legally contain
+            // `.holder.tmp.`, so a substring check could delete a live disk.
+            if name
+                .rsplit_once(".holder.tmp.")
+                .is_some_and(|(_, pid)| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+            {
                 let _ = std::fs::remove_file(entry.path());
                 continue;
             }
@@ -1120,18 +1126,24 @@ async fn handle_deploy(
 ) -> Result<()> {
     // Wait out any in-flight wake/hibernate before touching the disk: those drop the
     // platform lock during the slow VM op while still holding the data-disk lease, so
-    // releasing + re-fencing underneath one would race its cleanup and fail transiently
-    // with LeaseHeld. Mirror handle_teardown's bounded (~30s) wait, then hold the lock.
+    // releasing + re-fencing underneath one would (a) fail transiently with LeaseHeld,
+    // or worse (b) for a still-live hibernate, detach the disk its paused-but-alive FC
+    // still maps and start a second writer. Budget ~80s to actually outlast hibernate's
+    // worst case (3s log-ship + 60s snapshot timeout); on expiry FAIL CLOSED rather than
+    // charge ahead into a re-fence under a live peer — deploy is retryable.
     let mut plat = {
         let mut attempt = 0;
         loop {
             let plat = platform.lock().await;
-            if attempt < 150
-                && matches!(
-                    plat.vm_states.get(project_id),
-                    Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
-                )
-            {
+            if matches!(
+                plat.vm_states.get(project_id),
+                Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
+            ) {
+                if attempt >= 400 {
+                    anyhow::bail!(
+                        "project {project_id} busy (wake/hibernate still in flight after ~80s); retry deploy"
+                    );
+                }
                 drop(plat);
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1706,10 +1718,17 @@ async fn wake_project_inner(
     // Re-validate the project still exists before committing the VM. handle_teardown
     // waits out our `Waking` state, so a delete can't race the body above — but a
     // delete that landed BEFORE we set Waking would leave us booting a ghost. If so,
-    // abort: dropping `vm` SIGKILLs the FC and dropping the armed `disk_guard` releases
-    // the lease + disk.
+    // abort: SIGKILL the FC (drop `vm`) FIRST, then release the guard AWAITED — not via
+    // the fire-and-forget Drop backstop, whose deferred detach could later `losetup -d`
+    // a recreated same-slug VM's live device. Drop the platform lock first so the
+    // release's losetup I/O isn't held under the mutex.
     if plat.store.get_project(project_id).ok().flatten().is_none() {
         plat.vm_states.remove(project_id);
+        drop(plat);
+        drop(vm); // SIGKILL the FC before detaching the disk it still maps
+        if let Some(g) = disk_guard {
+            g.release().await; // detach + lease release inline; disarms so Drop no-ops
+        }
         anyhow::bail!("project {project_id} was deleted during wake; aborting");
     }
 
@@ -1939,9 +1958,13 @@ async fn migrate_legacy_data_disks(dir: &Path) -> Result<()> {
             } else {
                 // Both exist: the loop-managed `.img` is authoritative (storage accounting
                 // and the provider already use it), so the legacy `.ext4` is a dead orphan.
-                // Reap it instead of silently leaving it to leak disk forever.
+                // Reap it BEST-EFFORT — a stuck orphan (immutable attr / read-only FS) must
+                // never abort node startup (this runs under `?` in main, before serving);
+                // log and leave it for the next boot rather than bricking the whole host.
                 warn!(path = %p.display(), "legacy .ext4 data disk shadowed by an existing .img; reaping the orphan");
-                tokio::fs::remove_file(&p).await?;
+                if let Err(e) = tokio::fs::remove_file(&p).await {
+                    warn!(path = %p.display(), error = %e, "failed to reap shadowed legacy .ext4 orphan; leaving in place");
+                }
             }
         }
     }

@@ -122,7 +122,10 @@ impl LocalLoop {
         match lines.as_slice() {
             [pid, pid_starttime, epoch, source_id, loop_dev] => Some(Holder {
                 pid: pid.trim().parse().ok()?,
-                pid_starttime: pid_starttime.trim().parse().ok()?,
+                // Lenient: a corrupt start time degrades to 0=UNKNOWN (PID-only liveness)
+                // rather than failing the whole parse — returning None here would make
+                // attach_rwo see "no holder" and SKIP the exclusivity gate (fail-open).
+                pid_starttime: pid_starttime.trim().parse().unwrap_or(0),
                 epoch: epoch.trim().parse().ok()?,
                 source_id: source_id.to_string(),
                 loop_dev: loop_dev.to_string(),
