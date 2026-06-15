@@ -535,6 +535,9 @@ async fn main() -> Result<()> {
         domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
         wake_callback: Some(wake_callback),
+        backend_port: 80,
+        relay_idle_timeout: jkbase_wsproxy::DEFAULT_RELAY_IDLE_TIMEOUT,
+        max_concurrent_upgrades: 1024,
     };
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();

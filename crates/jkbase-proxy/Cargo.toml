@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 jkbase-common = { workspace = true }
+jkbase-wsproxy = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1"] }

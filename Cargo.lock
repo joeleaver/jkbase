@@ -1616,6 +1616,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jkbase-common",
+ "jkbase-wsproxy",
  "libc",
  "serde",
  "serde_json",
@@ -1729,6 +1730,7 @@ dependencies = [
  "hyper-util",
  "instant-acme",
  "jkbase-common",
+ "jkbase-wsproxy",
  "rcgen 0.13.2",
  "reqwest",
  "rustls",
@@ -1759,6 +1761,7 @@ dependencies = [
  "jkbase-orch",
  "jkbase-proxy",
  "jkbase-substrate",
+ "jkbase-wsproxy",
  "jkbuild-types",
  "rcgen 0.13.2",
  "reqwest",
@@ -1792,6 +1795,16 @@ dependencies = [
  "tokio",
  "tokio-util",
  "trybuild",
+]
+
+[[package]]
+name = "jkbase-wsproxy"
+version = "0.1.0"
+dependencies = [
+ "hyper",
+ "hyper-util",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

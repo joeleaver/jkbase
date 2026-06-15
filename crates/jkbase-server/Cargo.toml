@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 jkbase-common = { workspace = true }
 jkbase-proxy = { workspace = true }
+jkbase-wsproxy = { workspace = true }
 jkbase-control = { workspace = true }
 jkbase-orch = { workspace = true }
 jkbase-substrate = { workspace = true }

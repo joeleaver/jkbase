@@ -1,0 +1,10 @@
+[package]
+name = "jkbase-wsproxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+hyper = { workspace = true, features = ["client", "server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tracing = { workspace = true }

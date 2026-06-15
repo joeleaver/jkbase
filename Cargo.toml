@@ -8,6 +8,7 @@ members = [
     "crates/jkbase-control",
     "crates/jkbase-orch",
     "crates/jkbase-common",
+    "crates/jkbase-wsproxy",
     "crates/jkbase-substrate",
     "crates/jkbase-objectstore",
     "crates/jkbuild",
@@ -20,6 +21,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 jkbase-common = { path = "crates/jkbase-common" }
+jkbase-wsproxy = { path = "crates/jkbase-wsproxy" }
 jkbase-proxy = { path = "crates/jkbase-proxy" }
 jkbase-control = { path = "crates/jkbase-control" }
 jkbase-orch = { path = "crates/jkbase-orch" }
