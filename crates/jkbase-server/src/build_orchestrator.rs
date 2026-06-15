@@ -1365,7 +1365,7 @@ async fn build_one_target_inner(
         cache_hit: cache.cache_hit,
         cache_key: cache.cache_key,
         duration_breakdown_ms: cache.phases_ms,
-        builder_digest: sha256_hex(&toolchain).ok().map(|h| format!("sha256:{h}")),
+        builder_digest: toolchain_builder_digest(&toolchain).await,
     };
 
     Ok((log_tail, provenance))
@@ -1550,6 +1550,42 @@ fn read_cache_meta(output_img: &Path, workspace: &Path, tag: &str) -> jkbuild_ty
         .and_then(|b| serde_json::from_slice::<jkbuild_types::CacheMeta>(&b).ok());
     let _ = std::fs::remove_file(&tmp);
     parsed.unwrap_or_default()
+}
+
+/// `sha256:…` of the toolchain image for `builder_digest` provenance, memoized by
+/// (path, size, mtime). Toolchain images are large (up to ~1.8 GiB) and stable, so
+/// hash once per version rather than on every build, and on the blocking pool (a
+/// multi-second hash must not stall a tokio worker). `None` if the image is gone or
+/// the hash fails — provenance must never fail a build that otherwise succeeded.
+async fn toolchain_builder_digest(toolchain: &Path) -> Option<String> {
+    // (size, mtime) → digest, so a re-baked toolchain image (new size/mtime) re-hashes.
+    type DigestCache = std::sync::Mutex<HashMap<PathBuf, (u64, std::time::SystemTime, String)>>;
+    static CACHE: std::sync::LazyLock<DigestCache> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    let meta = std::fs::metadata(toolchain).ok()?;
+    let size = meta.len();
+    let mtime = meta.modified().ok()?;
+    {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((s, m, d)) = cache.get(toolchain)
+            && *s == size
+            && *m == mtime
+        {
+            return Some(d.clone());
+        }
+    }
+    let path = toolchain.to_path_buf();
+    let hex = tokio::task::spawn_blocking(move || sha256_hex(&path))
+        .await
+        .ok()?
+        .ok()?;
+    let digest = format!("sha256:{hex}");
+    CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(toolchain.to_path_buf(), (size, mtime, digest.clone()));
+    Some(digest)
 }
 
 /// Reject manifest-supplied names and paths that could escape the build/deploy

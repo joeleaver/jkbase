@@ -1005,25 +1005,26 @@ async fn reconcile_baselayers_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     let mut live: HashSet<String> = HashSet::new();
 
     // (1) Current platform.json base + every runtime are ALWAYS live (the next deploy
-    //     and any project mid-deploy use them). If it exists but won't parse, abort —
-    //     we must not risk reaping the current base/runtime.
+    //     and any project mid-deploy use them). baselayers/ existing implies platform.json
+    //     should too — the platform-layer build installs the blobs THEN writes the
+    //     manifest — so treat absent/unreadable/unparseable IDENTICALLY: abort the sweep
+    //     rather than risk reaping the current (or a freshly-baked, not-yet-deployed-onto)
+    //     base/runtime when the manifest momentarily isn't there.
     let platform_json = baselayers.join("platform.json");
-    if platform_json.exists() {
-        let parsed = std::fs::read(&platform_json)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-        let Some(v) = parsed else {
-            warn!("baselayers GC: platform.json unreadable/unparseable; skipping sweep");
-            return;
-        };
-        if let Some(f) = v.get("base").and_then(|b| b.get("file")).and_then(|f| f.as_str()) {
-            live.insert(f.to_string());
-        }
-        if let Some(rts) = v.get("runtimes").and_then(|r| r.as_object()) {
-            for desc in rts.values() {
-                if let Some(f) = desc.get("file").and_then(|f| f.as_str()) {
-                    live.insert(f.to_string());
-                }
+    let parsed = std::fs::read(&platform_json)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let Some(v) = parsed else {
+        warn!("baselayers GC: platform.json missing/unreadable/unparseable; skipping sweep");
+        return;
+    };
+    if let Some(f) = v.get("base").and_then(|b| b.get("file")).and_then(|f| f.as_str()) {
+        live.insert(f.to_string());
+    }
+    if let Some(rts) = v.get("runtimes").and_then(|r| r.as_object()) {
+        for desc in rts.values() {
+            if let Some(f) = desc.get("file").and_then(|f| f.as_str()) {
+                live.insert(f.to_string());
             }
         }
     }
@@ -1042,11 +1043,13 @@ async fn reconcile_baselayers_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             }
         };
         for p in paths {
-            // Only blobs in baselayers/ (base + runtime); app layers live in the
-            // per-version `_layers` dir and are reclaimed with that dir on prune.
-            if p.parent() == Some(baselayers.as_path())
-                && let Some(name) = p.file_name().and_then(|n| n.to_str())
-            {
+            // Match by content-addressed FILENAME, not parent path: the baked paths carry
+            // the data_dir spelling AS OF deploy time, so a relocated/re-spelled data_dir
+            // would make a live base/runtime's parent lexically != the boot-time baselayers
+            // dir and silently drop it from the set. A `sha256-<hex>.erofs` name uniquely
+            // identifies its blob regardless of directory; adding app-layer names too is
+            // harmless (they never collide with a baselayers blob's content address).
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                 live.insert(name.to_string());
             }
         }

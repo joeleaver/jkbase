@@ -352,21 +352,19 @@ pub(crate) fn try_read_layer_paths(metadata_image: &Path) -> Result<Vec<PathBuf>
         BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let _ = std::fs::remove_file(&dest);
+    // Remove the dump on EVERY return path (incl. the read/parse `?` below).
+    let _cleanup = TempCleanup(vec![dest.clone()]);
     let found =
         jkbase_orch::build_output::dump_file(metadata_image, &format!("/{LAYER_PATHS_FILE}"), &dest)
             .with_context(|| format!("extract {LAYER_PATHS_FILE} from {}", metadata_image.display()))?;
-    let result = if found {
-        let bytes = std::fs::read(&dest)
-            .with_context(|| format!("read extracted {}", dest.display()))?;
-        let v: Vec<String> = serde_json::from_slice(&bytes).with_context(|| {
-            format!("parse {LAYER_PATHS_FILE} from {}", metadata_image.display())
-        })?;
-        v.into_iter().map(PathBuf::from).collect()
-    } else {
-        Vec::new()
-    };
-    let _ = std::fs::remove_file(&dest);
-    Ok(result)
+    if !found {
+        return Ok(Vec::new());
+    }
+    let bytes =
+        std::fs::read(&dest).with_context(|| format!("read extracted {}", dest.display()))?;
+    let v: Vec<String> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse {LAYER_PATHS_FILE} from {}", metadata_image.display()))?;
+    Ok(v.into_iter().map(PathBuf::from).collect())
 }
 
 /// Monotonic suffix so concurrent / orphaned builds use distinct temp paths.
