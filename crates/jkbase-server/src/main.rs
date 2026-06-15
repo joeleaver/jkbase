@@ -274,6 +274,24 @@ async fn main() -> Result<()> {
             store.clone(),
             format!("storage.{}", args.domain),
         ));
+        // Multipart-staging sweeper: reap abandoned `.uploads/{id}` dirs older than
+        // MULTIPART_MAX_AGE on boot, then on a timer (mirrors S3's abort-incomplete-
+        // multipart lifecycle), so a crashed/forgotten upload can't pin disk forever.
+        {
+            let sweeper = svc.clone();
+            tokio::spawn(async move {
+                const MULTIPART_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+                const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+                let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+                loop {
+                    tick.tick().await; // fires immediately on the first iteration (boot)
+                    let n = sweeper.sweep_all_stale_uploads(MULTIPART_MAX_AGE).await;
+                    if n > 0 {
+                        info!(reaped = n, "object-store: swept stale multipart uploads");
+                    }
+                }
+            });
+        }
         let bind = format!("127.0.0.1:{}", args.storage_port);
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(&bind).await {
@@ -903,7 +921,9 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             info!(project = %id, artifact = "data-disks", "reaped orphaned artifact");
         }
     }
-    for sub in ["hosting", "run", "snapshots"] {
+    // `objectstore/{id}`: a deleted project's bucket tree (delete purges it, but a
+    // crash-interrupted teardown can leave it — reap so a recreated slug starts clean).
+    for sub in ["hosting", "run", "snapshots", "objectstore"] {
         let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
             continue;
         };
