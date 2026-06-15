@@ -660,6 +660,23 @@ async fn create_project(
 ) -> impl IntoResponse {
     let id = slug(&req.name);
 
+    // The slug becomes a filesystem path component for per-project state (object-store
+    // root, content image, data disk, hosting dir). slug() can collapse to "" (e.g.
+    // ".", "/", "---") or otherwise diverge, and an empty id would resolve the
+    // object-store root to the SHARED `objectstore/` parent — a cross-tenant breach.
+    // Enforce the same `[a-z0-9-]` (1-63) invariant every downstream path-join assumes.
+    if !is_valid_project_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "invalid project name: must reduce to [a-z0-9-] (1-63 chars); got '{id}'"
+                ),
+            }),
+        )
+            .into_response();
+    }
+
     if crate::store::host_is_reserved(&id) {
         return (
             StatusCode::CONFLICT,
@@ -679,6 +696,14 @@ async fn create_project(
         )
             .into_response();
     }
+
+    // Defense-in-depth: a crashed/interrupted teardown of a prior same-slug project
+    // could have left orphaned per-id state — tenant env secrets, S3 access keys, or
+    // the object-store root — that the deploy/auth paths would otherwise serve to the
+    // NEW owner (cross-tenant inheritance). Purge it before the slug is reused.
+    let _ = state.store.delete_all_secrets(&id);
+    let _ = state.store.delete_all_access_keys(&id);
+    let _ = tokio::fs::remove_dir_all(data_dir(&state).join("objectstore").join(&id)).await;
 
     // Claim the project's primary subdomain (host-key == project id). This also
     // reserves the name in the unified hostname namespace.

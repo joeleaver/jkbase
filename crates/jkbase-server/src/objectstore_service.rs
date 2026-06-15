@@ -77,6 +77,20 @@ impl ObjectStoreService {
     /// Get-or-open the per-project entry. Opening creates `{data_dir}/objectstore/{id}`
     /// lazily (mirrors how data disks / content images are made on first use).
     fn project_entry(&self, project_id: &str) -> std::io::Result<Arc<ProjectEntry>> {
+        // Defense-in-depth: project_id becomes a path component for the store root.
+        // The control plane only ever mints keys for validated `[a-z0-9-]` slugs, but
+        // refuse to join anything else (esp. empty → the shared `objectstore/` parent)
+        // so a malformed id that ever lands in ACCESS_KEYS fails closed here too.
+        if project_id.is_empty()
+            || project_id.len() > 63
+            || !project_id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(std::io::Error::other(format!(
+                "invalid project id {project_id:?}"
+            )));
+        }
         let mut map = self.projects.lock().unwrap();
         if let Some(e) = map.get(project_id) {
             return Ok(e.clone());
@@ -402,6 +416,30 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_project_id_key_cannot_reach_the_shared_root() {
+        // Regression for the empty-slug BLOCKER: a key whose project_id is "" must NOT
+        // resolve its store root to the shared `objectstore/` parent (which would list
+        // every other project as a "bucket"). project_entry must fail closed.
+        let dir = tmp("emptyproj");
+        let store = store_at(&dir);
+        let data = dir.join("data");
+        // A real victim project with a bucket sitting under the shared objectstore root.
+        std::fs::create_dir_all(data.join("objectstore").join("victim-proj").join("secret-bkt")).unwrap();
+        let bad = store.create_access_key("", "evil").unwrap(); // empty project id
+        let svc = Arc::new(ObjectStoreService::new(data, store, "storage.test".to_string()));
+        let app = svc.into_router();
+
+        // GET / would, without the guard, list the shared root (every project id).
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("GET", "/", &bad.access_key_id, &bad.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert_ne!(st, StatusCode::OK, "empty-project key must not succeed");
+        assert!(!body.contains("victim-proj"), "must not leak other projects' ids");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
