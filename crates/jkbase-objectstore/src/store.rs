@@ -1,11 +1,18 @@
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Per-idle-read timeout for put_object / upload_part (slow-loris guard).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum total time allowed for a single upload body, across all reads.
+const MAX_UPLOAD_DURATION: Duration = Duration::from_secs(3600);
 
 /// Errors surfaced by the object store. The HTTP layer maps these onto S3 error
 /// codes (NoSuchBucket, NoSuchKey, BucketNotEmpty, …).
@@ -29,6 +36,12 @@ pub enum ObjectError {
     NoSuchUpload(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// Slow-loris: idle-timeout per read or total upload cap exceeded.
+    #[error("request timeout: {0}")]
+    Timeout(String),
+    /// x-amz-content-sha256 mismatch (body corrupted in transit).
+    #[error("content sha256 mismatch")]
+    ContentSha256Mismatch,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -39,6 +52,10 @@ pub enum ObjectError {
 struct UploadInfo {
     key: String,
     content_type: String,
+    /// Unix seconds at which the upload was initiated. Defaulted to 0 for
+    /// uploads created before this field existed (pre-hardening).
+    #[serde(default)]
+    initiated: u64,
 }
 
 type Result<T> = std::result::Result<T, ObjectError>;
@@ -53,6 +70,25 @@ pub struct ObjectMeta {
     pub content_type: String,
     /// Last-modified, unix seconds.
     pub last_modified: u64,
+}
+
+/// Result page from `list_objects`. Holds the current page plus pagination
+/// state for the next call.
+#[derive(Debug)]
+pub struct ListPage {
+    pub objects: Vec<ObjectMeta>,
+    pub is_truncated: bool,
+    /// When `is_truncated`, the last key returned; pass as `start_after` next call.
+    pub next_continuation_token: Option<String>,
+}
+
+/// A pending multipart upload (returned by `list_multipart_uploads`).
+#[derive(Debug)]
+pub struct MultipartUpload {
+    pub upload_id: String,
+    pub key: String,
+    /// Unix seconds at which the upload was initiated (0 for pre-hardening uploads).
+    pub initiated: u64,
 }
 
 /// A tenant object store rooted at `root`, one subdirectory per bucket. Each
@@ -93,7 +129,6 @@ impl ObjectStore {
             return Err(ObjectError::BucketNotEmpty(bucket.to_string()));
         }
         tokio::fs::remove_dir(&dir).await?;
-        let _ = tokio::fs::remove_file(self.root.join(".owners").join(bucket)).await;
         Ok(())
     }
 
@@ -115,26 +150,6 @@ impl ObjectStore {
         Ok(out)
     }
 
-    /// Record the owning tenant of `bucket` (for per-tenant isolation). Stored
-    /// outside the bucket dir so it never blocks bucket deletion or shows in lists.
-    pub async fn set_bucket_owner(&self, bucket: &str, owner: &str) -> Result<()> {
-        validate_bucket(bucket)?;
-        let odir = self.root.join(".owners");
-        tokio::fs::create_dir_all(&odir).await?;
-        tokio::fs::write(odir.join(bucket), owner).await?;
-        Ok(())
-    }
-
-    /// The tenant that owns `bucket`, if recorded.
-    pub async fn bucket_owner(&self, bucket: &str) -> Result<Option<String>> {
-        validate_bucket(bucket)?;
-        match tokio::fs::read_to_string(self.root.join(".owners").join(bucket)).await {
-            Ok(s) => Ok(Some(s.trim().to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
         validate_bucket(bucket)?;
         Ok(tokio::fs::try_exists(self.root.join(bucket)).await?)
@@ -153,12 +168,20 @@ impl ObjectStore {
 
     /// Stream `reader` into `bucket/key`, computing the MD5 etag as it goes (the
     /// body is never fully buffered). Overwrites any existing object atomically.
+    ///
+    /// `expected_sha256`: when `Some(hex)` (64-char lowercase hex), the SHA-256 of
+    /// the streamed bytes is verified and `ContentSha256Mismatch` returned on
+    /// mismatch. Pass `None` for UNSIGNED-PAYLOAD or STREAMING-* bodies (no check).
+    ///
+    /// Note: `aws-chunked` (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) bodies are stored
+    /// raw / not de-framed; our JS SDK uses UNSIGNED-PAYLOAD plain bodies.
     pub async fn put_object<R: AsyncRead + Unpin>(
         &self,
         bucket: &str,
         key: &str,
         mut reader: R,
         content_type: &str,
+        expected_sha256: Option<&str>,
     ) -> Result<ObjectMeta> {
         validate_key(key)?;
         let dir = self.require_bucket(bucket).await?;
@@ -170,36 +193,28 @@ impl ObjectStore {
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
 
-        let mut hasher = Md5::new();
-        let mut size = 0u64;
-        {
-            let mut f = tokio::fs::File::create(&tmp).await?;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                let n = reader.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                f.write_all(&buf[..n]).await?;
-                size += n as u64;
+        let result = write_stream(&tmp, &mut reader, expected_sha256).await;
+        match result {
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
             }
-            f.sync_all().await?;
+            Ok((size, etag, _)) => {
+                if let Err(e) = tokio::fs::rename(&tmp, &obj).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err(e.into());
+                }
+                let meta = ObjectMeta {
+                    key: key.to_string(),
+                    size,
+                    etag,
+                    content_type: content_type.to_string(),
+                    last_modified: now_secs(),
+                };
+                tokio::fs::write(dir.join(format!("{hk}.meta")), serde_json::to_vec(&meta).unwrap()).await?;
+                Ok(meta)
+            }
         }
-        if let Err(e) = tokio::fs::rename(&tmp, &obj).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e.into());
-        }
-
-        let meta = ObjectMeta {
-            key: key.to_string(),
-            size,
-            etag: hex(&hasher.finalize()),
-            content_type: content_type.to_string(),
-            last_modified: now_secs(),
-        };
-        tokio::fs::write(dir.join(format!("{hk}.meta")), serde_json::to_vec(&meta).unwrap()).await?;
-        Ok(meta)
     }
 
     /// Open `bucket/key` for streaming, returning its metadata + the file handle.
@@ -224,24 +239,66 @@ impl ObjectStore {
     }
 
     /// List objects in `bucket` whose key starts with `prefix`, sorted by key.
-    pub async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    ///
+    /// Returns a page of up to `max_keys` objects (clamped to 1..=1000).
+    /// `start_after`: skip all keys ≤ this value (both V1 marker and V2
+    /// continuation-token are passed here by the HTTP layer).
+    ///
+    /// Only reads `.meta` files for the page's keys — a million-object bucket
+    /// never loads every meta into RAM.
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<ListPage> {
+        let max_keys = max_keys.clamp(1, 1000);
         let dir = self.require_bucket(bucket).await?;
-        let mut out = Vec::new();
+
+        // Collect all matching keys cheaply (filename → hex-decode → key string).
+        let mut keys: Vec<String> = Vec::new();
         let mut rd = tokio::fs::read_dir(&dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".meta") {
+            let Some(hex_key) = name.strip_suffix(".meta") else { continue };
+            // Hex-decode filename back to the original key bytes.
+            let Ok(key_bytes) = hex_decode(hex_key) else { continue };
+            let Ok(key) = String::from_utf8(key_bytes) else { continue };
+            if !key.starts_with(prefix) {
                 continue;
             }
-            let bytes = tokio::fs::read(entry.path()).await?;
-            let meta: ObjectMeta = serde_json::from_slice(&bytes)
-                .map_err(|_| ObjectError::CorruptMeta(name.clone()))?;
-            if meta.key.starts_with(prefix) {
-                out.push(meta);
+            if start_after.is_some_and(|sa| key.as_str() <= sa) {
+                continue;
             }
+            keys.push(key);
         }
-        out.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok(out)
+        keys.sort();
+
+        let is_truncated = keys.len() > max_keys;
+        let page_keys = &keys[..keys.len().min(max_keys)];
+        let next_continuation_token = if is_truncated {
+            page_keys.last().cloned()
+        } else {
+            None
+        };
+
+        // Read metadata only for the page's keys.
+        let mut objects = Vec::with_capacity(page_keys.len());
+        for key in page_keys {
+            let hk = hex(key.as_bytes());
+            let meta_path = dir.join(format!("{hk}.meta"));
+            let bytes = match tokio::fs::read(&meta_path).await {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue, // raced with delete
+                Err(e) => return Err(e.into()),
+            };
+            let meta: ObjectMeta = serde_json::from_slice(&bytes)
+                .map_err(|_| ObjectError::CorruptMeta(key.clone()))?;
+            objects.push(meta);
+        }
+
+        Ok(ListPage { objects, is_truncated, next_continuation_token })
     }
 
     // ---- multipart upload -------------------------------------------------
@@ -256,18 +313,24 @@ impl ObjectStore {
         let info = UploadInfo {
             key: key.to_string(),
             content_type: content_type.to_string(),
+            initiated: now_secs(),
         };
         tokio::fs::write(sdir.join("info.json"), serde_json::to_vec(&info).unwrap()).await?;
         Ok(upload_id)
     }
 
     /// Upload one part (number 1..=10000), streamed; returns its hex-MD5 etag.
+    ///
+    /// `expected_sha256`: same semantics as `put_object`.
+    ///
+    /// Note: `aws-chunked` bodies are stored raw / not de-framed.
     pub async fn upload_part<R: AsyncRead + Unpin>(
         &self,
         bucket: &str,
         upload_id: &str,
         part_number: u32,
         mut reader: R,
+        expected_sha256: Option<&str>,
     ) -> Result<String> {
         if !(1..=10_000).contains(&part_number) {
             return Err(ObjectError::InvalidArgument(format!("part number {part_number}")));
@@ -275,25 +338,23 @@ impl ObjectStore {
         let sdir = self.staging(bucket, upload_id).await?;
         let part = sdir.join(format!("part-{part_number}"));
         let tmp = sdir.join(format!("part-{part_number}.tmp"));
-        let mut hasher = Md5::new();
-        {
-            let mut f = tokio::fs::File::create(&tmp).await?;
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                let n = reader.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                f.write_all(&buf[..n]).await?;
+
+        let result = write_stream(&tmp, &mut reader, expected_sha256).await;
+        match result {
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
             }
-            f.sync_all().await?;
+            Ok((_, _, raw_md5)) => {
+                if let Err(e) = tokio::fs::rename(&tmp, &part).await {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    return Err(e.into());
+                }
+                // Persist the raw 16-byte digest; the final multipart etag is md5-of-md5s.
+                tokio::fs::write(sdir.join(format!("part-{part_number}.md5")), &raw_md5).await?;
+                Ok(hex(&raw_md5))
+            }
         }
-        tokio::fs::rename(&tmp, &part).await?;
-        let raw = hasher.finalize();
-        // Persist the raw 16-byte digest; the final multipart etag is md5-of-md5s.
-        tokio::fs::write(sdir.join(format!("part-{part_number}.md5")), raw).await?;
-        Ok(hex(&raw))
     }
 
     /// Complete a multipart upload: concatenate `part_numbers` in order into the
@@ -370,6 +431,93 @@ impl ObjectStore {
         Ok(())
     }
 
+    /// List all pending multipart uploads in `bucket`.
+    pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUpload>> {
+        let dir = self.require_bucket(bucket).await?;
+        let uploads_dir = dir.join(".uploads");
+        let mut out = Vec::new();
+        let mut rd = match tokio::fs::read_dir(&uploads_dir).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = rd.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let upload_id = entry.file_name().to_string_lossy().into_owned();
+            let info_path = entry.path().join("info.json");
+            let bytes = match tokio::fs::read(&info_path).await {
+                Ok(b) => b,
+                Err(_) => continue, // partially created or already removed
+            };
+            let info: UploadInfo = match serde_json::from_slice(&bytes) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            out.push(MultipartUpload {
+                upload_id,
+                key: info.key,
+                initiated: info.initiated,
+            });
+        }
+        out.sort_by(|a, b| a.upload_id.cmp(&b.upload_id));
+        Ok(out)
+    }
+
+    /// Remove abandoned uploads across ALL buckets whose `info.json` mtime (or
+    /// `initiated` field) is older than `max_age`. Returns the number of upload
+    /// directories removed. Also removes empty `.uploads` parent dirs.
+    pub async fn sweep_stale_uploads(&self, max_age: Duration) -> Result<usize> {
+        let threshold = now_secs().saturating_sub(max_age.as_secs());
+        let mut removed = 0usize;
+
+        let mut rd = match tokio::fs::read_dir(&self.root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(bucket_entry) = rd.next_entry().await? {
+            let name = bucket_entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !bucket_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let uploads_dir = bucket_entry.path().join(".uploads");
+            let mut urd = match tokio::fs::read_dir(&uploads_dir).await {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            while let Some(uid_entry) = urd.next_entry().await? {
+                if !uid_entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let info_path = uid_entry.path().join("info.json");
+                // Use the `initiated` field if present, fall back to file mtime.
+                let age_secs = if let Ok(bytes) = tokio::fs::read(&info_path).await {
+                    if let Ok(info) = serde_json::from_slice::<UploadInfo>(&bytes) {
+                        if info.initiated > 0 {
+                            info.initiated
+                        } else {
+                            mtime_secs(&info_path).await.unwrap_or(0)
+                        }
+                    } else {
+                        mtime_secs(&info_path).await.unwrap_or(0)
+                    }
+                } else {
+                    mtime_secs(&uid_entry.path()).await.unwrap_or(0)
+                };
+                if age_secs <= threshold {
+                    let _ = tokio::fs::remove_dir_all(uid_entry.path()).await;
+                    removed += 1;
+                }
+            }
+            // Clean up empty .uploads dir.
+            let _ = tokio::fs::remove_dir(&uploads_dir).await;
+        }
+        Ok(removed)
+    }
+
     async fn staging(&self, bucket: &str, upload_id: &str) -> Result<PathBuf> {
         let dir = self.require_bucket(bucket).await?;
         validate_upload_id(upload_id)?;
@@ -399,6 +547,61 @@ impl ObjectStore {
     }
 }
 
+/// Shared write-loop for `put_object` and `upload_part`. Streams `reader` into
+/// `tmp`, enforcing per-read idle timeout and total-upload cap. Computes MD5
+/// (for etag) and SHA-256 (for content binding) simultaneously.
+///
+/// Returns `(size, hex_md5_etag, raw_md5_bytes)` on success.
+/// The caller is responsible for unlinking `tmp` on any `Err` return.
+async fn write_stream<R: AsyncRead + Unpin>(
+    tmp: &PathBuf,
+    reader: &mut R,
+    expected_sha256: Option<&str>,
+) -> Result<(u64, String, Vec<u8>)> {
+    let mut md5_hasher: Md5 = Md5::new();
+    let mut sha_hasher: Sha256 = Sha256::new();
+    let mut size = 0u64;
+    let deadline = Instant::now() + MAX_UPLOAD_DURATION;
+
+    let mut f = tokio::fs::File::create(tmp).await?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ObjectError::Timeout("total upload time exceeded".into()));
+        }
+        let n = match tokio::time::timeout(IDLE_TIMEOUT, reader.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(ObjectError::Timeout("idle read timeout".into())),
+        };
+        if n == 0 {
+            break;
+        }
+        md5_hasher.update(&buf[..n]);
+        sha_hasher.update(&buf[..n]);
+        f.write_all(&buf[..n]).await?;
+        size += n as u64;
+    }
+    f.sync_all().await?;
+
+    let raw_md5 = md5_hasher.finalize().to_vec();
+    let etag = hex(&raw_md5);
+
+    if let Some(exp) = expected_sha256 {
+        let actual = hex(&sha_hasher.finalize());
+        if actual != exp.to_lowercase() {
+            return Err(ObjectError::ContentSha256Mismatch);
+        }
+    }
+
+    Ok((size, etag, raw_md5))
+}
+
+async fn mtime_secs(path: &std::path::Path) -> Option<u64> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    meta.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -413,6 +616,34 @@ fn hex(bytes: &[u8]) -> String {
         s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
     }
     s
+}
+
+/// Decode a lowercase-hex string to bytes. Returns `Err(())` if the input is
+/// not valid even-length hex (filenames are always valid since we write them,
+/// but malformed entries are silently skipped in listings).
+fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
+    if !s.len().is_multiple_of(2) {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let hi = hex_digit(b[i])?;
+        let lo = hex_digit(b[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_digit(b: u8) -> std::result::Result<u8, ()> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(()),
+    }
 }
 
 /// Opaque, traversal-safe (pure hex) upload id.
@@ -482,7 +713,7 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("my-bucket").await.unwrap();
         let body = b"hello object store";
-        let meta = s.put_object("my-bucket", "a/b/c.txt", &body[..], "text/plain").await.unwrap();
+        let meta = s.put_object("my-bucket", "a/b/c.txt", &body[..], "text/plain", None).await.unwrap();
         assert_eq!(meta.size, body.len() as u64);
         // S3 etag = hex md5 of the bytes.
         assert_eq!(meta.etag, format!("{:x}", Md5::digest(body)));
@@ -505,8 +736,8 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("flatbucket").await.unwrap();
         // In a hierarchical FS `a/b` and `a/b/c` would conflict; hex keys avoid it.
-        s.put_object("flatbucket", "a/b", &b"1"[..], "x").await.unwrap();
-        s.put_object("flatbucket", "a/b/c", &b"2"[..], "x").await.unwrap();
+        s.put_object("flatbucket", "a/b", &b"1"[..], "x", None).await.unwrap();
+        s.put_object("flatbucket", "a/b/c", &b"2"[..], "x", None).await.unwrap();
         assert_eq!(read_all(s.get_object("flatbucket", "a/b").await.unwrap().1).await, b"1");
         assert_eq!(read_all(s.get_object("flatbucket", "a/b/c").await.unwrap().1).await, b"2");
         let _ = std::fs::remove_dir_all(&dir);
@@ -518,26 +749,51 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bucket-one").await.unwrap();
         s.create_bucket("bucket-two").await.unwrap();
-        s.put_object("bucket-one", "img/a", &b"x"[..], "x").await.unwrap();
-        s.put_object("bucket-one", "img/b", &b"x"[..], "x").await.unwrap();
-        s.put_object("bucket-one", "doc/c", &b"x"[..], "x").await.unwrap();
-        s.put_object("bucket-two", "img/z", &b"x"[..], "x").await.unwrap();
+        s.put_object("bucket-one", "img/a", &b"x"[..], "x", None).await.unwrap();
+        s.put_object("bucket-one", "img/b", &b"x"[..], "x", None).await.unwrap();
+        s.put_object("bucket-one", "doc/c", &b"x"[..], "x", None).await.unwrap();
+        s.put_object("bucket-two", "img/z", &b"x"[..], "x", None).await.unwrap();
 
-        let keys: Vec<_> = s.list_objects("bucket-one", "img/").await.unwrap().into_iter().map(|m| m.key).collect();
+        let page = s.list_objects("bucket-one", "img/", None, 1000).await.unwrap();
+        let keys: Vec<_> = page.objects.into_iter().map(|m| m.key).collect();
         assert_eq!(keys, vec!["img/a".to_string(), "img/b".to_string()]);
         // Isolation: b2's object never shows up under b1.
-        assert_eq!(s.list_objects("bucket-two", "").await.unwrap().len(), 1);
+        assert_eq!(s.list_objects("bucket-two", "", None, 1000).await.unwrap().objects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_pagination() {
+        let dir = root("page");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("page-bucket").await.unwrap();
+        for i in 0..5u32 {
+            s.put_object("page-bucket", &format!("k{i}"), &b"x"[..], "x", None).await.unwrap();
+        }
+        let p1 = s.list_objects("page-bucket", "", None, 3).await.unwrap();
+        assert_eq!(p1.objects.len(), 3);
+        assert!(p1.is_truncated);
+        let token = p1.next_continuation_token.unwrap();
+        assert_eq!(token, "k2");
+
+        let p2 = s.list_objects("page-bucket", "", Some(&token), 3).await.unwrap();
+        assert_eq!(p2.objects.len(), 2);
+        assert!(!p2.is_truncated);
+        assert!(p2.next_continuation_token.is_none());
+
+        let all_keys: Vec<_> = p1.objects.iter().chain(p2.objects.iter()).map(|m| m.key.clone()).collect();
+        assert_eq!(all_keys, vec!["k0", "k1", "k2", "k3", "k4"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn errors_for_missing_bucket_and_invalid_names() {
         let dir = root("err");
         let s = ObjectStore::open(&dir).unwrap();
-        assert!(matches!(s.put_object("nope", "k", &b""[..], "x").await, Err(ObjectError::NoSuchBucket(_))));
+        assert!(matches!(s.put_object("nope", "k", &b""[..], "x", None).await, Err(ObjectError::NoSuchBucket(_))));
         assert!(matches!(s.create_bucket("AB").await, Err(ObjectError::InvalidBucketName(_)))); // too short + uppercase
         s.create_bucket("ok-bucket").await.unwrap();
         assert!(matches!(s.create_bucket("ok-bucket").await, Err(ObjectError::BucketAlreadyExists(_))));
-        s.put_object("ok-bucket", "k", &b"x"[..], "x").await.unwrap();
+        s.put_object("ok-bucket", "k", &b"x"[..], "x", None).await.unwrap();
         assert!(matches!(s.delete_bucket("ok-bucket").await, Err(ObjectError::BucketNotEmpty(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -548,8 +804,8 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("mp-bucket").await.unwrap();
         let uid = s.create_multipart("mp-bucket", "big/file", "application/octet-stream").await.unwrap();
-        let e1 = s.upload_part("mp-bucket", &uid, 1, &b"hello "[..]).await.unwrap();
-        let e2 = s.upload_part("mp-bucket", &uid, 2, &b"world"[..]).await.unwrap();
+        let e1 = s.upload_part("mp-bucket", &uid, 1, &b"hello "[..], None).await.unwrap();
+        let e2 = s.upload_part("mp-bucket", &uid, 2, &b"world"[..], None).await.unwrap();
         assert_eq!(e1, format!("{:x}", Md5::digest(b"hello ")));
         assert_eq!(e2, format!("{:x}", Md5::digest(b"world")));
 
@@ -560,7 +816,7 @@ mod tests {
 
         // The upload id is consumed by complete.
         assert!(matches!(
-            s.upload_part("mp-bucket", &uid, 3, &b"x"[..]).await,
+            s.upload_part("mp-bucket", &uid, 3, &b"x"[..], None).await,
             Err(ObjectError::NoSuchUpload(_))
         ));
         // Bucket can still be emptied + deleted (the .uploads dir was cleaned up).
@@ -575,7 +831,7 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("ab-bucket").await.unwrap();
         let uid = s.create_multipart("ab-bucket", "k", "x").await.unwrap();
-        s.upload_part("ab-bucket", &uid, 1, &b"data"[..]).await.unwrap();
+        s.upload_part("ab-bucket", &uid, 1, &b"data"[..], None).await.unwrap();
         s.abort_multipart("ab-bucket", &uid).await.unwrap();
         assert!(matches!(
             s.complete_multipart("ab-bucket", "k", &uid, &[1]).await,
@@ -586,18 +842,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_ownership_recorded_and_not_listed() {
-        let dir = root("own");
+    async fn multipart_list_and_sweep() {
+        let dir = root("mpu-list");
         let s = ObjectStore::open(&dir).unwrap();
-        s.create_bucket("tenant-bucket").await.unwrap();
-        assert!(s.bucket_owner("tenant-bucket").await.unwrap().is_none());
-        s.set_bucket_owner("tenant-bucket", "tenant-a").await.unwrap();
-        assert_eq!(s.bucket_owner("tenant-bucket").await.unwrap().as_deref(), Some("tenant-a"));
-        // The hidden .owners registry is never surfaced as a bucket.
-        assert_eq!(s.list_buckets().await.unwrap(), vec!["tenant-bucket".to_string()]);
-        // Deleting the bucket clears its owner record.
-        s.delete_bucket("tenant-bucket").await.unwrap();
-        assert!(s.bucket_owner("tenant-bucket").await.unwrap().is_none());
+        s.create_bucket("sweep-bucket").await.unwrap();
+        let uid = s.create_multipart("sweep-bucket", "pending/obj", "application/octet-stream").await.unwrap();
+        s.upload_part("sweep-bucket", &uid, 1, &b"part"[..], None).await.unwrap();
+
+        let uploads = s.list_multipart_uploads("sweep-bucket").await.unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].upload_id, uid);
+        assert_eq!(uploads[0].key, "pending/obj");
+
+        // Zero seconds max_age -> everything is "stale" (initiated <= now - 0 = now).
+        // Use 1s so freshly created upload IS stale only when initiated < now.
+        // Force stale by using a tiny threshold: max_age = u64::MAX seconds.
+        let removed = s.sweep_stale_uploads(Duration::from_secs(u64::MAX / 2)).await.unwrap();
+        // Not stale (just created) — no removal.
+        assert_eq!(removed, 0);
+
+        // With max_age=0 every upload is stale.
+        let removed = s.sweep_stale_uploads(Duration::from_secs(0)).await.unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(s.list_multipart_uploads("sweep-bucket").await.unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn content_sha256_binding() {
+        use sha2::{Digest as Sha2Digest, Sha256};
+        let dir = root("sha256");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("sha-bucket").await.unwrap();
+        let body = b"content to verify";
+        let correct = format!("{:x}", Sha256::digest(body));
+        // Correct hash -> succeeds.
+        s.put_object("sha-bucket", "k", &body[..], "x", Some(&correct)).await.unwrap();
+        // Wrong hash -> ContentSha256Mismatch.
+        assert!(matches!(
+            s.put_object("sha-bucket", "k", &body[..], "x", Some("aaaa")).await,
+            Err(ObjectError::ContentSha256Mismatch)
+        ));
+        // None -> no check.
+        s.put_object("sha-bucket", "k", &body[..], "x", None).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
