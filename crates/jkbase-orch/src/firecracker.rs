@@ -227,6 +227,28 @@ impl FirecrackerClient {
         Ok(())
     }
 
+    /// The drive ids currently configured on the VM, from `GET /vm/config`
+    /// (`FullVmConfiguration.drives`). Used post-restore to verify a drive the
+    /// snapshot was expected to carry is actually present before
+    /// [`patch_drive`](Self::patch_drive) repoints it — a fail-closed check against
+    /// a future Firecracker that might CREATE (rather than reject) a PATCH for an
+    /// absent drive. Returns an empty list if the config reports no drives.
+    pub async fn loaded_drive_ids(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct DriveId {
+            drive_id: String,
+        }
+        #[derive(Deserialize)]
+        struct FullVmConfig {
+            #[serde(default)]
+            drives: Vec<DriveId>,
+        }
+        let body = self.request("GET", "/vm/config", None).await?;
+        let cfg: FullVmConfig =
+            serde_json::from_str(&body).context("failed to parse GET /vm/config")?;
+        Ok(cfg.drives.into_iter().map(|d| d.drive_id).collect())
+    }
+
     /// Resume a paused VM (PATCH `/vm` `{state: Resumed}`).
     pub async fn resume_vm(&self) -> Result<()> {
         let json = serde_json::to_string(&serde_json::json!({"state": "Resumed"}))?;
