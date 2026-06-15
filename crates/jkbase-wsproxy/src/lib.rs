@@ -107,25 +107,36 @@ fn sanitize_set_cookies(headers: &mut HeaderMap, platform_domain: &str) {
 }
 
 /// Remove a `Domain=` attribute whose host equals `platform_domain` (the apex),
-/// leaving the rest of the cookie intact. Case-insensitive on the attribute name and
-/// the host; tolerant of a leading `.` on the value.
+/// leaving the rest of the cookie intact.
+///
+/// Attributes are parsed the way a user-agent does (RFC 6265 §5.2): split each
+/// `;`-part on its FIRST `=` and trim both sides — so `Domain =.JKBASE.APP.` (stray
+/// space, leading/trailing dot, any case), which browsers still honour as the apex,
+/// cannot slip an apex-scoped cookie past us. Only attributes are inspected; the
+/// leading `name=value` pair is kept verbatim (a cookie literally named `domain` is
+/// not the Domain attribute).
 fn strip_apex_domain(set_cookie: &str, platform_domain: &str) -> String {
-    let apex = platform_domain.trim().to_ascii_lowercase();
-    set_cookie
-        .split(';')
-        .filter(|attr| {
-            let a = attr.trim();
-            match a.get(..7) {
-                Some(prefix) if prefix.eq_ignore_ascii_case("domain=") => {
-                    let val = a[7..].trim().trim_start_matches('.').to_ascii_lowercase();
-                    // Keep everything except a Domain scoped to the platform apex.
-                    val != apex
-                }
-                _ => true,
+    let apex = platform_domain.trim().trim_matches('.').to_ascii_lowercase();
+    let mut parts = set_cookie.split(';');
+    let mut out = match parts.next() {
+        Some(name_value) => name_value.to_string(),
+        None => return set_cookie.to_string(),
+    };
+    for attr in parts {
+        let is_apex_domain = match attr.split_once('=') {
+            Some((name, value)) => {
+                name.trim().eq_ignore_ascii_case("domain")
+                    && value.trim().trim_matches('.').eq_ignore_ascii_case(&apex)
             }
-        })
-        .collect::<Vec<_>>()
-        .join(";")
+            None => false, // valueless attribute (Secure, HttpOnly, …)
+        };
+        if is_apex_domain {
+            continue;
+        }
+        out.push(';');
+        out.push_str(attr);
+    }
+    out
 }
 
 /// Splice two upgraded byte streams together once both ends complete, reaping the
@@ -308,6 +319,27 @@ mod tests {
         assert_eq!(
             strip_apex_domain("sid=abc; Path=/", "jkbase.app"),
             "sid=abc; Path=/"
+        );
+    }
+
+    #[test]
+    fn strip_apex_domain_resists_parsing_bypasses() {
+        // Stray space before '=' (a UA still honours it as Domain) → still dropped.
+        assert_eq!(strip_apex_domain("sid=x; Domain =jkbase.app", "jkbase.app"), "sid=x");
+        // Trailing-dot apex → dropped.
+        assert_eq!(strip_apex_domain("sid=x; Domain=jkbase.app.", "jkbase.app"), "sid=x");
+        // Leading dot + trailing dot + odd case → dropped.
+        assert_eq!(strip_apex_domain("sid=x; domain = .JKBASE.APP.", "jkbase.app"), "sid=x");
+        // A cookie literally NAMED "domain" with the apex value is NOT the Domain
+        // attribute (it's the name=value pair) → kept verbatim.
+        assert_eq!(
+            strip_apex_domain("domain=jkbase.app; Path=/", "jkbase.app"),
+            "domain=jkbase.app; Path=/"
+        );
+        // A non-apex Domain attribute is still kept even with whitespace.
+        assert_eq!(
+            strip_apex_domain("sid=x; Domain = a.jkbase.app", "jkbase.app"),
+            "sid=x; Domain = a.jkbase.app"
         );
     }
 
