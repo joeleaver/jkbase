@@ -211,7 +211,14 @@ impl ObjectStore {
                     content_type: content_type.to_string(),
                     last_modified: now_secs(),
                 };
-                tokio::fs::write(dir.join(format!("{hk}.meta")), serde_json::to_vec(&meta).unwrap()).await?;
+                let meta_path = dir.join(format!("{hk}.meta"));
+                if let Err(e) = tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await {
+                    // Bytes are committed but unreadable without the sidecar — don't leave
+                    // a quota-consuming orphan; drop both and fail.
+                    let _ = tokio::fs::remove_file(&obj).await;
+                    let _ = tokio::fs::remove_file(&meta_path).await;
+                    return Err(e.into());
+                }
                 Ok(meta)
             }
         }
@@ -256,8 +263,13 @@ impl ObjectStore {
         let max_keys = max_keys.clamp(1, 1000);
         let dir = self.require_bucket(bucket).await?;
 
-        // Collect all matching keys cheaply (filename → hex-decode → key string).
-        let mut keys: Vec<String> = Vec::new();
+        // Keep only the smallest `max_keys + 1` matching keys in a bounded max-heap, so
+        // per-request memory is O(max_keys) — NOT O(objects-in-bucket). A bucket sitting
+        // at its object-count quota (default 1M) therefore can't amplify one list call
+        // into ~100 MB of key strings on the shared host.
+        let cap = max_keys + 1;
+        let mut heap: std::collections::BinaryHeap<String> =
+            std::collections::BinaryHeap::with_capacity(cap + 1);
         let mut rd = tokio::fs::read_dir(&dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -271,12 +283,18 @@ impl ObjectStore {
             if start_after.is_some_and(|sa| key.as_str() <= sa) {
                 continue;
             }
-            keys.push(key);
+            heap.push(key);
+            if heap.len() > cap {
+                heap.pop(); // drop the current largest — retain the smallest `cap` keys
+            }
         }
-        keys.sort();
 
-        let is_truncated = keys.len() > max_keys;
-        let page_keys = &keys[..keys.len().min(max_keys)];
+        // Ascending page; truncated iff a `cap`-th (overflow) key was retained.
+        let mut page_keys = heap.into_sorted_vec();
+        let is_truncated = page_keys.len() > max_keys;
+        if is_truncated {
+            page_keys.truncate(max_keys);
+        }
         let next_continuation_token = if is_truncated {
             page_keys.last().cloned()
         } else {
@@ -285,7 +303,7 @@ impl ObjectStore {
 
         // Read metadata only for the page's keys.
         let mut objects = Vec::with_capacity(page_keys.len());
-        for key in page_keys {
+        for key in &page_keys {
             let hk = hex(key.as_bytes());
             let meta_path = dir.join(format!("{hk}.meta"));
             let bytes = match tokio::fs::read(&meta_path).await {
@@ -413,7 +431,13 @@ impl ObjectStore {
             content_type: info.content_type,
             last_modified: now_secs(),
         };
-        tokio::fs::write(dir.join(format!("{hk}.meta")), serde_json::to_vec(&meta).unwrap()).await?;
+        let meta_path = dir.join(format!("{hk}.meta"));
+        if let Err(e) = tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await {
+            // Drop the orphaned bytes; leave staging intact so the client can retry.
+            let _ = tokio::fs::remove_file(&obj).await;
+            let _ = tokio::fs::remove_file(&meta_path).await;
+            return Err(e.into());
+        }
         let _ = tokio::fs::remove_dir_all(&sdir).await;
         if let Some(p) = sdir.parent() {
             let _ = tokio::fs::remove_dir(p).await; // drop .uploads if now empty

@@ -222,10 +222,13 @@ async fn list_objects(
         .or_else(|| q.get("start-after"))
         .or_else(|| q.get("marker"))
         .map(String::as_str);
+    // Clamp here too so the echoed <MaxKeys> reflects the EFFECTIVE value the engine
+    // used (1..=1000), not the raw client-supplied number.
     let max_keys: usize = q
         .get("max-keys")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
+        .unwrap_or(1000)
+        .clamp(1, 1000);
 
     match store.list_objects(&bucket, prefix, start_after, max_keys).await {
         Ok(page) => {
@@ -313,7 +316,9 @@ fn content_type_of(headers: &HeaderMap) -> String {
 /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` are treated as absent (no body check).
 fn extract_content_sha256(headers: &HeaderMap) -> Option<String> {
     let v = headers.get("x-amz-content-sha256")?.to_str().ok()?;
-    if v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    // Accept upper- or lower-case hex (some header-auth SDKs send uppercase); the
+    // engine lowercases before comparing. UNSIGNED-PAYLOAD / STREAMING-* fall through.
+    if v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()) {
         Some(v.to_string())
     } else {
         None
