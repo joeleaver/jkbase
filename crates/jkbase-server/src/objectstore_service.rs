@@ -162,11 +162,23 @@ impl ObjectStoreService {
         }
         let dd = self.data_dir.clone();
         let pid = project_id.to_string();
-        let bytes = tokio::task::spawn_blocking(move || {
+        let bytes = match tokio::task::spawn_blocking(move || {
             jkbase_common::storage::project_storage_bytes(&dd, &pid)
         })
         .await
-        .unwrap_or(0);
+        {
+            Ok(b) => b,
+            // Fail CLOSED on a walk task failure (symmetric with the count walk below),
+            // rather than adopt bytes=0 and let writes slip the byte cap.
+            Err(e) => {
+                warn!(project = %project_id, error = %e, "object store byte walk task failed");
+                return Err(s3_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "quota check temporarily unavailable",
+                ));
+            }
+        };
         let (buckets, objects) = match entry.store.usage_counts().await {
             Ok(c) => c,
             Err(e) => {
@@ -666,13 +678,16 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Decode `%XX` from the RAW BYTES — never slice the &str by byte index, or a
+        // `%` sitting just before a multibyte UTF-8 char would panic on a non-char
+        // boundary (an unauthenticated request hits this before SigV4).
         if b[i] == b'%' && i + 2 < b.len() {
-            match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(h) => {
-                    out.push(h);
+            match (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
                     i += 3;
                 }
-                Err(_) => {
+                _ => {
                     out.push(b'%');
                     i += 1;
                 }
@@ -683,6 +698,15 @@ fn pct_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn xml_escape(s: &str) -> String {
@@ -1114,6 +1138,21 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pct_decode_is_byte_safe() {
+        // Regression: `pct_decode("%a€")` slices "%a€"[1..3] in the old code, cutting
+        // mid-`€` (a non-char boundary) → panic. The byte-safe decoder must NOT panic
+        // and must treat a `%` before a multibyte char literally. Valid escapes still
+        // decode; incomplete escapes pass through.
+        assert_eq!(pct_decode("/a%2Fb"), "/a/b");
+        assert_eq!(pct_decode("%E2%82%AC"), "€");
+        assert_eq!(pct_decode("%a€"), "%a€"); // % then non-hex multibyte → literal, no panic
+        assert_eq!(pct_decode("%\u{20ac}x"), "%\u{20ac}x");
+        assert_eq!(pct_decode("%zz"), "%zz");
+        assert_eq!(pct_decode("trailing%"), "trailing%");
+        assert_eq!(pct_decode("trailing%4"), "trailing%4");
     }
 
     #[test]
