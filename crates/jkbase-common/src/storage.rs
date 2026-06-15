@@ -75,6 +75,12 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
         }
     }
 
+    // Tenant object store: per-project root `objectstore/{id}` holding S3 buckets
+    // (object bytes + .meta sidecars + in-flight multipart staging). Counted here so
+    // it bills against the SAME storage cap and shows in the SAME metering rollup as
+    // everything else — one edit covers both the deploy gate and the hourly sampler.
+    total = total.saturating_add(dir_bytes(&data_dir.join("objectstore").join(project_id)));
+
     // The single deployment version being billed (live, or the one being
     // deployed). Excludes other retained versions; never follows symlinks.
     total = total.saturating_add(dir_bytes(deployment_dir));
@@ -142,6 +148,20 @@ mod tests {
         // Deploy-time check bills a specific version dir (content + that dir).
         assert_eq!(project_storage_bytes_for(&dd, pid, &dep.join("v1")), 1100);
         assert_eq!(project_storage_bytes_for(&dd, pid, &dep.join("v2")), 150);
+        let _ = fs::remove_dir_all(&dd);
+    }
+
+    #[test]
+    fn bills_object_store_bytes() {
+        let dd = tmp("objstore");
+        let pid = "proj";
+        write(&dd.join("content-images").join("proj.ext4"), &[0u8; 100]);
+        // Object store: a bucket dir with an object + its .meta sidecar.
+        let bkt = dd.join("objectstore").join(pid).join("my-bucket");
+        write(&bkt.join("deadbeef"), &[0u8; 500]);
+        write(&bkt.join("deadbeef.meta"), &[0u8; 30]);
+        // content(100) + object(500) + meta(30) = 630; no deployment yet.
+        assert_eq!(project_storage_bytes(&dd, pid), 630);
         let _ = fs::remove_dir_all(&dd);
     }
 
