@@ -987,7 +987,7 @@ async fn build_one_target(
     .await;
 
     match &outcome {
-        Ok(log) => {
+        Ok((log, provenance)) => {
             update_target(
                 deps,
                 record_lock,
@@ -995,7 +995,13 @@ async fn build_one_target(
                 build_id,
                 &spec.name,
                 BuildPhase::Succeeded,
-                |t| t.finished_at = Some(now()),
+                |t| {
+                    t.finished_at = Some(now());
+                    t.cache_hit = provenance.cache_hit;
+                    t.cache_key = provenance.cache_key.clone();
+                    t.duration_breakdown_ms = provenance.duration_breakdown_ms.clone();
+                    t.builder_digest = provenance.builder_digest.clone();
+                },
                 log.as_deref(),
             )
             .await;
@@ -1033,7 +1039,7 @@ async fn build_one_target_inner(
     staged: &Path,
     project_id: &str,
     build_id: u64,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<(Option<Vec<u8>>, BuildProvenance)> {
     // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
     // intake, but a build fans out one metered VM per target — refuse remaining
     // targets once month-to-date build-seconds reach the cap, so a many-target
@@ -1208,7 +1214,9 @@ async fn build_one_target_inner(
         jailer_bin: deps.jailer_bin.clone(),
         firecracker_bin: deps.firecracker_bin.clone(),
         kernel_path: deps.kernel_path.clone(),
-        toolchain_rootfs: toolchain,
+        // Clone the path (cheap) so the success path can hash the toolchain image for
+        // `builder_digest` provenance after the VM has consumed the config.
+        toolchain_rootfs: toolchain.clone(),
         source_drive: source_img.clone(),
         scratch_size_bytes,
         output_drive: output_img.clone(),
@@ -1348,7 +1356,19 @@ async fn build_one_target_inner(
         }
     }
 
-    Ok(log_tail)
+    // Fold provenance into the target record: the exporter's cache outcome/timings
+    // (best-effort — defaults until the in-VM cache keying lands) and the sha256 of
+    // the toolchain image this target built with. Provenance must never fail a build
+    // that otherwise succeeded, so a digest error degrades to None.
+    let cache = read_cache_meta(&output_img, workspace, &tag);
+    let provenance = BuildProvenance {
+        cache_hit: cache.cache_hit,
+        cache_key: cache.cache_key,
+        duration_breakdown_ms: cache.phases_ms,
+        builder_digest: sha256_hex(&toolchain).ok().map(|h| format!("sha256:{h}")),
+    };
+
+    Ok((log_tail, provenance))
 }
 
 /// Collect a layered server build: read `/layers/index.json`, dump + sha256-verify
@@ -1501,6 +1521,35 @@ fn read_built_manifest(output_img: &Path, workspace: &Path, tag: &str) -> Result
     } else {
         Ok(BuiltServerManifest::default())
     }
+}
+
+/// Build provenance folded into the target record on success: the cache outcome +
+/// per-phase timings the in-VM exporter reports, plus the sha256 of the toolchain
+/// image this target built with.
+#[derive(Debug, Default)]
+struct BuildProvenance {
+    cache_hit: bool,
+    cache_key: Option<String>,
+    duration_breakdown_ms: std::collections::BTreeMap<String, u64>,
+    builder_digest: Option<String>,
+}
+
+/// Read the in-VM exporter's `/cache.json` ([`jkbuild_types::CacheMeta`]: cache
+/// key/hit + per-phase timings), degrading to defaults when it is absent or
+/// unparseable. A build without it is valid — the in-VM cache keying may not be
+/// populated yet — so this never fails the build over provenance.
+fn read_cache_meta(output_img: &Path, workspace: &Path, tag: &str) -> jkbuild_types::CacheMeta {
+    let tmp = workspace.join(format!("{tag}.cache.json"));
+    let present =
+        build_output::dump_file(output_img, jkbuild_types::out::CACHE, &tmp).unwrap_or(false);
+    if !present {
+        return jkbuild_types::CacheMeta::default();
+    }
+    let parsed = std::fs::read(&tmp)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<jkbuild_types::CacheMeta>(&b).ok());
+    let _ = std::fs::remove_file(&tmp);
+    parsed.unwrap_or_default()
 }
 
 /// Reject manifest-supplied names and paths that could escape the build/deploy

@@ -106,7 +106,7 @@ fn device_node(i: usize) -> String {
 }
 
 /// `sha256-<64hex>.erofs`, no path separators — the filename becomes a dest path.
-fn is_safe_layer_filename(f: &str) -> bool {
+pub(crate) fn is_safe_layer_filename(f: &str) -> bool {
     const PRE: &str = "sha256-";
     const SUF: &str = ".erofs";
     f.len() == PRE.len() + 64 + SUF.len()
@@ -330,9 +330,20 @@ const LAYER_PATHS_FILE: &str = "_layerpaths.json";
 
 /// Read the `layer_paths` embedded in a metadata image via debugfs (no mount —
 /// P0-3), or an empty vec when absent (legacy flat image / static-only project).
+/// Swallows extraction errors as empty — callers that must distinguish a genuine
+/// failure from "no layers" (e.g. the boot-time baselayers GC, which has to fail
+/// safe) use [`try_read_layer_paths`].
 pub fn read_layer_paths(metadata_image: &Path) -> Vec<PathBuf> {
+    try_read_layer_paths(metadata_image).unwrap_or_default()
+}
+
+/// Like [`read_layer_paths`] but returns `Err` on a genuine extraction/parse
+/// failure, distinct from `Ok(empty)` for an absent image / no-layers project. The
+/// boot-time baselayers GC relies on this distinction: an unreadable layer map must
+/// NOT be treated as "references nothing" (that could reap a blob still in use).
+pub(crate) fn try_read_layer_paths(metadata_image: &Path) -> Result<Vec<PathBuf>> {
     if !metadata_image.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // Unique temp dest so two reads can't race on the same path.
     let dest = metadata_image.with_extension(format!(
@@ -341,23 +352,21 @@ pub fn read_layer_paths(metadata_image: &Path) -> Vec<PathBuf> {
         BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let _ = std::fs::remove_file(&dest);
-    let found = jkbase_orch::build_output::dump_file(
-        metadata_image,
-        &format!("/{LAYER_PATHS_FILE}"),
-        &dest,
-    )
-    .unwrap_or(false);
+    let found =
+        jkbase_orch::build_output::dump_file(metadata_image, &format!("/{LAYER_PATHS_FILE}"), &dest)
+            .with_context(|| format!("extract {LAYER_PATHS_FILE} from {}", metadata_image.display()))?;
     let result = if found {
-        std::fs::read(&dest)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
-            .map(|v| v.into_iter().map(PathBuf::from).collect())
-            .unwrap_or_default()
+        let bytes = std::fs::read(&dest)
+            .with_context(|| format!("read extracted {}", dest.display()))?;
+        let v: Vec<String> = serde_json::from_slice(&bytes).with_context(|| {
+            format!("parse {LAYER_PATHS_FILE} from {}", metadata_image.display())
+        })?;
+        v.into_iter().map(PathBuf::from).collect()
     } else {
         Vec::new()
     };
     let _ = std::fs::remove_file(&dest);
-    result
+    Ok(result)
 }
 
 /// Monotonic suffix so concurrent / orphaned builds use distinct temp paths.
