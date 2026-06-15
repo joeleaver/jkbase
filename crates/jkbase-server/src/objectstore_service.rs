@@ -194,8 +194,11 @@ impl ObjectStoreService {
 
     /// Reserve `len` bytes (and, when `adds_object`, one object) against the storage +
     /// object-count caps under the per-project lock. The reservation is added BEFORE
-    /// the write and held until the next TTL re-walk, so concurrent writes within a
-    /// window can't overshoot (fail-closed: it over-counts rather than under).
+    /// the write and held until the next authoritative TTL re-walk, which resets it to
+    /// the on-disk figures. This is a SOFT cap bounded by the TTL: a write that reserves
+    /// while a concurrent re-walk is in flight can have its reservation reset before its
+    /// bytes land in `base`, so a tenant's own concurrent writes can briefly overshoot
+    /// by up to what lands within one ≤TTL window; the next walk reconciles it.
     async fn refresh_and_reserve(
         &self,
         entry: &Arc<ProjectEntry>,
@@ -406,22 +409,17 @@ impl ObjectStoreService {
             }
         }
 
-        // --- 3c. Gate byte-adding writes against the storage + object-count caps. A
-        // plain PUT adds one object; an UploadPart adds bytes only; CompleteMultipart
-        // adds one object (its bytes were counted as parts). ---
+        // --- 3c. Gate byte-adding writes against the storage + object-count caps, NET
+        // of any object being overwritten: a re-PUT of an existing key adds no new
+        // object and only its size DELTA in bytes, so the common "re-PUT same key"
+        // pattern can't false-trip the cap. `reservation` = (reserved_bytes, +object?)
+        // for credit-back; `body_cap` always caps the stream at the FULL declared length
+        // (the unsigned Content-Length) regardless of the net reservation. ---
         let mut reservation: Option<(u64, bool)> = None;
+        let mut body_cap: Option<u64> = None;
         if is_object_write(&method, &path) {
-            let adds_object = !is_upload_part(&query);
-            match write_len(&req) {
-                Some(len) => {
-                    if let Some(resp) = self
-                        .refresh_and_reserve(&entry, &project_id, len, adds_object, &quota)
-                        .await
-                    {
-                        return resp;
-                    }
-                    reservation = Some((len, adds_object));
-                }
+            let len = match write_len(&req) {
+                Some(l) => l,
                 None => {
                     return s3_error(
                         StatusCode::LENGTH_REQUIRED,
@@ -429,26 +427,58 @@ impl ObjectStoreService {
                         "object writes require a Content-Length",
                     );
                 }
+            };
+            body_cap = Some(len);
+            if is_upload_part(&query) {
+                // A part adds bytes but is not (yet) a new object.
+                if let Some(resp) = self
+                    .refresh_and_reserve(&entry, &project_id, len, false, &quota)
+                    .await
+                {
+                    return resp;
+                }
+                reservation = Some((len, false));
+            } else {
+                // Plain PUT: reserve only the NET delta vs any existing object at the key.
+                let existing = match object_key(&path) {
+                    Some((b, k)) => entry.store.object_size(b, k).await.ok().flatten(),
+                    None => None,
+                };
+                let adds_object = existing.is_none();
+                let net_bytes = len.saturating_sub(existing.unwrap_or(0));
+                if let Some(resp) = self
+                    .refresh_and_reserve(&entry, &project_id, net_bytes, adds_object, &quota)
+                    .await
+                {
+                    return resp;
+                }
+                reservation = Some((net_bytes, adds_object));
             }
         } else if is_complete_multipart(&method, &query) {
+            // CompleteMultipart materializes one object (its bytes were counted as
+            // parts); an overwrite of an existing key adds no new object.
+            let adds_object = match object_key(&path) {
+                Some((b, k)) => entry.store.object_size(b, k).await.ok().flatten().is_none(),
+                None => true,
+            };
             if let Some(resp) = self
-                .refresh_and_reserve(&entry, &project_id, 0, true, &quota)
+                .refresh_and_reserve(&entry, &project_id, 0, adds_object, &quota)
                 .await
             {
                 return resp;
             }
-            reservation = Some((0, true));
+            reservation = Some((0, adds_object));
         }
 
         // --- 4. Serve from the project's own store. Route on the SAME canonical path
         // the signature covered (re-encode the verified, pct-decoded path) so a crafted
-        // `%2F` can't sign one key yet route another. Cap the body to the reservation:
-        // the declared length is NOT a signed header and the engine streams to EOF, so
-        // without this a client could reserve 1 byte and stream unbounded onto the
-        // shared disk. Exceeding the cap errors the body mid-stream → the engine aborts.
+        // `%2F` can't sign one key yet route another. Cap the body to the FULL declared
+        // length: it is NOT a signed header and the engine streams to EOF, so without
+        // this a client could declare 1 byte and stream unbounded onto the shared disk.
+        // Exceeding the cap errors the body mid-stream → the engine aborts the write.
         let req = set_canonical_path(req, &path);
-        let req = match reservation {
-            Some((len, _)) if len > 0 => limit_body(req, len),
+        let req = match body_cap {
+            Some(len) if len > 0 => limit_body(req, len),
             _ => req,
         };
         let app = jkbase_objectstore::router(entry.store.clone());
@@ -512,6 +542,16 @@ fn path_has_key(path: &str) -> bool {
     let mut it = path.trim_start_matches('/').splitn(2, '/');
     let _bucket = it.next();
     it.next().is_some_and(|k| !k.is_empty())
+}
+
+/// Split a decoded object path `/{bucket}/{key}` into its parts (key may contain
+/// `/`). `None` for the bucket-list root or a bucket-only path.
+fn object_key(path: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = path.trim_start_matches('/').split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket, key))
 }
 
 /// A valid project id = the slug the control plane mints (`[a-z0-9-]`, 1..=63). Used
@@ -1002,6 +1042,45 @@ mod tests {
         // A second object exceeds the count cap within the TTL window -> 507.
         let (st, body) = status_body(
             app.clone().oneshot(signed("PUT", "/bkt/o2", &a.access_key_id, &a.secret_key, "y")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(body.contains("TooManyObjects"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn object_overwrite_does_not_trip_count_cap() {
+        // Regression for the merge-gate HIGH: a re-PUT of an EXISTING key adds no
+        // object, so it must not false-trip max_objects even at the cap — while a
+        // genuinely new key still does.
+        let dir = tmp("objoverwrite");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_objects = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // First write of the key consumes the 1-object budget.
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "v1")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Overwriting the SAME key (even with a larger body) must still succeed.
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "v2-longer")).await.unwrap().status(),
+            StatusCode::OK,
+            "re-PUT of an existing key must not trip the object-count cap"
+        );
+        // A genuinely new key still trips the cap.
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("PUT", "/bkt/o2", &a.access_key_id, &a.secret_key, "x")).await.unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);

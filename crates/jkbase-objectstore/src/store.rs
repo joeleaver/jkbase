@@ -235,6 +235,17 @@ impl ObjectStore {
         Ok(self.locate(bucket, key).await?.0)
     }
 
+    /// The size of `bucket/key` if it currently exists, else `None` (a missing key or
+    /// bucket is not an error). Lets the quota gate reserve only the NET delta of an
+    /// overwrite, so re-PUTting an existing key can't false-trip the object/byte cap.
+    pub async fn object_size(&self, bucket: &str, key: &str) -> Result<Option<u64>> {
+        match self.head_object(bucket, key).await {
+            Ok(meta) => Ok(Some(meta.size)),
+            Err(ObjectError::NoSuchKey(_)) | Err(ObjectError::NoSuchBucket(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Idempotent (S3 DELETE returns success even if the key is absent).
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         let dir = self.require_bucket(bucket).await?;
