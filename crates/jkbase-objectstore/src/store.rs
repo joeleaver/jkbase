@@ -518,6 +518,67 @@ impl ObjectStore {
         Ok(removed)
     }
 
+    /// Count `(buckets, objects)` for this store in a single pass — buckets are the
+    /// non-dot top-level dirs, objects are the `.meta` sidecars within them. Used by
+    /// the server's per-project count quota (cached on a TTL, never per request).
+    pub async fn usage_counts(&self) -> Result<(u64, u64)> {
+        let mut buckets = 0u64;
+        let mut objects = 0u64;
+        let mut rd = match tokio::fs::read_dir(&self.root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(bucket_entry) = rd.next_entry().await? {
+            let name = bucket_entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !bucket_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            buckets += 1;
+            let mut brd = match tokio::fs::read_dir(bucket_entry.path()).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Some(obj) = brd.next_entry().await? {
+                if obj.file_name().to_string_lossy().ends_with(".meta") {
+                    objects += 1;
+                }
+            }
+        }
+        Ok((buckets, objects))
+    }
+
+    /// Total in-flight multipart uploads across all buckets (`.uploads/*` dirs).
+    /// Counting stops once `cap` is reached so the initiate gate stays O(cap), not
+    /// O(all staged uploads). Returns `min(actual, cap)`.
+    pub async fn count_inflight_uploads(&self, cap: u64) -> Result<u64> {
+        let mut total = 0u64;
+        let mut rd = match tokio::fs::read_dir(&self.root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(bucket_entry) = rd.next_entry().await? {
+            let name = bucket_entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !bucket_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut urd = match tokio::fs::read_dir(bucket_entry.path().join(".uploads")).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Some(u) = urd.next_entry().await? {
+                if u.file_type().await?.is_dir() {
+                    total += 1;
+                    if total >= cap {
+                        return Ok(total);
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+
     async fn staging(&self, bucket: &str, upload_id: &str) -> Result<PathBuf> {
         let dir = self.require_bucket(bucket).await?;
         validate_upload_id(upload_id)?;
