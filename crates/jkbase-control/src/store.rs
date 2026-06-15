@@ -278,6 +278,14 @@ pub struct QuotaLimits {
     /// overrides stored before build metering existed still deserialize.
     #[serde(default = "default_build_seconds_per_month")]
     pub build_seconds_per_month: u64,
+    /// Maximum number of objects (files) across all buckets for this project.
+    /// `#[serde(default)]` so overrides stored before this field existed still
+    /// deserialize with the platform default.
+    #[serde(default = "default_max_objects")]
+    pub max_objects: u64,
+    /// Maximum number of buckets for this project.
+    #[serde(default = "default_max_buckets")]
+    pub max_buckets: u64,
 }
 
 const DEFAULT_BUILD_SECONDS_PER_MONTH: u64 = 200 * 60; // 200 build-minutes/month
@@ -285,10 +293,22 @@ fn default_build_seconds_per_month() -> u64 {
     DEFAULT_BUILD_SECONDS_PER_MONTH
 }
 
+const DEFAULT_MAX_OBJECTS: u64 = 1_000_000;
+fn default_max_objects() -> u64 {
+    DEFAULT_MAX_OBJECTS
+}
+
+const DEFAULT_MAX_BUCKETS: u64 = 100;
+fn default_max_buckets() -> u64 {
+    DEFAULT_MAX_BUCKETS
+}
+
 pub const DEFAULT_QUOTA: QuotaLimits = QuotaLimits {
     storage_bytes_max: 16 * 1024 * 1024 * 1024,        // 16 GiB
     bandwidth_bytes_per_month: 100 * 1024 * 1024 * 1024, // 100 GiB/month
     build_seconds_per_month: DEFAULT_BUILD_SECONDS_PER_MONTH,
+    max_objects: DEFAULT_MAX_OBJECTS,
+    max_buckets: DEFAULT_MAX_BUCKETS,
 };
 
 /// Enforcement state for a project. Source of truth for the wake gate, so a
@@ -1226,10 +1246,31 @@ impl Store {
 
     // -- Object-store access keys --
 
+    /// Hard cap on the number of S3 access keys a single project may hold. Prevents
+    /// unbounded index growth and limits the blast radius of a compromised tenant.
+    pub const MAX_ACCESS_KEYS_PER_PROJECT: usize = 25;
+
+    /// Count the access keys that exist for `project_id` using a bounded range scan
+    /// over the `ACCESS_KEYS_BY_PROJECT` index.  Index keys are
+    /// `"{project_id}:{akid}"`, so the half-open range
+    /// `["{project_id}:" .. "{project_id};")`  (';' == ':' + 1) contains exactly
+    /// this project's entries and nothing else.
+    pub fn count_access_keys(&self, project_id: &str) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let count = index.range(lo.as_str()..hi.as_str())?.count();
+        Ok(count)
+    }
+
     /// Mint a new access key for `project_id`. Returns the full record INCLUDING the
     /// secret — the only time it's exposed (the caller shows it once). Writes the
     /// primary (`ACCESS_KEYS`) and per-project index (`ACCESS_KEYS_BY_PROJECT`) in a
     /// single txn so they can never diverge.
+    ///
+    /// Returns an error if the project already holds [`Self::MAX_ACCESS_KEYS_PER_PROJECT`]
+    /// keys; the check and insert share a write txn so the count is exact.
     pub fn create_access_key(&self, project_id: &str, tenant_id: &str, label: &str) -> Result<AccessKey> {
         let key = AccessKey {
             access_key_id: auth::generate_access_key_id(),
@@ -1242,6 +1283,19 @@ impl Store {
         let index_key = format!("{}:{}", project_id, key.access_key_id);
         let txn = self.db.begin_write()?;
         {
+            let lo = format!("{project_id}:");
+            let hi = format!("{project_id};");
+            // Open the index once as mutable; check the cap then insert — same table
+            // guard, so redb won't see a double-open.
+            let mut index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+            let current = index.range(lo.as_str()..hi.as_str())?.count();
+            if current >= Self::MAX_ACCESS_KEYS_PER_PROJECT {
+                return Err(anyhow::anyhow!(
+                    "access key limit reached ({} per project)",
+                    Self::MAX_ACCESS_KEYS_PER_PROJECT
+                ));
+            }
+
             let mut primary = txn.open_table(ACCESS_KEYS)?;
             // Astronomically unlikely, but never silently clobber a live key.
             if primary.get(key.access_key_id.as_str())?.is_some() {
@@ -1249,7 +1303,6 @@ impl Store {
             }
             let data = serde_json::to_vec(&key)?;
             primary.insert(key.access_key_id.as_str(), data.as_slice())?;
-            let mut index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
             index.insert(index_key.as_str(), key.access_key_id.as_bytes())?;
         }
         txn.commit()?;
@@ -1270,17 +1323,18 @@ impl Store {
 
     /// List a project's access keys (for the console / CLI). Secrets are included in
     /// the record but the API layer must NOT surface them after creation.
+    ///
+    /// Uses a bounded range scan over the index — O(keys-for-this-project), not
+    /// O(all keys across all tenants).
     pub fn list_access_keys(&self, project_id: &str) -> Result<Vec<AccessKey>> {
         let txn = self.db.begin_read()?;
         let index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
         let primary = txn.open_table(ACCESS_KEYS)?;
-        let prefix = format!("{project_id}:");
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
         let mut out = Vec::new();
-        for entry in index.iter()? {
-            let (k, v) = entry?;
-            if !k.value().starts_with(&prefix) {
-                continue;
-            }
+        for entry in index.range(lo.as_str()..hi.as_str())? {
+            let (_k, v) = entry?;
             let akid = String::from_utf8_lossy(v.value()).into_owned();
             if let Some(rec) = primary.get(akid.as_str())? {
                 out.push(serde_json::from_slice::<AccessKey>(rec.value())?);
@@ -1314,17 +1368,20 @@ impl Store {
     /// [`Self::delete_all_secrets`]: collect-then-delete (redb forbids mutating a
     /// table mid-iteration). Without this, a recreated project of the same slug could
     /// inherit a prior tenant's keys — a cross-tenant object-store breach.
+    ///
+    /// Uses a bounded range scan — O(keys-for-this-project), not O(all keys).
     pub fn delete_all_access_keys(&self, project_id: &str) -> Result<usize> {
-        let prefix = format!("{project_id}:");
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
         let txn = self.db.begin_write()?;
         let mut removed = 0usize;
         {
             let mut index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+            // Collect first: redb forbids mutating a table while its iterator is live.
             let entries: Vec<(String, String)> = index
-                .iter()?
+                .range(lo.as_str()..hi.as_str())?
                 .filter_map(|e| e.ok())
                 .map(|(k, v)| (k.value().to_string(), String::from_utf8_lossy(v.value()).into_owned()))
-                .filter(|(k, _)| k.starts_with(&prefix))
                 .collect();
             let mut primary = txn.open_table(ACCESS_KEYS)?;
             for (index_key, akid) in entries {
@@ -1485,6 +1542,76 @@ mod tests {
         assert_eq!(store.delete_all_access_keys("forumall").unwrap(), 0);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn access_key_cap_enforced_per_project() {
+        let (store, path) = tmp_db();
+        // Fill up to the cap for proj-a.
+        for i in 0..Store::MAX_ACCESS_KEYS_PER_PROJECT {
+            store
+                .create_access_key("proj-a", "t1", &format!("key-{i}"))
+                .unwrap_or_else(|e| panic!("key {i} should succeed: {e}"));
+        }
+        assert_eq!(
+            store.count_access_keys("proj-a").unwrap(),
+            Store::MAX_ACCESS_KEYS_PER_PROJECT
+        );
+        // The next key must be rejected.
+        let err = store
+            .create_access_key("proj-a", "t1", "overflow")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("access key limit reached"),
+            "unexpected error: {err}"
+        );
+        // A different project is unaffected — it can still issue keys freely.
+        store
+            .create_access_key("proj-b", "t2", "first")
+            .expect("proj-b should not be throttled by proj-a's cap");
+        assert_eq!(store.count_access_keys("proj-b").unwrap(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn access_key_range_scan_isolates_projects() {
+        let (store, path) = tmp_db();
+        // proj-x and proj-x2 share a prefix; verify the range boundary is exact.
+        store.create_access_key("proj-x", "t1", "a").unwrap();
+        store.create_access_key("proj-x", "t1", "b").unwrap();
+        store.create_access_key("proj-x2", "t2", "c").unwrap();
+
+        // list_access_keys must see exactly this project's entries.
+        assert_eq!(store.list_access_keys("proj-x").unwrap().len(), 2);
+        assert_eq!(store.list_access_keys("proj-x2").unwrap().len(), 1);
+        assert_eq!(store.count_access_keys("proj-x").unwrap(), 2);
+        assert_eq!(store.count_access_keys("proj-x2").unwrap(), 1);
+
+        // delete_all_access_keys must not sweep the sibling project.
+        let removed = store.delete_all_access_keys("proj-x").unwrap();
+        assert_eq!(removed, 2, "wrong removal count");
+        assert!(store.list_access_keys("proj-x").unwrap().is_empty());
+        assert_eq!(
+            store.list_access_keys("proj-x2").unwrap().len(),
+            1,
+            "proj-x2 must not be swept by delete_all_access_keys(proj-x)"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn quota_limits_back_compat_missing_new_fields() {
+        // A QuotaLimits JSON that was serialized before max_objects / max_buckets
+        // existed must deserialize with those fields set to the platform defaults.
+        let old_json = r#"{"storage_bytes_max":1,"bandwidth_bytes_per_month":2,"build_seconds_per_month":3}"#;
+        let q: QuotaLimits = serde_json::from_str(old_json).unwrap();
+        assert_eq!(q.storage_bytes_max, 1);
+        assert_eq!(q.bandwidth_bytes_per_month, 2);
+        assert_eq!(q.build_seconds_per_month, 3);
+        assert_eq!(q.max_objects, DEFAULT_MAX_OBJECTS, "max_objects should default");
+        assert_eq!(q.max_buckets, DEFAULT_MAX_BUCKETS, "max_buckets should default");
     }
 
     #[test]
@@ -1675,6 +1802,8 @@ mod tests {
                     storage_bytes_max: 123,
                     bandwidth_bytes_per_month: 456,
                     build_seconds_per_month: 789,
+                    max_objects: DEFAULT_MAX_OBJECTS,
+                    max_buckets: DEFAULT_MAX_BUCKETS,
                 },
             )
             .unwrap();

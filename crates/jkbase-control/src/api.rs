@@ -2011,6 +2011,8 @@ pub struct QuotaResponse {
     pub storage_bytes_max: u64,
     pub bandwidth_bytes_per_month: u64,
     pub build_seconds_per_month: u64,
+    pub max_objects: u64,
+    pub max_buckets: u64,
     /// True if this project has a per-project override (vs platform defaults).
     pub overridden: bool,
     pub bandwidth_blocked: bool,
@@ -2020,6 +2022,12 @@ pub struct QuotaResponse {
 fn default_build_seconds_quota() -> u64 {
     crate::store::DEFAULT_QUOTA.build_seconds_per_month
 }
+fn default_max_objects_quota() -> u64 {
+    crate::store::DEFAULT_QUOTA.max_objects
+}
+fn default_max_buckets_quota() -> u64 {
+    crate::store::DEFAULT_QUOTA.max_buckets
+}
 
 #[derive(Deserialize)]
 pub struct SetQuotaRequest {
@@ -2027,6 +2035,10 @@ pub struct SetQuotaRequest {
     pub bandwidth_bytes_per_month: u64,
     #[serde(default = "default_build_seconds_quota")]
     pub build_seconds_per_month: u64,
+    #[serde(default = "default_max_objects_quota")]
+    pub max_objects: u64,
+    #[serde(default = "default_max_buckets_quota")]
+    pub max_buckets: u64,
 }
 
 /// Month-to-date metered usage for a project. Works while hibernated (store-only).
@@ -2092,6 +2104,8 @@ async fn get_project_quota(
         storage_bytes_max: limits.storage_bytes_max,
         bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
         build_seconds_per_month: limits.build_seconds_per_month,
+        max_objects: limits.max_objects,
+        max_buckets: limits.max_buckets,
         overridden,
         bandwidth_blocked: status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false),
         blocked_reason: status.and_then(|s| s.blocked_reason),
@@ -2149,12 +2163,22 @@ async fn set_project_quota(
             req.build_seconds_per_month,
             crate::store::DEFAULT_QUOTA.build_seconds_per_month,
         ),
+        max_objects: limit(
+            req.max_objects,
+            crate::store::DEFAULT_QUOTA.max_objects,
+        ),
+        max_buckets: limit(
+            req.max_buckets,
+            crate::store::DEFAULT_QUOTA.max_buckets,
+        ),
     };
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
             storage_bytes_max: limits.storage_bytes_max,
             bandwidth_bytes_per_month: limits.bandwidth_bytes_per_month,
             build_seconds_per_month: limits.build_seconds_per_month,
+            max_objects: limits.max_objects,
+            max_buckets: limits.max_buckets,
             overridden: true,
             bandwidth_blocked: false,
             blocked_reason: None,
