@@ -13,6 +13,7 @@ jkbase-proxy = { workspace = true }
 jkbase-control = { workspace = true }
 jkbase-orch = { workspace = true }
 jkbase-substrate = { workspace = true }
+jkbase-objectstore = { workspace = true }
 jkbuild-types = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -35,6 +36,7 @@ cron = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
 toml = { workspace = true }

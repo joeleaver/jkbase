@@ -82,6 +82,7 @@ async fn proxy_relays_websocket_upgrade() {
         platform_domain: "test.local".to_string(),
         cert_manager: None,
         api_addr: Some(format!("127.0.0.1:{backend_port}")),
+        storage_addr: None,
         domains: None,
         activity_tracker: None,
         wake_callback: None,

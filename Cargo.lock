@@ -1755,6 +1755,7 @@ dependencies = [
  "hyper-util",
  "jkbase-common",
  "jkbase-control",
+ "jkbase-objectstore",
  "jkbase-orch",
  "jkbase-proxy",
  "jkbase-substrate",
@@ -1771,6 +1772,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

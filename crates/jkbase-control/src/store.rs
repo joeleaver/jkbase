@@ -22,10 +22,21 @@ const QUOTA_STATUS: TableDefinition<&str, &[u8]> = TableDefinition::new("quota_s
 /// token fingerprint, bound to the owning tenant. Kept out of the app-`SECRETS`
 /// table (those are tenant env vars) so the two never leak into each other.
 const REPO_TRIGGERS: TableDefinition<&str, &[u8]> = TableDefinition::new("repo_triggers");
+/// Tenant S3 access keys for the object store, keyed by the (globally unique)
+/// access-key id → the full [`AccessKey`] record (incl. the secret, which must be
+/// recoverable to verify SigV4 signatures). This is the O(1) lookup the object-store
+/// auth path hits on every request, given only the access-key id from a signature.
+const ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
+/// Secondary index for per-project list/revoke, keyed `{project_id}:{access_key_id}`
+/// (the `:` makes the prefix exact, like `SECRETS`). Value is the access-key id, so a
+/// project scan yields its ids without a full `ACCESS_KEYS` walk. Both tables are
+/// written in one txn so they never diverge.
+const ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("access_keys_by_project");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
-pub const RESERVED_LABELS: &[&str] = &["api", "www", "console"];
+pub const RESERVED_LABELS: &[&str] = &["api", "www", "console", "storage"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -77,6 +88,29 @@ pub struct Secret {
     pub project_id: String,
     pub key: String,
     pub value: String,
+}
+
+/// A tenant S3 access key for the object store. The `secret_key` is stored in
+/// cleartext at rest (unlike argon2'd passwords) because SigV4 verification must
+/// recompute the HMAC from it; the control db is already the trust root for all
+/// tenant state. Bound to `project_id` so a signature resolves to exactly one
+/// project's object-store root.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessKey {
+    pub access_key_id: String,
+    pub project_id: String,
+    /// The tenant that minted the key. The object-store auth path re-checks this
+    /// against the project's CURRENT owner (like the git-push token), so a key
+    /// orphaned by a crash-interrupted teardown can't be inherited by a different
+    /// tenant who later recreates the same-slug project. `#[serde(default)]` so a key
+    /// written before this field existed deserializes (with empty tenant → fails the
+    /// ownership check → safe).
+    #[serde(default)]
+    pub tenant_id: String,
+    pub secret_key: String,
+    /// Optional tenant-supplied label (e.g. "ci", "backups"); never authoritative.
+    pub label: String,
+    pub created_unix: u64,
 }
 
 /// Per-project connected-repo build-trigger credentials (build · D). Stored
@@ -362,6 +396,8 @@ impl Store {
         let _ = txn.open_table(USAGE)?;
         let _ = txn.open_table(QUOTAS)?;
         let _ = txn.open_table(QUOTA_STATUS)?;
+        let _ = txn.open_table(ACCESS_KEYS)?;
+        let _ = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -1188,6 +1224,120 @@ impl Store {
         Ok(removed)
     }
 
+    // -- Object-store access keys --
+
+    /// Mint a new access key for `project_id`. Returns the full record INCLUDING the
+    /// secret — the only time it's exposed (the caller shows it once). Writes the
+    /// primary (`ACCESS_KEYS`) and per-project index (`ACCESS_KEYS_BY_PROJECT`) in a
+    /// single txn so they can never diverge.
+    pub fn create_access_key(&self, project_id: &str, tenant_id: &str, label: &str) -> Result<AccessKey> {
+        let key = AccessKey {
+            access_key_id: auth::generate_access_key_id(),
+            project_id: project_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            secret_key: auth::generate_secret_access_key(),
+            label: label.to_string(),
+            created_unix: auth::timestamp(),
+        };
+        let index_key = format!("{}:{}", project_id, key.access_key_id);
+        let txn = self.db.begin_write()?;
+        {
+            let mut primary = txn.open_table(ACCESS_KEYS)?;
+            // Astronomically unlikely, but never silently clobber a live key.
+            if primary.get(key.access_key_id.as_str())?.is_some() {
+                return Err(anyhow::anyhow!("access key id collision; retry"));
+            }
+            let data = serde_json::to_vec(&key)?;
+            primary.insert(key.access_key_id.as_str(), data.as_slice())?;
+            let mut index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+            index.insert(index_key.as_str(), key.access_key_id.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(key)
+    }
+
+    /// Resolve an access-key id to its full record (incl. project + secret). The
+    /// O(1) lookup the object-store SigV4 path performs on every request. `None` if
+    /// the key is unknown or was revoked.
+    pub fn lookup_access_key(&self, access_key_id: &str) -> Result<Option<AccessKey>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(ACCESS_KEYS)?;
+        match table.get(access_key_id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List a project's access keys (for the console / CLI). Secrets are included in
+    /// the record but the API layer must NOT surface them after creation.
+    pub fn list_access_keys(&self, project_id: &str) -> Result<Vec<AccessKey>> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+        let primary = txn.open_table(ACCESS_KEYS)?;
+        let prefix = format!("{project_id}:");
+        let mut out = Vec::new();
+        for entry in index.iter()? {
+            let (k, v) = entry?;
+            if !k.value().starts_with(&prefix) {
+                continue;
+            }
+            let akid = String::from_utf8_lossy(v.value()).into_owned();
+            if let Some(rec) = primary.get(akid.as_str())? {
+                out.push(serde_json::from_slice::<AccessKey>(rec.value())?);
+            }
+        }
+        out.sort_by_key(|a| a.created_unix);
+        Ok(out)
+    }
+
+    /// Revoke one access key. Scoped to `project_id` via the index compound key, so a
+    /// tenant can't revoke another project's key by guessing its id. Returns whether
+    /// it existed for this project.
+    pub fn delete_access_key(&self, project_id: &str, access_key_id: &str) -> Result<bool> {
+        let index_key = format!("{project_id}:{access_key_id}");
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+            // Only touch the primary record if the key really belongs to this project.
+            let owned = index.remove(index_key.as_str())?.is_some();
+            if owned {
+                let mut primary = txn.open_table(ACCESS_KEYS)?;
+                primary.remove(access_key_id)?;
+            }
+            owned
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Revoke ALL of a project's access keys (project teardown). Mirrors
+    /// [`Self::delete_all_secrets`]: collect-then-delete (redb forbids mutating a
+    /// table mid-iteration). Without this, a recreated project of the same slug could
+    /// inherit a prior tenant's keys — a cross-tenant object-store breach.
+    pub fn delete_all_access_keys(&self, project_id: &str) -> Result<usize> {
+        let prefix = format!("{project_id}:");
+        let txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut index = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+            let entries: Vec<(String, String)> = index
+                .iter()?
+                .filter_map(|e| e.ok())
+                .map(|(k, v)| (k.value().to_string(), String::from_utf8_lossy(v.value()).into_owned()))
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .collect();
+            let mut primary = txn.open_table(ACCESS_KEYS)?;
+            for (index_key, akid) in entries {
+                index.remove(index_key.as_str())?;
+                if primary.remove(akid.as_str())?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
     // -- Connected-repo build triggers (build · D) --
 
     /// Load a project's repo-trigger credentials, or `None` if it has none yet.
@@ -1280,6 +1430,59 @@ mod tests {
         assert_eq!(store.list_secrets("other").unwrap().len(), 1);
         // Idempotent.
         assert_eq!(store.delete_all_secrets("forumall").unwrap(), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn access_keys_issue_lookup_and_scope_to_project() {
+        let (store, path) = tmp_db();
+        let a = store.create_access_key("proj-a", "tenant-a", "ci").unwrap();
+        let b = store.create_access_key("proj-b", "tenant-b", "").unwrap();
+        // Issued ids are unique, AKIA-shaped, and `/`-free (SigV4 Credential safe).
+        assert_ne!(a.access_key_id, b.access_key_id);
+        assert!(a.access_key_id.starts_with("JKBA") && !a.access_key_id.contains('/'));
+        assert!(!a.secret_key.is_empty() && a.secret_key != b.secret_key);
+
+        // O(1) reverse lookup resolves the owning project + secret.
+        let got = store.lookup_access_key(&a.access_key_id).unwrap().unwrap();
+        assert_eq!(got.project_id, "proj-a");
+        assert_eq!(got.secret_key, a.secret_key);
+        assert!(store.lookup_access_key("JKBADEADBEEF00000000").unwrap().is_none());
+
+        // List is per-project.
+        assert_eq!(store.list_access_keys("proj-a").unwrap().len(), 1);
+        assert_eq!(store.list_access_keys("proj-b").unwrap().len(), 1);
+
+        // A tenant can't revoke another project's key by guessing the id.
+        assert!(!store.delete_access_key("proj-b", &a.access_key_id).unwrap());
+        assert!(store.lookup_access_key(&a.access_key_id).unwrap().is_some());
+        // The owning project can.
+        assert!(store.delete_access_key("proj-a", &a.access_key_id).unwrap());
+        assert!(store.lookup_access_key(&a.access_key_id).unwrap().is_none());
+        assert!(store.list_access_keys("proj-a").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delete_all_access_keys_purges_only_the_target_project() {
+        let (store, path) = tmp_db();
+        let k1 = store.create_access_key("forumall", "t1", "a").unwrap();
+        let _k2 = store.create_access_key("forumall", "t1", "b").unwrap();
+        // A slug that shares a prefix must NOT be swept (the ':' separator is exact).
+        let keep = store.create_access_key("forumall2", "t2", "c").unwrap();
+
+        let removed = store.delete_all_access_keys("forumall").unwrap();
+        assert_eq!(removed, 2);
+        assert!(store.list_access_keys("forumall").unwrap().is_empty());
+        // Primary records are gone too (not just the index) — no orphaned secrets.
+        assert!(store.lookup_access_key(&k1.access_key_id).unwrap().is_none());
+        // Prefix boundary: forumall2's key survives and still resolves.
+        assert_eq!(store.list_access_keys("forumall2").unwrap().len(), 1, "prefix boundary");
+        assert!(store.lookup_access_key(&keep.access_key_id).unwrap().is_some());
+        // Idempotent.
+        assert_eq!(store.delete_all_access_keys("forumall").unwrap(), 0);
 
         let _ = std::fs::remove_file(path);
     }

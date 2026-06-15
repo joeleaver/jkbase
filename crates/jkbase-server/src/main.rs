@@ -5,6 +5,7 @@ mod layer_plan;
 mod log_shipper;
 mod metering;
 mod mirror;
+mod objectstore_service;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -44,6 +45,11 @@ struct Args {
 
     #[arg(long, default_value = "9090")]
     api_port: u16,
+
+    /// Local port for the tenant S3 object-store service. Bound on 127.0.0.1 and
+    /// reached only via the proxy's `storage.{domain}` reserved-host branch.
+    #[arg(long, default_value = "9091")]
+    storage_port: u16,
 
     #[arg(long, default_value = "8080")]
     proxy_port: u16,
@@ -257,6 +263,30 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&logs_dir).await?;
     let log_store = LogStore::new(logs_dir.clone());
     let log_shipper = LogShipper::new(log_store.clone(), logs_dir.join(".cursors.json"));
+
+    // Tenant S3 object-store service on its OWN local listener (the proxy forwards
+    // `storage.{domain}` to it via a reserved-host branch). Separate from the control
+    // app: SigV4 auth (not Bearer), no global body cap (uploads stream to disk), and
+    // it must never co-mingle with control-plane state.
+    {
+        let svc = Arc::new(objectstore_service::ObjectStoreService::new(
+            data_dir.clone(),
+            store.clone(),
+            format!("storage.{}", args.domain),
+        ));
+        let bind = format!("127.0.0.1:{}", args.storage_port);
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&bind).await {
+                Ok(listener) => {
+                    info!(storage = %bind, "object-store service listening");
+                    if let Err(e) = axum::serve(listener, svc.into_router()).await {
+                        tracing::error!(error = %e, "object-store service error");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, addr = %bind, "object-store bind failed"),
+            }
+        });
+    }
     let routing_table = new_routing_table();
     let domain_map: DomainMap = new_domain_map();
     let activity_tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
@@ -483,6 +513,7 @@ async fn main() -> Result<()> {
         platform_domain: args.domain,
         cert_manager: cert_manager.clone(),
         api_addr: Some(api_addr),
+        storage_addr: Some(format!("127.0.0.1:{}", args.storage_port)),
         domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
         wake_callback: Some(wake_callback),
