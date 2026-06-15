@@ -192,12 +192,14 @@ impl ObjectStoreService {
         };
 
         // --- 3. Gate byte-adding writes against the storage quota. ---
+        let mut write_cap: Option<u64> = None;
         if is_object_write(&method, &path) {
             match write_len(&req) {
                 Some(len) => {
                     if let Some(resp) = self.reserve_quota(&entry, &project_id, len) {
                         return resp;
                     }
+                    write_cap = Some(len);
                 }
                 None => {
                     return s3_error(
@@ -210,6 +212,16 @@ impl ObjectStoreService {
         }
 
         // --- 4. Serve from the project's own store (engine router, already authed). ---
+        // Cap the bytes the engine will write to exactly the reserved amount. The
+        // declared length (Content-Length / x-amz-decoded-content-length) is NOT a
+        // signed SigV4 header and the engine streams to EOF, so without this a client
+        // could reserve 1 byte and stream unbounded data onto the shared disk (which
+        // also holds the control-plane db). Exceeding the cap errors the body
+        // mid-stream, so the engine aborts the write.
+        let req = match write_cap {
+            Some(len) => limit_body(req, len),
+            None => req,
+        };
         let app = jkbase_objectstore::router(entry.store.clone());
         match app.oneshot(req).await {
             Ok(resp) => resp,
@@ -220,6 +232,15 @@ impl ObjectStoreService {
 
 async fn dispatch(State(svc): State<Arc<ObjectStoreService>>, req: Request) -> Response {
     svc.handle(req).await
+}
+
+/// Replace the request body with one hard-capped at `max` bytes. Reading past `max`
+/// yields an error, which the engine surfaces as a failed (aborted) write — making
+/// the quota reservation authoritative regardless of the (unsigned) declared length.
+fn limit_body(req: Request, max: u64) -> Request {
+    let (parts, body) = req.into_parts();
+    let limited = http_body_util::Limited::new(body, max as usize);
+    Request::from_parts(parts, axum::body::Body::new(limited))
 }
 
 /// A byte-adding object write = PUT on an object path (`/{bucket}/{key}`): a plain
@@ -444,6 +465,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_exceeding_declared_length_is_capped_and_rejected() {
+        // A client declares a tiny Content-Length (reserves tiny) but streams more —
+        // the body must be capped at the reservation so it can't fill the shared disk.
+        let dir = tmp("cap");
+        let store = store_at(&dir);
+        let a = store.create_access_key("proj", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Declare length 2 but send 100 bytes.
+        let (auth, amzd) = sigv4::sign_header(
+            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+        );
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bkt/k")
+            .header("host", "storage.test")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("content-length", "2")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let st = app.clone().oneshot(req).await.unwrap().status();
+        assert_ne!(st, StatusCode::OK, "over-length write must not succeed");
+        // And the object must not be readable as the full 100 bytes.
+        let (gst, gbody) = status_body(
+            app.clone().oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert!(gst != StatusCode::OK || gbody.len() <= 2, "must not store beyond the reservation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn write_without_content_length_is_rejected() {
         let dir = tmp("nolen");
         let store = store_at(&dir);
@@ -452,11 +511,11 @@ mod tests {
         let app = svc.into_router();
         // Sign a PUT but strip content-length -> 411 (can't dodge the quota gate).
         let (auth, amzd) = sigv4::sign_header(
-            "PUT", "storage.test", "/b/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
         );
         let req = HttpRequest::builder()
             .method("PUT")
-            .uri("/b/k")
+            .uri("/bkt/k")
             .header("host", "storage.test")
             .header("authorization", auth)
             .header("x-amz-date", amzd)
