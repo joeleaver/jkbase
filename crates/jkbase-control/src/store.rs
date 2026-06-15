@@ -99,6 +99,14 @@ pub struct Secret {
 pub struct AccessKey {
     pub access_key_id: String,
     pub project_id: String,
+    /// The tenant that minted the key. The object-store auth path re-checks this
+    /// against the project's CURRENT owner (like the git-push token), so a key
+    /// orphaned by a crash-interrupted teardown can't be inherited by a different
+    /// tenant who later recreates the same-slug project. `#[serde(default)]` so a key
+    /// written before this field existed deserializes (with empty tenant → fails the
+    /// ownership check → safe).
+    #[serde(default)]
+    pub tenant_id: String,
     pub secret_key: String,
     /// Optional tenant-supplied label (e.g. "ci", "backups"); never authoritative.
     pub label: String,
@@ -1222,10 +1230,11 @@ impl Store {
     /// secret — the only time it's exposed (the caller shows it once). Writes the
     /// primary (`ACCESS_KEYS`) and per-project index (`ACCESS_KEYS_BY_PROJECT`) in a
     /// single txn so they can never diverge.
-    pub fn create_access_key(&self, project_id: &str, label: &str) -> Result<AccessKey> {
+    pub fn create_access_key(&self, project_id: &str, tenant_id: &str, label: &str) -> Result<AccessKey> {
         let key = AccessKey {
             access_key_id: auth::generate_access_key_id(),
             project_id: project_id.to_string(),
+            tenant_id: tenant_id.to_string(),
             secret_key: auth::generate_secret_access_key(),
             label: label.to_string(),
             created_unix: auth::timestamp(),
@@ -1428,8 +1437,8 @@ mod tests {
     #[test]
     fn access_keys_issue_lookup_and_scope_to_project() {
         let (store, path) = tmp_db();
-        let a = store.create_access_key("proj-a", "ci").unwrap();
-        let b = store.create_access_key("proj-b", "").unwrap();
+        let a = store.create_access_key("proj-a", "tenant-a", "ci").unwrap();
+        let b = store.create_access_key("proj-b", "tenant-b", "").unwrap();
         // Issued ids are unique, AKIA-shaped, and `/`-free (SigV4 Credential safe).
         assert_ne!(a.access_key_id, b.access_key_id);
         assert!(a.access_key_id.starts_with("JKBA") && !a.access_key_id.contains('/'));
@@ -1459,10 +1468,10 @@ mod tests {
     #[test]
     fn delete_all_access_keys_purges_only_the_target_project() {
         let (store, path) = tmp_db();
-        let k1 = store.create_access_key("forumall", "a").unwrap();
-        let _k2 = store.create_access_key("forumall", "b").unwrap();
+        let k1 = store.create_access_key("forumall", "t1", "a").unwrap();
+        let _k2 = store.create_access_key("forumall", "t1", "b").unwrap();
         // A slug that shares a prefix must NOT be swept (the ':' separator is exact).
-        let keep = store.create_access_key("forumall2", "c").unwrap();
+        let keep = store.create_access_key("forumall2", "t2", "c").unwrap();
 
         let removed = store.delete_all_access_keys("forumall").unwrap();
         assert_eq!(removed, 2);

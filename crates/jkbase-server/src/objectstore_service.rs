@@ -174,10 +174,20 @@ impl ObjectStoreService {
         };
 
         // --- 2. Resolve the owning project from the key (authoritative tenancy). ---
-        let project_id = match self.control.lookup_access_key(&access_key_id) {
-            Ok(Some(k)) => k.project_id,
+        let key = match self.control.lookup_access_key(&access_key_id) {
+            Ok(Some(k)) => k,
             _ => return s3_access_denied("unknown access key"),
         };
+        let project_id = key.project_id.clone();
+
+        // Re-bind to the project's CURRENT owner (mirrors the git-push token guard): a
+        // key orphaned by a crash-interrupted teardown must not be honored once a
+        // DIFFERENT tenant recreates the same-slug project. Fails closed if the project
+        // is gone or the owner changed.
+        match self.control.get_project(&project_id) {
+            Ok(Some(p)) if p.tenant_id.as_deref() == Some(key.tenant_id.as_str()) => {}
+            _ => return s3_access_denied("access key not valid for the current project owner"),
+        }
 
         let entry = match self.project_entry(&project_id) {
             Ok(e) => e,
@@ -361,6 +371,23 @@ mod tests {
         Store::open(&dir.join("ctl.redb")).unwrap()
     }
 
+    /// Insert a project owned by `tenant` (the storage service re-checks key ↔ current
+    /// project owner on every request, so tests must register the project).
+    fn mk_project(store: &Store, id: &str, tenant: &str) {
+        use jkbase_control::store::{Project, ProjectState};
+        store
+            .create_project(&Project {
+                id: id.to_string(),
+                name: id.to_string(),
+                tenant_id: Some(tenant.to_string()),
+                current_version: None,
+                state: ProjectState::Stopped,
+                vm_ip: None,
+                domains: Vec::new(),
+            })
+            .unwrap();
+    }
+
     /// Build a SigV4 header-signed request for the service's public host.
     fn signed(method: &str, path: &str, akid: &str, secret: &str, body: &str) -> Request {
         let (auth, amzd) = sigv4::sign_header(
@@ -388,8 +415,10 @@ mod tests {
     async fn signed_put_get_round_trip_and_tenant_isolation() {
         let dir = tmp("rt");
         let store = store_at(&dir);
-        let a = store.create_access_key("proj-a", "t").unwrap();
-        let b = store.create_access_key("proj-b", "t").unwrap();
+        mk_project(&store, "proj-a", "tenant-a");
+        mk_project(&store, "proj-b", "tenant-b");
+        let a = store.create_access_key("proj-a", "tenant-a", "t").unwrap();
+        let b = store.create_access_key("proj-b", "tenant-b", "t").unwrap();
         let svc = Arc::new(ObjectStoreService::new(
             dir.join("data"),
             store,
@@ -441,6 +470,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphaned_key_rejected_after_owner_change() {
+        // A key minted by tenant A, then the project is torn down WITHOUT purging the
+        // key (crash) and recreated by tenant B (same slug). A's orphaned key must NOT
+        // authenticate against B's store — the owner re-check fails closed.
+        let dir = tmp("rebind");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-a");
+        let k = store.create_access_key("proj", "tenant-a", "").unwrap();
+        // Simulate same-slug recreate by a different tenant (key left orphaned).
+        store.delete_project("proj").unwrap();
+        mk_project(&store, "proj", "tenant-b");
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        let r = app
+            .clone()
+            .oneshot(signed("GET", "/bkt/x", &k.access_key_id, &k.secret_key, ""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "orphaned key must not work after owner change");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn empty_project_id_key_cannot_reach_the_shared_root() {
         // Regression for the empty-slug BLOCKER: a key whose project_id is "" must NOT
         // resolve its store root to the shared `objectstore/` parent (which would list
@@ -450,7 +502,7 @@ mod tests {
         let data = dir.join("data");
         // A real victim project with a bucket sitting under the shared objectstore root.
         std::fs::create_dir_all(data.join("objectstore").join("victim-proj").join("secret-bkt")).unwrap();
-        let bad = store.create_access_key("", "evil").unwrap(); // empty project id
+        let bad = store.create_access_key("", "attacker", "evil").unwrap(); // empty project id
         let svc = Arc::new(ObjectStoreService::new(data, store, "storage.test".to_string()));
         let app = svc.into_router();
 
@@ -470,7 +522,8 @@ mod tests {
         // the body must be capped at the reservation so it can't fill the shared disk.
         let dir = tmp("cap");
         let store = store_at(&dir);
-        let a = store.create_access_key("proj", "").unwrap();
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
         let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
         let app = svc.into_router();
         assert_eq!(
@@ -506,7 +559,8 @@ mod tests {
     async fn write_without_content_length_is_rejected() {
         let dir = tmp("nolen");
         let store = store_at(&dir);
-        let a = store.create_access_key("p", "").unwrap();
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
         let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
         let app = svc.into_router();
         // Sign a PUT but strip content-length -> 411 (can't dodge the quota gate).

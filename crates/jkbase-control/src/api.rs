@@ -2729,7 +2729,7 @@ async fn issue_access_key(
             .into_response();
     }
 
-    match state.store.create_access_key(&id, label) {
+    match state.store.create_access_key(&id, &tenant.id, label) {
         Ok(key) => {
             info!(project = %id, access_key_id = %key.access_key_id, "object-store access key issued");
             (
