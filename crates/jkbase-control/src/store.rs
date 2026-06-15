@@ -36,7 +36,7 @@ const ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
-pub const RESERVED_LABELS: &[&str] = &["api", "www", "console"];
+pub const RESERVED_LABELS: &[&str] = &["api", "www", "console", "storage"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
