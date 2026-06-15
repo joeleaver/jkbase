@@ -104,6 +104,9 @@ pub enum Command {
     /// Manage secrets
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Manage S3 object-store access keys
+    #[command(subcommand)]
+    AccessKey(AccessKeyCommand),
     /// Manage custom domains
     #[command(subcommand)]
     Domain(DomainCommand),
@@ -142,6 +145,38 @@ pub enum SecretCommand {
         #[arg(long)]
         project: Option<String>,
         /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AccessKeyCommand {
+    /// Issue a new access key (the secret access key is shown ONCE)
+    Issue {
+        /// Optional label (e.g. ci, backups)
+        #[arg(long, default_value = "")]
+        label: String,
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// List access keys (ids + labels; secrets are never shown)
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Revoke an access key
+    Rm {
+        /// Access key id to revoke
+        access_key_id: String,
+        #[arg(long)]
+        project: Option<String>,
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
@@ -278,6 +313,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             api,
         } => run_logs(follow, service, limit, json, project, api).await,
         Command::Secret(cmd) => run_secret(cmd).await,
+        Command::AccessKey(cmd) => run_access_key(cmd).await,
         Command::Domain(cmd) => run_domain(cmd).await,
         Command::Repo(cmd) => repo::run(cmd).await,
     }
@@ -726,6 +762,101 @@ async fn api_json<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> an
     } else {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         anyhow::bail!("{}", body["error"].as_str().unwrap_or("request failed"));
+    }
+}
+
+/// Derive the object-store endpoint from the control API URL
+/// (`https://api.jkbase.app` -> `https://storage.jkbase.app`).
+fn storage_endpoint(api: &str) -> String {
+    api.replacen("://api.", "://storage.", 1)
+}
+
+async fn run_access_key(cmd: AccessKeyCommand) -> anyhow::Result<()> {
+    match cmd {
+        AccessKeyCommand::Issue { label, project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+
+            let resp = client
+                .post(format!("{api}/projects/{project_id}/access-keys"))
+                .json(&serde_json::json!({ "label": label }))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await?;
+                let akid = body["access_key_id"].as_str().unwrap_or("");
+                let secret = body["secret_access_key"].as_str().unwrap_or("");
+                println!("Access key issued for project '{project_id}':");
+                println!("  Endpoint:          {}", storage_endpoint(&api));
+                println!("  Access Key ID:     {akid}");
+                println!("  Secret Access Key: {secret}");
+                println!("\n  Save the secret now — it is not shown again.");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to issue access key: {err}");
+            }
+            Ok(())
+        }
+        AccessKeyCommand::List { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+
+            let resp = client
+                .get(format!("{api}/projects/{project_id}/access-keys"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+
+            if resp.status().is_success() {
+                let keys: Vec<serde_json::Value> = resp.json().await?;
+                if keys.is_empty() {
+                    println!("No access keys for project '{project_id}'");
+                } else {
+                    for k in &keys {
+                        let akid = k["access_key_id"].as_str().unwrap_or("");
+                        let label = k["label"].as_str().unwrap_or("");
+                        if label.is_empty() {
+                            println!("  {akid}");
+                        } else {
+                            println!("  {akid}  ({label})");
+                        }
+                    }
+                }
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to list access keys: {err}");
+            }
+            Ok(())
+        }
+        AccessKeyCommand::Rm { access_key_id, project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+
+            let resp = client
+                .delete(format!("{api}/projects/{project_id}/access-keys/{access_key_id}"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+
+            if resp.status().is_success() {
+                println!("Access key '{access_key_id}' revoked from project '{project_id}'");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to revoke access key: {err}");
+            }
+            Ok(())
+        }
     }
 }
 
