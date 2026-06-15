@@ -513,6 +513,7 @@ async fn main() -> Result<()> {
         platform_domain: args.domain,
         cert_manager: cert_manager.clone(),
         api_addr: Some(api_addr),
+        storage_addr: Some(format!("127.0.0.1:{}", args.storage_port)),
         domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
         wake_callback: Some(wake_callback),

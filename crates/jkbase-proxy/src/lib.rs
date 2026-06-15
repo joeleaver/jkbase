@@ -1,7 +1,7 @@
 pub mod tls;
 
 use anyhow::Result;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -60,12 +60,29 @@ pub fn new_domain_map() -> DomainMap {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Unified proxy response body. A branch can return either a buffered `Full` (error
+/// pages, small control responses) or a STREAMED backend body (object downloads,
+/// large tenant responses) without buffering it in proxy memory — the latter is what
+/// keeps a multi-GB object GET from sitting wholly in RAM.
+type ProxyBody = BoxBody<Bytes, std::io::Error>;
+
+/// Box a buffered body into [`ProxyBody`]. `Full`'s error is `Infallible`, mapped to
+/// the `io::Error` the boxed type declares (the closure is never called).
+fn full_body(b: impl Into<Bytes>) -> ProxyBody {
+    Full::new(b.into())
+        .map_err(|e: std::convert::Infallible| match e {})
+        .boxed()
+}
+
 pub struct ProxyConfig {
     pub http_port: u16,
     pub https_port: Option<u16>,
     pub platform_domain: String,
     pub cert_manager: Option<Arc<tls::CertManager>>,
     pub api_addr: Option<String>,
+    /// Local address of the tenant S3 object-store service. `storage.{domain}` is
+    /// forwarded here (streamed). `None` disables the reserved host.
+    pub storage_addr: Option<String>,
     pub domains: Option<DomainMap>,
     pub activity_tracker: Option<ActivityTracker>,
     pub wake_callback: Option<WakeCallback>,
@@ -75,6 +92,7 @@ struct SharedState {
     routes: RoutingTable,
     domain: Arc<String>,
     api_addr: Arc<Option<String>>,
+    storage_addr: Arc<Option<String>>,
     domains: Option<DomainMap>,
     activity: Option<ActivityTracker>,
     wake_cb: Option<WakeCallback>,
@@ -85,6 +103,7 @@ pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
         routes,
         domain: Arc::new(config.platform_domain),
         api_addr: Arc::new(config.api_addr),
+        storage_addr: Arc::new(config.storage_addr),
         domains: config.domains,
         activity: config.activity_tracker,
         wake_cb: config.wake_callback,
@@ -224,7 +243,7 @@ async fn serve_http_redirect(
 async fn proxy_request(
     shared: Arc<SharedState>,
     req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<ProxyBody>, hyper::Error> {
     let host = req
         .headers()
         .get("host")
@@ -241,6 +260,20 @@ async fn proxy_request(
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     error!(error = %e, "API forward failed");
+                    Ok(bad_gateway())
+                }
+            };
+        }
+
+    // Route storage.{domain} to the tenant object-store service (infra host, never a
+    // tenant project). Same local-forward pattern as the API; the service verifies
+    // SigV4 against its configured public host, so the Host rewrite here is harmless.
+    if subdomain.as_deref() == Some("storage")
+        && let Some(ref addr) = *shared.storage_addr {
+            return match forward_to_api(addr, req).await {
+                Ok(resp) => Ok(resp),
+                Err(e) => {
+                    error!(error = %e, "object-store forward failed");
                     Ok(bad_gateway())
                 }
             };
@@ -311,7 +344,7 @@ async fn proxy_request(
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("Content-Type", "text/plain")
                 .header("Retry-After", "5")
-                .body(Full::new(Bytes::from("project is starting up, please retry")))
+                .body(full_body("project is starting up, please retry"))
                 .unwrap())
         }
         Err(WakeError::Gone(reason)) => {
@@ -321,37 +354,35 @@ async fn proxy_request(
             Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("Content-Type", "text/plain")
-                .body(Full::new(Bytes::from(
+                .body(full_body(
                     "This project has no active deployment. Redeploy it to bring it back online.",
-                )))
+                ))
                 .unwrap())
         }
     }
 }
 
-fn payment_required(reason: &str) -> Response<Full<Bytes>> {
+fn payment_required(reason: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::PAYMENT_REQUIRED)
         .header("Content-Type", "text/plain")
-        .body(Full::new(Bytes::from(format!("project over quota: {reason}"))))
+        .body(full_body(format!("project over quota: {reason}")))
         .unwrap()
 }
 
-fn bad_gateway() -> Response<Full<Bytes>> {
+fn bad_gateway() -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
         .header("Content-Type", "text/plain")
-        .body(Full::new(Bytes::from("bad gateway")))
+        .body(full_body("bad gateway"))
         .unwrap()
 }
 
-fn not_found(project_id: &str) -> Response<Full<Bytes>> {
+fn not_found(project_id: &str) -> Response<ProxyBody> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header("Content-Type", "text/plain")
-        .body(Full::new(Bytes::from(format!(
-            "project not found: '{project_id}'"
-        ))))
+        .body(full_body(format!("project not found: '{project_id}'")))
         .unwrap()
 }
 
@@ -478,7 +509,7 @@ where
 fn relay_upgrade(
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     mut backend_resp: Response<hyper::body::Incoming>,
-) -> Response<Full<Bytes>> {
+) -> Response<ProxyBody> {
     let backend_upgrade = hyper::upgrade::on(&mut backend_resp);
     match client_upgrade {
         Some(client_upgrade) => {
@@ -504,13 +535,13 @@ fn relay_upgrade(
     for (key, value) in backend_resp.headers() {
         builder = builder.header(key, value);
     }
-    builder.body(Full::new(Bytes::new())).unwrap()
+    builder.body(full_body(Bytes::new())).unwrap()
 }
 
 async fn forward_to_api(
     api_addr: &str,
     mut req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ProxyBody>> {
     let path = req
         .uri()
         .path_and_query()
@@ -541,20 +572,22 @@ async fn forward_to_api(
     }
     let status = resp.status();
     let headers = resp.headers().clone();
-    let body = resp.into_body().collect().await?.to_bytes();
+    // Stream the backend body through instead of buffering it in proxy RAM — an
+    // object download (or any large tenant response) must not sit wholly in memory.
+    let body = resp.into_body().map_err(std::io::Error::other).boxed();
 
     let mut builder = Response::builder().status(status);
     for (key, value) in &headers {
         builder = builder.header(key, value);
     }
-    Ok(builder.body(Full::new(body)).unwrap())
+    Ok(builder.body(body).unwrap())
 }
 
 async fn forward_request(
     backend_ip: &str,
     site: Option<&str>,
     mut req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ProxyBody>> {
     let path_and_query = req
         .uri()
         .path_and_query()
@@ -590,13 +623,15 @@ async fn forward_request(
     }
     let status = resp.status();
     let headers = resp.headers().clone();
-    let body = resp.into_body().collect().await?.to_bytes();
+    // Stream the backend body through instead of buffering it in proxy RAM — an
+    // object download (or any large tenant response) must not sit wholly in memory.
+    let body = resp.into_body().map_err(std::io::Error::other).boxed();
 
     let mut builder = Response::builder().status(status);
     for (key, value) in &headers {
         builder = builder.header(key, value);
     }
-    Ok(builder.body(Full::new(body)).unwrap())
+    Ok(builder.body(body).unwrap())
 }
 
 fn extract_subdomain(hostname: &str, platform_domain: &str) -> Option<String> {
