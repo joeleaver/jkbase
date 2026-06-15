@@ -360,6 +360,72 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request as HttpRequest;
 
+    /// On-box e2e over real TCP/HTTP via reqwest. Proves SigV4 verifies on the wire
+    /// AND that host-binding uses the CONFIGURED public host (the request's actual Host
+    /// is `127.0.0.1:port`, but the signature is for `storage.jkbase.app`) — the exact
+    /// property that makes the service correct behind the Host-rewriting proxy.
+    /// `#[ignore]` because it binds a port; run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn e2e_over_real_http() {
+        let dir = tmp("e2e");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let k = store.create_access_key("proj", "tenant-x", "ci").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.jkbase.app".to_string(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, svc.into_router()).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // Sign for the PUBLIC host, not the connection address.
+        let send = |method: &'static str, path: String, body: &'static str| {
+            let client = client.clone();
+            let base = base.clone();
+            let akid = k.access_key_id.clone();
+            let secret = k.secret_key.clone();
+            async move {
+                let (auth, amzd) = sigv4::sign_header(
+                    method, "storage.jkbase.app", &path, &[], "UNSIGNED-PAYLOAD",
+                    &akid, &secret, "us-east-1", now_secs(),
+                );
+                let rb = client
+                    .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("{base}{path}"))
+                    .header("authorization", auth)
+                    .header("x-amz-date", amzd)
+                    .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                    .body(body);
+                let resp = rb.send().await.unwrap();
+                (resp.status().as_u16(), resp.text().await.unwrap())
+            }
+        };
+
+        // Create bucket -> PUT object -> GET (verify) -> LIST -> DELETE -> GET 404.
+        assert_eq!(send("PUT", "/photos".into(), "").await.0, 200);
+        assert_eq!(send("PUT", "/photos/cat.txt".into(), "meow").await.0, 200);
+        let (gst, gbody) = send("GET", "/photos/cat.txt".into(), "").await;
+        assert_eq!(gst, 200);
+        assert_eq!(gbody, "meow");
+        let (lst, lbody) = send("GET", "/photos".into(), "").await;
+        assert_eq!(lst, 200);
+        assert!(lbody.contains("<Key>cat.txt</Key>"), "list: {lbody}");
+        assert_eq!(send("DELETE", "/photos/cat.txt".into(), "").await.0, 204);
+        assert_eq!(send("GET", "/photos/cat.txt".into(), "").await.0, 404);
+
+        // An unsigned request is refused over the wire too.
+        let anon = client.get(format!("{base}/photos/cat.txt")).send().await.unwrap();
+        assert_eq!(anon.status().as_u16(), 403);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("jkb-objsvc-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
