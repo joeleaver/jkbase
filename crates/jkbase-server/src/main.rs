@@ -544,6 +544,7 @@ async fn main() -> Result<()> {
     reap_orphan_firecrackers_on_boot().await;
     cleanup_orphans(&platform).await;
     reconcile_orphans_on_boot(&platform).await;
+    reconcile_baselayers_on_boot(&platform).await;
     backfill_domains(&platform, &domain_map).await;
 
     tokio::spawn(async move {
@@ -965,6 +966,108 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
                 let _ = std::fs::remove_dir_all(entry.path());
                 info!(project = %id, artifact = "git", "reaped orphaned bare repo");
             }
+        }
+    }
+}
+
+/// Boot-time GC of the shared layer store (`baselayers/`). Base + per-language
+/// runtime erofs blobs are content-addressed, dm-verity'd, and shared across ALL
+/// projects; they accumulate as the platform's layers are rebuilt (each new base/
+/// runtime version adds a `sha256-<hex>.erofs` and `platform.json` is repointed).
+/// A blob is LIVE iff the CURRENT `platform.json` names it, OR some registered
+/// project's current metadata image still attaches it (its baked `_layerpaths.json`
+/// pins the exact base/runtime version that project deployed with — possibly older
+/// than `platform.json` if it hasn't redeployed since). Everything else is an
+/// unreferenced old version: reap it.
+///
+/// Runs at boot ONLY — before the proxy/control serve, so no deploy/wake can race
+/// (same ordering guarantee as [`reconcile_orphans_on_boot`]); the live set needs no
+/// lock. Per-tenant app layers live under each version dir and are already reclaimed
+/// with the dir on prune, so only `baselayers/` leaks and only it is swept here.
+///
+/// FAILS SAFE: if `platform.json` is present but unparseable, or any project's layer
+/// map can't be read, the sweep aborts (leak rather than risk reaping a live blob).
+async fn reconcile_baselayers_on_boot(platform: &Arc<Mutex<PlatformState>>) {
+    let plat = platform.lock().await;
+    let registered: Vec<String> = match plat.store.list_projects() {
+        Ok(ps) => ps.into_iter().map(|p| p.id).collect(),
+        Err(_) => return,
+    };
+    let data_dir = plat.data_dir.clone();
+    drop(plat);
+
+    let baselayers = data_dir.join("baselayers");
+    if !baselayers.is_dir() {
+        return;
+    }
+
+    // The LIVE set of baselayers blob filenames a deletion must never touch.
+    let mut live: HashSet<String> = HashSet::new();
+
+    // (1) Current platform.json base + every runtime are ALWAYS live (the next deploy
+    //     and any project mid-deploy use them). baselayers/ existing implies platform.json
+    //     should too — the platform-layer build installs the blobs THEN writes the
+    //     manifest — so treat absent/unreadable/unparseable IDENTICALLY: abort the sweep
+    //     rather than risk reaping the current (or a freshly-baked, not-yet-deployed-onto)
+    //     base/runtime when the manifest momentarily isn't there.
+    let platform_json = baselayers.join("platform.json");
+    let parsed = std::fs::read(&platform_json)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let Some(v) = parsed else {
+        warn!("baselayers GC: platform.json missing/unreadable/unparseable; skipping sweep");
+        return;
+    };
+    if let Some(f) = v.get("base").and_then(|b| b.get("file")).and_then(|f| f.as_str()) {
+        live.insert(f.to_string());
+    }
+    if let Some(rts) = v.get("runtimes").and_then(|r| r.as_object()) {
+        for desc in rts.values() {
+            if let Some(f) = desc.get("file").and_then(|f| f.as_str()) {
+                live.insert(f.to_string());
+            }
+        }
+    }
+
+    // (2) Each registered project's CURRENT metadata image pins the exact base/runtime
+    //     blobs it attaches. If a project's layer map can't be read, abort the whole
+    //     sweep (treating it as "references nothing" could reap a blob it still needs).
+    let content_images = data_dir.join("content-images");
+    for id in &registered {
+        let img = content_images.join(format!("{id}.ext4"));
+        let paths = match layer_plan::try_read_layer_paths(&img) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(project = %id, error = %e, "baselayers GC: cannot read layer paths; skipping sweep");
+                return;
+            }
+        };
+        for p in paths {
+            // Match by content-addressed FILENAME, not parent path: the baked paths carry
+            // the data_dir spelling AS OF deploy time, so a relocated/re-spelled data_dir
+            // would make a live base/runtime's parent lexically != the boot-time baselayers
+            // dir and silently drop it from the set. A `sha256-<hex>.erofs` name uniquely
+            // identifies its blob regardless of directory; adding app-layer names too is
+            // harmless (they never collide with a baselayers blob's content address).
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                live.insert(name.to_string());
+            }
+        }
+    }
+
+    // Sweep: reap content-addressed blobs (`sha256-<hex>.erofs`) not in the live set.
+    // Anything else in baselayers/ (platform.json, verity sidecars) is left untouched.
+    let Ok(entries) = std::fs::read_dir(&baselayers) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !layer_plan::is_safe_layer_filename(&name) || live.contains(&name) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => info!(blob = %name, "reaped unreferenced baselayer blob"),
+            Err(e) => warn!(blob = %name, error = %e, "failed to reap unreferenced baselayer blob"),
         }
     }
 }

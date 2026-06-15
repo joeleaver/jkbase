@@ -26,7 +26,14 @@ use std::path::Path;
 /// Dump one known file from the untrusted ext4 `image` to `dest` on the host via
 /// `debugfs` (no mount). `guest_path` is absolute within the image (e.g.
 /// `/status`). Returns `Ok(true)` if the file existed and was written, `Ok(false)`
-/// if it was absent in the image.
+/// if it was genuinely absent in a READABLE image, and `Err` if `debugfs` could not
+/// open/parse the image at all (bad superblock, short read, corrupt/hostile fs).
+///
+/// Distinguishing "file absent" from "image unreadable" is load-bearing for callers
+/// that must fail safe (the baselayers GC reaps shared blobs a project no longer
+/// references; mistaking an unreadable metadata image for "references nothing" would
+/// wrongly delete a live cross-tenant blob). `debugfs` exits 0 in both cases, so the
+/// signal is its stderr: a genuine miss prints `File not found by ext2_lookup`.
 ///
 /// `guest_path` and `dest` must be whitespace-free: `debugfs -R` splits its
 /// request string on whitespace. Callers control both (fixed output-contract
@@ -57,10 +64,25 @@ pub fn dump_file(image: &Path, guest_path: &str, dest: &Path) -> Result<bool> {
                 image.display()
             )
         })?;
-    // Note: exit status is unreliable (0 even on missing file). The destination
-    // file's existence is the real signal. A spawn/exec failure is caught above.
-    let _ = out;
-    Ok(dest.exists())
+    // Exit status is unreliable (0 even on a missing file AND on a failed open), so
+    // the destination file is the success signal. When nothing was written, the stderr
+    // tells us WHY: a genuine miss in a readable image says `File not found by
+    // ext2_lookup`; anything else (bad superblock, short read, …) means debugfs could
+    // not open/parse the image — surface that as an error so fail-safe callers don't
+    // treat a corrupt image as "file absent".
+    if dest.exists() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("File not found") {
+        Ok(false)
+    } else {
+        bail!(
+            "debugfs could not read {guest_path} from {} (unreadable/corrupt image?): {}",
+            image.display(),
+            stderr.trim()
+        )
+    }
 }
 
 /// Read a known file out of the untrusted `image`, capped at `max_bytes` (keeping
@@ -153,6 +175,15 @@ mod tests {
         // oversized log is tail-capped
         let log = read_capped(&img, "/build.log", 16 * 1024).unwrap().unwrap();
         assert_eq!(log.len(), 16 * 1024);
+
+        // A CORRUPT/unreadable image must ERROR, not read as "file absent" — the
+        // load-bearing distinction the baselayers GC relies on to fail safe.
+        let corrupt = dir.join("corrupt.img");
+        std::fs::write(&corrupt, vec![0u8; 4096]).unwrap();
+        assert!(
+            dump_file(&corrupt, "/status", &dir.join("x")).is_err(),
+            "an unreadable image must Err, not Ok(false)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
