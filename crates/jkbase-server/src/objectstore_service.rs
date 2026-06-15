@@ -56,9 +56,11 @@ const MAX_INFLIGHT_UPLOADS: u64 = 1000;
 struct Usage {
     base_bytes: u64,
     base_objects: u64,
+    base_buckets: u64,
     sampled_at: Instant,
     reserved_bytes: u64,
     reserved_objects: u64,
+    reserved_buckets: u64,
 }
 
 struct ProjectEntry {
@@ -113,12 +115,14 @@ impl ObjectStoreService {
             usage: Mutex::new(Usage {
                 base_bytes: 0,
                 base_objects: 0,
+                base_buckets: 0,
                 // Force a fresh walk on the first write (sampled "in the past").
                 sampled_at: Instant::now()
                     .checked_sub(QUOTA_TTL)
                     .unwrap_or_else(Instant::now),
                 reserved_bytes: 0,
                 reserved_objects: 0,
+                reserved_buckets: 0,
             }),
         });
         // Keep the cache bounded: evict an arbitrary entry once at capacity (cheap to
@@ -140,15 +144,58 @@ impl ObjectStoreService {
         self.projects.lock().unwrap().remove(project_id);
     }
 
-    /// Reserve `len` bytes (and, when `adds_object`, one object) against the project's
-    /// storage + object-count caps. Returns `Some(error response)` if it would exceed
-    /// a cap, else `None` (reserved). Fail-closed: the reservation is added BEFORE the
-    /// write and held until the next TTL re-walk, which re-reads the authoritative
-    /// on-disk figures — so concurrent writes within a window can't overshoot.
+    /// Re-walk the project's authoritative on-disk footprint when the cached sample is
+    /// stale, OFF the per-project lock (`spawn_blocking` for bytes + an async count
+    /// walk), so one project's walk never blocks its own — or any other's — requests.
     ///
-    /// The (potentially large) authoritative dir-walk runs OFF the per-project lock
-    /// (a `spawn_blocking` for bytes + an async walk for counts), so one project's
-    /// refresh never blocks its own — or any other project's — concurrent requests.
+    /// Fail-CLOSED: if the count walk errors (a real IO fault on the store root),
+    /// return an error response rather than adopt a zeroed base that would let writes
+    /// slip past the object/bucket caps for a TTL window.
+    async fn refresh_if_stale(
+        &self,
+        entry: &Arc<ProjectEntry>,
+        project_id: &str,
+    ) -> Result<(), Response> {
+        let stale = { entry.usage.lock().unwrap().sampled_at.elapsed() > QUOTA_TTL };
+        if !stale {
+            return Ok(());
+        }
+        let dd = self.data_dir.clone();
+        let pid = project_id.to_string();
+        let bytes = tokio::task::spawn_blocking(move || {
+            jkbase_common::storage::project_storage_bytes(&dd, &pid)
+        })
+        .await
+        .unwrap_or(0);
+        let (buckets, objects) = match entry.store.usage_counts().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(project = %project_id, error = %e, "object store usage walk failed");
+                return Err(s3_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "quota check temporarily unavailable",
+                ));
+            }
+        };
+        let mut u = entry.usage.lock().unwrap();
+        // Re-check under the lock: don't clobber a fresher concurrent refresh.
+        if u.sampled_at.elapsed() > QUOTA_TTL {
+            u.base_bytes = bytes;
+            u.base_objects = objects;
+            u.base_buckets = buckets;
+            u.reserved_bytes = 0;
+            u.reserved_objects = 0;
+            u.reserved_buckets = 0;
+            u.sampled_at = Instant::now();
+        }
+        Ok(())
+    }
+
+    /// Reserve `len` bytes (and, when `adds_object`, one object) against the storage +
+    /// object-count caps under the per-project lock. The reservation is added BEFORE
+    /// the write and held until the next TTL re-walk, so concurrent writes within a
+    /// window can't overshoot (fail-closed: it over-counts rather than under).
     async fn refresh_and_reserve(
         &self,
         entry: &Arc<ProjectEntry>,
@@ -157,25 +204,8 @@ impl ObjectStoreService {
         adds_object: bool,
         quota: &QuotaLimits,
     ) -> Option<Response> {
-        let stale = { entry.usage.lock().unwrap().sampled_at.elapsed() > QUOTA_TTL };
-        if stale {
-            let dd = self.data_dir.clone();
-            let pid = project_id.to_string();
-            let bytes = tokio::task::spawn_blocking(move || {
-                jkbase_common::storage::project_storage_bytes(&dd, &pid)
-            })
-            .await
-            .unwrap_or(0);
-            let (_buckets, objects) = entry.store.usage_counts().await.unwrap_or((0, 0));
-            let mut u = entry.usage.lock().unwrap();
-            // Re-check under the lock: don't clobber a fresher concurrent refresh.
-            if u.sampled_at.elapsed() > QUOTA_TTL {
-                u.base_bytes = bytes;
-                u.base_objects = objects;
-                u.reserved_bytes = 0;
-                u.reserved_objects = 0;
-                u.sampled_at = Instant::now();
-            }
+        if let Err(resp) = self.refresh_if_stale(entry, project_id).await {
+            return Some(resp);
         }
         let mut u = entry.usage.lock().unwrap();
         let projected_bytes = u.base_bytes.saturating_add(u.reserved_bytes).saturating_add(len);
@@ -207,15 +237,45 @@ impl ObjectStoreService {
         None
     }
 
-    /// Release a reservation taken by [`Self::refresh_and_reserve`] when the write
-    /// did not land (engine returned an error / non-2xx), crediting the bytes (and
-    /// object, if reserved) back instead of waiting out the TTL.
+    /// Reserve one bucket against `max_buckets` under the per-project lock — closes the
+    /// check-then-create race a raw `list_buckets` count would leave open (two
+    /// concurrent creates both seeing room) and is fail-closed on the count walk.
+    async fn reserve_bucket(
+        &self,
+        entry: &Arc<ProjectEntry>,
+        project_id: &str,
+        quota: &QuotaLimits,
+    ) -> Option<Response> {
+        if let Err(resp) = self.refresh_if_stale(entry, project_id).await {
+            return Some(resp);
+        }
+        let mut u = entry.usage.lock().unwrap();
+        let projected = u.base_buckets.saturating_add(u.reserved_buckets).saturating_add(1);
+        if projected > quota.max_buckets {
+            return Some(s3_error(
+                StatusCode::CONFLICT,
+                "TooManyBuckets",
+                &format!("bucket quota exceeded: cap is {}", quota.max_buckets),
+            ));
+        }
+        u.reserved_buckets = u.reserved_buckets.saturating_add(1);
+        None
+    }
+
+    /// Release a byte/object reservation when the write didn't land (non-2xx),
+    /// crediting it back instead of waiting out the TTL.
     fn release_reservation(&self, entry: &ProjectEntry, len: u64, had_object: bool) {
         let mut u = entry.usage.lock().unwrap();
         u.reserved_bytes = u.reserved_bytes.saturating_sub(len);
         if had_object {
             u.reserved_objects = u.reserved_objects.saturating_sub(1);
         }
+    }
+
+    /// Release a bucket reservation when the create didn't land (non-2xx).
+    fn release_bucket_reservation(&self, entry: &ProjectEntry) {
+        let mut u = entry.usage.lock().unwrap();
+        u.reserved_buckets = u.reserved_buckets.saturating_sub(1);
     }
 
     /// Force the project's next quota check to re-walk (e.g. after a delete frees
@@ -320,25 +380,23 @@ impl ObjectStoreService {
 
         let quota = self.control.get_quota(&project_id).unwrap_or(DEFAULT_QUOTA);
 
-        // --- 3a. Cap bucket COUNT at create (PUT /{bucket}). ---
+        // --- 3a. Cap bucket COUNT at create (PUT /{bucket}) via a lock-held reservation. ---
+        let mut bucket_reserved = false;
         if is_bucket_create(&method, &path) {
-            let n = entry.store.list_buckets().await.map(|b| b.len() as u64).unwrap_or(0);
-            if n >= quota.max_buckets {
-                return s3_error(
-                    StatusCode::CONFLICT,
-                    "TooManyBuckets",
-                    &format!("bucket quota exceeded: cap is {}", quota.max_buckets),
-                );
+            if let Some(resp) = self.reserve_bucket(&entry, &project_id, &quota).await {
+                return resp;
             }
+            bucket_reserved = true;
         }
 
         // --- 3b. Cap concurrent in-flight multipart uploads (POST ?uploads). ---
         if is_create_multipart(&method, &query) {
+            // Fail closed: a count-walk error counts as "at cap", not "empty".
             let inflight = entry
                 .store
                 .count_inflight_uploads(MAX_INFLIGHT_UPLOADS)
                 .await
-                .unwrap_or(0);
+                .unwrap_or(MAX_INFLIGHT_UPLOADS);
             if inflight >= MAX_INFLIGHT_UPLOADS {
                 return s3_error(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -405,6 +463,9 @@ impl ObjectStoreService {
         {
             // The write didn't land — credit the reservation back immediately.
             self.release_reservation(&entry, len, had_object);
+        }
+        if bucket_reserved && !resp.status().is_success() {
+            self.release_bucket_reservation(&entry);
         }
         if method == "DELETE" && path_has_key(&path) && resp.status().is_success() {
             // A delete (or AbortMultipartUpload) freed space/objects: re-walk on the
