@@ -201,7 +201,7 @@ fn extract_tags(xml: &str, open: &str, close: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ObjectStore, StaticCredentials, router_with_auth};
+    use crate::{ObjectStore, router};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -209,8 +209,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("jkb-objclient-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Arc::new(ObjectStore::open(&dir).unwrap());
-        let creds = Arc::new(StaticCredentials::new().with("AK", "SK", "tenant-a"));
-        let app = router_with_auth(store, creds);
+        // The bare `router` is what the productized server uses; per-project FS
+        // root is the sole tenant boundary, no SigV4 auth middleware needed here.
+        let app = router(store);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

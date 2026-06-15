@@ -23,7 +23,7 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
-use jkbase_control::store::Store;
+use jkbase_control::store::{DEFAULT_QUOTA, QuotaLimits, Store};
 use jkbase_objectstore::{ObjectStore, sigv4};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,12 +38,29 @@ use tracing::warn;
 /// off the per-request hot path (and out of reach as an O(n²) amplifier).
 const QUOTA_TTL: Duration = Duration::from_secs(10);
 
+/// Bound the per-project entry cache so a churn of distinct project ids can't grow
+/// it without limit. Entries are cheap to reopen (a stateless `ObjectStore` + fresh
+/// usage counters) and the per-request owner re-check makes a stale one safe, so
+/// arbitrary eviction when over the cap is fine.
+const PROJECT_CACHE_CAP: usize = 4096;
+
+/// Cap on concurrent in-flight (un-completed) multipart uploads per project — a
+/// floor against `.uploads/{id}` staging-dir / inode amplification (staging already
+/// counts toward the tenant's own byte quota, so this is defense-in-depth).
+const MAX_INFLIGHT_UPLOADS: u64 = 1000;
+
 /// Mutable per-project usage accounting, guarded by its OWN lock so one project's
-/// (potentially large) dir-walk never blocks another project's requests.
+/// (potentially large) dir-walk never blocks another project's requests. Both bytes
+/// AND object count are gated; each carries an in-flight reservation that fails
+/// CLOSED (over-counts) until the next authoritative TTL re-walk reconciles it.
 struct Usage {
     base_bytes: u64,
+    base_objects: u64,
+    base_buckets: u64,
     sampled_at: Instant,
-    reserved: u64,
+    reserved_bytes: u64,
+    reserved_objects: u64,
+    reserved_buckets: u64,
 }
 
 struct ProjectEntry {
@@ -81,12 +98,7 @@ impl ObjectStoreService {
         // The control plane only ever mints keys for validated `[a-z0-9-]` slugs, but
         // refuse to join anything else (esp. empty → the shared `objectstore/` parent)
         // so a malformed id that ever lands in ACCESS_KEYS fails closed here too.
-        if project_id.is_empty()
-            || project_id.len() > 63
-            || !project_id
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
+        if !is_valid_project_id(project_id) {
             return Err(std::io::Error::other(format!(
                 "invalid project id {project_id:?}"
             )));
@@ -102,72 +114,252 @@ impl ObjectStoreService {
             store: Arc::new(store),
             usage: Mutex::new(Usage {
                 base_bytes: 0,
+                base_objects: 0,
+                base_buckets: 0,
                 // Force a fresh walk on the first write (sampled "in the past").
                 sampled_at: Instant::now()
                     .checked_sub(QUOTA_TTL)
                     .unwrap_or_else(Instant::now),
-                reserved: 0,
+                reserved_bytes: 0,
+                reserved_objects: 0,
+                reserved_buckets: 0,
             }),
         });
+        // Keep the cache bounded: evict an arbitrary entry once at capacity (cheap to
+        // reopen). Never evicts the one we're about to insert.
+        if map.len() >= PROJECT_CACHE_CAP && !map.contains_key(project_id)
+            && let Some(victim) = map.keys().next().cloned()
+        {
+            map.remove(&victim);
+        }
         map.insert(project_id.to_string(), entry.clone());
         Ok(entry)
     }
 
-    /// Reserve `len` bytes against the project's storage cap. Returns `Some(error
-    /// response)` if it would exceed the cap, else `None` (reserved). Fail-closed: the
-    /// reservation is added BEFORE the write, deletes are not credited until the next
-    /// TTL re-walk, and the base re-walk includes the just-written bytes — so
-    /// concurrent writes within a window can't overshoot.
-    fn reserve_quota(&self, entry: &ProjectEntry, project_id: &str, len: u64) -> Option<Response> {
-        let cap = self
-            .control
-            .get_quota(project_id)
-            .map(|q| q.storage_bytes_max)
-            .unwrap_or(u64::MAX);
+    /// Drop a project's cached entry (e.g. after the project is deleted/recreated).
+    /// Self-healing today via the per-request owner re-check + stateless store, so
+    /// this is an opportunistic eviction the cache bound also covers.
+    #[allow(dead_code)]
+    pub fn invalidate(&self, project_id: &str) {
+        self.projects.lock().unwrap().remove(project_id);
+    }
+
+    /// Re-walk the project's authoritative on-disk footprint when the cached sample is
+    /// stale, OFF the per-project lock (`spawn_blocking` for bytes + an async count
+    /// walk), so one project's walk never blocks its own — or any other's — requests.
+    ///
+    /// Fail-CLOSED: if the count walk errors (a real IO fault on the store root),
+    /// return an error response rather than adopt a zeroed base that would let writes
+    /// slip past the object/bucket caps for a TTL window.
+    async fn refresh_if_stale(
+        &self,
+        entry: &Arc<ProjectEntry>,
+        project_id: &str,
+    ) -> Result<(), Response> {
+        let stale = { entry.usage.lock().unwrap().sampled_at.elapsed() > QUOTA_TTL };
+        if !stale {
+            return Ok(());
+        }
+        let dd = self.data_dir.clone();
+        let pid = project_id.to_string();
+        let bytes = match tokio::task::spawn_blocking(move || {
+            jkbase_common::storage::project_storage_bytes(&dd, &pid)
+        })
+        .await
+        {
+            Ok(b) => b,
+            // Fail CLOSED on a walk task failure (symmetric with the count walk below),
+            // rather than adopt bytes=0 and let writes slip the byte cap.
+            Err(e) => {
+                warn!(project = %project_id, error = %e, "object store byte walk task failed");
+                return Err(s3_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "quota check temporarily unavailable",
+                ));
+            }
+        };
+        let (buckets, objects) = match entry.store.usage_counts().await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(project = %project_id, error = %e, "object store usage walk failed");
+                return Err(s3_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "quota check temporarily unavailable",
+                ));
+            }
+        };
         let mut u = entry.usage.lock().unwrap();
+        // Re-check under the lock: don't clobber a fresher concurrent refresh.
         if u.sampled_at.elapsed() > QUOTA_TTL {
-            u.base_bytes = jkbase_common::storage::project_storage_bytes(&self.data_dir, project_id);
-            u.reserved = 0;
+            u.base_bytes = bytes;
+            u.base_objects = objects;
+            u.base_buckets = buckets;
+            u.reserved_bytes = 0;
+            u.reserved_objects = 0;
+            u.reserved_buckets = 0;
             u.sampled_at = Instant::now();
         }
-        let projected = u.base_bytes.saturating_add(u.reserved).saturating_add(len);
-        if projected > cap {
+        Ok(())
+    }
+
+    /// Reserve `len` bytes (and, when `adds_object`, one object) against the storage +
+    /// object-count caps under the per-project lock. The reservation is added BEFORE
+    /// the write and held until the next authoritative TTL re-walk, which resets it to
+    /// the on-disk figures. This is a SOFT cap bounded by the TTL: a write that reserves
+    /// while a concurrent re-walk is in flight can have its reservation reset before its
+    /// bytes land in `base`, so a tenant's own concurrent writes can briefly overshoot
+    /// by up to what lands within one ≤TTL window; the next walk reconciles it.
+    async fn refresh_and_reserve(
+        &self,
+        entry: &Arc<ProjectEntry>,
+        project_id: &str,
+        len: u64,
+        adds_object: bool,
+        quota: &QuotaLimits,
+    ) -> Option<Response> {
+        if let Err(resp) = self.refresh_if_stale(entry, project_id).await {
+            return Some(resp);
+        }
+        let mut u = entry.usage.lock().unwrap();
+        let projected_bytes = u.base_bytes.saturating_add(u.reserved_bytes).saturating_add(len);
+        if projected_bytes > quota.storage_bytes_max {
             return Some(s3_error(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "QuotaExceeded",
-                &format!("storage quota exceeded: would use {projected} bytes, cap is {cap}"),
+                &format!(
+                    "storage quota exceeded: would use {projected_bytes} bytes, cap is {}",
+                    quota.storage_bytes_max
+                ),
             ));
         }
-        u.reserved = u.reserved.saturating_add(len);
+        if adds_object {
+            let projected_objs = u.base_objects.saturating_add(u.reserved_objects).saturating_add(1);
+            if projected_objs > quota.max_objects {
+                return Some(s3_error(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "TooManyObjects",
+                    &format!(
+                        "object-count quota exceeded: would hold {projected_objs} objects, cap is {}",
+                        quota.max_objects
+                    ),
+                ));
+            }
+            u.reserved_objects = u.reserved_objects.saturating_add(1);
+        }
+        u.reserved_bytes = u.reserved_bytes.saturating_add(len);
         None
     }
 
+    /// Reserve one bucket against `max_buckets` under the per-project lock — closes the
+    /// check-then-create race a raw `list_buckets` count would leave open (two
+    /// concurrent creates both seeing room) and is fail-closed on the count walk.
+    async fn reserve_bucket(
+        &self,
+        entry: &Arc<ProjectEntry>,
+        project_id: &str,
+        quota: &QuotaLimits,
+    ) -> Option<Response> {
+        if let Err(resp) = self.refresh_if_stale(entry, project_id).await {
+            return Some(resp);
+        }
+        let mut u = entry.usage.lock().unwrap();
+        let projected = u.base_buckets.saturating_add(u.reserved_buckets).saturating_add(1);
+        if projected > quota.max_buckets {
+            return Some(s3_error(
+                StatusCode::CONFLICT,
+                "TooManyBuckets",
+                &format!("bucket quota exceeded: cap is {}", quota.max_buckets),
+            ));
+        }
+        u.reserved_buckets = u.reserved_buckets.saturating_add(1);
+        None
+    }
+
+    /// Release a byte/object reservation when the write didn't land (non-2xx),
+    /// crediting it back instead of waiting out the TTL.
+    fn release_reservation(&self, entry: &ProjectEntry, len: u64, had_object: bool) {
+        let mut u = entry.usage.lock().unwrap();
+        u.reserved_bytes = u.reserved_bytes.saturating_sub(len);
+        if had_object {
+            u.reserved_objects = u.reserved_objects.saturating_sub(1);
+        }
+    }
+
+    /// Release a bucket reservation when the create didn't land (non-2xx).
+    fn release_bucket_reservation(&self, entry: &ProjectEntry) {
+        let mut u = entry.usage.lock().unwrap();
+        u.reserved_buckets = u.reserved_buckets.saturating_sub(1);
+    }
+
+    /// Force the project's next quota check to re-walk (e.g. after a delete frees
+    /// space/objects) so reclaimed capacity is credited promptly, not in ≤TTL.
+    fn invalidate_usage_sample(&self, entry: &ProjectEntry) {
+        let mut u = entry.usage.lock().unwrap();
+        u.sampled_at = Instant::now()
+            .checked_sub(QUOTA_TTL)
+            .unwrap_or_else(Instant::now);
+    }
+
+    /// Sweep abandoned multipart staging across every registered project. Returns the
+    /// total number of stale `.uploads/{id}` dirs removed. Driven on boot + on a timer.
+    pub async fn sweep_all_stale_uploads(&self, max_age: Duration) -> usize {
+        let projects = match self.control.list_projects() {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        let mut total = 0usize;
+        for p in projects {
+            if !is_valid_project_id(&p.id) {
+                continue;
+            }
+            let root = self.data_dir.join("objectstore").join(&p.id);
+            if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
+                continue;
+            }
+            if let Ok(store) = ObjectStore::open(&root)
+                && let Ok(n) = store.sweep_stale_uploads(max_age).await
+            {
+                total += n;
+            }
+        }
+        total
+    }
+
     async fn handle(&self, req: Request) -> Response {
-        // --- 1. Authenticate (SigV4) against the CONFIGURED public host. ---
+        // --- 1. Authenticate (SigV4) against the CONFIGURED public host. The edge
+        // proxy rewrites Host to the local backend, so we verify the signed host
+        // ourselves; accept the bare public host AND its :443/:80 variants for SDKs/
+        // CLIs that sign the port (fail-closed against any other host). ---
         let method = req.method().as_str().to_string();
         let path = pct_decode(req.uri().path());
         let query = parse_query(req.uri().query().unwrap_or(""));
         let now = now_secs();
-        let lookup = |akid: &str| {
-            self.control
-                .lookup_access_key(akid)
-                .ok()
-                .flatten()
-                .map(|k| k.secret_key)
-        };
-
-        let auth = if query.iter().any(|(k, _)| k == "X-Amz-Signature") {
-            sigv4::verify_presigned(&method, &self.public_host, &path, &query, lookup, now)
-        } else if let Some(a) = req
+        let is_presigned = query.iter().any(|(k, _)| k == "X-Amz-Signature");
+        let header_auth = req
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-        {
-            let headers = lower_headers(&req);
-            sigv4::verify_header(&method, &self.public_host, &path, &query, &headers, a, lookup, now)
-        } else {
-            Err("anonymous requests are not allowed".to_string())
-        };
+            .map(|s| s.to_string());
+        let headers = lower_headers(&req);
+
+        let mut auth = Err("anonymous requests are not allowed".to_string());
+        for host in self.host_candidates() {
+            let lookup = |akid: &str| {
+                self.control.lookup_access_key(akid).ok().flatten().map(|k| k.secret_key)
+            };
+            auth = if is_presigned {
+                sigv4::verify_presigned(&method, &host, &path, &query, lookup, now)
+            } else if let Some(a) = header_auth.as_deref() {
+                sigv4::verify_header(&method, &host, &path, &query, &headers, a, lookup, now)
+            } else {
+                break; // anonymous: no point trying other hosts
+            };
+            if auth.is_ok() {
+                break;
+            }
+        }
         let access_key_id = match auth {
             Ok(k) => k,
             Err(e) => return s3_access_denied(&e),
@@ -201,16 +393,45 @@ impl ObjectStoreService {
             }
         };
 
-        // --- 3. Gate byte-adding writes against the storage quota. ---
-        let mut write_cap: Option<u64> = None;
+        let quota = self.control.get_quota(&project_id).unwrap_or(DEFAULT_QUOTA);
+
+        // --- 3a. Cap bucket COUNT at create (PUT /{bucket}) via a lock-held reservation. ---
+        let mut bucket_reserved = false;
+        if is_bucket_create(&method, &path) {
+            if let Some(resp) = self.reserve_bucket(&entry, &project_id, &quota).await {
+                return resp;
+            }
+            bucket_reserved = true;
+        }
+
+        // --- 3b. Cap concurrent in-flight multipart uploads (POST ?uploads). ---
+        if is_create_multipart(&method, &query) {
+            // Fail closed: a count-walk error counts as "at cap", not "empty".
+            let inflight = entry
+                .store
+                .count_inflight_uploads(MAX_INFLIGHT_UPLOADS)
+                .await
+                .unwrap_or(MAX_INFLIGHT_UPLOADS);
+            if inflight >= MAX_INFLIGHT_UPLOADS {
+                return s3_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SlowDown",
+                    "too many in-flight multipart uploads; complete or abort some first",
+                );
+            }
+        }
+
+        // --- 3c. Gate byte-adding writes against the storage + object-count caps, NET
+        // of any object being overwritten: a re-PUT of an existing key adds no new
+        // object and only its size DELTA in bytes, so the common "re-PUT same key"
+        // pattern can't false-trip the cap. `reservation` = (reserved_bytes, +object?)
+        // for credit-back; `body_cap` always caps the stream at the FULL declared length
+        // (the unsigned Content-Length) regardless of the net reservation. ---
+        let mut reservation: Option<(u64, bool)> = None;
+        let mut body_cap: Option<u64> = None;
         if is_object_write(&method, &path) {
-            match write_len(&req) {
-                Some(len) => {
-                    if let Some(resp) = self.reserve_quota(&entry, &project_id, len) {
-                        return resp;
-                    }
-                    write_cap = Some(len);
-                }
+            let len = match write_len(&req) {
+                Some(l) => l,
                 None => {
                     return s3_error(
                         StatusCode::LENGTH_REQUIRED,
@@ -218,25 +439,92 @@ impl ObjectStoreService {
                         "object writes require a Content-Length",
                     );
                 }
+            };
+            body_cap = Some(len);
+            if is_upload_part(&query) {
+                // A part adds bytes but is not (yet) a new object.
+                if let Some(resp) = self
+                    .refresh_and_reserve(&entry, &project_id, len, false, &quota)
+                    .await
+                {
+                    return resp;
+                }
+                reservation = Some((len, false));
+            } else {
+                // Plain PUT: reserve only the NET delta vs any existing object at the key.
+                let existing = match object_key(&path) {
+                    Some((b, k)) => entry.store.object_size(b, k).await.ok().flatten(),
+                    None => None,
+                };
+                let adds_object = existing.is_none();
+                let net_bytes = len.saturating_sub(existing.unwrap_or(0));
+                if let Some(resp) = self
+                    .refresh_and_reserve(&entry, &project_id, net_bytes, adds_object, &quota)
+                    .await
+                {
+                    return resp;
+                }
+                reservation = Some((net_bytes, adds_object));
             }
+        } else if is_complete_multipart(&method, &query) {
+            // CompleteMultipart materializes one object (its bytes were counted as
+            // parts); an overwrite of an existing key adds no new object.
+            let adds_object = match object_key(&path) {
+                Some((b, k)) => entry.store.object_size(b, k).await.ok().flatten().is_none(),
+                None => true,
+            };
+            if let Some(resp) = self
+                .refresh_and_reserve(&entry, &project_id, 0, adds_object, &quota)
+                .await
+            {
+                return resp;
+            }
+            reservation = Some((0, adds_object));
         }
 
-        // --- 4. Serve from the project's own store (engine router, already authed). ---
-        // Cap the bytes the engine will write to exactly the reserved amount. The
-        // declared length (Content-Length / x-amz-decoded-content-length) is NOT a
-        // signed SigV4 header and the engine streams to EOF, so without this a client
-        // could reserve 1 byte and stream unbounded data onto the shared disk (which
-        // also holds the control-plane db). Exceeding the cap errors the body
-        // mid-stream, so the engine aborts the write.
-        let req = match write_cap {
-            Some(len) => limit_body(req, len),
-            None => req,
+        // --- 4. Serve from the project's own store. Route on the SAME canonical path
+        // the signature covered (re-encode the verified, pct-decoded path) so a crafted
+        // `%2F` can't sign one key yet route another. Cap the body to the FULL declared
+        // length: it is NOT a signed header and the engine streams to EOF, so without
+        // this a client could declare 1 byte and stream unbounded onto the shared disk.
+        // Exceeding the cap errors the body mid-stream → the engine aborts the write.
+        let req = set_canonical_path(req, &path);
+        let req = match body_cap {
+            Some(len) if len > 0 => limit_body(req, len),
+            _ => req,
         };
         let app = jkbase_objectstore::router(entry.store.clone());
-        match app.oneshot(req).await {
+        let resp = match app.oneshot(req).await {
             Ok(resp) => resp,
             Err(e) => match e {}, // Router error is Infallible
+        };
+
+        // --- 5. Reconcile the reservation against the outcome. ---
+        if let Some((len, had_object)) = reservation
+            && !resp.status().is_success()
+        {
+            // The write didn't land — credit the reservation back immediately.
+            self.release_reservation(&entry, len, had_object);
         }
+        if bucket_reserved && !resp.status().is_success() {
+            self.release_bucket_reservation(&entry);
+        }
+        if method == "DELETE" && path_has_key(&path) && resp.status().is_success() {
+            // A delete (or AbortMultipartUpload) freed space/objects: re-walk on the
+            // next request rather than wait out the TTL.
+            self.invalidate_usage_sample(&entry);
+        }
+        resp
+    }
+
+    /// Host values to try when verifying the signed `host`: the configured public
+    /// host plus the `:443`/`:80` variants some SDKs/CLIs sign.
+    fn host_candidates(&self) -> [String; 3] {
+        [
+            self.public_host.clone(),
+            format!("{}:443", self.public_host),
+            format!("{}:80", self.public_host),
+        ]
     }
 }
 
@@ -266,6 +554,80 @@ fn path_has_key(path: &str) -> bool {
     let mut it = path.trim_start_matches('/').splitn(2, '/');
     let _bucket = it.next();
     it.next().is_some_and(|k| !k.is_empty())
+}
+
+/// Split a decoded object path `/{bucket}/{key}` into its parts (key may contain
+/// `/`). `None` for the bucket-list root or a bucket-only path.
+fn object_key(path: &str) -> Option<(&str, &str)> {
+    let (bucket, key) = path.trim_start_matches('/').split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket, key))
+}
+
+/// A valid project id = the slug the control plane mints (`[a-z0-9-]`, 1..=63). Used
+/// both as the store-root path component (must never be empty → the shared parent)
+/// and to skip junk dirs in the multipart sweeper.
+fn is_valid_project_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 63
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A bucket create = `PUT /{bucket}` with no key segment.
+fn is_bucket_create(method: &str, path: &str) -> bool {
+    method == "PUT" && !path_has_key(path) && path.trim_start_matches('/').split('/').next().is_some_and(|b| !b.is_empty())
+}
+
+/// InitiateMultipartUpload = `POST …?uploads`.
+fn is_create_multipart(method: &str, query: &[(String, String)]) -> bool {
+    method == "POST" && query.iter().any(|(k, _)| k == "uploads")
+}
+
+/// CompleteMultipartUpload = `POST …?uploadId=..` (without `?uploads`).
+fn is_complete_multipart(method: &str, query: &[(String, String)]) -> bool {
+    method == "POST"
+        && query.iter().any(|(k, _)| k == "uploadId")
+        && !query.iter().any(|(k, _)| k == "uploads")
+}
+
+/// UploadPart = a PUT carrying `?uploadId=..&partNumber=..` (bytes, but not a new
+/// object — the object materializes at CompleteMultipartUpload).
+fn is_upload_part(query: &[(String, String)]) -> bool {
+    query.iter().any(|(k, _)| k == "uploadId") && query.iter().any(|(k, _)| k == "partNumber")
+}
+
+/// RFC-3986 path encoding matching the SigV4 canonical form (`uri_encode(path,
+/// encode_slash=false)`): unreserved chars verbatim, `/` preserved, everything else
+/// percent-encoded. Re-encoding the verified (pct-decoded) path with this yields a
+/// URI axum decodes back to exactly that path — so routing matches what was signed.
+fn uri_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b'/' => out.push('/'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Rewrite the request's path to the canonical re-encoding of `decoded_path`
+/// (preserving the raw query), so the engine routes the SAME bucket/key the SigV4
+/// signature was verified over. A no-op for already-canonical requests.
+fn set_canonical_path(req: Request, decoded_path: &str) -> Request {
+    let (mut parts, body) = req.into_parts();
+    let canon = uri_encode_path(decoded_path);
+    let pq = match parts.uri.query() {
+        Some(q) => format!("{canon}?{q}"),
+        None => canon,
+    };
+    if let Ok(uri) = pq.parse::<axum::http::Uri>() {
+        parts.uri = uri;
+    }
+    Request::from_parts(parts, body)
 }
 
 /// Declared body length for a write: `Content-Length`, or the AWS streaming header
@@ -316,13 +678,16 @@ fn pct_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // Decode `%XX` from the RAW BYTES — never slice the &str by byte index, or a
+        // `%` sitting just before a multibyte UTF-8 char would panic on a non-char
+        // boundary (an unauthenticated request hits this before SigV4).
         if b[i] == b'%' && i + 2 < b.len() {
-            match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(h) => {
-                    out.push(h);
+            match (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
                     i += 3;
                 }
-                Err(_) => {
+                _ => {
                     out.push(b'%');
                     i += 1;
                 }
@@ -333,6 +698,15 @@ fn pct_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn xml_escape(s: &str) -> String {
@@ -644,5 +1018,149 @@ mod tests {
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::LENGTH_REQUIRED);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bucket_count_quota_enforced() {
+        let dir = tmp("bktcap");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_buckets = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(body.contains("TooManyBuckets"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn object_count_quota_enforced() {
+        let dir = tmp("objcap");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_objects = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "x")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // A second object exceeds the count cap within the TTL window -> 507.
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("PUT", "/bkt/o2", &a.access_key_id, &a.secret_key, "y")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(body.contains("TooManyObjects"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn object_overwrite_does_not_trip_count_cap() {
+        // Regression for the merge-gate HIGH: a re-PUT of an EXISTING key adds no
+        // object, so it must not false-trip max_objects even at the cap — while a
+        // genuinely new key still does.
+        let dir = tmp("objoverwrite");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_objects = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // First write of the key consumes the 1-object budget.
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "v1")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Overwriting the SAME key (even with a larger body) must still succeed.
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "v2-longer")).await.unwrap().status(),
+            StatusCode::OK,
+            "re-PUT of an existing key must not trip the object-count cap"
+        );
+        // A genuinely new key still trips the cap.
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("PUT", "/bkt/o2", &a.access_key_id, &a.secret_key, "x")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);
+        assert!(body.contains("TooManyObjects"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn signed_host_port_variant_is_accepted() {
+        // A client signing `storage.test:443` (port included) must still verify against
+        // the bare configured host `storage.test`.
+        let dir = tmp("hostport");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        let (auth, amzd) = sigv4::sign_header(
+            "PUT", "storage.test:443", "/bkt", &[], "UNSIGNED-PAYLOAD",
+            &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+        );
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bkt")
+            .header("host", "storage.test:443")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("content-length", "0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pct_decode_is_byte_safe() {
+        // Regression: `pct_decode("%a€")` slices "%a€"[1..3] in the old code, cutting
+        // mid-`€` (a non-char boundary) → panic. The byte-safe decoder must NOT panic
+        // and must treat a `%` before a multibyte char literally. Valid escapes still
+        // decode; incomplete escapes pass through.
+        assert_eq!(pct_decode("/a%2Fb"), "/a/b");
+        assert_eq!(pct_decode("%E2%82%AC"), "€");
+        assert_eq!(pct_decode("%a€"), "%a€"); // % then non-hex multibyte → literal, no panic
+        assert_eq!(pct_decode("%\u{20ac}x"), "%\u{20ac}x");
+        assert_eq!(pct_decode("%zz"), "%zz");
+        assert_eq!(pct_decode("trailing%"), "trailing%");
+        assert_eq!(pct_decode("trailing%4"), "trailing%4");
+    }
+
+    #[test]
+    fn canonical_path_keeps_slashes_and_encodes_the_rest() {
+        // Route-on-same-form: re-encode the verified path so the engine routes exactly
+        // what SigV4 signed. No-op for normal keys; percent-encodes the rest.
+        assert_eq!(uri_encode_path("/bkt/a/b/c.txt"), "/bkt/a/b/c.txt");
+        assert_eq!(uri_encode_path("/bkt/hello world"), "/bkt/hello%20world");
+        assert_eq!(uri_encode_path("/bkt/a+b%"), "/bkt/a%2Bb%25");
     }
 }
