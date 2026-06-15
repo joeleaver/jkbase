@@ -889,6 +889,13 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     if let Ok(entries) = std::fs::read_dir(data_dir.join("data-disks")) {
         for entry in entries.flatten().collect::<Vec<_>>() {
             let name = entry.file_name().to_string_lossy().to_string();
+            // Orphaned atomic-write temp files (`{id}.holder.tmp.{pid}`) left by a crash
+            // mid `write_holder`: always stale (a completed write renames into place), so
+            // reap unconditionally — they carry no live identity to match `registered`.
+            if name.contains(".holder.tmp.") {
+                let _ = std::fs::remove_file(entry.path());
+                continue;
+            }
             let Some(id) = name
                 .strip_suffix(".img")
                 .or_else(|| name.strip_suffix(".holder"))
@@ -1111,7 +1118,28 @@ async fn handle_deploy(
     domain_map: DomainMap,
     shipper: Arc<LogShipper>,
 ) -> Result<()> {
-    let mut plat = platform.lock().await;
+    // Wait out any in-flight wake/hibernate before touching the disk: those drop the
+    // platform lock during the slow VM op while still holding the data-disk lease, so
+    // releasing + re-fencing underneath one would race its cleanup and fail transiently
+    // with LeaseHeld. Mirror handle_teardown's bounded (~30s) wait, then hold the lock.
+    let mut plat = {
+        let mut attempt = 0;
+        loop {
+            let plat = platform.lock().await;
+            if attempt < 150
+                && matches!(
+                    plat.vm_states.get(project_id),
+                    Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
+                )
+            {
+                drop(plat);
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            break plat;
+        }
+    };
 
     // If hibernated, clear stale snapshot
     if plat.vm_states.get(project_id) == Some(&VmLifecycle::Hibernated) {
@@ -1238,8 +1266,18 @@ async fn handle_deploy(
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
     };
-    // If start fails, `disk_guard` drops here and releases the lease + disk.
-    let vm = VmInstance::start(project_id, &config, &runtime_dir).await?;
+    // If start fails, release the fenced disk + lease AWAITED (not via the Drop
+    // backstop) so an immediate re-deploy/re-wake can't race a fire-and-forget cleanup
+    // and fail transiently with LeaseHeld/RwoUnsafe.
+    let vm = match VmInstance::start(project_id, &config, &runtime_dir).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            if let Some(g) = disk_guard {
+                g.release().await;
+            }
+            return Err(e);
+        }
+    };
 
     // Re-acquire to commit the running VM: record Firecracker's PID as the data-disk
     // writer (so a future attach's liveness check tracks the real writer, not this
@@ -1597,57 +1635,71 @@ async fn wake_project_inner(
         None
     };
 
-    // From here, any `?` (restore/start/wait_for_agent failure) drops `disk_guard`,
-    // which releases the lease + detaches the disk — so a failed wake never bricks the
-    // project with a leaked lease.
-    let vm = if let Some(ref meta) = snap_meta {
-        let snap_path = PathBuf::from(&meta.snapshot_path);
-        let mem_path = PathBuf::from(&meta.mem_file_path);
-        if snap_path.exists() && mem_path.exists() {
-            info!(project = %project_id, "restoring from snapshot");
-            match VmInstance::restore_from_snapshot(
-                project_id,
-                &config,
-                &runtime_dir,
-                &snap_path,
-                &mem_path,
-            )
-            .await
-            {
-                Ok(vm) => vm,
-                Err(e) => {
-                    tracing::warn!(project = %project_id, error = %e, "snapshot restore failed, cold booting");
-                    // Clean up the failed restore's Firecracker process and socket
-                    let failed_sock = runtime_dir.join(project_id).join("firecracker.sock");
-                    if failed_sock.exists() {
-                        let _ = tokio::fs::remove_file(&failed_sock).await;
+    // Boot (restore-or-cold) + agent readiness, fenced by `disk_guard`. Any `?` in here
+    // returns into `boot`; on Err we release the fenced disk + lease AWAITED (not via the
+    // Drop backstop) so a re-wake/re-deploy can't race a fire-and-forget cleanup and fail
+    // transiently with LeaseHeld/RwoUnsafe.
+    let boot: Result<VmInstance> = async {
+        let vm = if let Some(ref meta) = snap_meta {
+            let snap_path = PathBuf::from(&meta.snapshot_path);
+            let mem_path = PathBuf::from(&meta.mem_file_path);
+            if snap_path.exists() && mem_path.exists() {
+                info!(project = %project_id, "restoring from snapshot");
+                match VmInstance::restore_from_snapshot(
+                    project_id,
+                    &config,
+                    &runtime_dir,
+                    &snap_path,
+                    &mem_path,
+                )
+                .await
+                {
+                    Ok(vm) => vm,
+                    Err(e) => {
+                        tracing::warn!(project = %project_id, error = %e, "snapshot restore failed, cold booting");
+                        // Clean up the failed restore's Firecracker process and socket
+                        let failed_sock = runtime_dir.join(project_id).join("firecracker.sock");
+                        if failed_sock.exists() {
+                            let _ = tokio::fs::remove_file(&failed_sock).await;
+                        }
+                        // Kill any leftover Firecracker for this project
+                        let _ = tokio::process::Command::new("pkill")
+                            .args(["-f", &format!("firecracker.*{project_id}")])
+                            .status()
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        VmInstance::start(project_id, &config, &runtime_dir).await?
                     }
-                    // Kill any leftover Firecracker for this project
-                    let _ = tokio::process::Command::new("pkill")
-                        .args(["-f", &format!("firecracker.*{project_id}")])
-                        .status()
-                        .await;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    VmInstance::start(project_id, &config, &runtime_dir).await?
                 }
+            } else {
+                info!(project = %project_id, "snapshot files missing, cold booting");
+                VmInstance::start(project_id, &config, &runtime_dir).await?
             }
         } else {
-            info!(project = %project_id, "snapshot files missing, cold booting");
+            info!(project = %project_id, "no snapshot, cold booting");
             VmInstance::start(project_id, &config, &runtime_dir).await?
+        };
+
+        wait_for_agent(&alloc.ip).await?;
+
+        // A restored snapshot resumes with its wall clock frozen at snapshot time, so
+        // it lags by the whole hibernation; a cold boot's tsc clock is undisciplined.
+        // Nudge the agent to re-read its KVM PTP reference and step CLOCK_REALTIME now,
+        // so the first request after wake sees correct time instead of waiting for the
+        // agent's periodic discipline tick. Best-effort — never fail a wake on this.
+        resync_clock_agent(&alloc.ip).await;
+        Ok(vm)
+    }
+    .await;
+    let vm = match boot {
+        Ok(vm) => vm,
+        Err(e) => {
+            if let Some(g) = disk_guard {
+                g.release().await;
+            }
+            return Err(e);
         }
-    } else {
-        info!(project = %project_id, "no snapshot, cold booting");
-        VmInstance::start(project_id, &config, &runtime_dir).await?
     };
-
-    wait_for_agent(&alloc.ip).await?;
-
-    // A restored snapshot resumes with its wall clock frozen at snapshot time, so
-    // it lags by the whole hibernation; a cold boot's tsc clock is undisciplined.
-    // Nudge the agent to re-read its KVM PTP reference and step CLOCK_REALTIME now,
-    // so the first request after wake sees correct time instead of waiting for the
-    // agent's periodic discipline tick. Best-effort — never fail a wake on this.
-    resync_clock_agent(&alloc.ip).await;
 
     let mut plat = platform.lock().await;
 
@@ -1884,6 +1936,12 @@ async fn migrate_legacy_data_disks(dir: &Path) -> Result<()> {
             if !tokio::fs::try_exists(&img).await.unwrap_or(false) {
                 info!(from = %p.display(), to = %img.display(), "migrating legacy data disk to .img");
                 tokio::fs::rename(&p, &img).await?;
+            } else {
+                // Both exist: the loop-managed `.img` is authoritative (storage accounting
+                // and the provider already use it), so the legacy `.ext4` is a dead orphan.
+                // Reap it instead of silently leaving it to leak disk forever.
+                warn!(path = %p.display(), "legacy .ext4 data disk shadowed by an existing .img; reaping the orphan");
+                tokio::fs::remove_file(&p).await?;
             }
         }
     }
@@ -1928,6 +1986,20 @@ impl DiskLeaseGuard {
         self.armed = false;
         self.token.clone()
     }
+
+    /// Failure-path release: detach the disk + release the lease **awaited inline**,
+    /// then disarm so the [`Drop`] backstop no-ops. Call this on every boot error path
+    /// instead of leaning on Drop — Drop can only fire-and-forget (it's sync and can't
+    /// block on a tokio runtime), so a re-fence landing before that spawned task ran
+    /// would hit a transient, self-clearing `LeaseHeld`/`RwoUnsafe`. Awaiting here closes
+    /// that window: the lease + holder are gone before the error returns to the caller.
+    async fn release(mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        release_data_disk(&self.data_disk, &self.lease, &self.project_id, self.token.clone()).await;
+    }
 }
 
 impl Drop for DiskLeaseGuard {
@@ -1935,13 +2007,16 @@ impl Drop for DiskLeaseGuard {
         if !self.armed {
             return;
         }
-        // Release asynchronously. Guard against being dropped outside a runtime (e.g.
-        // during shutdown) so we never panic in Drop; the flock releases on process
-        // exit anyway.
+        // BACKSTOP ONLY. Normal boot-error paths call `release().await` (which awaits the
+        // cleanup before returning); reaching Drop still armed means an unexpected drop —
+        // a panic unwind or a future cancellation. Release fire-and-forget here: Drop is
+        // sync and can't block on the runtime, and guard against being dropped outside a
+        // runtime (e.g. during shutdown) so we never panic in Drop — the flock releases on
+        // process exit anyway.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        warn!(project = %self.project_id, "data-disk boot guard dropped before activation — detaching + releasing lease");
+        warn!(project = %self.project_id, "data-disk boot guard dropped while armed (panic/cancel) — detaching + releasing lease");
         let (dd, ls, id, tok) = (
             self.data_disk.clone(),
             self.lease.clone(),

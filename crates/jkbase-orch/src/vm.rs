@@ -67,6 +67,11 @@ impl VmInstance {
             .arg(&socket_path)
             .stdout(std::process::Stdio::from(log_file))
             .stderr(std::process::Stdio::from(stderr_log))
+            // Backstop: any of the config `?` calls below (machine-config, boot-source,
+            // drives, network, vsock, InstanceStart) can fail after spawn but before the
+            // VmInstance is built — dropping this bare Child. kill_on_drop kills the
+            // Firecracker with it instead of orphaning it. Matches build_vm.rs.
+            .kill_on_drop(true)
             .spawn()
             .context("failed to spawn Firecracker process")?;
 
@@ -282,6 +287,11 @@ impl VmInstance {
             .arg(&socket_path)
             .stdout(std::process::Stdio::from(log_file))
             .stderr(std::process::Stdio::from(stderr_log))
+            // Backstop: if restore fails after spawn but before the VmInstance is built
+            // (load_snapshot / drive-probe / patch_drive / resume_vm error), this bare
+            // Child is dropped — kill_on_drop kills the paused Firecracker with it rather
+            // than orphaning it. Matches build_vm.rs and the cold-boot path.
+            .kill_on_drop(true)
             .spawn()
             .context("failed to spawn Firecracker process")?;
 
@@ -316,6 +326,23 @@ impl VmInstance {
             .await?;
 
         if let Some(data_path) = &config.data_disk_path {
+            // Fail-closed guard: only repoint a `data` drive the snapshot actually
+            // restored. FC v1.15.1 already errors on a PATCH for an absent drive, so this
+            // is upgrade-hardening against a future/looser FC that might instead CREATE
+            // the drive — binding the data disk OUTSIDE the read-write-once fence. Refuse
+            // ONLY on positive evidence (the loaded drive set is reported AND `data` is
+            // genuinely missing). If the set can't be read or comes back empty (an FC that
+            // doesn't surface restored drives via GET /vm/config), fall through to PATCH
+            // and rely on FC's native check — so the normal restore path never regresses.
+            match client.loaded_drive_ids().await {
+                Ok(ids) if !ids.is_empty() && !ids.iter().any(|d| d == "data") => {
+                    anyhow::bail!(
+                        "restore {id}: snapshot has no 'data' drive to repoint (loaded: {ids:?}); \
+                         refusing PATCH to avoid binding the data disk outside the RWO fence"
+                    );
+                }
+                _ => {}
+            }
             info!(id, data = %data_path.display(), "repointing data drive to fenced device");
             client.patch_drive("data", &data_path.to_string_lossy()).await?;
         }
