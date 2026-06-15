@@ -165,6 +165,11 @@ pub fn verify_presigned(
         .ok_or("missing X-Amz-Expires")?
         .parse()
         .map_err(|_| "bad X-Amz-Expires")?;
+    // Bound the lifetime like AWS (max 7 days): an unbounded X-Amz-Expires would mint a
+    // forever-valid bearer grant to the object for anyone who captures the URL.
+    if expires == 0 || expires > 604_800 {
+        return Err("X-Amz-Expires out of range (1..=604800)".into());
+    }
     let provided = get("X-Amz-Signature").ok_or("missing X-Amz-Signature")?;
 
     let parts: Vec<&str> = cred.split('/').collect();
@@ -175,6 +180,11 @@ pub fn verify_presigned(
     let secret = lookup_secret(access_key).ok_or("unknown access key")?;
 
     let signed_at = parse_amz_date(amzd).ok_or("bad X-Amz-Date")?;
+    // Reject a future-dated signature (small skew allowed) so a URL can't be pre-minted
+    // to become "valid from now" for its full lifetime.
+    if signed_at > now_unix.saturating_add(300) {
+        return Err("X-Amz-Date is in the future".into());
+    }
     if now_unix > signed_at.saturating_add(expires) {
         return Err("presigned URL expired".into());
     }
@@ -362,6 +372,22 @@ mod tests {
             }
         }
         assert!(verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW).is_err());
+    }
+
+    #[test]
+    fn presign_rejects_unbounded_expiry_and_future_date() {
+        // Expiry beyond the 7-day cap is rejected even with a valid signature.
+        let url = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 700_000, NOW);
+        let (path, q) = split(&url);
+        assert!(verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW).is_err());
+        // A future-dated signature (signed_at well ahead of now) is rejected.
+        let url2 = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 900, NOW + 100_000);
+        let (path2, q2) = split(&url2);
+        assert!(verify_presigned("GET", "s3.jkbase.app", &path2, &q2, lookup, NOW).is_err());
+        // A normal one still round-trips.
+        let url3 = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 900, NOW);
+        let (path3, q3) = split(&url3);
+        assert!(verify_presigned("GET", "s3.jkbase.app", &path3, &q3, lookup, NOW + 10).is_ok());
     }
 
     #[test]

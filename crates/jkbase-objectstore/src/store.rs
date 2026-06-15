@@ -317,7 +317,9 @@ impl ObjectStore {
         if part_numbers.is_empty() {
             return Err(ObjectError::InvalidArgument("no parts".into()));
         }
-        let dir = self.root.join(bucket);
+        // Re-validate the bucket here too (every other write path goes through
+        // require_bucket); staging() already did, but don't rely on call-order.
+        let dir = self.require_bucket(bucket).await?;
         let hk = hex(key.as_bytes());
         let obj = dir.join(&hk);
         let tmp = dir.join(format!(

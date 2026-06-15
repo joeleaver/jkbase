@@ -140,7 +140,10 @@ async fn serve_http(port: u16, shared: Arc<SharedState>) -> Result<()> {
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
             // with_upgrades(): keep driving the connection after a 101 so a
             // proxied WebSocket (or other Upgrade) can reclaim the raw stream.
+            // header_read_timeout caps slow-header (slowloris) connections.
             if let Err(e) = http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(30))
                 .serve_connection(io, svc)
                 .with_upgrades()
                 .await
@@ -171,6 +174,8 @@ async fn serve_https(port: u16, acceptor: TlsAcceptor, shared: Arc<SharedState>)
             let io = TokioIo::new(tls_stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
             if let Err(e) = http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(30))
                 .serve_connection(io, svc)
                 .with_upgrades()
                 .await
