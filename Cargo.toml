@@ -24,6 +24,7 @@ jkbase-proxy = { path = "crates/jkbase-proxy" }
 jkbase-control = { path = "crates/jkbase-control" }
 jkbase-orch = { path = "crates/jkbase-orch" }
 jkbase-substrate = { path = "crates/jkbase-substrate" }
+jkbase-objectstore = { path = "crates/jkbase-objectstore" }
 jkbuild-types = { path = "crates/jkbuild-types" }
 jkbuild = { path = "crates/jkbuild" }
 
