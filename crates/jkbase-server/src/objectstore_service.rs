@@ -99,11 +99,12 @@ impl ObjectStoreService {
         Ok(entry)
     }
 
-    /// Reserve `len` bytes against the project's storage cap, or return an S3 error
-    /// response. Fail-closed: the reservation is added BEFORE the write, deletes are
-    /// not credited until the next TTL re-walk, and the base re-walk includes the
-    /// just-written bytes — so concurrent writes within a window can't overshoot.
-    fn reserve_quota(&self, entry: &ProjectEntry, project_id: &str, len: u64) -> Result<(), Response> {
+    /// Reserve `len` bytes against the project's storage cap. Returns `Some(error
+    /// response)` if it would exceed the cap, else `None` (reserved). Fail-closed: the
+    /// reservation is added BEFORE the write, deletes are not credited until the next
+    /// TTL re-walk, and the base re-walk includes the just-written bytes — so
+    /// concurrent writes within a window can't overshoot.
+    fn reserve_quota(&self, entry: &ProjectEntry, project_id: &str, len: u64) -> Option<Response> {
         let cap = self
             .control
             .get_quota(project_id)
@@ -117,14 +118,14 @@ impl ObjectStoreService {
         }
         let projected = u.base_bytes.saturating_add(u.reserved).saturating_add(len);
         if projected > cap {
-            return Err(s3_error(
+            return Some(s3_error(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "QuotaExceeded",
                 &format!("storage quota exceeded: would use {projected} bytes, cap is {cap}"),
             ));
         }
         u.reserved = u.reserved.saturating_add(len);
-        Ok(())
+        None
     }
 
     async fn handle(&self, req: Request) -> Response {
@@ -180,7 +181,7 @@ impl ObjectStoreService {
         if is_object_write(&method, &path) {
             match write_len(&req) {
                 Some(len) => {
-                    if let Err(resp) = self.reserve_quota(&entry, &project_id, len) {
+                    if let Some(resp) = self.reserve_quota(&entry, &project_id, len) {
                         return resp;
                     }
                 }

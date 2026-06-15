@@ -1277,7 +1277,7 @@ impl Store {
                 out.push(serde_json::from_slice::<AccessKey>(rec.value())?);
             }
         }
-        out.sort_by(|a, b| a.created_unix.cmp(&b.created_unix));
+        out.sort_by_key(|a| a.created_unix);
         Ok(out)
     }
 
