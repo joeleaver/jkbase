@@ -278,6 +278,14 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
         .route(
+            "/projects/{id}/access-keys",
+            get(list_access_keys).post(issue_access_key),
+        )
+        .route(
+            "/projects/{id}/access-keys/{akid}",
+            axum::routing::delete(revoke_access_key),
+        )
+        .route(
             "/projects/{id}/repo",
             get(get_repo_trigger_status),
         )
@@ -815,6 +823,15 @@ async fn delete_project(
                     // slug can't inherit them — the deploy path injects secrets into the
                     // container env, so a stale secret would leak to a new tenant.
                     let _ = state.store.delete_all_secrets(&id);
+                    // Revoke all object-store access keys + purge the project's
+                    // object-store root, same reasoning as secrets: a recreated
+                    // same-slug project must not inherit a prior tenant's S3
+                    // credentials or stored objects (keys gate cross-tenant access).
+                    let _ = state.store.delete_all_access_keys(&id);
+                    let _ = tokio::fs::remove_dir_all(
+                        data_dir(&state).join("objectstore").join(&id),
+                    )
+                    .await;
                     // Reap the git-push credential + bare repo so a recreated
                     // project of the same slug can't inherit a prior tenant's
                     // token or pushed objects (the auth tenant-check is the
@@ -2615,6 +2632,173 @@ async fn delete_secret(
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!("secret '{key}' not found"),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateAccessKeyRequest {
+    /// Optional human label (e.g. "ci", "backups"). Defaults to empty.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Returned ONCE, at creation — the only time the secret is ever exposed.
+#[derive(Serialize)]
+pub struct AccessKeyCreatedResponse {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub label: String,
+    pub created_unix: u64,
+}
+
+/// Listing view of an access key — the secret is NEVER included.
+#[derive(Serialize)]
+pub struct AccessKeyResponse {
+    pub access_key_id: String,
+    pub label: String,
+    pub created_unix: u64,
+}
+
+/// `POST /projects/{id}/access-keys` — mint an S3 access key for the project's
+/// object store. Owner-scoped. The secret is shown once in the response and is not
+/// retrievable afterwards.
+async fn issue_access_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateAccessKeyRequest>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+
+    // The label is cosmetic, but it's tenant-controlled and shown back in the
+    // console, so keep it short and free of control characters.
+    let label = req.label.trim();
+    if label.len() > 64 || label.bytes().any(|b| b.is_ascii_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "label must be <= 64 chars and contain no control characters".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match state.store.create_access_key(&id, label) {
+        Ok(key) => {
+            info!(project = %id, access_key_id = %key.access_key_id, "object-store access key issued");
+            (
+                StatusCode::CREATED,
+                Json(AccessKeyCreatedResponse {
+                    access_key_id: key.access_key_id,
+                    secret_access_key: key.secret_key,
+                    label: key.label,
+                    created_unix: key.created_unix,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/access-keys` — list the project's access keys (ids + labels,
+/// never secrets). Owner-scoped.
+async fn list_access_keys(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+
+    match state.store.list_access_keys(&id) {
+        Ok(keys) => {
+            let out: Vec<AccessKeyResponse> = keys
+                .into_iter()
+                .map(|k| AccessKeyResponse {
+                    access_key_id: k.access_key_id,
+                    label: k.label,
+                    created_unix: k.created_unix,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /projects/{id}/access-keys/{akid}` — revoke one access key. Owner-scoped
+/// and key-scoped (the store only removes it if it belongs to this project).
+async fn revoke_access_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path((id, akid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response()
+        }
+    }
+
+    match state.store.delete_access_key(&id, &akid) {
+        Ok(true) => {
+            info!(project = %id, access_key_id = %akid, "object-store access key revoked");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("access key '{akid}' not found"),
             }),
         )
             .into_response(),
