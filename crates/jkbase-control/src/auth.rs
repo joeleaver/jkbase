@@ -50,6 +50,32 @@ pub fn generate_git_token() -> String {
     )
 }
 
+/// Mint an S3 access-key id — the PUBLIC identifier a tenant puts in their SDK
+/// config. It travels in the SigV4 `Credential` scope (`{akid}/{date}/...`), which
+/// splits on `/`, so it must stay `/`-free: uppercase hex keeps it `[A-Z0-9]` and
+/// AWS-AKID-shaped (20 chars) for SDK familiarity. 64 bits of entropy — it's only
+/// an identifier, not a secret.
+pub fn generate_access_key_id() -> String {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(20);
+    s.push_str("JKBA");
+    for b in bytes {
+        s.push_str(&format!("{b:02X}"));
+    }
+    s
+}
+
+/// Mint an S3 secret access key (240 bits). Used ONLY as SigV4 HMAC key material —
+/// it never appears in a URL, so URL-safe base64 is for tenant copy/paste ergonomics
+/// rather than correctness. Shown once at creation and stored at rest in the control
+/// db (it must be recoverable to verify signatures, unlike argon2'd passwords).
+pub fn generate_secret_access_key() -> String {
+    let mut bytes = [0u8; 30];
+    OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// SHA-256 (hex) fingerprint of a high-entropy token, used to store and look up
 /// the per-project git-push token WITHOUT keeping the plaintext. A 256-bit random
 /// token makes SHA-256 preimage-resistant (unlike a low-entropy password, which
