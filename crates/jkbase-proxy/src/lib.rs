@@ -86,6 +86,15 @@ pub struct ProxyConfig {
     pub domains: Option<DomainMap>,
     pub activity_tracker: Option<ActivityTracker>,
     pub wake_callback: Option<WakeCallback>,
+    /// TCP port tenant backends listen on (default 80). Configurable so an
+    /// integration test can point `forward_request` at a local echo server.
+    pub backend_port: u16,
+    /// Idle-reap window for a spliced upgrade (WebSocket &c.); see
+    /// [`jkbase_wsproxy::DEFAULT_RELAY_IDLE_TIMEOUT`].
+    pub relay_idle_timeout: Duration,
+    /// Cap on concurrent in-flight relayed upgrades on this (shared) edge — bounds
+    /// the fds + relay tasks a flood of cheap WebSocket holds can pin.
+    pub max_concurrent_upgrades: usize,
 }
 
 struct SharedState {
@@ -96,6 +105,10 @@ struct SharedState {
     domains: Option<DomainMap>,
     activity: Option<ActivityTracker>,
     wake_cb: Option<WakeCallback>,
+    backend_port: u16,
+    relay_idle_timeout: Duration,
+    /// Permits for in-flight relayed upgrades; a relay holds one for its lifetime.
+    relay_permits: Arc<tokio::sync::Semaphore>,
 }
 
 pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
@@ -107,6 +120,9 @@ pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
         domains: config.domains,
         activity: config.activity_tracker,
         wake_cb: config.wake_callback,
+        backend_port: config.backend_port,
+        relay_idle_timeout: config.relay_idle_timeout,
+        relay_permits: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_upgrades)),
     });
 
     if let (Some(https_port), Some(cert_manager)) = (config.https_port, config.cert_manager.clone())
@@ -261,7 +277,7 @@ async fn proxy_request(
     // Route api.{domain} to the control plane (infra, never a tenant project).
     if subdomain.as_deref() == Some("api")
         && let Some(ref addr) = *shared.api_addr {
-            return match forward_to_api(addr, req).await {
+            return match forward_to_api(&shared, addr, req).await {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     error!(error = %e, "API forward failed");
@@ -275,7 +291,7 @@ async fn proxy_request(
     // SigV4 against its configured public host, so the Host rewrite here is harmless.
     if subdomain.as_deref() == Some("storage")
         && let Some(ref addr) = *shared.storage_addr {
-            return match forward_to_api(addr, req).await {
+            return match forward_to_api(&shared, addr, req).await {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
                     error!(error = %e, "object-store forward failed");
@@ -316,7 +332,7 @@ async fn proxy_request(
     };
 
     if let Some(ip) = backend_ip {
-        return match forward_request(&ip, site, req).await {
+        return match forward_request(&shared, &ip, site, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend request failed");
@@ -332,7 +348,7 @@ async fn proxy_request(
 
     info!(project = %project_id, host = %host_key, "waking hibernated project");
     match (cb)(project_id.clone()).await {
-        Ok(ip) => match forward_request(&ip, site, req).await {
+        Ok(ip) => match forward_request(&shared, &ip, site, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend failed after wake");
@@ -391,17 +407,6 @@ fn not_found(project_id: &str) -> Response<ProxyBody> {
         .unwrap()
 }
 
-/// Did the client ask to switch protocols (e.g. a WebSocket handshake)?
-/// `Connection: Upgrade` + an `Upgrade:` token, per RFC 9110 §7.8.
-fn is_upgrade_request(headers: &hyper::HeaderMap) -> bool {
-    let connection_upgrade = headers
-        .get(hyper::header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
-        .unwrap_or(false);
-    connection_upgrade && headers.contains_key(hyper::header::UPGRADE)
-}
-
 /// Drive the backend client connection. When the request may upgrade, the
 /// connection future must run `with_upgrades()` so the raw stream can be
 /// reclaimed from the 101 response; otherwise the plain future is fine.
@@ -424,126 +429,62 @@ fn spawn_backend_conn<B>(
     }
 }
 
-/// If no bytes flow in either direction for this long, a spliced upgrade
-/// (WebSocket, etc.) is torn down. Active traffic — including WebSocket
-/// ping/pong keepalives — resets the timer, so legitimate long-lived
-/// connections are unaffected; only abandoned or deliberately-idle sockets are
-/// reaped. Without this, a peer that completes the handshake and then stalls
-/// would pin two fds plus two relay tasks on the *shared* edge proxy forever.
-const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Splice two upgraded byte streams together, reaping the relay if it goes idle
-/// for [`RELAY_IDLE_TIMEOUT`]. This replaces a bare `copy_bidirectional`, which
-/// only returns once *both* directions close and so never reaps a wedged
-/// half-open connection.
-async fn relay_bidirectional<A, B>(client: A, backend: B)
-where
-    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let (mut client_rd, mut client_wr) = tokio::io::split(client);
-    let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
-    let activity = Arc::new(tokio::sync::Notify::new());
-
-    let to_backend = {
-        let activity = activity.clone();
-        async move {
-            let mut buf = [0u8; 8192];
-            loop {
-                match client_rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if backend_wr.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                        activity.notify_one();
-                    }
-                }
-            }
-            // Propagate the half-close so the other side sees EOF.
-            let _ = backend_wr.shutdown().await;
-        }
-    };
-
-    let to_client = {
-        let activity = activity.clone();
-        async move {
-            let mut buf = [0u8; 8192];
-            loop {
-                match backend_rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if client_wr.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                        activity.notify_one();
-                    }
-                }
-            }
-            let _ = client_wr.shutdown().await;
-        }
-    };
-
-    // The idle watchdog: each loop resets when either pump signals traffic, and
-    // fires only after a full idle window with no activity.
-    let idle = async {
-        loop {
-            tokio::select! {
-                _ = activity.notified() => {}
-                _ = tokio::time::sleep(RELAY_IDLE_TIMEOUT) => break,
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = async { tokio::join!(to_backend, to_client) } => {}
-        _ = idle => info!("upgrade relay idle timeout; closing"),
-    }
-}
-
 /// A backend answered `101 Switching Protocols`. Splice the two upgraded byte
-/// streams together once both ends complete, and return the 101 verbatim so
-/// hyper finishes the client-side switch (it only does this because the
-/// listener runs `serve_connection(...).with_upgrades()`).
+/// streams together (via [`jkbase_wsproxy::spawn_upgrade_relay`], which bounds
+/// concurrency with `relay_permits` and reaps an idle relay after
+/// `relay_idle_timeout`) and return the 101 — with its headers sanitized — so hyper
+/// finishes the client-side switch (only because the listener runs
+/// `serve_connection(...).with_upgrades()`).
 ///
-/// `client_upgrade` is the `OnUpgrade` captured from the inbound request BEFORE
-/// its body was moved into the backend request — capturing it afterward is too
-/// late, the extension is gone.
+/// `client_upgrade` is the `OnUpgrade` captured from the inbound request BEFORE its
+/// body was moved into the backend request. A backend `101` with no client upgrade
+/// becomes `502`; a relay refused by the cap becomes `503`.
 fn relay_upgrade(
     client_upgrade: Option<hyper::upgrade::OnUpgrade>,
     mut backend_resp: Response<hyper::body::Incoming>,
+    shared: &SharedState,
+    strip_hsts: bool,
 ) -> Response<ProxyBody> {
-    let backend_upgrade = hyper::upgrade::on(&mut backend_resp);
-    match client_upgrade {
-        Some(client_upgrade) => {
-            tokio::spawn(async move {
-                match tokio::join!(client_upgrade, backend_upgrade) {
-                    (Ok(client), Ok(backend)) => {
-                        relay_bidirectional(TokioIo::new(client), TokioIo::new(backend)).await;
-                    }
-                    (c, b) => error!(
-                        client_err = ?c.err(),
-                        backend_err = ?b.err(),
-                        "protocol upgrade failed; dropping connection"
-                    ),
-                }
-            });
+    use jkbase_wsproxy::UpgradeOutcome;
+    match jkbase_wsproxy::spawn_upgrade_relay(
+        client_upgrade,
+        &mut backend_resp,
+        shared.relay_idle_timeout,
+        &shared.relay_permits,
+    ) {
+        UpgradeOutcome::Relayed => {}
+        UpgradeOutcome::Unsolicited => {
+            error!("backend sent 101 without a client upgrade request");
+            return bad_gateway();
         }
-        // Backend switched protocols but the client never asked to: nothing to
-        // splice to. Return the 101 anyway; hyper has no upgrade to fulfil.
-        None => error!("backend sent 101 without a client upgrade request"),
+        UpgradeOutcome::CapReached => {
+            error!("in-flight upgrade cap reached; refusing relay");
+            return upgrades_overloaded();
+        }
     }
 
+    let mut headers = backend_resp.headers().clone();
+    // Preserve Connection+Upgrade (they carry the switch); strip the rest.
+    jkbase_wsproxy::sanitize_response_headers(&mut headers, &shared.domain, strip_hsts, true);
     let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
-    for (key, value) in backend_resp.headers() {
+    for (key, value) in &headers {
         builder = builder.header(key, value);
     }
     builder.body(full_body(Bytes::new())).unwrap()
 }
 
+/// 503 for an upgrade refused because the shared edge's in-flight-upgrade cap is full.
+fn upgrades_overloaded() -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("Content-Type", "text/plain")
+        .header("Retry-After", "5")
+        .body(full_body("too many concurrent upgrades, please retry"))
+        .unwrap()
+}
+
 async fn forward_to_api(
+    shared: &SharedState,
     api_addr: &str,
     mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ProxyBody>> {
@@ -554,7 +495,7 @@ async fn forward_to_api(
         .unwrap_or("/");
     let uri = format!("http://{api_addr}{path}");
 
-    let upgrade = is_upgrade_request(req.headers());
+    let upgrade = jkbase_wsproxy::is_upgrade_request(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
 
     let stream = tokio::net::TcpStream::connect(api_addr).await?;
@@ -573,10 +514,15 @@ async fn forward_to_api(
 
     let resp = sender.send_request(proxy_req).await?;
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        return Ok(relay_upgrade(client_upgrade, resp));
+        // Infra hosts (api/storage): keep their HSTS (`strip_hsts = false`).
+        return Ok(relay_upgrade(client_upgrade, resp, shared, false));
     }
     let status = resp.status();
-    let headers = resp.headers().clone();
+    let mut headers = resp.headers().clone();
+    // Drop hop-by-hop + any apex-scoped Set-Cookie even for infra: the platform's own
+    // session cookie must never be apex-scoped (it would leak to every tenant). HSTS
+    // is kept — the console/API legitimately set their transport policy.
+    jkbase_wsproxy::sanitize_response_headers(&mut headers, &shared.domain, false, false);
     // Stream the backend body through instead of buffering it in proxy RAM — an
     // object download (or any large tenant response) must not sit wholly in memory.
     let body = resp.into_body().map_err(std::io::Error::other).boxed();
@@ -589,22 +535,24 @@ async fn forward_to_api(
 }
 
 async fn forward_request(
+    shared: &SharedState,
     backend_ip: &str,
     site: Option<&str>,
     mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ProxyBody>> {
+    let port = shared.backend_port;
     let path_and_query = req
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let uri = format!("http://{}:{}{}", backend_ip, 80, path_and_query);
+    let uri = format!("http://{backend_ip}:{port}{path_and_query}");
 
     // Capture the client-side upgrade future before the body is consumed below.
-    let upgrade = is_upgrade_request(req.headers());
+    let upgrade = jkbase_wsproxy::is_upgrade_request(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let stream = tokio::net::TcpStream::connect(format!("{backend_ip}:80")).await?;
+    let stream = tokio::net::TcpStream::connect(format!("{backend_ip}:{port}")).await?;
     let io = TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     spawn_backend_conn(conn, upgrade);
@@ -624,10 +572,13 @@ async fn forward_request(
 
     let resp = sender.send_request(proxy_req).await?;
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        return Ok(relay_upgrade(client_upgrade, resp));
+        // Tenant backend (untrusted): strip HSTS too — the platform owns transport
+        // policy for `*.{domain}`.
+        return Ok(relay_upgrade(client_upgrade, resp, shared, true));
     }
     let status = resp.status();
-    let headers = resp.headers().clone();
+    let mut headers = resp.headers().clone();
+    jkbase_wsproxy::sanitize_response_headers(&mut headers, &shared.domain, true, false);
     // Stream the backend body through instead of buffering it in proxy RAM — an
     // object download (or any large tenant response) must not sit wholly in memory.
     let body = resp.into_body().map_err(std::io::Error::other).boxed();
@@ -675,54 +626,7 @@ mod tests {
         );
     }
 
-    fn upgrade_headers(connection: Option<&str>, upgrade: Option<&str>) -> hyper::HeaderMap {
-        let mut h = hyper::HeaderMap::new();
-        if let Some(c) = connection {
-            h.insert(hyper::header::CONNECTION, c.parse().unwrap());
-        }
-        if let Some(u) = upgrade {
-            h.insert(hyper::header::UPGRADE, u.parse().unwrap());
-        }
-        h
-    }
-
-    #[test]
-    fn detects_websocket_upgrade() {
-        // Bare `Connection: Upgrade` + an Upgrade header.
-        assert!(is_upgrade_request(&upgrade_headers(
-            Some("Upgrade"),
-            Some("websocket")
-        )));
-        // The comma-list form real browsers send (`keep-alive, Upgrade`).
-        assert!(is_upgrade_request(&upgrade_headers(
-            Some("keep-alive, Upgrade"),
-            Some("websocket")
-        )));
-        // Token match is case-insensitive.
-        assert!(is_upgrade_request(&upgrade_headers(
-            Some("upgrade"),
-            Some("WebSocket")
-        )));
-    }
-
-    #[test]
-    fn rejects_non_upgrade_requests() {
-        // No upgrade signalling at all.
-        assert!(!is_upgrade_request(&upgrade_headers(None, None)));
-        // Connection has the token but the Upgrade header is missing.
-        assert!(!is_upgrade_request(&upgrade_headers(Some("Upgrade"), None)));
-        // Upgrade header present but Connection never lists the token.
-        assert!(!is_upgrade_request(&upgrade_headers(
-            Some("keep-alive"),
-            Some("websocket")
-        )));
-        // Full-token match, not substring: `upgrade-insecure-requests` as a
-        // Connection token must NOT count as an upgrade.
-        assert!(!is_upgrade_request(&upgrade_headers(
-            Some("upgrade-insecure-requests"),
-            Some("websocket")
-        )));
-    }
+    // (is_upgrade_request + header sanitization are tested in `jkbase-wsproxy`.)
 
     // The apex and "www" both map to the "www" landing project's host-key.
     #[test]
