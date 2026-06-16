@@ -1010,6 +1010,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_v2_folder_marker_key_folds_like_s3() {
+        // A key that ENDS in the delimiter (a zero-byte "folder marker", e.g. "dir/")
+        // folds into the common prefix "dir/" at the parent level — it is NOT listed
+        // as an object there. This matches AWS S3 ListObjectsV2 semantics exactly.
+        // Descending into the folder (prefix="dir/") then surfaces the marker object.
+        let dir = root("marker");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("buk").await.unwrap();
+        s.put_object("buk", "dir/", &b""[..], "x", None).await.unwrap();
+        s.put_object("buk", "dir/file", &b"x"[..], "x", None).await.unwrap();
+
+        let root_page = s.list_v2("buk", "", Some("/"), None, 1000).await.unwrap();
+        assert!(root_page.objects.is_empty(), "marker must not list as a root object");
+        assert_eq!(root_page.common_prefixes, vec!["dir/".to_string()]);
+
+        // Inside the folder, the marker object (remainder "" has no delimiter) appears.
+        let sub = s.list_v2("buk", "dir/", Some("/"), None, 1000).await.unwrap();
+        let keys: Vec<_> = sub.objects.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(keys, vec!["dir/".to_string(), "dir/file".to_string()]);
+        assert!(sub.common_prefixes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn list_v2_delimiter_pagination_skips_emitted_folder() {
         // The continuation token can be a FOLDER marker; the next page must skip the
         // whole folder even though its member keys sort after the marker string.

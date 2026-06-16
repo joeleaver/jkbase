@@ -1994,12 +1994,22 @@ body {
     state.revealedAccessKey = null;
     state.showCreateAccessKey = false;
     state.revokeKeyConfirm = null;
-    // Object-browser inline UI state is tab-local too.
+    // Reset the object browser to a fresh bucket list on every tab change so a stale
+    // folder view (or a since-deleted bucket) can't linger when returning to Storage.
     state.showCreateBucket = false;
     state.deleteBucketConfirm = null;
     state.deleteObjectConfirm = null;
     state.objError = null;
+    state.currentBucket = null;
+    state.currentPrefix = "";
+    state.objects = [];
+    state.prefixes = [];
+    state.objToken = null;
     render();
+    // Re-fetch the bucket list when entering Storage so it reflects current state.
+    if (tab === "storage" && state.currentProject) {
+      loadBuckets(state.currentProject.id);
+    }
   }
 
   function loadStatus(projectId) {
@@ -2235,10 +2245,16 @@ body {
     state.objectsLoading = true;
     if (reset) { state.objects = []; state.prefixes = []; state.objToken = null; }
     render();
+    // Capture the view this request belongs to; a response that lands after the user
+    // has navigated to a different bucket/folder must NOT overwrite or append to the
+    // new view (out-of-order responses, stale "Load more").
+    var reqBucket = state.currentBucket;
+    var reqPrefix = state.currentPrefix;
     var path = objBase(projectId) + "/" + encodeURIComponent(state.currentBucket) + "/objects" +
       "?prefix=" + encodeURIComponent(state.currentPrefix) + "&max_keys=200";
     if (!reset && state.objToken) path += "&token=" + encodeURIComponent(state.objToken);
     objApi("GET", path).then(function(d) {
+      if (reqBucket !== state.currentBucket || reqPrefix !== state.currentPrefix) return;
       d = d || {};
       if (reset) {
         state.objects = d.objects || [];
@@ -2251,6 +2267,7 @@ body {
       state.objectsLoading = false;
       render();
     }).catch(function(e) {
+      if (reqBucket !== state.currentBucket || reqPrefix !== state.currentPrefix) return;
       state.objectsLoading = false;
       state.objError = e.message;
       render();
@@ -2262,11 +2279,15 @@ body {
     state.objError = null;
     state.uploadBusy = true;
     render();
-    var key = state.currentPrefix + file.name;
+    // Bind the upload to the bucket/folder it targets, so a refresh after it lands
+    // re-lists the right view even if the user has since navigated elsewhere.
+    var upBucket = state.currentBucket;
+    var upPrefix = state.currentPrefix;
+    var key = upPrefix + file.name;
     var headers = {};
     if (state.token) headers["Authorization"] = "Bearer " + state.token;
     headers["Content-Type"] = file.type || "application/octet-stream";
-    fetch(storageEndpoint() + objBase(projectId) + "/" + encodeURIComponent(state.currentBucket) +
+    fetch(storageEndpoint() + objBase(projectId) + "/" + encodeURIComponent(upBucket) +
       "/object?key=" + encodeURIComponent(key), { method: "PUT", headers: headers, body: file })
       .then(function(res) {
         if (res.status === 401) { logout(); throw new Error("Session expired. Please sign in again."); }
@@ -2276,7 +2297,12 @@ body {
         });
       }).then(function() {
         state.uploadBusy = false;
-        loadObjects(projectId, true);
+        // Only refresh if the user is still viewing the folder we uploaded into.
+        if (upBucket === state.currentBucket && upPrefix === state.currentPrefix) {
+          loadObjects(projectId, true);
+        } else {
+          render();
+        }
       }).catch(function(e) {
         state.uploadBusy = false;
         state.objError = e.message;

@@ -594,8 +594,11 @@ impl ObjectStoreService {
         // Exceeding the cap errors the body mid-stream → the engine aborts the write.
         let req = set_canonical_path(req, &path);
         let req = match body_cap {
-            Some(len) if len > 0 => limit_body(req, len),
-            _ => req,
+            // Cap at the FULL declared length, INCLUDING 0: a write that declares
+            // Content-Length: 0 (reserving nothing) but then streams bytes must be
+            // aborted, not allowed to write unbounded onto the shared disk.
+            Some(len) => limit_body(req, len),
+            None => req,
         };
         let app = jkbase_objectstore::router(entry.store.clone());
         let resp = match app.oneshot(req).await {
@@ -645,6 +648,14 @@ async fn dispatch(State(svc): State<Arc<ObjectStoreService>>, req: Request) -> R
 
 fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// 500 for an unexpected engine error: log the detail server-side, return a generic
+/// body. Avoids echoing internal error strings (e.g. `CorruptMeta(<key>)`, raw IO
+/// errors) back over the wire.
+fn console_internal(op: &str, e: impl std::fmt::Display) -> Response {
+    warn!(op, error = %e, "console object api: internal error");
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
 /// Convert a quota-reservation `Response` (built as S3 XML by the shared helpers)
@@ -703,7 +714,7 @@ async fn console_list_buckets(
                 .collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => console_internal("object api", e),
     }
 }
 
@@ -736,7 +747,7 @@ async fn console_create_bucket(
             StatusCode::BAD_REQUEST,
             "invalid bucket name (3–63 chars: lowercase letters, digits, hyphens)",
         ),
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => console_internal("object api", e),
     }
 }
 
@@ -759,7 +770,7 @@ async fn console_delete_bucket(
         Err(ObjectError::InvalidBucketName(_)) => {
             json_error(StatusCode::BAD_REQUEST, "invalid bucket name")
         }
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => console_internal("object api", e),
     }
 }
 
@@ -807,7 +818,7 @@ async fn console_list_objects(
         Err(ObjectError::InvalidBucketName(_)) => {
             json_error(StatusCode::BAD_REQUEST, "invalid bucket name")
         }
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => console_internal("object api", e),
     }
 }
 
@@ -847,7 +858,7 @@ async fn console_get_object(
         Err(ObjectError::InvalidKey(_)) | Err(ObjectError::InvalidBucketName(_)) => {
             json_error(StatusCode::BAD_REQUEST, "invalid request")
         }
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => console_internal("object api", e),
     }
 }
 
@@ -892,9 +903,11 @@ async fn console_put_object(
     {
         return reservation_json_error(resp);
     }
-    // Cap the body at the declared length: a client must not under-declare and then
-    // stream unbounded onto the shared disk (exceeding the cap aborts the write).
-    let req = if len > 0 { limit_body(req, len) } else { req };
+    // Cap the body at the declared length, INCLUDING 0: a client must not declare a
+    // small (or zero) Content-Length — reserving little or nothing against the byte
+    // quota — and then stream unbounded onto the shared disk. Exceeding the cap
+    // aborts the write; a genuine 0-byte object (empty body) still succeeds.
+    let req = limit_body(req, len);
     let reader = StreamReader::new(req.into_body().into_data_stream().map_err(std::io::Error::other));
     match entry
         .store
@@ -912,7 +925,7 @@ async fn console_put_object(
                 ObjectError::NoSuchBucket(_) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
                 ObjectError::InvalidKey(_) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
                 ObjectError::Timeout(_) => json_error(StatusCode::REQUEST_TIMEOUT, "upload timed out"),
-                _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                _ => console_internal("put_object", e),
             }
         }
     }
@@ -939,7 +952,7 @@ async fn console_delete_object(
         }
         Err(ObjectError::NoSuchBucket(_)) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
         Err(ObjectError::InvalidKey(_)) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
-        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => console_internal("object api", e),
     }
 }
 
@@ -1407,6 +1420,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_zero_length_declared_then_streamed_is_capped() {
+        // SigV4 path: declaring Content-Length: 0 (reserving nothing) then streaming
+        // bytes must be capped by the 0-byte body limit, not written to the disk.
+        let dir = tmp("cl0");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let (auth, amzd) = sigv4::sign_header(
+            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+        );
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bkt/k")
+            .header("host", "storage.test")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("content-length", "0")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let st = app.clone().oneshot(req).await.unwrap().status();
+        assert_ne!(st, StatusCode::OK, "CL:0 + streamed body must not succeed");
+        let (gst, gbody) = status_body(
+            app.clone().oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert!(gst != StatusCode::OK || gbody.is_empty(), "must not store beyond the 0-byte reservation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn write_without_content_length_is_rejected() {
         let dir = tmp("nolen");
         let store = store_at(&dir);
@@ -1641,6 +1691,56 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::NO_CONTENT, "empty bucket deletes");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn console_zero_length_declared_then_streamed_is_capped() {
+        // A console upload that declares Content-Length: 0 (reserving nothing) but
+        // streams bytes must be aborted by the 0-byte body cap — not written
+        // unbounded onto the shared disk. A genuine 0-byte object still succeeds.
+        let dir = tmp("console-cl0");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let tok = mk_tenant_token(&store, "tenant-x");
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        assert_eq!(
+            status_body(app.clone().oneshot(bearer("POST", "/_console/projects/proj/buckets", &tok, "application/json", "{\"name\":\"bkt\"}")).await.unwrap()).await.0,
+            StatusCode::CREATED
+        );
+        // Declare 0 but stream 100 bytes -> aborted (non-2xx), object not stored as 100B.
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/_console/projects/proj/buckets/bkt/object?key=k")
+            .header("authorization", format!("Bearer {tok}"))
+            .header("content-length", "0")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let st = app.clone().oneshot(req).await.unwrap().status();
+        assert_ne!(st, StatusCode::OK, "CL:0 + streamed body must not succeed");
+        let (gst, gbody) = status_body(
+            app.clone()
+                .oneshot(bearer("GET", "/_console/projects/proj/buckets/bkt/object?key=k", &tok, "", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(gst != StatusCode::OK || gbody.is_empty(), "must not store beyond the 0-byte reservation");
+
+        // A genuine empty (0-byte) object still uploads fine.
+        let ok = HttpRequest::builder()
+            .method("PUT")
+            .uri("/_console/projects/proj/buckets/bkt/object?key=empty")
+            .header("authorization", format!("Bearer {tok}"))
+            .header("content-length", "0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK, "empty object should upload");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
