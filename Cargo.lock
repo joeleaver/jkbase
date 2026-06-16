@@ -1752,6 +1752,7 @@ dependencies = [
  "clap",
  "cron",
  "flate2",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1774,8 +1775,10 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "toml 0.8.23",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

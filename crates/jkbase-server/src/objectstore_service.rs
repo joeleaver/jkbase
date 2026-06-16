@@ -18,18 +18,23 @@
 //! it runs as its own local listener that the proxy forwards `storage.{domain}` to.
 
 use axum::{
-    Router,
-    extract::{Request, State},
-    http::{StatusCode, header},
+    Json, Router,
+    body::Body,
+    extract::{Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
+    routing::{delete, get},
 };
+use futures_util::TryStreamExt;
 use jkbase_control::store::{DEFAULT_QUOTA, QuotaLimits, Store};
-use jkbase_objectstore::{ObjectStore, sigv4};
+use jkbase_objectstore::{ObjectError, ObjectStore, sigv4};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio_util::io::{ReaderStream, StreamReader};
 use tower::ServiceExt; // oneshot
+use tower_http::cors::CorsLayer;
 use tracing::warn;
 
 /// How often a project's authoritative on-disk footprint is re-walked. Between
@@ -88,7 +93,106 @@ impl ObjectStoreService {
     /// The axum app: a single fallback that authenticates, resolves the project,
     /// gates writes, and dispatches into the per-project engine router.
     pub fn into_router(self: Arc<Self>) -> Router {
-        Router::new().fallback(dispatch).with_state(self)
+        // The Bearer-authenticated CONSOLE object API (`/_console/*`) lives on this same
+        // service — the only component allowed to touch a tenant's store (the control
+        // plane must not, per the no-S3-for-control-plane rule). It reuses this service's
+        // per-project isolation + quota machinery; auth is the session Bearer token, not
+        // SigV4, so no tenant secret ever reaches the browser. CORS is scoped to the
+        // console sub-router only — the S3 fallback gets no CORS headers. The `_console`
+        // path can't collide with a bucket (underscore is illegal in bucket names).
+        let cors = self.console_cors();
+        let console = Router::new()
+            .route(
+                "/_console/projects/{id}/buckets",
+                get(console_list_buckets).post(console_create_bucket),
+            )
+            .route(
+                "/_console/projects/{id}/buckets/{bucket}",
+                delete(console_delete_bucket),
+            )
+            .route(
+                "/_console/projects/{id}/buckets/{bucket}/objects",
+                get(console_list_objects),
+            )
+            .route(
+                "/_console/projects/{id}/buckets/{bucket}/object",
+                get(console_get_object)
+                    .put(console_put_object)
+                    .delete(console_delete_object),
+            )
+            .layer(cors);
+        Router::new().merge(console).fallback(dispatch).with_state(self)
+    }
+
+    /// CORS for the Bearer console API: allow the platform's console origins (mirrors
+    /// the control plane's allowlist) to call the `_console/*` object endpoints with
+    /// the session Bearer token. The token rides the `Authorization` header (not a
+    /// cookie), so no credentialed-CORS is needed.
+    fn console_cors(&self) -> CorsLayer {
+        let domain = self
+            .public_host
+            .strip_prefix("storage.")
+            .unwrap_or(&self.public_host);
+        let origins = [
+            format!("https://console.{domain}"),
+            format!("https://{domain}"),
+            format!("https://www.{domain}"),
+            "http://localhost:3000".to_string(),
+        ];
+        let allow: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+        CorsLayer::new()
+            .allow_origin(allow)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+            .max_age(Duration::from_secs(86400))
+    }
+
+    /// Authenticate a console (Bearer) request and resolve the OWNED project's store.
+    /// Mirrors the SigV4 path's owner re-check and fails closed: a bad/absent token is
+    /// 401; a project that is absent OR owned by a different tenant is 404 (never 403),
+    /// so the API can't be used to probe another tenant's project ids. Returns the
+    /// project's store entry, or a JSON error `Response` to return verbatim.
+    // The Err is a ready-to-return `Response` (the file's pattern for fail-closed
+    // handler helpers); boxing it would only churn the 7 call sites.
+    #[allow(clippy::result_large_err)]
+    fn console_auth(
+        &self,
+        headers: &HeaderMap,
+        project_id: &str,
+    ) -> std::result::Result<Arc<ProjectEntry>, Response> {
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+        let tenant = match self.control.authenticate(token) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Err(json_error(StatusCode::UNAUTHORIZED, "invalid token")),
+            Err(e) => {
+                warn!(error = %e, "console: authenticate failed");
+                return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "auth unavailable"));
+            }
+        };
+        match self.control.get_project(project_id) {
+            Ok(Some(p)) if p.tenant_id.as_deref() == Some(tenant.id.as_str()) => {}
+            Ok(_) => return Err(json_error(StatusCode::NOT_FOUND, "project not found")),
+            Err(e) => {
+                warn!(error = %e, "console: get_project failed");
+                return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"));
+            }
+        }
+        self.project_entry(project_id).map_err(|e| {
+            warn!(project = %project_id, error = %e, "console: object store open failed");
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "object store unavailable")
+        })
     }
 
     /// Get-or-open the per-project entry. Opening creates `{data_dir}/objectstore/{id}`
@@ -490,8 +594,11 @@ impl ObjectStoreService {
         // Exceeding the cap errors the body mid-stream → the engine aborts the write.
         let req = set_canonical_path(req, &path);
         let req = match body_cap {
-            Some(len) if len > 0 => limit_body(req, len),
-            _ => req,
+            // Cap at the FULL declared length, INCLUDING 0: a write that declares
+            // Content-Length: 0 (reserving nothing) but then streams bytes must be
+            // aborted, not allowed to write unbounded onto the shared disk.
+            Some(len) => limit_body(req, len),
+            None => req,
         };
         let app = jkbase_objectstore::router(entry.store.clone());
         let resp = match app.oneshot(req).await {
@@ -530,6 +637,323 @@ impl ObjectStoreService {
 
 async fn dispatch(State(svc): State<Arc<ObjectStoreService>>, req: Request) -> Response {
     svc.handle(req).await
+}
+
+// ============================================================================
+// Console object API (`/_console/*`) — Bearer-authenticated, owner-scoped, JSON.
+// Reuses this service's per-project store isolation + quota machinery; the control
+// plane never touches the store. Errors are JSON (`{"error": ...}`) to match the
+// control plane's shape so the console's `api()` helper reads them uniformly.
+// ============================================================================
+
+fn json_error(status: StatusCode, msg: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+}
+
+/// 500 for an unexpected engine error: log the detail server-side, return a generic
+/// body. Avoids echoing internal error strings (e.g. `CorruptMeta(<key>)`, raw IO
+/// errors) back over the wire.
+fn console_internal(op: &str, e: impl std::fmt::Display) -> Response {
+    warn!(op, error = %e, "console object api: internal error");
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+/// Convert a quota-reservation `Response` (built as S3 XML by the shared helpers)
+/// into the console's JSON error shape, preserving the status.
+fn reservation_json_error(resp: Response) -> Response {
+    let status = resp.status();
+    let msg = match status {
+        StatusCode::CONFLICT => "bucket quota exceeded",
+        StatusCode::INSUFFICIENT_STORAGE => "storage or object-count quota exceeded",
+        _ => "quota check temporarily unavailable",
+    };
+    json_error(status, msg)
+}
+
+/// Reduce an object key to a safe `Content-Disposition` filename: basename only,
+/// with anything outside a conservative allowlist replaced by `_`, so a crafted key
+/// can never inject CR/LF or quotes into the response header.
+fn sanitize_filename(key: &str) -> String {
+    let base = key.rsplit('/').next().unwrap_or(key);
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '(' | ')') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "download".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CreateBucketReq {
+    name: String,
+}
+
+async fn console_list_buckets(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let entry = match svc.console_auth(&headers, &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    match entry.store.list_buckets().await {
+        Ok(buckets) => Json(serde_json::json!({
+            "buckets": buckets.into_iter()
+                .map(|name| serde_json::json!({ "name": name }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => console_internal("object api", e),
+    }
+}
+
+async fn console_create_bucket(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<CreateBucketReq>,
+) -> Response {
+    let entry = match svc.console_auth(&headers, &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let name = req.name.trim().to_string();
+    let quota = svc.control.get_quota(&id).unwrap_or(DEFAULT_QUOTA);
+    // Reserve the bucket slot under the per-project lock (closes the create race).
+    if let Some(resp) = svc.reserve_bucket(&entry, &id, &quota).await {
+        return reservation_json_error(resp);
+    }
+    let res = entry.store.create_bucket(&name).await;
+    if res.is_err() {
+        svc.release_bucket_reservation(&entry);
+    }
+    match res {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "name": name }))).into_response(),
+        Err(ObjectError::BucketAlreadyExists(_)) => {
+            json_error(StatusCode::CONFLICT, "bucket already exists")
+        }
+        Err(ObjectError::InvalidBucketName(_)) => json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid bucket name (3–63 chars: lowercase letters, digits, hyphens)",
+        ),
+        Err(e) => console_internal("object api", e),
+    }
+}
+
+async fn console_delete_bucket(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path((id, bucket)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let entry = match svc.console_auth(&headers, &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    match entry.store.delete_bucket(&bucket).await {
+        Ok(()) => {
+            svc.invalidate_usage_sample(&entry); // a freed bucket: re-walk next request
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(ObjectError::BucketNotEmpty(_)) => json_error(StatusCode::CONFLICT, "bucket not empty"),
+        Err(ObjectError::NoSuchBucket(_)) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
+        Err(ObjectError::InvalidBucketName(_)) => {
+            json_error(StatusCode::BAD_REQUEST, "invalid bucket name")
+        }
+        Err(e) => console_internal("object api", e),
+    }
+}
+
+async fn console_list_objects(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path((id, bucket)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let entry = match svc.console_auth(&headers, &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
+    // Default to folder-style "/" folding; an explicit empty delimiter means "flat".
+    let delim = q.get("delimiter").map(String::as_str).unwrap_or("/");
+    let delimiter = if delim.is_empty() { None } else { Some(delim) };
+    let token = q
+        .get("token")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    let max_keys = q
+        .get("max_keys")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100);
+    match entry
+        .store
+        .list_v2(&bucket, prefix, delimiter, token, max_keys)
+        .await
+    {
+        Ok(page) => Json(serde_json::json!({
+            "prefixes": page.common_prefixes,
+            "objects": page.objects.iter().map(|m| serde_json::json!({
+                "key": m.key,
+                "size": m.size,
+                "etag": m.etag,
+                "content_type": m.content_type,
+                "last_modified": m.last_modified,
+            })).collect::<Vec<_>>(),
+            "is_truncated": page.is_truncated,
+            "next_token": page.next_continuation_token,
+        }))
+        .into_response(),
+        Err(ObjectError::NoSuchBucket(_)) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
+        Err(ObjectError::InvalidBucketName(_)) => {
+            json_error(StatusCode::BAD_REQUEST, "invalid bucket name")
+        }
+        Err(e) => console_internal("object api", e),
+    }
+}
+
+async fn console_get_object(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path((id, bucket)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let entry = match svc.console_auth(&headers, &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let key = match q.get("key").map(String::as_str).filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => return json_error(StatusCode::BAD_REQUEST, "missing key"),
+    };
+    let download = matches!(q.get("download").map(String::as_str), Some("1") | Some("true"));
+    match entry.store.get_object(&bucket, key).await {
+        Ok((meta, file)) => {
+            let disp = if download {
+                format!("attachment; filename=\"{}\"", sanitize_filename(key))
+            } else {
+                "inline".to_string()
+            };
+            let parts: [(header::HeaderName, String); 4] = [
+                (header::CONTENT_TYPE, meta.content_type.clone()),
+                (header::CONTENT_LENGTH, meta.size.to_string()),
+                (header::ETAG, format!("\"{}\"", meta.etag)),
+                (header::CONTENT_DISPOSITION, disp),
+            ];
+            (parts, Body::from_stream(ReaderStream::new(file))).into_response()
+        }
+        Err(ObjectError::NoSuchKey(_)) | Err(ObjectError::NoSuchBucket(_)) => {
+            json_error(StatusCode::NOT_FOUND, "not found")
+        }
+        Err(ObjectError::InvalidKey(_)) | Err(ObjectError::InvalidBucketName(_)) => {
+            json_error(StatusCode::BAD_REQUEST, "invalid request")
+        }
+        Err(e) => console_internal("object api", e),
+    }
+}
+
+async fn console_put_object(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path((id, bucket)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    let entry = match svc.console_auth(req.headers(), &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let key = match parse_query(req.uri().query().unwrap_or(""))
+        .into_iter()
+        .find(|(k, _)| k == "key")
+        .map(|(_, v)| v)
+        .filter(|s| !s.is_empty())
+    {
+        Some(k) => k,
+        None => return json_error(StatusCode::BAD_REQUEST, "missing key"),
+    };
+    // A declared length is required to gate the byte quota AND cap the streamed body.
+    let len = match write_len(&req) {
+        Some(l) => l,
+        None => return json_error(StatusCode::LENGTH_REQUIRED, "upload requires a Content-Length"),
+    };
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let quota = svc.control.get_quota(&id).unwrap_or(DEFAULT_QUOTA);
+    // Reserve only the NET delta vs any object already at this key (a re-upload adds
+    // no new object and only its size delta), mirroring the SigV4 write path.
+    let existing = entry.store.object_size(&bucket, &key).await.ok().flatten();
+    let adds_object = existing.is_none();
+    let net_bytes = len.saturating_sub(existing.unwrap_or(0));
+    if let Some(resp) = svc
+        .refresh_and_reserve(&entry, &id, net_bytes, adds_object, &quota)
+        .await
+    {
+        return reservation_json_error(resp);
+    }
+    // Cap the body at the declared length, INCLUDING 0: a client must not declare a
+    // small (or zero) Content-Length — reserving little or nothing against the byte
+    // quota — and then stream unbounded onto the shared disk. Exceeding the cap
+    // aborts the write; a genuine 0-byte object (empty body) still succeeds.
+    let req = limit_body(req, len);
+    let reader = StreamReader::new(req.into_body().into_data_stream().map_err(std::io::Error::other));
+    match entry
+        .store
+        .put_object(&bucket, &key, reader, &content_type, None)
+        .await
+    {
+        Ok(meta) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "key": meta.key, "size": meta.size, "etag": meta.etag })),
+        )
+            .into_response(),
+        Err(e) => {
+            svc.release_reservation(&entry, net_bytes, adds_object);
+            match e {
+                ObjectError::NoSuchBucket(_) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
+                ObjectError::InvalidKey(_) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
+                ObjectError::Timeout(_) => json_error(StatusCode::REQUEST_TIMEOUT, "upload timed out"),
+                _ => console_internal("put_object", e),
+            }
+        }
+    }
+}
+
+async fn console_delete_object(
+    State(svc): State<Arc<ObjectStoreService>>,
+    Path((id, bucket)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let entry = match svc.console_auth(&headers, &id) {
+        Ok(e) => e,
+        Err(r) => return r,
+    };
+    let key = match q.get("key").map(String::as_str).filter(|s| !s.is_empty()) {
+        Some(k) => k,
+        None => return json_error(StatusCode::BAD_REQUEST, "missing key"),
+    };
+    match entry.store.delete_object(&bucket, key).await {
+        Ok(()) => {
+            svc.invalidate_usage_sample(&entry); // freed space/object: re-walk next request
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(ObjectError::NoSuchBucket(_)) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
+        Err(ObjectError::InvalidKey(_)) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
+        Err(e) => console_internal("object api", e),
+    }
 }
 
 /// Replace the request body with one hard-capped at `max` bytes. Reading past `max`
@@ -800,6 +1224,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// On-box e2e of the Bearer CONSOLE object API over real TCP/HTTP. Proves the
+    /// whole stack the browser drives: CORS preflight, Bearer auth, bucket create,
+    /// streamed upload, delimiter folder listing + pagination, authenticated
+    /// download (Content-Disposition), delete, and cross-tenant 404. `#[ignore]`
+    /// because it binds a port; run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn console_e2e_over_real_http() {
+        let dir = tmp("console-e2e");
+        let store = store_at(&dir);
+        mk_project(&store, "proj-a", "tenant-a");
+        mk_project(&store, "proj-b", "tenant-b");
+        let tok_a = mk_tenant_token(&store, "tenant-a");
+        let tok_b = mk_tenant_token(&store, "tenant-b");
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.jkbase.app".to_string(), // -> console origin https://console.jkbase.app
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, svc.into_router()).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let c = reqwest::Client::new();
+        let bget = |p: String, t: String| {
+            let c = c.clone();
+            let base = base.clone();
+            async move { c.get(format!("{base}{p}")).bearer_auth(t).send().await.unwrap() }
+        };
+
+        // CORS preflight from the console origin is allowed + echoes the origin.
+        let pre = c
+            .request(reqwest::Method::OPTIONS, format!("{base}/_console/projects/proj-a/buckets"))
+            .header("origin", "https://console.jkbase.app")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization,content-type")
+            .send()
+            .await
+            .unwrap();
+        assert!(pre.status().is_success(), "preflight status {}", pre.status());
+        assert_eq!(
+            pre.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            Some("https://console.jkbase.app"),
+            "CORS must allow the console origin"
+        );
+
+        // No token -> 401.
+        let r = c.get(format!("{base}/_console/projects/proj-a/buckets")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+
+        // Create a bucket.
+        let r = c
+            .post(format!("{base}/_console/projects/proj-a/buckets"))
+            .bearer_auth(&tok_a)
+            .json(&serde_json::json!({ "name": "docs" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "create bucket");
+
+        // Streamed uploads: two under "a/", one at the root.
+        for (key, body) in [("a/1.txt", "hello"), ("a/2.txt", "world"), ("readme.txt", "top")] {
+            let r = c
+                .put(format!("{base}/_console/projects/proj-a/buckets/docs/object?key={key}"))
+                .bearer_auth(&tok_a)
+                .header("content-type", "text/plain")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200, "upload {key}");
+        }
+
+        // Bucket list reflects the new bucket.
+        let buckets = bget("/_console/projects/proj-a/buckets".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(buckets["buckets"][0]["name"], "docs");
+
+        // Folder listing at root: folder "a/" folded, "readme.txt" listed.
+        let root = bget("/_console/projects/proj-a/buckets/docs/objects".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(root["prefixes"][0], "a/");
+        assert_eq!(root["objects"][0]["key"], "readme.txt");
+
+        // Pagination over "a/": max_keys=1 -> truncated, token "a/1.txt".
+        let p1 = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(p1["is_truncated"], true);
+        assert_eq!(p1["next_token"], "a/1.txt");
+        let p2 = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1&token=a%2F1.txt".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(p2["objects"][0]["key"], "a/2.txt");
+
+        // Authenticated download with attachment disposition + body round-trip.
+        let dl = bget("/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt&download=1".into(), tok_a.clone()).await;
+        assert_eq!(dl.status().as_u16(), 200);
+        let cd = dl.headers().get("content-disposition").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        assert!(cd.starts_with("attachment") && cd.contains("1.txt"), "disposition: {cd}");
+        assert_eq!(dl.text().await.unwrap(), "hello");
+
+        // Cross-tenant: tenant-b's valid token must 404 on proj-a.
+        let x = bget("/_console/projects/proj-a/buckets".into(), tok_b.clone()).await;
+        assert_eq!(x.status().as_u16(), 404, "cross-tenant must 404");
+
+        // Delete an object, then it's gone.
+        let d = c.delete(format!("{base}/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt")).bearer_auth(&tok_a).send().await.unwrap();
+        assert_eq!(d.status().as_u16(), 204);
+        let after = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        let keys: Vec<String> = after["objects"].as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap().to_string()).collect();
+        assert_eq!(keys, vec!["a/2.txt".to_string()], "deleted object gone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("jkb-objsvc-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -996,6 +1532,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signed_zero_length_declared_then_streamed_is_capped() {
+        // SigV4 path: declaring Content-Length: 0 (reserving nothing) then streaming
+        // bytes must be capped by the 0-byte body limit, not written to the disk.
+        let dir = tmp("cl0");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let (auth, amzd) = sigv4::sign_header(
+            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+        );
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bkt/k")
+            .header("host", "storage.test")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("content-length", "0")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let st = app.clone().oneshot(req).await.unwrap().status();
+        assert_ne!(st, StatusCode::OK, "CL:0 + streamed body must not succeed");
+        let (gst, gbody) = status_body(
+            app.clone().oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert!(gst != StatusCode::OK || gbody.is_empty(), "must not store beyond the 0-byte reservation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn write_without_content_length_is_rejected() {
         let dir = tmp("nolen");
         let store = store_at(&dir);
@@ -1017,6 +1590,314 @@ mod tests {
             .body(Body::from("data"))
             .unwrap();
         assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::LENGTH_REQUIRED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- console (Bearer) object API ---------------------------------------
+
+    /// Create a tenant + a session API token; returns the raw bearer token string.
+    fn mk_tenant_token(store: &Store, tenant_id: &str) -> String {
+        use jkbase_control::auth::{self, ApiToken, Tenant};
+        store
+            .create_tenant(&Tenant {
+                id: tenant_id.to_string(),
+                email: format!("{tenant_id}@test"),
+                password_hash: None,
+                created_at: 0,
+            })
+            .unwrap();
+        let raw = format!("tok-{tenant_id}-secret");
+        store
+            .save_api_token(&ApiToken {
+                id: format!("tid-{tenant_id}"),
+                tenant_id: tenant_id.to_string(),
+                name: "console".to_string(),
+                token_hash: auth::hash_token(&raw).unwrap(),
+                created_at: 0,
+            })
+            .unwrap();
+        raw
+    }
+
+    fn bearer(method: &str, path: &str, token: &str, ct: &str, body: &str) -> Request {
+        HttpRequest::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", ct)
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn console_browser_round_trip_pagination_and_isolation() {
+        let dir = tmp("console");
+        let store = store_at(&dir);
+        mk_project(&store, "proj-a", "tenant-a");
+        mk_project(&store, "proj-b", "tenant-b");
+        let tok_a = mk_tenant_token(&store, "tenant-a");
+        let tok_b = mk_tenant_token(&store, "tenant-b");
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        let go = |req: Request| {
+            let app = app.clone();
+            async move { status_body(app.oneshot(req).await.unwrap()).await }
+        };
+
+        // No token -> 401.
+        let (st, _) = status_body(
+            app.clone()
+                .oneshot(
+                    HttpRequest::get("/_console/projects/proj-a/buckets")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // Bad bucket name -> 400 (and quota slot is released, not leaked).
+        let (st, _) = go(bearer(
+            "POST",
+            "/_console/projects/proj-a/buckets",
+            &tok_a,
+            "application/json",
+            "{\"name\":\"AB\"}",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // Create bucket "docs".
+        let (st, _) = go(bearer(
+            "POST",
+            "/_console/projects/proj-a/buckets",
+            &tok_a,
+            "application/json",
+            "{\"name\":\"docs\"}",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        // Upload three objects: two under folder "a/", one at the root.
+        for (key, body) in [("a/1.txt", "hello"), ("a/2.txt", "world"), ("readme.txt", "top")] {
+            let (st, _) = go(bearer(
+                "PUT",
+                &format!("/_console/projects/proj-a/buckets/docs/object?key={key}"),
+                &tok_a,
+                "text/plain",
+                body,
+            ))
+            .await;
+            assert_eq!(st, StatusCode::OK, "upload {key}");
+        }
+
+        // List root with delimiter "/" -> folder "a/" folded, "readme.txt" listed.
+        let (st, body) = go(bearer(
+            "GET",
+            "/_console/projects/proj-a/buckets/docs/objects",
+            &tok_a,
+            "",
+            "",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body.contains("\"a/\""), "prefixes should hold a/: {body}");
+        assert!(body.contains("readme.txt"), "objects should hold readme.txt: {body}");
+        assert!(!body.contains("a/1.txt"), "nested keys must be folded, not listed: {body}");
+
+        // Descend into "a/" -> its two members, no sub-folders.
+        let (st, body) = go(bearer(
+            "GET",
+            "/_console/projects/proj-a/buckets/docs/objects?prefix=a/",
+            &tok_a,
+            "",
+            "",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body.contains("a/1.txt") && body.contains("a/2.txt"), "{body}");
+
+        // Pagination: max_keys=1 over "a/" pages cleanly via next_token.
+        let (st, body) = go(bearer(
+            "GET",
+            "/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1",
+            &tok_a,
+            "",
+            "",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body.contains("\"is_truncated\":true"), "{body}");
+        assert!(body.contains("\"next_token\":\"a/1.txt\""), "{body}");
+
+        // Download an object (content round-trips; Content-Disposition is attachment).
+        let resp = app
+            .clone()
+            .oneshot(bearer(
+                "GET",
+                "/_console/projects/proj-a/buckets/docs/object?key=a/1.txt&download=1",
+                &tok_a,
+                "",
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cd = resp
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(cd.starts_with("attachment") && cd.contains("1.txt"), "cd: {cd}");
+        let (_, dl) = status_body(resp).await;
+        assert_eq!(dl, "hello");
+
+        // Cross-tenant: tenant-b's valid token must NOT reach proj-a (404, not 403).
+        let (st, _) = go(bearer(
+            "GET",
+            "/_console/projects/proj-a/buckets",
+            &tok_b,
+            "",
+            "",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "cross-tenant access must 404");
+
+        // Delete is gated + bucket-non-empty is refused, then cleanup succeeds.
+        let (st, _) = go(bearer(
+            "DELETE",
+            "/_console/projects/proj-a/buckets/docs",
+            &tok_a,
+            "",
+            "",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "non-empty bucket delete must 409");
+
+        for key in ["a/1.txt", "a/2.txt", "readme.txt"] {
+            let (st, _) = go(bearer(
+                "DELETE",
+                &format!("/_console/projects/proj-a/buckets/docs/object?key={key}"),
+                &tok_a,
+                "",
+                "",
+            ))
+            .await;
+            assert_eq!(st, StatusCode::NO_CONTENT, "delete {key}");
+        }
+        let (st, _) = go(bearer(
+            "DELETE",
+            "/_console/projects/proj-a/buckets/docs",
+            &tok_a,
+            "",
+            "",
+        ))
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT, "empty bucket deletes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn console_zero_length_declared_then_streamed_is_capped() {
+        // A console upload that declares Content-Length: 0 (reserving nothing) but
+        // streams bytes must be aborted by the 0-byte body cap — not written
+        // unbounded onto the shared disk. A genuine 0-byte object still succeeds.
+        let dir = tmp("console-cl0");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let tok = mk_tenant_token(&store, "tenant-x");
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        assert_eq!(
+            status_body(app.clone().oneshot(bearer("POST", "/_console/projects/proj/buckets", &tok, "application/json", "{\"name\":\"bkt\"}")).await.unwrap()).await.0,
+            StatusCode::CREATED
+        );
+        // Declare 0 but stream 100 bytes -> aborted (non-2xx), object not stored as 100B.
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/_console/projects/proj/buckets/bkt/object?key=k")
+            .header("authorization", format!("Bearer {tok}"))
+            .header("content-length", "0")
+            .body(Body::from("x".repeat(100)))
+            .unwrap();
+        let st = app.clone().oneshot(req).await.unwrap().status();
+        assert_ne!(st, StatusCode::OK, "CL:0 + streamed body must not succeed");
+        let (gst, gbody) = status_body(
+            app.clone()
+                .oneshot(bearer("GET", "/_console/projects/proj/buckets/bkt/object?key=k", &tok, "", ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(gst != StatusCode::OK || gbody.is_empty(), "must not store beyond the 0-byte reservation");
+
+        // A genuine empty (0-byte) object still uploads fine.
+        let ok = HttpRequest::builder()
+            .method("PUT")
+            .uri("/_console/projects/proj/buckets/bkt/object?key=empty")
+            .header("authorization", format!("Bearer {tok}"))
+            .header("content-length", "0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK, "empty object should upload");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn console_put_without_content_length_is_rejected() {
+        // The byte-quota gate needs a declared length; a console upload without one
+        // must 411 (can't dodge the cap), mirroring the SigV4 path.
+        let dir = tmp("console-nolen");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let tok = mk_tenant_token(&store, "tenant-x");
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        // Pre-create the bucket so we reach the length check, not a 404.
+        assert_eq!(
+            status_body(
+                app.clone()
+                    .oneshot(bearer(
+                        "POST",
+                        "/_console/projects/proj/buckets",
+                        &tok,
+                        "application/json",
+                        "{\"name\":\"bkt\"}"
+                    ))
+                    .await
+                    .unwrap()
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/_console/projects/proj/buckets/bkt/object?key=k")
+            .header("authorization", format!("Bearer {tok}"))
+            .body(Body::from("data"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::LENGTH_REQUIRED
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

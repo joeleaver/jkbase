@@ -38,6 +38,9 @@ chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
