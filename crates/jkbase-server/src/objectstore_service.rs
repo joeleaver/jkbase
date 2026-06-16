@@ -39,9 +39,12 @@ use tracing::warn;
 
 /// How often a project's authoritative on-disk footprint is re-walked. Between
 /// refreshes, write reservations accumulate so the cap holds within the window;
-/// short enough that deleted space frees quickly, long enough to keep the dir-walk
-/// off the per-request hot path (and out of reach as an O(n²) amplifier).
-const QUOTA_TTL: Duration = Duration::from_secs(10);
+/// short enough that deleted space frees quickly AND that the documented soft-cap
+/// overshoot window (a tenant's own concurrent writes racing a re-walk) stays small,
+/// long enough to keep the dir-walk off the per-request hot path (and out of reach
+/// as an O(n²) amplifier). Lowered 10s→3s to tighten the overshoot window ~3×
+/// (residual #1) — the full hard cap would need per-mutation ledger reconciliation.
+const QUOTA_TTL: Duration = Duration::from_secs(3);
 
 /// Bound the per-project entry cache so a churn of distinct project ids can't grow
 /// it without limit. Entries are cheap to reopen (a stateless `ObjectStore` + fresh
