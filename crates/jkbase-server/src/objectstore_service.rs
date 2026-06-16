@@ -616,9 +616,12 @@ impl ObjectStoreService {
         if bucket_reserved && !resp.status().is_success() {
             self.release_bucket_reservation(&entry);
         }
-        if method == "DELETE" && path_has_key(&path) && resp.status().is_success() {
-            // A delete (or AbortMultipartUpload) freed space/objects: re-walk on the
-            // next request rather than wait out the TTL.
+        if method == "DELETE" && resp.status().is_success() {
+            // A successful DELETE freed something — an object/AbortMultipartUpload
+            // (bytes + object count) OR a bucket (bucket count). Re-walk on the next
+            // request so the freed capacity is credited promptly, not after the TTL.
+            // (Previously only object deletes invalidated; a bucket delete left the
+            // bucket count stale until the next ≤TTL re-walk — residual #2.)
             self.invalidate_usage_sample(&entry);
         }
         resp
@@ -1922,6 +1925,41 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
         assert!(body.contains("TooManyBuckets"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bucket_delete_credits_count_promptly() {
+        // Residual #2: a successful bucket DELETE invalidates the usage sample so the
+        // freed slot is credited on the NEXT request, not after the ≤TTL re-walk.
+        let dir = tmp("bktcredit");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_buckets = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        // At the cap with one bucket; a second create is refused.
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        // Delete frees the slot; the re-create must succeed IMMEDIATELY (no TTL wait).
+        assert_eq!(
+            app.clone().oneshot(signed("DELETE", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK,
+            "freed bucket slot must be credited without waiting out the TTL"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
