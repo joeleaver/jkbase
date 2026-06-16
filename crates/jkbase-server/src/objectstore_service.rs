@@ -1224,6 +1224,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// On-box e2e of the Bearer CONSOLE object API over real TCP/HTTP. Proves the
+    /// whole stack the browser drives: CORS preflight, Bearer auth, bucket create,
+    /// streamed upload, delimiter folder listing + pagination, authenticated
+    /// download (Content-Disposition), delete, and cross-tenant 404. `#[ignore]`
+    /// because it binds a port; run with `--ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn console_e2e_over_real_http() {
+        let dir = tmp("console-e2e");
+        let store = store_at(&dir);
+        mk_project(&store, "proj-a", "tenant-a");
+        mk_project(&store, "proj-b", "tenant-b");
+        let tok_a = mk_tenant_token(&store, "tenant-a");
+        let tok_b = mk_tenant_token(&store, "tenant-b");
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.jkbase.app".to_string(), // -> console origin https://console.jkbase.app
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, svc.into_router()).await.unwrap();
+        });
+        let base = format!("http://{addr}");
+        let c = reqwest::Client::new();
+        let bget = |p: String, t: String| {
+            let c = c.clone();
+            let base = base.clone();
+            async move { c.get(format!("{base}{p}")).bearer_auth(t).send().await.unwrap() }
+        };
+
+        // CORS preflight from the console origin is allowed + echoes the origin.
+        let pre = c
+            .request(reqwest::Method::OPTIONS, format!("{base}/_console/projects/proj-a/buckets"))
+            .header("origin", "https://console.jkbase.app")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization,content-type")
+            .send()
+            .await
+            .unwrap();
+        assert!(pre.status().is_success(), "preflight status {}", pre.status());
+        assert_eq!(
+            pre.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            Some("https://console.jkbase.app"),
+            "CORS must allow the console origin"
+        );
+
+        // No token -> 401.
+        let r = c.get(format!("{base}/_console/projects/proj-a/buckets")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+
+        // Create a bucket.
+        let r = c
+            .post(format!("{base}/_console/projects/proj-a/buckets"))
+            .bearer_auth(&tok_a)
+            .json(&serde_json::json!({ "name": "docs" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 201, "create bucket");
+
+        // Streamed uploads: two under "a/", one at the root.
+        for (key, body) in [("a/1.txt", "hello"), ("a/2.txt", "world"), ("readme.txt", "top")] {
+            let r = c
+                .put(format!("{base}/_console/projects/proj-a/buckets/docs/object?key={key}"))
+                .bearer_auth(&tok_a)
+                .header("content-type", "text/plain")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 200, "upload {key}");
+        }
+
+        // Bucket list reflects the new bucket.
+        let buckets = bget("/_console/projects/proj-a/buckets".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(buckets["buckets"][0]["name"], "docs");
+
+        // Folder listing at root: folder "a/" folded, "readme.txt" listed.
+        let root = bget("/_console/projects/proj-a/buckets/docs/objects".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(root["prefixes"][0], "a/");
+        assert_eq!(root["objects"][0]["key"], "readme.txt");
+
+        // Pagination over "a/": max_keys=1 -> truncated, token "a/1.txt".
+        let p1 = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(p1["is_truncated"], true);
+        assert_eq!(p1["next_token"], "a/1.txt");
+        let p2 = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1&token=a%2F1.txt".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(p2["objects"][0]["key"], "a/2.txt");
+
+        // Authenticated download with attachment disposition + body round-trip.
+        let dl = bget("/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt&download=1".into(), tok_a.clone()).await;
+        assert_eq!(dl.status().as_u16(), 200);
+        let cd = dl.headers().get("content-disposition").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        assert!(cd.starts_with("attachment") && cd.contains("1.txt"), "disposition: {cd}");
+        assert_eq!(dl.text().await.unwrap(), "hello");
+
+        // Cross-tenant: tenant-b's valid token must 404 on proj-a.
+        let x = bget("/_console/projects/proj-a/buckets".into(), tok_b.clone()).await;
+        assert_eq!(x.status().as_u16(), 404, "cross-tenant must 404");
+
+        // Delete an object, then it's gone.
+        let d = c.delete(format!("{base}/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt")).bearer_auth(&tok_a).send().await.unwrap();
+        assert_eq!(d.status().as_u16(), 204);
+        let after = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        let keys: Vec<String> = after["objects"].as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap().to_string()).collect();
+        assert_eq!(keys, vec!["a/2.txt".to_string()], "deleted object gone");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("jkb-objsvc-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
