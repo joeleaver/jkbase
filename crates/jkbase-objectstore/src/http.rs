@@ -318,12 +318,14 @@ fn content_type_of(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// The declared body length (Content-Length, or `x-amz-decoded-content-length` for
-/// aws-chunked), used only to size the upload deadline. `None` when absent.
+/// The declared body length, used only to size the upload deadline. Prefers
+/// `x-amz-decoded-content-length` (the true payload size for aws-chunked, where
+/// Content-Length is the larger framed size), falling back to Content-Length.
+/// `None` when absent.
 fn declared_len(headers: &HeaderMap) -> Option<u64> {
     headers
-        .get(header::CONTENT_LENGTH)
-        .or_else(|| headers.get("x-amz-decoded-content-length"))
+        .get("x-amz-decoded-content-length")
+        .or_else(|| headers.get(header::CONTENT_LENGTH))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
 }

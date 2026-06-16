@@ -23,13 +23,24 @@ const MIN_UPLOAD_DEADLINE: Duration = Duration::from_secs(3600);
 /// use multipart, but a single large PUT over a slow link is now allowed.)
 const MIN_UPLOAD_RATE: u64 = 1024 * 1024;
 
+/// Absolute CEILING on a single upload body's total budget. The size-aware deadline
+/// scales with the declared length, which the front-end only bounds by the (possibly
+/// very large) byte quota — so without this ceiling a large-quota tenant could
+/// declare a huge length and hold a connection open for days/years by trickling one
+/// byte per `IDLE_TIMEOUT`. 6h covers a full default-quota (16 GiB) single PUT at the
+/// floor rate (~4.6h); larger objects must use multipart.
+const MAX_UPLOAD_DEADLINE: Duration = Duration::from_secs(6 * 3600);
+
 /// Total wall-clock budget for one upload body of `declared_len` (the declared
-/// Content-Length / decoded length). `None` (length unknown) falls back to the
-/// floor. Combined with [`IDLE_TIMEOUT`] per read, this bounds both stalls and
-/// total hold while scaling the budget to the work.
+/// Content-Length / decoded length), clamped to `[MIN_UPLOAD_DEADLINE,
+/// MAX_UPLOAD_DEADLINE]`. `None` (length unknown) uses the floor. Combined with
+/// [`IDLE_TIMEOUT`] per read, this bounds both per-read stalls and total connection
+/// hold while scaling the budget to the work.
 fn upload_deadline(declared_len: Option<u64>) -> Duration {
     match declared_len {
-        Some(n) => MIN_UPLOAD_DEADLINE.max(Duration::from_secs(n / MIN_UPLOAD_RATE)),
+        Some(n) => {
+            Duration::from_secs(n / MIN_UPLOAD_RATE).clamp(MIN_UPLOAD_DEADLINE, MAX_UPLOAD_DEADLINE)
+        }
         None => MIN_UPLOAD_DEADLINE,
     }
 }
@@ -1063,16 +1074,22 @@ mod tests {
     }
 
     #[test]
-    fn upload_deadline_is_size_aware_with_a_floor() {
+    fn upload_deadline_is_size_aware_clamped_to_floor_and_ceiling() {
         // Unknown / small uploads get the floor; a large declared length scales the
-        // budget so a near-quota single PUT over a slow link isn't capped at the floor.
+        // budget; a hostile huge declared length is bounded by the ceiling (so it
+        // can't be used to hold a connection open for days/years).
         assert_eq!(upload_deadline(None), MIN_UPLOAD_DEADLINE);
         assert_eq!(upload_deadline(Some(1024)), MIN_UPLOAD_DEADLINE); // tiny -> floor
         assert_eq!(upload_deadline(Some(0)), MIN_UPLOAD_DEADLINE);
-        // 16 GiB at the 1 MiB/s floor rate = 16384s, well above the 3600s floor.
-        let huge = 16u64 * 1024 * 1024 * 1024;
-        assert_eq!(upload_deadline(Some(huge)), Duration::from_secs(huge / MIN_UPLOAD_RATE));
-        assert!(upload_deadline(Some(huge)) > MIN_UPLOAD_DEADLINE);
+        // 16 GiB (the default quota) at the 1 MiB/s floor rate = 16384s: above the
+        // floor, below the 6h ceiling -> used as-is.
+        let dq = 16u64 * 1024 * 1024 * 1024;
+        assert_eq!(upload_deadline(Some(dq)), Duration::from_secs(dq / MIN_UPLOAD_RATE));
+        assert!(upload_deadline(Some(dq)) > MIN_UPLOAD_DEADLINE);
+        assert!(upload_deadline(Some(dq)) <= MAX_UPLOAD_DEADLINE);
+        // A hostile / large-quota declared length is clamped to the ceiling, NOT years.
+        assert_eq!(upload_deadline(Some(u64::MAX)), MAX_UPLOAD_DEADLINE);
+        assert_eq!(upload_deadline(Some(1024u64.pow(5))), MAX_UPLOAD_DEADLINE); // 1 PiB
     }
 
     #[tokio::test]
