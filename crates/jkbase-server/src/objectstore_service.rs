@@ -502,10 +502,16 @@ impl ObjectStoreService {
         // --- 3a. Cap bucket COUNT at create (PUT /{bucket}) via a lock-held reservation. ---
         let mut bucket_reserved = false;
         if is_bucket_create(&method, &path) {
-            if let Some(resp) = self.reserve_bucket(&entry, &project_id, &quota).await {
-                return resp;
+            // Idempotent re-create of an EXISTING bucket must reach the engine (409
+            // BucketAlreadyExists), NOT consume a reservation and report 409
+            // TooManyBuckets when already at the bucket cap (residual #3).
+            let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
+            if !entry.store.bucket_exists(bucket).await.unwrap_or(false) {
+                if let Some(resp) = self.reserve_bucket(&entry, &project_id, &quota).await {
+                    return resp;
+                }
+                bucket_reserved = true;
             }
-            bucket_reserved = true;
         }
 
         // --- 3b. Cap concurrent in-flight multipart uploads (POST ?uploads). ---
@@ -734,11 +740,18 @@ async fn console_create_bucket(
     let name = req.name.trim().to_string();
     let quota = svc.control.get_quota(&id).unwrap_or(DEFAULT_QUOTA);
     // Reserve the bucket slot under the per-project lock (closes the create race).
-    if let Some(resp) = svc.reserve_bucket(&entry, &id, &quota).await {
-        return reservation_json_error(resp);
+    // Skip the reservation for an idempotent re-create of an EXISTING bucket, so it
+    // returns 409 BucketAlreadyExists from the engine instead of 409 TooManyBuckets
+    // when at the cap (residual #3).
+    let mut reserved = false;
+    if !entry.store.bucket_exists(&name).await.unwrap_or(false) {
+        if let Some(resp) = svc.reserve_bucket(&entry, &id, &quota).await {
+            return reservation_json_error(resp);
+        }
+        reserved = true;
     }
     let res = entry.store.create_bucket(&name).await;
-    if res.is_err() {
+    if res.is_err() && reserved {
         svc.release_bucket_reservation(&entry);
     }
     match res {
@@ -1925,6 +1938,34 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
         assert!(body.contains("TooManyBuckets"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn idempotent_recreate_at_cap_is_bucket_exists_not_quota() {
+        // Residual #3: re-creating an EXISTING bucket while at the bucket cap must hit
+        // the engine's idempotency (409 BucketAlreadyExists), not be misreported as
+        // 409 TooManyBuckets by the reservation gate.
+        let dir = tmp("recreate");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_buckets = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Re-PUT the same bucket while at the cap: engine idempotency, not the quota gate.
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(body.contains("BucketAlreadyExists"), "expected BucketAlreadyExists, got: {body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
