@@ -20,4 +20,4 @@ mod store;
 pub use client::{ClientError, ObjectClient};
 pub use http::router;
 pub use sigv4::{presign, sign_header, verify_header, verify_presigned};
-pub use store::{ListPage, MultipartUpload, ObjectError, ObjectMeta, ObjectStore};
+pub use store::{ListPage, ListV2Page, MultipartUpload, ObjectError, ObjectMeta, ObjectStore};
