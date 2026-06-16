@@ -1757,6 +1757,21 @@ body {
     accessKeyBusy: false,
     revealedAccessKey: null,   // { access_key_id, secret_access_key, label } shown ONCE after create
     revokeKeyConfirm: null,     // access_key_id awaiting revoke confirmation
+    // storage / object browser (Bearer-proxied API on storage.<domain>/_console)
+    buckets: [],
+    bucketsLoading: false,
+    showCreateBucket: false,
+    bucketBusy: false,
+    deleteBucketConfirm: null,  // bucket name awaiting delete confirm
+    currentBucket: null,        // open bucket name, or null at the bucket list
+    currentPrefix: "",          // current folder prefix within the open bucket
+    objects: [],                // current object page (files at this level)
+    prefixes: [],               // current folder common-prefixes at this level
+    objectsLoading: false,
+    objToken: null,             // continuation token for "load more" (null = end)
+    objError: null,             // inline object-browser error
+    uploadBusy: false,
+    deleteObjectConfirm: null,  // object key awaiting delete confirm
   };
 
   // --- API helpers ---
@@ -1947,6 +1962,16 @@ body {
     state.deleteConfirm = false;
     state.dropdownOpen = false;
     state.sidebarOpen = false;
+    // Reset the object browser to the bucket list for the newly-opened project.
+    state.currentBucket = null;
+    state.currentPrefix = "";
+    state.objects = [];
+    state.prefixes = [];
+    state.objToken = null;
+    state.objError = null;
+    state.showCreateBucket = false;
+    state.deleteBucketConfirm = null;
+    state.deleteObjectConfirm = null;
     render();
     // Fetch all data in parallel
     loadStatus(project.id);
@@ -1954,6 +1979,7 @@ body {
     loadDomains(project.id);
     loadDeployments(project.id);
     loadAccessKeys(project.id);
+    loadBuckets(project.id);
     loadUsage(project.id);
     loadLogs(project.id);
   }
@@ -1968,6 +1994,11 @@ body {
     state.revealedAccessKey = null;
     state.showCreateAccessKey = false;
     state.revokeKeyConfirm = null;
+    // Object-browser inline UI state is tab-local too.
+    state.showCreateBucket = false;
+    state.deleteBucketConfirm = null;
+    state.deleteObjectConfirm = null;
+    state.objError = null;
     render();
   }
 
@@ -2095,6 +2126,206 @@ body {
     } catch (e) {
       return "https://storage.jkbase.app";
     }
+  }
+
+  // --- Object browser (Bearer-proxied object API on storage.<domain>/_console) ---
+  // Same session token + error contract as api(), but a different base host: the
+  // control plane must not touch the object store, so the owner-scoped browser API
+  // lives on the storage service itself.
+  function objApi(method, path, body) {
+    var headers = {};
+    if (state.token) headers["Authorization"] = "Bearer " + state.token;
+    var opts = { method: method, headers: headers };
+    if (body !== undefined && body !== null) {
+      headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(storageEndpoint() + path, opts).then(function(res) {
+      if (res.status === 401) {
+        logout();
+        throw new Error("Session expired. Please sign in again.");
+      }
+      if (res.status === 204) return null;
+      return res.json().then(function(data) {
+        if (!res.ok) {
+          throw new Error(data.error || data.message || "Request failed (" + res.status + ")");
+        }
+        return data;
+      });
+    });
+  }
+
+  function objBase(projectId) {
+    return "/_console/projects/" + encodeURIComponent(projectId) + "/buckets";
+  }
+
+  function loadBuckets(projectId) {
+    state.bucketsLoading = true;
+    render();
+    objApi("GET", objBase(projectId)).then(function(d) {
+      state.buckets = (d && d.buckets) || [];
+      state.bucketsLoading = false;
+      render();
+    }).catch(function(e) {
+      state.bucketsLoading = false;
+      state.objError = e.message;
+      render();
+    });
+  }
+
+  function createBucket(projectId, name) {
+    state.objError = null;
+    state.bucketBusy = true;
+    render();
+    objApi("POST", objBase(projectId), { name: name }).then(function() {
+      state.bucketBusy = false;
+      state.showCreateBucket = false;
+      render();
+      loadBuckets(projectId);
+    }).catch(function(e) {
+      state.bucketBusy = false;
+      state.objError = e.message;
+      render();
+    });
+  }
+
+  function deleteBucket(projectId, name) {
+    state.objError = null;
+    state.deleteBucketConfirm = null;
+    state.bucketBusy = true;
+    render();
+    objApi("DELETE", objBase(projectId) + "/" + encodeURIComponent(name)).then(function() {
+      state.bucketBusy = false;
+      render();
+      loadBuckets(projectId);
+    }).catch(function(e) {
+      state.bucketBusy = false;
+      state.objError = e.message;
+      render();
+    });
+  }
+
+  function openBucket(projectId, bucket) {
+    state.currentBucket = bucket;
+    state.currentPrefix = "";
+    state.objError = null;
+    state.deleteObjectConfirm = null;
+    loadObjects(projectId, true);
+  }
+
+  function closeBucket() {
+    state.currentBucket = null;
+    state.currentPrefix = "";
+    state.objects = [];
+    state.prefixes = [];
+    state.objToken = null;
+    state.objError = null;
+    state.deleteObjectConfirm = null;
+    render();
+  }
+
+  function navigatePrefix(projectId, prefix) {
+    state.currentPrefix = prefix;
+    state.objError = null;
+    state.deleteObjectConfirm = null;
+    loadObjects(projectId, true);
+  }
+
+  function loadObjects(projectId, reset) {
+    state.objectsLoading = true;
+    if (reset) { state.objects = []; state.prefixes = []; state.objToken = null; }
+    render();
+    var path = objBase(projectId) + "/" + encodeURIComponent(state.currentBucket) + "/objects" +
+      "?prefix=" + encodeURIComponent(state.currentPrefix) + "&max_keys=200";
+    if (!reset && state.objToken) path += "&token=" + encodeURIComponent(state.objToken);
+    objApi("GET", path).then(function(d) {
+      d = d || {};
+      if (reset) {
+        state.objects = d.objects || [];
+        state.prefixes = d.prefixes || [];
+      } else {
+        state.objects = state.objects.concat(d.objects || []);
+        state.prefixes = state.prefixes.concat(d.prefixes || []);
+      }
+      state.objToken = d.is_truncated ? d.next_token : null;
+      state.objectsLoading = false;
+      render();
+    }).catch(function(e) {
+      state.objectsLoading = false;
+      state.objError = e.message;
+      render();
+    });
+  }
+
+  function uploadObject(projectId, file) {
+    if (!file) return;
+    state.objError = null;
+    state.uploadBusy = true;
+    render();
+    var key = state.currentPrefix + file.name;
+    var headers = {};
+    if (state.token) headers["Authorization"] = "Bearer " + state.token;
+    headers["Content-Type"] = file.type || "application/octet-stream";
+    fetch(storageEndpoint() + objBase(projectId) + "/" + encodeURIComponent(state.currentBucket) +
+      "/object?key=" + encodeURIComponent(key), { method: "PUT", headers: headers, body: file })
+      .then(function(res) {
+        if (res.status === 401) { logout(); throw new Error("Session expired. Please sign in again."); }
+        if (res.ok) return null;
+        return res.json().then(function(d) {
+          throw new Error((d && (d.error || d.message)) || "Upload failed (" + res.status + ")");
+        });
+      }).then(function() {
+        state.uploadBusy = false;
+        loadObjects(projectId, true);
+      }).catch(function(e) {
+        state.uploadBusy = false;
+        state.objError = e.message;
+        render();
+      });
+  }
+
+  function deleteObject(projectId, key) {
+    state.objError = null;
+    state.deleteObjectConfirm = null;
+    state.uploadBusy = true;
+    render();
+    objApi("DELETE", objBase(projectId) + "/" + encodeURIComponent(state.currentBucket) +
+      "/object?key=" + encodeURIComponent(key)).then(function() {
+      state.uploadBusy = false;
+      loadObjects(projectId, true);
+    }).catch(function(e) {
+      state.uploadBusy = false;
+      state.objError = e.message;
+      render();
+    });
+  }
+
+  // Authenticated download: fetch with the Bearer header (a plain link can't carry
+  // it), then save the returned blob via a transient object URL.
+  function downloadObject(projectId, key) {
+    state.objError = null;
+    render();
+    var headers = {};
+    if (state.token) headers["Authorization"] = "Bearer " + state.token;
+    fetch(storageEndpoint() + objBase(projectId) + "/" + encodeURIComponent(state.currentBucket) +
+      "/object?key=" + encodeURIComponent(key) + "&download=1", { headers: headers })
+      .then(function(res) {
+        if (res.status === 401) { logout(); throw new Error("Session expired. Please sign in again."); }
+        if (!res.ok) throw new Error("Download failed (" + res.status + ")");
+        return res.blob();
+      }).then(function(blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = key.split("/").pop() || "download";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
+      }).catch(function(e) {
+        state.objError = e.message;
+        render();
+      });
   }
 
   // Friendly date from a unix-seconds timestamp (e.g. "Jun 14, 2026").
@@ -3330,6 +3561,207 @@ body {
   }
 
   // Storage (object-store access keys)
+  // Bucket/object browser card shown under the Storage tab. Two modes: a bucket
+  // list (when currentBucket is null) and an object list scoped to the open bucket
+  // + folder prefix. All calls go through the Bearer-proxied object API.
+  function renderObjectBrowser(project) {
+    var pid = project.id;
+    var errBanner = state.objError
+      ? h("div", { className: "error-banner", style: "margin-bottom: 12px" }, state.objError)
+      : null;
+
+    // ===== Bucket list =====
+    if (state.currentBucket === null) {
+      var bucketRows = [];
+      if (state.bucketsLoading && state.buckets.length === 0) {
+        bucketRows.push(h("div", { className: "section-desc" }, "Loading buckets..."));
+      } else if (state.buckets.length > 0) {
+        bucketRows.push(
+          h("table", { className: "secret-table" },
+            h("tbody", null,
+              state.buckets.map(function(b) {
+                return h("tr", null,
+                  h("td", {
+                    style: "font-family: var(--mono); font-size: 13px; cursor: pointer",
+                    onClick: function() { openBucket(pid, b.name); },
+                  }, h("span", { style: "color: var(--text-dim); margin-right: 6px" }, "[ ]"), b.name),
+                  h("td", { className: "secret-actions" },
+                    h("button", { className: "btn btn-secondary btn-sm", onClick: function() { openBucket(pid, b.name); } }, "Open"),
+                    h("button", {
+                      className: "btn btn-danger btn-sm",
+                      style: "margin-left: 8px",
+                      disabled: state.bucketBusy ? "disabled" : null,
+                      onClick: function() { state.deleteBucketConfirm = b.name; render(); },
+                    }, "Delete")
+                  )
+                );
+              })
+            )
+          )
+        );
+      } else if (!state.bucketsLoading) {
+        bucketRows.push(h("div", { className: "section-desc" }, "No buckets yet. Create one to start storing objects."));
+      }
+
+      if (state.deleteBucketConfirm) {
+        bucketRows.push(
+          h("div", { className: "secret-delete-confirm" },
+            h("div", { className: "secret-delete-confirm-text" },
+              "Delete bucket ", h("span", { className: "highlight" }, state.deleteBucketConfirm),
+              "? The bucket must be empty."
+            ),
+            h("div", { className: "secret-delete-confirm-actions" },
+              h("button", { className: "btn btn-secondary btn-sm", onClick: function() { state.deleteBucketConfirm = null; render(); } }, "Cancel"),
+              h("button", { className: "btn btn-danger btn-sm", disabled: state.bucketBusy ? "disabled" : null,
+                onClick: function() { deleteBucket(pid, state.deleteBucketConfirm); } }, "Delete")
+            )
+          )
+        );
+      }
+
+      if (state.showCreateBucket) {
+        bucketRows.push(
+          h("form", { className: "secret-add-form", onSubmit: function(e) {
+            e.preventDefault();
+            var input = e.target.querySelector("input");
+            var name = input ? input.value.trim() : "";
+            if (name) createBucket(pid, name);
+          }},
+            h("input", { className: "input", type: "text", placeholder: "bucket-name (3–63: a-z, 0-9, -)", autocomplete: "off" }),
+            h("button", { className: "btn btn-primary btn-sm", type: "submit", disabled: state.bucketBusy ? "disabled" : null },
+              state.bucketBusy ? "Creating..." : "Create"),
+            h("button", { className: "btn btn-secondary btn-sm", type: "button", onClick: function() { state.showCreateBucket = false; render(); } }, "Cancel")
+          )
+        );
+      }
+
+      return h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px" },
+            h("div", { className: "card-title", style: "margin-bottom: 0" }, "Buckets"),
+            h("button", {
+              className: "btn btn-secondary btn-sm",
+              disabled: state.showCreateBucket ? "disabled" : null,
+              onClick: function() { state.showCreateBucket = true; render(); },
+            }, "New bucket")
+          ),
+          errBanner,
+          h("div", null, bucketRows)
+        )
+      );
+    }
+
+    // ===== Object list (inside a bucket) =====
+    // Breadcrumb: Buckets / <bucket> / <seg> / <seg> ...
+    var crumbs = [
+      h("span", { style: "cursor: pointer; color: var(--accent)", onClick: function() { closeBucket(); } }, "Buckets"),
+      h("span", { style: "color: var(--text-dim); margin: 0 6px" }, "/"),
+      h("span", {
+        style: "cursor: pointer; color: " + (state.currentPrefix ? "var(--accent)" : "var(--text)"),
+        onClick: function() { navigatePrefix(pid, ""); },
+      }, state.currentBucket),
+    ];
+    if (state.currentPrefix) {
+      var segs = state.currentPrefix.split("/").filter(function(s) { return s.length; });
+      var acc = "";
+      segs.forEach(function(seg, idx) {
+        acc += seg + "/";
+        var target = acc;
+        var isLast = idx === segs.length - 1;
+        crumbs.push(h("span", { style: "color: var(--text-dim); margin: 0 6px" }, "/"));
+        crumbs.push(h("span", {
+          style: "cursor: pointer; color: " + (isLast ? "var(--text)" : "var(--accent)"),
+          onClick: function() { navigatePrefix(pid, target); },
+        }, seg));
+      });
+    }
+
+    var listRows = [];
+    state.prefixes.forEach(function(p) {
+      var label = p.slice(state.currentPrefix.length);
+      listRows.push(h("tr", null,
+        h("td", {
+          style: "font-family: var(--mono); font-size: 13px; cursor: pointer",
+          onClick: function() { navigatePrefix(pid, p); },
+        }, h("span", { style: "color: var(--accent); margin-right: 6px" }, "[+]"), label),
+        h("td", null, ""),
+        h("td", null, ""),
+        h("td", null, "")
+      ));
+    });
+    state.objects.forEach(function(o) {
+      var name = o.key.slice(state.currentPrefix.length);
+      listRows.push(h("tr", null,
+        h("td", { style: "font-family: var(--mono); font-size: 13px", title: o.key }, name),
+        h("td", { style: "color: var(--text-dim); font-size: 12px; white-space: nowrap" }, fmtBytes(o.size)),
+        h("td", { style: "color: var(--text-dim); font-size: 12px; white-space: nowrap" }, formatDate(o.last_modified)),
+        h("td", { className: "secret-actions" },
+          h("button", { className: "btn btn-secondary btn-sm", onClick: function() { downloadObject(pid, o.key); } }, "Download"),
+          h("button", {
+            className: "btn btn-danger btn-sm",
+            style: "margin-left: 8px",
+            disabled: state.uploadBusy ? "disabled" : null,
+            onClick: function() { state.deleteObjectConfirm = o.key; render(); },
+          }, "Delete")
+        )
+      ));
+    });
+
+    var body = [];
+    if (state.objectsLoading && listRows.length === 0) {
+      body.push(h("div", { className: "section-desc" }, "Loading objects..."));
+    } else if (listRows.length > 0) {
+      body.push(h("table", { className: "secret-table" }, h("tbody", null, listRows)));
+    } else if (!state.objectsLoading) {
+      body.push(h("div", { className: "section-desc" }, "This folder is empty. Upload a file to get started."));
+    }
+
+    if (state.deleteObjectConfirm) {
+      body.push(h("div", { className: "secret-delete-confirm" },
+        h("div", { className: "secret-delete-confirm-text" },
+          "Delete ", h("span", { className: "highlight" }, state.deleteObjectConfirm), "? This cannot be undone."
+        ),
+        h("div", { className: "secret-delete-confirm-actions" },
+          h("button", { className: "btn btn-secondary btn-sm", onClick: function() { state.deleteObjectConfirm = null; render(); } }, "Cancel"),
+          h("button", { className: "btn btn-danger btn-sm", onClick: function() { deleteObject(pid, state.deleteObjectConfirm); } }, "Delete")
+        )
+      ));
+    }
+
+    if (state.objToken) {
+      body.push(h("div", { style: "margin-top: 12px" },
+        h("button", {
+          className: "btn btn-secondary btn-sm",
+          disabled: state.objectsLoading ? "disabled" : null,
+          onClick: function() { loadObjects(pid, false); },
+        }, state.objectsLoading ? "Loading..." : "Load more")
+      ));
+    }
+
+    return h("div", { className: "card" },
+      h("div", { className: "card-static" },
+        h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; flex-wrap: wrap; gap: 8px" },
+          h("div", { style: "font-size: 13px; display: flex; align-items: center; flex-wrap: wrap" }, crumbs),
+          h("label", { className: "btn btn-primary btn-sm", style: "cursor: pointer; margin: 0" },
+            state.uploadBusy ? "Uploading..." : "Upload file",
+            h("input", {
+              type: "file",
+              style: "display: none",
+              disabled: state.uploadBusy ? "disabled" : null,
+              onChange: function(e) {
+                var f = e.target.files && e.target.files[0];
+                e.target.value = ""; // allow re-selecting the same file
+                if (f) uploadObject(pid, f);
+              },
+            })
+          )
+        ),
+        errBanner,
+        h("div", null, body)
+      )
+    );
+  }
+
   function renderStorageView(project) {
     var endpoint = storageEndpoint();
 
@@ -3510,9 +3942,9 @@ body {
           h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Access keys"),
           h("div", null, listItems)
         )
-      )
+      ),
 
-      // TODO: bucket/object browser (needs object-proxy API)
+      renderObjectBrowser(project)
     );
   }
 
