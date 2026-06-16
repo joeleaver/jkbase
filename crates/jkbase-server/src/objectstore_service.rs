@@ -39,9 +39,12 @@ use tracing::warn;
 
 /// How often a project's authoritative on-disk footprint is re-walked. Between
 /// refreshes, write reservations accumulate so the cap holds within the window;
-/// short enough that deleted space frees quickly, long enough to keep the dir-walk
-/// off the per-request hot path (and out of reach as an O(n²) amplifier).
-const QUOTA_TTL: Duration = Duration::from_secs(10);
+/// short enough that deleted space frees quickly AND that the documented soft-cap
+/// overshoot window (a tenant's own concurrent writes racing a re-walk) stays small,
+/// long enough to keep the dir-walk off the per-request hot path (and out of reach
+/// as an O(n²) amplifier). Lowered 10s→3s to tighten the overshoot window ~3×
+/// (residual #1) — the full hard cap would need per-mutation ledger reconciliation.
+const QUOTA_TTL: Duration = Duration::from_secs(3);
 
 /// Bound the per-project entry cache so a churn of distinct project ids can't grow
 /// it without limit. Entries are cheap to reopen (a stateless `ObjectStore` + fresh
@@ -502,10 +505,16 @@ impl ObjectStoreService {
         // --- 3a. Cap bucket COUNT at create (PUT /{bucket}) via a lock-held reservation. ---
         let mut bucket_reserved = false;
         if is_bucket_create(&method, &path) {
-            if let Some(resp) = self.reserve_bucket(&entry, &project_id, &quota).await {
-                return resp;
+            // Idempotent re-create of an EXISTING bucket must reach the engine (409
+            // BucketAlreadyExists), NOT consume a reservation and report 409
+            // TooManyBuckets when already at the bucket cap (residual #3).
+            let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
+            if !entry.store.bucket_exists(bucket).await.unwrap_or(false) {
+                if let Some(resp) = self.reserve_bucket(&entry, &project_id, &quota).await {
+                    return resp;
+                }
+                bucket_reserved = true;
             }
-            bucket_reserved = true;
         }
 
         // --- 3b. Cap concurrent in-flight multipart uploads (POST ?uploads). ---
@@ -616,9 +625,12 @@ impl ObjectStoreService {
         if bucket_reserved && !resp.status().is_success() {
             self.release_bucket_reservation(&entry);
         }
-        if method == "DELETE" && path_has_key(&path) && resp.status().is_success() {
-            // A delete (or AbortMultipartUpload) freed space/objects: re-walk on the
-            // next request rather than wait out the TTL.
+        if method == "DELETE" && resp.status().is_success() {
+            // A successful DELETE freed something — an object/AbortMultipartUpload
+            // (bytes + object count) OR a bucket (bucket count). Re-walk on the next
+            // request so the freed capacity is credited promptly, not after the TTL.
+            // (Previously only object deletes invalidated; a bucket delete left the
+            // bucket count stale until the next ≤TTL re-walk — residual #2.)
             self.invalidate_usage_sample(&entry);
         }
         resp
@@ -731,11 +743,18 @@ async fn console_create_bucket(
     let name = req.name.trim().to_string();
     let quota = svc.control.get_quota(&id).unwrap_or(DEFAULT_QUOTA);
     // Reserve the bucket slot under the per-project lock (closes the create race).
-    if let Some(resp) = svc.reserve_bucket(&entry, &id, &quota).await {
-        return reservation_json_error(resp);
+    // Skip the reservation for an idempotent re-create of an EXISTING bucket, so it
+    // returns 409 BucketAlreadyExists from the engine instead of 409 TooManyBuckets
+    // when at the cap (residual #3).
+    let mut reserved = false;
+    if !entry.store.bucket_exists(&name).await.unwrap_or(false) {
+        if let Some(resp) = svc.reserve_bucket(&entry, &id, &quota).await {
+            return reservation_json_error(resp);
+        }
+        reserved = true;
     }
     let res = entry.store.create_bucket(&name).await;
-    if res.is_err() {
+    if res.is_err() && reserved {
         svc.release_bucket_reservation(&entry);
     }
     match res {
@@ -911,7 +930,7 @@ async fn console_put_object(
     let reader = StreamReader::new(req.into_body().into_data_stream().map_err(std::io::Error::other));
     match entry
         .store
-        .put_object(&bucket, &key, reader, &content_type, None)
+        .put_object_capped(&bucket, &key, reader, &content_type, None, Some(len))
         .await
     {
         Ok(meta) => (
@@ -1922,6 +1941,69 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
         assert!(body.contains("TooManyBuckets"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn idempotent_recreate_at_cap_is_bucket_exists_not_quota() {
+        // Residual #3: re-creating an EXISTING bucket while at the bucket cap must hit
+        // the engine's idempotency (409 BucketAlreadyExists), not be misreported as
+        // 409 TooManyBuckets by the reservation gate.
+        let dir = tmp("recreate");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_buckets = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        // Re-PUT the same bucket while at the cap: engine idempotency, not the quota gate.
+        let (st, body) = status_body(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        assert!(body.contains("BucketAlreadyExists"), "expected BucketAlreadyExists, got: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bucket_delete_credits_count_promptly() {
+        // Residual #2: a successful bucket DELETE invalidates the usage sample so the
+        // freed slot is credited on the NEXT request, not after the ≤TTL re-walk.
+        let dir = tmp("bktcredit");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.max_buckets = 1;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+        // At the cap with one bucket; a second create is refused.
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        // Delete frees the slot; the re-create must succeed IMMEDIATELY (no TTL wait).
+        assert_eq!(
+            app.clone().oneshot(signed("DELETE", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK,
+            "freed bucket slot must be credited without waiting out the TTL"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
