@@ -53,13 +53,17 @@ async fn put_dispatch(
     body: Body,
 ) -> Response {
     let sha256 = extract_content_sha256(&headers);
+    let declared = declared_len(&headers);
     if let (Some(uid), Some(pn)) = (q.get("uploadId"), q.get("partNumber")) {
         let part_number: u32 = match pn.parse() {
             Ok(n) => n,
             Err(_) => return s3_error(ObjectError::InvalidArgument(format!("partNumber {pn}"))),
         };
         let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
-        return match store.upload_part(&bucket, uid, part_number, reader, sha256.as_deref()).await {
+        return match store
+            .upload_part_capped(&bucket, uid, part_number, reader, sha256.as_deref(), declared)
+            .await
+        {
             Ok(etag) => ([(header::ETAG, quoted(&etag))], StatusCode::OK).into_response(),
             Err(e) => s3_error(e),
         };
@@ -67,7 +71,10 @@ async fn put_dispatch(
     // Plain object put — stream the body straight to disk, never buffered.
     let content_type = content_type_of(&headers);
     let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
-    match store.put_object(&bucket, &key, reader, &content_type, sha256.as_deref()).await {
+    match store
+        .put_object_capped(&bucket, &key, reader, &content_type, sha256.as_deref(), declared)
+        .await
+    {
         Ok(meta) => ([(header::ETAG, quoted(&meta.etag))], StatusCode::OK).into_response(),
         Err(e) => s3_error(e),
     }
@@ -309,6 +316,16 @@ fn content_type_of(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string()
+}
+
+/// The declared body length (Content-Length, or `x-amz-decoded-content-length` for
+/// aws-chunked), used only to size the upload deadline. `None` when absent.
+fn declared_len(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .or_else(|| headers.get("x-amz-decoded-content-length"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Extract `x-amz-content-sha256` only when it looks like a literal hex digest

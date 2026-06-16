@@ -11,8 +11,28 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Per-idle-read timeout for put_object / upload_part (slow-loris guard).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum total time allowed for a single upload body, across all reads.
-const MAX_UPLOAD_DURATION: Duration = Duration::from_secs(3600);
+/// Floor on a single upload body's total wall-clock budget. A tiny upload can't
+/// camp a connection longer than this (the per-read idle timeout is the finer
+/// slow-loris guard); larger uploads get proportionally more (see below).
+const MIN_UPLOAD_DEADLINE: Duration = Duration::from_secs(3600);
+
+/// Throughput floor used to size a large upload's total budget: the deadline is
+/// `declared_bytes / MIN_UPLOAD_RATE`, floored at `MIN_UPLOAD_DEADLINE`. Set low
+/// (1 MiB/s) so a genuinely slow link can still complete a near-quota single PUT,
+/// while a connection that delivers nothing is still bounded. (Huge objects should
+/// use multipart, but a single large PUT over a slow link is now allowed.)
+const MIN_UPLOAD_RATE: u64 = 1024 * 1024;
+
+/// Total wall-clock budget for one upload body of `declared_len` (the declared
+/// Content-Length / decoded length). `None` (length unknown) falls back to the
+/// floor. Combined with [`IDLE_TIMEOUT`] per read, this bounds both stalls and
+/// total hold while scaling the budget to the work.
+fn upload_deadline(declared_len: Option<u64>) -> Duration {
+    match declared_len {
+        Some(n) => MIN_UPLOAD_DEADLINE.max(Duration::from_secs(n / MIN_UPLOAD_RATE)),
+        None => MIN_UPLOAD_DEADLINE,
+    }
+}
 
 /// Errors surfaced by the object store. The HTTP layer maps these onto S3 error
 /// codes (NoSuchBucket, NoSuchKey, BucketNotEmpty, …).
@@ -195,9 +215,26 @@ impl ObjectStore {
         &self,
         bucket: &str,
         key: &str,
+        reader: R,
+        content_type: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<ObjectMeta> {
+        self.put_object_capped(bucket, key, reader, content_type, expected_sha256, None)
+            .await
+    }
+
+    /// Like [`put_object`], but `declared_len` (the declared Content-Length) sizes the
+    /// total upload deadline — see [`upload_deadline`]. Authenticated front-ends pass
+    /// the declared length so a large single PUT over a slow link isn't capped at the
+    /// small-upload floor; plain `put_object` (unknown length) uses the floor.
+    pub async fn put_object_capped<R: AsyncRead + Unpin>(
+        &self,
+        bucket: &str,
+        key: &str,
         mut reader: R,
         content_type: &str,
         expected_sha256: Option<&str>,
+        declared_len: Option<u64>,
     ) -> Result<ObjectMeta> {
         validate_key(key)?;
         let dir = self.require_bucket(bucket).await?;
@@ -209,7 +246,7 @@ impl ObjectStore {
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
 
-        let result = write_stream(&tmp, &mut reader, expected_sha256).await;
+        let result = write_stream(&tmp, &mut reader, expected_sha256, declared_len).await;
         match result {
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
@@ -457,8 +494,23 @@ impl ObjectStore {
         bucket: &str,
         upload_id: &str,
         part_number: u32,
+        reader: R,
+        expected_sha256: Option<&str>,
+    ) -> Result<String> {
+        self.upload_part_capped(bucket, upload_id, part_number, reader, expected_sha256, None)
+            .await
+    }
+
+    /// Like [`upload_part`], but `declared_len` sizes the per-part upload deadline
+    /// (see [`upload_deadline`]) for large parts over a slow link.
+    pub async fn upload_part_capped<R: AsyncRead + Unpin>(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: u32,
         mut reader: R,
         expected_sha256: Option<&str>,
+        declared_len: Option<u64>,
     ) -> Result<String> {
         if !(1..=10_000).contains(&part_number) {
             return Err(ObjectError::InvalidArgument(format!("part number {part_number}")));
@@ -467,7 +519,7 @@ impl ObjectStore {
         let part = sdir.join(format!("part-{part_number}"));
         let tmp = sdir.join(format!("part-{part_number}.tmp"));
 
-        let result = write_stream(&tmp, &mut reader, expected_sha256).await;
+        let result = write_stream(&tmp, &mut reader, expected_sha256, declared_len).await;
         match result {
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
@@ -752,11 +804,12 @@ async fn write_stream<R: AsyncRead + Unpin>(
     tmp: &PathBuf,
     reader: &mut R,
     expected_sha256: Option<&str>,
+    declared_len: Option<u64>,
 ) -> Result<(u64, String, Vec<u8>)> {
     let mut md5_hasher: Md5 = Md5::new();
     let mut sha_hasher: Sha256 = Sha256::new();
     let mut size = 0u64;
-    let deadline = Instant::now() + MAX_UPLOAD_DURATION;
+    let deadline = Instant::now() + upload_deadline(declared_len);
 
     let mut f = tokio::fs::File::create(tmp).await?;
     let mut buf = vec![0u8; 256 * 1024];
@@ -1007,6 +1060,19 @@ mod tests {
         let sub2 = s.list_v2("buk", "a/", Some("/"), None, 1000).await.unwrap();
         assert_eq!(sub2.common_prefixes, vec!["a/deep/".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_deadline_is_size_aware_with_a_floor() {
+        // Unknown / small uploads get the floor; a large declared length scales the
+        // budget so a near-quota single PUT over a slow link isn't capped at the floor.
+        assert_eq!(upload_deadline(None), MIN_UPLOAD_DEADLINE);
+        assert_eq!(upload_deadline(Some(1024)), MIN_UPLOAD_DEADLINE); // tiny -> floor
+        assert_eq!(upload_deadline(Some(0)), MIN_UPLOAD_DEADLINE);
+        // 16 GiB at the 1 MiB/s floor rate = 16384s, well above the 3600s floor.
+        let huge = 16u64 * 1024 * 1024 * 1024;
+        assert_eq!(upload_deadline(Some(huge)), Duration::from_secs(huge / MIN_UPLOAD_RATE));
+        assert!(upload_deadline(Some(huge)) > MIN_UPLOAD_DEADLINE);
     }
 
     #[tokio::test]

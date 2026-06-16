@@ -911,7 +911,7 @@ async fn console_put_object(
     let reader = StreamReader::new(req.into_body().into_data_stream().map_err(std::io::Error::other));
     match entry
         .store
-        .put_object(&bucket, &key, reader, &content_type, None)
+        .put_object_capped(&bucket, &key, reader, &content_type, None, Some(len))
         .await
     {
         Ok(meta) => (
