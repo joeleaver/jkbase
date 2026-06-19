@@ -2,9 +2,9 @@
 
 **Your own little cloud, minus the part where you pay someone else's yacht payment.**
 
-jkbase is a self-hostable platform for shipping **static sites**, **WASM functions**, and **server apps** — and every project gets its own [Firecracker](https://firecracker-microvm.github.io/) microVM. Not a container. A real VM, with its own kernel, booted in ~125ms. Your neighbors can't read your secrets because they're in a different machine entirely. Blast radius: one.
+jkbase is a self-hostable platform for shipping **static sites** and **server apps**, with **S3-compatible object storage** built in — and every project gets its own [Firecracker](https://firecracker-microvm.github.io/) microVM. Not a container. A real VM, with its own kernel, booted in ~125ms. Your neighbors can't read your secrets because they're in a different machine entirely. Blast radius: one.
 
-You push source; the platform builds it **server-side** in a sealed, network-fenced microVM (no Docker on your laptop, no `node_modules` on your conscience), and serves it on HTTPS. Bun is the lead language; bring-your-own-Dockerfile is a supported escape hatch for when you have Opinions.
+You push source; the platform builds it **server-side** in a sealed, network-fenced microVM (no Docker on your laptop, no `node_modules` on your conscience), and serves it on HTTPS. Bun is the lead language; Node, Rust, Python and Go ride the same lifecycle, and bring-your-own-Dockerfile is a supported escape hatch for when you have Opinions.
 
 There are two ways to read this README:
 
@@ -74,7 +74,7 @@ public = "./dist"
 spa = true
 
 # A server, built from source — no Dockerfile, no toolchain on your machine.
-# The language is auto-detected (Bun leads; Node/Python/Go ride the same lifecycle).
+# The language is auto-detected (Bun leads; Node/Rust/Python/Go ride the same lifecycle).
 [servers.api]
 source = "./server"
 port = 8080
@@ -98,16 +98,18 @@ spa = true
 
 ### Multi-site hosting
 
-Several static directories, one project, prefix routing:
+Several static directories, one project, prefix routing — and each site can claim its own subdomain or custom domain:
 
 ```toml
 [sites.docs]
 public = "./docs/build"
 prefix = "/docs"
+# domain = "docs"               # → docs.jkbase.app, or a full "docs.example.com"
 
 [sites.blog]
 public = "./blog/out"
 prefix = "/blog"
+spa = true
 ```
 
 ### Servers
@@ -116,8 +118,10 @@ A server runs inside your project's microVM with its own port and optional persi
 
 ```toml
 [servers.api]
-source = "./server"
-port = 8080
+source = "./server"           # build subdir (default ".")
+# language = "bun"            # optional hint; auto-detected (bun|node|rust|python|go)
+port = 8080                   # required — authoritative for routing
+# command = ["/opt/bun/bin/bun", "run", "start"]   # optional: override the launch argv (argv[0] absolute)
 health_check = { path = "/health", interval = "10s", timeout = "5s" }
 volumes = [{ name = "data", mount = "/app/data" }]
 ```
@@ -133,24 +137,77 @@ port = 8080
 
 Volumes persist across deploys. Build output does not — that's the point.
 
-### WASM functions
+### WASM functions (experimental)
+
+The in-VM runtime can execute WASM (via [wasmtime](https://wasmtime.dev/)) on request or on a cron schedule, and the config + build contract are wired:
 
 ```toml
 [functions.hello]
-source = "./functions/hello"   # builds to a wasi-http component, server-side
+source = "./functions/hello"   # builds to a wasm component, server-side
 # schedule = "*/5 * * * *"      # optional: run it on a cron instead of (or as well as) on request
 ```
+
+> **Heads up:** functions are early, and the limits above are a stage, not a stance. Today's runtime is the legacy WASI **preview1** path (`_start` + stdin/stdout JSON), which has no sockets, filesystem, or env by construction — so a function is a hermetic compute box *for now*. The planned upgrade migrates the runtime to the **WASI 0.2 component model** (`wasi:http`), which brings outbound `fetch` and an async event loop with it (host-mediated, so egress can be policy-gated). That migration is deliberately deferred off the critical path behind the server/OCI work, so treat functions as experimental, not production — static sites and servers are the load-bearing deploy targets today.
 
 ### Routing & custom domains
 
 ```toml
+# Top-level — must come before any [table] header (it's a bare key on the project).
+domains = ["example.com", "www.example.com"]
+
 [routes]
 "/api/*" = { service = "server", name = "api" }
-
-domains = ["example.com", "www.example.com"]
 ```
 
-Or attach domains imperatively with `jkbase domain add` (handy for `_acme-challenge` / TXT-verification flows).
+Or attach domains imperatively with `jkbase domain add` (handy for `_acme-challenge` / TXT-verification flows). `--site <name>` binds a domain to one site within a multi-site project.
+
+---
+
+## Object storage (S3-compatible)
+
+Every project gets its own **S3-compatible object store** at `https://storage.<domain>` (e.g. `storage.jkbase.app`). Auth is AWS **SigV4** with per-project access keys, so the AWS SDKs, `aws s3`, `rclone`, and friends work out of the box — pointed at your jkbase endpoint. Buckets and objects are isolated to the project that owns the key; another project's credentials can't see them.
+
+### Issue an access key
+
+```bash
+jkbase access-key issue --label ci      # secret is shown ONCE — save it
+jkbase access-key list                  # ids + labels (secrets never shown)
+jkbase access-key rm AKID...            # revoke
+```
+
+`issue` prints the endpoint, the access-key id, and the secret. Point any S3 client at the endpoint with **path-style** addressing.
+
+### What's supported
+
+- **Buckets** — create, delete (empty), head, list.
+- **Objects** — `PUT` / `GET` / `HEAD` / `DELETE`, with MD5 ETags, content-type and last-modified.
+- **Multipart uploads** — initiate / upload part / complete / abort / list, for large objects.
+- **Presigned URLs** — time-limited GET/PUT links, no SDK on the client.
+- **Listing** — `ListObjects` v1 + v2 with prefix and pagination (continuation tokens / markers).
+
+Per-project quotas apply (defaults: ~16 GiB of storage, 1,000,000 objects, 100 buckets) and stored bytes count toward the project's storage cap and metering alongside deployments and data disks. Object-store traffic is served straight off the platform — no extra service to stand up.
+
+### JavaScript SDK
+
+A zero-dependency SigV4 client (Web Crypto + `fetch`; Node, Deno, browsers) lives in [`sdk/js`](sdk/js):
+
+```js
+import { ObjectClient } from "@jkbase/objectstore";
+
+const s3 = new ObjectClient("https://storage.jkbase.app", accessKeyId, secretAccessKey);
+await s3.createBucket("uploads");
+await s3.putObject("uploads", "hello.txt", "hi", "text/plain");
+const body = await s3.getObject("uploads", "hello.txt");
+const url  = await s3.presignedGet("uploads", "hello.txt", 900); // 15-min link
+```
+
+No AWS SDK bloat — the same SigV4 canonicalization the server verifies.
+
+---
+
+## Web console
+
+The platform ships a browser console (itself a jkbase-hosted static site) at `https://console.<domain>`. Sign in with your token to manage projects without the CLI: deployments and rollback, live logs, secrets, custom domains, month-to-date usage, S3 access keys, and a **storage browser** for poking through buckets and objects (upload, download, delete, folder-style listing). The console talks to the object store over a session-scoped Bearer API — your S3 secret never touches the browser.
 
 ---
 
@@ -201,13 +258,14 @@ jkbase repo disconnect       # revoke the token + remove the remote
 | `jkbase project info [name]` | Show a project's details |
 | `jkbase project delete <name>` | Delete a project (and purge its data + secrets) |
 | `jkbase deploy` | Build + deploy the current project |
-| `jkbase rollback [--version N]` | Roll back to a previous deployment |
+| `jkbase rollback [--version N] [--force]` | Roll back to a previous deployment |
 | `jkbase deployments` | Show deployment history |
-| `jkbase logs [-f] [--service X]` | Tail server logs (`-f` to follow) |
+| `jkbase logs [-f] [--service X] [-n N] [--json]` | Tail server logs (`-f` to follow) |
 | `jkbase usage` | Month-to-date metered usage (CPU, bandwidth, storage) |
-| `jkbase quota [--set-storage-gib N]` | Show / restrict per-project quotas |
+| `jkbase quota [--set-storage-gib N] [--set-bandwidth-gib N]` | Show / restrict per-project quotas |
 | `jkbase secret set\|list\|rm` | Manage secrets |
-| `jkbase domain add\|verify\|list\|rm` | Manage custom domains |
+| `jkbase access-key issue\|list\|rm` | Manage S3 object-store access keys |
+| `jkbase domain add\|verify\|list\|rm` | Manage custom domains (`add --site <name>` to bind to one site) |
 | `jkbase repo connect` | Mint a push token + add a local `jkbase` remote (local only) |
 | `jkbase repo github` | Scaffold a GitHub Actions deploy workflow (opt-in; writes a tracked file) |
 | `jkbase repo token\|disconnect` | Re-mint / revoke the git-push token |
@@ -261,6 +319,8 @@ sudo bash tools/setup-bridge.sh    # the runtime network bridge (jkbr0), once pe
 jkbase init you@example.com --api http://127.0.0.1:9090   # bootstrap your local platform
 ```
 
+The S3 object store rides along automatically: the server binds it on `127.0.0.1` (`--storage-port`, default 9091) and the proxy routes `storage.<domain>` to it — no extra process to run.
+
 ### Remote (production server)
 
 One command from your workstation provisions a fresh server end to end — system deps, Firecracker, a release build of jkbase, the **6.12 guest kernel** (built on the box; the layered runtime needs erofs/overlay), the systemd unit, and the isolated build network:
@@ -279,7 +339,7 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    ```
 2. **Build toolchains** — provisioning bakes the busybox `default.ext4`. For Bun and Dockerfile builds you also need `bun.ext4` + `dockerfile.ext4` + the shared base layers. Bake them with `apko` + `tools/dev toolchains` / `tools/dev baselayers` and drop the results in `/var/jkbase/toolchains` and `/var/jkbase/baselayers`. *(Automating this in `provision.sh` is on the list.)*
 3. **Start it:** `ssh you@your-server 'sudo systemctl start jkbase'`
-4. **Point DNS:** `*.your-domain.com → your server's IP` (Firecracker-per-project means each app answers on its own subdomain).
+4. **Point DNS:** `*.your-domain.com → your server's IP` (Firecracker-per-project means each app answers on its own subdomain; the wildcard also covers `api.`, `storage.`, and `console.`).
 5. **Bootstrap:** `jkbase init you@example.com --api https://api.your-domain.com`
 
 Ship a code update later with:
@@ -288,9 +348,24 @@ Ship a code update later with:
 ./tools/deploy-server.sh you@your-server.example.com    # pull, rebuild, drain, restart
 ```
 
+---
+
+## How it works
+
+A single `jkbase-server` process is the control plane, the reverse proxy, and the orchestrator:
+
+- **Routing & TLS.** The proxy terminates HTTPS (Cloudflare DNS-01 ACME for the wildcard, HTTP-01 for custom domains), maps the request's `Host` to a project, and forwards over a per-VM TAP/bridge. Two reserved hosts short-circuit that: `api.` (the control API) and `storage.` (the object-store service). The console is just a normal jkbase project deployed on `console.<domain>`.
+- **On-demand boot & hibernation.** Idle projects (default 5 min) hibernate to a snapshot; the next request wakes them in ~125ms. Over-quota projects stay parked until the monthly reset.
+- **Per-project microVM.** Each project boots its own kernel under Firecracker + the jailer with a content-addressed, layered read-only rootfs (shared Wolfi base + per-language runtime, page-cached across tenants) plus a thin app layer. An in-VM `jkbase-agent` mounts the layers, injects secrets, and serves the app on port 80.
+- **Storage substrate.** Storage is abstracted behind four pluggable roles — control store, lease, data disk, and blob store. The single-host defaults are `redb`, file locks, loop devices, and the local filesystem; cluster backends (etcd, Ceph RBD, S3-compatible) exist behind feature flags but are **not** the production path yet. The platform never assumes S3 for its *own* state — object storage is a product it serves, not a dependency it leans on.
+
 ### Why microVMs instead of containers?
 
-Because "all tenants are untrusted" is a load-bearing assumption here, not a slogan. A shared kernel is a shared fate; a hypervisor boundary is not. Every project boots its own kernel under Firecracker + the jailer, builds run in sealed VMs with **default-deny egress** (a build can reach pinned package registries and nothing else — no SSRF into your control plane), and data disks are fenced read-write-once so a restored or relocated VM can never scribble on a disk another VM still holds. It's more moving parts than `docker run`. It's also a lot harder for tenant #2 to ruin tenant #1's afternoon.
+Because "all tenants are untrusted" is a load-bearing assumption here, not a slogan. A shared kernel is a shared fate; a hypervisor boundary is not. Every project boots its own kernel under Firecracker + the jailer, builds run in sealed VMs with **default-deny egress** (a build can reach pinned package registries and nothing else — no SSRF into your control plane) and a **fetch-then-seal** model (the host tears the network down before the offline compile), shared base layers are integrity-checked with **dm-verity** (a poisoned shared layer can't ride into every tenant), and data disks are fenced read-write-once so a restored or relocated VM can never scribble on a disk another VM still holds. It's more moving parts than `docker run`. It's also a lot harder for tenant #2 to ruin tenant #1's afternoon.
+
+### Status
+
+Single-host is the production configuration today. Static sites, server apps (Bun/Node/Rust/Python/Go + Dockerfile), S3-compatible object storage, secrets, custom domains, metering/quotas, and push-to-deploy are all live. The next arc is the HA / multi-node cluster layer (the substrate seams are in place for it); WASM functions remain experimental.
 
 ---
 
