@@ -7,8 +7,8 @@ spa = true
 
 # Server-side build: push raw source, the platform builds it (no Dockerfile).
 # `language` is optional — it's auto-detected from the source (e.g. bun.lock /
-# bun.lockb / a "bun@…" packageManager). Bun is the lead language; Node/Python/Go
-# build on the same lifecycle.
+# bun.lockb / a "bun@…" packageManager). Bun, Node, Rust, Python and Go are all
+# first-class buildpacks on one lifecycle — jkbase has no lead language.
 [servers.api]
 source = "./server"
 language = "bun"

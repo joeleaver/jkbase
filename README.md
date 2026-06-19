@@ -4,7 +4,7 @@
 
 jkbase is a self-hostable platform for shipping **static sites** and **server apps**, with **S3-compatible object storage** built in — and every project gets its own [Firecracker](https://firecracker-microvm.github.io/) microVM. Not a container. A real VM, with its own kernel, booted in ~125ms. Your neighbors can't read your secrets because they're in a different machine entirely. Blast radius: one.
 
-You push source; the platform builds it **server-side** in a sealed, network-fenced microVM (no Docker on your laptop, no `node_modules` on your conscience), and serves it on HTTPS. Bun is the lead language; Node, Rust, Python and Go ride the same lifecycle, and bring-your-own-Dockerfile is a supported escape hatch for when you have Opinions.
+You push source; the platform builds it **server-side** in a sealed, network-fenced microVM (no Docker on your laptop, no `node_modules` on your conscience), and serves it on HTTPS. Bun, Node, Rust, Python and Go are all first-class — one build lifecycle, no lead language — and bring-your-own-Dockerfile is a supported escape hatch for when you have Opinions.
 
 There are two ways to read this README:
 
@@ -74,7 +74,7 @@ public = "./dist"
 spa = true
 
 # A server, built from source — no Dockerfile, no toolchain on your machine.
-# The language is auto-detected (Bun leads; Node/Rust/Python/Go ride the same lifecycle).
+# The language is auto-detected — Bun, Node, Rust, Python and Go are all first-class, one lifecycle.
 [servers.api]
 source = "./server"
 port = 8080

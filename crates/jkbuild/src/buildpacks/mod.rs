@@ -1,5 +1,7 @@
-//! Per-language buildpack modules. Bun is the lead language; Node, Rust, Python and
-//! Go follow on the same lifecycle.
+//! Per-language buildpack modules — Bun, Node, Rust, Python and Go, all equal
+//! first-class on one lifecycle (no lead language). The registry order is for
+//! detect disambiguation (e.g. Bun is tried before Node because a Bun repo also
+//! carries `package.json`), not a preference.
 
 pub mod bun;
 pub mod dockerfile;

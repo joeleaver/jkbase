@@ -8,7 +8,7 @@
 //!
 //! - [`buildpack`] — the in-process `Buildpack` trait + contexts (libcnb-shape,
 //!   minus libcnb's on-disk TOML/exit-code protocol, since we own both sides).
-//! - [`buildpacks`] — the per-language modules. Bun is the lead language.
+//! - [`buildpacks`] — the per-language modules (Bun, Node, Rust, Python, Go), all first-class.
 //! - [`env`] — layer env accumulation.
 //! - [`export`] — translate a build into the `/out` artifact (index + manifest
 //!   + cache metadata; layer packing).
