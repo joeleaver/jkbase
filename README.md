@@ -331,7 +331,7 @@ One command from your workstation provisions a fresh server end to end — syste
 
 Then, on the server side (`provision.sh` prints these as it finishes):
 
-1. **Secrets / DNS creds** — fill in `/var/jkbase/.env`:
+1. **DNS creds (wildcard TLS via DNS-01)** — fill in `/var/jkbase/.env`:
    ```
    CLOUDFLARE_API_TOKEN=...
    CLOUDFLARE_ZONE_ID=...
@@ -354,7 +354,7 @@ Ship a code update later with:
 
 A single `jkbase-server` process is the control plane, the reverse proxy, and the orchestrator:
 
-- **Routing & TLS.** The proxy terminates HTTPS (Cloudflare DNS-01 ACME for the wildcard, HTTP-01 for custom domains), maps the request's `Host` to a project, and forwards over a per-VM TAP/bridge. Two reserved hosts short-circuit that: `api.` (the control API) and `storage.` (the object-store service). The console is just a normal jkbase project deployed on `console.<domain>`.
+- **Routing & TLS.** The proxy terminates HTTPS (DNS-01 ACME for the wildcard, HTTP-01 for custom domains), maps the request's `Host` to a project, and forwards over a per-VM TAP/bridge. Two reserved hosts short-circuit that: `api.` (the control API) and `storage.` (the object-store service). The console is just a normal jkbase project deployed on `console.<domain>`.
 - **On-demand boot & hibernation.** Idle projects (default 5 min) hibernate to a snapshot; the next request wakes them in ~125ms. Over-quota projects stay parked until the monthly reset.
 - **Per-project microVM.** Each project boots its own kernel under Firecracker + the jailer with a content-addressed, layered read-only rootfs (shared Wolfi base + per-language runtime, page-cached across tenants) plus a thin app layer. An in-VM `jkbase-agent` mounts the layers, injects secrets, and serves the app on port 80.
 - **Storage substrate.** Storage is abstracted behind four pluggable roles — control store, lease, data disk, and blob store. The single-host defaults are `redb`, file locks, loop devices, and the local filesystem; cluster backends (etcd, Ceph RBD, S3-compatible) exist behind feature flags but are **not** the production path yet. The platform never assumes S3 for its *own* state — object storage is a product it serves, not a dependency it leans on.
