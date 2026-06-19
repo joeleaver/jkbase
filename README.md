@@ -147,7 +147,7 @@ source = "./functions/hello"   # builds to a wasm component, server-side
 # schedule = "*/5 * * * *"      # optional: run it on a cron instead of (or as well as) on request
 ```
 
-> **Heads up:** functions are early. The runtime and orchestration contract exist, but the multi-language build toolchain isn't part of the standard image bake yet — treat this as experimental, not production. Static sites and servers are the load-bearing deploy targets today.
+> **Heads up:** functions are early, and the limits above are a stage, not a stance. Today's runtime is the legacy WASI **preview1** path (`_start` + stdin/stdout JSON), which has no sockets, filesystem, or env by construction — so a function is a hermetic compute box *for now*. The planned upgrade migrates the runtime to the **WASI 0.2 component model** (`wasi:http`), which brings outbound `fetch` and an async event loop with it (host-mediated, so egress can be policy-gated). That migration is deliberately deferred off the critical path behind the server/OCI work, so treat functions as experimental, not production — static sites and servers are the load-bearing deploy targets today.
 
 ### Routing & custom domains
 
