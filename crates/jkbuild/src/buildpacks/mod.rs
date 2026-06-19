@@ -1,7 +1,6 @@
-//! Per-language buildpack modules — Bun, Node, Rust, Python and Go, all equal
-//! first-class on one lifecycle (no lead language). The registry order is for
-//! detect disambiguation (e.g. Bun is tried before Node because a Bun repo also
-//! carries `package.json`), not a preference.
+//! Per-language buildpack modules: Bun, Node, Rust, Python and Go (plus a
+//! Dockerfile escape hatch). Order matters only for detect disambiguation — Bun
+//! is tried before Node since a Bun repo also carries `package.json`.
 
 pub mod bun;
 pub mod dockerfile;

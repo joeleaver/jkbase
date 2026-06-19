@@ -1,5 +1,4 @@
-//! The Bun buildpack. Bun was the first buildpack jkbase shipped, but it's one
-//! of several equal first-class languages — not a privileged "lead".
+//! The Bun buildpack.
 //!
 //! Bun is the easiest target: a single self-contained glibc binary that is *also*
 //! the package manager. detect keys off Bun's lockfiles/config; fetch runs
