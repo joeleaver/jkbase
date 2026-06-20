@@ -14,7 +14,7 @@
 
 use crate::buildpack::{BuildContext, BuildOutput, DetectContext};
 use crate::env::BuildEnv;
-use crate::{buildpacks, export};
+use crate::{buildpacks, export, function_build};
 use anyhow::{Context, Result};
 use jkbuild_types::{CacheMeta, Index, FETCH_COMPLETE_MARKER};
 use std::ffi::CString;
@@ -78,8 +78,15 @@ pub fn run() -> Result<i32> {
     let builder = parse_cmdline_value(&cmdline, "jkbase.builder");
     let dockerfile = parse_cmdline_value(&cmdline, "jkbase.dockerfile");
     let mode = ExportMode::from_cmdline(&cmdline);
+    let kind = parse_cmdline_value(&cmdline, "jkbase.kind");
 
-    let result = drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode);
+    let result = if kind.as_deref() == Some("function") {
+        // Function target: the curated per-language function-builder → /out/function.wasm,
+        // not the server detect/export path.
+        drive_function(proxy, lang.as_deref())
+    } else {
+        drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode)
+    };
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
@@ -155,6 +162,42 @@ fn drive(
 
     // 4. export.
     export_artifact(&output, mode)
+}
+
+/// Build a WASM function: detect the language, fetch→seal→compile to ONE `wasi:http`
+/// component, and write it to `/out/function.wasm` (the artifact the host collects). Same
+/// host-enforced network boundary as the server path — network only during fetch.
+fn drive_function(proxy: Option<String>, lang: Option<&str>) -> Result<()> {
+    let registry = function_build::registry();
+    let chosen = function_build::select(&registry, Path::new(SRC), lang)
+        .context("no function builder matched the source")?;
+    append_log(&format!("jkbuild: matched function builder {}\n", chosen.id()))?;
+
+    prepare_workspace()?;
+    let mut ctx = function_build::FunctionContext {
+        app_dir: Path::new(WORKSPACE),
+        cache_dir: Path::new(CACHE),
+        proxy: proxy.clone(),
+    };
+
+    if proxy.is_some() {
+        chosen.fetch(&mut ctx).context("function fetch phase")?;
+        // Tell the host it may seal the network now, then compile offline.
+        println!("{FETCH_COMPLETE_MARKER}");
+        let _ = std::io::stdout().flush();
+        wait_for_seal(proxy.as_deref());
+        ctx.proxy = None;
+    } else {
+        chosen.fetch(&mut ctx).context("function fetch phase (offline)")?;
+    }
+
+    let wasm = chosen.compile(&mut ctx).context("function compile phase")?;
+    let out = Path::new(OUT).join("function.wasm");
+    std::fs::copy(&wasm, &out)
+        .with_context(|| format!("copy {} → {}", wasm.display(), out.display()))?;
+    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    append_log(&format!("jkbuild: wrote function.wasm ({bytes} bytes)\n"))?;
+    Ok(())
 }
 
 fn export_artifact(output: &BuildOutput, mode: ExportMode) -> Result<()> {

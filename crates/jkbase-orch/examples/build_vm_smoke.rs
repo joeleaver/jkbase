@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         egress_proxy: None,
         lang_hint: None,
         export_layered: false,
+        build_function: false,
         builder_hint: None,
         dockerfile: None,
         fetch_deadline: Duration::from_secs(120),

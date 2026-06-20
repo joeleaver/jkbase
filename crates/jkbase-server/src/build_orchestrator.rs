@@ -132,7 +132,14 @@ impl BuildDeps {
 /// first). Pure so it can be unit-tested without a full [`BuildDeps`].
 fn toolchain_candidates(kind_name: &str, language: Option<&str>) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
-    if let Some(lang) = language.filter(|l| !l.is_empty()) {
+    // Functions use ONE per-kind toolchain image (cargo + wasm32-wasip2 + the JS
+    // componentizer), never a per-language *server* image — a Rust function must never
+    // grab the server `rust.ext4` (no wasm target, no cargo-component): it would build a
+    // native binary, not a `wasi:http` component. Only the server path keys the image on
+    // language; the in-VM function-builder dispatches on language itself.
+    if kind_name != "function"
+        && let Some(lang) = language.filter(|l| !l.is_empty())
+    {
         candidates.push(format!("{lang}.ext4"));
     }
     candidates.push(format!("jkbuild-{kind_name}.ext4"));
@@ -1259,6 +1266,9 @@ async fn build_one_target_inner(
         // overlays it on the shared base/runtime layers (or, for a dockerfile build,
         // runs the single self-contained app layer with no base/runtime).
         export_layered: true,
+        // Function targets run the in-VM function-builder (→ /out/function.wasm), which
+        // ignores the server export mode above.
+        build_function: matches!(spec.kind, TargetKind::Function),
         builder_hint: is_dockerfile.then(|| "dockerfile".to_string()),
         dockerfile: spec.dockerfile.clone(),
         fetch_deadline: deps.fetch_deadline,
@@ -2039,6 +2049,15 @@ mod tests {
                 .map(String::from)
                 .to_vec()
         );
+        // The collision fix: a Rust *function* must NOT pick the server `rust.ext4` — the
+        // language hint is ignored for the function kind (one per-kind image).
+        assert_eq!(
+            toolchain_candidates("function", Some("rust")),
+            ["jkbuild-function.ext4", "function.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec(),
+            "a function must never select a per-language server toolchain"
+        );
     }
 
     #[test]
@@ -2395,6 +2414,7 @@ esac
             egress_proxy: Some(net.proxy_url()),
             lang_hint: None,
             export_layered: false,
+            build_function: false,
             builder_hint: None,
             dockerfile: None,
             fetch_deadline: Duration::from_secs(20),
