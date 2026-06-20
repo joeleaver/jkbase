@@ -120,6 +120,7 @@ esac
         egress_proxy: Some(format!("http://{GW}:{PORT}")), // non-empty → two-phase
         lang_hint: None,
         export_layered: false,
+        build_function: false,
         builder_hint: None,
         dockerfile: None,
         fetch_deadline: Duration::from_secs(20),

@@ -9,6 +9,8 @@
 //! - [`buildpack`] — the in-process `Buildpack` trait + contexts (libcnb-shape,
 //!   minus libcnb's on-disk TOML/exit-code protocol, since we own both sides).
 //! - [`buildpacks`] — the per-language modules: Bun, Node, Rust, Python, Go.
+//! - [`function_build`] — the function-builder matrix (NOT CNB): source → ONE
+//!   `wasi:http` component (`/out/function.wasm`), language-dispatched.
 //! - [`env`] — layer env accumulation.
 //! - [`export`] — translate a build into the `/out` artifact (index + manifest
 //!   + cache metadata; layer packing).
@@ -18,6 +20,7 @@ pub mod buildpack;
 pub mod buildpacks;
 pub mod env;
 pub mod export;
+pub mod function_build;
 pub mod lifecycle;
 
 pub use jkbuild_types as types;

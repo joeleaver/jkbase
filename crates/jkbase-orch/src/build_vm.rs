@@ -132,6 +132,10 @@ pub struct BuildVmConfig {
     /// Request the layered artifact (content-addressed erofs layers + index.json)
     /// instead of the flat `rootfs.tar.gz` — passed as `jkbase.export=layered`.
     pub export_layered: bool,
+    /// Build a WASM function (one `wasi:http` component → `/out/function.wasm`) instead
+    /// of a server — passed as `jkbase.kind=function`. The in-VM lifecycle then runs the
+    /// function-builder (language-dispatched) rather than the server buildpacks.
+    pub build_function: bool,
     /// Build strategy override for the in-VM lifecycle's detect, passed via the
     /// kernel cmdline (`jkbase.builder=`). `Some("dockerfile")` forces the
     /// Dockerfile escape-hatch buildpack; `None` → normal language detection.
@@ -391,6 +395,9 @@ impl BuildVm {
         }
         if config.export_layered {
             boot_args.push_str(" jkbase.export=layered");
+        }
+        if config.build_function {
+            boot_args.push_str(" jkbase.kind=function");
         }
         if let Some(builder) = &config.builder_hint
             && !builder.is_empty()

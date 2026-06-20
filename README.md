@@ -137,17 +137,39 @@ port = 8080
 
 Volumes persist across deploys. Build output does not — that's the point.
 
-### WASM functions (experimental)
+### Functions (WASI components)
 
-The in-VM runtime can execute WASM (via [wasmtime](https://wasmtime.dev/)) on request or on a cron schedule, and the config + build contract are wired:
+Write a function in **Rust or JavaScript/TypeScript**; the platform builds it server-side
+(no local toolchain) to a single **`wasi:http` component** and runs it in the project's
+microVM — on request or on a cron schedule. One component ABI
+(`wasi:http/incoming-handler`) across every language, executed via
+[wasmtime](https://wasmtime.dev/).
 
 ```toml
 [functions.hello]
-source = "./functions/hello"   # builds to a wasm component, server-side
-# schedule = "*/5 * * * *"      # optional: run it on a cron instead of (or as well as) on request
+source   = "./functions/hello"   # source dir; built to a wasi:http component server-side
+language = "rust"                # rust | javascript (auto-detected from the source if omitted)
+# schedule = "*/5 * * * *"       # optional: also (or instead) run it on a cron
 ```
 
-> **Heads up:** functions are early, and the limits above are a stage, not a stance. Today's runtime is the legacy WASI **preview1** path (`_start` + stdin/stdout JSON), which has no sockets, filesystem, or env by construction — so a function is a hermetic compute box *for now*. The planned upgrade migrates the runtime to the **WASI 0.2 component model** (`wasi:http`), which brings outbound `fetch` and an async event loop with it (host-mediated, so egress can be policy-gated). That migration is deliberately deferred off the critical path behind the server/OCI work, so treat functions as experimental, not production — static sites and servers are the load-bearing deploy targets today.
+A Rust function exports a handler via the `wasi` crate's `proxy::export!`; a JS function is
+a Service-Worker-style `addEventListener('fetch', …)` handler (ComponentizeJS /
+StarlingMonkey). See `templates/function-rust` and `templates/function-js`.
+
+**What functions can do today:** handle HTTP, compute, run on a schedule, and read their
+project's **secrets** — Rust via `std::env`, JS via `process.env`. Each invocation is
+sandboxed and bounded (epoch + wall-clock + memory caps) and runs fresh — no state
+persists between calls.
+
+**Current limits (being lifted):** no **outbound network** yet — a function can't `fetch`
+the internet or reach the object store. Outbound is the next arc: one host-mediated,
+default-deny, SSRF-guarded path that delivers own-bucket object-store access *and*
+allowlisted egress together. (A function can already *hold* an API token via secrets — it
+just can't make the call yet.)
+
+> The legacy WASI **preview1** path (`_start` + stdin/stdout JSON) still runs unchanged
+> beside the component runtime, so older functions keep working; `runtime = "wasip1"` is a
+> supported build path for Rust.
 
 ### Routing & custom domains
 
@@ -365,7 +387,7 @@ Because "all tenants are untrusted" is a load-bearing assumption here, not a slo
 
 ### Status
 
-Single-host is the production configuration today. Static sites, server apps (Bun/Node/Rust/Python/Go + Dockerfile), S3-compatible object storage, secrets, custom domains, metering/quotas, and push-to-deploy are all live. The next arc is the HA / multi-node cluster layer (the substrate seams are in place for it); WASM functions remain experimental.
+Single-host is the production configuration today. Static sites, server apps (Bun/Node/Rust/Python/Go + Dockerfile), S3-compatible object storage, secrets, custom domains, metering/quotas, and push-to-deploy are all live. Functions (Rust/JS, built server-side to `wasi:http` components) are a supported deploy target too, with outbound network — object-store access + allowlisted egress — as the next capability. The next infrastructure arc is the HA / multi-node cluster layer (the substrate seams are in place for it).
 
 ---
 

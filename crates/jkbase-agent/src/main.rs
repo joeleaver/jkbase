@@ -7,7 +7,7 @@ mod static_server;
 use anyhow::Result;
 use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -319,6 +319,20 @@ struct SiteEntry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `jkbase-agent --precompile <in.wasm> <out.cwasm>`: AOT-compile a function with the
+    // runtime's exact engine config so the agent deserializes it at boot instead of
+    // recompiling the big JS engine. Invoked by the host deploy pipeline (it ships this
+    // same binary), so the precompiler and loader configs can never drift.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--precompile") {
+        let (Some(input), Some(output)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: jkbase-agent --precompile <in.wasm> <out.cwasm>");
+            std::process::exit(2);
+        };
+        function_runtime::precompile(Path::new(input), Path::new(output))?;
+        return Ok(());
+    }
+
     if is_pid1() {
         mount_filesystems();
         seed_entropy();
@@ -802,6 +816,19 @@ fn upgrade_permits() -> &'static Arc<tokio::sync::Semaphore> {
     &PERMITS
 }
 
+/// Bound on concurrent function invocations inside this agent (one tenant VM). Caps the
+/// peak CPU/threads/memory a flood of (possibly slow, fuel-heavy) functions can pin in the
+/// process that also serves this project's sites + servers. Waiters queue rather than 503.
+fn function_permits() -> &'static Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
+    &PERMITS
+}
+
+/// Max request body bytes marshalled into a function (matches the response cap). The body
+/// is fully buffered here, upstream of the runtime, so the bound belongs here.
+const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
+
 async fn invoke_function(
     state: Arc<AgentState>,
     name: &str,
@@ -816,13 +843,12 @@ async fn invoke_function(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let body = match req.into_body().collect().await {
+    let body = match Limited::new(req.into_body(), MAX_REQUEST_BODY).collect().await {
         Ok(b) => b.to_bytes().to_vec(),
-        Err(e) => {
-            error!(error = %e, "failed to read request body");
+        Err(_) => {
             return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("failed to read body")))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Full::new(Bytes::from("request body too large")))
                 .unwrap();
         }
     };
@@ -835,26 +861,23 @@ async fn invoke_function(
         body,
     };
 
-    let func_resp = {
-        let name = name.to_string();
-        let state = state.clone();
-        tokio::task::spawn_blocking(move || state.functions.invoke(&name, func_req)).await
-    };
+    // Hold a concurrency permit for the duration of the invocation (see function_permits).
+    let _permit = function_permits()
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("function semaphore is never closed");
 
-    let func_resp = match func_resp {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
+    let func_resp = match state.functions.invoke(name, func_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Log the detail server-side; return a GENERIC body — the error string can carry
+            // request-derived data (headers/paths a caller controls) and must not be
+            // reflected back from the platform-trusted agent (review H1).
             error!(function = name, error = %e, "function invocation error");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(format!("function error: {e}"))))
-                .unwrap();
-        }
-        Err(e) => {
-            error!(function = name, error = %e, "function task panicked");
-            return Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from("internal error")))
+                .body(Full::new(Bytes::from("function error")))
                 .unwrap();
         }
     };

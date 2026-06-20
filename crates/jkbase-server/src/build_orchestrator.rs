@@ -101,6 +101,11 @@ pub struct BuildDeps {
     /// Sparse logical size of a per-`(project,language)` build cache image (`vde`);
     /// grows on demand, billed by ACTUAL blocks against the project storage quota.
     pub cache_size_bytes: u64,
+    /// The in-VM agent binary (musl, runs on the host too). Used to AOT-precompile a
+    /// built function `.wasm` → sibling `.cwasm` (`--precompile`) so the runtime VM
+    /// deserializes at boot instead of recompiling the multi-MB JS component. `None`
+    /// disables it (the agent falls back to compiling the `.wasm`).
+    pub agent_bin: Option<PathBuf>,
 }
 
 /// Get-or-create the per-`(project,language)` cache lock (the `LogShipper::project_lock`
@@ -132,7 +137,14 @@ impl BuildDeps {
 /// first). Pure so it can be unit-tested without a full [`BuildDeps`].
 fn toolchain_candidates(kind_name: &str, language: Option<&str>) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
-    if let Some(lang) = language.filter(|l| !l.is_empty()) {
+    // Functions use ONE per-kind toolchain image (cargo + wasm32-wasip2 + the JS
+    // componentizer), never a per-language *server* image — a Rust function must never
+    // grab the server `rust.ext4` (no wasm target, no cargo-component): it would build a
+    // native binary, not a `wasi:http` component. Only the server path keys the image on
+    // language; the in-VM function-builder dispatches on language itself.
+    if kind_name != "function"
+        && let Some(lang) = language.filter(|l| !l.is_empty())
+    {
         candidates.push(format!("{lang}.ext4"));
     }
     candidates.push(format!("jkbuild-{kind_name}.ext4"));
@@ -1259,6 +1271,9 @@ async fn build_one_target_inner(
         // overlays it on the shared base/runtime layers (or, for a dockerfile build,
         // runs the single self-contained app layer with no base/runtime).
         export_layered: true,
+        // Function targets run the in-VM function-builder (→ /out/function.wasm), which
+        // ignores the server export mode above.
+        build_function: matches!(spec.kind, TargetKind::Function),
         builder_hint: is_dockerfile.then(|| "dockerfile".to_string()),
         dockerfile: spec.dockerfile.clone(),
         fetch_deadline: deps.fetch_deadline,
@@ -1342,6 +1357,18 @@ async fn build_one_target_inner(
             if !build_output::dump_file(&output_img, "/function.wasm", &dest)? {
                 bail!("function build produced no /function.wasm artifact");
             }
+            // Best-effort AOT precompile to a sibling `.cwasm`, moving the (multi-second,
+            // for the big JS engine) component compile off the runtime VM's boot/wake path
+            // to here. Non-fatal: the agent falls back to compiling the `.wasm` if the
+            // `.cwasm` is absent or CPU/version-incompatible.
+            if let Some(agent_bin) = deps.agent_bin.clone() {
+                let wasm = dest.clone();
+                let cwasm = dest.with_extension("cwasm");
+                let _ = tokio::task::spawn_blocking(move || {
+                    precompile_function(&agent_bin, &wasm, &cwasm)
+                })
+                .await;
+            }
         }
         TargetKind::Server => {
             collect_layered_server(
@@ -1376,6 +1403,34 @@ async fn build_one_target_inner(
 /// server manifest augmented with the layer refs the host deploy path needs
 /// (`app_layer` filename + `runtime` language). The shared base/runtime layers are
 /// injected host-side by digest, not carried in the tenant's build output.
+/// Run `jkbase-agent --precompile <wasm> <cwasm>` (host-side; the agent is a musl static
+/// binary). Best-effort: on any failure the `.cwasm` is removed and the runtime compiles
+/// the `.wasm` at boot, so functions still work — this only trades a slow first boot for a
+/// slower deploy.
+fn precompile_function(agent_bin: &Path, wasm: &Path, cwasm: &Path) {
+    match std::process::Command::new(agent_bin)
+        .arg("--precompile")
+        .arg(wasm)
+        .arg(cwasm)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            info!(wasm = %wasm.display(), "precompiled function → .cwasm");
+        }
+        Ok(out) => {
+            warn!(
+                wasm = %wasm.display(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "function precompile failed (non-fatal; compiles at boot)"
+            );
+            let _ = std::fs::remove_file(cwasm);
+        }
+        Err(e) => {
+            warn!(wasm = %wasm.display(), error = %e, "could not run agent --precompile (non-fatal)");
+        }
+    }
+}
+
 fn collect_layered_server(
     output_img: &Path,
     staged: &Path,
@@ -2039,6 +2094,15 @@ mod tests {
                 .map(String::from)
                 .to_vec()
         );
+        // The collision fix: a Rust *function* must NOT pick the server `rust.ext4` — the
+        // language hint is ignored for the function kind (one per-kind image).
+        assert_eq!(
+            toolchain_candidates("function", Some("rust")),
+            ["jkbuild-function.ext4", "function.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec(),
+            "a function must never select a per-language server toolchain"
+        );
     }
 
     #[test]
@@ -2246,6 +2310,7 @@ public = "./public"
             fetch_deadline: Duration::from_secs(60),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 512 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2395,6 +2460,7 @@ esac
             egress_proxy: Some(net.proxy_url()),
             lang_hint: None,
             export_layered: false,
+            build_function: false,
             builder_hint: None,
             dockerfile: None,
             fetch_deadline: Duration::from_secs(20),
@@ -2721,6 +2787,7 @@ name = "api"
             fetch_deadline: Duration::from_secs(if workload.networked() { 180 } else { 120 }),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 1024 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2847,6 +2914,7 @@ name = "api"
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 1024 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -3391,6 +3459,157 @@ name = "api"
         res
     }
 
+    /// Function deploy e2e — the runtime DEPLOY + SERVE half end to end. A built
+    /// `wasi:http` component (the committed fixture, so no build VM is needed) is staged
+    /// as a function-only deployment, the host bakes the metadata image, and a **real
+    /// `jkbase-agent` runtime VM** boots, loads it, and serves `GET /functions/hello` →
+    /// HTTP 200 — with the injected secret readable and egress denied. Complements
+    /// `function_build_smoke` (the BUILD half).
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       <test-bin> --ignored --nocapture function_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "function deploy e2e: needs KVM + root + musl agent"]
+    async fn function_pipeline_to_http_200() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Ok(data) = std::env::var("JKB_DATA") else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let data = PathBuf::from(data);
+        let fc_release = std::env::var("JKB_FC_RELEASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data.join("release-v1.15.1-x86_64"));
+        let Ok(agent_bin) = std::env::var("JKB_AGENT").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
+            return;
+        };
+        if !agent_bin.exists() {
+            eprintln!("skip: agent binary {} missing", agent_bin.display());
+            return;
+        }
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
+        };
+        if !kernel.exists() {
+            eprintln!("skip: no kernel at {}", kernel.display());
+            return;
+        }
+
+        // Stage a function-only deployment: the committed wasi:http component as
+        // `_functions/hello.wasm`, with a sidecar injecting a secret (the runtime path the
+        // server's inject_function_secrets produces).
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../jkbase-agent/tests/fixtures/echo-component.wasm");
+        assert!(fixture.exists(), "missing component fixture {}", fixture.display());
+        let staged = data.join("fn-e2e-staged");
+        let _ = std::fs::remove_dir_all(&staged);
+        let funcs = staged.join("_functions");
+        std::fs::create_dir_all(&funcs).unwrap();
+        std::fs::copy(&fixture, funcs.join("hello.wasm")).unwrap();
+        std::fs::write(
+            funcs.join("hello.json"),
+            r#"{"runtime":"wasi-http","env":{"DEMO_SECRET":"e2e-secret"}}"#,
+        )
+        .unwrap();
+
+        // Empty layer plan (no servers) + metadata image (carries _functions).
+        let plan =
+            crate::layer_plan::compute_layer_plan(&staged, &data.join("baselayers"), false, true)
+                .expect("compute layer plan");
+        assert!(plan.layer_paths.is_empty(), "a function-only project has no erofs layers");
+        let meta_img = data.join("fn-e2e-metadata.ext4");
+        crate::layer_plan::build_metadata_image(&staged, &plan, &Default::default(), &meta_img)
+            .expect("build the metadata image");
+
+        // Minimal agent rootfs (vda): the musl agent as /sbin/init (no verity needed).
+        let rootfs_stage = data.join("fn-e2e-vda-stage");
+        let _ = std::fs::remove_dir_all(&rootfs_stage);
+        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
+            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+        }
+        std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = rootfs_stage.join("sbin/init");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let rootfs_img = data.join("fn-e2e-vda.ext4");
+        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("fne2e", "172.23.0.1", "172.23.0.2", "AA:FC:00:00:23:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = data.join(format!("{tag}-run"));
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("runtime VM should start");
+
+        // GET /functions/hello (poll_http_200 only hits `/`).
+        let body = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            let mut out = None;
+            while std::time::Instant::now() < deadline {
+                if let Ok(mut s) = tokio::net::TcpStream::connect((guest_ip, 80u16)).await {
+                    let _ = s
+                        .write_all(b"GET /functions/hello HTTP/1.0\r\nHost: jkbase\r\n\r\n")
+                        .await;
+                    let mut buf = Vec::new();
+                    if s.read_to_end(&mut buf).await.is_ok() {
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, b)) = text.split_once("\r\n\r\n")
+                            && head.lines().next().is_some_and(|l| l.contains(" 200 "))
+                        {
+                            out = Some(b.trim().to_string());
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            out
+        };
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+
+        let body = body.expect("function should serve HTTP 200 at /functions/hello");
+        eprintln!("function response:\n{body}");
+        assert!(body.contains("hello from a wasi:http component"), "got: {body}");
+        assert!(body.contains("DEMO_SECRET=e2e-secret"), "injected secret must be readable: {body}");
+        assert!(body.contains("egress=DENIED"), "egress must be denied: {body}");
+    }
+
     /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun
     /// server is built through `run_project_build` (→ a layered app erofs blob),
     /// the host resolves the layer plan + bakes the metadata image
@@ -3646,6 +3865,7 @@ name = "api"
             fetch_deadline: Duration::from_secs(300),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 512 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
