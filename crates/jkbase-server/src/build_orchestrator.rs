@@ -3459,6 +3459,157 @@ name = "api"
         res
     }
 
+    /// Function deploy e2e — the runtime DEPLOY + SERVE half end to end. A built
+    /// `wasi:http` component (the committed fixture, so no build VM is needed) is staged
+    /// as a function-only deployment, the host bakes the metadata image, and a **real
+    /// `jkbase-agent` runtime VM** boots, loads it, and serves `GET /functions/hello` →
+    /// HTTP 200 — with the injected secret readable and egress denied. Complements
+    /// `function_build_smoke` (the BUILD half).
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       <test-bin> --ignored --nocapture function_pipeline_to_http_200
+    #[tokio::test]
+    #[ignore = "function deploy e2e: needs KVM + root + musl agent"]
+    async fn function_pipeline_to_http_200() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Ok(data) = std::env::var("JKB_DATA") else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let data = PathBuf::from(data);
+        let fc_release = std::env::var("JKB_FC_RELEASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data.join("release-v1.15.1-x86_64"));
+        let Ok(agent_bin) = std::env::var("JKB_AGENT").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
+            return;
+        };
+        if !agent_bin.exists() {
+            eprintln!("skip: agent binary {} missing", agent_bin.display());
+            return;
+        }
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
+        };
+        if !kernel.exists() {
+            eprintln!("skip: no kernel at {}", kernel.display());
+            return;
+        }
+
+        // Stage a function-only deployment: the committed wasi:http component as
+        // `_functions/hello.wasm`, with a sidecar injecting a secret (the runtime path the
+        // server's inject_function_secrets produces).
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../jkbase-agent/tests/fixtures/echo-component.wasm");
+        assert!(fixture.exists(), "missing component fixture {}", fixture.display());
+        let staged = data.join("fn-e2e-staged");
+        let _ = std::fs::remove_dir_all(&staged);
+        let funcs = staged.join("_functions");
+        std::fs::create_dir_all(&funcs).unwrap();
+        std::fs::copy(&fixture, funcs.join("hello.wasm")).unwrap();
+        std::fs::write(
+            funcs.join("hello.json"),
+            r#"{"runtime":"wasi-http","env":{"DEMO_SECRET":"e2e-secret"}}"#,
+        )
+        .unwrap();
+
+        // Empty layer plan (no servers) + metadata image (carries _functions).
+        let plan =
+            crate::layer_plan::compute_layer_plan(&staged, &data.join("baselayers"), false, true)
+                .expect("compute layer plan");
+        assert!(plan.layer_paths.is_empty(), "a function-only project has no erofs layers");
+        let meta_img = data.join("fn-e2e-metadata.ext4");
+        crate::layer_plan::build_metadata_image(&staged, &plan, &Default::default(), &meta_img)
+            .expect("build the metadata image");
+
+        // Minimal agent rootfs (vda): the musl agent as /sbin/init (no verity needed).
+        let rootfs_stage = data.join("fn-e2e-vda-stage");
+        let _ = std::fs::remove_dir_all(&rootfs_stage);
+        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data"] {
+            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+        }
+        std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = rootfs_stage.join("sbin/init");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let rootfs_img = data.join("fn-e2e-vda.ext4");
+        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("fne2e", "172.23.0.1", "172.23.0.2", "AA:FC:00:00:23:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = data.join(format!("{tag}-run"));
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("runtime VM should start");
+
+        // GET /functions/hello (poll_http_200 only hits `/`).
+        let body = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            let mut out = None;
+            while std::time::Instant::now() < deadline {
+                if let Ok(mut s) = tokio::net::TcpStream::connect((guest_ip, 80u16)).await {
+                    let _ = s
+                        .write_all(b"GET /functions/hello HTTP/1.0\r\nHost: jkbase\r\n\r\n")
+                        .await;
+                    let mut buf = Vec::new();
+                    if s.read_to_end(&mut buf).await.is_ok() {
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, b)) = text.split_once("\r\n\r\n")
+                            && head.lines().next().is_some_and(|l| l.contains(" 200 "))
+                        {
+                            out = Some(b.trim().to_string());
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            out
+        };
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+
+        let body = body.expect("function should serve HTTP 200 at /functions/hello");
+        eprintln!("function response:\n{body}");
+        assert!(body.contains("hello from a wasi:http component"), "got: {body}");
+        assert!(body.contains("DEMO_SECRET=e2e-secret"), "injected secret must be readable: {body}");
+        assert!(body.contains("egress=DENIED"), "egress must be denied: {body}");
+    }
+
     /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun
     /// server is built through `run_project_build` (→ a layered app erofs blob),
     /// the host resolves the layer plan + bakes the metadata image
