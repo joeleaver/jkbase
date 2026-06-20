@@ -247,6 +247,8 @@ struct HostState {
     limits: StoreLimits,
     egress: ResolvedEgress,
     egress_ctx: Arc<EgressContext>,
+    /// This function's name — stamped onto each egress observe record.
+    function: String,
 }
 
 impl IoView for HostState {
@@ -281,15 +283,21 @@ impl WasiHttpView for HostState {
     ) -> HttpResult<HostFutureIncomingResponse> {
         let ctx = self.egress_ctx.clone();
         let policy = self.egress.clone();
+        let function = self.function.clone();
         let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(gate_send(request, config, ctx, policy).await)
+            Ok(gate_send(request, config, ctx, policy, function).await)
         });
         Ok(HostFutureIncomingResponse::pending(handle))
     }
 }
 
 impl HostState {
-    fn new(env: &BTreeMap<String, String>, egress: ResolvedEgress, egress_ctx: Arc<EgressContext>) -> Self {
+    fn new(
+        env: &BTreeMap<String, String>,
+        egress: ResolvedEgress,
+        egress_ctx: Arc<EgressContext>,
+        function: String,
+    ) -> Self {
         let mut builder = WasiCtxBuilder::new();
         // `wasi:sockets` STAYS denied — HTTP egress is enabled ONLY through `send_request`,
         // so the SSRF gate has exactly one door (P0-EGRESS-ONEDOOR). The guest never resolves
@@ -312,6 +320,7 @@ impl HostState {
                 .build(),
             egress,
             egress_ctx,
+            function,
         }
     }
 }
@@ -507,6 +516,7 @@ impl FunctionRuntime {
                     env.clone(),
                     egress.clone(),
                     self.egress_ctx.clone(),
+                    name.to_string(),
                     req,
                 )
                 .await
@@ -602,9 +612,10 @@ async fn invoke_component(
     env: BTreeMap<String, String>,
     egress: ResolvedEgress,
     egress_ctx: Arc<EgressContext>,
+    function: String,
     req: FunctionRequest,
 ) -> Result<FunctionResponse> {
-    let mut store = Store::new(pre.engine(), HostState::new(&env, egress, egress_ctx));
+    let mut store = Store::new(pre.engine(), HostState::new(&env, egress, egress_ctx, function));
     store.set_epoch_deadline(epoch_deadline_ticks());
     store.limiter(|s| &mut s.limits);
 
@@ -726,7 +737,8 @@ mod tests {
     /// `fetch` is denied (DnsError/timeout or, post-resolution, the policy), proving the gate
     /// is wired without a live upstream.
     fn test_rt() -> FunctionRuntime {
-        let ctx = EgressContext::new(&jkbase_common::config::PlatformEgress::default())
+        let sink = std::sync::Arc::new(crate::log_sink::LogSink::new());
+        let ctx = EgressContext::new(&jkbase_common::config::PlatformEgress::default(), sink)
             .expect("build egress context");
         FunctionRuntime::new(ctx)
     }

@@ -38,8 +38,10 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::HOST;
 use hyper_util::rt::TokioIo;
+use crate::log_sink::LogSink;
 use jkbase_common::config::{PlatformEgress, ResolvedEgress};
 use jkbase_common::egress::{host_allowed, ip_is_public};
+use jkbase_common::logs::{EgressEvent, Verdict};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -101,12 +103,15 @@ pub struct EgressContext {
     tls: Arc<rustls::ClientConfig>,
     inflight: Arc<Semaphore>,
     rate: Mutex<TokenBucket>,
+    /// The shared log sink — every egress decision is recorded into its reserved
+    /// `stream == "egress"` channel (observe-by-default; P0-OBS-UNCONDITIONAL).
+    log_sink: Arc<LogSink>,
 }
 
 impl EgressContext {
     /// Build the shared context from the host-asserted platform facts (`_platform.json`).
     /// A malformed `platform_ips` entry is dropped (logged), never treated as "allow".
-    pub fn new(platform: &PlatformEgress) -> Result<Arc<Self>> {
+    pub fn new(platform: &PlatformEgress, log_sink: Arc<LogSink>) -> Result<Arc<Self>> {
         let resolver = build_resolver();
         let tls = build_tls_config();
         let mut platform_ips = HashSet::new();
@@ -130,8 +135,36 @@ impl EgressContext {
             tls,
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_OUTBOUND)),
             rate: Mutex::new(TokenBucket::new(RATE_BURST, RATE_REFILL_PER_SEC)),
+            log_sink,
         }))
     }
+}
+
+/// Record one egress decision into the reserved `stream == "egress"` channel (host-only,
+/// coalesced; P0-OBS-UNCONDITIONAL / -STREAM-RESERVED). Metadata only — see [`EgressEvent`].
+async fn emit(
+    ctx: &EgressContext,
+    function: &str,
+    host: &str,
+    port: u16,
+    method: &str,
+    verdict: Verdict,
+    dest_ip: Option<String>,
+) {
+    ctx.log_sink
+        .push_egress(EgressEvent {
+            function: function.to_string(),
+            dest_host: host.to_string(),
+            dest_port: port,
+            dest_ip,
+            verdict,
+            method: method.to_string(),
+            count: 1,
+            bytes_out: 0,
+            bytes_in: 0,
+            status: None,
+        })
+        .await;
 }
 
 /// Build the pinned resolver: ONLY `172.16.0.1:53`, IPv4-only (we refuse v6 anyway),
@@ -206,11 +239,13 @@ impl TokenBucket {
     }
 }
 
-/// The egress decision: which vetted address to dial, or a typed deny.
+/// The egress decision: which vetted address to dial, or a typed deny with the manifest
+/// verdict that classifies WHY (so the observe record distinguishes sandbox vs allowlist vs
+/// the hard platform fence, which share an `ErrorCode`).
 enum Decision {
     /// Dial exactly this address (already vetted: public + policy-allowed, or OWN).
     Dial(SocketAddr),
-    Deny(ErrorCode),
+    Deny(ErrorCode, Verdict),
 }
 
 /// Is `ip` a legitimate Zone-3 PUBLIC destination for a function? Fail-closed superset of
@@ -248,25 +283,27 @@ fn decide(
             .find(|ip| matches!(ip, IpAddr::V4(_)) && platform_ips.contains(ip))
         {
             Some(ip) => Decision::Dial(SocketAddr::new(ip, port)),
-            None => Decision::Deny(ErrorCode::DestinationIpProhibited),
+            None => Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform),
         };
     }
 
     // Zone 2 vs Zone 3 — pick the first PUBLIC, non-platform, IPv4 address. If none exists,
     // every resolved address is internal/platform/IPv6 ⇒ Zone-2 DENY, independent of policy.
     let Some(public_addr) = addrs.iter().copied().find(|ip| vet_public(*ip, platform_ips)) else {
-        return Decision::Deny(ErrorCode::DestinationIpProhibited);
+        return Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform);
     };
 
     // Zone 3 — PUBLIC: modulate by the per-function policy.
     match policy {
         ResolvedEgress::Default => Decision::Dial(SocketAddr::new(public_addr, port)),
-        ResolvedEgress::Sandbox => Decision::Deny(ErrorCode::HttpRequestDenied),
+        ResolvedEgress::Sandbox => {
+            Decision::Deny(ErrorCode::HttpRequestDenied, Verdict::DenySandbox)
+        }
         ResolvedEgress::Allowlist(hosts) => {
             if host_allowed(&host_norm, hosts) {
                 Decision::Dial(SocketAddr::new(public_addr, port))
             } else {
-                Decision::Deny(ErrorCode::HttpRequestDenied)
+                Decision::Deny(ErrorCode::HttpRequestDenied, Verdict::DenyAllowlist)
             }
         }
     }
@@ -290,14 +327,17 @@ pub async fn gate_send(
     config: OutgoingRequestConfig,
     ctx: Arc<EgressContext>,
     policy: ResolvedEgress,
+    function: String,
 ) -> Result<IncomingResponse, ErrorCode> {
     let use_tls = config.use_tls;
+    let method = request.method().to_string();
     let (host, port) = authority_parts(request.uri(), use_tls)
         .ok_or(ErrorCode::HttpRequestUriInvalid)?;
 
     // Refuse IPv6 literals up front (phase 1 is IPv4-only egress — one rule removes a whole
-    // class of v6-classifier-edge risk).
+    // class of v6-classifier-edge risk). An IPv6 destination is the hard fence.
     if host.parse::<std::net::Ipv6Addr>().is_ok() || host.contains(':') {
+        emit(&ctx, &function, &host, port, &method, Verdict::DenyPlatform, None).await;
         return Err(ErrorCode::DestinationIpProhibited);
     }
 
@@ -314,11 +354,15 @@ pub async fn gate_send(
         }
     };
     if addrs.is_empty() {
+        emit(&ctx, &function, &host, port, &method, Verdict::Error, None).await;
         return Err(ErrorCode::DnsError(DnsErrorPayload {
             rcode: None,
             info_code: None,
         }));
     }
+    // The first resolved address — recorded on a deny so the manifest shows what the name
+    // pointed at (IR primitive), even though we never dial it.
+    let first_ip = addrs.first().map(|ip| ip.to_string());
 
     let addr = match decide(
         &addrs,
@@ -329,11 +373,15 @@ pub async fn gate_send(
         &policy,
     ) {
         Decision::Dial(a) => a,
-        Decision::Deny(code) => return Err(code),
+        Decision::Deny(code, verdict) => {
+            emit(&ctx, &function, &host, port, &method, verdict, first_ip).await;
+            return Err(code);
+        }
     };
 
     // Per-VM outbound connect-rate limiter (after the verdict, before any socket).
     if !ctx.rate.lock().expect("rate mutex").try_take() {
+        emit(&ctx, &function, &host, port, &method, Verdict::Error, first_ip).await;
         return Err(ErrorCode::ConnectionLimitReached);
     }
 
@@ -341,7 +389,10 @@ pub async fn gate_send(
     // waiting on a full outbound pool). Held by the connection worker until it ends.
     let permit = match ctx.inflight.clone().try_acquire_owned() {
         Ok(p) => p,
-        Err(_) => return Err(ErrorCode::ConnectionLimitReached),
+        Err(_) => {
+            emit(&ctx, &function, &host, port, &method, Verdict::Error, first_ip).await;
+            return Err(ErrorCode::ConnectionLimitReached);
+        }
     };
 
     // Connector-site re-check (P0-EGRESS-DUAL-ENFORCE): the address we are about to dial
@@ -353,8 +404,14 @@ pub async fn gate_send(
         .is_some_and(|s| host.trim_end_matches('.').eq_ignore_ascii_case(s))
         && ctx.platform_ips.contains(&addr.ip());
     if !own_ok && !vet_public(addr.ip(), &ctx.platform_ips) {
+        emit(&ctx, &function, &host, port, &method, Verdict::DenyPlatform, Some(addr.ip().to_string())).await;
         return Err(ErrorCode::DestinationIpProhibited);
     }
+
+    // ALLOW: record the contact (host:port, pinned IP) BEFORE the connect, so an abort /
+    // connect failure can lose the byte refinement but never the existence of the
+    // destination (P0-OBS-UNCONDITIONAL).
+    emit(&ctx, &function, &host, port, &method, Verdict::Allow, Some(addr.ip().to_string())).await;
 
     let connect_to = min_dur(config.connect_timeout, CONNECT_TIMEOUT_CAP);
     let first_byte = min_dur(config.first_byte_timeout, FIRST_BYTE_TIMEOUT_CAP);
@@ -543,17 +600,17 @@ mod tests {
         // Resolves to RFC1918 → Zone-2 deny even under Default.
         assert!(matches!(
             decide(&[ip("10.0.0.5")], "evil.example.com", 443, None, &plat, &ResolvedEgress::Default),
-            Decision::Deny(ErrorCode::DestinationIpProhibited)
+            Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
         // Resolves to the platform's own public IP (domain-front to api.) → Zone-2 deny.
         assert!(matches!(
             decide(&[ip("203.0.113.10")], "api.attacker.com", 443, None, &plat, &ResolvedEgress::Default),
-            Decision::Deny(ErrorCode::DestinationIpProhibited)
+            Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
         // Metadata IP literal → deny.
         assert!(matches!(
             decide(&[ip("169.254.169.254")], "169.254.169.254", 80, None, &plat, &ResolvedEgress::Default),
-            Decision::Deny(ErrorCode::DestinationIpProhibited)
+            Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
 
@@ -570,7 +627,7 @@ mod tests {
             &ResolvedEgress::Default,
         ) {
             Decision::Dial(a) => assert_eq!(a.ip(), ip("140.82.112.3")),
-            Decision::Deny(_) => panic!("should dial the public addr"),
+            Decision::Deny(..) => panic!("should dial the public addr"),
         }
     }
 
@@ -580,7 +637,7 @@ mod tests {
         // An AAAA-only result (we filter v6 before decide, but defense in depth) → deny.
         assert!(matches!(
             decide(&[ip("2606:4700::1111")], "v6.example.com", 443, None, &plat, &ResolvedEgress::Default),
-            Decision::Deny(ErrorCode::DestinationIpProhibited)
+            Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
 
@@ -591,7 +648,7 @@ mod tests {
         // Sandbox → public denied.
         assert!(matches!(
             decide(&[ip("140.82.112.3")], "api.stripe.com", 443, storage, &plat, &ResolvedEgress::Sandbox),
-            Decision::Deny(ErrorCode::HttpRequestDenied)
+            Decision::Deny(ErrorCode::HttpRequestDenied, _)
         ));
         // OWN storage (host==storage, IP∈platform) → allowed EVEN under sandbox.
         assert!(matches!(
@@ -602,7 +659,7 @@ mod tests {
         // match alone never suffices).
         assert!(matches!(
             decide(&[ip("140.82.112.3")], "storage.jkbase.app", 443, storage, &plat, &ResolvedEgress::Sandbox),
-            Decision::Deny(ErrorCode::DestinationIpProhibited)
+            Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
 
@@ -618,13 +675,13 @@ mod tests {
         // Not on the list → denied.
         assert!(matches!(
             decide(&[ip("140.82.112.3")], "evil.com", 443, None, &plat, &al),
-            Decision::Deny(ErrorCode::HttpRequestDenied)
+            Decision::Deny(ErrorCode::HttpRequestDenied, _)
         ));
         // On the list but resolves internal → STILL denied (allowlist widens public; it
         // never overrides the fence). Zone-2 deny precedes the policy.
         assert!(matches!(
             decide(&[ip("10.0.0.1")], "api.stripe.com", 443, None, &plat, &al),
-            Decision::Deny(ErrorCode::DestinationIpProhibited)
+            Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
 

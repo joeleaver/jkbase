@@ -440,7 +440,7 @@ async fn main() -> Result<()> {
     // classifies against these. Absent/malformed ⇒ fail-closed defaults (no OWN host, empty
     // deny-set → rely on the netfilter fence for Zone 2; stricter, never wider).
     let platform_egress = load_platform_egress(&serve_dir);
-    let egress_ctx = function_egress::EgressContext::new(&platform_egress)
+    let egress_ctx = function_egress::EgressContext::new(&platform_egress, log_sink.clone())
         .context("build function egress context")?;
 
     let mut functions = FunctionRuntime::new(egress_ctx);
