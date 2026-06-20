@@ -290,6 +290,12 @@ fn mount_early() {
     for d in ["/var/tmp", "/var/cache", "/var/lib"] {
         let _ = std::fs::create_dir_all(d);
     }
+    // Writable HOME for root: some build tools (notably jco's wizer → wasmtime) write a
+    // cache under `~/.cache`, and the toolchain root is read-only. componentize-js spawns
+    // wizer with a minimal env (it drops HOME/XDG), so an env override doesn't reach it —
+    // a tmpfs over /root is the robust fix. Harmless for the server toolchains, which key
+    // their caches off CARGO_HOME / npm_config_cache, not ~.
+    mount_log("tmpfs", "/root", "tmpfs", 0);
     for dir in [SRC, OUT, CACHE, "/scratch"] {
         let _ = std::fs::create_dir_all(dir);
     }

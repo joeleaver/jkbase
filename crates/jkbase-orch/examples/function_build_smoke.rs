@@ -52,8 +52,8 @@ async fn main() -> anyhow::Result<()> {
     if !kernel.exists() {
         anyhow::bail!("kernel not found at {} (set KERNEL=)", kernel.display());
     }
-    if !fn_src.join("Cargo.toml").exists() {
-        anyhow::bail!("FN_SRC {} has no Cargo.toml", fn_src.display());
+    if !fn_src.join("Cargo.toml").exists() && !fn_src.join("package.json").exists() {
+        anyhow::bail!("FN_SRC {} has neither Cargo.toml nor package.json", fn_src.display());
     }
 
     std::fs::create_dir_all(&data)?;
@@ -100,7 +100,8 @@ async fn main() -> anyhow::Result<()> {
         guest_ip: None,
         gateway_ip: None,
         egress_proxy: None,
-        lang_hint: Some("rust".to_string()),
+        // LANG_HINT selects the in-VM function builder (rust | javascript). Default rust.
+        lang_hint: Some(std::env::var("LANG_HINT").unwrap_or_else(|_| "rust".to_string())),
         export_layered: false,
         build_function: true,
         builder_hint: None,

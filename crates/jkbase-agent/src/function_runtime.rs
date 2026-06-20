@@ -740,6 +740,31 @@ mod tests {
         std::fs::remove_dir_all(wasm.parent().unwrap()).ok();
     }
 
+    /// Run an arbitrary component from `JKBASE_TEST_COMPONENT` through the full runtime —
+    /// used to validate language toolchains (e.g. a ComponentizeJS/StarlingMonkey output)
+    /// without committing a multi-MB fixture. Ignored by default.
+    ///   JKBASE_TEST_COMPONENT=/path/to/component.wasm cargo test -p jkbase-agent \
+    ///     --bins runs_external_component -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs JKBASE_TEST_COMPONENT=/path/to/component.wasm"]
+    async fn runs_external_component() {
+        let path = std::env::var("JKBASE_TEST_COMPONENT").expect("set JKBASE_TEST_COMPONENT");
+        let mut rt = FunctionRuntime::new();
+        rt.load_module("ext", std::path::Path::new(&path))
+            .expect("load component");
+        let req = FunctionRequest {
+            method: "GET".into(),
+            path: "/probe".into(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        };
+        let resp = rt.invoke("ext", req).await.expect("invoke");
+        let text = String::from_utf8_lossy(&resp.body);
+        eprintln!("status={} body={}", resp.status, text);
+        assert_eq!(resp.status, 200, "body: {text}");
+    }
+
     /// A sidecar that declares a runtime disagreeing with the real artifact is rejected at
     /// load (a tenant must not be able to declare one kind and ship another).
     #[test]

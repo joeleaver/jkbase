@@ -391,7 +391,7 @@ cmd_toolchains() {
     local rust_ver; rust_ver="$(rustc --version 2>/dev/null || echo unknown)"
     bake_image jkbuild-function "$TOOLCHAIN_DIR/jkbuild-function.ext4" \
         "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.lock.json"):init:$init_sha:rust:$rust_ver")" \
-        env INJECT_BUN=0 INJECT_RUST_WASIP2=1 CONFIG="$REPO_ROOT/images/apko/build-function.apko.yaml" OUT="$TOOLCHAIN_DIR/jkbuild-function.ext4" "$REPO_ROOT/tools/build-image.sh"
+        env INJECT_BUN=0 INJECT_RUST_WASIP2=1 INJECT_JS=1 CONFIG="$REPO_ROOT/images/apko/build-function.apko.yaml" OUT="$TOOLCHAIN_DIR/jkbuild-function.ext4" "$REPO_ROOT/tools/build-image.sh"
     RAN[toolchains]=OK
 }
 

@@ -31,6 +31,10 @@ INJECT_BUN="${INJECT_BUN:-1}"
 # build-function.apko.yaml header for why this is injected, not an apko package.
 INJECT_RUST_WASIP2="${INJECT_RUST_WASIP2:-0}"
 RUST_TOOLCHAIN_DIR="${RUST_TOOLCHAIN_DIR:-}"
+# INJECT_JS=1 bakes the JS componentizer (jco + componentize-js + esbuild) into
+# /opt/js-tools and generates the wasi:http WIT (at the engine's exact version) at
+# /opt/jkbuild/wit/function.wit, for the function toolchain's JS/TS path.
+INJECT_JS="${INJECT_JS:-0}"
 export PATH="$HOME/.local/bin:$PATH"
 
 command -v apko >/dev/null || {
@@ -41,11 +45,16 @@ if [ "$INJECT_BUN" = "1" ] && [ ! -f "$BUN_BIN" ]; then
     echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2
     exit 1
 fi
-if [ ! -f "$INIT_BIN" ]; then
-    echo "[build-image] building jkbuild-init (musl-static)"
+# Always (re)build jkbuild-init — it's the in-VM lifecycle, and baking a stale one ships
+# an old detect/build contract (a silent, confusing footgun). cargo is incremental, so
+# this is ~free when unchanged. Allow opt-out only when a caller pre-built it deliberately.
+if [ "${SKIP_INIT_BUILD:-0}" != "1" ]; then
+    echo "[build-image] building jkbuild-init (musl-static, incremental)"
     (cd "$REPO_ROOT" && cargo build -p jkbuild --bin jkbuild-init \
-        --target x86_64-unknown-linux-musl --release)
+        --target x86_64-unknown-linux-musl --release) \
+        || { echo "[build-image] ERROR: jkbuild-init build failed" >&2; exit 1; }
 fi
+[ -f "$INIT_BIN" ] || { echo "[build-image] ERROR: jkbuild-init missing at $INIT_BIN" >&2; exit 1; }
 
 rm -rf "$WORK"
 mkdir -p "$WORK/stage"
@@ -124,6 +133,56 @@ if [ "$INJECT_RUST_WASIP2" = "1" ]; then
     for tool in cargo rustc rustdoc; do
         [ -e "$STAGE/opt/rust/bin/$tool" ] && ln -sf /opt/rust/bin/"$tool" "$STAGE/usr/local/bin/$tool"
     done
+fi
+
+# Inject the JS componentizer (jco + componentize-js + esbuild) at /opt/js-tools and
+# generate the wasi:http WIT the JS builder targets. The StarlingMonkey engine ships
+# inside componentize-js, so no separate engine download. node_modules is portable JS +
+# the linux-x64 esbuild binary (this host's arch == the VM's), so a host npm install
+# into the stage is correct for the guest.
+if [ "$INJECT_JS" = "1" ]; then
+    command -v node >/dev/null && command -v npm >/dev/null || {
+        echo "[build-image] ERROR: node + npm required on the host for INJECT_JS" >&2
+        exit 1
+    }
+    command -v wasm-tools >/dev/null || {
+        echo "[build-image] ERROR: wasm-tools required on the host for INJECT_JS (WIT gen)" >&2
+        exit 1
+    }
+    echo "[build-image] injecting JS componentizer (jco + componentize-js + esbuild) → /opt/js-tools"
+    jsdir="$STAGE/opt/js-tools"
+    mkdir -p "$jsdir"
+    ( cd "$jsdir" && npm install --no-audit --no-fund --silent \
+        @bytecodealliance/jco @bytecodealliance/componentize-js esbuild ) \
+        || { echo "[build-image] ERROR: npm install of JS componentizer failed" >&2; exit 1; }
+    # /bin/sh wrappers on the build PATH (avoid #!/usr/bin/env node shebang assumptions).
+    mkdir -p "$STAGE/usr/local/bin"
+    cat > "$STAGE/usr/local/bin/jco" <<'SH'
+#!/bin/sh
+exec node /opt/js-tools/node_modules/@bytecodealliance/jco/src/jco.js "$@"
+SH
+    # esbuild's bin/esbuild is the NATIVE binary (its postinstall installs the platform
+    # binary there), so exec it directly — it is not a node script.
+    cat > "$STAGE/usr/local/bin/esbuild" <<'SH'
+#!/bin/sh
+exec /opt/js-tools/node_modules/esbuild/bin/esbuild "$@"
+SH
+    chmod 0755 "$STAGE/usr/local/bin/jco" "$STAGE/usr/local/bin/esbuild"
+
+    # Generate /opt/jkbuild/wit/function.wit from the bundled StarlingMonkey engine, at
+    # its EXACT wasi:http version (so a componentize-js engine bump can't skew it). The
+    # `fn` world exports incoming-handler; the awk slice keeps the wasi:* dep packages.
+    engine="$jsdir/node_modules/@bytecodealliance/componentize-js/lib/starlingmonkey_embedding.wasm"
+    [ -f "$engine" ] || { echo "[build-image] ERROR: StarlingMonkey engine missing at $engine" >&2; exit 1; }
+    ver="$(wasm-tools component wit "$engine" | grep -oE 'export wasi:http/incoming-handler@0\.2\.[0-9]+' | grep -oE '0\.2\.[0-9]+' | head -1)"
+    [ -n "$ver" ] || { echo "[build-image] ERROR: could not read wasi:http version from the engine" >&2; exit 1; }
+    echo "[build-image] generating /opt/jkbuild/wit/function.wit (wasi:http@$ver)"
+    mkdir -p "$STAGE/opt/jkbuild/wit"
+    {
+        echo "package local:fn;"
+        echo "world fn { export wasi:http/incoming-handler@$ver; }"
+        wasm-tools component wit "$engine" | awk '/^package wasi:/{p=1} /^package local:/{p=0} p'
+    } > "$STAGE/opt/jkbuild/wit/function.wit"
 fi
 
 # Build-mirror CA (optional). When BUILD_CA_CERT points at the shared CA cert, bake it

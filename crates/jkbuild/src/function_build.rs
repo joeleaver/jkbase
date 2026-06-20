@@ -45,9 +45,16 @@ pub trait FunctionBuilder {
     fn compile(&self, ctx: &mut FunctionContext) -> Result<PathBuf>;
 }
 
-/// The function-builder roster. Rust today; JS/TS (ComponentizeJS) joins in the JS phase.
+/// Path (in the function toolchain image) of the pre-baked WIT the JS componentizer
+/// targets: a `local:fn` world exporting `wasi:http/incoming-handler` at the EXACT
+/// version the bundled StarlingMonkey engine implements, plus the wasi deps. Generated at
+/// image-bake time from the engine itself (see tools/build-image.sh), so a componentize-js
+/// engine bump can't silently skew the version.
+const FUNCTION_WIT_PATH: &str = "/opt/jkbuild/wit/function.wit";
+
+/// The function-builder roster: Rust (cargo/wasm32-wasip2) + JS/TS (ComponentizeJS).
 pub fn registry() -> Vec<Box<dyn FunctionBuilder>> {
-    vec![Box::new(RustFunction)]
+    vec![Box::new(RustFunction), Box::new(JsFunction)]
 }
 
 /// Pick the highest-confidence builder for the source (mirrors the server lifecycle).
@@ -116,6 +123,135 @@ impl FunctionBuilder for RustFunction {
             .join("release");
         find_component(&release)
     }
+}
+
+/// JS/TS → `wasi:http` component via esbuild (bundle) + ComponentizeJS (StarlingMonkey).
+/// The tenant writes a Service-Worker-style `addEventListener('fetch', …)` handler; the
+/// engine's fetch-event auto-attaches to the exported `wasi:http/incoming-handler`.
+struct JsFunction;
+
+impl FunctionBuilder for JsFunction {
+    fn id(&self) -> &'static str {
+        "jkbase/function-js"
+    }
+
+    fn detect(&self, app_dir: &Path, lang: Option<&str>) -> Decision {
+        match lang {
+            Some("javascript" | "typescript" | "js" | "ts") => Decision::pass(100),
+            Some(_) => Decision::Fail,
+            // Lower than Rust's Cargo.toml confidence so a (pathological) dual tree
+            // prefers Rust; a normal function dir has only one of the two.
+            None if app_dir.join("package.json").exists() => Decision::pass(70),
+            None => Decision::Fail,
+        }
+    }
+
+    fn fetch(&self, ctx: &mut FunctionContext) -> Result<()> {
+        // Only the tenant's own dependencies need the network; the componentizer
+        // (jco/componentize-js/esbuild) + the StarlingMonkey engine are baked into the
+        // image. Skip npm entirely when there are no declared dependencies.
+        if !has_npm_dependencies(&ctx.app_dir.join("package.json")) {
+            return Ok(());
+        }
+        let mut cmd = Command::new("npm");
+        cmd.current_dir(ctx.app_dir)
+            .env("PATH", BUILD_PATH)
+            .env("npm_config_cache", ctx.cache_dir.join("npm"))
+            // Scripts run hostile and the VM is the boundary, but kill the most-abused
+            // postinstall vector as noise-reduction (mirrors the server JS path).
+            .args(["install", "--no-audit", "--no-fund", "--ignore-scripts"]);
+        apply_proxy(&mut cmd, ctx.proxy.as_deref());
+        apply_mirror_ca(&mut cmd);
+        run(cmd, "npm install")
+    }
+
+    fn compile(&self, ctx: &mut FunctionContext) -> Result<PathBuf> {
+        let out_dir = ctx.app_dir.join(".jkbuild");
+        std::fs::create_dir_all(&out_dir).ok();
+        let entry = resolve_js_entry(ctx.app_dir)?;
+
+        // 1. Bundle the entry (+ any imports / node_modules) into one ESM file. esbuild
+        //    handles TS→JS too. `--platform=neutral`: StarlingMonkey provides the web
+        //    globals (fetch/Request/Response), so don't inject Node shims.
+        let bundle = out_dir.join("bundle.js");
+        let mut cmd = Command::new("esbuild");
+        cmd.current_dir(ctx.app_dir)
+            .env("PATH", BUILD_PATH)
+            .arg(&entry)
+            .arg("--bundle")
+            .arg("--format=esm")
+            .arg("--platform=neutral")
+            .arg(format!("--outfile={}", bundle.display()));
+        run(cmd, "esbuild bundle")?;
+
+        // 2. Componentize the bundle into a wasi:http component (offline — the engine is
+        //    local). The fetch-event auto-attaches to the exported incoming-handler.
+        let wasm = out_dir.join("function.wasm");
+        // jco runs wizer (a wasmtime embedding) which writes a cache under $HOME/.cache;
+        // the toolchain rootfs is read-only, so redirect HOME/XDG cache into the writable
+        // workspace or wizer fails with EROFS.
+        let cache_home = out_dir.join("cache");
+        std::fs::create_dir_all(&cache_home).ok();
+        let mut cmd = Command::new("jco");
+        cmd.current_dir(ctx.app_dir)
+            .env("PATH", BUILD_PATH)
+            .env("HOME", ctx.app_dir)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .args([
+                "componentize",
+                &bundle.to_string_lossy(),
+                "--wit",
+                FUNCTION_WIT_PATH,
+                "--world-name",
+                "fn",
+                "--enable",
+                "http",
+                "--enable",
+                "fetch-event",
+                "-o",
+                &wasm.to_string_lossy(),
+            ]);
+        run(cmd, "jco componentize")?;
+        Ok(wasm)
+    }
+}
+
+/// Resolve the JS/TS entry: `package.json` `module`/`main`, else a conventional
+/// `index.{ts,mjs,js}`.
+fn resolve_js_entry(app_dir: &Path) -> Result<PathBuf> {
+    if let Ok(bytes) = std::fs::read(app_dir.join("package.json"))
+        && let Ok(pkg) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    {
+        for key in ["module", "main"] {
+            if let Some(rel) = pkg.get(key).and_then(|v| v.as_str()) {
+                let p = app_dir.join(rel);
+                if p.exists() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    for cand in ["index.ts", "index.mjs", "index.js"] {
+        let p = app_dir.join(cand);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    bail!("no JS entry found (package.json `module`/`main`, or index.ts/mjs/js)")
+}
+
+/// Whether a `package.json` declares any runtime dependencies (so the fetch phase needs
+/// the network). Missing file / no deps → offline-buildable.
+fn has_npm_dependencies(package_json: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(package_json) else {
+        return false;
+    };
+    let Ok(pkg) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "optionalDependencies"]
+        .iter()
+        .any(|k| pkg.get(k).and_then(|v| v.as_object()).is_some_and(|o| !o.is_empty()))
 }
 
 /// Find the single `wasi:http` component cargo produced in the wasip2 release dir.
@@ -217,6 +353,51 @@ mod tests {
             Some("jkbase/function-rust")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn js_detect_keys_off_language_then_package_json() {
+        let dir = std::env::temp_dir().join(format!("jkfb-js-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let js = JsFunction;
+        assert_eq!(js.detect(&dir, Some("javascript")).confidence(), 100);
+        assert_eq!(js.detect(&dir, Some("typescript")).confidence(), 100);
+        assert!(!js.detect(&dir, Some("rust")).is_pass());
+        assert!(!js.detect(&dir, None).is_pass());
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        assert!(js.detect(&dir, None).is_pass());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn js_entry_and_deps_resolution() {
+        let dir = std::env::temp_dir().join(format!("jkfb-jse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No deps → offline-buildable; entry falls back to index.js.
+        std::fs::write(dir.join("package.json"), r#"{"name":"f"}"#).unwrap();
+        std::fs::write(dir.join("index.js"), "addEventListener('fetch',()=>{})").unwrap();
+        assert!(!has_npm_dependencies(&dir.join("package.json")));
+        assert_eq!(resolve_js_entry(&dir).unwrap(), dir.join("index.js"));
+        // Declared `module` wins; deps present → needs network.
+        std::fs::write(dir.join("main.ts"), "export {}").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"f","module":"main.ts","dependencies":{"x":"1"}}"#,
+        )
+        .unwrap();
+        assert!(has_npm_dependencies(&dir.join("package.json")));
+        assert_eq!(resolve_js_entry(&dir).unwrap(), dir.join("main.ts"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_has_both_languages() {
+        let reg = registry();
+        let ids: Vec<&str> = reg.iter().map(|b| b.id()).collect();
+        assert!(ids.contains(&"jkbase/function-rust"));
+        assert!(ids.contains(&"jkbase/function-js"));
     }
 
     #[test]

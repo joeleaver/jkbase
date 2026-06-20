@@ -1,0 +1,7 @@
+{
+  "name": "jkbase-function",
+  "version": "0.1.0",
+  "type": "module",
+  "module": "index.js",
+  "description": "A jkbase JS function: a wasi:http component built server-side via ComponentizeJS."
+}

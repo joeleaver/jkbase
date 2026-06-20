@@ -37,10 +37,14 @@ contents:
     # required even though the function itself links via the bundled rust-lld.
     - build-base
     - pkgconf
-    # git deps (`git = "..."` in Cargo.toml) fetched via the git CLI through the proxy.
+    # git deps (`git = "..."` in Cargo.toml / `git+https` npm specs) via the git CLI.
     - git
     # Component inspection / sanity (not required to build; cheap to ship).
     - wasm-tools
+    # JS/TS path: Node runs the componentizer (jco + componentize-js + esbuild, injected
+    # by tools/build-image.sh) and `npm install`s the tenant's dependencies during fetch.
+    - nodejs-24
+    - npm
 
 archs:
   - x86_64
