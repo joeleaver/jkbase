@@ -43,6 +43,11 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # 2. NAT + forwarding to the PUBLIC internet via the default-route uplink.
 PUB_IFACE=$(ip route show default | awk '{print $5; exit}')
+# The host's primary public IPv4 on that uplink — the address *.{domain} resolves to, and
+# hence the address guests use to reach the reverse proxy (their own object store via
+# storage.{domain}, their api, their own sites). JKRUNFW (below) allows guest→PUB_IP:80,443
+# and DROPs every other guest→host destination.
+PUB_IP=$(ip -4 -o addr show "$PUB_IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
 if [ -n "$PUB_IFACE" ]; then
     if ! iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$PUB_IFACE" -j MASQUERADE
@@ -96,10 +101,31 @@ fi
 # not just glibc. The agent points each container's /etc/resolv.conf at ${GW_IP}.
 # (A non-systemd-resolved host should run some forwarder on ${GW_IP}:53 instead — the
 # only contract is "a resolver answers at the gateway".)
+# Host-service isolation. A dedicated JKRUNFW INPUT chain (flushed + rebuilt each run, so
+# idempotent) gates EVERYTHING arriving from the runtime bridge to the host. A guest may
+# reach ONLY: the gateway DNS forwarder (${GW_IP}:53) and the public reverse proxy
+# (${PUB_IP}:80,443 — its own object store via storage.{domain}, its api, its own sites).
+# Every other guest→host destination is DROPped — the control API (:9090, now also
+# loopback-bound), the object-store backend (:9091, loopback-bound), the gateway on any
+# non-DNS port, and any other host service — regardless of whether/how ufw is configured.
+# Egress to the internet is FORWARD, not INPUT, so it is untouched (RFC1918 egress stays
+# open per the apps-need-private-services decision). -w: jkbase-server edits iptables
+# (build per-VM grants) concurrently, so wait for the xtables lock rather than race it.
+iptables -w -N JKRUNFW 2>/dev/null || iptables -w -F JKRUNFW
+iptables -w -A JKRUNFW -d "$GW_IP" -p udp --dport 53 -j ACCEPT
+iptables -w -A JKRUNFW -d "$GW_IP" -p tcp --dport 53 -j ACCEPT
+if [ -n "${PUB_IP:-}" ]; then
+    iptables -w -A JKRUNFW -d "$PUB_IP" -p tcp -m multiport --dports 80,443 -j ACCEPT
+fi
+iptables -w -A JKRUNFW -j DROP
+iptables -w -C INPUT -i "$BRIDGE" -j JKRUNFW 2>/dev/null \
+    || iptables -w -I INPUT 1 -i "$BRIDGE" -j JKRUNFW
+# Remove the pre-JKRUNFW standalone :53 ACCEPTs that older versions of this script left in
+# INPUT, so a re-synced box doesn't accumulate cruft (JKRUNFW covers guest DNS now).
 for proto in udp tcp; do
-    if ! iptables -C INPUT -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT 2>/dev/null; then
-        iptables -I INPUT 1 -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT
-    fi
+    while iptables -w -C INPUT -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT 2>/dev/null; do
+        iptables -w -D INPUT -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT
+    done
 done
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
     mkdir -p /etc/systemd/resolved.conf.d
