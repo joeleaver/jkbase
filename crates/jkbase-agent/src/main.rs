@@ -1,11 +1,12 @@
 mod clock;
 mod container_supervisor;
 mod dmverity;
+mod function_egress;
 mod function_runtime;
 mod log_sink;
 mod static_server;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
 use log_sink::LogSink;
@@ -155,6 +156,21 @@ fn load_runtime_layers(serve_dir: &Path) -> Option<RuntimeLayers> {
             eprintln!("failed to parse {}: {e}", path.display());
             None
         }
+    }
+}
+
+/// Read the host-written `_platform.json` (the host-asserted egress facts) from the
+/// metadata image. Absent/malformed ⇒ fail-closed defaults (no OWN-storage host, empty
+/// deny-set): stricter, never wider — the agent then leans on the netfilter fence for
+/// Zone 2 and treats no host as OWN-storage.
+fn load_platform_egress(serve_dir: &Path) -> jkbase_common::config::PlatformEgress {
+    let path = serve_dir.join(jkbase_common::config::PlatformEgress::FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            eprintln!("failed to parse {}: {e}; using fail-closed egress defaults", path.display());
+            Default::default()
+        }),
+        Err(_) => Default::default(),
     }
 }
 
@@ -407,7 +423,15 @@ async fn main() -> Result<()> {
     // into it, so the host shipper dedups on one cursor space (P0-OBS-UNIFIED-SINK).
     let log_sink = Arc::new(LogSink::new());
 
-    let mut functions = FunctionRuntime::new();
+    // Host-asserted platform egress facts (`_platform.json`): the OWN object-store host +
+    // the platform's own public-IP deny-set. Read once at boot; the agent's egress gate
+    // classifies against these. Absent/malformed ⇒ fail-closed defaults (no OWN host, empty
+    // deny-set → rely on the netfilter fence for Zone 2; stricter, never wider).
+    let platform_egress = load_platform_egress(&serve_dir);
+    let egress_ctx = function_egress::EgressContext::new(&platform_egress)
+        .context("build function egress context")?;
+
+    let mut functions = FunctionRuntime::new(egress_ctx);
     if let Err(e) = functions.load_all_from_dir(&functions_dir) {
         error!(error = %e, "failed to load functions");
     }

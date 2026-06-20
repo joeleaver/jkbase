@@ -5,10 +5,11 @@
 //! platform builds this to a component server-side (`cargo build --release --target
 //! wasm32-wasip2`) and runs it in the per-project microVM.
 //!
-//! Available today: the request, response, compute, and project **secrets** as env vars.
-//! NOT available yet: outbound network (`fetch`) and object-store access — those arrive
-//! together in the host-mediated outbound-I/O work; until then an outbound request is
-//! denied by the platform (demonstrated by the `egress` line below).
+//! Available today: the request, response, compute, project **secrets** as env vars, and
+//! host-mediated **outbound HTTP** (`fetch`) — policed per-function by `egress` in
+//! `jkbase.toml` (default: public allowed + observed; `egress = ["host", ...]` to enforce
+//! an allowlist; `egress = false` to sandbox). The `egress` line below probes a real
+//! outbound request and reports whether the host allowed it.
 
 use wasi::http::types::{
     Fields, IncomingRequest, Method, OutgoingBody, OutgoingRequest, OutgoingResponse,
@@ -49,16 +50,25 @@ impl wasi::exports::http::incoming_handler::Guest for Component {
     }
 }
 
-/// Attempt an outbound request. The platform denies all egress today, so this reports
-/// `DENIED` (the host rejects `send_request` before any socket opens).
+/// Probe outbound HTTP. The host accepts `handle` and returns a *future* — the egress
+/// verdict (allow vs. policy/zone deny) surfaces only when that future RESOLVES, exactly as
+/// real `wasi:http` works. So we must AWAIT it: report `ALLOWED` only when a response
+/// actually arrives, `DENIED` when the host refuses (sandbox, off-allowlist, or a
+/// platform/internal destination).
 fn probe_egress() -> &'static str {
     let req = OutgoingRequest::new(Fields::new());
     let _ = req.set_method(&Method::Get);
     let _ = req.set_scheme(Some(&Scheme::Https));
     let _ = req.set_authority(Some("example.com"));
     let _ = req.set_path_with_query(Some("/"));
-    match wasi::http::outgoing_handler::handle(req, None) {
-        Ok(_) => "ALLOWED",
-        Err(_) => "DENIED",
+    let future = match wasi::http::outgoing_handler::handle(req, None) {
+        Ok(f) => f,
+        Err(_) => return "DENIED",
+    };
+    // Block until the host's gate decides (connect + first response, or a typed deny).
+    future.subscribe().block();
+    match future.get() {
+        Some(Ok(Ok(_response))) => "ALLOWED",
+        _ => "DENIED",
     }
 }
