@@ -157,14 +157,15 @@ a Service-Worker-style `addEventListener('fetch', …)` handler (ComponentizeJS 
 StarlingMonkey). See `templates/function-rust` and `templates/function-js`.
 
 **What functions can do today:** handle HTTP, compute, run on a schedule, and read their
-project's **secrets** (Rust, via `std::env`). Each invocation is sandboxed and bounded
-(fuel + wall-clock + memory caps), and runs fresh — no state persists between calls.
+project's **secrets** — Rust via `std::env`, JS via `process.env`. Each invocation is
+sandboxed and bounded (epoch + wall-clock + memory caps) and runs fresh — no state
+persists between calls.
 
 **Current limits (being lifted):** no **outbound network** yet — a function can't `fetch`
 the internet or reach the object store. Outbound is the next arc: one host-mediated,
 default-deny, SSRF-guarded path that delivers own-bucket object-store access *and*
-allowlisted egress together. JS secret-env access lands alongside it. (A function can
-already *hold* an API token via secrets — it just can't make the call yet.)
+allowlisted egress together. (A function can already *hold* an API token via secrets — it
+just can't make the call yet.)
 
 > The legacy WASI **preview1** path (`_start` + stdin/stdout JSON) still runs unchanged
 > beside the component runtime, so older functions keep working; `runtime = "wasip1"` is a
