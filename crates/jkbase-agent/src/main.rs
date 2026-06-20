@@ -871,10 +871,13 @@ async fn invoke_function(
     let func_resp = match state.functions.invoke(name, func_req).await {
         Ok(r) => r,
         Err(e) => {
+            // Log the detail server-side; return a GENERIC body — the error string can carry
+            // request-derived data (headers/paths a caller controls) and must not be
+            // reflected back from the platform-trusted agent (review H1).
             error!(function = name, error = %e, "function invocation error");
             return Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(format!("function error: {e}"))))
+                .body(Full::new(Bytes::from("function error")))
                 .unwrap();
         }
     };

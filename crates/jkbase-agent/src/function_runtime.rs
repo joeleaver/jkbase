@@ -469,18 +469,9 @@ impl FunctionRuntime {
                 }
             }
             LoadedFunction::Component { pre, env } => {
-                match tokio::time::timeout(
-                    FUNCTION_WALL_TIMEOUT,
-                    invoke_component(pre.clone(), env.clone(), req),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        warn!(function = %name, "function timed out (wall-clock)");
-                        Ok(FunctionResponse::error(504, "function timed out"))
-                    }
-                }
+                // The wall-clock bound + task abort live inside invoke_component (it owns the
+                // handler task, which must be aborted — not merely dropped — on timeout).
+                invoke_component(pre.clone(), env.clone(), req).await
             }
         }
     }
@@ -594,9 +585,8 @@ async fn invoke_component(
         .new_response_outparam(tx)
         .context("build response outparam")?;
 
-    // Run the handler on its own task so a streaming guest can make progress while we
-    // read the response concurrently (and so we can drop it on timeout). The guest signals
-    // the response via the outparam, which fires `rx`.
+    // The handler runs on its own task so a streaming guest can make progress while we read
+    // the response. The guest signals the response via the outparam, which fires `rx`.
     let task = tokio::task::spawn(async move {
         let proxy = pre.instantiate_async(&mut store).await?;
         proxy
@@ -606,54 +596,58 @@ async fn invoke_component(
         Ok::<(), anyhow::Error>(())
     });
 
-    let resp = match rx.await {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(code)) => {
-            warn!(error = %code, "function returned an error response");
-            return Ok(FunctionResponse::error(502, "function error"));
-        }
-        // Sender dropped without setting a response: the guest returned (or trapped)
-        // without calling `response-outparam::set`. Surface the task error if any.
-        Err(_) => {
-            let detail = match task.await {
-                Ok(Ok(())) => "function produced no response".to_string(),
-                Ok(Err(e)) => {
-                    error!(error = %e, "function execution failed");
-                    "function error".to_string()
+    // Bound the ENTIRE response lifecycle (headers + body drain) by the wall clock — epoch
+    // only interrupts *running* guest code, not a guest parked in a host call (e.g. a long
+    // timer subscription) or a slow/stalled body stream. On EVERY exit we `abort()` the task:
+    // dropping a JoinHandle does NOT cancel a tokio task, so without this a timed-out guest
+    // would leak its (up to 128 MiB) Store while its freed concurrency permit admits the next
+    // request → the project VM OOMs. This is the load-bearing "a bad function cannot exhaust
+    // the agent" invariant (review B1/M2/M5).
+    let outcome = tokio::time::timeout(FUNCTION_WALL_TIMEOUT, async {
+        let resp = match rx.await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(code)) => {
+                warn!(error = %code, "function returned an error response");
+                return FunctionResponse::error(502, "function error");
+            }
+            // Sender dropped without a response: the guest returned/trapped without calling
+            // `response-outparam::set`. (No detail is exposed to the client — see main.rs.)
+            Err(_) => return FunctionResponse::error(500, "function produced no response"),
+        };
+        let (parts, body) = resp.into_parts();
+        match Limited::new(body, MAX_RESPONSE_BODY).collect().await {
+            Ok(c) => {
+                let headers = parts
+                    .headers
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            String::from_utf8_lossy(v.as_bytes()).to_string(),
+                        )
+                    })
+                    .collect();
+                FunctionResponse {
+                    status: parts.status.as_u16(),
+                    headers,
+                    body: c.to_bytes().to_vec(),
                 }
-                Err(e) => {
-                    error!(error = %e, "function task panicked");
-                    "internal error".to_string()
-                }
-            };
-            return Ok(FunctionResponse::error(500, &detail));
+            }
+            Err(_) => {
+                warn!("function response body exceeded cap or failed to read");
+                FunctionResponse::error(502, "function response too large")
+            }
         }
-    };
-
-    let (parts, body) = resp.into_parts();
-    let body = match Limited::new(body, MAX_RESPONSE_BODY).collect().await {
-        Ok(c) => c.to_bytes().to_vec(),
-        Err(_) => {
-            warn!("function response body exceeded cap or failed to read");
-            return Ok(FunctionResponse::error(502, "function response too large"));
-        }
-    };
-    let headers = parts
-        .headers
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                String::from_utf8_lossy(v.as_bytes()).to_string(),
-            )
-        })
-        .collect();
-
-    Ok(FunctionResponse {
-        status: parts.status.as_u16(),
-        headers,
-        body,
     })
+    .await;
+
+    // Reclaim the Store immediately on every path (timeout, success, or error).
+    task.abort();
+
+    Ok(outcome.unwrap_or_else(|_| {
+        warn!("function timed out (wall-clock)");
+        FunctionResponse::error(504, "function timed out")
+    }))
 }
 
 /// Build a `hyper::Request` (the shape `new_incoming_request` consumes — its body error

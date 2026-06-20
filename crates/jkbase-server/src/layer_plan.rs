@@ -517,8 +517,7 @@ fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Res
             // is the load-bearing guard for already-stored or future inputs.
             if RESERVED_ENV.contains(&k.as_str())
                 || k.is_empty()
-                || k.contains('=')
-                || k.contains('\0')
+                || k.contains(['=', '\0', '\n', '\r'])
                 || v.contains('\0')
             {
                 continue;
@@ -567,7 +566,9 @@ fn inject_function_secrets(
             continue;
         };
         for (k, v) in secrets {
-            if k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
+            // A key with `=`/NUL/newline, or a NUL in the value, would break
+            // `WasiCtxBuilder::env`; drop just that var rather than fail the whole load.
+            if k.is_empty() || k.contains(['=', '\0', '\n', '\r']) || v.contains('\0') {
                 continue;
             }
             env.insert(k.clone(), serde_json::Value::String(v.clone()));
