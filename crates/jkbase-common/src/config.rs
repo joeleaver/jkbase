@@ -67,6 +67,143 @@ pub struct FunctionConfig {
     /// function on the schedule (waking the project if hibernated).
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Per-function PUBLIC-internet egress policy. The OWN-stuff and platform-internals
+    /// zones are classified independently and are NOT governed by this. Three states:
+    ///   absent        => default (allow public + observe/meter; zero config)
+    ///   ["host", ...] => enforced allowlist (preventive; connect-time, IP-pinned)
+    ///   false         => sandbox (deny public egress; OWN stuff still reachable)
+    #[serde(default)]
+    pub egress: Option<EgressPolicy>,
+}
+
+/// A declared per-function (or project-default) PUBLIC-egress policy. TOML has no native
+/// union, so this is an untagged enum: `egress = false`/`true` → `Toggle`; `egress =
+/// ["host", ...]` → `Allowlist`. OWN-stuff and platform-internals are zone-classified
+/// independently and are NOT governed by this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EgressPolicy {
+    /// `false` => sandbox (deny public). `true` => "default within the ceiling" (documents
+    /// intent; never widens past a project allowlist — see [`resolve_egress`]).
+    Toggle(bool),
+    /// `["api.stripe.com", ...]` => enforced allowlist.
+    Allowlist(Vec<String>),
+}
+
+/// The concrete PUBLIC-egress capability after collapsing project-default × per-function
+/// precedence host-side at deploy (the agent never re-derives it — it receives exactly one
+/// of these states, immutable for the VM's life).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedEgress {
+    /// Allow public + observe/meter (the zero-config default).
+    Default,
+    /// Deny all public egress (own-stuff still reachable).
+    Sandbox,
+    /// Allow ONLY these exact hosts (preventive; connect-time, IP-pinned). Normalized
+    /// (lowercased, trailing dot stripped, deduped).
+    Allowlist(Vec<String>),
+}
+
+/// Collapse a project-default policy and a per-function policy into one concrete
+/// [`ResolvedEgress`]. The project policy is a **CEILING**: a function may NARROW it but
+/// never WIDEN past it — else a function `egress = true` would punch through a marketplace
+/// floor (adversarial-review HIGH-1). `egress = true` therefore means "the default, but no
+/// wider than the ceiling", never "allow-all".
+pub fn resolve_egress(
+    project: Option<&EgressPolicy>,
+    function: Option<&EgressPolicy>,
+) -> ResolvedEgress {
+    use EgressPolicy::{Allowlist, Toggle};
+    match (project, function) {
+        // No ceiling (absent / allow-all project): the function policy applies verbatim.
+        (None | Some(Toggle(true)), None | Some(Toggle(true))) => ResolvedEgress::Default,
+        (None | Some(Toggle(true)), Some(Toggle(false))) => ResolvedEgress::Sandbox,
+        (None | Some(Toggle(true)), Some(Allowlist(f))) => {
+            ResolvedEgress::Allowlist(dedup_hosts(f))
+        }
+        // Sandbox ceiling: nothing can widen it.
+        (Some(Toggle(false)), _) => ResolvedEgress::Sandbox,
+        // Allowlist ceiling P: narrow freely; a widening request is intersected against P.
+        (Some(Allowlist(p)), None | Some(Toggle(true))) => ResolvedEgress::Allowlist(dedup_hosts(p)),
+        (Some(Allowlist(_)), Some(Toggle(false))) => ResolvedEgress::Sandbox,
+        (Some(Allowlist(p)), Some(Allowlist(f))) => ResolvedEgress::Allowlist(intersect_hosts(p, f)),
+    }
+}
+
+fn norm_host(h: &str) -> String {
+    h.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn dedup_hosts(hosts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in hosts {
+        let n = norm_host(h);
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn intersect_hosts(ceiling: &[String], req: &[String]) -> Vec<String> {
+    let c = dedup_hosts(ceiling);
+    dedup_hosts(req).into_iter().filter(|h| c.contains(h)).collect()
+}
+
+#[cfg(test)]
+mod egress_policy_tests {
+    use super::*;
+
+    #[test]
+    fn function_cannot_widen_past_an_allowlist_ceiling() {
+        let p = EgressPolicy::Allowlist(vec!["api.stripe.com".into()]);
+        // `egress = true` under a ceiling stays the ceiling — NOT allow-all.
+        assert_eq!(
+            resolve_egress(Some(&p), Some(&EgressPolicy::Toggle(true))),
+            ResolvedEgress::Allowlist(vec!["api.stripe.com".into()])
+        );
+        // A wider function allowlist is intersected (evil.com dropped).
+        let f = EgressPolicy::Allowlist(vec!["api.stripe.com".into(), "evil.com".into()]);
+        assert_eq!(
+            resolve_egress(Some(&p), Some(&f)),
+            ResolvedEgress::Allowlist(vec!["api.stripe.com".into()])
+        );
+        // Narrowing to sandbox is always allowed.
+        assert_eq!(
+            resolve_egress(Some(&p), Some(&EgressPolicy::Toggle(false))),
+            ResolvedEgress::Sandbox
+        );
+    }
+
+    #[test]
+    fn sandbox_ceiling_cannot_be_widened() {
+        let p = EgressPolicy::Toggle(false);
+        for f in [
+            None,
+            Some(EgressPolicy::Toggle(true)),
+            Some(EgressPolicy::Allowlist(vec!["x.com".into()])),
+        ] {
+            assert_eq!(resolve_egress(Some(&p), f.as_ref()), ResolvedEgress::Sandbox);
+        }
+    }
+
+    #[test]
+    fn defaults_and_normalization_without_a_ceiling() {
+        assert_eq!(resolve_egress(None, None), ResolvedEgress::Default);
+        assert_eq!(
+            resolve_egress(None, Some(&EgressPolicy::Toggle(false))),
+            ResolvedEgress::Sandbox
+        );
+        // Hosts normalized (case + trailing dot) and deduped.
+        assert_eq!(
+            resolve_egress(
+                None,
+                Some(&EgressPolicy::Allowlist(vec!["A.com.".into(), "a.com".into()]))
+            ),
+            ResolvedEgress::Allowlist(vec!["a.com".into()])
+        );
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,6 +320,11 @@ pub struct VolumeConfig {
 pub struct HostingConfig {
     pub public: Option<String>,
     pub spa: Option<bool>,
+    /// Project-default PUBLIC-egress policy for every function that omits its own
+    /// `egress`. A CEILING, not merely a default: a function may narrow it but never
+    /// widen past it (see [`resolve_egress`]).
+    #[serde(default)]
+    pub function_egress: Option<EgressPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
