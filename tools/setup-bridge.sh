@@ -43,11 +43,12 @@ echo 1 > /proc/sys/net/ipv4/ip_forward
 
 # 2. NAT + forwarding to the PUBLIC internet via the default-route uplink.
 PUB_IFACE=$(ip route show default | awk '{print $5; exit}')
-# The host's primary public IPv4 on that uplink — the address *.{domain} resolves to, and
-# hence the address guests use to reach the reverse proxy (their own object store via
-# storage.{domain}, their api, their own sites). JKRUNFW (below) allows guest→PUB_IP:80,443
-# and DROPs every other guest→host destination.
-PUB_IP=$(ip -4 -o addr show "$PUB_IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+# ALL global IPv4s on that uplink — the proxy binds 0.0.0.0:80/443 (every host IP), and on a
+# multi-homed / failover-IP host (the OVH prod target) *.{domain} may resolve to a secondary.
+# Guests reach the reverse proxy (their object store via storage.{domain}, their api, their
+# own sites) on whichever it is, so JKRUNFW (below) allows guest→each of them and DROPs the
+# rest. (head -n1 would silently fence object-store/api/sites on a secondary-IP host.)
+PUB_IPS=$(ip -4 -o addr show "$PUB_IFACE" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')
 if [ -n "$PUB_IFACE" ]; then
     if ! iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$PUB_IFACE" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$PUB_IFACE" -j MASQUERADE
@@ -112,10 +113,19 @@ fi
 # open per the apps-need-private-services decision). -w: jkbase-server edits iptables
 # (build per-VM grants) concurrently, so wait for the xtables lock rather than race it.
 iptables -w -N JKRUNFW 2>/dev/null || iptables -w -F JKRUNFW
+# Replies to HOST-initiated flows MUST pass: the reverse proxy + wait_for_agent connect INTO
+# each guest on :80, and the guest's return packets are locally destined → INPUT → JKRUNFW.
+# Without this the proxy can't serve a single request. This does NOT let a guest open a NEW
+# flow to a forbidden host port — only RELATED/ESTABLISHED replies are admitted.
+iptables -w -A JKRUNFW -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -w -A JKRUNFW -d "$GW_IP" -p udp --dport 53 -j ACCEPT
 iptables -w -A JKRUNFW -d "$GW_IP" -p tcp --dport 53 -j ACCEPT
-if [ -n "${PUB_IP:-}" ]; then
-    iptables -w -A JKRUNFW -d "$PUB_IP" -p tcp -m multiport --dports 80,443 -j ACCEPT
+if [ -n "${PUB_IPS// /}" ]; then
+    for pub in $PUB_IPS; do
+        iptables -w -A JKRUNFW -d "$pub" -p tcp -m multiport --dports 80,443 -j ACCEPT
+    done
+elif [ -n "$PUB_IFACE" ]; then
+    echo "WARNING: no global IPv4 on $PUB_IFACE; guest→proxy (object store / api / own sites) will be DROPped" >&2
 fi
 iptables -w -A JKRUNFW -j DROP
 iptables -w -C INPUT -i "$BRIDGE" -j JKRUNFW 2>/dev/null \
