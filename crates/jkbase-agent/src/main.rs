@@ -327,9 +327,21 @@ struct AgentState {
     sites: Vec<SiteEntry>,
 }
 
+/// A backend kind a tenant route can target. Resolved at the agent's deserialization
+/// boundary ONLY (from `_routes.json` in this VM's host-built metadata image) — the proxy
+/// stays unaware of function-vs-server (P0-INGRESS-HOST-TRUST). An unknown kind is dropped
+/// (fail-closed) at load.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RouteKind {
+    Server,
+    Function,
+}
+
 struct RouteEntry {
     prefix: String,
-    server_name: String,
+    /// Target backend name (server or function) within this project.
+    name: String,
+    kind: RouteKind,
 }
 
 struct SiteEntry {
@@ -564,10 +576,19 @@ fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
 
     routes
         .iter()
-        .filter(|(_, target)| target.service == "server")
-        .map(|(prefix, target)| RouteEntry {
-            prefix: prefix.clone(),
-            server_name: target.name.clone(),
+        .filter_map(|(prefix, target)| {
+            // Typed backend kind; an unknown service is dropped (forward-compat + fail-closed)
+            // rather than silently treated as a server.
+            let kind = match target.service.as_str() {
+                "server" => RouteKind::Server,
+                "function" => RouteKind::Function,
+                _ => return None,
+            };
+            Some(RouteEntry {
+                prefix: prefix.clone(),
+                name: target.name.clone(),
+                kind,
+            })
         })
         .collect()
 }
@@ -598,21 +619,49 @@ async fn handle_request(
         return Ok(logs_response(&state, &req).await);
     }
 
-    // Check route config for server routing
+    // Walk the tenant route table, dispatching by backend kind. A FUNCTION route is
+    // request/response only: an upgrade to it gets 426 (before the body is buffered) and a
+    // declared-but-missing function 404s WITHOUT falling through to static — so a misspelled
+    // function name can't accidentally serve the static site or probe the metadata image.
+    // A SERVER route that matches but has no running backend falls through (unchanged).
     for route in &state.route_config {
         let prefix = route.prefix.trim_end_matches('*');
-        if path.starts_with(prefix)
-            && let Some(port) = state.containers.get_server_for_route(&route.server_name).await {
-                return Ok(proxy_to_server(port, req).await);
+        if !path.starts_with(prefix) {
+            continue;
+        }
+        match route.kind {
+            RouteKind::Server => {
+                if let Some(port) = state.containers.get_server_for_route(&route.name).await {
+                    return Ok(proxy_to_server(port, req).await);
+                }
             }
+            RouteKind::Function => {
+                if jkbase_wsproxy::is_upgrade_request(req.headers()) {
+                    return Ok(upgrade_required_response());
+                }
+                if state.functions.has_function(&route.name) {
+                    // Own the name so nothing borrows `state.route_config` across the move.
+                    let name = route.name.clone();
+                    info!(function = %name, path = %path, "routing to function (route)");
+                    return Ok(invoke_function(state.clone(), &name, req).await);
+                }
+                return Ok(not_found_response());
+            }
+        }
     }
 
-    // Check if this is a function call
-    if let Some(func_name) = extract_function_name(&path)
-        && state.functions.has_function(&func_name) {
+    // Legacy implicit function route: `/functions/{name}`. Same request/response rules —
+    // 426 on upgrade, 404 (no fallthrough) on a missing function.
+    if let Some(func_name) = extract_function_name(&path) {
+        if jkbase_wsproxy::is_upgrade_request(req.headers()) {
+            return Ok(upgrade_required_response());
+        }
+        if state.functions.has_function(&func_name) {
             info!(function = %func_name, path = %path, "routing to function");
             return Ok(invoke_function(state, &func_name, req).await);
         }
+        return Ok(not_found_response());
+    }
 
     // Host-bound site: the proxy sets X-Jkbase-Site (stripped from inbound, so
     // trusted) when the request's hostname maps to a specific site. Serve that
@@ -723,6 +772,30 @@ async fn logs_response(
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+/// `426 Upgrade Required` — a function backend is strictly request/response and cannot be
+/// coerced into a long-lived/streaming connection (P0-INGRESS-UPGRADE). Long-lived traffic
+/// must target a `server`.
+fn upgrade_required_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::UPGRADE_REQUIRED)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from(
+            "upgrade not supported on a function route; use a server backend",
+        )))
+        .unwrap()
+}
+
+/// `404 Not Found` for a declared-but-missing function route. Deliberately does NOT fall
+/// through to static serving — a misspelled/undeployed function must not expose the static
+/// site or the metadata image's `_`-prefixed control files.
+fn not_found_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from("not found")))
         .unwrap()
 }
 
@@ -932,4 +1005,44 @@ async fn invoke_function(
     builder
         .body(Full::new(Bytes::from(func_resp.body)))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_config_maps_kinds_and_drops_unknown() {
+        let dir = std::env::temp_dir().join(format!("jkagent-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // server + function are typed; an unknown service is dropped (fail-closed), never
+        // silently treated as a server.
+        std::fs::write(
+            dir.join("_routes.json"),
+            r#"{
+              "/api": {"service":"function","name":"api"},
+              "/":    {"service":"server","name":"web"},
+              "/x":   {"service":"bogus","name":"x"}
+            }"#,
+        )
+        .unwrap();
+        let routes = load_route_config(&dir);
+        assert_eq!(routes.len(), 2, "the unknown-service route must be dropped");
+        let api = routes.iter().find(|r| r.prefix == "/api").unwrap();
+        assert_eq!(api.kind, RouteKind::Function);
+        assert_eq!(api.name, "api");
+        let web = routes.iter().find(|r| r.prefix == "/").unwrap();
+        assert_eq!(web.kind, RouteKind::Server);
+        assert!(!routes.iter().any(|r| r.prefix == "/x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn function_name_extraction() {
+        assert_eq!(extract_function_name("/functions/hello"), Some("hello".into()));
+        assert_eq!(extract_function_name("/functions/hello/world"), Some("hello".into()));
+        assert_eq!(extract_function_name("/api/foo"), None);
+        assert_eq!(extract_function_name("/"), None);
+    }
 }
