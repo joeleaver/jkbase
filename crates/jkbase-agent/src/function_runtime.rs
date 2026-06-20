@@ -26,12 +26,13 @@
 //!     preopens** (no ambient filesystem). Granting real egress is the deferred
 //!     host-mediated, default-deny, SSRF-guarded outbound-I/O arc — not here.
 //!   * **P0 — a bad function cannot hang or exhaust the agent.** Every invocation is
-//!     bounded by the kill-switch trio: per-invocation **fuel** (CPU), an **epoch**
-//!     deadline driven by a shared background ticker (interrupts tight loops even when
-//!     fuel is generous), and an **outer wall-clock timeout** (covers a guest parked in
-//!     a host call, where fuel does not tick). `StoreLimits` caps guest memory, the
-//!     request/response bodies are size-capped, and each call gets a fresh
-//!     `Store`+`ResourceTable` so no state bleeds between invocations.
+//!     bounded by an **epoch** deadline (a shared background ticker interrupts a tight
+//!     loop) plus an **outer wall-clock timeout** (covers a guest parked in a host call,
+//!     which epoch alone can't see). The wasip1 path additionally meters **fuel**; the
+//!     component path omits it — epoch + the timeout already bound it, and fuel
+//!     instrumentation inflates compile of the big JS engine ~15x for no safety gain.
+//!     `StoreLimits` caps guest memory, request/response bodies are size-capped, and each
+//!     call gets a fresh `Store`+`ResourceTable` so no state bleeds between invocations.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -69,6 +70,75 @@ pub const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
 /// Epoch deadline in ticks, derived from the wall-clock budget + tick period.
 fn epoch_deadline_ticks() -> u64 {
     (FUNCTION_WALL_TIMEOUT.as_millis() / EPOCH_TICK.as_millis()).max(1) as u64
+}
+
+/// Engine config for the legacy wasip1 path (fuel + epoch). Shared by the runtime and the
+/// `.cwasm` precompiler so a precompiled artifact is byte-compatible with the loader.
+fn sync_config() -> Config {
+    let mut cfg = Config::new();
+    cfg.consume_fuel(true);
+    cfg.epoch_interruption(true);
+    cfg
+}
+
+/// Engine config for the component path (async + epoch, no fuel — see [`FunctionRuntime::new`]).
+/// Shared by the runtime and the precompiler (same flags ⇒ `deserialize` accepts the artifact).
+fn async_config() -> Config {
+    let mut cfg = Config::new();
+    cfg.async_support(true);
+    cfg.epoch_interruption(true);
+    cfg
+}
+
+/// Precompile a function `.wasm` to a `.cwasm` (cranelift AOT) with the runtime's exact
+/// engine config, so the agent can `deserialize` it at boot instead of recompiling — the
+/// big StarlingMonkey JS engine compiles in seconds, which we move off the VM-boot path to
+/// deploy time. Run by the agent binary in `--precompile` mode from the deploy pipeline.
+/// The artifact is platform-produced (from the build's `.wasm`) and shipped read-only, so
+/// the agent's `deserialize` (unsafe — trusts the bytes) is sound; a tenant can't inject one.
+pub fn precompile(in_wasm: &Path, out_cwasm: &Path) -> Result<()> {
+    let bytes = std::fs::read(in_wasm)
+        .with_context(|| format!("read {}", in_wasm.display()))?;
+    let kind = classify_preamble(&bytes).context("not a wasm module or component")?;
+    let serialized = match kind {
+        RuntimeKind::WasiHttp => Engine::new(&async_config())?.precompile_component(&bytes)?,
+        RuntimeKind::Wasip1 => Engine::new(&sync_config())?.precompile_module(&bytes)?,
+    };
+    std::fs::write(out_cwasm, &serialized)
+        .with_context(|| format!("write {}", out_cwasm.display()))?;
+    Ok(())
+}
+
+/// Deserialize a precompiled component, or `None` (absent, or incompatible → recompile).
+fn load_cached_component(engine: &Engine, cwasm_path: &Path) -> Option<Component> {
+    if !cwasm_path.exists() {
+        return None;
+    }
+    // SAFETY: the `.cwasm` is platform-produced (deploy-time precompile of the build's
+    // `.wasm`) and shipped read-only — a tenant cannot inject one. wasmtime also rejects an
+    // artifact whose config/ISA doesn't match this engine, so a skew falls back, not UB.
+    match unsafe { Component::deserialize_file(engine, cwasm_path) } {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(path = %cwasm_path.display(), error = %e, "ignoring incompatible .cwasm; recompiling");
+            None
+        }
+    }
+}
+
+/// Deserialize a precompiled wasip1 module, or `None` (absent, or incompatible → recompile).
+fn load_cached_module(engine: &Engine, cwasm_path: &Path) -> Option<Module> {
+    if !cwasm_path.exists() {
+        return None;
+    }
+    // SAFETY: as above — platform-produced, read-only, config/ISA-checked by wasmtime.
+    match unsafe { Module::deserialize_file(engine, cwasm_path) } {
+        Ok(m) => Some(m),
+        Err(e) => {
+            warn!(path = %cwasm_path.display(), error = %e, "ignoring incompatible .cwasm; recompiling");
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,19 +324,13 @@ impl FunctionRuntime {
         // both shared epoch counters, so a tight loop in either path is bounded even when
         // fuel is generous. Engine clones share epoch state (Arc-backed), so the loaded
         // functions' clones observe the same ticks.
-        let sync_engine = {
-            let mut cfg = Config::new();
-            cfg.consume_fuel(true);
-            cfg.epoch_interruption(true);
-            Engine::new(&cfg).expect("sync engine config is valid")
-        };
-        let async_engine = {
-            let mut cfg = Config::new();
-            cfg.async_support(true);
-            cfg.consume_fuel(true);
-            cfg.epoch_interruption(true);
-            Engine::new(&cfg).expect("async engine config is valid")
-        };
+        // No fuel on the component path: epoch + the outer wall-clock timeout already bound
+        // a tight loop AND a host-call park (fuel can't see the latter), so fuel adds only
+        // instruction-level metering — which we don't bill yet — at the cost of slower
+        // compile + per-call runtime overhead. Epoch is the structural CPU-loop kill-switch.
+        // The big-engine (JS) compile is moved off the VM-boot path to deploy via `.cwasm`.
+        let sync_engine = Engine::new(&sync_config()).expect("sync engine config is valid");
+        let async_engine = Engine::new(&async_config()).expect("async engine config is valid");
 
         let se = sync_engine.clone();
         let ae = async_engine.clone();
@@ -300,11 +364,19 @@ impl FunctionRuntime {
             .transpose()?;
         let kind = resolve_kind(declared, &bytes)?;
         let env = sidecar.env;
+        // Prefer a precompiled sibling `.cwasm` (deploy-time AOT) — deserialize is ~ms vs
+        // seconds to recompile the big JS engine. Falls back to compiling the `.wasm` if
+        // the `.cwasm` is absent or incompatible (e.g. a CPU/wasmtime skew).
+        let cwasm_path = wasm_path.with_extension("cwasm");
 
         let loaded = match kind {
             RuntimeKind::Wasip1 => {
-                let module = Module::from_binary(&self.sync_engine, &bytes)
-                    .with_context(|| format!("compile wasip1 module {}", wasm_path.display()))?;
+                let module = match load_cached_module(&self.sync_engine, &cwasm_path) {
+                    Some(m) => m,
+                    None => Module::from_binary(&self.sync_engine, &bytes).with_context(|| {
+                        format!("compile wasip1 module {}", wasm_path.display())
+                    })?,
+                };
                 let mut linker = Linker::new(&self.sync_engine);
                 preview1::add_to_linker_sync(&mut linker, |ctx| ctx)?;
                 LoadedFunction::CoreModule {
@@ -315,8 +387,11 @@ impl FunctionRuntime {
                 }
             }
             RuntimeKind::WasiHttp => {
-                let component = Component::from_binary(&self.async_engine, &bytes)
-                    .with_context(|| format!("compile component {}", wasm_path.display()))?;
+                let component = match load_cached_component(&self.async_engine, &cwasm_path) {
+                    Some(c) => c,
+                    None => Component::from_binary(&self.async_engine, &bytes)
+                        .with_context(|| format!("compile component {}", wasm_path.display()))?,
+                };
                 let mut linker = ComponentLinker::new(&self.async_engine);
                 // Full wasi p2 provides io/cli/clocks/random + `wasi:cli/environment`
                 // (the channel project secrets ride in on). Then add ONLY the http
@@ -505,7 +580,6 @@ async fn invoke_component(
     req: FunctionRequest,
 ) -> Result<FunctionResponse> {
     let mut store = Store::new(pre.engine(), HostState::new(&env));
-    store.set_fuel(FUNCTION_FUEL)?;
     store.set_epoch_deadline(epoch_deadline_ticks());
     store.limiter(|s| &mut s.limits);
 
@@ -750,8 +824,10 @@ mod tests {
     async fn runs_external_component() {
         let path = std::env::var("JKBASE_TEST_COMPONENT").expect("set JKBASE_TEST_COMPONENT");
         let mut rt = FunctionRuntime::new();
+        let t0 = std::time::Instant::now();
         rt.load_module("ext", std::path::Path::new(&path))
             .expect("load component");
+        eprintln!("LOAD took {:?}", t0.elapsed());
         let req = FunctionRequest {
             method: "GET".into(),
             path: "/probe".into(),
@@ -759,7 +835,9 @@ mod tests {
             headers: vec![],
             body: vec![],
         };
+        let t1 = std::time::Instant::now();
         let resp = rt.invoke("ext", req).await.expect("invoke");
+        eprintln!("INVOKE took {:?}", t1.elapsed());
         let text = String::from_utf8_lossy(&resp.body);
         eprintln!("status={} body={}", resp.status, text);
         assert_eq!(resp.status, 200, "body: {text}");

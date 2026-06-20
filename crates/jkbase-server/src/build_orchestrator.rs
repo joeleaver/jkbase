@@ -101,6 +101,11 @@ pub struct BuildDeps {
     /// Sparse logical size of a per-`(project,language)` build cache image (`vde`);
     /// grows on demand, billed by ACTUAL blocks against the project storage quota.
     pub cache_size_bytes: u64,
+    /// The in-VM agent binary (musl, runs on the host too). Used to AOT-precompile a
+    /// built function `.wasm` → sibling `.cwasm` (`--precompile`) so the runtime VM
+    /// deserializes at boot instead of recompiling the multi-MB JS component. `None`
+    /// disables it (the agent falls back to compiling the `.wasm`).
+    pub agent_bin: Option<PathBuf>,
 }
 
 /// Get-or-create the per-`(project,language)` cache lock (the `LogShipper::project_lock`
@@ -1352,6 +1357,18 @@ async fn build_one_target_inner(
             if !build_output::dump_file(&output_img, "/function.wasm", &dest)? {
                 bail!("function build produced no /function.wasm artifact");
             }
+            // Best-effort AOT precompile to a sibling `.cwasm`, moving the (multi-second,
+            // for the big JS engine) component compile off the runtime VM's boot/wake path
+            // to here. Non-fatal: the agent falls back to compiling the `.wasm` if the
+            // `.cwasm` is absent or CPU/version-incompatible.
+            if let Some(agent_bin) = deps.agent_bin.clone() {
+                let wasm = dest.clone();
+                let cwasm = dest.with_extension("cwasm");
+                let _ = tokio::task::spawn_blocking(move || {
+                    precompile_function(&agent_bin, &wasm, &cwasm)
+                })
+                .await;
+            }
         }
         TargetKind::Server => {
             collect_layered_server(
@@ -1386,6 +1403,34 @@ async fn build_one_target_inner(
 /// server manifest augmented with the layer refs the host deploy path needs
 /// (`app_layer` filename + `runtime` language). The shared base/runtime layers are
 /// injected host-side by digest, not carried in the tenant's build output.
+/// Run `jkbase-agent --precompile <wasm> <cwasm>` (host-side; the agent is a musl static
+/// binary). Best-effort: on any failure the `.cwasm` is removed and the runtime compiles
+/// the `.wasm` at boot, so functions still work — this only trades a slow first boot for a
+/// slower deploy.
+fn precompile_function(agent_bin: &Path, wasm: &Path, cwasm: &Path) {
+    match std::process::Command::new(agent_bin)
+        .arg("--precompile")
+        .arg(wasm)
+        .arg(cwasm)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            info!(wasm = %wasm.display(), "precompiled function → .cwasm");
+        }
+        Ok(out) => {
+            warn!(
+                wasm = %wasm.display(),
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "function precompile failed (non-fatal; compiles at boot)"
+            );
+            let _ = std::fs::remove_file(cwasm);
+        }
+        Err(e) => {
+            warn!(wasm = %wasm.display(), error = %e, "could not run agent --precompile (non-fatal)");
+        }
+    }
+}
+
 fn collect_layered_server(
     output_img: &Path,
     staged: &Path,
@@ -2265,6 +2310,7 @@ public = "./public"
             fetch_deadline: Duration::from_secs(60),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 512 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2741,6 +2787,7 @@ name = "api"
             fetch_deadline: Duration::from_secs(if workload.networked() { 180 } else { 120 }),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 1024 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -2867,6 +2914,7 @@ name = "api"
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 1024 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
@@ -3666,6 +3714,7 @@ name = "api"
             fetch_deadline: Duration::from_secs(300),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             cache_size_bytes: 512 * 1024 * 1024,
+            agent_bin: None,
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 

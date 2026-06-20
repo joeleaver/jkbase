@@ -319,6 +319,20 @@ struct SiteEntry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `jkbase-agent --precompile <in.wasm> <out.cwasm>`: AOT-compile a function with the
+    // runtime's exact engine config so the agent deserializes it at boot instead of
+    // recompiling the big JS engine. Invoked by the host deploy pipeline (it ships this
+    // same binary), so the precompiler and loader configs can never drift.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--precompile") {
+        let (Some(input), Some(output)) = (args.get(2), args.get(3)) else {
+            eprintln!("usage: jkbase-agent --precompile <in.wasm> <out.cwasm>");
+            std::process::exit(2);
+        };
+        function_runtime::precompile(Path::new(input), Path::new(output))?;
+        return Ok(());
+    }
+
     if is_pid1() {
         mount_filesystems();
         seed_entropy();

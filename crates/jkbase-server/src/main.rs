@@ -498,6 +498,9 @@ async fn main() -> Result<()> {
         // Per-(project,language) warm cache image (vde): sparse 4 GiB logical, grows
         // on demand, billed by actual blocks against the project storage quota.
         cache_size_bytes: 4096 * 1024 * 1024,
+        // The agent binary doubles as the function precompiler (host-side `--precompile`),
+        // so a function's component compiles once at deploy, not on every cold VM boot.
+        agent_bin: Some(args.agent_bin.clone()),
     });
     // The jail chroot base + toolchain dir must exist on the data-dir fs.
     let _ = std::fs::create_dir_all(&build_deps.chroot_base);
