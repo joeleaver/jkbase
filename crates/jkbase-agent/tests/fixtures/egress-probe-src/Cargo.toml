@@ -1,0 +1,24 @@
+# Standalone (own workspace) egress-probe fixture for the on-box egress e2e test
+# (`function_egress_e2e`). Built to a `wasi:http` component with
+#   cargo build --release --target wasm32-wasip2
+# and the result committed as `../egress-probe.wasm`. It issues ONE outbound request to a
+# target supplied by request headers (x-egress-scheme / -authority / -path) and reports
+# `RESULT:ALLOWED:<status>` or `RESULT:DENIED` — so one VM boot can drive the allow / deny
+# / rebind / ipv6 cases by varying headers.
+[workspace]
+
+[package]
+name = "egress-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi = "0.14"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

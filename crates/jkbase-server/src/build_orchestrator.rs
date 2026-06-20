@@ -3726,6 +3726,338 @@ name = "api"
         assert!(body.contains("egress=DENIED"), "egress must be denied: {body}");
     }
 
+    /// Build a minimal DNS response: echo the query's header ID + question, append a single
+    /// A record (`name → ip`) or set RCODE=NXDOMAIN when `ip` is `None`. Enough for the
+    /// agent's hickory resolver (single A query, Ipv4Only). `query` is the raw UDP datagram.
+    fn dns_reply(query: &[u8], ip: Option<std::net::Ipv4Addr>) -> Option<Vec<u8>> {
+        if query.len() < 12 {
+            return None;
+        }
+        // Walk the QNAME labels to find where the question ends (QTYPE+QCLASS follow).
+        let mut i = 12usize;
+        while i < query.len() {
+            let len = query[i] as usize;
+            if len == 0 {
+                i += 1;
+                break;
+            }
+            i += 1 + len;
+        }
+        let q_end = i + 4; // QTYPE(2) + QCLASS(2)
+        if q_end > query.len() {
+            return None;
+        }
+        let mut r = Vec::with_capacity(q_end + 16);
+        r.extend_from_slice(&query[0..2]); // ID
+        // Flags: QR=1, AA=1, RD copied from query, RA=0; RCODE 0 (or 3 = NXDOMAIN).
+        let rd = query[2] & 0x01;
+        let rcode: u8 = if ip.is_some() { 0 } else { 3 };
+        r.push(0x84 | rd);
+        r.push(rcode);
+        r.extend_from_slice(&query[4..6]); // QDCOUNT (echo, =1)
+        let ancount: u16 = if ip.is_some() { 1 } else { 0 };
+        r.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
+        r.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
+        r.extend_from_slice(&query[12..q_end]); // echo the question
+        if let Some(ip) = ip {
+            r.extend_from_slice(&[0xc0, 0x0c]); // NAME pointer to the question
+            r.extend_from_slice(&[0, 1, 0, 1]); // TYPE=A, CLASS=IN
+            r.extend_from_slice(&[0, 0, 0, 30]); // TTL=30
+            r.extend_from_slice(&[0, 4]); // RDLENGTH
+            r.extend_from_slice(&ip.octets());
+        }
+        Some(r)
+    }
+
+    /// G — the on-box EGRESS e2e. Boots a REAL agent VM whose function egress gate must
+    /// resolve through a host-controlled resolver and reach (or refuse) host-controlled
+    /// upstreams over the guest TAP — proving #7 (gate) + #9 (observe) end to end through the
+    /// production runtime path, not just `decide()` in isolation. One boot, two functions
+    /// (default + sandbox) sharing the header-driven egress-probe fixture; the test drives
+    /// allow / sandbox-deny / platform-deny / DNS-rebind / ipv6-refuse by varying headers,
+    /// then reads `/_jkbase/logs` and asserts the observe manifest recorded the verdicts.
+    ///
+    /// Self-contained control plane on the host side of the TAP:
+    ///   * a tiny UDP DNS responder on 172.16.0.1:53 (the agent's PINNED resolver) maps
+    ///     allow.test→9.9.9.9, platform.test→9.9.9.10, rebind.test→10.0.0.1;
+    ///   * HTTP upstreams on 9.9.9.9:80 (allowed public) and 9.9.9.10:80 (a platform IP,
+    ///     listed in `_platform.json` → must be denied), both host-owned via `lo` /32s.
+    /// Plain HTTP only (a self-signed TLS upstream wouldn't pass webpki roots; the TLS
+    /// construction mirrors default_send_request and is covered structurally).
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       <test-bin> --ignored --nocapture function_egress_e2e
+    #[tokio::test]
+    #[ignore = "egress e2e: needs KVM + root + musl agent; binds 172.16.0.1:53 + 9.9.9.x"]
+    async fn function_egress_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let fc_release = std::env::var("JKB_FC_RELEASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data.join("release-v1.15.1-x86_64"));
+        let Ok(agent_bin) = std::env::var("JKB_AGENT").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
+            return;
+        };
+        if !agent_bin.exists() {
+            eprintln!("skip: agent binary {} missing", agent_bin.display());
+            return;
+        }
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+        };
+        if !kernel.exists() {
+            eprintln!("skip: no kernel at {}", kernel.display());
+            return;
+        }
+
+        // Stage two functions sharing the egress-probe fixture: one default, one sandbox.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../jkbase-agent/tests/fixtures/egress-probe.wasm");
+        assert!(fixture.exists(), "missing egress-probe fixture {}", fixture.display());
+        let staged = data.join("egr-e2e-staged");
+        let _ = std::fs::remove_dir_all(&staged);
+        let funcs = staged.join("_functions");
+        std::fs::create_dir_all(&funcs).unwrap();
+        for (name, egress) in [("probe_default", "\"default\""), ("probe_sandbox", "\"sandbox\"")] {
+            std::fs::copy(&fixture, funcs.join(format!("{name}.wasm"))).unwrap();
+            std::fs::write(
+                funcs.join(format!("{name}.json")),
+                format!(r#"{{"runtime":"wasi-http","egress":{egress}}}"#),
+            )
+            .unwrap();
+        }
+        // Host-asserted platform facts (the PRODUCTION channel: a host param, NOT a tenant
+        // file — build_metadata_image writes `_platform.json` from this, overriding anything
+        // staged). 9.9.9.10 is a platform IP (must be denied); storage.test is the OWN host
+        // (not exercised here — own-bucket is #10-A). A tenant-smuggled `_platform.json`
+        // would be overwritten; we deliberately do NOT stage one.
+        let platform = jkbase_common::config::PlatformEgress {
+            storage_host: Some("storage.test".to_string()),
+            platform_ips: vec!["9.9.9.10".to_string()],
+        };
+
+        let plan =
+            crate::layer_plan::compute_layer_plan(&staged, &data.join("baselayers"), false, true)
+                .expect("compute layer plan");
+        let meta_img = data.join("egr-e2e-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &staged,
+            &plan,
+            &Default::default(),
+            &platform,
+            &meta_img,
+        )
+        .expect("build the metadata image");
+
+        // Minimal agent rootfs (vda): the musl agent as /sbin/init.
+        let rootfs_stage = data.join("egr-e2e-vda-stage");
+        let _ = std::fs::remove_dir_all(&rootfs_stage);
+        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data", "etc"] {
+            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+        }
+        std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = rootfs_stage.join("sbin/init");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let rootfs_img = data.join("egr-e2e-vda.ext4");
+        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+
+        // Networking: the resolver is hardcoded to 172.16.0.1, so the gateway IS 172.16.0.1.
+        let (host_ip, guest_ip, guest_mac) = ("172.16.0.1", "172.16.0.2", "AA:FC:00:00:16:02");
+        let tap = "jkegre2e".to_string();
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+        // Host owns the upstream IPs so a guest packet for them is delivered locally.
+        for ip in ["9.9.9.9/32", "9.9.9.10/32"] {
+            let _ = sh("ip", &["addr", "add", ip, "dev", "lo"]).await;
+        }
+
+        // Control plane on the host side of the TAP. Tasks abort when the test's runtime
+        // shuts down at return; the TAP/lo teardown below also tears the bindings down.
+        let dns = tokio::net::UdpSocket::bind((host_ip, 53u16)).await.expect("bind DNS :53");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = dns.recv_from(&mut buf).await else { continue };
+                // Decode the QNAME (lowercased) for the map.
+                let mut name = String::new();
+                let mut i = 12usize;
+                while i < n {
+                    let len = buf[i] as usize;
+                    if len == 0 { break; }
+                    if !name.is_empty() { name.push('.'); }
+                    if i + 1 + len > n { break; }
+                    name.push_str(&String::from_utf8_lossy(&buf[i + 1..i + 1 + len]));
+                    i += 1 + len;
+                }
+                let name = name.to_ascii_lowercase();
+                let ip = match name.as_str() {
+                    "allow.test" => Some(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+                    "platform.test" => Some(std::net::Ipv4Addr::new(9, 9, 9, 10)),
+                    "rebind.test" => Some(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                    _ => None,
+                };
+                if let Some(reply) = dns_reply(&buf[..n], ip) {
+                    let _ = dns.send_to(&reply, from).await;
+                }
+            }
+        });
+
+        for upstream in ["9.9.9.9", "9.9.9.10"] {
+            let l = tokio::net::TcpListener::bind((upstream, 80u16))
+                .await
+                .unwrap_or_else(|e| panic!("bind upstream {upstream}:80: {e}"));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = l.accept().await else { continue };
+                    tokio::spawn(async move {
+                        let mut b = [0u8; 1024];
+                        let _ = s.read(&mut b).await;
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nupstream-ok",
+                            )
+                            .await;
+                    });
+                }
+            });
+        }
+
+        let config = VmConfig {
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = data.join("egr-e2e-run");
+        let mut vm = VmInstance::start("egre2e", &config, &runtime_dir)
+            .await
+            .expect("runtime VM should start");
+
+        // Drive one probe: GET /functions/{fn} with the egress-target headers; returns the
+        // trimmed body (`RESULT:...`). Retries until the agent is up.
+        async fn probe(
+            guest_ip: &str,
+            func: &str,
+            authority: &str,
+            scheme: &str,
+        ) -> Option<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            while std::time::Instant::now() < deadline {
+                if let Ok(mut s) = tokio::net::TcpStream::connect((guest_ip, 80u16)).await {
+                    let req = format!(
+                        "GET /functions/{func} HTTP/1.0\r\nHost: jkbase\r\nx-egress-scheme: {scheme}\r\nx-egress-authority: {authority}\r\nx-egress-path: /\r\n\r\n"
+                    );
+                    let _ = s.write_all(req.as_bytes()).await;
+                    let mut buf = Vec::new();
+                    if s.read_to_end(&mut buf).await.is_ok() {
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = text.split_once("\r\n\r\n")
+                            && head.lines().next().is_some_and(|l| l.contains(" 200 "))
+                        {
+                            return Some(body.trim().to_string());
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            None
+        }
+
+        let allow = probe(guest_ip, "probe_default", "allow.test", "http").await;
+        let rebind = probe(guest_ip, "probe_default", "rebind.test", "http").await;
+        let platform = probe(guest_ip, "probe_default", "platform.test", "http").await;
+        let ipv6 = probe(guest_ip, "probe_default", "[::1]", "http").await;
+        let sandbox = probe(guest_ip, "probe_sandbox", "allow.test", "http").await;
+
+        // Pull the observe manifest (stream=="egress") before teardown.
+        let logs = {
+            let mut out = String::new();
+            if let Ok(mut s) = tokio::net::TcpStream::connect((guest_ip, 80u16)).await {
+                let _ = s
+                    .write_all(b"GET /_jkbase/logs HTTP/1.0\r\nHost: jkbase\r\n\r\n")
+                    .await;
+                let mut buf = Vec::new();
+                if s.read_to_end(&mut buf).await.is_ok() {
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some((_, body)) = text.split_once("\r\n\r\n") {
+                        out = body.to_string();
+                    }
+                }
+            }
+            out
+        };
+
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        for ip in ["9.9.9.9/32", "9.9.9.10/32"] {
+            let _ = sh("ip", &["addr", "del", ip, "dev", "lo"]).await;
+        }
+
+        eprintln!("allow={allow:?}\nrebind={rebind:?}\nplatform={platform:?}\nipv6={ipv6:?}\nsandbox={sandbox:?}");
+        eprintln!("egress logs:\n{logs}");
+
+        assert_eq!(allow.as_deref(), Some("RESULT:ALLOWED:200"), "default must reach an allowed public upstream");
+        assert_eq!(rebind.as_deref(), Some("RESULT:DENIED"), "a public name resolving to an internal IP must be denied (post-DNS)");
+        assert_eq!(platform.as_deref(), Some("RESULT:DENIED"), "a platform IP must be denied (Zone-2 by IP)");
+        assert_eq!(ipv6.as_deref(), Some("RESULT:DENIED"), "an IPv6 destination must be refused");
+        assert_eq!(sandbox.as_deref(), Some("RESULT:DENIED"), "a sandboxed function must not reach public");
+
+        // #9: the observe manifest recorded the verdicts, via the unified log pipe with the
+        // reserved egress stream. Parse the events (the EgressEvent is JSON inside the
+        // escaped `line` field) rather than substring-matching the escaped bytes.
+        use jkbase_common::logs::{EgressEvent, Verdict};
+        let parsed: serde_json::Value = serde_json::from_str(&logs).unwrap_or(serde_json::Value::Null);
+        let events: Vec<EgressEvent> = parsed
+            .get("lines")
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|l| l.get("stream").and_then(|s| s.as_str()) == Some("egress"))
+                    .filter_map(|l| l.get("line").and_then(|s| s.as_str()))
+                    .filter_map(|s| serde_json::from_str::<EgressEvent>(s).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            events.iter().any(|e| e.verdict == Verdict::Allow && e.dest_host == "allow.test"),
+            "an allow verdict must be recorded for allow.test: {logs}"
+        );
+        assert!(
+            events.iter().any(|e| e.verdict == Verdict::DenySandbox),
+            "the sandboxed function's deny must be recorded: {logs}"
+        );
+        assert!(
+            events.iter().any(|e| e.verdict == Verdict::DenyPlatform && e.dest_host == "platform.test"),
+            "the platform-IP deny must be recorded: {logs}"
+        );
+        println!("PASS: function_egress_e2e — allow/rebind/platform/ipv6/sandbox + observe manifest");
+    }
+
     /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun
     /// server is built through `run_project_build` (→ a layered app erofs blob),
     /// the host resolves the layer plan + bakes the metadata image
