@@ -672,7 +672,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
+    // P0 (function-outbound-io, Phase 0): bind the control API to LOOPBACK, not 0.0.0.0.
+    // The proxy reaches it at 127.0.0.1 (api_addr, above) and external clients reach it
+    // via the `api.` reserved host THROUGH the proxy — nothing legitimate needs it on a
+    // routable address. Binding 0.0.0.0 also put the socket on the runtime bridge IP
+    // (172.16.0.1:9090), so a hostile guest's only barrier to the control plane was ufw
+    // ordering; never listening off loopback closes that structurally (setup-bridge.sh's
+    // JKRUNFW INPUT chain is the netfilter backstop). Threat model: all tenants untrusted.
+    let addr = SocketAddr::from(([127, 0, 0, 1], args.api_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(
         api = %addr,
@@ -2000,9 +2007,8 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
     // tenant's runtime VM can't reach another's at 172.16.0.x on the shared bridge (the
     // gateway/uplink — a non-isolated port — stays reachable, so egress is unaffected).
     // Fail-closed: if the kernel can't apply it, the deploy fails rather than running a
-    // VM with cross-tenant L2 reachability. NB this is the isolation half only — an
-    // ebtables L2 source-guard (anti IP/MAC spoof, as the build bridge has) is a tracked
-    // follow-up; port isolation already blocks the high-value cross-tenant-hijack case.
+    // VM with cross-tenant L2 reachability. Port isolation blocks cross-tenant *reach*;
+    // the ebtables L2 source-guard installed below closes *spoofing* (the other half).
     run_cmd(
         "ip",
         &["link", "set", "dev", tap_name, "type", "bridge_slave", "isolated", "on"],
@@ -2017,6 +2023,21 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
     )
     .await;
     run_cmd("ip", &["link", "set", tap_name, "up"]).await?;
+
+    // L2 source-guard (anti IP/MAC spoof): pin this TAP to its deterministic {MAC, IPv4
+    // src, ARP src}. Port isolation (above) blocks cross-tenant *reach*; this closes
+    // *spoofing* — without it a hostile guest can emit frames bearing another project's
+    // source IP, poisoning per-project egress attribution + the bandwidth meter (and any
+    // future `-s`-scoped rule). Mirrors the build bridge's JKBUILD_SG. Fail-closed, to
+    // match the port-isolation posture above. {ip,mac} derive from the TAP name via the
+    // same deterministic octet map as allocate_ip, so setup_tap needs no new args.
+    if let Some((ip, mac)) = tap_identity(tap_name) {
+        install_tap_source_guard(tap_name, &ip, &mac)
+            .await
+            .context("install runtime L2 source-guard (is ebtables installed?)")?;
+    } else {
+        warn!(tap_name, "tap name outside the tapN scheme — L2 source-guard NOT applied");
+    }
 
     Ok(())
 }
@@ -2047,6 +2068,90 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
         anyhow::bail!("{} {:?} failed with {}", cmd, args, status);
     }
     Ok(())
+}
+
+/// The ebtables (L2/bridge filter) chain holding the runtime per-TAP source-guard rules.
+const RUNTIME_SOURCE_GUARD_CHAIN: &str = "JKRUN_SG";
+
+/// Derive a runtime TAP's deterministic `(ipv4, mac)` from its name. MUST stay in
+/// lock-step with `PlatformState::allocate_ip`: octet ∈ 2..=254, tap = `tap{octet-2}`,
+/// ip = `172.16.0.{octet}`, mac = `AA:FC:00:00:00:{octet:02X}`. Because that map is a
+/// bijection, a TAP's source-guard rules are stable across project churn — so they need
+/// no teardown (a deleted TAP's rules match nothing; a reused octet gets identical {ip,mac}).
+fn tap_identity(tap: &str) -> Option<(String, String)> {
+    let n: u16 = tap.strip_prefix("tap")?.parse().ok()?;
+    let octet = n.checked_add(2)?;
+    if octet > 254 {
+        return None;
+    }
+    Some((format!("172.16.0.{octet}"), format!("AA:FC:00:00:00:{octet:02X}")))
+}
+
+/// Ensure the runtime source-guard chain exists and is hooked into the L2 INPUT (frames
+/// to the gateway/host) + FORWARD (VM↔VM, already port-isolated — defense in depth) paths.
+/// Do NOT flush: unlike the build guard (a static pool repopulated at startup), runtime
+/// TAPs are pinned lazily in `setup_tap`, so flushing here would drop active TAPs' rules
+/// until their next wake. Idempotent: `-N` ignores "exists", the hook is `-C`-guarded.
+/// Rules match `-i tap*`, so build-bridge (`jkbld*`) frames fall straight through.
+async fn ensure_runtime_source_guard_chain() -> Result<()> {
+    let _ = run_ebtables(&["-t", "filter", "-N", RUNTIME_SOURCE_GUARD_CHAIN]).await;
+    for hook in ["INPUT", "FORWARD"] {
+        if !ebtables_ok(&["-t", "filter", "-C", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN]).await {
+            run_ebtables(&["-t", "filter", "-I", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN])
+                .await
+                .with_context(|| format!("hook runtime source-guard into ebtables {hook}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Install the per-TAP L2 source-guard: DROP any frame on `tap` not bearing this slot's
+/// source MAC / IPv4 source / ARP source, plus DROP 802.1Q VLAN-tagged frames outright (a
+/// tagged frame's outer ethertype is 0x8100, so `-p IPv4`/`-p ARP` would skip the source
+/// pins). Idempotent (`-C` before `-A`), so re-asserting a surviving TAP on wake is a
+/// no-op. Mirrors `build_orchestrator::ensure_source_guard` rule-for-rule.
+async fn install_tap_source_guard(tap: &str, ip: &str, mac: &str) -> Result<()> {
+    ensure_runtime_source_guard_chain().await?;
+    let rules: [Vec<&str>; 4] = [
+        vec!["-i", tap, "-p", "802_1Q", "-j", "DROP"],
+        vec!["-i", tap, "!", "-s", mac, "-j", "DROP"],
+        vec!["-i", tap, "-p", "IPv4", "!", "--ip-src", ip, "-j", "DROP"],
+        vec!["-i", tap, "-p", "ARP", "!", "--arp-ip-src", ip, "-j", "DROP"],
+    ];
+    for r in &rules {
+        let mut check = vec!["-t", "filter", "-C", RUNTIME_SOURCE_GUARD_CHAIN];
+        check.extend_from_slice(r);
+        if !ebtables_ok(&check).await {
+            let mut add = vec!["-t", "filter", "-A", RUNTIME_SOURCE_GUARD_CHAIN];
+            add.extend_from_slice(r);
+            run_ebtables(&add).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Run an ebtables command, erroring on failure (fail-closed). Distinct from the build
+/// orchestrator's own copy so the runtime guard does not couple to that module.
+async fn run_ebtables(args: &[&str]) -> Result<()> {
+    let status = tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .context("spawn ebtables")?;
+    if !status.success() {
+        anyhow::bail!("ebtables {args:?} failed: {status}");
+    }
+    Ok(())
+}
+
+/// True iff the ebtables command succeeds — for `-C` existence checks; never errors.
+async fn ebtables_ok(args: &[&str]) -> bool {
+    tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Rename any legacy `{id}.ext4` data disks to LocalLoop's `{id}.img` convention so
