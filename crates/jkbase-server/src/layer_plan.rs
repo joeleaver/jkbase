@@ -422,6 +422,8 @@ pub fn build_metadata_image(
     if !secrets.is_empty() {
         inject_secrets(&stage.join("_servers"), secrets)
             .context("inject project secrets into server manifests")?;
+        inject_function_secrets(&stage.join("_functions"), secrets)
+            .context("inject project secrets into function sidecars")?;
     }
 
     // Bake the device map the agent reads at boot...
@@ -528,6 +530,53 @@ fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Res
     Ok(())
 }
 
+/// Merge project `secrets` into each function's `_functions/{name}.json` sidecar `env`
+/// (creating the sidecar if absent), for the agent's function runtime to expose to the
+/// component (and wasip1) as WASI env. Like [`inject_secrets`], this writes into the
+/// PER-VM metadata image staging ONLY — the on-disk artifact stays secret-free, and
+/// `_functions/*.json` is never static-servable (the agent blocks `_`-prefixed entries).
+///
+/// Functions have no platform-reserved env (the runtime hands the component a clean env),
+/// so unlike the server path there is no reserved-key filter — but the same structural
+/// guards apply: a key/value that would break `WasiCtxBuilder::env` (empty key, `=` in the
+/// key, or a NUL) is dropped so one bad secret never fails the whole function load.
+fn inject_function_secrets(
+    functions_dir: &Path,
+    secrets: &BTreeMap<String, String>,
+) -> Result<()> {
+    if !functions_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(functions_dir)? {
+        let wasm = entry?.path();
+        if wasm.extension().and_then(|e| e.to_str()) != Some("wasm") {
+            continue;
+        }
+        let sidecar = wasm.with_extension("json");
+        let mut manifest: serde_json::Value = match std::fs::read(&sidecar) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse function sidecar {}", sidecar.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e).with_context(|| format!("read {}", sidecar.display())),
+        };
+        let Some(obj) = manifest.as_object_mut() else {
+            continue;
+        };
+        let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
+        let Some(env) = env.as_object_mut() else {
+            continue;
+        };
+        for (k, v) in secrets {
+            if k.is_empty() || k.contains('=') || k.contains('\0') || v.contains('\0') {
+                continue;
+            }
+            env.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        std::fs::write(&sidecar, serde_json::to_vec_pretty(&manifest)?)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +653,45 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(servers.join("app.json")).unwrap()).unwrap();
         assert_eq!(v["env"]["X"], "y");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inject_function_secrets_creates_and_merges_sidecars() {
+        let dir = std::env::temp_dir().join(format!("ls-fnsec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let functions = dir.join("_functions");
+        std::fs::create_dir_all(&functions).unwrap();
+        // One function with a pre-existing sidecar (runtime declared), one with none.
+        std::fs::write(functions.join("api.wasm"), b"\0asm\x0d\0\x01\0").unwrap();
+        std::fs::write(functions.join("api.json"), r#"{"runtime":"wasi-http"}"#).unwrap();
+        std::fs::write(functions.join("beat.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let mut secrets = BTreeMap::new();
+        secrets.insert("API_KEY".to_string(), "sk-live-123".to_string());
+        // Functions have no reserved env, so PATH is a perfectly valid secret here.
+        secrets.insert("PATH".to_string(), "/custom".to_string());
+        secrets.insert("BAD=KEY".to_string(), "x".to_string()); // '=' in key → skipped
+        secrets.insert("NUL_VAL".to_string(), "a\0b".to_string()); // NUL value → skipped
+
+        inject_function_secrets(&functions, &secrets).unwrap();
+
+        let api: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(functions.join("api.json")).unwrap()).unwrap();
+        assert_eq!(api["runtime"], "wasi-http", "existing runtime preserved");
+        assert_eq!(api["env"]["API_KEY"], "sk-live-123");
+        assert_eq!(api["env"]["PATH"], "/custom", "no reserved filter for functions");
+        assert!(!api["env"].as_object().unwrap().contains_key("BAD=KEY"));
+        assert!(!api["env"].as_object().unwrap().contains_key("NUL_VAL"));
+
+        // The function with no prior sidecar gets one created (env only; runtime → sniff).
+        let beat: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(functions.join("beat.json")).unwrap()).unwrap();
+        assert_eq!(beat["env"]["API_KEY"], "sk-live-123");
+        assert!(beat.get("runtime").is_none());
+
+        // Missing dir is a no-op.
+        inject_function_secrets(&dir.join("_nope"), &secrets).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
