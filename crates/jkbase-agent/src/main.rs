@@ -2,11 +2,13 @@ mod clock;
 mod container_supervisor;
 mod dmverity;
 mod function_runtime;
+mod log_sink;
 mod static_server;
 
 use anyhow::Result;
 use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
+use log_sink::LogSink;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -301,6 +303,10 @@ struct AgentState {
     functions_dir: PathBuf,
     functions: FunctionRuntime,
     containers: Arc<ContainerSupervisor>,
+    /// The one process-wide log sink (server output + function egress events),
+    /// shared by every producer so the host shipper sees a single `(boot_id, seq)`
+    /// cursor space. Read directly by the `/_jkbase/logs` endpoint.
+    log_sink: Arc<LogSink>,
     route_config: Vec<RouteEntry>,
     sites: Vec<SiteEntry>,
 }
@@ -395,6 +401,12 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The single shared log sink: one `seq` source + one `boot_id` for the whole
+    // agent process, constructed here and handed to every log producer. Both the
+    // server supervisor and (in the egress-observe path) the function runtime push
+    // into it, so the host shipper dedups on one cursor space (P0-OBS-UNIFIED-SINK).
+    let log_sink = Arc::new(LogSink::new());
+
     let mut functions = FunctionRuntime::new();
     if let Err(e) = functions.load_all_from_dir(&functions_dir) {
         error!(error = %e, "failed to load functions");
@@ -405,7 +417,11 @@ async fn main() -> Result<()> {
         info!(functions = ?func_names, "loaded WASM functions");
     }
 
-    let containers = Arc::new(ContainerSupervisor::new(servers_dir, layer_map));
+    let containers = Arc::new(ContainerSupervisor::new(
+        servers_dir,
+        layer_map,
+        log_sink.clone(),
+    ));
     if let Err(e) = containers.start_all().await {
         error!(error = %e, "failed to start server containers");
     }
@@ -444,6 +460,7 @@ async fn main() -> Result<()> {
         functions_dir,
         functions,
         containers,
+        log_sink,
         route_config,
         sites,
     });
@@ -663,16 +680,18 @@ async fn logs_response(
             .and_then(|v| v.parse().ok())
     };
 
-    // `since` (incremental cursor) takes precedence over `limit` (tail).
+    // `since` (incremental cursor) takes precedence over `limit` (tail). Read the
+    // unified sink directly: it carries both server output and function egress
+    // events under one `(boot_id, seq)` cursor space.
     let lines = if let Some(since) = param("since=") {
-        state.containers.get_logs_since(since).await
+        state.log_sink.get_logs_since(since).await
     } else {
         let limit = param("limit=").unwrap_or(200) as usize;
-        state.containers.get_logs(limit).await
+        state.log_sink.get_logs(limit).await
     };
 
     let resp = jkbase_common::logs::LogsResponse {
-        boot_id: state.containers.boot_id().to_string(),
+        boot_id: state.log_sink.boot_id().to_string(),
         lines,
     };
     let body = serde_json::to_vec(&resp).unwrap_or_default();
