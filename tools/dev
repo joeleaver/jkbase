@@ -14,7 +14,7 @@
 #   assets       download+verify pinned Firecracker release, bun, apko
 #   rust         cargo build host bins + the musl agent + jkbuild-init
 #   kernel       build (or adopt) the 6.12 guest kernel                          [long]
-#   toolchains   bake default/bun/dockerfile/node/rust/python/go .ext4 build images
+#   toolchains   bake default/bun/dockerfile/node/rust/python/go/function .ext4 images
 #   baselayers   bake base + bun/node/rust runtime erofs layers + platform.json  [root]
 #   net          provision the build bridge + firewall (3128+3129) + cgroup      [root, per-boot]
 #   all          preflight→deps→assets→rust→kernel→toolchains→baselayers  (NOT net)
@@ -383,6 +383,15 @@ cmd_toolchains() {
     bake_image go "$TOOLCHAIN_DIR/go.ext4" \
         "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-go.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-go.apko.lock.json"):init:$init_sha")" \
         env INJECT_BUN=0 CONFIG="$REPO_ROOT/images/apko/build-go.apko.yaml" OUT="$TOOLCHAIN_DIR/go.ext4" "$REPO_ROOT/tools/build-image.sh"
+    # jkbuild-function.ext4 (apko base + jkbuild-init + a pinned official Rust toolchain
+    # with the wasm32-wasip2 std injected at /opt/rust). Functions → one wasi:http
+    # component. Ensure the wasip2 target is materialized on this host before baking,
+    # then stamp on the rust version so a toolchain bump rebakes.
+    if [ "$CHECK" != 1 ]; then rustup target add wasm32-wasip2 >/dev/null 2>&1 || true; fi
+    local rust_ver; rust_ver="$(rustc --version 2>/dev/null || echo unknown)"
+    bake_image jkbuild-function "$TOOLCHAIN_DIR/jkbuild-function.ext4" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.lock.json"):init:$init_sha:rust:$rust_ver")" \
+        env INJECT_BUN=0 INJECT_RUST_WASIP2=1 CONFIG="$REPO_ROOT/images/apko/build-function.apko.yaml" OUT="$TOOLCHAIN_DIR/jkbuild-function.ext4" "$REPO_ROOT/tools/build-image.sh"
     RAN[toolchains]=OK
 }
 

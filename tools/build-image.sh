@@ -24,6 +24,13 @@ WORK="${WORK:-$REPO_ROOT/.firecracker/work/image-$(basename "${OUT%.ext4}")}"
 BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
 INIT_BIN="${INIT_BIN:-$REPO_ROOT/target/x86_64-unknown-linux-musl/release/jkbuild-init}"
 INJECT_BUN="${INJECT_BUN:-1}"
+# INJECT_RUST_WASIP2=1 bakes a pinned official Rust toolchain (with the wasm32-wasip2
+# target std) at /opt/rust for the function toolchain. RUST_TOOLCHAIN_DIR points at a
+# self-contained rustup toolchain dir (bin/ + lib/rustlib/{host,wasm32-wasip2}); the
+# default is the repo-pinned toolchain rustup materialized on this host. See the
+# build-function.apko.yaml header for why this is injected, not an apko package.
+INJECT_RUST_WASIP2="${INJECT_RUST_WASIP2:-0}"
+RUST_TOOLCHAIN_DIR="${RUST_TOOLCHAIN_DIR:-}"
 export PATH="$HOME/.local/bin:$PATH"
 
 command -v apko >/dev/null || {
@@ -86,6 +93,37 @@ if [ -n "$bb" ]; then
     done
 else
     echo "[build-image] WARN: busybox not found in image; lifecycle shell-outs may fail" >&2
+fi
+
+# Inject a pinned official Rust toolchain WITH the wasm32-wasip2 target std at
+# /opt/rust (the function toolchain). Wolfi packages only the host std, and the
+# wasip2 std must be built by the SAME rustc, so we bake the official self-contained
+# toolchain (its binaries target an old glibc, so they run on Wolfi's newer glibc).
+if [ "$INJECT_RUST_WASIP2" = "1" ]; then
+    src="$RUST_TOOLCHAIN_DIR"
+    if [ -z "$src" ]; then
+        # Default: the repo-pinned toolchain rustup materialized for this host.
+        chan="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain.toml" | head -1)"
+        host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+        src="${RUSTUP_HOME:-$HOME/.rustup}/toolchains/${chan}-${host}"
+    fi
+    if [ ! -x "$src/bin/cargo" ] || [ ! -x "$src/bin/rustc" ]; then
+        echo "[build-image] ERROR: rust toolchain not found at $src (set RUST_TOOLCHAIN_DIR, or run: rustup toolchain install <chan> && rustup target add wasm32-wasip2)" >&2
+        exit 1
+    fi
+    if [ ! -d "$src/lib/rustlib/wasm32-wasip2" ]; then
+        echo "[build-image] ERROR: wasm32-wasip2 std missing in $src — run: rustup target add wasm32-wasip2" >&2
+        exit 1
+    fi
+    echo "[build-image] injecting Rust toolchain + wasm32-wasip2 std from $src → /opt/rust"
+    mkdir -p "$STAGE/opt/rust"
+    # Copy the self-contained toolchain (real binaries, not rustup proxies). rustc
+    # resolves its sysroot relative to its own path, so /opt/rust is self-sufficient.
+    cp -a "$src/." "$STAGE/opt/rust/"
+    mkdir -p "$STAGE/usr/local/bin"
+    for tool in cargo rustc rustdoc; do
+        [ -e "$STAGE/opt/rust/bin/$tool" ] && ln -sf /opt/rust/bin/"$tool" "$STAGE/usr/local/bin/$tool"
+    done
 fi
 
 # Build-mirror CA (optional). When BUILD_CA_CERT points at the shared CA cert, bake it
