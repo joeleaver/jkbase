@@ -15,6 +15,7 @@
 //! mount, no root — `mkfs.ext4 -d`, threat-model P0-3).
 
 use anyhow::{ensure, Context, Result};
+use jkbase_common::config::PlatformEgress;
 use jkbase_common::layers::{RuntimeLayers, ServerLayers, VerityParams};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use serde::Deserialize;
@@ -392,6 +393,7 @@ pub fn build_metadata_image(
     deployment_dir: &Path,
     plan: &LayerPlan,
     secrets: &BTreeMap<String, String>,
+    platform: &PlatformEgress,
     out: &Path,
 ) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
@@ -439,6 +441,16 @@ pub fn build_metadata_image(
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     std::fs::write(stage.join(LAYER_PATHS_FILE), serde_json::to_vec_pretty(&paths)?)?;
+
+    // Host-asserted platform egress facts (`_platform.json`): the OWN object-store host
+    // (Zone 1) + the platform's own public IP set (Zone 2 deny). Written LAST, into the
+    // per-VM image only — overriding any same-named file a tenant might have smuggled into
+    // their source tree, so this region is genuinely host-authored and tenant-unforgeable
+    // (P0-EGRESS-OWN-HOST-ASSERTED). NEVER `jkbase.toml`-derived.
+    std::fs::write(
+        stage.join(PlatformEgress::FILE),
+        serde_json::to_vec_pretty(platform)?,
+    )?;
 
     build_ro_ext4_from_dir(&stage, &tmp_img, 8)
         .with_context(|| format!("mkfs metadata image for {}", out.display()))?;

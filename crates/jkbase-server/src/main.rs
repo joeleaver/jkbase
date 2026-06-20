@@ -9,6 +9,7 @@ mod objectstore_service;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use jkbase_common::config::PlatformEgress;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
@@ -139,6 +140,15 @@ struct Args {
     /// not a tenant privilege — keep it out of tenant reach.
     #[arg(long, env = "JKBASE_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// The platform's own public/uplink IP(s) (comma-separated) — where the proxy /
+    /// control API / object-store terminate. Stamped into each VM's `_platform.json` as the
+    /// Zone-2 deny-set so a function cannot reach `api.{domain}` (control plane) by IP or
+    /// domain-fronting (P0-EGRESS-PLATFORM-BY-IP). When unset, the server auto-discovers
+    /// the global IPs on the default-route uplink (mirrors tools/setup-bridge.sh). Set this
+    /// to be explicit / on hosts where auto-discovery is wrong (e.g. behind NAT).
+    #[arg(long, env = "JKBASE_PLATFORM_IPS", value_delimiter = ',')]
+    platform_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +177,11 @@ struct PlatformState {
     disk_tokens: HashMap<String, FenceToken>,
     /// This host's stable identity, stamped into lease tokens.
     host_id: String,
+    /// Host-asserted platform egress facts (OWN object-store host + the platform's own
+    /// public IP deny-set), stamped into every per-VM metadata image as `_platform.json`
+    /// so the in-VM agent can recognize OWN-storage (Zone 1) and deny the control-plane /
+    /// proxy IP(s) (Zone 2). Computed once at startup; the same for every VM on this host.
+    platform_egress: PlatformEgress,
 }
 
 /// Data disk size (MiB) created on first use for projects that declare volumes.
@@ -324,6 +339,30 @@ async fn main() -> Result<()> {
     let lease: Arc<dyn Lease> =
         Arc::new(FlockLease::open(data_dir.join("leases"), host_id.clone())?);
 
+    // Host-asserted platform egress facts, computed once. The OWN object-store host is
+    // `storage.{domain}`; the Zone-2 deny-set is the host's own public uplink IP(s) — taken
+    // from --platform-ips when given, else auto-discovered off the default-route interface
+    // (the same source tools/setup-bridge.sh uses for its firewall rules).
+    let platform_ips = if args.platform_ips.is_empty() {
+        discover_uplink_ips()
+    } else {
+        args.platform_ips.clone()
+    };
+    if platform_ips.is_empty() {
+        // The netfilter fence ALLOWS guest→public-IP:80,443 (servers reach the object-store /
+        // own-sites through the proxy there), so the agent's platform-IP list is the ONLY
+        // layer denying a function the control plane on those ports. Empty = that agent-side
+        // Zone-2 deny is disabled — loudly flag it (the control API is still loopback-bound +
+        // auth-gated, but this is a real gap to close before tenant exposure).
+        warn!("no platform uplink IPs (auto-discovery empty and --platform-ips unset); function egress Zone-2 deny by IP is DISABLED — set --platform-ips");
+    } else {
+        info!(ips = ?platform_ips, "platform egress deny-set (Zone-2 platform IPs)");
+    }
+    let platform_egress = PlatformEgress {
+        storage_host: Some(format!("storage.{}", args.domain)),
+        platform_ips,
+    };
+
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         vm_states: HashMap::new(),
@@ -338,6 +377,7 @@ async fn main() -> Result<()> {
         lease,
         disk_tokens: HashMap::new(),
         host_id,
+        platform_egress,
     }));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
@@ -1238,6 +1278,60 @@ fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &s
     let _ = store.claim_domain(&record);
 }
 
+/// Discover the host's public uplink IPv4(s): the global-scope addresses on the
+/// default-route interface. Mirrors `tools/setup-bridge.sh` (`ip route show default` →
+/// `ip -4 -o addr show $IFACE scope global`). Fail-soft: returns empty on any error (the
+/// caller warns), never a partial/garbage IP. Used to build the agent's Zone-2 deny-set.
+fn discover_uplink_ips() -> Vec<String> {
+    let iface = match std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            // "default via <gw> dev <iface> ..." — take the token after `dev`.
+            text.lines()
+                .next()
+                .and_then(|l| {
+                    let mut it = l.split_whitespace();
+                    while let Some(tok) = it.next() {
+                        if tok == "dev" {
+                            return it.next().map(str::to_string);
+                        }
+                    }
+                    None
+                })
+        }
+        _ => None,
+    };
+    let Some(iface) = iface else {
+        return Vec::new();
+    };
+    match std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", &iface, "scope", "global"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                // "<n>: <iface>    inet <ip>/<prefix> ..." — take the addr after `inet`,
+                // strip the prefix, and only keep a parseable IPv4.
+                let mut it = l.split_whitespace();
+                while let Some(tok) = it.next() {
+                    if tok == "inet" {
+                        let addr = it.next()?.split('/').next()?;
+                        if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                            return Some(addr.to_string());
+                        }
+                    }
+                }
+                None
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 async fn handle_deploy(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
@@ -1348,6 +1442,9 @@ async fn handle_deploy(
         .list_secrets(project_id)
         .map(|v| v.into_iter().map(|s| (s.key, s.value)).collect())
         .unwrap_or_default();
+    // Host-asserted platform egress facts, stamped into this VM's metadata image as
+    // `_platform.json` (the agent's OWN-storage host + Zone-2 deny-set). Read under the lock.
+    let platform_egress = plat.platform_egress.clone();
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -1367,7 +1464,7 @@ async fn handle_deploy(
             // verify=true: cold-boot deploy re-checks every tenant + platform blob's
             // sha256 before it can be attached to a VM.
             let plan = layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, true)?;
-            layer_plan::build_metadata_image(&content_dir, &plan, &secrets, &out)?;
+            layer_plan::build_metadata_image(&content_dir, &plan, &secrets, &platform_egress, &out)?;
             Ok(plan)
         })
         .await

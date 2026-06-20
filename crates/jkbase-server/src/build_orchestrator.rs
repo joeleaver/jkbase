@@ -24,7 +24,7 @@
 //! cargo-component for functions) are B2 and keep this contract unchanged.
 
 use anyhow::{bail, ensure, Context, Result};
-use jkbase_common::config::{Builder, ProjectConfig};
+use jkbase_common::config::{resolve_egress, Builder, EgressPolicy, ProjectConfig};
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
@@ -1695,6 +1695,19 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         if !path_ok(&f.source) {
             bail!("function '{name}' source {:?} must be a relative path inside the project (no '..' or absolute)", f.source);
         }
+        // `egress = []` is ambiguous: [] and `false` are identical for the PUBLIC zone, but
+        // an author writing [] to mean "deny everything incl. own-stuff" would be surprised
+        // that own-stuff still works. Make it un-writable rather than silently alias it to
+        // `false` (design §3 edge case). Point them at the explicit spelling.
+        if matches!(&f.egress, Some(EgressPolicy::Allowlist(a)) if a.is_empty()) {
+            bail!("function '{name}' has `egress = []` (empty allowlist); use `egress = false` to deny all public egress, or list the allowed hosts");
+        }
+    }
+    if matches!(
+        config.hosting.as_ref().and_then(|h| h.function_egress.as_ref()),
+        Some(EgressPolicy::Allowlist(a)) if a.is_empty()
+    ) {
+        bail!("[hosting] function_egress = [] (empty allowlist); use `false` to sandbox every function, or list the allowed hosts");
     }
     for (name, s) in &config.servers {
         let sd = s.source_dir();
@@ -1785,6 +1798,34 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     }
     if let Some(j) = config.schedules_json() {
         std::fs::write(staged.join("_schedules.json"), j)?;
+    }
+
+    // Stamp each function's RESOLVED public-egress policy into its `_functions/{name}.json`
+    // sidecar. Precedence (project ceiling × per-function) is collapsed HERE, host-side,
+    // into one concrete `ResolvedEgress` so the agent receives exactly one immutable state
+    // and never parses `jkbase.toml` nor re-derives precedence (P0-EGRESS-POLICY-HOST-
+    // RESOLVED). Written before the `.wasm` is staged and before deploy-time secret
+    // injection, both of which merge into (never clobber) this sidecar.
+    if !config.functions.is_empty() {
+        let functions_dir = staged.join("_functions");
+        std::fs::create_dir_all(&functions_dir)?;
+        let project_ceiling = config.hosting.as_ref().and_then(|h| h.function_egress.as_ref());
+        for (name, f) in &config.functions {
+            let resolved = resolve_egress(project_ceiling, f.egress.as_ref());
+            let sidecar = functions_dir.join(format!("{name}.json"));
+            // Merge into any existing sidecar (preserve a future `runtime`/`env`); create
+            // it otherwise. Only the `egress` key is host-authored here.
+            let mut obj: serde_json::Value = match std::fs::read(&sidecar) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse function sidecar {}", sidecar.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+                Err(e) => return Err(e).with_context(|| format!("read {}", sidecar.display())),
+            };
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("egress".to_string(), serde_json::to_value(&resolved)?);
+                std::fs::write(&sidecar, serde_json::to_vec_pretty(&obj)?)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2058,6 +2099,69 @@ mod tests {
         assert!(!dir.join("_sites.json").exists());
         assert!(!dir.join("_schedules.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assemble_sidecars_stamps_resolved_function_egress() {
+        let dir = std::env::temp_dir().join(format!("jkb-fnegress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Project ceiling = allowlist; one fn narrows (intersect), one omits (=ceiling),
+        // one sandboxes. Verifies the host collapses precedence into the sidecar.
+        let cfg: ProjectConfig = toml::from_str(
+            r#"
+            [hosting]
+            function_egress = ["api.stripe.com", "api.twilio.com"]
+            [functions.narrow]
+            source = "narrow"
+            egress = ["api.stripe.com", "evil.com"]
+            [functions.inherit]
+            source = "inherit"
+            [functions.boxed]
+            source = "boxed"
+            egress = false
+            "#,
+        )
+        .unwrap();
+        assemble_sidecars(&cfg, &dir).unwrap();
+
+        let read = |n: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join("_functions").join(n)).unwrap()).unwrap()
+        };
+        // evil.com intersected out of the ceiling.
+        assert_eq!(read("narrow.json")["egress"]["allowlist"], serde_json::json!(["api.stripe.com"]));
+        // Omitted → the project ceiling verbatim (NOT allow-all).
+        let inherit = read("inherit.json");
+        let mut got: Vec<String> = inherit["egress"]["allowlist"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        got.sort();
+        assert_eq!(got, vec!["api.stripe.com".to_string(), "api.twilio.com".to_string()]);
+        // `false` → sandbox (snake_case unit variant).
+        assert_eq!(read("boxed.json")["egress"], serde_json::json!("sandbox"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_empty_egress_allowlist() {
+        let fn_empty: ProjectConfig = toml::from_str(
+            "[functions.api]\nsource = \"api\"\negress = []\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&fn_empty).unwrap_err().to_string();
+        assert!(err.contains("egress = []"), "got: {err}");
+
+        let proj_empty: ProjectConfig = toml::from_str(
+            "[hosting]\nfunction_egress = []\n[functions.api]\nsource = \"api\"\n",
+        )
+        .unwrap();
+        assert!(validate_manifest(&proj_empty).unwrap_err().to_string().contains("function_egress = []"));
+
+        // A non-empty allowlist is fine.
+        let ok: ProjectConfig = toml::from_str(
+            "[functions.api]\nsource = \"api\"\negress = [\"api.stripe.com\"]\n",
+        )
+        .unwrap();
+        assert!(validate_manifest(&ok).is_ok());
     }
 
     #[test]
@@ -3393,8 +3497,14 @@ name = "api"
         assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
 
         let meta_img = fx.data.join(format!("{tag}-metadata.ext4"));
-        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &Default::default(), &meta_img)
-            .expect("build the metadata image");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            &meta_img,
+        )
+        .expect("build the metadata image");
 
         // Agent base rootfs (vda). With JKB_ROOTFS set, boot the prebuilt apko rootfs
         // verbatim — it carries the agent as /sbin/init AND `veritysetup`, which the
@@ -3527,8 +3637,14 @@ name = "api"
                 .expect("compute layer plan");
         assert!(plan.layer_paths.is_empty(), "a function-only project has no erofs layers");
         let meta_img = data.join("fn-e2e-metadata.ext4");
-        crate::layer_plan::build_metadata_image(&staged, &plan, &Default::default(), &meta_img)
-            .expect("build the metadata image");
+        crate::layer_plan::build_metadata_image(
+            &staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            &meta_img,
+        )
+        .expect("build the metadata image");
 
         // Minimal agent rootfs (vda): the musl agent as /sbin/init (no verity needed).
         let rootfs_stage = data.join("fn-e2e-vda-stage");

@@ -131,6 +131,37 @@ pub fn resolve_egress(
     }
 }
 
+/// Host-asserted platform egress facts, delivered to the in-VM agent via the per-VM
+/// metadata image as `_platform.json` — a host-written region the tenant CANNOT author
+/// (NEVER `jkbase.toml`-derived, P0-EGRESS-OWN-HOST-ASSERTED). The agent reads exactly
+/// this to (a) recognize its OWN object-store host as Zone-1 OWN-stuff (allowed even under
+/// sandbox), and (b) deny the platform's own public IP(s) as Zone-2 PLATFORM (the
+/// control-plane / proxy / object-store ingress), defeating IP-literal + domain-fronting
+/// to `api.{domain}` (P0-EGRESS-PLATFORM-BY-IP). Absent ⇒ the agent falls back to the
+/// netfilter fence alone for Zone-2 and treats no host as OWN-storage (fail-closed:
+/// stricter, never wider).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformEgress {
+    /// The platform object-store host, e.g. `"storage.jkbase.app"`. A request to this
+    /// EXACT host whose resolved IP is in `platform_ips` is OWN-stuff (Zone 1) — allowed
+    /// regardless of the per-function policy, so it survives `egress = false`.
+    #[serde(default)]
+    pub storage_host: Option<String>,
+    /// The platform's own public/uplink IP(s) — where api/proxy/object-store terminate.
+    /// Any resolved destination IP in this set is Zone-2 PLATFORM (DENY) UNLESS the request
+    /// host is `storage_host`. String form; the agent parses to `IpAddr` (a malformed entry
+    /// is dropped, never silently treated as "allow"). Multi-homed hosts (e.g. OVH failover
+    /// IPs) list every uplink global IP.
+    #[serde(default)]
+    pub platform_ips: Vec<String>,
+}
+
+impl PlatformEgress {
+    /// Metadata-image filename. Host-written into the per-VM image; the agent's static
+    /// server refuses to serve `_`-prefixed entries, so it never leaks to the public.
+    pub const FILE: &'static str = "_platform.json";
+}
+
 fn norm_host(h: &str) -> String {
     h.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -186,6 +217,23 @@ mod egress_policy_tests {
         ] {
             assert_eq!(resolve_egress(Some(&p), f.as_ref()), ResolvedEgress::Sandbox);
         }
+    }
+
+    #[test]
+    fn platform_egress_round_trips_and_defaults_empty() {
+        // Default (absent file shape) → no OWN host, empty deny-set: fail-closed (the agent
+        // treats no host as OWN-storage and relies on the netfilter fence for Zone 2).
+        let empty: PlatformEgress = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, PlatformEgress::default());
+        assert!(empty.storage_host.is_none() && empty.platform_ips.is_empty());
+
+        let p = PlatformEgress {
+            storage_host: Some("storage.jkbase.app".into()),
+            platform_ips: vec!["203.0.113.7".into(), "203.0.113.8".into()],
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<PlatformEgress>(&j).unwrap(), p);
+        assert_eq!(PlatformEgress::FILE, "_platform.json");
     }
 
     #[test]
