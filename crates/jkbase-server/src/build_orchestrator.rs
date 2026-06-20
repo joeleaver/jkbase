@@ -729,7 +729,7 @@ impl BuildNet {
         // isolated — defense in depth) paths, once each. Rules match `-i jkbld*`, so
         // frames from the runtime bridge fall straight through with no effect.
         for hook in ["INPUT", "FORWARD"] {
-            if !ebtables_ok(&["-t", "filter", "-C", hook, "-j", SOURCE_GUARD_CHAIN]).await {
+            if !ebtables_ok(&["-t", "filter", "--check", hook, "-j", SOURCE_GUARD_CHAIN]).await {
                 run_ebtables(&["-t", "filter", "-I", hook, "-j", SOURCE_GUARD_CHAIN])
                     .await
                     .with_context(|| format!("hook source-guard into ebtables {hook}"))?;

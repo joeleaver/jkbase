@@ -184,9 +184,7 @@ impl PlatformState {
 
         for octet in 2..=254u8 {
             if !used_octets.contains(&octet) {
-                let ip = format!("172.16.0.{octet}");
-                let tap = format!("tap{}", octet - 2);
-                let mac = format!("AA:FC:00:00:00:{octet:02X}");
+                let (tap, ip, mac) = slot_identity(octet);
                 return Ok((ip, tap, mac));
             }
         }
@@ -461,6 +459,13 @@ async fn main() -> Result<()> {
     if let Some(net) = &build_net {
         net.verify_firewall().await?;
         net.ensure_source_guard().await?;
+    }
+    // Pre-create + hook the runtime VM L2 source-guard chain at startup (defense in depth:
+    // it exists before the first project wakes; per-TAP rules are added lazily in setup_tap).
+    // Fail-closed — ebtables is a provisioned dependency (provision.sh / deploy-server.sh).
+    {
+        let _g = runtime_ebtables_lock().lock().await;
+        ensure_runtime_source_guard_chain().await?;
     }
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
@@ -2036,7 +2041,9 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
             .await
             .context("install runtime L2 source-guard (is ebtables installed?)")?;
     } else {
-        warn!(tap_name, "tap name outside the tapN scheme — L2 source-guard NOT applied");
+        anyhow::bail!(
+            "tap {tap_name:?} is outside the tapN scheme — refusing to boot without its L2 source-guard"
+        );
     }
 
     Ok(())
@@ -2073,18 +2080,39 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
 /// The ebtables (L2/bridge filter) chain holding the runtime per-TAP source-guard rules.
 const RUNTIME_SOURCE_GUARD_CHAIN: &str = "JKRUN_SG";
 
-/// Derive a runtime TAP's deterministic `(ipv4, mac)` from its name. MUST stay in
-/// lock-step with `PlatformState::allocate_ip`: octet ∈ 2..=254, tap = `tap{octet-2}`,
-/// ip = `172.16.0.{octet}`, mac = `AA:FC:00:00:00:{octet:02X}`. Because that map is a
-/// bijection, a TAP's source-guard rules are stable across project churn — so they need
-/// no teardown (a deleted TAP's rules match nothing; a reused octet gets identical {ip,mac}).
+/// The deterministic identity of a runtime VM slot, keyed by its last IP octet (2..=254).
+/// `PlatformState::allocate_ip` and `tap_identity` BOTH go through this single formula, so
+/// the L2 source-guard can never pin a different {ip,mac} than the VM was actually given.
+fn slot_identity(octet: u8) -> (String, String, String) {
+    (
+        format!("tap{}", octet - 2),
+        format!("172.16.0.{octet}"),
+        format!("AA:FC:00:00:00:{octet:02X}"),
+    )
+}
+
+/// Derive a runtime TAP's deterministic `(ipv4, mac)` from its name (the inverse of the
+/// `slot_identity` map). Because that map is a bijection, a TAP's source-guard rules are
+/// stable across project churn — so they need no teardown (a deleted TAP's rules match
+/// nothing; a reused octet gets the identical {ip,mac}).
 fn tap_identity(tap: &str) -> Option<(String, String)> {
     let n: u16 = tap.strip_prefix("tap")?.parse().ok()?;
     let octet = n.checked_add(2)?;
     if octet > 254 {
         return None;
     }
-    Some((format!("172.16.0.{octet}"), format!("AA:FC:00:00:00:{octet:02X}")))
+    let (_, ip, mac) = slot_identity(octet as u8);
+    Some((ip, mac))
+}
+
+/// Serializes all runtime ebtables edits. The nf_tables ebtables backend does a whole-
+/// ruleset read-modify-write per call, so concurrent project wakes (proxy-driven, routine)
+/// clobber each other (verified: 20 concurrent `-A` → only 2 land; `--concurrent` does not
+/// help). Held across the chain-ensure + per-TAP rule installs.
+static RUNTIME_EBTABLES_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+fn runtime_ebtables_lock() -> &'static tokio::sync::Mutex<()> {
+    RUNTIME_EBTABLES_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Ensure the runtime source-guard chain exists and is hooked into the L2 INPUT (frames
@@ -2096,7 +2124,7 @@ fn tap_identity(tap: &str) -> Option<(String, String)> {
 async fn ensure_runtime_source_guard_chain() -> Result<()> {
     let _ = run_ebtables(&["-t", "filter", "-N", RUNTIME_SOURCE_GUARD_CHAIN]).await;
     for hook in ["INPUT", "FORWARD"] {
-        if !ebtables_ok(&["-t", "filter", "-C", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN]).await {
+        if !ebtables_ok(&["-t", "filter", "--check", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN]).await {
             run_ebtables(&["-t", "filter", "-I", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN])
                 .await
                 .with_context(|| format!("hook runtime source-guard into ebtables {hook}"))?;
@@ -2111,6 +2139,7 @@ async fn ensure_runtime_source_guard_chain() -> Result<()> {
 /// pins). Idempotent (`-C` before `-A`), so re-asserting a surviving TAP on wake is a
 /// no-op. Mirrors `build_orchestrator::ensure_source_guard` rule-for-rule.
 async fn install_tap_source_guard(tap: &str, ip: &str, mac: &str) -> Result<()> {
+    let _guard = runtime_ebtables_lock().lock().await;
     ensure_runtime_source_guard_chain().await?;
     let rules: [Vec<&str>; 4] = [
         vec!["-i", tap, "-p", "802_1Q", "-j", "DROP"],
@@ -2119,7 +2148,7 @@ async fn install_tap_source_guard(tap: &str, ip: &str, mac: &str) -> Result<()> 
         vec!["-i", tap, "-p", "ARP", "!", "--arp-ip-src", ip, "-j", "DROP"],
     ];
     for r in &rules {
-        let mut check = vec!["-t", "filter", "-C", RUNTIME_SOURCE_GUARD_CHAIN];
+        let mut check = vec!["-t", "filter", "--check", RUNTIME_SOURCE_GUARD_CHAIN];
         check.extend_from_slice(r);
         if !ebtables_ok(&check).await {
             let mut add = vec!["-t", "filter", "-A", RUNTIME_SOURCE_GUARD_CHAIN];
@@ -2152,6 +2181,33 @@ async fn ebtables_ok(args: &[&str]) -> bool {
         .await
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod source_guard_tests {
+    use super::{slot_identity, tap_identity};
+
+    #[test]
+    fn tap_identity_inverts_slot_identity_over_all_octets() {
+        // The two octet maps live ~1900 lines apart; this binds them so the source-guard
+        // can never pin a different {ip,mac} than allocate_ip handed the VM.
+        for octet in 2u8..=254 {
+            let (tap, ip, mac) = slot_identity(octet);
+            assert_eq!(
+                tap_identity(&tap),
+                Some((ip, mac)),
+                "tap_identity must invert slot_identity for octet {octet}"
+            );
+        }
+    }
+
+    #[test]
+    fn tap_identity_rejects_out_of_range_and_malformed() {
+        assert_eq!(tap_identity("tap253"), None); // octet 255 > 254
+        assert_eq!(tap_identity("eth0"), None);
+        assert_eq!(tap_identity("tapX"), None);
+        assert_eq!(tap_identity("tap"), None);
+    }
 }
 
 /// Rename any legacy `{id}.ext4` data disks to LocalLoop's `{id}.img` convention so
