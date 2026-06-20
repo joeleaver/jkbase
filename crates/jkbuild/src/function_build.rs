@@ -52,6 +52,12 @@ pub trait FunctionBuilder {
 /// engine bump can't silently skew the version.
 const FUNCTION_WIT_PATH: &str = "/opt/jkbuild/wit/function.wit";
 
+/// Path (in the function toolchain image) of the env shim prepended to every JS function:
+/// it exposes the project's secrets as `process.env` (a lazy getter over
+/// `wasi:cli/environment`, read per-request so wizer pre-init can't snapshot the empty
+/// build-time env). Generated at image-bake time at the engine's exact wasi:cli version.
+const FUNCTION_JS_ENV_SHIM: &str = "/opt/jkbuild/js/env-shim.js";
+
 /// The function-builder roster: Rust (cargo/wasm32-wasip2) + JS/TS (ComponentizeJS).
 pub fn registry() -> Vec<Box<dyn FunctionBuilder>> {
     vec![Box::new(RustFunction), Box::new(JsFunction)]
@@ -170,17 +176,33 @@ impl FunctionBuilder for JsFunction {
         std::fs::create_dir_all(&out_dir).ok();
         let entry = resolve_js_entry(ctx.app_dir)?;
 
-        // 1. Bundle the entry (+ any imports / node_modules) into one ESM file. esbuild
-        //    handles TS→JS too. `--platform=neutral`: StarlingMonkey provides the web
-        //    globals (fetch/Request/Response), so don't inject Node shims.
+        // Wrapper entry: the env shim (exposes `process.env` from project secrets) first,
+        // then the tenant handler. Both run as side-effect modules — the fetch-event
+        // contract registers the handler at module top-level.
+        let wrapper = out_dir.join("_jkbuild_entry.js");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "import {:?};\nimport {:?};\n",
+                FUNCTION_JS_ENV_SHIM,
+                entry.to_string_lossy()
+            ),
+        )
+        .context("write JS wrapper entry")?;
+
+        // 1. Bundle (esbuild handles TS→JS + node_modules) into one ESM file.
+        //    `--platform=neutral`: StarlingMonkey provides the web globals
+        //    (fetch/Request/Response), so don't inject Node shims. `--external:wasi:*`
+        //    keeps the shim's `wasi:cli/environment` import for componentize-js to resolve.
         let bundle = out_dir.join("bundle.js");
         let mut cmd = Command::new("esbuild");
         cmd.current_dir(ctx.app_dir)
             .env("PATH", BUILD_PATH)
-            .arg(&entry)
+            .arg(&wrapper)
             .arg("--bundle")
             .arg("--format=esm")
             .arg("--platform=neutral")
+            .arg("--external:wasi:*")
             .arg(format!("--outfile={}", bundle.display()));
         run(cmd, "esbuild bundle")?;
 

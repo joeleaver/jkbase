@@ -180,9 +180,27 @@ SH
     mkdir -p "$STAGE/opt/jkbuild/wit"
     {
         echo "package local:fn;"
-        echo "world fn { export wasi:http/incoming-handler@$ver; }"
+        echo "world fn {"
+        # Import wasi:cli/environment so the JS env-shim can read project secrets.
+        echo "  import wasi:cli/environment@$ver;"
+        echo "  export wasi:http/incoming-handler@$ver;"
+        echo "}"
         wasm-tools component wit "$engine" | awk '/^package wasi:/{p=1} /^package local:/{p=0} p'
     } > "$STAGE/opt/jkbuild/wit/function.wit"
+
+    # Env shim the JS builder prepends so a function reads project secrets via the
+    # standard `process.env`. The getter calls getEnvironment() lazily — at REQUEST time,
+    # not at wizer pre-init (which would snapshot the empty build-time env). Pinned to the
+    # engine's exact wasi:cli version.
+    mkdir -p "$STAGE/opt/jkbuild/js"
+    cat > "$STAGE/opt/jkbuild/js/env-shim.js" <<SHIM
+import { getEnvironment } from 'wasi:cli/environment@$ver';
+globalThis.process ??= {};
+Object.defineProperty(globalThis.process, 'env', {
+  configurable: true,
+  get() { return Object.fromEntries(getEnvironment()); },
+});
+SHIM
 fi
 
 # Build-mirror CA (optional). When BUILD_CA_CERT points at the shared CA cert, bake it

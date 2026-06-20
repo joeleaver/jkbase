@@ -5,10 +5,10 @@
 // the per-project microVM. The same `wasi:http/incoming-handler` ABI as every other
 // jkbase function language. TypeScript works too (rename to `index.ts`; esbuild handles it).
 //
-// Available today: the request, response, and compute. NOT available yet: outbound
-// network (`fetch`) and object-store access — those arrive together in the host-mediated
-// outbound-I/O work; until then an outbound request is denied by the platform (shown by
-// the `egress` line below).
+// Available today: the request, response, compute, and your project's **secrets** via
+// `process.env`. NOT available yet: outbound network (`fetch`) and object-store access —
+// those arrive together in the host-mediated outbound-I/O work; until then an outbound
+// request is denied by the platform (shown by the `egress` line below).
 
 addEventListener('fetch', (event) => {
   event.respondWith(handle(event.request));
@@ -17,11 +17,14 @@ addEventListener('fetch', (event) => {
 async function handle(request) {
   const url = new URL(request.url);
   const egress = await probeEgress();
+  // Project secrets are injected as env vars (empty until you set one).
+  const demo = process.env.DEMO_SECRET || '<unset>';
   const body =
     'hello from a JS wasi:http component\n' +
     `method=${request.method}\n` +
     `path=${url.pathname}\n` +
-    `egress=${egress}\n`;
+    `egress=${egress}\n` +
+    `DEMO_SECRET=${demo}\n`;
   return new Response(body, { headers: { 'content-type': 'text/plain' } });
 }
 
