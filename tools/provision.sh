@@ -232,10 +232,23 @@ sudo chmod +x /usr/local/bin/jkbase-build-net.sh
 
 # Create .env file for secrets if it doesn't exist
 if [ ! -f /var/jkbase/.env ]; then
-    echo "# jkbase environment" | sudo tee /var/jkbase/.env > /dev/null
-    echo "# CLOUDFLARE_API_TOKEN=" | sudo tee -a /var/jkbase/.env > /dev/null
-    echo "# CLOUDFLARE_ZONE_ID=" | sudo tee -a /var/jkbase/.env > /dev/null
-    echo "# ACME_EMAIL=" | sudo tee -a /var/jkbase/.env > /dev/null
+    {
+        echo "# jkbase environment"
+        echo "# ACME_EMAIL="
+        echo "#"
+        echo "# Wildcard TLS via ACME DNS-01 — pick a provider (default: cloudflare):"
+        echo "# ACME_DNS_PROVIDER=cloudflare"
+        echo "# CLOUDFLARE_API_TOKEN="
+        echo "# CLOUDFLARE_ZONE_ID="
+        echo "#"
+        echo "# …or any RFC2136 (dynamic-update) DNS server (BIND/Knot/PowerDNS/etc):"
+        echo "# ACME_DNS_PROVIDER=rfc2136"
+        echo "# RFC2136_NAMESERVER=ns1.example.com:53"
+        echo "# RFC2136_TSIG_NAME=acme-key"
+        echo "# RFC2136_TSIG_SECRET=          # base64, as in a BIND key file"
+        echo "# RFC2136_TSIG_ALGORITHM=hmac-sha256"
+        echo "# RFC2136_ZONE=                 # defaults to --domain"
+    } | sudo tee /var/jkbase/.env > /dev/null
 fi
 
 # Create systemd service with TLS.
@@ -310,7 +323,7 @@ echo ""
 echo "=== Provisioning complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Set env vars in /var/jkbase/.env (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, ACME_EMAIL)"
+echo "  1. Set env vars in /var/jkbase/.env (ACME_EMAIL + your ACME_DNS_PROVIDER creds — see the file's comments)"
 echo "  2. Start the service:  ssh $TARGET 'sudo systemctl start jkbase'"
 echo "  3. Init the platform:  ssh $TARGET 'jkbase init <email> --api http://127.0.0.1:9090'  (API is loopback-only; remote CLI uses https://api.<domain> via the proxy)"
 echo "  4. Point DNS:          *.jkbase.app → <server-ip>"
