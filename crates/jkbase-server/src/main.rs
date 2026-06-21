@@ -13,7 +13,7 @@ use jkbase_common::config::PlatformEgress;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    month_start_epoch, DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord,
+    month_start_epoch, DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, Project,
     ProjectState, QuotaStatus, SnapshotMeta, Store, VmAllocation,
 };
 use log_shipper::LogShipper;
@@ -572,6 +572,81 @@ async fn host_heartbeat_loop(store: Store, mut self_host: HostRecord, is_leader:
     }
 }
 
+/// What the leader's reconcile tick found needs doing to converge running → desired.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconcilePlan {
+    /// Deployed, wakeable projects whose owning host is dead or absent — they need
+    /// (re)placement onto a live host. Computed by the leader; APPLIED by placement (the
+    /// next P3 card). Empty on a healthy single node (allocations are unplaced/local).
+    orphaned: Vec<String>,
+}
+
+/// Compare desired (deployed, wakeable projects) vs running (allocations + live hosts) and
+/// return the drift the leader must act on. Pure + deterministic. A host counts as live
+/// iff its heartbeat is within `dead_threshold_secs`; an allocation with an empty host_id
+/// is single-node/pre-placement (local) and never orphaned.
+fn reconcile_plan(
+    projects: &[Project],
+    allocations: &[VmAllocation],
+    hosts: &[HostRecord],
+    now: u64,
+    dead_threshold_secs: u64,
+) -> ReconcilePlan {
+    let live: HashSet<&str> = hosts
+        .iter()
+        .filter(|h| h.last_heartbeat != 0 && now.saturating_sub(h.last_heartbeat) <= dead_threshold_secs)
+        .map(|h| h.host_id.as_str())
+        .collect();
+    let alloc_by_project: HashMap<&str, &VmAllocation> =
+        allocations.iter().map(|a| (a.project_id.as_str(), a)).collect();
+    let mut orphaned = Vec::new();
+    for p in projects {
+        if p.current_version.is_none() {
+            continue; // never deployed → nothing to place
+        }
+        if !matches!(p.state, ProjectState::Active | ProjectState::Hibernated) {
+            continue; // NeedsRedeploy / Stopped are not wakeable
+        }
+        if let Some(alloc) = alloc_by_project.get(p.id.as_str())
+            && !alloc.host_id.is_empty()
+            && !live.contains(alloc.host_id.as_str())
+        {
+            // Owned by a host that is no longer live → needs (re)placement.
+            orphaned.push(p.id.clone());
+        }
+    }
+    orphaned.sort();
+    ReconcilePlan { orphaned }
+}
+
+/// HA P3 — the continuous cluster reconciler. Only the leader reconciles cluster-wide
+/// (followers no-op here and reconcile their own host via the wake/boot paths). Each tick
+/// it compares desired (deployed projects) vs running (allocations + live hosts) via
+/// [`reconcile_plan`] and surfaces the drift; the actual (re)placement of orphaned
+/// projects onto live hosts is the next P3 card (placement + ownership + deploy
+/// forwarding) — this loop is the engine that drives it. Inert on a single node (no
+/// placed allocations, so nothing is ever orphaned).
+async fn reconcile_loop(platform: Arc<Mutex<PlatformState>>, is_leader: Arc<AtomicBool>) {
+    loop {
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+        if !is_leader.load(Ordering::Relaxed) {
+            continue;
+        }
+        let plan = {
+            let plat = platform.lock().await;
+            let projects = plat.store.list_projects().unwrap_or_default();
+            let allocs = plat.store.list_vm_allocations().unwrap_or_default();
+            let hosts = plat.store.list_hosts().unwrap_or_default();
+            let now = jkbase_control::auth::timestamp();
+            reconcile_plan(&projects, &allocs, &hosts, now, DEAD_HOST_THRESHOLD.as_secs())
+        };
+        if !plan.orphaned.is_empty() {
+            warn!(count = plan.orphaned.len(), projects = ?plan.orphaned,
+                  "reconcile: projects owned by a dead/absent host need (re)placement (applied by placement, next P3 card)");
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmLifecycle {
     Running,
@@ -640,6 +715,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// placement) reassigns its projects. Tunable for the RTO budget; kept above a few
 /// heartbeat intervals so one missed beat / a brief GC pause is not a false positive.
 const DEAD_HOST_THRESHOLD: Duration = Duration::from_secs(15);
+/// How often the leader runs the continuous cluster reconcile (desired vs running).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 impl PlatformState {
     /// HA P2: whether this host currently holds cluster leadership. Advisory until P3
@@ -859,6 +936,7 @@ async fn main() -> Result<()> {
     let host_id_for_election = host_id.clone();
     let host_id_for_heartbeat = host_id.clone();
     let is_leader_for_heartbeat = is_leader.clone();
+    let is_leader_for_reconcile = is_leader.clone();
 
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
@@ -913,6 +991,10 @@ async fn main() -> Result<()> {
         self_host,
         is_leader_for_heartbeat,
     ));
+
+    // HA P3: the continuous cluster reconciler — the leader compares desired vs running
+    // each tick and surfaces drift (placement applies it, next card). Inert single-node.
+    tokio::spawn(reconcile_loop(platform.clone(), is_leader_for_reconcile));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
@@ -3732,6 +3814,56 @@ mod tests {
         assert!(a.renew(&ta, ttl).await.is_err());
 
         let _ = std::fs::remove_dir_all(&leases);
+    }
+
+    #[test]
+    fn reconcile_plan_orphans_only_projects_on_dead_hosts() {
+        // HA P3: the leader's desired-vs-running drift. A deployed, wakeable project is
+        // orphaned iff its owning host is no longer live; unplaced (empty host_id),
+        // live-owned, never-deployed, and non-wakeable projects are left alone.
+        let proj = |id: &str, ver: Option<u64>, state: ProjectState| Project {
+            id: id.into(),
+            name: id.into(),
+            tenant_id: Some("t".into()),
+            current_version: ver,
+            state,
+            vm_ip: None,
+            domains: vec![],
+        };
+        let alloc = |pid: &str, host: &str| VmAllocation {
+            project_id: pid.into(),
+            ip: "172.16.0.2".into(),
+            tap_device: "tap".into(),
+            mac: "AA".into(),
+            host_id: host.into(),
+            placement_epoch: 1,
+        };
+        let host = |id: &str, hb: u64| HostRecord {
+            host_id: id.into(),
+            region: "r".into(),
+            public_addr: None,
+            last_heartbeat: hb,
+            cpu_template_id: None,
+            kernel_id: None,
+            capacity: HostCapacity::default(),
+        };
+        let now = 1000;
+        let projects = vec![
+            proj("on-dead", Some(1), ProjectState::Hibernated), // owner dead → orphan
+            proj("on-live", Some(1), ProjectState::Active),     // owner live → ok
+            proj("unplaced", Some(1), ProjectState::Hibernated), // empty host_id → ok
+            proj("undeployed", None, ProjectState::Active),     // no version → ignored
+            proj("needs", Some(1), ProjectState::NeedsRedeploy), // not wakeable → ignored
+        ];
+        let allocs = vec![
+            alloc("on-dead", "host-dead"),
+            alloc("on-live", "host-live"),
+            alloc("unplaced", ""),
+            alloc("needs", "host-dead"),
+        ];
+        let hosts = vec![host("host-live", 995), host("host-dead", 970)]; // dead = 30s stale
+        let plan = reconcile_plan(&projects, &allocs, &hosts, now, 15);
+        assert_eq!(plan.orphaned, vec!["on-dead".to_string()]);
     }
 
     #[test]
