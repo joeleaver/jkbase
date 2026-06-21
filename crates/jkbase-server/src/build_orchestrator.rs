@@ -24,7 +24,7 @@
 //! cargo-component for functions) are B2 and keep this contract unchanged.
 
 use anyhow::{bail, ensure, Context, Result};
-use jkbase_common::config::{Builder, ProjectConfig};
+use jkbase_common::config::{resolve_egress, Builder, EgressPolicy, ProjectConfig};
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
@@ -729,7 +729,7 @@ impl BuildNet {
         // isolated — defense in depth) paths, once each. Rules match `-i jkbld*`, so
         // frames from the runtime bridge fall straight through with no effect.
         for hook in ["INPUT", "FORWARD"] {
-            if !ebtables_ok(&["-t", "filter", "-C", hook, "-j", SOURCE_GUARD_CHAIN]).await {
+            if !ebtables_ok(&["-t", "filter", "--check", hook, "-j", SOURCE_GUARD_CHAIN]).await {
                 run_ebtables(&["-t", "filter", "-I", hook, "-j", SOURCE_GUARD_CHAIN])
                     .await
                     .with_context(|| format!("hook source-guard into ebtables {hook}"))?;
@@ -903,9 +903,12 @@ async fn run_inner(
     std::fs::create_dir_all(&staged)?;
 
     let assemble_and_build = async {
-        // 4. Non-build artifacts: sidecars + static site content.
-        assemble_sidecars(&config, &staged).context("assemble config sidecars")?;
+        // 4. Non-build artifacts: static site content FIRST, then the host-authored
+        //    `_`-prefixed sidecars — so a host artifact is always written LAST and a tenant
+        //    cannot clobber it via site content (defense-in-depth for B-1; copy_filtered_guarded
+        //    already refuses `_`-prefixed top-level tenant entries into the root).
         assemble_sites(&config, &src_dir, &staged).context("assemble site content")?;
+        assemble_sidecars(&config, &staged).context("assemble config sidecars")?;
         std::fs::create_dir_all(staged.join("_functions"))?;
         std::fs::create_dir_all(staged.join("_servers"))?;
 
@@ -1695,6 +1698,19 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         if !path_ok(&f.source) {
             bail!("function '{name}' source {:?} must be a relative path inside the project (no '..' or absolute)", f.source);
         }
+        // `egress = []` is ambiguous: [] and `false` are identical for the PUBLIC zone, but
+        // an author writing [] to mean "deny everything incl. own-stuff" would be surprised
+        // that own-stuff still works. Make it un-writable rather than silently alias it to
+        // `false` (design §3 edge case). Point them at the explicit spelling.
+        if matches!(&f.egress, Some(EgressPolicy::Allowlist(a)) if a.is_empty()) {
+            bail!("function '{name}' has `egress = []` (empty allowlist); use `egress = false` to deny all public egress, or list the allowed hosts");
+        }
+    }
+    if matches!(
+        config.hosting.as_ref().and_then(|h| h.function_egress.as_ref()),
+        Some(EgressPolicy::Allowlist(a)) if a.is_empty()
+    ) {
+        bail!("[hosting] function_egress = [] (empty allowlist); use `false` to sandbox every function, or list the allowed hosts");
     }
     for (name, s) in &config.servers {
         let sd = s.source_dir();
@@ -1786,6 +1802,34 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     if let Some(j) = config.schedules_json() {
         std::fs::write(staged.join("_schedules.json"), j)?;
     }
+
+    // Stamp each function's RESOLVED public-egress policy into its `_functions/{name}.json`
+    // sidecar. Precedence (project ceiling × per-function) is collapsed HERE, host-side,
+    // into one concrete `ResolvedEgress` so the agent receives exactly one immutable state
+    // and never parses `jkbase.toml` nor re-derives precedence (P0-EGRESS-POLICY-HOST-
+    // RESOLVED). Written before the `.wasm` is staged and before deploy-time secret
+    // injection, both of which merge into (never clobber) this sidecar.
+    if !config.functions.is_empty() {
+        let functions_dir = staged.join("_functions");
+        std::fs::create_dir_all(&functions_dir)?;
+        let project_ceiling = config.hosting.as_ref().and_then(|h| h.function_egress.as_ref());
+        for (name, f) in &config.functions {
+            let resolved = resolve_egress(project_ceiling, f.egress.as_ref());
+            let sidecar = functions_dir.join(format!("{name}.json"));
+            // Merge into any existing sidecar (preserve a future `runtime`/`env`); create
+            // it otherwise. Only the `egress` key is host-authored here.
+            let mut obj: serde_json::Value = match std::fs::read(&sidecar) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse function sidecar {}", sidecar.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+                Err(e) => return Err(e).with_context(|| format!("read {}", sidecar.display())),
+            };
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("egress".to_string(), serde_json::to_value(&resolved)?);
+                std::fs::write(&sidecar, serde_json::to_vec_pretty(&obj)?)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1801,7 +1845,9 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
     } else if let Some(site) = sites.first() {
         let site_dir = src_dir.join(&site.public);
         if site_dir.is_dir() {
-            copy_filtered(&site_dir, staged)?;
+            // Single-site content lands in the staged ROOT alongside the host's `_`-prefixed
+            // control artifacts — guard against a tenant clobbering them (review B-1).
+            copy_filtered_guarded(&site_dir, staged)?;
         }
     }
     Ok(())
@@ -1810,11 +1856,36 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
 /// Recursively copy `src` into `dst`, skipping the build/VCS dirs and manifest
 /// files (mirrors the CLI's old packaging exclusions). Symlinks are skipped.
 fn copy_filtered(src: &Path, dst: &Path) -> Result<()> {
+    copy_filtered_inner(src, dst, false)
+}
+
+/// As [`copy_filtered`], but REFUSES any TOP-LEVEL entry whose name begins with `_`.
+/// Used for the single-site copy into the staged ROOT, where the host's own
+/// `_`-prefixed control artifacts live (`_functions/`, `_routes.json`, `_platform.json`,
+/// `_servers/`, …). Without this a tenant whose site is the project root (`public = "."`)
+/// could smuggle a `_functions/<fn>.json` into their source tree that overwrites the
+/// host-authored, precedence-resolved egress sidecar — escaping its own `egress = false`
+/// or widening past a project ceiling (adversarial-review BLOCKER B-1,
+/// P0-EGRESS-POLICY-HOST-RESOLVED). The agent's static server already refuses to SERVE
+/// `_`-prefixed top-level entries, so refusing to COPY them loses nothing legitimate.
+/// (Site SUBdirs like `_next/` remain fine — the guard is top-level only, and multi-site
+/// content lands under a namespaced `_site_<name>/`, not the root.)
+fn copy_filtered_guarded(src: &Path, dst: &Path) -> Result<()> {
+    copy_filtered_inner(src, dst, true)
+}
+
+fn copy_filtered_inner(src: &Path, dst: &Path, guard_top_underscore: bool) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        // Top-level `_`-prefixed entries collide with host control artifacts — never copy
+        // them from tenant content into the staged root.
+        if guard_top_underscore && name_str.starts_with('_') {
+            warn!(entry = %name_str, "refusing to copy a tenant `_`-prefixed top-level entry into the deployment root");
+            continue;
+        }
         let ft = entry.file_type()?;
         if ft.is_symlink() {
             continue;
@@ -1822,7 +1893,9 @@ fn copy_filtered(src: &Path, dst: &Path) -> Result<()> {
             if EXCLUDED_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
-            copy_filtered(&entry.path(), &dst.join(&name))?;
+            // The guard is top-level only; subdirectories may legitimately hold `_`-prefixed
+            // framework dirs (e.g. `_next/`).
+            copy_filtered_inner(&entry.path(), &dst.join(&name), false)?;
         } else if ft.is_file() {
             if EXCLUDED_FILES.contains(&name_str.as_ref()) {
                 continue;
@@ -2058,6 +2131,110 @@ mod tests {
         assert!(!dir.join("_sites.json").exists());
         assert!(!dir.join("_schedules.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assemble_sidecars_stamps_resolved_function_egress() {
+        let dir = std::env::temp_dir().join(format!("jkb-fnegress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Project ceiling = allowlist; one fn narrows (intersect), one omits (=ceiling),
+        // one sandboxes. Verifies the host collapses precedence into the sidecar.
+        let cfg: ProjectConfig = toml::from_str(
+            r#"
+            [hosting]
+            function_egress = ["api.stripe.com", "api.twilio.com"]
+            [functions.narrow]
+            source = "narrow"
+            egress = ["api.stripe.com", "evil.com"]
+            [functions.inherit]
+            source = "inherit"
+            [functions.boxed]
+            source = "boxed"
+            egress = false
+            "#,
+        )
+        .unwrap();
+        assemble_sidecars(&cfg, &dir).unwrap();
+
+        let read = |n: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(dir.join("_functions").join(n)).unwrap()).unwrap()
+        };
+        // evil.com intersected out of the ceiling.
+        assert_eq!(read("narrow.json")["egress"]["allowlist"], serde_json::json!(["api.stripe.com"]));
+        // Omitted → the project ceiling verbatim (NOT allow-all).
+        let inherit = read("inherit.json");
+        let mut got: Vec<String> = inherit["egress"]["allowlist"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        got.sort();
+        assert_eq!(got, vec!["api.stripe.com".to_string(), "api.twilio.com".to_string()]);
+        // `false` → sandbox (snake_case unit variant).
+        assert_eq!(read("boxed.json")["egress"], serde_json::json!("sandbox"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_filtered_guarded_refuses_underscore_toplevel() {
+        // B-1: a tenant whose single-site root (`public = "."`) carries a planted
+        // `_functions/<fn>.json` must NOT clobber the host-authored sidecar. The guarded copy
+        // refuses `_`-prefixed TOP-LEVEL entries but keeps ordinary content and nested
+        // `_`-prefixed framework dirs.
+        let base = std::env::temp_dir().join(format!("jkb-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("_functions")).unwrap();
+        std::fs::create_dir_all(src.join("sub/_next")).unwrap();
+        std::fs::write(src.join("_functions/api.json"), "{\"egress\":\"default\"}").unwrap();
+        std::fs::write(src.join("_routes.json"), "tenant").unwrap();
+        std::fs::write(src.join("index.html"), "hi").unwrap();
+        std::fs::write(src.join("sub/_next/app.js"), "ok").unwrap();
+
+        copy_filtered_guarded(&src, &dst).unwrap();
+
+        // Top-level `_`-prefixed tenant entries refused…
+        assert!(!dst.join("_functions").exists(), "top-level _functions must be refused");
+        assert!(!dst.join("_routes.json").exists(), "top-level _routes.json must be refused");
+        // …ordinary content + NESTED `_`-prefixed dirs preserved.
+        assert!(dst.join("index.html").exists());
+        assert!(dst.join("sub/_next/app.js").exists(), "nested _next is fine (guard is top-level only)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_site_name() {
+        // The multi-site `_site_<name>` copy uses the site KEY verbatim; validate_manifest's
+        // name_ok gate (runs before assemble_sites) rejects any `/`-or-`..` key, so a
+        // `../_functions` site cannot traverse into the host artifact dir.
+        let cfg: ProjectConfig = toml::from_str(
+            "[sites.\"../_functions\"]\npublic = \"x\"\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&cfg).unwrap_err().to_string();
+        assert!(err.contains("invalid site name"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_egress_allowlist() {
+        let fn_empty: ProjectConfig = toml::from_str(
+            "[functions.api]\nsource = \"api\"\negress = []\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&fn_empty).unwrap_err().to_string();
+        assert!(err.contains("egress = []"), "got: {err}");
+
+        let proj_empty: ProjectConfig = toml::from_str(
+            "[hosting]\nfunction_egress = []\n[functions.api]\nsource = \"api\"\n",
+        )
+        .unwrap();
+        assert!(validate_manifest(&proj_empty).unwrap_err().to_string().contains("function_egress = []"));
+
+        // A non-empty allowlist is fine.
+        let ok: ProjectConfig = toml::from_str(
+            "[functions.api]\nsource = \"api\"\negress = [\"api.stripe.com\"]\n",
+        )
+        .unwrap();
+        assert!(validate_manifest(&ok).is_ok());
     }
 
     #[test]
@@ -3393,8 +3570,15 @@ name = "api"
         assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
 
         let meta_img = fx.data.join(format!("{tag}-metadata.ext4"));
-        crate::layer_plan::build_metadata_image(&fx.staged, &plan, &Default::default(), &meta_img)
-            .expect("build the metadata image");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            &meta_img,
+        )
+        .expect("build the metadata image");
 
         // Agent base rootfs (vda). With JKB_ROOTFS set, boot the prebuilt apko rootfs
         // verbatim — it carries the agent as /sbin/init AND `veritysetup`, which the
@@ -3527,8 +3711,15 @@ name = "api"
                 .expect("compute layer plan");
         assert!(plan.layer_paths.is_empty(), "a function-only project has no erofs layers");
         let meta_img = data.join("fn-e2e-metadata.ext4");
-        crate::layer_plan::build_metadata_image(&staged, &plan, &Default::default(), &meta_img)
-            .expect("build the metadata image");
+        crate::layer_plan::build_metadata_image(
+            &staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            &meta_img,
+        )
+        .expect("build the metadata image");
 
         // Minimal agent rootfs (vda): the musl agent as /sbin/init (no verity needed).
         let rootfs_stage = data.join("fn-e2e-vda-stage");
@@ -3608,6 +3799,339 @@ name = "api"
         assert!(body.contains("hello from a wasi:http component"), "got: {body}");
         assert!(body.contains("DEMO_SECRET=e2e-secret"), "injected secret must be readable: {body}");
         assert!(body.contains("egress=DENIED"), "egress must be denied: {body}");
+    }
+
+    /// Build a minimal DNS response: echo the query's header ID + question, append a single
+    /// A record (`name → ip`) or set RCODE=NXDOMAIN when `ip` is `None`. Enough for the
+    /// agent's hickory resolver (single A query, Ipv4Only). `query` is the raw UDP datagram.
+    fn dns_reply(query: &[u8], ip: Option<std::net::Ipv4Addr>) -> Option<Vec<u8>> {
+        if query.len() < 12 {
+            return None;
+        }
+        // Walk the QNAME labels to find where the question ends (QTYPE+QCLASS follow).
+        let mut i = 12usize;
+        while i < query.len() {
+            let len = query[i] as usize;
+            if len == 0 {
+                i += 1;
+                break;
+            }
+            i += 1 + len;
+        }
+        let q_end = i + 4; // QTYPE(2) + QCLASS(2)
+        if q_end > query.len() {
+            return None;
+        }
+        let mut r = Vec::with_capacity(q_end + 16);
+        r.extend_from_slice(&query[0..2]); // ID
+        // Flags: QR=1, AA=1, RD copied from query, RA=0; RCODE 0 (or 3 = NXDOMAIN).
+        let rd = query[2] & 0x01;
+        let rcode: u8 = if ip.is_some() { 0 } else { 3 };
+        r.push(0x84 | rd);
+        r.push(rcode);
+        r.extend_from_slice(&query[4..6]); // QDCOUNT (echo, =1)
+        let ancount: u16 = if ip.is_some() { 1 } else { 0 };
+        r.extend_from_slice(&ancount.to_be_bytes()); // ANCOUNT
+        r.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT, ARCOUNT
+        r.extend_from_slice(&query[12..q_end]); // echo the question
+        if let Some(ip) = ip {
+            r.extend_from_slice(&[0xc0, 0x0c]); // NAME pointer to the question
+            r.extend_from_slice(&[0, 1, 0, 1]); // TYPE=A, CLASS=IN
+            r.extend_from_slice(&[0, 0, 0, 30]); // TTL=30
+            r.extend_from_slice(&[0, 4]); // RDLENGTH
+            r.extend_from_slice(&ip.octets());
+        }
+        Some(r)
+    }
+
+    /// G — the on-box EGRESS e2e. Boots a REAL agent VM whose function egress gate must
+    /// resolve through a host-controlled resolver and reach (or refuse) host-controlled
+    /// upstreams over the guest TAP — proving #7 (gate) + #9 (observe) end to end through the
+    /// production runtime path, not just `decide()` in isolation. One boot, two functions
+    /// (default + sandbox) sharing the header-driven egress-probe fixture; the test drives
+    /// allow / sandbox-deny / platform-deny / DNS-rebind / ipv6-refuse by varying headers,
+    /// then reads `/_jkbase/logs` and asserts the observe manifest recorded the verdicts.
+    ///
+    /// Self-contained control plane on the host side of the TAP:
+    ///   * a tiny UDP DNS responder on 172.16.0.1:53 (the agent's PINNED resolver) maps
+    ///     allow.test→9.9.9.9, platform.test→9.9.9.10, rebind.test→10.0.0.1;
+    ///   * HTTP upstreams on 9.9.9.9:80 (allowed public) and 9.9.9.10:80 (a platform IP,
+    ///     listed in `_platform.json` → must be denied), both host-owned via `lo` /32s.
+    /// Plain HTTP only (a self-signed TLS upstream wouldn't pass webpki roots; the TLS
+    /// construction mirrors default_send_request and is covered structurally).
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       <test-bin> --ignored --nocapture function_egress_e2e
+    #[tokio::test]
+    #[ignore = "egress e2e: needs KVM + root + musl agent; binds 172.16.0.1:53 + 9.9.9.x"]
+    async fn function_egress_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let fc_release = std::env::var("JKB_FC_RELEASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data.join("release-v1.15.1-x86_64"));
+        let Ok(agent_bin) = std::env::var("JKB_AGENT").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_AGENT to the musl jkbase-agent binary");
+            return;
+        };
+        if !agent_bin.exists() {
+            eprintln!("skip: agent binary {} missing", agent_bin.display());
+            return;
+        }
+        let kernel = {
+            let lts = data.join("vmlinux-6.12.92.bin");
+            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+        };
+        if !kernel.exists() {
+            eprintln!("skip: no kernel at {}", kernel.display());
+            return;
+        }
+
+        // Stage two functions sharing the egress-probe fixture: one default, one sandbox.
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../jkbase-agent/tests/fixtures/egress-probe.wasm");
+        assert!(fixture.exists(), "missing egress-probe fixture {}", fixture.display());
+        let staged = data.join("egr-e2e-staged");
+        let _ = std::fs::remove_dir_all(&staged);
+        let funcs = staged.join("_functions");
+        std::fs::create_dir_all(&funcs).unwrap();
+        for (name, egress) in [("probe_default", "\"default\""), ("probe_sandbox", "\"sandbox\"")] {
+            std::fs::copy(&fixture, funcs.join(format!("{name}.wasm"))).unwrap();
+            std::fs::write(
+                funcs.join(format!("{name}.json")),
+                format!(r#"{{"runtime":"wasi-http","egress":{egress}}}"#),
+            )
+            .unwrap();
+        }
+        // Host-asserted platform facts (the PRODUCTION channel: a host param, NOT a tenant
+        // file — build_metadata_image writes `_platform.json` from this, overriding anything
+        // staged). 9.9.9.10 is a platform IP (must be denied); storage.test is the OWN host
+        // (not exercised here — own-bucket is #10-A). A tenant-smuggled `_platform.json`
+        // would be overwritten; we deliberately do NOT stage one.
+        let platform = jkbase_common::config::PlatformEgress {
+            storage_host: Some("storage.test".to_string()),
+            platform_ips: vec!["9.9.9.10".to_string()],
+        };
+
+        let plan =
+            crate::layer_plan::compute_layer_plan(&staged, &data.join("baselayers"), false, true)
+                .expect("compute layer plan");
+        let meta_img = data.join("egr-e2e-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &staged,
+            &plan,
+            &Default::default(),
+            &platform,
+            None,
+            &meta_img,
+        )
+        .expect("build the metadata image");
+
+        // Minimal agent rootfs (vda): the musl agent as /sbin/init.
+        let rootfs_stage = data.join("egr-e2e-vda-stage");
+        let _ = std::fs::remove_dir_all(&rootfs_stage);
+        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data", "etc"] {
+            std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
+        }
+        std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = rootfs_stage.join("sbin/init");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+        let rootfs_img = data.join("egr-e2e-vda.ext4");
+        jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+
+        // Networking: the resolver is hardcoded to 172.16.0.1, so the gateway IS 172.16.0.1.
+        let (host_ip, guest_ip, guest_mac) = ("172.16.0.1", "172.16.0.2", "AA:FC:00:00:16:02");
+        let tap = "jkegre2e".to_string();
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+        // Host owns the upstream IPs so a guest packet for them is delivered locally.
+        for ip in ["9.9.9.9/32", "9.9.9.10/32"] {
+            let _ = sh("ip", &["addr", "add", ip, "dev", "lo"]).await;
+        }
+
+        // Control plane on the host side of the TAP. Tasks abort when the test's runtime
+        // shuts down at return; the TAP/lo teardown below also tears the bindings down.
+        let dns = tokio::net::UdpSocket::bind((host_ip, 53u16)).await.expect("bind DNS :53");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = dns.recv_from(&mut buf).await else { continue };
+                // Decode the QNAME (lowercased) for the map.
+                let mut name = String::new();
+                let mut i = 12usize;
+                while i < n {
+                    let len = buf[i] as usize;
+                    if len == 0 { break; }
+                    if !name.is_empty() { name.push('.'); }
+                    if i + 1 + len > n { break; }
+                    name.push_str(&String::from_utf8_lossy(&buf[i + 1..i + 1 + len]));
+                    i += 1 + len;
+                }
+                let name = name.to_ascii_lowercase();
+                let ip = match name.as_str() {
+                    "allow.test" => Some(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+                    "platform.test" => Some(std::net::Ipv4Addr::new(9, 9, 9, 10)),
+                    "rebind.test" => Some(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                    _ => None,
+                };
+                if let Some(reply) = dns_reply(&buf[..n], ip) {
+                    let _ = dns.send_to(&reply, from).await;
+                }
+            }
+        });
+
+        for upstream in ["9.9.9.9", "9.9.9.10"] {
+            let l = tokio::net::TcpListener::bind((upstream, 80u16))
+                .await
+                .unwrap_or_else(|e| panic!("bind upstream {upstream}:80: {e}"));
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut s, _)) = l.accept().await else { continue };
+                    tokio::spawn(async move {
+                        let mut b = [0u8; 1024];
+                        let _ = s.read(&mut b).await;
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nupstream-ok",
+                            )
+                            .await;
+                    });
+                }
+            });
+        }
+
+        let config = VmConfig {
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = data.join("egr-e2e-run");
+        let mut vm = VmInstance::start("egre2e", &config, &runtime_dir)
+            .await
+            .expect("runtime VM should start");
+
+        // Drive one probe: GET /functions/{fn} with the egress-target headers; returns the
+        // trimmed body (`RESULT:...`). Retries until the agent is up.
+        async fn probe(
+            guest_ip: &str,
+            func: &str,
+            authority: &str,
+            scheme: &str,
+        ) -> Option<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            while std::time::Instant::now() < deadline {
+                if let Ok(mut s) = tokio::net::TcpStream::connect((guest_ip, 80u16)).await {
+                    let req = format!(
+                        "GET /functions/{func} HTTP/1.0\r\nHost: jkbase\r\nx-egress-scheme: {scheme}\r\nx-egress-authority: {authority}\r\nx-egress-path: /\r\n\r\n"
+                    );
+                    let _ = s.write_all(req.as_bytes()).await;
+                    let mut buf = Vec::new();
+                    if s.read_to_end(&mut buf).await.is_ok() {
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, body)) = text.split_once("\r\n\r\n")
+                            && head.lines().next().is_some_and(|l| l.contains(" 200 "))
+                        {
+                            return Some(body.trim().to_string());
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            None
+        }
+
+        let allow = probe(guest_ip, "probe_default", "allow.test", "http").await;
+        let rebind = probe(guest_ip, "probe_default", "rebind.test", "http").await;
+        let platform = probe(guest_ip, "probe_default", "platform.test", "http").await;
+        let ipv6 = probe(guest_ip, "probe_default", "[::1]", "http").await;
+        let sandbox = probe(guest_ip, "probe_sandbox", "allow.test", "http").await;
+
+        // Pull the observe manifest (stream=="egress") before teardown.
+        let logs = {
+            let mut out = String::new();
+            if let Ok(mut s) = tokio::net::TcpStream::connect((guest_ip, 80u16)).await {
+                let _ = s
+                    .write_all(b"GET /_jkbase/logs HTTP/1.0\r\nHost: jkbase\r\n\r\n")
+                    .await;
+                let mut buf = Vec::new();
+                if s.read_to_end(&mut buf).await.is_ok() {
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some((_, body)) = text.split_once("\r\n\r\n") {
+                        out = body.to_string();
+                    }
+                }
+            }
+            out
+        };
+
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        for ip in ["9.9.9.9/32", "9.9.9.10/32"] {
+            let _ = sh("ip", &["addr", "del", ip, "dev", "lo"]).await;
+        }
+
+        eprintln!("allow={allow:?}\nrebind={rebind:?}\nplatform={platform:?}\nipv6={ipv6:?}\nsandbox={sandbox:?}");
+        eprintln!("egress logs:\n{logs}");
+
+        assert_eq!(allow.as_deref(), Some("RESULT:ALLOWED:200"), "default must reach an allowed public upstream");
+        assert_eq!(rebind.as_deref(), Some("RESULT:DENIED"), "a public name resolving to an internal IP must be denied (post-DNS)");
+        assert_eq!(platform.as_deref(), Some("RESULT:DENIED"), "a platform IP must be denied (Zone-2 by IP)");
+        assert_eq!(ipv6.as_deref(), Some("RESULT:DENIED"), "an IPv6 destination must be refused");
+        assert_eq!(sandbox.as_deref(), Some("RESULT:DENIED"), "a sandboxed function must not reach public");
+
+        // #9: the observe manifest recorded the verdicts, via the unified log pipe with the
+        // reserved egress stream. Parse the events (the EgressEvent is JSON inside the
+        // escaped `line` field) rather than substring-matching the escaped bytes.
+        use jkbase_common::logs::{EgressEvent, Verdict};
+        let parsed: serde_json::Value = serde_json::from_str(&logs).unwrap_or(serde_json::Value::Null);
+        let events: Vec<EgressEvent> = parsed
+            .get("lines")
+            .and_then(|l| l.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|l| l.get("stream").and_then(|s| s.as_str()) == Some("egress"))
+                    .filter_map(|l| l.get("line").and_then(|s| s.as_str()))
+                    .filter_map(|s| serde_json::from_str::<EgressEvent>(s).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            events.iter().any(|e| e.verdict == Verdict::Allow && e.dest_host == "allow.test"),
+            "an allow verdict must be recorded for allow.test: {logs}"
+        );
+        assert!(
+            events.iter().any(|e| e.verdict == Verdict::DenySandbox),
+            "the sandboxed function's deny must be recorded: {logs}"
+        );
+        assert!(
+            events.iter().any(|e| e.verdict == Verdict::DenyPlatform && e.dest_host == "platform.test"),
+            "the platform-IP deny must be recorded: {logs}"
+        );
+        println!("PASS: function_egress_e2e — allow/rebind/platform/ipv6/sandbox + observe manifest");
     }
 
     /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun

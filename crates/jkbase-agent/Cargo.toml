@@ -22,3 +22,9 @@ wasmtime-wasi-http = "33"
 bytes = "1"
 flate2 = { workspace = true }
 tar = { workspace = true }
+# Function egress gate (P1): a pinned DNS resolver (172.16.0.1:53, NOT ambient
+# resolv.conf) + an agent-built TLS client that dials a vetted, pinned IP.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+hickory-resolver = { workspace = true }

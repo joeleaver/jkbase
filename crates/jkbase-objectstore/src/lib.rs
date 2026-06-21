@@ -15,7 +15,10 @@
 
 mod http;
 pub mod client;
-pub mod sigv4;
+/// SigV4 lives in `jkbase-common` so the object-store verify path and the agent's own-bucket
+/// sign path share byte-identical canonicalization (no divergence). Re-exported here so the
+/// existing `crate::sigv4::` / `jkbase_objectstore::sigv4` call sites are unchanged.
+pub use jkbase_common::sigv4;
 mod store;
 pub use client::{ClientError, ObjectClient};
 pub use http::router;

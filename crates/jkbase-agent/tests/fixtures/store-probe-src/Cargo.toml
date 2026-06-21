@@ -1,0 +1,26 @@
+# Standalone (own workspace) own-bucket-probe fixture for the runtime integration test
+# (`component_calls_store_binding`). Built to a `wasi:http` component that ALSO imports
+# `jkbase:objectstore/store`, with
+#   cargo build --release --target wasm32-wasip2
+# committed as `../store-probe.wasm`. It calls the store binding and reports the typed
+# outcome, proving the WIT import resolves + reaches the agent's host impl end to end.
+[workspace]
+
+[package]
+name = "store-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasi = "0.14"
+# Same wit-bindgen the `wasi` crate uses (0.57) → no runtime-symbol clash between the
+# proxy export (wasi crate) and the store import (generated here).
+wit-bindgen = "0.57"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

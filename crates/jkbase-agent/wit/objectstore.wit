@@ -1,0 +1,44 @@
+// The own-bucket typed capability: a function names KEYS in its own project bucket; the
+// agent supplies everything else (endpoint, credentials, project scope). The type system
+// forecloses "talk to bucket X of project Y" — there is deliberately NO bucket / endpoint /
+// region / host / credential / presign surface (design §7, P0-OBJ-*). Buffered bodies
+// (list<u8>, not stream), capped at the function 10 MiB ceilings.
+package jkbase:objectstore@0.1.0;
+
+interface store {
+    // Opaque error set — host internal detail is NEVER reflected here (P0-OBJ-OPAQUE).
+    variant error {
+        not-found,
+        access-denied,
+        quota-exceeded,
+        too-large,
+        invalid-key,
+        internal,
+    }
+
+    record object-meta {
+        key: string,
+        size: u64,
+        etag: string,
+        last-modified: u64,
+    }
+
+    // Maps 1:1 onto the engine's list_v2 (S3 delimiter/common-prefix folding).
+    record list-page {
+        objects: list<object-meta>,
+        common-prefixes: list<string>,
+        next-cursor: option<string>,
+    }
+
+    get: func(key: string) -> result<list<u8>, error>;
+    put: func(key: string, body: list<u8>) -> result<_, error>;
+    delete: func(key: string) -> result<_, error>;
+    // `list` is a reserved WIT keyword, so the function is `list-objects`.
+    list-objects: func(prefix: string, delimiter: option<string>, cursor: option<string>) -> result<list-page, error>;
+}
+
+// Host-side import world: the agent SUPPLIES `store` to the guest component. bindgen
+// generates the `Host` trait + `add_to_linker` from this.
+world host-store {
+    import store;
+}

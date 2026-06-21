@@ -1,20 +1,17 @@
+use crate::log_sink::LogSink;
 use anyhow::{Context, Result};
-use jkbase_common::logs::LogLine;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
-
-const MAX_LOG_LINES: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMount {
@@ -52,38 +49,6 @@ struct ManagedServer {
     healthy: bool,
 }
 
-/// Shared, append-only-ish log buffer plus the monotonic sequence source the
-/// host shipper uses as a cursor.
-#[derive(Clone)]
-struct LogSink {
-    buffer: Arc<Mutex<VecDeque<LogLine>>>,
-    seq: Arc<AtomicU64>,
-}
-
-impl LogSink {
-    fn new() -> Self {
-        Self {
-            buffer: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_LINES))),
-            seq: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    async fn push(&self, server: &str, stream: &str, line: String) {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut buf = self.buffer.lock().await;
-        if buf.len() >= MAX_LOG_LINES {
-            buf.pop_front();
-        }
-        buf.push_back(LogLine {
-            server: server.to_string(),
-            stream: stream.to_string(),
-            line,
-            timestamp: now_secs(),
-            seq,
-        });
-    }
-}
-
 pub struct ContainerSupervisor {
     servers: RwLock<Vec<ManagedServer>>,
     servers_dir: PathBuf,
@@ -92,10 +57,9 @@ pub struct ContainerSupervisor {
     /// resolved at boot from `_layers.json`. A server present here is layered
     /// (overlay + pivot_root); absent ⇒ legacy flat chroot.
     layer_map: HashMap<String, Vec<PathBuf>>,
-    logs: LogSink,
-    /// Identifies this agent process incarnation. Stable across snapshot restore
-    /// (memory survives), regenerated on cold boot — lets the host detect resets.
-    boot_id: String,
+    /// The process-wide shared log sink (owns the `seq` source + `boot_id`),
+    /// constructed in `main` and handed to every log producer. See [`LogSink`].
+    logs: Arc<LogSink>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,28 +70,20 @@ pub struct ServerStatus {
     pub healthy: bool,
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 impl ContainerSupervisor {
-    pub fn new(servers_dir: PathBuf, layer_map: HashMap<String, Vec<PathBuf>>) -> Self {
+    pub fn new(
+        servers_dir: PathBuf,
+        layer_map: HashMap<String, Vec<PathBuf>>,
+        logs: Arc<LogSink>,
+    ) -> Self {
         let extract_dir = PathBuf::from("/tmp/jkbase-servers");
         Self {
             servers: RwLock::new(Vec::new()),
             servers_dir,
             extract_dir,
             layer_map,
-            logs: LogSink::new(),
-            boot_id: generate_boot_id(),
+            logs,
         }
-    }
-
-    pub fn boot_id(&self) -> &str {
-        &self.boot_id
     }
 
     pub async fn start_all(&self) -> Result<()> {
@@ -327,19 +283,6 @@ impl ContainerSupervisor {
             .map(|s| s.manifest.port)
     }
 
-    /// Return the most recent `limit` buffered lines.
-    pub async fn get_logs(&self, limit: usize) -> Vec<LogLine> {
-        let buf = self.logs.buffer.lock().await;
-        let start = buf.len().saturating_sub(limit);
-        buf.iter().skip(start).cloned().collect()
-    }
-
-    /// Return all buffered lines with `seq` strictly greater than `since`.
-    /// Used by the host shipper for incremental, deduplicated fetches.
-    pub async fn get_logs_since(&self, since: u64) -> Vec<LogLine> {
-        let buf = self.logs.buffer.lock().await;
-        buf.iter().filter(|l| l.seq > since).cloned().collect()
-    }
 }
 
 fn remount_rw(target: &str) {
@@ -378,16 +321,6 @@ fn extract_tarball(tarball: &Path, target: &Path) -> Result<()> {
     archive.unpack(target)?;
 
     Ok(())
-}
-
-fn generate_boot_id() -> String {
-    // Nanosecond timestamp + pid is enough to distinguish process incarnations.
-    // (It need not be globally unique, only different across cold boots of one VM.)
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("{nanos:x}-{}", std::process::id())
 }
 
 const BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -446,7 +379,7 @@ fn apply_server_env(
 }
 
 /// Drain the child's stdout/stderr into the shared log sink.
-fn attach_log_readers(child: &mut Child, name: &str, logs: &LogSink) {
+fn attach_log_readers(child: &mut Child, name: &str, logs: &Arc<LogSink>) {
     let server_name = name.to_string();
     if let Some(stdout) = child.stdout.take() {
         let sink = logs.clone();
@@ -479,7 +412,7 @@ fn spawn_server_chroot(
     name: &str,
     manifest: &ServerManifest,
     rootfs_dir: &Path,
-    logs: &LogSink,
+    logs: &Arc<LogSink>,
 ) -> Result<Child> {
     use std::os::unix::process::CommandExt;
 
@@ -550,7 +483,7 @@ fn spawn_server_layered(
     name: &str,
     manifest: &ServerManifest,
     lowerdirs: &[PathBuf],
-    logs: &LogSink,
+    logs: &Arc<LogSink>,
 ) -> Result<Child> {
     use std::os::unix::process::CommandExt;
 
@@ -845,42 +778,6 @@ async fn tcp_health_check(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn seq_increments_and_since_filters() {
-        let sup = ContainerSupervisor::new(PathBuf::from("/nonexistent"), HashMap::new());
-        sup.logs.push("web", "stdout", "a".into()).await;
-        sup.logs.push("web", "stdout", "b".into()).await;
-        sup.logs.push("web", "stderr", "c".into()).await;
-
-        let all = sup.get_logs(10).await;
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].seq, 1);
-        assert_eq!(all[2].seq, 3);
-
-        let since1 = sup.get_logs_since(1).await;
-        assert_eq!(since1.len(), 2);
-        assert_eq!(since1[0].line, "b");
-        assert!(sup.get_logs_since(3).await.is_empty());
-
-        assert!(!sup.boot_id().is_empty());
-    }
-
-    #[tokio::test]
-    async fn ring_buffer_caps_but_seq_keeps_growing() {
-        let sup = ContainerSupervisor::new(PathBuf::from("/nonexistent"), HashMap::new());
-        for i in 0..(MAX_LOG_LINES + 50) {
-            sup.logs.push("web", "stdout", format!("line{i}")).await;
-        }
-        let all = sup.get_logs(MAX_LOG_LINES * 2).await;
-        // Buffer is capped...
-        assert_eq!(all.len(), MAX_LOG_LINES);
-        // ...but seq reflects every line ever pushed, so the host cursor never
-        // mistakes wrap-around for "no new logs".
-        assert_eq!(all.last().unwrap().seq as usize, MAX_LOG_LINES + 50);
-        let recent = sup.get_logs_since((MAX_LOG_LINES + 48) as u64).await;
-        assert_eq!(recent.len(), 2);
-    }
 
     #[test]
     fn apply_server_env_reserved_vars_win_over_manifest_env() {

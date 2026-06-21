@@ -32,7 +32,7 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub fn sha256_hex(data: &[u8]) -> String {
     hex(&Sha256::digest(data))
 }
 
@@ -72,7 +72,10 @@ fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
 
 /// Sorted, percent-encoded `k=v&...` canonical query string, optionally excluding
 /// one key (the signature itself, which isn't part of what it signs).
-fn canonical_query(pairs: &[(String, String)], exclude: &str) -> String {
+/// The canonical (sorted, percent-encoded) query string SigV4 signs over. Exposed so a
+/// signing client can build a wire query byte-identical to the signed one (pass the same
+/// pairs to [`sign_header`]); `exclude` drops a key (e.g. `X-Amz-Signature` for presign).
+pub fn canonical_query(pairs: &[(String, String)], exclude: &str) -> String {
     let mut enc: Vec<(String, String)> = pairs
         .iter()
         .filter(|(k, _)| k != exclude)
@@ -93,23 +96,58 @@ fn build_canonical_request(method: &str, path: &str, cquery: &str, host: &str) -
     )
 }
 
+/// Break a Unix timestamp into UTC `(year, month, day, hour, min, sec)` — dependency-free
+/// (Howard Hinnant's `civil_from_days`), so `jkbase-common` stays light for the musl agent.
+fn civil(now_unix: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let secs = now_unix as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    // days since 1970-01-01 → civil date
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d, hh, mm, ss)
+}
+
 fn date_stamp(now_unix: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix as i64, 0)
-        .unwrap_or_default()
-        .format("%Y%m%d")
-        .to_string()
+    let (y, m, d, ..) = civil(now_unix);
+    format!("{y:04}{m:02}{d:02}")
 }
 
 fn amz_date(now_unix: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix as i64, 0)
-        .unwrap_or_default()
-        .format("%Y%m%dT%H%M%SZ")
-        .to_string()
+    let (y, mo, d, h, mi, s) = civil(now_unix);
+    format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z")
 }
 
 fn parse_amz_date(s: &str) -> Option<u64> {
-    let ndt = chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ").ok()?;
-    u64::try_from(ndt.and_utc().timestamp()).ok()
+    // "YYYYMMDDTHHMMSSZ" → unix seconds (UTC). Manual parse keeps common dep-free.
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d) = (num(0..4)?, num(4..6)?, num(6..8)?);
+    let (h, mi, sec) = (num(9..11)?, num(11..13)?, num(13..15)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // civil date → days since 1970 (inverse of `civil`).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy.rem_euclid(400);
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
 }
 
 /// Mint a presigned URL `"<path>?<query>"` valid for `expires_secs` from `now_unix`.

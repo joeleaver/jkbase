@@ -1309,6 +1309,41 @@ impl Store {
         Ok(key)
     }
 
+    /// Stable access-key id for a project's PLATFORM-MANAGED own-bucket binding credential
+    /// (the `jkbase:objectstore/store` function binding). Deterministic so each deploy
+    /// OVERWRITES the same primary record (rotating the secret) instead of accumulating keys.
+    pub fn binding_access_key_id(project_id: &str) -> String {
+        format!("JKBND-{project_id}")
+    }
+
+    /// Mint (or rotate) the project's own-bucket binding credential. Unlike a user access
+    /// key this is stored ONLY in the primary `ACCESS_KEYS` table, NOT the per-project index
+    /// — so it is invisible to [`Self::list_access_keys`], never counts against the per-project
+    /// cap, and is purged via the stable id on teardown. It is owner-bound (`tenant_id`) and
+    /// re-minted with a fresh secret on every deploy; the SigV4 path resolves it via
+    /// [`Self::lookup_access_key`] like any key and the object-store owner re-bind fail-closes
+    /// an orphaned one. P0-OBJ-NO-STANDING-KEY (phase-1 form: a platform-managed,
+    /// deploy-rotated, not-user-visible credential — never the user's own standing key).
+    pub fn mint_binding_key(&self, project_id: &str, tenant_id: &str) -> Result<AccessKey> {
+        let key = AccessKey {
+            access_key_id: Self::binding_access_key_id(project_id),
+            project_id: project_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            secret_key: auth::generate_secret_access_key(),
+            label: "__binding".to_string(),
+            created_unix: auth::timestamp(),
+        };
+        let txn = self.db.begin_write()?;
+        {
+            // Overwrite any prior binding key = rotation. Primary only (no index entry).
+            let mut primary = txn.open_table(ACCESS_KEYS)?;
+            let data = serde_json::to_vec(&key)?;
+            primary.insert(key.access_key_id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(key)
+    }
+
     /// Resolve an access-key id to its full record (incl. project + secret). The
     /// O(1) lookup the object-store SigV4 path performs on every request. `None` if
     /// the key is unknown or was revoked.
@@ -1389,6 +1424,15 @@ impl Store {
                 if primary.remove(akid.as_str())?.is_some() {
                     removed += 1;
                 }
+            }
+            // The platform-managed binding key lives outside the index — purge it by its
+            // stable id so a recreated same-slug project never inherits it (the owner re-bind
+            // is the backstop, but don't leave a stale credential behind).
+            if primary
+                .remove(Self::binding_access_key_id(project_id).as_str())?
+                .is_some()
+            {
+                removed += 1;
             }
         }
         txn.commit()?;
@@ -1540,6 +1584,33 @@ mod tests {
         assert!(store.lookup_access_key(&keep.access_key_id).unwrap().is_some());
         // Idempotent.
         assert_eq!(store.delete_all_access_keys("forumall").unwrap(), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn binding_key_is_invisible_uncapped_rotated_and_purged() {
+        let (store, path) = tmp_db();
+        // Fill the project to the user-key cap; the binding key must NOT count against it.
+        for i in 0..Store::MAX_ACCESS_KEYS_PER_PROJECT {
+            store.create_access_key("p", "t1", &format!("k{i}")).unwrap();
+        }
+        let b1 = store.mint_binding_key("p", "t1").unwrap();
+        assert_eq!(b1.access_key_id, Store::binding_access_key_id("p"));
+        // Resolvable by the SigV4 path…
+        assert!(store.lookup_access_key(&b1.access_key_id).unwrap().is_some());
+        // …but invisible to the user key list (not in the per-project index).
+        assert!(store.list_access_keys("p").unwrap().iter().all(|k| k.access_key_id != b1.access_key_id));
+        assert_eq!(store.list_access_keys("p").unwrap().len(), Store::MAX_ACCESS_KEYS_PER_PROJECT);
+
+        // Re-mint rotates the SECRET under the stable id (one entry, fresh secret).
+        let b2 = store.mint_binding_key("p", "t1").unwrap();
+        assert_eq!(b1.access_key_id, b2.access_key_id);
+        assert_ne!(b1.secret_key, b2.secret_key, "deploy re-mint rotates the secret");
+
+        // Teardown purges it (by stable id) along with the user keys.
+        store.delete_all_access_keys("p").unwrap();
+        assert!(store.lookup_access_key(&b1.access_key_id).unwrap().is_none(), "binding key purged on teardown");
 
         let _ = std::fs::remove_file(path);
     }

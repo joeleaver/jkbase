@@ -69,8 +69,20 @@ echo "[3/7] Configuring firewall..."
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow ssh
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
+# Scope the proxy ports to the PUBLIC uplink only — a bare `ufw allow 443/tcp` opens 443
+# on EVERY interface incl. the runtime bridge jkbr0, which (pre-JKRUNFW) let a guest reach
+# the proxy/gateway directly. guest→proxy is governed by JKRUNFW (setup-bridge.sh) now, so
+# the public ports only need to be open on the uplink.
+PUB_IFACE=$(ip route show default | awk '{print $5; exit}')
+sudo ufw delete allow 80/tcp 2>/dev/null || true
+sudo ufw delete allow 443/tcp 2>/dev/null || true
+if [ -n "$PUB_IFACE" ]; then
+    sudo ufw allow in on "$PUB_IFACE" to any port 80 proto tcp
+    sudo ufw allow in on "$PUB_IFACE" to any port 443 proto tcp
+else
+    sudo ufw allow 80/tcp
+    sudo ufw allow 443/tcp
+fi
 echo "y" | sudo ufw enable || true
 sudo ufw status
 
@@ -300,6 +312,6 @@ echo ""
 echo "Next steps:"
 echo "  1. Set env vars in /var/jkbase/.env (CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, ACME_EMAIL)"
 echo "  2. Start the service:  ssh $TARGET 'sudo systemctl start jkbase'"
-echo "  3. Init the platform:  jkbase init <email> --api http://<server-ip>:9090"
+echo "  3. Init the platform:  ssh $TARGET 'jkbase init <email> --api http://127.0.0.1:9090'  (API is loopback-only; remote CLI uses https://api.<domain> via the proxy)"
 echo "  4. Point DNS:          *.jkbase.app → <server-ip>"
 echo ""

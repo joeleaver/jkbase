@@ -34,10 +34,12 @@
 //!     `StoreLimits` caps guest memory, request/response bodies are size-capped, and each
 //!     call gets a fresh `Store`+`ResourceTable` so no state bleeds between invocations.
 
+use crate::function_egress::{gate_send, EgressContext};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, Limited};
+use jkbase_common::config::ResolvedEgress;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -50,7 +52,7 @@ use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::p2::{IoView, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 use wasmtime_wasi_http::bindings::ProxyPre;
-use wasmtime_wasi_http::bindings::http::types::{ErrorCode, Scheme};
+use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
 use wasmtime_wasi_http::{HttpResult, WasiHttpCtx, WasiHttpView};
@@ -199,6 +201,25 @@ struct FunctionSidecar {
     runtime: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// The host-resolved PUBLIC-egress policy for this function (one concrete state; the
+    /// agent never re-derives precedence — P0-EGRESS-POLICY-HOST-RESOLVED). Absent ⇒ a
+    /// hand-placed/legacy function the host never processed: fail closed to `Sandbox`
+    /// (deny public; OWN-stuff still reachable), never silently allow-all.
+    #[serde(default)]
+    egress: Option<ResolvedEgress>,
+    /// The platform-managed own-bucket binding credential (reserved channel, NOT in `env` —
+    /// P0-OBJ-RESERVED-CHANNEL/-NOKEY). Present only when the host minted one this deploy;
+    /// the agent signs SigV4 to the pinned storage host with it. Absent ⇒ the `store`
+    /// capability fails closed (access-denied).
+    #[serde(default)]
+    storage_credential: Option<StorageCredential>,
+}
+
+/// The own-bucket binding credential read from the function sidecar's reserved channel.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StorageCredential {
+    pub access_key_id: String,
+    pub secret_key: String,
 }
 
 /// Classify a wasm blob by its 8-byte preamble: `\0asm` magic + a u16 version and a u16
@@ -229,12 +250,23 @@ fn resolve_kind(declared: Option<RuntimeKind>, bytes: &[u8]) -> Result<RuntimeKi
 }
 
 /// Per-invocation host state for the component path. Implements `WasiView` (core WASI),
-/// `WasiHttpView` (incoming + the *denied* outgoing handler), and holds the memory limiter.
-struct HostState {
+/// `WasiHttpView` (incoming + the host-mediated outgoing gate), and holds the memory
+/// limiter. Carries the function's immutable resolved egress policy + the shared egress
+/// context (pinned resolver, platform facts, DoS limiters), snapshotted per invocation.
+/// `pub(crate)` so the `objectstore_host` module can impl the generated `store::Host` on it.
+pub(crate) struct HostState {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     table: ResourceTable,
     limits: StoreLimits,
+    egress: ResolvedEgress,
+    pub(crate) egress_ctx: Arc<EgressContext>,
+    /// This function's name — stamped onto each egress observe record.
+    function: String,
+    /// The own-bucket binding credential, if the host minted one this deploy. The
+    /// `store::Host` impl (objectstore_host.rs) signs SigV4 with it to the pinned storage
+    /// host; `None` ⇒ the `store` capability fails closed.
+    pub(crate) storage_cred: Option<StorageCredential>,
 }
 
 impl IoView for HostState {
@@ -254,28 +286,42 @@ impl WasiHttpView for HostState {
         &mut self.http
     }
 
-    /// **EGRESS OFF (P0).** Every outbound request from tenant code is denied here,
-    /// before `default_send_request` (the only code that opens an outbound socket) can
-    /// run. This is the structural chokepoint the threat model requires; the deferred
-    /// host-mediated outbound-I/O arc will replace this with an allowlisted, SSRF-guarded
-    /// policy. Returns a clean `wasi:http` error so the guest's `fetch` rejects gracefully.
+    /// **The connect-time egress enforcement point (P0).** Every outbound request from
+    /// tenant code funnels through here — the sole `send-request` impl; `wasi:sockets` stays
+    /// denied, so this is the one door (P0-EGRESS-ONEDOOR). We delegate to the egress gate
+    /// (`function_egress::gate_send`), which resolves via the pinned resolver, zone-classifies
+    /// each resolved IP, applies this function's policy, and dials a single vetted, pinned
+    /// address on the guest TAP — or returns a typed deny opening NO socket. The gate runs on
+    /// a task spawned into the invocation's tree, so the outer wall-clock `task.abort()` tears
+    /// down any in-flight outbound (P0-EGRESS-ABORT).
     fn send_request(
         &mut self,
-        _request: hyper::Request<HyperOutgoingBody>,
-        _config: OutgoingRequestConfig,
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
-        Err(ErrorCode::InternalError(Some(
-            "outbound network is disabled for functions".to_string(),
-        ))
-        .into())
+        let ctx = self.egress_ctx.clone();
+        let policy = self.egress.clone();
+        let function = self.function.clone();
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            Ok(gate_send(request, config, ctx, policy, function).await)
+        });
+        Ok(HostFutureIncomingResponse::pending(handle))
     }
 }
 
 impl HostState {
-    fn new(env: &BTreeMap<String, String>) -> Self {
+    fn new(
+        env: &BTreeMap<String, String>,
+        egress: ResolvedEgress,
+        egress_ctx: Arc<EgressContext>,
+        function: String,
+        storage_cred: Option<StorageCredential>,
+    ) -> Self {
         let mut builder = WasiCtxBuilder::new();
-        // No preopens, no stdio inheritance, no network — all denied explicitly so a
-        // linked-but-unused capability still fails closed if a component reaches for it.
+        // `wasi:sockets` STAYS denied — HTTP egress is enabled ONLY through `send_request`,
+        // so the SSRF gate has exactly one door (P0-EGRESS-ONEDOOR). The guest never resolves
+        // (`allow_ip_name_lookup(false)`): the AGENT resolves via the pinned resolver and pins
+        // the result, closing guest-resolver TOCTOU. No preopens (no ambient filesystem).
         builder
             .allow_tcp(false)
             .allow_udp(false)
@@ -291,6 +337,10 @@ impl HostState {
             limits: StoreLimitsBuilder::new()
                 .memory_size(FUNCTION_MEMORY_MAX)
                 .build(),
+            egress,
+            egress_ctx,
+            function,
+            storage_cred,
         }
     }
 }
@@ -307,6 +357,10 @@ enum LoadedFunction {
     Component {
         pre: Arc<ProxyPre<HostState>>,
         env: BTreeMap<String, String>,
+        /// Immutable host-resolved PUBLIC-egress policy for this function.
+        egress: ResolvedEgress,
+        /// Own-bucket binding credential (reserved sidecar channel), if minted.
+        storage_cred: Option<StorageCredential>,
     },
 }
 
@@ -316,10 +370,13 @@ pub struct FunctionRuntime {
     /// Async engine for the component path (async + fuel + epoch).
     async_engine: Engine,
     functions: HashMap<String, Arc<LoadedFunction>>,
+    /// Shared egress context (pinned resolver, host-asserted platform facts, DoS limiters),
+    /// snapshotted into each component invocation's `HostState`.
+    egress_ctx: Arc<EgressContext>,
 }
 
 impl FunctionRuntime {
-    pub fn new() -> Self {
+    pub fn new(egress_ctx: Arc<EgressContext>) -> Self {
         // Both engines get fuel + epoch interruption. A single detached ticker increments
         // both shared epoch counters, so a tight loop in either path is bounded even when
         // fuel is generous. Engine clones share epoch state (Arc-backed), so the loaded
@@ -349,6 +406,7 @@ impl FunctionRuntime {
             sync_engine,
             async_engine,
             functions: HashMap::new(),
+            egress_ctx,
         }
     }
 
@@ -364,6 +422,10 @@ impl FunctionRuntime {
             .transpose()?;
         let kind = resolve_kind(declared, &bytes)?;
         let env = sidecar.env;
+        // Absent ⇒ a function the host never processed (hand-placed/legacy): fail closed to
+        // Sandbox (deny public; OWN-stuff still reachable), never silently allow-all.
+        let egress = sidecar.egress.unwrap_or(ResolvedEgress::Sandbox);
+        let storage_cred = sidecar.storage_credential;
         // Prefer a precompiled sibling `.cwasm` (deploy-time AOT) — deserialize is ~ms vs
         // seconds to recompile the big JS engine. Falls back to compiling the `.wasm` if
         // the `.cwasm` is absent or incompatible (e.g. a CPU/wasmtime skew).
@@ -399,6 +461,10 @@ impl FunctionRuntime {
                 // outgoing-handler routes through our denying `send_request`.
                 wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
                 wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+                // The own-bucket capability (jkbase:objectstore/store). A component that does
+                // not import it is unaffected — an extra linker definition is harmless, so the
+                // legacy/HTTP-only functions still instantiate.
+                crate::objectstore_host::add_to_linker(&mut linker)?;
                 let pre =
                     ProxyPre::new(linker.instantiate_pre(&component)?).with_context(|| {
                         format!("pre-instantiate component {}", wasm_path.display())
@@ -406,6 +472,8 @@ impl FunctionRuntime {
                 LoadedFunction::Component {
                     pre: Arc::new(pre),
                     env,
+                    egress,
+                    storage_cred,
                 }
             }
         };
@@ -468,18 +536,26 @@ impl FunctionRuntime {
                     }
                 }
             }
-            LoadedFunction::Component { pre, env } => {
+            LoadedFunction::Component {
+                pre,
+                env,
+                egress,
+                storage_cred,
+            } => {
                 // The wall-clock bound + task abort live inside invoke_component (it owns the
                 // handler task, which must be aborted — not merely dropped — on timeout).
-                invoke_component(pre.clone(), env.clone(), req).await
+                invoke_component(
+                    pre.clone(),
+                    env.clone(),
+                    egress.clone(),
+                    self.egress_ctx.clone(),
+                    name.to_string(),
+                    storage_cred.clone(),
+                    req,
+                )
+                .await
             }
         }
-    }
-}
-
-impl Default for FunctionRuntime {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -565,12 +641,20 @@ fn invoke_wasip1(func: &LoadedFunction, req: &FunctionRequest) -> Result<Functio
 /// `FunctionRequest`, runs the exported `incoming-handler`, and reads back the
 /// `OutgoingResponse` under a size cap. Bounded by fuel + the shared epoch deadline; the
 /// caller wraps this in the outer wall-clock timeout.
+#[allow(clippy::too_many_arguments)] // per-invocation host-state inputs; all load-bearing
 async fn invoke_component(
     pre: Arc<ProxyPre<HostState>>,
     env: BTreeMap<String, String>,
+    egress: ResolvedEgress,
+    egress_ctx: Arc<EgressContext>,
+    function: String,
+    storage_cred: Option<StorageCredential>,
     req: FunctionRequest,
 ) -> Result<FunctionResponse> {
-    let mut store = Store::new(pre.engine(), HostState::new(&env));
+    let mut store = Store::new(
+        pre.engine(),
+        HostState::new(&env, egress, egress_ctx, function, storage_cred),
+    );
     store.set_epoch_deadline(epoch_deadline_ticks());
     store.limiter(|s| &mut s.limits);
 
@@ -687,6 +771,17 @@ fn build_incoming_request(
 mod tests {
     use super::*;
 
+    /// A runtime with a fail-closed egress context (no OWN host, empty deny-set). The
+    /// pinned resolver points at 172.16.0.1, which is absent in CI — so a function's outbound
+    /// `fetch` is denied (DnsError/timeout or, post-resolution, the policy), proving the gate
+    /// is wired without a live upstream.
+    fn test_rt() -> FunctionRuntime {
+        let sink = std::sync::Arc::new(crate::log_sink::LogSink::new());
+        let ctx = EgressContext::new(&jkbase_common::config::PlatformEgress::default(), sink)
+            .expect("build egress context");
+        FunctionRuntime::new(ctx)
+    }
+
     #[test]
     fn classifies_core_module_preamble() {
         // `\0asm` + version 1 (core module): 00 61 73 6d 01 00 00 00
@@ -765,7 +860,7 @@ mod tests {
     /// structurally, not just by config.
     #[tokio::test]
     async fn component_executes_and_egress_is_denied() {
-        let mut rt = FunctionRuntime::new();
+        let mut rt = test_rt();
         rt.load_module("echo", &fixture()).expect("load component");
         assert!(rt.has_function("echo"));
 
@@ -787,12 +882,41 @@ mod tests {
         assert!(text.contains("egress=DENIED"), "egress not denied! got: {text}");
     }
 
+    /// The own-bucket `jkbase:objectstore/store` binding resolves end to end: a real
+    /// component that IMPORTS the interface loads through the linker, runs, and its `put`/`get`
+    /// calls reach the agent's host impl. With no binding credential in the (test) sidecar the
+    /// host fails closed to `access-denied` — which still PROVES the WIT plumbing (import
+    /// resolved, linker wired, host impl invoked), distinct from a trap or an unresolved import.
+    #[tokio::test]
+    async fn component_calls_store_binding() {
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/store-probe.wasm");
+        assert!(probe.exists(), "missing store-probe fixture {}", probe.display());
+        let mut rt = test_rt();
+        rt.load_module("store", &probe).expect("load store-probe component");
+
+        let req = FunctionRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        };
+        let resp = rt.invoke("store", req).await.expect("invoke");
+        let text = String::from_utf8_lossy(&resp.body);
+        assert_eq!(resp.status, 200, "body: {text}");
+        // The guest called store::put/get; with no credential the host returns access-denied —
+        // proving the binding is wired (not a trap / unresolved import).
+        assert!(text.contains("put=access-denied"), "store put did not reach the host impl: {text}");
+        assert!(text.contains("get=access-denied"), "store get did not reach the host impl: {text}");
+    }
+
     /// Project secrets injected via the sidecar env reach the component (pre-validates the
     /// secrets mechanism end-to-end through the real runtime).
     #[tokio::test]
     async fn component_reads_injected_env() {
         let wasm = staged("env", Some(r#"{"env":{"DEMO_SECRET":"hunter2"}}"#));
-        let mut rt = FunctionRuntime::new();
+        let mut rt = test_rt();
         rt.load_module("echo", &wasm).expect("load component");
 
         let req = FunctionRequest {
@@ -817,7 +941,7 @@ mod tests {
     #[ignore = "needs JKBASE_TEST_COMPONENT=/path/to/component.wasm"]
     async fn runs_external_component() {
         let path = std::env::var("JKBASE_TEST_COMPONENT").expect("set JKBASE_TEST_COMPONENT");
-        let mut rt = FunctionRuntime::new();
+        let mut rt = test_rt();
         let t0 = std::time::Instant::now();
         rt.load_module("ext", std::path::Path::new(&path))
             .expect("load component");
@@ -842,7 +966,7 @@ mod tests {
     #[test]
     fn real_component_with_mismatched_sidecar_is_rejected() {
         let wasm = staged("mismatch", Some(r#"{"runtime":"wasip1"}"#));
-        let mut rt = FunctionRuntime::new();
+        let mut rt = test_rt();
         let err = rt.load_module("echo", &wasm).unwrap_err();
         assert!(err.to_string().contains("disagrees"), "got: {err}");
         std::fs::remove_dir_all(wasm.parent().unwrap()).ok();

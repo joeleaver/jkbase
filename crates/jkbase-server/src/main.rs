@@ -9,6 +9,7 @@ mod objectstore_service;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use jkbase_common::config::PlatformEgress;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
@@ -139,6 +140,15 @@ struct Args {
     /// not a tenant privilege — keep it out of tenant reach.
     #[arg(long, env = "JKBASE_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// The platform's own public/uplink IP(s) (comma-separated) — where the proxy /
+    /// control API / object-store terminate. Stamped into each VM's `_platform.json` as the
+    /// Zone-2 deny-set so a function cannot reach `api.{domain}` (control plane) by IP or
+    /// domain-fronting (P0-EGRESS-PLATFORM-BY-IP). When unset, the server auto-discovers
+    /// the global IPs on the default-route uplink (mirrors tools/setup-bridge.sh). Set this
+    /// to be explicit / on hosts where auto-discovery is wrong (e.g. behind NAT).
+    #[arg(long, env = "JKBASE_PLATFORM_IPS", value_delimiter = ',')]
+    platform_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +177,11 @@ struct PlatformState {
     disk_tokens: HashMap<String, FenceToken>,
     /// This host's stable identity, stamped into lease tokens.
     host_id: String,
+    /// Host-asserted platform egress facts (OWN object-store host + the platform's own
+    /// public IP deny-set), stamped into every per-VM metadata image as `_platform.json`
+    /// so the in-VM agent can recognize OWN-storage (Zone 1) and deny the control-plane /
+    /// proxy IP(s) (Zone 2). Computed once at startup; the same for every VM on this host.
+    platform_egress: PlatformEgress,
 }
 
 /// Data disk size (MiB) created on first use for projects that declare volumes.
@@ -184,9 +199,7 @@ impl PlatformState {
 
         for octet in 2..=254u8 {
             if !used_octets.contains(&octet) {
-                let ip = format!("172.16.0.{octet}");
-                let tap = format!("tap{}", octet - 2);
-                let mac = format!("AA:FC:00:00:00:{octet:02X}");
+                let (tap, ip, mac) = slot_identity(octet);
                 return Ok((ip, tap, mac));
             }
         }
@@ -326,6 +339,37 @@ async fn main() -> Result<()> {
     let lease: Arc<dyn Lease> =
         Arc::new(FlockLease::open(data_dir.join("leases"), host_id.clone())?);
 
+    // Host-asserted platform egress facts, computed once. The OWN object-store host is
+    // `storage.{domain}`; the Zone-2 deny-set is the host's own public uplink IP(s).
+    //
+    // ALWAYS union the operator's --platform-ips with auto-discovery (never replace) — review
+    // M-1. tools/setup-bridge.sh independently opens guest→PUB_IP:80,443 for EVERY global IP on
+    // the uplink (its own discovery), so if an operator passed a NARROWER explicit list the
+    // agent's deny-set could miss a secondary/failover IP the firewall still exposes → a
+    // function could reach the control-plane proxy on that IP. Unioning guarantees the agent
+    // deny-set ⊇ the discovered uplink set the firewall allows, closing the desync; --platform-ips
+    // only ADDS (e.g. an IP behind NAT that discovery can't see), never subtracts.
+    let mut platform_ips = discover_uplink_ips();
+    for ip in &args.platform_ips {
+        if !platform_ips.contains(ip) {
+            platform_ips.push(ip.clone());
+        }
+    }
+    if platform_ips.is_empty() {
+        // The netfilter fence ALLOWS guest→public-IP:80,443 (servers reach the object-store /
+        // own-sites through the proxy there), so the agent's platform-IP list is the ONLY
+        // layer denying a function the control plane on those ports. Empty = that agent-side
+        // Zone-2 deny is disabled — loudly flag it (the control API is still loopback-bound +
+        // auth-gated, but this is a real gap to close before tenant exposure).
+        warn!("no platform uplink IPs (auto-discovery empty and --platform-ips unset); function egress Zone-2 deny by IP is DISABLED — set --platform-ips");
+    } else {
+        info!(ips = ?platform_ips, "platform egress deny-set (Zone-2 platform IPs)");
+    }
+    let platform_egress = PlatformEgress {
+        storage_host: Some(format!("storage.{}", args.domain)),
+        platform_ips,
+    };
+
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         vm_states: HashMap::new(),
@@ -340,6 +384,7 @@ async fn main() -> Result<()> {
         lease,
         disk_tokens: HashMap::new(),
         host_id,
+        platform_egress,
     }));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
@@ -461,6 +506,13 @@ async fn main() -> Result<()> {
     if let Some(net) = &build_net {
         net.verify_firewall().await?;
         net.ensure_source_guard().await?;
+    }
+    // Pre-create + hook the runtime VM L2 source-guard chain at startup (defense in depth:
+    // it exists before the first project wakes; per-TAP rules are added lazily in setup_tap).
+    // Fail-closed — ebtables is a provisioned dependency (provision.sh / deploy-server.sh).
+    {
+        let _g = runtime_ebtables_lock().lock().await;
+        ensure_runtime_source_guard_chain().await?;
     }
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
@@ -672,7 +724,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], args.api_port));
+    // P0 (function-outbound-io, Phase 0): bind the control API to LOOPBACK, not 0.0.0.0.
+    // The proxy reaches it at 127.0.0.1 (api_addr, above) and external clients reach it
+    // via the `api.` reserved host THROUGH the proxy — nothing legitimate needs it on a
+    // routable address. Binding 0.0.0.0 also put the socket on the runtime bridge IP
+    // (172.16.0.1:9090), so a hostile guest's only barrier to the control plane was ufw
+    // ordering; never listening off loopback closes that structurally (setup-bridge.sh's
+    // JKRUNFW INPUT chain is the netfilter backstop). Threat model: all tenants untrusted.
+    let addr = SocketAddr::from(([127, 0, 0, 1], args.api_port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(
         api = %addr,
@@ -1226,6 +1285,60 @@ fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &s
     let _ = store.claim_domain(&record);
 }
 
+/// Discover the host's public uplink IPv4(s): the global-scope addresses on the
+/// default-route interface. Mirrors `tools/setup-bridge.sh` (`ip route show default` →
+/// `ip -4 -o addr show $IFACE scope global`). Fail-soft: returns empty on any error (the
+/// caller warns), never a partial/garbage IP. Used to build the agent's Zone-2 deny-set.
+fn discover_uplink_ips() -> Vec<String> {
+    let iface = match std::process::Command::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            // "default via <gw> dev <iface> ..." — take the token after `dev`.
+            text.lines()
+                .next()
+                .and_then(|l| {
+                    let mut it = l.split_whitespace();
+                    while let Some(tok) = it.next() {
+                        if tok == "dev" {
+                            return it.next().map(str::to_string);
+                        }
+                    }
+                    None
+                })
+        }
+        _ => None,
+    };
+    let Some(iface) = iface else {
+        return Vec::new();
+    };
+    match std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show", &iface, "scope", "global"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                // "<n>: <iface>    inet <ip>/<prefix> ..." — take the addr after `inet`,
+                // strip the prefix, and only keep a parseable IPv4.
+                let mut it = l.split_whitespace();
+                while let Some(tok) = it.next() {
+                    if tok == "inet" {
+                        let addr = it.next()?.split('/').next()?;
+                        if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+                            return Some(addr.to_string());
+                        }
+                    }
+                }
+                None
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 async fn handle_deploy(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
@@ -1336,6 +1449,26 @@ async fn handle_deploy(
         .list_secrets(project_id)
         .map(|v| v.into_iter().map(|s| (s.key, s.value)).collect())
         .unwrap_or_default();
+    // Host-asserted platform egress facts, stamped into this VM's metadata image as
+    // `_platform.json` (the agent's OWN-storage host + Zone-2 deny-set). Read under the lock.
+    let platform_egress = plat.platform_egress.clone();
+    // Mint (rotate) the project's own-bucket binding credential and write it into the
+    // function sidecars' reserved channel below. Owner-bound to the project's CURRENT tenant
+    // (the object-store owner re-bind fail-closes a stale one); a fresh secret each deploy.
+    // Only when the project has an owner — an ownerless project gets no binding (the SigV4
+    // owner re-check would reject it anyway). Best-effort: a mint failure must not fail the
+    // deploy (functions just can't use the typed binding until the next deploy).
+    let storage_binding: Option<layer_plan::StorageBinding> = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.tenant_id)
+        .and_then(|tenant| plat.store.mint_binding_key(project_id, &tenant).ok())
+        .map(|k| layer_plan::StorageBinding {
+            access_key_id: k.access_key_id,
+            secret_key: k.secret_key,
+        });
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -1355,7 +1488,14 @@ async fn handle_deploy(
             // verify=true: cold-boot deploy re-checks every tenant + platform blob's
             // sha256 before it can be attached to a VM.
             let plan = layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, true)?;
-            layer_plan::build_metadata_image(&content_dir, &plan, &secrets, &out)?;
+            layer_plan::build_metadata_image(
+                &content_dir,
+                &plan,
+                &secrets,
+                &platform_egress,
+                storage_binding.as_ref(),
+                &out,
+            )?;
             Ok(plan)
         })
         .await
@@ -2000,9 +2140,8 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
     // tenant's runtime VM can't reach another's at 172.16.0.x on the shared bridge (the
     // gateway/uplink — a non-isolated port — stays reachable, so egress is unaffected).
     // Fail-closed: if the kernel can't apply it, the deploy fails rather than running a
-    // VM with cross-tenant L2 reachability. NB this is the isolation half only — an
-    // ebtables L2 source-guard (anti IP/MAC spoof, as the build bridge has) is a tracked
-    // follow-up; port isolation already blocks the high-value cross-tenant-hijack case.
+    // VM with cross-tenant L2 reachability. Port isolation blocks cross-tenant *reach*;
+    // the ebtables L2 source-guard installed below closes *spoofing* (the other half).
     run_cmd(
         "ip",
         &["link", "set", "dev", tap_name, "type", "bridge_slave", "isolated", "on"],
@@ -2017,6 +2156,23 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
     )
     .await;
     run_cmd("ip", &["link", "set", tap_name, "up"]).await?;
+
+    // L2 source-guard (anti IP/MAC spoof): pin this TAP to its deterministic {MAC, IPv4
+    // src, ARP src}. Port isolation (above) blocks cross-tenant *reach*; this closes
+    // *spoofing* — without it a hostile guest can emit frames bearing another project's
+    // source IP, poisoning per-project egress attribution + the bandwidth meter (and any
+    // future `-s`-scoped rule). Mirrors the build bridge's JKBUILD_SG. Fail-closed, to
+    // match the port-isolation posture above. {ip,mac} derive from the TAP name via the
+    // same deterministic octet map as allocate_ip, so setup_tap needs no new args.
+    if let Some((ip, mac)) = tap_identity(tap_name) {
+        install_tap_source_guard(tap_name, &ip, &mac)
+            .await
+            .context("install runtime L2 source-guard (is ebtables installed?)")?;
+    } else {
+        anyhow::bail!(
+            "tap {tap_name:?} is outside the tapN scheme — refusing to boot without its L2 source-guard"
+        );
+    }
 
     Ok(())
 }
@@ -2047,6 +2203,139 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
         anyhow::bail!("{} {:?} failed with {}", cmd, args, status);
     }
     Ok(())
+}
+
+/// The ebtables (L2/bridge filter) chain holding the runtime per-TAP source-guard rules.
+const RUNTIME_SOURCE_GUARD_CHAIN: &str = "JKRUN_SG";
+
+/// The deterministic identity of a runtime VM slot, keyed by its last IP octet (2..=254).
+/// `PlatformState::allocate_ip` and `tap_identity` BOTH go through this single formula, so
+/// the L2 source-guard can never pin a different {ip,mac} than the VM was actually given.
+fn slot_identity(octet: u8) -> (String, String, String) {
+    (
+        format!("tap{}", octet - 2),
+        format!("172.16.0.{octet}"),
+        format!("AA:FC:00:00:00:{octet:02X}"),
+    )
+}
+
+/// Derive a runtime TAP's deterministic `(ipv4, mac)` from its name (the inverse of the
+/// `slot_identity` map). Because that map is a bijection, a TAP's source-guard rules are
+/// stable across project churn — so they need no teardown (a deleted TAP's rules match
+/// nothing; a reused octet gets the identical {ip,mac}).
+fn tap_identity(tap: &str) -> Option<(String, String)> {
+    let n: u16 = tap.strip_prefix("tap")?.parse().ok()?;
+    let octet = n.checked_add(2)?;
+    if octet > 254 {
+        return None;
+    }
+    let (_, ip, mac) = slot_identity(octet as u8);
+    Some((ip, mac))
+}
+
+/// Serializes all runtime ebtables edits. The nf_tables ebtables backend does a whole-
+/// ruleset read-modify-write per call, so concurrent project wakes (proxy-driven, routine)
+/// clobber each other (verified: 20 concurrent `-A` → only 2 land; `--concurrent` does not
+/// help). Held across the chain-ensure + per-TAP rule installs.
+static RUNTIME_EBTABLES_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+fn runtime_ebtables_lock() -> &'static tokio::sync::Mutex<()> {
+    RUNTIME_EBTABLES_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Ensure the runtime source-guard chain exists and is hooked into the L2 INPUT (frames
+/// to the gateway/host) + FORWARD (VM↔VM, already port-isolated — defense in depth) paths.
+/// Do NOT flush: unlike the build guard (a static pool repopulated at startup), runtime
+/// TAPs are pinned lazily in `setup_tap`, so flushing here would drop active TAPs' rules
+/// until their next wake. Idempotent: `-N` ignores "exists", the hook is `-C`-guarded.
+/// Rules match `-i tap*`, so build-bridge (`jkbld*`) frames fall straight through.
+async fn ensure_runtime_source_guard_chain() -> Result<()> {
+    let _ = run_ebtables(&["-t", "filter", "-N", RUNTIME_SOURCE_GUARD_CHAIN]).await;
+    for hook in ["INPUT", "FORWARD"] {
+        if !ebtables_ok(&["-t", "filter", "--check", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN]).await {
+            run_ebtables(&["-t", "filter", "-I", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN])
+                .await
+                .with_context(|| format!("hook runtime source-guard into ebtables {hook}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Install the per-TAP L2 source-guard: DROP any frame on `tap` not bearing this slot's
+/// source MAC / IPv4 source / ARP source, plus DROP 802.1Q VLAN-tagged frames outright (a
+/// tagged frame's outer ethertype is 0x8100, so `-p IPv4`/`-p ARP` would skip the source
+/// pins). Idempotent (`-C` before `-A`), so re-asserting a surviving TAP on wake is a
+/// no-op. Mirrors `build_orchestrator::ensure_source_guard` rule-for-rule.
+async fn install_tap_source_guard(tap: &str, ip: &str, mac: &str) -> Result<()> {
+    let _guard = runtime_ebtables_lock().lock().await;
+    ensure_runtime_source_guard_chain().await?;
+    let rules: [Vec<&str>; 4] = [
+        vec!["-i", tap, "-p", "802_1Q", "-j", "DROP"],
+        vec!["-i", tap, "!", "-s", mac, "-j", "DROP"],
+        vec!["-i", tap, "-p", "IPv4", "!", "--ip-src", ip, "-j", "DROP"],
+        vec!["-i", tap, "-p", "ARP", "!", "--arp-ip-src", ip, "-j", "DROP"],
+    ];
+    for r in &rules {
+        let mut check = vec!["-t", "filter", "--check", RUNTIME_SOURCE_GUARD_CHAIN];
+        check.extend_from_slice(r);
+        if !ebtables_ok(&check).await {
+            let mut add = vec!["-t", "filter", "-A", RUNTIME_SOURCE_GUARD_CHAIN];
+            add.extend_from_slice(r);
+            run_ebtables(&add).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Run an ebtables command, erroring on failure (fail-closed). Distinct from the build
+/// orchestrator's own copy so the runtime guard does not couple to that module.
+async fn run_ebtables(args: &[&str]) -> Result<()> {
+    let status = tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .context("spawn ebtables")?;
+    if !status.success() {
+        anyhow::bail!("ebtables {args:?} failed: {status}");
+    }
+    Ok(())
+}
+
+/// True iff the ebtables command succeeds — for `-C` existence checks; never errors.
+async fn ebtables_ok(args: &[&str]) -> bool {
+    tokio::process::Command::new("ebtables")
+        .args(args)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod source_guard_tests {
+    use super::{slot_identity, tap_identity};
+
+    #[test]
+    fn tap_identity_inverts_slot_identity_over_all_octets() {
+        // The two octet maps live ~1900 lines apart; this binds them so the source-guard
+        // can never pin a different {ip,mac} than allocate_ip handed the VM.
+        for octet in 2u8..=254 {
+            let (tap, ip, mac) = slot_identity(octet);
+            assert_eq!(
+                tap_identity(&tap),
+                Some((ip, mac)),
+                "tap_identity must invert slot_identity for octet {octet}"
+            );
+        }
+    }
+
+    #[test]
+    fn tap_identity_rejects_out_of_range_and_malformed() {
+        assert_eq!(tap_identity("tap253"), None); // octet 255 > 254
+        assert_eq!(tap_identity("eth0"), None);
+        assert_eq!(tap_identity("tapX"), None);
+        assert_eq!(tap_identity("tap"), None);
+    }
 }
 
 /// Rename any legacy `{id}.ext4` data disks to LocalLoop's `{id}.img` convention so

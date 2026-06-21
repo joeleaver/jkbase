@@ -90,6 +90,20 @@ sudo cp "$HOME/jkbase/tools/setup-build-cgroup.sh" /usr/local/bin/jkbase-build-c
 sudo cp "$HOME/jkbase/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-build-net.sh
 
+# Re-scope ufw 80/443 to the public uplink on already-provisioned boxes. provision.sh only
+# runs once, so an existing box keeps the broad `ufw allow 80/443` on EVERY interface (incl.
+# jkbr0). JKRUNFW (re-synced above, evaluated before ufw) is the load-bearing control; this
+# is defense in depth so the broad rule doesn't linger. Idempotent; skips if ufw is inactive.
+if command -v ufw >/dev/null 2>&1 && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    DEPLOY_PUB_IFACE=$(ip route show default | awk '{print $5; exit}')
+    if [ -n "$DEPLOY_PUB_IFACE" ]; then
+        sudo ufw delete allow 80/tcp 2>/dev/null || true
+        sudo ufw delete allow 443/tcp 2>/dev/null || true
+        sudo ufw allow in on "$DEPLOY_PUB_IFACE" to any port 80 proto tcp >/dev/null || true
+        sudo ufw allow in on "$DEPLOY_PUB_IFACE" to any port 443 proto tcp >/dev/null || true
+    fi
+fi
+
 # ebtables is required when --build-proxy-any-port is active (the server's L2
 # source-guard, ensure_source_guard, fails closed without it). provision.sh installs
 # it on fresh boxes; guarantee it here too so deploying this branch to a box

@@ -67,6 +67,191 @@ pub struct FunctionConfig {
     /// function on the schedule (waking the project if hibernated).
     #[serde(default)]
     pub schedule: Option<String>,
+    /// Per-function PUBLIC-internet egress policy. The OWN-stuff and platform-internals
+    /// zones are classified independently and are NOT governed by this. Three states:
+    ///   absent        => default (allow public + observe/meter; zero config)
+    ///   ["host", ...] => enforced allowlist (preventive; connect-time, IP-pinned)
+    ///   false         => sandbox (deny public egress; OWN stuff still reachable)
+    #[serde(default)]
+    pub egress: Option<EgressPolicy>,
+}
+
+/// A declared per-function (or project-default) PUBLIC-egress policy. TOML has no native
+/// union, so this is an untagged enum: `egress = false`/`true` → `Toggle`; `egress =
+/// ["host", ...]` → `Allowlist`. OWN-stuff and platform-internals are zone-classified
+/// independently and are NOT governed by this.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EgressPolicy {
+    /// `false` => sandbox (deny public). `true` => "default within the ceiling" (documents
+    /// intent; never widens past a project allowlist — see [`resolve_egress`]).
+    Toggle(bool),
+    /// `["api.stripe.com", ...]` => enforced allowlist.
+    Allowlist(Vec<String>),
+}
+
+/// The concrete PUBLIC-egress capability after collapsing project-default × per-function
+/// precedence host-side at deploy (the agent never re-derives it — it receives exactly one
+/// of these states, immutable for the VM's life).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedEgress {
+    /// Allow public + observe/meter (the zero-config default).
+    Default,
+    /// Deny all public egress (own-stuff still reachable).
+    Sandbox,
+    /// Allow ONLY these exact hosts (preventive; connect-time, IP-pinned). Normalized
+    /// (lowercased, trailing dot stripped, deduped).
+    Allowlist(Vec<String>),
+}
+
+/// Collapse a project-default policy and a per-function policy into one concrete
+/// [`ResolvedEgress`]. The project policy is a **CEILING**: a function may NARROW it but
+/// never WIDEN past it — else a function `egress = true` would punch through a marketplace
+/// floor (adversarial-review HIGH-1). `egress = true` therefore means "the default, but no
+/// wider than the ceiling", never "allow-all".
+pub fn resolve_egress(
+    project: Option<&EgressPolicy>,
+    function: Option<&EgressPolicy>,
+) -> ResolvedEgress {
+    use EgressPolicy::{Allowlist, Toggle};
+    match (project, function) {
+        // No ceiling (absent / allow-all project): the function policy applies verbatim.
+        (None | Some(Toggle(true)), None | Some(Toggle(true))) => ResolvedEgress::Default,
+        (None | Some(Toggle(true)), Some(Toggle(false))) => ResolvedEgress::Sandbox,
+        (None | Some(Toggle(true)), Some(Allowlist(f))) => {
+            ResolvedEgress::Allowlist(dedup_hosts(f))
+        }
+        // Sandbox ceiling: nothing can widen it.
+        (Some(Toggle(false)), _) => ResolvedEgress::Sandbox,
+        // Allowlist ceiling P: narrow freely; a widening request is intersected against P.
+        (Some(Allowlist(p)), None | Some(Toggle(true))) => ResolvedEgress::Allowlist(dedup_hosts(p)),
+        (Some(Allowlist(_)), Some(Toggle(false))) => ResolvedEgress::Sandbox,
+        (Some(Allowlist(p)), Some(Allowlist(f))) => ResolvedEgress::Allowlist(intersect_hosts(p, f)),
+    }
+}
+
+/// Host-asserted platform egress facts, delivered to the in-VM agent via the per-VM
+/// metadata image as `_platform.json` — a host-written region the tenant CANNOT author
+/// (NEVER `jkbase.toml`-derived, P0-EGRESS-OWN-HOST-ASSERTED). The agent reads exactly
+/// this to (a) recognize its OWN object-store host as Zone-1 OWN-stuff (allowed even under
+/// sandbox), and (b) deny the platform's own public IP(s) as Zone-2 PLATFORM (the
+/// control-plane / proxy / object-store ingress), defeating IP-literal + domain-fronting
+/// to `api.{domain}` (P0-EGRESS-PLATFORM-BY-IP). Absent ⇒ the agent falls back to the
+/// netfilter fence alone for Zone-2 and treats no host as OWN-storage (fail-closed:
+/// stricter, never wider).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformEgress {
+    /// The platform object-store host, e.g. `"storage.jkbase.app"`. A request to this
+    /// EXACT host whose resolved IP is in `platform_ips` is OWN-stuff (Zone 1) — allowed
+    /// regardless of the per-function policy, so it survives `egress = false`.
+    #[serde(default)]
+    pub storage_host: Option<String>,
+    /// The platform's own public/uplink IP(s) — where api/proxy/object-store terminate.
+    /// Any resolved destination IP in this set is Zone-2 PLATFORM (DENY) UNLESS the request
+    /// host is `storage_host`. String form; the agent parses to `IpAddr` (a malformed entry
+    /// is dropped, never silently treated as "allow"). Multi-homed hosts (e.g. OVH failover
+    /// IPs) list every uplink global IP.
+    #[serde(default)]
+    pub platform_ips: Vec<String>,
+}
+
+impl PlatformEgress {
+    /// Metadata-image filename. Host-written into the per-VM image; the agent's static
+    /// server refuses to serve `_`-prefixed entries, so it never leaks to the public.
+    pub const FILE: &'static str = "_platform.json";
+}
+
+fn norm_host(h: &str) -> String {
+    h.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn dedup_hosts(hosts: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for h in hosts {
+        let n = norm_host(h);
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn intersect_hosts(ceiling: &[String], req: &[String]) -> Vec<String> {
+    let c = dedup_hosts(ceiling);
+    dedup_hosts(req).into_iter().filter(|h| c.contains(h)).collect()
+}
+
+#[cfg(test)]
+mod egress_policy_tests {
+    use super::*;
+
+    #[test]
+    fn function_cannot_widen_past_an_allowlist_ceiling() {
+        let p = EgressPolicy::Allowlist(vec!["api.stripe.com".into()]);
+        // `egress = true` under a ceiling stays the ceiling — NOT allow-all.
+        assert_eq!(
+            resolve_egress(Some(&p), Some(&EgressPolicy::Toggle(true))),
+            ResolvedEgress::Allowlist(vec!["api.stripe.com".into()])
+        );
+        // A wider function allowlist is intersected (evil.com dropped).
+        let f = EgressPolicy::Allowlist(vec!["api.stripe.com".into(), "evil.com".into()]);
+        assert_eq!(
+            resolve_egress(Some(&p), Some(&f)),
+            ResolvedEgress::Allowlist(vec!["api.stripe.com".into()])
+        );
+        // Narrowing to sandbox is always allowed.
+        assert_eq!(
+            resolve_egress(Some(&p), Some(&EgressPolicy::Toggle(false))),
+            ResolvedEgress::Sandbox
+        );
+    }
+
+    #[test]
+    fn sandbox_ceiling_cannot_be_widened() {
+        let p = EgressPolicy::Toggle(false);
+        for f in [
+            None,
+            Some(EgressPolicy::Toggle(true)),
+            Some(EgressPolicy::Allowlist(vec!["x.com".into()])),
+        ] {
+            assert_eq!(resolve_egress(Some(&p), f.as_ref()), ResolvedEgress::Sandbox);
+        }
+    }
+
+    #[test]
+    fn platform_egress_round_trips_and_defaults_empty() {
+        // Default (absent file shape) → no OWN host, empty deny-set: fail-closed (the agent
+        // treats no host as OWN-storage and relies on the netfilter fence for Zone 2).
+        let empty: PlatformEgress = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, PlatformEgress::default());
+        assert!(empty.storage_host.is_none() && empty.platform_ips.is_empty());
+
+        let p = PlatformEgress {
+            storage_host: Some("storage.jkbase.app".into()),
+            platform_ips: vec!["203.0.113.7".into(), "203.0.113.8".into()],
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<PlatformEgress>(&j).unwrap(), p);
+        assert_eq!(PlatformEgress::FILE, "_platform.json");
+    }
+
+    #[test]
+    fn defaults_and_normalization_without_a_ceiling() {
+        assert_eq!(resolve_egress(None, None), ResolvedEgress::Default);
+        assert_eq!(
+            resolve_egress(None, Some(&EgressPolicy::Toggle(false))),
+            ResolvedEgress::Sandbox
+        );
+        // Hosts normalized (case + trailing dot) and deduped.
+        assert_eq!(
+            resolve_egress(
+                None,
+                Some(&EgressPolicy::Allowlist(vec!["A.com.".into(), "a.com".into()]))
+            ),
+            ResolvedEgress::Allowlist(vec!["a.com".into()])
+        );
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,6 +368,11 @@ pub struct VolumeConfig {
 pub struct HostingConfig {
     pub public: Option<String>,
     pub spa: Option<bool>,
+    /// Project-default PUBLIC-egress policy for every function that omits its own
+    /// `egress`. A CEILING, not merely a default: a function may narrow it but never
+    /// widen past it (see [`resolve_egress`]).
+    #[serde(default)]
+    pub function_egress: Option<EgressPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

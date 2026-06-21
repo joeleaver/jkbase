@@ -237,6 +237,45 @@ async fn list_objects(
         .unwrap_or(1000)
         .clamp(1, 1000);
 
+    // `?delimiter=` switches to V2 folding (CommonPrefixes), e.g. for the own-bucket binding's
+    // `list-objects` and S3 clients that pass a delimiter.
+    if let Some(delim) = q.get("delimiter").filter(|d| !d.is_empty()) {
+        return match store.list_v2(&bucket, prefix, Some(delim), start_after, max_keys).await {
+            Ok(page) => {
+                let mut x = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Name>{}</Name><Prefix>{}</Prefix><Delimiter>{}</Delimiter>\
+                     <MaxKeys>{max_keys}</MaxKeys><KeyCount>{}</KeyCount>\
+                     <IsTruncated>{}</IsTruncated>",
+                    xml_escape(&bucket),
+                    xml_escape(prefix),
+                    xml_escape(delim),
+                    page.objects.len() + page.common_prefixes.len(),
+                    page.is_truncated,
+                );
+                if let Some(ref tok) = page.next_continuation_token {
+                    x.push_str(&format!("<NextContinuationToken>{}</NextContinuationToken>", xml_escape(tok)));
+                }
+                for m in page.objects {
+                    x.push_str(&format!(
+                        "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Contents>",
+                        xml_escape(&m.key),
+                        iso8601(m.last_modified),
+                        xml_escape(&quoted(&m.etag)),
+                        m.size,
+                    ));
+                }
+                for p in page.common_prefixes {
+                    x.push_str(&format!("<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>", xml_escape(&p)));
+                }
+                x.push_str("</ListBucketResult>");
+                xml_ok(x)
+            }
+            Err(e) => s3_error(e),
+        };
+    }
+
     match store.list_objects(&bucket, prefix, start_after, max_keys).await {
         Ok(page) => {
             let key_count = page.objects.len();

@@ -24,7 +24,7 @@
 //! unchanged, and the pinned address is the one the mirror dials (no re-resolve).
 
 use anyhow::Result;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,87 +80,11 @@ pub enum Deny {
     NoSafeAddr,
 }
 
-/// True if `ip` is a globally-routable public address safe to egress to. Default
-/// **deny**: only addresses that are clearly public unicast pass. v4-mapped IPv6
-/// is canonicalized first so `::ffff:169.254.169.254` is caught as the metadata
-/// IP. This is the load-bearing SSRF check — keep it conservative.
-pub fn ip_is_public(ip: IpAddr) -> bool {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => v4_is_public(v4),
-        IpAddr::V6(v6) => v6_is_public(v6),
-    }
-}
-
-fn v4_is_public(ip: Ipv4Addr) -> bool {
-    // std-stable categories: loopback (127/8), private (10/8, 172.16/12,
-    // 192.168/16), link-local (169.254/16 — incl. 169.254.169.254 metadata),
-    // broadcast (255.255.255.255), unspecified (0.0.0.0), multicast (224/4),
-    // documentation (192.0.2/24, 198.51.100/24, 203.0.113/24).
-    if ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || ip.is_documentation()
-    {
-        return false;
-    }
-    let o = ip.octets();
-    // Ranges not covered by the stable std helpers:
-    if o[0] == 0 {
-        return false; // 0.0.0.0/8 "this network"
-    }
-    if o[0] == 100 && (o[1] & 0xc0) == 64 {
-        return false; // 100.64.0.0/10 CGNAT
-    }
-    if o[0] == 192 && o[1] == 0 && o[2] == 0 {
-        return false; // 192.0.0.0/24 IETF protocol assignments
-    }
-    if o[0] == 192 && o[1] == 88 && o[2] == 99 {
-        return false; // 192.88.99.0/24 6to4 relay anycast
-    }
-    if o[0] == 198 && (o[1] & 0xfe) == 18 {
-        return false; // 198.18.0.0/15 benchmarking
-    }
-    if o[0] >= 240 {
-        return false; // 240.0.0.0/4 reserved
-    }
-    true
-}
-
-fn v6_is_public(ip: Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return false;
-    }
-    let seg = ip.segments();
-    // Allow ONLY global unicast 2000::/3, which excludes ULA (fc00::/7) and
-    // link-local (fe80::/10) by construction; then carve out documentation and
-    // 6to4 (which embeds a v4 that could be private/metadata).
-    if (seg[0] & 0xe000) != 0x2000 {
-        return false;
-    }
-    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
-        return false; // 2001:db8::/32 documentation
-    }
-    if seg[0] == 0x2002 {
-        return false; // 2002::/16 6to4
-    }
-    true
-}
-
-/// Exact, case-insensitive allowlist match (trailing dot tolerated). Never does
-/// suffix/subdomain matching — `crates.io.evil.com` must not pass for `crates.io`.
-pub fn host_allowed(host: &str, allowlist: &[String]) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    allowlist.iter().any(|a| a.eq_ignore_ascii_case(&h))
-}
-
-/// First public, egress-safe address from a resolved set (the pinned target).
-/// `None` if every resolved address is non-public (a rebind/SSRF attempt).
-pub fn pick_safe_addr<I: IntoIterator<Item = SocketAddr>>(addrs: I) -> Option<SocketAddr> {
-    addrs.into_iter().find(|a| ip_is_public(a.ip()))
-}
+// Public-IP / allowlist SSRF logic is the SINGLE source of truth in jkbase-common, so this
+// build egress proxy and the function-runtime egress gate (jkbase-agent) apply byte-identical
+// classification (P0-EGRESS-SHAREDLOGIC). Re-exported so existing call sites (incl.
+// mirror.rs's `crate::egress::pick_safe_addr`) are unchanged.
+pub use jkbase_common::egress::{host_allowed, pick_safe_addr};
 
 /// Configuration for the egress proxy: the host allowlist and its mode.
 pub struct EgressConfig {
@@ -444,6 +368,10 @@ fn parse_absolute_http(target: &str) -> Option<(String, u16, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the runtime path re-exports just host_allowed + pick_safe_addr; the
+    // ip_is_public + IpAddr below are used only by these unit tests.
+    use jkbase_common::egress::ip_is_public;
+    use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()

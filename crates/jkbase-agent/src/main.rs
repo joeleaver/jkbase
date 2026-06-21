@@ -1,12 +1,16 @@
 mod clock;
 mod container_supervisor;
 mod dmverity;
+mod function_egress;
 mod function_runtime;
+mod log_sink;
+mod objectstore_host;
 mod static_server;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
+use log_sink::LogSink;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -156,6 +160,21 @@ fn load_runtime_layers(serve_dir: &Path) -> Option<RuntimeLayers> {
     }
 }
 
+/// Read the host-written `_platform.json` (the host-asserted egress facts) from the
+/// metadata image. Absent/malformed ⇒ fail-closed defaults (no OWN-storage host, empty
+/// deny-set): stricter, never wider — the agent then leans on the netfilter fence for
+/// Zone 2 and treats no host as OWN-storage.
+fn load_platform_egress(serve_dir: &Path) -> jkbase_common::config::PlatformEgress {
+    let path = serve_dir.join(jkbase_common::config::PlatformEgress::FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            eprintln!("failed to parse {}: {e}; using fail-closed egress defaults", path.display());
+            Default::default()
+        }),
+        Err(_) => Default::default(),
+    }
+}
+
 /// dm-verity mapper name for a layer block device (e.g. `/dev/vdc` → `jkverity-vdc`):
 /// stable, unique per device, and within `dmverity::activate`'s accepted name charset.
 fn verity_name(device: &str) -> String {
@@ -301,13 +320,29 @@ struct AgentState {
     functions_dir: PathBuf,
     functions: FunctionRuntime,
     containers: Arc<ContainerSupervisor>,
+    /// The one process-wide log sink (server output + function egress events),
+    /// shared by every producer so the host shipper sees a single `(boot_id, seq)`
+    /// cursor space. Read directly by the `/_jkbase/logs` endpoint.
+    log_sink: Arc<LogSink>,
     route_config: Vec<RouteEntry>,
     sites: Vec<SiteEntry>,
 }
 
+/// A backend kind a tenant route can target. Resolved at the agent's deserialization
+/// boundary ONLY (from `_routes.json` in this VM's host-built metadata image) — the proxy
+/// stays unaware of function-vs-server (P0-INGRESS-HOST-TRUST). An unknown kind is dropped
+/// (fail-closed) at load.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RouteKind {
+    Server,
+    Function,
+}
+
 struct RouteEntry {
     prefix: String,
-    server_name: String,
+    /// Target backend name (server or function) within this project.
+    name: String,
+    kind: RouteKind,
 }
 
 struct SiteEntry {
@@ -395,7 +430,21 @@ async fn main() -> Result<()> {
         }
     }
 
-    let mut functions = FunctionRuntime::new();
+    // The single shared log sink: one `seq` source + one `boot_id` for the whole
+    // agent process, constructed here and handed to every log producer. Both the
+    // server supervisor and (in the egress-observe path) the function runtime push
+    // into it, so the host shipper dedups on one cursor space (P0-OBS-UNIFIED-SINK).
+    let log_sink = Arc::new(LogSink::new());
+
+    // Host-asserted platform egress facts (`_platform.json`): the OWN object-store host +
+    // the platform's own public-IP deny-set. Read once at boot; the agent's egress gate
+    // classifies against these. Absent/malformed ⇒ fail-closed defaults (no OWN host, empty
+    // deny-set → rely on the netfilter fence for Zone 2; stricter, never wider).
+    let platform_egress = load_platform_egress(&serve_dir);
+    let egress_ctx = function_egress::EgressContext::new(&platform_egress, log_sink.clone())
+        .context("build function egress context")?;
+
+    let mut functions = FunctionRuntime::new(egress_ctx);
     if let Err(e) = functions.load_all_from_dir(&functions_dir) {
         error!(error = %e, "failed to load functions");
     }
@@ -405,7 +454,11 @@ async fn main() -> Result<()> {
         info!(functions = ?func_names, "loaded WASM functions");
     }
 
-    let containers = Arc::new(ContainerSupervisor::new(servers_dir, layer_map));
+    let containers = Arc::new(ContainerSupervisor::new(
+        servers_dir,
+        layer_map,
+        log_sink.clone(),
+    ));
     if let Err(e) = containers.start_all().await {
         error!(error = %e, "failed to start server containers");
     }
@@ -444,6 +497,7 @@ async fn main() -> Result<()> {
         functions_dir,
         functions,
         containers,
+        log_sink,
         route_config,
         sites,
     });
@@ -523,10 +577,19 @@ fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
 
     routes
         .iter()
-        .filter(|(_, target)| target.service == "server")
-        .map(|(prefix, target)| RouteEntry {
-            prefix: prefix.clone(),
-            server_name: target.name.clone(),
+        .filter_map(|(prefix, target)| {
+            // Typed backend kind; an unknown service is dropped (forward-compat + fail-closed)
+            // rather than silently treated as a server.
+            let kind = match target.service.as_str() {
+                "server" => RouteKind::Server,
+                "function" => RouteKind::Function,
+                _ => return None,
+            };
+            Some(RouteEntry {
+                prefix: prefix.clone(),
+                name: target.name.clone(),
+                kind,
+            })
         })
         .collect()
 }
@@ -557,21 +620,49 @@ async fn handle_request(
         return Ok(logs_response(&state, &req).await);
     }
 
-    // Check route config for server routing
+    // Walk the tenant route table, dispatching by backend kind. A FUNCTION route is
+    // request/response only: an upgrade to it gets 426 (before the body is buffered) and a
+    // declared-but-missing function 404s WITHOUT falling through to static — so a misspelled
+    // function name can't accidentally serve the static site or probe the metadata image.
+    // A SERVER route that matches but has no running backend falls through (unchanged).
     for route in &state.route_config {
         let prefix = route.prefix.trim_end_matches('*');
-        if path.starts_with(prefix)
-            && let Some(port) = state.containers.get_server_for_route(&route.server_name).await {
-                return Ok(proxy_to_server(port, req).await);
+        if !path.starts_with(prefix) {
+            continue;
+        }
+        match route.kind {
+            RouteKind::Server => {
+                if let Some(port) = state.containers.get_server_for_route(&route.name).await {
+                    return Ok(proxy_to_server(port, req).await);
+                }
             }
+            RouteKind::Function => {
+                if jkbase_wsproxy::is_upgrade_request(req.headers()) {
+                    return Ok(upgrade_required_response());
+                }
+                if state.functions.has_function(&route.name) {
+                    // Own the name so nothing borrows `state.route_config` across the move.
+                    let name = route.name.clone();
+                    info!(function = %name, path = %path, "routing to function (route)");
+                    return Ok(invoke_function(state.clone(), &name, req).await);
+                }
+                return Ok(not_found_response());
+            }
+        }
     }
 
-    // Check if this is a function call
-    if let Some(func_name) = extract_function_name(&path)
-        && state.functions.has_function(&func_name) {
+    // Legacy implicit function route: `/functions/{name}`. Same request/response rules —
+    // 426 on upgrade, 404 (no fallthrough) on a missing function.
+    if let Some(func_name) = extract_function_name(&path) {
+        if jkbase_wsproxy::is_upgrade_request(req.headers()) {
+            return Ok(upgrade_required_response());
+        }
+        if state.functions.has_function(&func_name) {
             info!(function = %func_name, path = %path, "routing to function");
             return Ok(invoke_function(state, &func_name, req).await);
         }
+        return Ok(not_found_response());
+    }
 
     // Host-bound site: the proxy sets X-Jkbase-Site (stripped from inbound, so
     // trusted) when the request's hostname maps to a specific site. Serve that
@@ -663,16 +754,18 @@ async fn logs_response(
             .and_then(|v| v.parse().ok())
     };
 
-    // `since` (incremental cursor) takes precedence over `limit` (tail).
+    // `since` (incremental cursor) takes precedence over `limit` (tail). Read the
+    // unified sink directly: it carries both server output and function egress
+    // events under one `(boot_id, seq)` cursor space.
     let lines = if let Some(since) = param("since=") {
-        state.containers.get_logs_since(since).await
+        state.log_sink.get_logs_since(since).await
     } else {
         let limit = param("limit=").unwrap_or(200) as usize;
-        state.containers.get_logs(limit).await
+        state.log_sink.get_logs(limit).await
     };
 
     let resp = jkbase_common::logs::LogsResponse {
-        boot_id: state.containers.boot_id().to_string(),
+        boot_id: state.log_sink.boot_id().to_string(),
         lines,
     };
     let body = serde_json::to_vec(&resp).unwrap_or_default();
@@ -680,6 +773,30 @@ async fn logs_response(
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+/// `426 Upgrade Required` — a function backend is strictly request/response and cannot be
+/// coerced into a long-lived/streaming connection (P0-INGRESS-UPGRADE). Long-lived traffic
+/// must target a `server`.
+fn upgrade_required_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::UPGRADE_REQUIRED)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from(
+            "upgrade not supported on a function route; use a server backend",
+        )))
+        .unwrap()
+}
+
+/// `404 Not Found` for a declared-but-missing function route. Deliberately does NOT fall
+/// through to static serving — a misspelled/undeployed function must not expose the static
+/// site or the metadata image's `_`-prefixed control files.
+fn not_found_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from("not found")))
         .unwrap()
 }
 
@@ -889,4 +1006,44 @@ async fn invoke_function(
     builder
         .body(Full::new(Bytes::from(func_resp.body)))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_config_maps_kinds_and_drops_unknown() {
+        let dir = std::env::temp_dir().join(format!("jkagent-routes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // server + function are typed; an unknown service is dropped (fail-closed), never
+        // silently treated as a server.
+        std::fs::write(
+            dir.join("_routes.json"),
+            r#"{
+              "/api": {"service":"function","name":"api"},
+              "/":    {"service":"server","name":"web"},
+              "/x":   {"service":"bogus","name":"x"}
+            }"#,
+        )
+        .unwrap();
+        let routes = load_route_config(&dir);
+        assert_eq!(routes.len(), 2, "the unknown-service route must be dropped");
+        let api = routes.iter().find(|r| r.prefix == "/api").unwrap();
+        assert_eq!(api.kind, RouteKind::Function);
+        assert_eq!(api.name, "api");
+        let web = routes.iter().find(|r| r.prefix == "/").unwrap();
+        assert_eq!(web.kind, RouteKind::Server);
+        assert!(!routes.iter().any(|r| r.prefix == "/x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn function_name_extraction() {
+        assert_eq!(extract_function_name("/functions/hello"), Some("hello".into()));
+        assert_eq!(extract_function_name("/functions/hello/world"), Some("hello".into()));
+        assert_eq!(extract_function_name("/api/foo"), None);
+        assert_eq!(extract_function_name("/"), None);
+    }
 }

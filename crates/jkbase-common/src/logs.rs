@@ -23,6 +23,62 @@ pub struct LogLine {
     pub seq: u64,
 }
 
+/// One function PUBLIC-egress decision, recorded by the agent's egress gate (host code the
+/// guest cannot skip) and shipped as a `LogLine` with the reserved `stream == "egress"`.
+/// **Metadata only** — there is deliberately NO field that can hold a path, query, header,
+/// or body, so "the manifest never contains payload" is enforced by type, not discipline
+/// (P0-OBS-METADATA-ONLY). The agent originates TLS (it's in the tenant VM) so it *could*
+/// see plaintext; the schema forecloses recording any of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EgressEvent {
+    /// The function that made the request.
+    pub function: String,
+    /// Guest-requested authority host (pre-DNS), e.g. `"api.stripe.com"`.
+    pub dest_host: String,
+    pub dest_port: u16,
+    /// Pinned/observed IP, if known (the vetted dial target, or the first resolved address
+    /// on a pre-connect deny). `None` when resolution failed.
+    #[serde(default)]
+    pub dest_ip: Option<String>,
+    pub verdict: Verdict,
+    pub method: String,
+    /// How many times this exact `(function, dest_host, port, verdict)` coalesced into this
+    /// row (P0-DOS-EGRESS-EVENT-BUFFER: a tight loop is one row + count, not N DoS rows).
+    #[serde(default)]
+    pub count: u64,
+    /// ADVISORY best-effort byte counters (P0-OBS-BYTES-ADVISORY) — never billing (billing
+    /// reads the kernel TAP counters). 0 until refined.
+    #[serde(default)]
+    pub bytes_out: u64,
+    #[serde(default)]
+    pub bytes_in: u64,
+    /// Upstream response status, once known. `None` for a deny / pre-response.
+    #[serde(default)]
+    pub status: Option<u16>,
+}
+
+/// The egress decision recorded for a PUBLIC-zone outbound. (Zone-1 own-stuff is
+/// informational; Zone-2 platform/internal denials are an attack signal.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Verdict {
+    /// Allowed public egress (default policy, or an allowlist hit).
+    Allow,
+    /// Denied: host not on the function's enforced allowlist.
+    DenyAllowlist,
+    /// Denied: the function is sandboxed (`egress = false`).
+    DenySandbox,
+    /// Denied: a platform/internal/IPv6 destination — the hard fence (attack signal).
+    DenyPlatform,
+    /// The outbound could not be evaluated/completed (DNS failure, rate/connection limit).
+    Error,
+}
+
+/// The reserved `LogLine.stream` value for egress events. Only the host egress mediator
+/// writes it; the guest output drains hardcode `stdout`/`stderr`, so a guest cannot forge
+/// or bury egress rows (P0-OBS-STREAM-RESERVED).
+pub const EGRESS_STREAM: &str = "egress";
+
 /// Response body returned by the agent's `GET /_jkbase/logs` endpoint.
 ///
 /// `boot_id` identifies the agent process incarnation. It is stable across
