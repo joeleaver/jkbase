@@ -3,7 +3,7 @@
 A lean, tenant-facing Rust client for the [jkbase](../../README.md) S3-compatible object
 store (`storage.{your-domain}`).
 
-It signs every request with AWS SigV4 via the shared [`jkbase-sigv4`](../jkbase-sigv4)
+It signs every request with AWS SigV4 via the shared [`jkbase-sigv4`](../../crates/jkbase-sigv4)
 crate — the *same* canonicalisation the server verifies — so your app can read and write
 its buckets without pulling in an AWS SDK or any jkbase server code. The only runtime
 dependencies are `reqwest` and the tiny signer.
