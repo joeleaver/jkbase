@@ -27,6 +27,7 @@ use jkbase_proxy::{
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -178,10 +179,11 @@ struct Args {
 
     // --- HA cluster identity (HA P0: schema/config only — parsed, validated, and
     // logged, but NOT yet wired into placement/failover; later phases consume it) ---
-    /// Stable, cluster-unique id for THIS server instance. Default "local" = the
-    /// single-node identity; give each node a distinct id to form a cluster.
-    #[arg(long, env = "JKBASE_HOST_ID", default_value = "local")]
-    host_id: String,
+    /// Stable, cluster-unique id for THIS server instance. Unset = derive from the
+    /// system hostname (single-node default); give each node a distinct id to form a
+    /// cluster (and a distinct id per process for a single-box sim cluster).
+    #[arg(long, env = "JKBASE_HOST_ID")]
+    host_id: Option<String>,
 
     /// Placement region for this host; projects are placed least-loaded WITHIN a
     /// region (P3). Default "default" = one flat region (single-node).
@@ -254,6 +256,62 @@ fn validate_substrate_selection(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// This host's identity when `--host-id` is unset: the system hostname, or
+/// "node-local" if that can't be read. (Single-node default; a cluster sets --host-id.)
+fn resolve_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node-local".to_string())
+}
+
+// HA P2 — cluster leader election parameters.
+const LEADER_SCOPE: &str = "cluster-leader";
+const LEADER_TTL: Duration = Duration::from_secs(15);
+const LEADER_TICK: Duration = Duration::from_secs(5);
+
+/// HA P2 — cluster leader election. The elected leader (holder of the `cluster-leader`
+/// lease) will own cluster-wide placement (P3); followers reconcile only their own host.
+/// On a single node the one process wins the lease and stays leader. Backend-agnostic:
+/// acquire once, then renew each tick — a no-op re-assert for `FlockLease`, the TTL
+/// keepalive for a distributed lease — and on a lost/expired token drop back to
+/// contender and re-acquire. `is_leader` is advisory at P2 (nothing gates on it yet);
+/// the data-disk write-boundary self-fence, NOT this flag, is the split-brain guarantee.
+async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader: Arc<AtomicBool>) {
+    let mut token: Option<FenceToken> = None;
+    loop {
+        match token.take() {
+            // We hold leadership: re-assert it (keepalive). On loss, step down.
+            Some(t) => match lease.renew(&t, LEADER_TTL).await {
+                Ok(nt) => {
+                    is_leader.store(true, Ordering::Relaxed);
+                    token = Some(nt);
+                }
+                Err(e) => {
+                    is_leader.store(false, Ordering::Relaxed);
+                    warn!(host_id = %host_id, error = %e, "lost cluster leadership; re-contesting");
+                }
+            },
+            // We are a contender: try to win the lease.
+            None => match lease.acquire(LEADER_SCOPE, &host_id, LEADER_TTL).await {
+                Ok(t) => {
+                    info!(host_id = %host_id, epoch = t.epoch, "acquired cluster leadership");
+                    is_leader.store(true, Ordering::Relaxed);
+                    token = Some(t);
+                }
+                // Another live host holds it — stay a follower and retry next tick.
+                Err(SubstrateError::LeaseHeld { .. }) => is_leader.store(false, Ordering::Relaxed),
+                Err(e) => {
+                    is_leader.store(false, Ordering::Relaxed);
+                    warn!(host_id = %host_id, error = %e, "cluster leader election error");
+                }
+            },
+        }
+        tokio::time::sleep(LEADER_TICK).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmLifecycle {
     Running,
@@ -280,6 +338,10 @@ struct PlatformState {
     disk_tokens: HashMap<String, FenceToken>,
     /// This host's stable identity, stamped into lease tokens.
     host_id: String,
+    /// HA P2: set while THIS host holds the `cluster-leader` lease. Advisory at P2 —
+    /// nothing gates on it yet (placement is P3) — and the data-disk write-boundary
+    /// self-fence, not this flag, is the split-brain safety guarantee.
+    is_leader: Arc<AtomicBool>,
     /// Host-asserted platform egress facts (OWN object-store host + the platform's own
     /// public IP deny-set), stamped into every per-VM metadata image as `_platform.json`
     /// so the in-VM agent can recognize OWN-storage (Zone 1) and deny the control-plane /
@@ -293,6 +355,13 @@ const DATA_DISK_MIB: u64 = 1024;
 const DISK_LEASE_TTL: Duration = Duration::from_secs(3600);
 
 impl PlatformState {
+    /// HA P2: whether this host currently holds cluster leadership. Advisory until P3
+    /// (placement) gates on it.
+    #[allow(dead_code)] // consumed by the P3 placement gate
+    fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::Relaxed)
+    }
+
     fn allocate_ip(&self) -> Result<(String, String, String)> {
         let existing = self.store.list_vm_allocations()?;
         let used_octets: HashSet<u8> = existing
@@ -365,12 +434,19 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // HA cluster identity + [substrate] backend selection (HA P0): validate up front
-    // so a typo fails fast, then log the resolved view. Schema/config only — nothing
-    // here changes placement, failover, or the substrate factory yet.
+    // HA cluster identity (P0/P2) + [substrate] backend selection. The host id is the
+    // configured --host-id, else the system hostname (single-node default); it names
+    // this server in lease tokens and the P2 leader election. Validate the substrate
+    // backend selection up front so a typo fails fast (the factory itself is not wired
+    // until P1+).
     validate_substrate_selection(&args)?;
+    let host_id = args
+        .host_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(resolve_hostname);
     info!(
-        host_id = %args.host_id,
+        host_id = %host_id,
         region = %args.region,
         public_addr = ?args.public_addr,
         cap_vcpus = args.host_vcpus,
@@ -380,7 +456,7 @@ async fn main() -> Result<()> {
         lease = %args.substrate_lease,
         data_disk = %args.substrate_data_disk,
         blob_store = %args.substrate_blob_store,
-        "cluster config (HA P0: schema/config only — not wired)"
+        "cluster config"
     );
 
     let data_dir = args.data_dir.clone();
@@ -449,12 +525,8 @@ async fn main() -> Result<()> {
 
     // Data-disk RWO substrate: R3 LocalLoop (loop-device exclusivity) + R2 FlockLease
     // (monotonic fence token). Migrate any legacy `{id}.ext4` disks to LocalLoop's
-    // `{id}.img` naming so they become loop-managed + fenced.
-    let host_id = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "node-local".to_string());
+    // `{id}.img` naming so they become loop-managed + fenced. (`host_id` was resolved
+    // from --host-id / the hostname at startup, above.)
     let data_disks_dir = data_dir.join("data-disks");
     migrate_legacy_data_disks(&data_disks_dir).await?;
     let data_disk: Arc<dyn DataDiskProvider> = Arc::new(LocalLoop::open(&data_disks_dir)?);
@@ -492,6 +564,12 @@ async fn main() -> Result<()> {
         platform_ips,
     };
 
+    // HA P2: cluster leadership flag + the lease/host_id the election loop needs
+    // (the originals are moved into PlatformState below).
+    let is_leader = Arc::new(AtomicBool::new(false));
+    let lease_for_election = lease.clone();
+    let host_id_for_election = host_id.clone();
+
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         vm_states: HashMap::new(),
@@ -507,7 +585,17 @@ async fn main() -> Result<()> {
         disk_tokens: HashMap::new(),
         host_id,
         platform_egress,
+        is_leader: is_leader.clone(),
     }));
+
+    // HA P2: elect a single cluster leader (the holder of the `cluster-leader` lease).
+    // On a single node this process simply wins and stays leader. Advisory at P2 — P3's
+    // placement gate reads `is_leader`; the data-disk self-fence is the real safety net.
+    tokio::spawn(leader_election_loop(
+        lease_for_election,
+        host_id_for_election,
+        is_leader,
+    ));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
@@ -3135,6 +3223,43 @@ async fn wait_for_agent(ip: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn flock_lease_elects_single_leader() {
+        // The election primitive (HA P2): with a SHARED lease backend, exactly one host
+        // holds `cluster-leader` at a time; a contender wins only after the holder
+        // releases (≈ the holder dying, which the OS does for flock), with a strictly
+        // higher epoch. Two FlockLease instances over one leases dir = a single-box sim
+        // cluster of two hosts.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let leases = std::env::temp_dir().join(format!("jkbase-leader-{nanos}"));
+        let a = jkbase_substrate::FlockLease::open(leases.clone(), "host-a").unwrap();
+        let b = jkbase_substrate::FlockLease::open(leases.clone(), "host-b").unwrap();
+        let ttl = Duration::from_secs(15);
+
+        // host-a wins leadership.
+        let ta = a.acquire(LEADER_SCOPE, "host-a", ttl).await.unwrap();
+        // host-b cannot while a live holder owns it.
+        assert!(matches!(
+            b.acquire(LEADER_SCOPE, "host-b", ttl).await,
+            Err(SubstrateError::LeaseHeld { .. })
+        ));
+        // host-a re-asserts (the loop's keepalive) — same token, no epoch churn.
+        assert_eq!(a.renew(&ta, ttl).await.unwrap().epoch, ta.epoch);
+
+        // host-a steps down (≈ crash); host-b now wins, with a higher epoch (fence
+        // monotonicity across the leadership change).
+        a.release(&ta).await.unwrap();
+        let tb = b.acquire(LEADER_SCOPE, "host-b", ttl).await.unwrap();
+        assert!(tb.epoch > ta.epoch, "new leader's epoch must supersede the old");
+        // The deposed host can no longer renew its stale token.
+        assert!(a.renew(&ta, ttl).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&leases);
+    }
 
     #[test]
     fn cron_parse_5field_and_due_since() {
