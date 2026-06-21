@@ -12,9 +12,6 @@
 //!   - **Box verification** — every `// VERIFY(build/jailer):` marker here and
 //!     in [`crate::jailer`] must be confirmed on a real KVM host (no CI/KVM in
 //!     this repo). The OOM-kill containment test is a ship-blocker.
-//!   - **Bounded console log** — the inherited `console.log` fd is currently
-//!     unbounded (TODO below); a hostile guest can fill the host partition via
-//!     `ttyS0` until it is capped/drained.
 //!   - **cgroup provisioning** — `<cgroup_mount>/<parent_cgroup>` must exist
 //!     with `+pids +memory +cpu` in `cgroup.subtree_control`, provisioned to
 //!     survive reboot. A missing `memory` controller means `memory.max` never
@@ -108,7 +105,10 @@ pub struct BuildVmConfig {
     /// guest write past the limit's offset SIGXFSZ-kills the VM. It is not the
     /// build-artifact cap (that is the fixed output-drive size). `None` → unbounded.
     pub fsize_limit_bytes: Option<u64>,
-    /// Console-log byte ceiling (enforcement is a TODO — see module docs).
+    /// Console-log byte ceiling. Firecracker's stdout/stderr are piped (never an
+    /// inherited fd) and drained into a byte-capped [`BoundedLog`]: past this many
+    /// bytes output is discarded after a one-time marker, so a hostile guest
+    /// spamming `ttyS0` can neither fill the host partition nor block on a full pipe.
     pub console_log_max_bytes: u64,
     /// Custom seccomp filter; `None` keeps firecracker's built-in advanced one.
     pub seccomp_filter: Option<PathBuf>,
