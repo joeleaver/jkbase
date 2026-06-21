@@ -528,10 +528,16 @@ async fn self_fence_project(
     let _ = data_disk.detach(project_id).await;
 }
 
-/// HA P3 — hosts whose heartbeat has gone stale (last beat older than `threshold_secs`
-/// before `now`), excluding `self_id` (we're alive) and never-beaten rows
-/// (`last_heartbeat == 0`, e.g. a peer that just registered). The leader reassigns these
-/// (P3 reconciler/placement); this card only DETECTS them.
+/// A host is live iff it has beaten at least once and its last heartbeat is within
+/// `threshold_secs` of `now`. The single liveness predicate the heartbeat detection,
+/// reconciler, and placement all share.
+fn host_is_live(h: &HostRecord, now: u64, threshold_secs: u64) -> bool {
+    h.last_heartbeat != 0 && now.saturating_sub(h.last_heartbeat) <= threshold_secs
+}
+
+/// HA P3 — hosts whose heartbeat has gone stale, excluding `self_id` (we're alive) and
+/// never-beaten rows (`last_heartbeat == 0`, e.g. a peer that just registered). The leader
+/// reassigns these; the heartbeat loop only DETECTS them.
 fn dead_hosts<'a>(
     hosts: &'a [HostRecord],
     now: u64,
@@ -542,8 +548,73 @@ fn dead_hosts<'a>(
         .iter()
         .filter(|h| h.host_id != self_id)
         .filter(|h| h.last_heartbeat != 0)
-        .filter(|h| now.saturating_sub(h.last_heartbeat) > threshold_secs)
+        .filter(|h| !host_is_live(h, now, threshold_secs))
         .collect()
+}
+
+/// Current allocation count per host (the placement load). Skips unplaced (empty host_id).
+fn current_load(allocations: &[VmAllocation]) -> HashMap<String, u32> {
+    let mut load: HashMap<String, u32> = HashMap::new();
+    for a in allocations {
+        if !a.host_id.is_empty() {
+            *load.entry(a.host_id.clone()).or_insert(0) += 1;
+        }
+    }
+    load
+}
+
+/// HA P3 placement — the least-loaded LIVE host in `region` that still has spare capacity
+/// (`capacity.max_vms == 0` means unbounded). Ties broken by host_id for determinism.
+/// `None` if no live host in the region can take it (region at capacity / empty).
+fn place_project<'a>(
+    hosts: &'a [HostRecord],
+    load: &HashMap<String, u32>,
+    region: &str,
+    now: u64,
+    dead_threshold_secs: u64,
+) -> Option<&'a HostRecord> {
+    hosts
+        .iter()
+        .filter(|h| h.region == region)
+        .filter(|h| host_is_live(h, now, dead_threshold_secs))
+        .filter(|h| {
+            h.capacity.max_vms == 0
+                || load.get(&h.host_id).copied().unwrap_or(0) < h.capacity.max_vms
+        })
+        .min_by(|a, b| {
+            let la = load.get(&a.host_id).copied().unwrap_or(0);
+            let lb = load.get(&b.host_id).copied().unwrap_or(0);
+            la.cmp(&lb).then_with(|| a.host_id.cmp(&b.host_id))
+        })
+}
+
+/// HA P3 — assign each orphaned project to a freshly-placed live host, in the SAME region
+/// as its (now-dead) prior host so it stays near its data. Spreads multiple orphans by
+/// simulating load as it assigns. Returns `(project_id, new_host_id)`; an orphan with no
+/// available host in its region is omitted (the caller logs — region at capacity). Pure.
+fn reassign_plan(
+    orphaned: &[String],
+    hosts: &[HostRecord],
+    allocations: &[VmAllocation],
+    now: u64,
+    dead_threshold_secs: u64,
+) -> Vec<(String, String)> {
+    let alloc_by_project: HashMap<&str, &VmAllocation> =
+        allocations.iter().map(|a| (a.project_id.as_str(), a)).collect();
+    let mut load = current_load(allocations);
+    let mut out = Vec::new();
+    for pid in orphaned {
+        let region = alloc_by_project
+            .get(pid.as_str())
+            .and_then(|a| hosts.iter().find(|h| h.host_id == a.host_id))
+            .map(|h| h.region.clone())
+            .unwrap_or_else(|| "default".to_string());
+        if let Some(h) = place_project(hosts, &load, &region, now, dead_threshold_secs) {
+            *load.entry(h.host_id.clone()).or_insert(0) += 1; // simulate the assignment
+            out.push((pid.clone(), h.host_id.clone()));
+        }
+    }
+    out
 }
 
 /// HA P3 — the cluster heartbeat. Upserts THIS host's HOSTS row with a fresh
@@ -594,7 +665,7 @@ fn reconcile_plan(
 ) -> ReconcilePlan {
     let live: HashSet<&str> = hosts
         .iter()
-        .filter(|h| h.last_heartbeat != 0 && now.saturating_sub(h.last_heartbeat) <= dead_threshold_secs)
+        .filter(|h| host_is_live(h, now, dead_threshold_secs))
         .map(|h| h.host_id.as_str())
         .collect();
     let alloc_by_project: HashMap<&str, &VmAllocation> =
@@ -632,18 +703,79 @@ async fn reconcile_loop(platform: Arc<Mutex<PlatformState>>, is_leader: Arc<Atom
         if !is_leader.load(Ordering::Relaxed) {
             continue;
         }
-        let plan = {
-            let plat = platform.lock().await;
-            let projects = plat.store.list_projects().unwrap_or_default();
-            let allocs = plat.store.list_vm_allocations().unwrap_or_default();
-            let hosts = plat.store.list_hosts().unwrap_or_default();
-            let now = jkbase_control::auth::timestamp();
-            reconcile_plan(&projects, &allocs, &hosts, now, DEAD_HOST_THRESHOLD.as_secs())
-        };
-        if !plan.orphaned.is_empty() {
-            warn!(count = plan.orphaned.len(), projects = ?plan.orphaned,
-                  "reconcile: projects owned by a dead/absent host need (re)placement (applied by placement, next P3 card)");
+        // Hold the platform lock for the read + reassign writes — all fast redb ops, no VM
+        // work here. On a single node `orphaned` is empty, so this is lock + 3 reads + bail.
+        let plat = platform.lock().await;
+        let projects = plat.store.list_projects().unwrap_or_default();
+        let allocs = plat.store.list_vm_allocations().unwrap_or_default();
+        let hosts = plat.store.list_hosts().unwrap_or_default();
+        let now = jkbase_control::auth::timestamp();
+        let plan = reconcile_plan(&projects, &allocs, &hosts, now, DEAD_HOST_THRESHOLD.as_secs());
+        if plan.orphaned.is_empty() {
+            continue;
         }
+        // Place each orphan on a live host (least-loaded in its region) and reassign: update
+        // the allocation's owner + bump placement_epoch. The new owner boots it on its next
+        // wake/reconcile, acquiring the disk lease (whose epoch the old host has already
+        // self-fenced from); the data disk moves via the substrate DataDiskProvider (Ceph).
+        let reassignments =
+            reassign_plan(&plan.orphaned, &hosts, &allocs, now, DEAD_HOST_THRESHOLD.as_secs());
+        for (pid, new_host) in &reassignments {
+            match plat.store.get_vm_allocation(pid) {
+                Ok(Some(mut alloc)) => {
+                    let from = alloc.host_id.clone();
+                    alloc.host_id = new_host.clone();
+                    alloc.placement_epoch = alloc.placement_epoch.saturating_add(1);
+                    if let Err(e) = plat.store.save_vm_allocation(&alloc) {
+                        warn!(project = %pid, error = %e, "reconcile: failed to persist reassignment");
+                    } else {
+                        info!(project = %pid, from = %from, to = %new_host,
+                              epoch = alloc.placement_epoch, "reconcile: reassigned to a live host");
+                    }
+                }
+                _ => warn!(project = %pid, "reconcile: orphan has no allocation to reassign"),
+            }
+        }
+        let unplaced = plan.orphaned.len() - reassignments.len();
+        if unplaced > 0 {
+            warn!(unplaced, "reconcile: orphaned projects with no live host in-region (cluster at capacity)");
+        }
+    }
+}
+
+/// HA P3 — where a deploy for a project must run, given its allocation + the fleet.
+#[derive(Debug, PartialEq, Eq)]
+enum DeployTarget {
+    /// Run here: we own it, or it is unplaced (single-node / pre-placement / first deploy).
+    Local,
+    /// Owned by a live remote host — forward the deploy there.
+    Remote { host_id: String, addr: Option<String> },
+    /// Owned by a host that is no longer live; the reconciler must reassign it first. Fail
+    /// closed (deploy is retryable) rather than have a non-owner boot a second copy.
+    OwnerDead { host_id: String },
+}
+
+/// Decide where `alloc`'s deploy belongs. Local when unplaced / owned-by-me / no-alloc;
+/// Remote when a live peer owns it; OwnerDead when the owner is gone. Pure.
+fn deploy_target(
+    alloc: Option<&VmAllocation>,
+    hosts: &[HostRecord],
+    me: &str,
+    now: u64,
+    dead_threshold_secs: u64,
+) -> DeployTarget {
+    match alloc {
+        None => DeployTarget::Local,
+        Some(a) if a.host_id.is_empty() || a.host_id == me => DeployTarget::Local,
+        Some(a) => match hosts.iter().find(|h| h.host_id == a.host_id) {
+            Some(h) if host_is_live(h, now, dead_threshold_secs) => DeployTarget::Remote {
+                host_id: h.host_id.clone(),
+                addr: h.public_addr.clone(),
+            },
+            _ => DeployTarget::OwnerDead {
+                host_id: a.host_id.clone(),
+            },
+        },
     }
 }
 
@@ -2017,6 +2149,28 @@ async fn handle_deploy(
         }
     };
 
+    // HA P3: only the OWNER host may deploy a project. On a single node every project is
+    // local (unplaced / owned by this host), so this is a no-op; in a cluster a deploy that
+    // reached a non-owner fails closed (retry) rather than booting a second owner.
+    {
+        let me = plat.host_id.clone();
+        let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+        let hosts = plat.store.list_hosts().unwrap_or_default();
+        let now = jkbase_control::auth::timestamp();
+        match deploy_target(alloc.as_ref(), &hosts, &me, now, DEAD_HOST_THRESHOLD.as_secs()) {
+            DeployTarget::Local => {}
+            DeployTarget::Remote { host_id, addr } => anyhow::bail!(
+                "project {project_id} is owned by host {host_id} ({}); the deploy must run there \
+                 (cross-host deploy forwarding not yet wired)",
+                addr.as_deref().unwrap_or("addr unknown")
+            ),
+            DeployTarget::OwnerDead { host_id } => anyhow::bail!(
+                "project {project_id}'s owner host {host_id} is down; the reconciler will reassign \
+                 it — retry the deploy shortly"
+            ),
+        }
+    }
+
     // If hibernated, clear stale snapshot
     if plat.vm_states.get(project_id) == Some(&VmLifecycle::Hibernated) {
         info!(project = %project_id, "clearing snapshot for fresh deploy");
@@ -2060,11 +2214,11 @@ async fn handle_deploy(
                 ip,
                 tap_device: tap,
                 mac,
-                // HA P0: schema present but not populated here — the leader's placement
-                // (P3) stamps host_id/placement_epoch. Single-node leaves them at their
-                // defaults (empty / 0), identical to pre-HA records.
-                host_id: String::new(),
-                placement_epoch: 0,
+                // HA P3: the host that first deploys a project owns it (initial placement);
+                // the leader reassigns on host death (reconcile_loop). On a single node this
+                // is the one live host, so ownership is a no-op for routing.
+                host_id: plat.host_id.clone(),
+                placement_epoch: 1,
             };
             plat.store.save_vm_allocation(&alloc)?;
             info!(project = %project_id, ip = %alloc.ip, "allocated new IP");
@@ -3814,6 +3968,96 @@ mod tests {
         assert!(a.renew(&ta, ttl).await.is_err());
 
         let _ = std::fs::remove_dir_all(&leases);
+    }
+
+    fn test_host(id: &str, region: &str, hb: u64, max_vms: u32) -> HostRecord {
+        HostRecord {
+            host_id: id.into(),
+            region: region.into(),
+            public_addr: Some(format!("{id}:9090")),
+            last_heartbeat: hb,
+            cpu_template_id: None,
+            kernel_id: None,
+            capacity: HostCapacity { vcpus: 0, mem_mib: 0, max_vms },
+        }
+    }
+    fn test_alloc(pid: &str, host: &str) -> VmAllocation {
+        VmAllocation {
+            project_id: pid.into(),
+            ip: "172.16.0.2".into(),
+            tap_device: "tap".into(),
+            mac: "AA".into(),
+            host_id: host.into(),
+            placement_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn place_project_picks_least_loaded_live_in_region_with_capacity() {
+        let now = 1000;
+        let hosts = vec![
+            test_host("a", "east", 995, 0), // live, region east, unbounded
+            test_host("b", "east", 995, 0), // live, region east
+            test_host("c", "west", 995, 0), // live, wrong region
+            test_host("d", "east", 900, 0), // east but DEAD (100s stale)
+            test_host("full", "east", 995, 1), // east, live, but at capacity (1)
+        ];
+        // a has 2 allocations, b has 0, full has 1 (at its cap).
+        let allocs = vec![
+            test_alloc("p1", "a"),
+            test_alloc("p2", "a"),
+            test_alloc("p3", "full"),
+        ];
+        let load = current_load(&allocs);
+        let pick = place_project(&hosts, &load, "east", now, 15).unwrap();
+        assert_eq!(pick.host_id, "b", "least-loaded live in-region with capacity");
+        // No host in an empty region.
+        assert!(place_project(&hosts, &load, "north", now, 15).is_none());
+    }
+
+    #[test]
+    fn reassign_plan_spreads_orphans_across_live_in_region() {
+        let now = 1000;
+        let hosts = vec![
+            test_host("dead", "east", 900, 0), // dead owner of the orphans
+            test_host("a", "east", 995, 0),
+            test_host("b", "east", 995, 0),
+        ];
+        // Two orphans, both previously on the dead east host → spread across a and b.
+        let allocs = vec![test_alloc("p1", "dead"), test_alloc("p2", "dead")];
+        let orphaned = vec!["p1".to_string(), "p2".to_string()];
+        let plan = reassign_plan(&orphaned, &hosts, &allocs, now, 15);
+        let targets: HashSet<&str> = plan.iter().map(|(_, h)| h.as_str()).collect();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(targets, HashSet::from(["a", "b"]), "spread, not piled onto one host");
+    }
+
+    #[test]
+    fn deploy_target_routes_by_ownership() {
+        let now = 1000;
+        let hosts = vec![test_host("me", "east", 995, 0), test_host("peer", "east", 995, 0)];
+        // No allocation (first deploy) → local.
+        assert_eq!(deploy_target(None, &hosts, "me", now, 15), DeployTarget::Local);
+        // Unplaced (empty host_id) → local.
+        assert_eq!(
+            deploy_target(Some(&test_alloc("p", "")), &hosts, "me", now, 15),
+            DeployTarget::Local
+        );
+        // Owned by me → local.
+        assert_eq!(
+            deploy_target(Some(&test_alloc("p", "me")), &hosts, "me", now, 15),
+            DeployTarget::Local
+        );
+        // Owned by a live peer → forward.
+        assert!(matches!(
+            deploy_target(Some(&test_alloc("p", "peer")), &hosts, "me", now, 15),
+            DeployTarget::Remote { ref host_id, .. } if host_id == "peer"
+        ));
+        // Owned by a host that is gone (not in HOSTS / dead) → fail closed.
+        assert!(matches!(
+            deploy_target(Some(&test_alloc("p", "ghost")), &hosts, "me", now, 15),
+            DeployTarget::OwnerDead { ref host_id } if host_id == "ghost"
+        ));
     }
 
     #[test]
