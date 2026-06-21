@@ -3315,6 +3315,148 @@ async fn wait_for_agent(ip: &str) -> Result<()> {
     anyhow::bail!("agent at {ip} did not become ready within 10 seconds");
 }
 
+/// HA P2 — the split-brain GATE. A deterministic proof that the data-disk fence the
+/// self-fence (`disk_fence_loop`/`self_fence_project`) and the restore-path fence rely
+/// on never admits two simultaneous writers for one disk scope. **GATE: no failover
+/// automation (P3+) ships until this module is green.**
+///
+/// Admission model: a host may write a disk iff it still holds the lease — i.e. its
+/// token renews. That is exactly what production does (the disk-fence loop self-fences
+/// the instant `renew` fails). The four scenarios below walk the split-brain space and
+/// assert the invariant `at most one host is admitted at any moment`.
+///
+/// Coverage boundary (honest — not silently capped):
+///  - These run against the node-local `FlockLease` (no root, CI-deterministic) and so
+///    prove the COORDINATION layer (mutual exclusion, de-admission on loss, epoch
+///    monotonicity). A voluntary `release` models "lease lost".
+///  - The real BLOCK-DEVICE exclusivity (a live prior writer blocks `attach_rwo`) is the
+///    substrate's on-box `attach_refuses_while_prior_writer_is_alive`.
+///  - The live-partition case (holder still alive while the AUTHORITY expired its lease)
+///    needs the distributed `EtcdLease` + a real 2-host/partition run — the rented-
+///    hardware last mile. The renew-or-die logic that handles it is unit-tested by
+///    `disk_lease_renewal_signals_loss_after_release`.
+#[cfg(test)]
+mod split_brain_gate {
+    use jkbase_substrate::{FenceToken, FlockLease, Lease, SubstrateError};
+    use std::time::Duration;
+
+    const TTL: Duration = Duration::from_secs(15);
+
+    fn leases_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("jkbase-gate-{tag}-{nanos}"))
+    }
+
+    /// The production admission gate: a host may write iff its lease token still renews.
+    async fn may_write(lease: &FlockLease, token: &FenceToken) -> bool {
+        lease.renew(token, TTL).await.is_ok()
+    }
+
+    /// S1 — racing writers: two hosts contend for one disk; mutual exclusion admits
+    /// at most one. The loser never even gets a token.
+    #[tokio::test]
+    async fn racing_writers_admit_at_most_one() {
+        let dir = leases_dir("race");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        // host-b races for the same disk and is refused while a live holder owns it.
+        assert!(matches!(
+            b.acquire("disk-p", "host-b", TTL).await,
+            Err(SubstrateError::LeaseHeld { .. })
+        ));
+        assert!(may_write(&a, &ta).await, "exactly one admitted writer (a)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2 — lease loss mid-write: the holder's admission is revoked the instant it loses
+    /// the lease (→ self-fence), and a survivor can be admitted ONLY afterwards, with a
+    /// strictly higher epoch. There is never a moment with two admitted writers.
+    #[tokio::test]
+    async fn lease_loss_revokes_admission_before_survivor_is_admitted() {
+        let dir = leases_dir("loss");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        assert!(may_write(&a, &ta).await, "a is the writer");
+        // While a holds, the survivor CANNOT acquire — so two are never admitted at once.
+        assert!(b.acquire("disk-p", "host-b", TTL).await.is_err());
+
+        // a loses the lease (partition / TTL expiry ≈ the OS releasing its flock).
+        a.release(&ta).await.unwrap();
+        assert!(
+            !may_write(&a, &ta).await,
+            "a self-fences the instant it loses the lease"
+        );
+        // Only NOW can the survivor be admitted, with a strictly higher epoch.
+        let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
+        assert!(tb.epoch > ta.epoch);
+        assert!(may_write(&b, &tb).await);
+        assert!(!may_write(&a, &ta).await, "deposed a stays de-admitted (no double writer)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3 — TTL clock skew: authority is by epoch (monotonic, lease-issued), NOT by any
+    /// host's wall clock. A clock-skewed old host's token can never supersede the newer
+    /// holder's, so skew cannot revive a stale writer.
+    #[tokio::test]
+    async fn clock_skew_cannot_revive_a_stale_token() {
+        let dir = leases_dir("skew");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        a.release(&ta).await.unwrap();
+        let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
+        assert!(tb.supersedes(&ta).unwrap(), "newer epoch supersedes");
+        assert!(
+            !ta.supersedes(&tb).unwrap(),
+            "a clock-skewed stale token never supersedes the live holder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S4 — zombie double-write: a hung old writer that still 'believes' it holds the
+    /// disk after a takeover is denied on both axes — its stale token neither renews nor
+    /// supersedes the live holder.
+    #[tokio::test]
+    async fn zombie_holder_cannot_write_after_takeover() {
+        let dir = leases_dir("zombie");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        // a hangs/partitions; its flock is released (OS on crash, modelled by release).
+        a.release(&ta).await.unwrap();
+        let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
+        // The zombie keeps trying to use its stale token — denied both ways:
+        assert!(!may_write(&a, &ta).await, "stale token can't renew → denied admission");
+        assert!(
+            !ta.supersedes(&tb).unwrap(),
+            "stale token can't supersede the live holder"
+        );
+        assert!(may_write(&b, &tb).await, "the live holder is the sole writer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
