@@ -17,7 +17,7 @@
 //! agent seq it does not reset across guest cold boots.
 
 use anyhow::Result;
-use jkbase_common::logs::LogLine;
+use jkbase_common::logs::{LogLine, EGRESS_STREAM};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,16 @@ use std::sync::Mutex;
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
 /// Number of rotated files to retain per project (`app.log.1` .. `app.log.N`).
 const MAX_ROTATED: usize = 3;
+
+/// Egress audit events (`stream == "egress"`) are stored in a SEPARATE file set with an
+/// INDEPENDENT retention budget, so a tenant flooding ordinary app logs cannot rotate its
+/// own (or the operator's) egress-audit rows off disk (adversarial-review H-1; the durable
+/// counterpart of the in-VM separate buffer, P0-OBS-UNCONDITIONAL / P0-DOS-EGRESS-EVENT-
+/// BUFFER). Events are small, coalesced, and rate-limited at the agent, so a generous
+/// rotated-file count buys a long (≥weeks) window at a small footprint. Read-side merges
+/// app + egress by the unified store seq, so the CLI sees one ordered stream.
+const EGRESS_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024; // 5 MiB
+const EGRESS_MAX_ROTATED: usize = 11; // ~60 MiB egress budget, independent of app logs
 
 #[derive(Default)]
 struct ProjectState {
@@ -72,7 +82,6 @@ impl LogStore {
 
         let dir = self.project_dir(project_id);
         std::fs::create_dir_all(&dir)?;
-        let active = dir.join("app.log");
 
         let mut guard = self.inner.state.lock().unwrap();
         let st = guard.entry(project_id.to_string()).or_default();
@@ -81,27 +90,28 @@ impl LogStore {
             st.initialized = true;
         }
 
-        // Rotate before writing if the active file is already at the threshold.
-        if file_len(&active) >= MAX_FILE_BYTES {
-            rotate(&dir)?;
-        }
-
-        let mut buf = String::with_capacity(lines.len() * 128);
+        // Assign the unified per-project seq in arrival order, then PARTITION by stream into
+        // two independently-retained file sets (app vs egress) so an app-log flood cannot
+        // evict the egress audit trail. Both share the seq space → read-side merges them.
+        let mut app_buf = String::with_capacity(lines.len() * 128);
+        let mut egr_buf = String::new();
         for line in lines {
             st.next_seq += 1;
             let stored = LogLine {
                 seq: st.next_seq,
                 ..line.clone()
             };
-            buf.push_str(&serde_json::to_string(&stored)?);
-            buf.push('\n');
+            let target = if line.stream == EGRESS_STREAM {
+                &mut egr_buf
+            } else {
+                &mut app_buf
+            };
+            target.push_str(&serde_json::to_string(&stored)?);
+            target.push('\n');
         }
 
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&active)?;
-        f.write_all(buf.as_bytes())?;
+        append_stream(&dir, "app.log", &app_buf, MAX_FILE_BYTES, MAX_ROTATED)?;
+        append_stream(&dir, "egress.log", &egr_buf, EGRESS_MAX_FILE_BYTES, EGRESS_MAX_ROTATED)?;
         Ok(())
     }
 
@@ -128,6 +138,13 @@ impl LogStore {
             read_lines_into(&dir.join(format!("app.log.{i}")), &mut all);
         }
         read_lines_into(&dir.join("app.log"), &mut all);
+        // Merge in the separately-retained egress audit stream, then sort by the unified
+        // store seq so the two streams interleave in chronological order.
+        for i in (1..=EGRESS_MAX_ROTATED).rev() {
+            read_lines_into(&dir.join(format!("egress.log.{i}")), &mut all);
+        }
+        read_lines_into(&dir.join("egress.log"), &mut all);
+        all.sort_by_key(|l| l.seq);
 
         if let Some(svc) = service {
             all.retain(|l| l.server == svc);
@@ -161,22 +178,41 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Shift `app.log` -> `app.log.1` -> ... dropping the oldest, leaving no `app.log`.
-fn rotate(dir: &Path) -> Result<()> {
-    let oldest = dir.join(format!("app.log.{MAX_ROTATED}"));
+/// Append `buf` to `dir/{base}`, rotating that base's file set first if the active file is
+/// already at `max_bytes`. No-op on an empty buffer. Each stream (app/egress) rotates
+/// independently, which is the whole point of H-1: app churn never touches egress files.
+fn append_stream(dir: &Path, base: &str, buf: &str, max_bytes: u64, max_rotated: usize) -> Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let active = dir.join(base);
+    if file_len(&active) >= max_bytes {
+        rotate(dir, base, max_rotated)?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&active)?;
+    f.write_all(buf.as_bytes())?;
+    Ok(())
+}
+
+/// Shift `{base}` -> `{base}.1` -> ... dropping the oldest, leaving no active `{base}`.
+fn rotate(dir: &Path, base: &str, max_rotated: usize) -> Result<()> {
+    let oldest = dir.join(format!("{base}.{max_rotated}"));
     if oldest.exists() {
         std::fs::remove_file(&oldest)?;
     }
-    for i in (1..MAX_ROTATED).rev() {
-        let from = dir.join(format!("app.log.{i}"));
-        let to = dir.join(format!("app.log.{}", i + 1));
+    for i in (1..max_rotated).rev() {
+        let from = dir.join(format!("{base}.{i}"));
+        let to = dir.join(format!("{base}.{}", i + 1));
         if from.exists() {
             std::fs::rename(&from, &to)?;
         }
     }
-    let active = dir.join("app.log");
+    let active = dir.join(base);
     if active.exists() {
-        std::fs::rename(&active, dir.join("app.log.1"))?;
+        std::fs::rename(&active, dir.join(format!("{base}.1")))?;
     }
     Ok(())
 }
@@ -196,11 +232,15 @@ fn read_lines_into(path: &Path, out: &mut Vec<LogLine>) {
     }
 }
 
-/// Determine the highest store seq already persisted for a project so a fresh
-/// process continues numbering monotonically. The active file holds the newest
-/// lines; if it was just rotated and is empty, fall back to `app.log.1`.
+/// Determine the highest store seq already persisted for a project so a fresh process
+/// continues numbering monotonically. The seq is unified across both streams, so consider
+/// the newest line of each active file (and its first rotation, in case it was just rotated
+/// empty).
 fn highest_seq_on_disk(dir: &Path) -> u64 {
-    last_seq(&dir.join("app.log")).max(last_seq(&dir.join("app.log.1")))
+    last_seq(&dir.join("app.log"))
+        .max(last_seq(&dir.join("app.log.1")))
+        .max(last_seq(&dir.join("egress.log")))
+        .max(last_seq(&dir.join("egress.log.1")))
 }
 
 fn last_seq(path: &Path) -> u64 {
@@ -237,6 +277,16 @@ mod tests {
         LogLine {
             server: server.to_string(),
             stream: "stdout".to_string(),
+            line: msg.to_string(),
+            timestamp: 0,
+            seq: 0,
+        }
+    }
+
+    fn egress_line(msg: &str) -> LogLine {
+        LogLine {
+            server: "fn".to_string(),
+            stream: EGRESS_STREAM.to_string(),
             line: msg.to_string(),
             timestamp: 0,
             seq: 0,
@@ -314,6 +364,34 @@ mod tests {
         assert_eq!(all[0].seq, 1);
         assert_eq!(all[1].seq, 2);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn egress_audit_survives_an_app_log_flood() {
+        // H-1: a tenant makes one real egress (audit) call, then floods app logs. The
+        // egress row must survive — it lives in a separately-retained file set that app
+        // churn never rotates.
+        let root = tmp_root();
+        let store = LogStore::new(root.clone());
+        store.append("p", &[egress_line("{\"dest_host\":\"c2.evil\"}")]).unwrap();
+
+        let big = "x".repeat(64 * 1024);
+        for i in 0..400 {
+            store.append("p", &[line("web", &format!("{i}:{big}"))]).unwrap();
+        }
+
+        // App logs rotated hard (oldest gone), but the egress row is still readable.
+        let all = store.read("p", 100_000, None, None).unwrap();
+        let egress: Vec<&LogLine> = all.iter().filter(|l| l.stream == EGRESS_STREAM).collect();
+        assert_eq!(egress.len(), 1, "the egress audit row must survive the app-log flood");
+        assert!(egress[0].line.contains("c2.evil"));
+        assert_eq!(egress[0].seq, 1, "it kept its unified seq and read-merges in order");
+        // Sanity: the app flood DID rotate (oldest app lines gone).
+        let app: Vec<&LogLine> = all.iter().filter(|l| l.stream != EGRESS_STREAM).collect();
+        assert!(app.iter().all(|l| !l.line.starts_with("0:")), "oldest app lines rotated off");
+
+        store.clear("p").unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -903,9 +903,12 @@ async fn run_inner(
     std::fs::create_dir_all(&staged)?;
 
     let assemble_and_build = async {
-        // 4. Non-build artifacts: sidecars + static site content.
-        assemble_sidecars(&config, &staged).context("assemble config sidecars")?;
+        // 4. Non-build artifacts: static site content FIRST, then the host-authored
+        //    `_`-prefixed sidecars — so a host artifact is always written LAST and a tenant
+        //    cannot clobber it via site content (defense-in-depth for B-1; copy_filtered_guarded
+        //    already refuses `_`-prefixed top-level tenant entries into the root).
         assemble_sites(&config, &src_dir, &staged).context("assemble site content")?;
+        assemble_sidecars(&config, &staged).context("assemble config sidecars")?;
         std::fs::create_dir_all(staged.join("_functions"))?;
         std::fs::create_dir_all(staged.join("_servers"))?;
 
@@ -1842,7 +1845,9 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
     } else if let Some(site) = sites.first() {
         let site_dir = src_dir.join(&site.public);
         if site_dir.is_dir() {
-            copy_filtered(&site_dir, staged)?;
+            // Single-site content lands in the staged ROOT alongside the host's `_`-prefixed
+            // control artifacts — guard against a tenant clobbering them (review B-1).
+            copy_filtered_guarded(&site_dir, staged)?;
         }
     }
     Ok(())
@@ -1851,11 +1856,36 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
 /// Recursively copy `src` into `dst`, skipping the build/VCS dirs and manifest
 /// files (mirrors the CLI's old packaging exclusions). Symlinks are skipped.
 fn copy_filtered(src: &Path, dst: &Path) -> Result<()> {
+    copy_filtered_inner(src, dst, false)
+}
+
+/// As [`copy_filtered`], but REFUSES any TOP-LEVEL entry whose name begins with `_`.
+/// Used for the single-site copy into the staged ROOT, where the host's own
+/// `_`-prefixed control artifacts live (`_functions/`, `_routes.json`, `_platform.json`,
+/// `_servers/`, …). Without this a tenant whose site is the project root (`public = "."`)
+/// could smuggle a `_functions/<fn>.json` into their source tree that overwrites the
+/// host-authored, precedence-resolved egress sidecar — escaping its own `egress = false`
+/// or widening past a project ceiling (adversarial-review BLOCKER B-1,
+/// P0-EGRESS-POLICY-HOST-RESOLVED). The agent's static server already refuses to SERVE
+/// `_`-prefixed top-level entries, so refusing to COPY them loses nothing legitimate.
+/// (Site SUBdirs like `_next/` remain fine — the guard is top-level only, and multi-site
+/// content lands under a namespaced `_site_<name>/`, not the root.)
+fn copy_filtered_guarded(src: &Path, dst: &Path) -> Result<()> {
+    copy_filtered_inner(src, dst, true)
+}
+
+fn copy_filtered_inner(src: &Path, dst: &Path, guard_top_underscore: bool) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
+        // Top-level `_`-prefixed entries collide with host control artifacts — never copy
+        // them from tenant content into the staged root.
+        if guard_top_underscore && name_str.starts_with('_') {
+            warn!(entry = %name_str, "refusing to copy a tenant `_`-prefixed top-level entry into the deployment root");
+            continue;
+        }
         let ft = entry.file_type()?;
         if ft.is_symlink() {
             continue;
@@ -1863,7 +1893,9 @@ fn copy_filtered(src: &Path, dst: &Path) -> Result<()> {
             if EXCLUDED_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
-            copy_filtered(&entry.path(), &dst.join(&name))?;
+            // The guard is top-level only; subdirectories may legitimately hold `_`-prefixed
+            // framework dirs (e.g. `_next/`).
+            copy_filtered_inner(&entry.path(), &dst.join(&name), false)?;
         } else if ft.is_file() {
             if EXCLUDED_FILES.contains(&name_str.as_ref()) {
                 continue;

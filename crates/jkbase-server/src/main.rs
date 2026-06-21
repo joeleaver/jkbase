@@ -340,14 +340,21 @@ async fn main() -> Result<()> {
         Arc::new(FlockLease::open(data_dir.join("leases"), host_id.clone())?);
 
     // Host-asserted platform egress facts, computed once. The OWN object-store host is
-    // `storage.{domain}`; the Zone-2 deny-set is the host's own public uplink IP(s) — taken
-    // from --platform-ips when given, else auto-discovered off the default-route interface
-    // (the same source tools/setup-bridge.sh uses for its firewall rules).
-    let platform_ips = if args.platform_ips.is_empty() {
-        discover_uplink_ips()
-    } else {
-        args.platform_ips.clone()
-    };
+    // `storage.{domain}`; the Zone-2 deny-set is the host's own public uplink IP(s).
+    //
+    // ALWAYS union the operator's --platform-ips with auto-discovery (never replace) — review
+    // M-1. tools/setup-bridge.sh independently opens guest→PUB_IP:80,443 for EVERY global IP on
+    // the uplink (its own discovery), so if an operator passed a NARROWER explicit list the
+    // agent's deny-set could miss a secondary/failover IP the firewall still exposes → a
+    // function could reach the control-plane proxy on that IP. Unioning guarantees the agent
+    // deny-set ⊇ the discovered uplink set the firewall allows, closing the desync; --platform-ips
+    // only ADDS (e.g. an IP behind NAT that discovery can't see), never subtracts.
+    let mut platform_ips = discover_uplink_ips();
+    for ip in &args.platform_ips {
+        if !platform_ips.contains(ip) {
+            platform_ips.push(ip.clone());
+        }
+    }
     if platform_ips.is_empty() {
         // The netfilter fence ALLOWS guest→public-IP:80,443 (servers reach the object-store /
         // own-sites through the proxy there), so the agent's platform-IP list is the ONLY
