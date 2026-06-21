@@ -20,7 +20,6 @@ use hickory_client::proto::rr::dnssec::tsig::TSigner;
 use hickory_client::proto::rr::rdata::TXT;
 use hickory_client::proto::rr::{Name, RData, Record};
 use hickory_client::proto::udp::UdpClientStream;
-use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
@@ -298,6 +297,20 @@ impl CertManager {
     }
 
     async fn provision_wildcard(&self) -> Result<()> {
+        let mut record_handles: Vec<String> = Vec::new();
+        let outcome = self.issue_wildcard(&mut record_handles).await;
+        // Always remove the published challenge records — on success AND failure — so a failed
+        // attempt doesn't leak `_acme-challenge` TXTs (which the RFC2136 `append` path would
+        // otherwise accumulate at the same name across retries). Best-effort.
+        for handle in &record_handles {
+            let _ = self.cfg.dns_provider.delete_txt(handle).await;
+        }
+        outcome
+    }
+
+    /// The wildcard ACME order flow. Each published DNS-01 challenge handle is pushed into
+    /// `record_handles` so [`provision_wildcard`](Self::provision_wildcard) can always clean up.
+    async fn issue_wildcard(&self, record_handles: &mut Vec<String>) -> Result<()> {
         let wildcard = format!("*.{}", self.cfg.domain);
         let identifiers = vec![
             Identifier::Dns(self.cfg.domain.clone()),
@@ -309,7 +322,6 @@ impl CertManager {
             .await
             .context("failed to create ACME order")?;
 
-        let mut record_handles: Vec<String> = Vec::new();
         {
             let mut authorizations = order.authorizations();
             while let Some(result) = authorizations.next().await {
@@ -351,10 +363,6 @@ impl CertManager {
         tokio::fs::write(self.cfg.cert_dir.join("fullchain.pem"), &cert_chain).await?;
         tokio::fs::write(self.cfg.cert_dir.join("privkey.pem"), key_pair.serialize_pem()).await?;
         info!("wildcard certificate provisioned");
-
-        for handle in &record_handles {
-            let _ = self.cfg.dns_provider.delete_txt(handle).await;
-        }
         Ok(())
     }
 
@@ -542,7 +550,8 @@ impl DnsProvider for CloudflareProvider {
 /// the `_acme-challenge` TXT (append, not create, so the wildcard + apex challenges can share
 /// the name with two distinct values).
 pub struct Rfc2136Provider {
-    nameserver: SocketAddr,
+    /// `host:port` — resolved at connect time (so a hostname works, not just an IP literal).
+    nameserver: String,
     zone: String,
     tsig_name: String,
     tsig_secret: Vec<u8>,
@@ -550,8 +559,8 @@ pub struct Rfc2136Provider {
 }
 
 impl Rfc2136Provider {
-    /// `nameserver` is `host:port`; `tsig_secret` is base64 (as in a BIND key file); `tsig_alg`
-    /// is `hmac-sha256` (default) / `hmac-sha384` / `hmac-sha512`.
+    /// `nameserver` is `host:port` (hostname or IP); `tsig_secret` is base64 (as in a BIND key
+    /// file); `tsig_alg` is `hmac-sha256` (default) / `hmac-sha384` / `hmac-sha512`.
     pub fn new(
         nameserver: &str,
         zone: &str,
@@ -559,9 +568,24 @@ impl Rfc2136Provider {
         tsig_secret_b64: &str,
         tsig_alg: &str,
     ) -> Result<Self> {
-        let nameserver: SocketAddr = nameserver
-            .parse()
-            .with_context(|| format!("RFC2136_NAMESERVER must be host:port, got {nameserver:?}"))?;
+        // Validate the host:port shape now; the host is resolved at connect time so a hostname
+        // (ns1.example.com:53) works — std::net::SocketAddr's parser only accepts IP:port.
+        let nameserver = nameserver.trim().to_string();
+        let shape_ok = nameserver
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+        if !shape_ok {
+            anyhow::bail!(
+                "RFC2136_NAMESERVER must be host:port (e.g. ns1.example.com:53 or 192.0.2.1:53), got {nameserver:?}"
+            );
+        }
+        let zone = zone.trim();
+        if zone.is_empty() {
+            anyhow::bail!("RFC2136_ZONE must not be empty");
+        }
+        if tsig_name.trim().is_empty() {
+            anyhow::bail!("RFC2136_TSIG_NAME must not be empty");
+        }
         let tsig_secret = base64::engine::general_purpose::STANDARD
             .decode(tsig_secret_b64.trim())
             .context("RFC2136_TSIG_SECRET must be base64")?;
@@ -590,14 +614,38 @@ impl Rfc2136Provider {
     /// Open a fresh TSIG-signed UDP client to the nameserver. The background driver is
     /// spawned for the lifetime of the returned client.
     async fn client(&self) -> Result<AsyncClient> {
+        // Resolve here (accepts hostname:port and ip:port) rather than at construction.
+        let addr = tokio::net::lookup_host(&self.nameserver)
+            .await
+            .with_context(|| format!("RFC2136_NAMESERVER {:?} failed to resolve", self.nameserver))?
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!("RFC2136_NAMESERVER {:?} resolved to no addresses", self.nameserver)
+            })?;
         let stream = UdpClientStream::<UdpSocket, TSigner>::with_timeout_and_signer(
-            self.nameserver,
+            addr,
             Duration::from_secs(10),
             Some(Arc::new(self.signer()?)),
         );
         let (client, bg) = AsyncClient::connect(stream).await.context("rfc2136: TSIG client connect failed")?;
         tokio::spawn(bg);
         Ok(client)
+    }
+
+    /// Build the TXT record + zone for an UPDATE, guarding that the zone actually contains the
+    /// record. hickory's `append`/`delete_by_rdata` `assert!(zone_of)` and would PANIC the
+    /// process on a NOTZONE misconfig; bail with a clear error instead.
+    fn record_and_zone(&self, name: &str, value: &str) -> Result<(Record, Name)> {
+        let rec_name = fqdn(name)?;
+        let zone = fqdn(&self.zone)?;
+        if !zone.zone_of(&rec_name) {
+            anyhow::bail!(
+                "RFC2136_ZONE {:?} does not contain the challenge record {name:?}; set RFC2136_ZONE to the zone that holds _acme-challenge.<domain>",
+                self.zone
+            );
+        }
+        let record = Record::from_rdata(rec_name, 120, RData::TXT(TXT::new(vec![value.to_string()])));
+        Ok((record, zone))
     }
 }
 
@@ -610,12 +658,12 @@ fn fqdn(s: &str) -> Result<Name> {
 #[async_trait]
 impl DnsProvider for Rfc2136Provider {
     async fn create_txt(&self, name: &str, value: &str) -> Result<String> {
-        let mut client = self.client().await?;
-        let record = Record::from_rdata(fqdn(name)?, 120, RData::TXT(TXT::new(vec![value.to_string()])));
         // append (must_exist=false): adds this TXT RR, creating the RRset if absent — so the
         // wildcard and apex challenges (same name, different values) both land.
+        let (record, zone) = self.record_and_zone(name, value)?;
+        let mut client = self.client().await?;
         let resp = client
-            .append(record, fqdn(&self.zone)?, false)
+            .append(record, zone, false)
             .await
             .context("rfc2136: TXT append (dynamic UPDATE) failed")?;
         if resp.response_code() != ResponseCode::NoError {
@@ -629,10 +677,10 @@ impl DnsProvider for Rfc2136Provider {
         let (name, value) = handle
             .split_once('\t')
             .ok_or_else(|| anyhow::anyhow!("malformed rfc2136 record handle"))?;
+        let (record, zone) = self.record_and_zone(name, value)?;
         let mut client = self.client().await?;
-        let record = Record::from_rdata(fqdn(name)?, 120, RData::TXT(TXT::new(vec![value.to_string()])));
         let resp = client
-            .delete_by_rdata(record, fqdn(&self.zone)?)
+            .delete_by_rdata(record, zone)
             .await
             .context("rfc2136: TXT delete (dynamic UPDATE) failed")?;
         if resp.response_code() != ResponseCode::NoError {
@@ -648,16 +696,32 @@ mod tests {
 
     #[test]
     fn rfc2136_config_validation() {
-        // Valid config parses.
+        // Valid config parses (IP:port).
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").is_ok());
+        // A HOSTNAME:port is accepted at construction (resolved later, not via SocketAddr parse).
+        assert!(Rfc2136Provider::new("ns1.example.com:53", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_ok());
         // Empty algorithm string defaults to hmac-sha256.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "").is_ok());
-        // Bad nameserver (not host:port).
-        assert!(Rfc2136Provider::new("not-a-sockaddr", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        // Bad nameserver (no port).
+        assert!(Rfc2136Provider::new("ns1.example.com", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        assert!(Rfc2136Provider::new("not-a-nameserver", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        // Empty zone / key name rejected.
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "", "c2VjcmV0", "hmac-sha256").is_err());
         // Non-base64 secret.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "!!! not base64 !!!", "hmac-sha256").is_err());
         // Unsupported algorithm.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "hmac-md5").is_err());
+    }
+
+    #[test]
+    fn record_and_zone_rejects_record_outside_zone() {
+        let p = Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").unwrap();
+        // In-zone record is accepted (no panic, builds record+zone).
+        assert!(p.record_and_zone("_acme-challenge.example.com", "v").is_ok());
+        // Out-of-zone record is a clean error, NOT a hickory zone_of panic.
+        let p2 = Rfc2136Provider::new("192.0.2.1:53", "other.net", "acme-key", "c2VjcmV0", "hmac-sha256").unwrap();
+        assert!(p2.record_and_zone("_acme-challenge.example.com", "v").is_err());
     }
 
     #[test]

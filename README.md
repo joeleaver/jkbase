@@ -371,6 +371,10 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    # RFC2136_TSIG_ALGORITHM=hmac-sha256    # or hmac-sha384 / hmac-sha512
    # RFC2136_ZONE=your-domain.com          # defaults to --domain
    ```
+   With RFC2136, the host must be able to reach the nameserver (UDP/53, the update target),
+   and the zone you update must be the one Let's Encrypt resolves publicly — point
+   `RFC2136_NAMESERVER` at the authoritative primary and make sure the TXT propagates to the
+   public NS set (the apex `_acme-challenge` must be served, or delegated, from there).
 2. **Build toolchains** — provisioning bakes the busybox `default.ext4`. For Bun and Dockerfile builds you also need `bun.ext4` + `dockerfile.ext4` + the shared base layers. Bake them with `apko` + `tools/dev toolchains` / `tools/dev baselayers` and drop the results in `/var/jkbase/toolchains` and `/var/jkbase/baselayers`. *(Automating this in `provision.sh` is on the list.)*
 3. **Start it:** `ssh you@your-server 'sudo systemctl start jkbase'`
 4. **Point DNS:** `*.your-domain.com → your server's IP` (Firecracker-per-project means each app answers on its own subdomain; the wildcard also covers `api.`, `storage.`, and `console.`).
