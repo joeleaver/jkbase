@@ -175,6 +175,83 @@ struct Args {
     /// to be explicit / on hosts where auto-discovery is wrong (e.g. behind NAT).
     #[arg(long, env = "JKBASE_PLATFORM_IPS", value_delimiter = ',')]
     platform_ips: Vec<String>,
+
+    // --- HA cluster identity (HA P0: schema/config only — parsed, validated, and
+    // logged, but NOT yet wired into placement/failover; later phases consume it) ---
+    /// Stable, cluster-unique id for THIS server instance. Default "local" = the
+    /// single-node identity; give each node a distinct id to form a cluster.
+    #[arg(long, env = "JKBASE_HOST_ID", default_value = "local")]
+    host_id: String,
+
+    /// Placement region for this host; projects are placed least-loaded WITHIN a
+    /// region (P3). Default "default" = one flat region (single-node).
+    #[arg(long, env = "JKBASE_REGION", default_value = "default")]
+    region: String,
+
+    /// Address peers/the proxy use to forward to THIS host (deploy forwarding P3,
+    /// routing backend P4). Unset on single-node.
+    #[arg(long, env = "JKBASE_PUBLIC_ADDR")]
+    public_addr: Option<String>,
+
+    /// Firecracker CPU template this host bakes into its VMs from first boot (P5); a
+    /// warm cross-host restore needs source+target to match. Unset = cold-boot only.
+    #[arg(long, env = "JKBASE_CPU_TEMPLATE_ID")]
+    cpu_template_id: Option<String>,
+
+    /// Guest-kernel identity for warm/cold migration decisions (P5). Unset = derived
+    /// later from the resolved guest kernel.
+    #[arg(long, env = "JKBASE_KERNEL_ID")]
+    kernel_id: Option<String>,
+
+    /// Declared scheduling capacity for placement bin-packing (P3): host vCPUs.
+    /// 0 = unset/auto (no declared bound).
+    #[arg(long, default_value_t = 0)]
+    host_vcpus: u32,
+    /// Declared host memory (MiB) for placement (P3). 0 = unset/auto.
+    #[arg(long, default_value_t = 0)]
+    host_mem_mib: u64,
+    /// Declared max concurrent VMs for placement (P3). 0 = unset/auto.
+    #[arg(long, default_value_t = 0)]
+    host_max_vms: u32,
+
+    // --- [substrate] backend selection (HA P0: schema/config only) ---
+    /// Control-store backend: "redb" (default, single-node) | "etcd" (clustered).
+    #[arg(long, env = "JKBASE_SUBSTRATE_CONTROL_STORE", default_value = "redb")]
+    substrate_control_store: String,
+    /// Lease backend: "flock" (default, single-node) | "etcd" (clustered).
+    #[arg(long, env = "JKBASE_SUBSTRATE_LEASE", default_value = "flock")]
+    substrate_lease: String,
+    /// Data-disk provider: "localloop" (default) | "cephrbd" (clustered).
+    #[arg(long, env = "JKBASE_SUBSTRATE_DATA_DISK", default_value = "localloop")]
+    substrate_data_disk: String,
+    /// Blob store: "localfs" (default) | "s3" (clustered/offsite).
+    #[arg(long, env = "JKBASE_SUBSTRATE_BLOB_STORE", default_value = "localfs")]
+    substrate_blob_store: String,
+}
+
+/// Validate the `[substrate]` backend selection (HA P0). Accepts the single-node
+/// defaults and the known clustered backends; bails on an unknown name so a typo
+/// fails fast instead of silently falling back. A non-default (clustered) backend is
+/// accepted as config but warns that it is NOT wired until HA P1+.
+fn validate_substrate_selection(args: &Args) -> Result<()> {
+    fn check(role: &str, val: &str, allowed: &[&str]) -> Result<()> {
+        if !allowed.contains(&val) {
+            anyhow::bail!("unknown substrate {role} backend {val:?}; expected one of {allowed:?}");
+        }
+        Ok(())
+    }
+    check("control-store", &args.substrate_control_store, &["redb", "etcd"])?;
+    check("lease", &args.substrate_lease, &["flock", "etcd"])?;
+    check("data-disk", &args.substrate_data_disk, &["localloop", "cephrbd"])?;
+    check("blob-store", &args.substrate_blob_store, &["localfs", "s3"])?;
+    let clustered = args.substrate_control_store != "redb"
+        || args.substrate_lease != "flock"
+        || args.substrate_data_disk != "localloop"
+        || args.substrate_blob_store != "localfs";
+    if clustered {
+        warn!("non-default substrate backend selected; accepted as config but NOT wired until HA P1");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +364,25 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // HA cluster identity + [substrate] backend selection (HA P0): validate up front
+    // so a typo fails fast, then log the resolved view. Schema/config only — nothing
+    // here changes placement, failover, or the substrate factory yet.
+    validate_substrate_selection(&args)?;
+    info!(
+        host_id = %args.host_id,
+        region = %args.region,
+        public_addr = ?args.public_addr,
+        cap_vcpus = args.host_vcpus,
+        cap_mem_mib = args.host_mem_mib,
+        cap_max_vms = args.host_max_vms,
+        control_store = %args.substrate_control_store,
+        lease = %args.substrate_lease,
+        data_disk = %args.substrate_data_disk,
+        blob_store = %args.substrate_blob_store,
+        "cluster config (HA P0: schema/config only — not wired)"
+    );
+
     let data_dir = args.data_dir.clone();
     let guest_kernel = resolve_guest_kernel(&args.fc_dir);
     tracing::info!(kernel = %guest_kernel.display(), "guest kernel selected");
@@ -1469,6 +1565,11 @@ async fn handle_deploy(
                 ip,
                 tap_device: tap,
                 mac,
+                // HA P0: schema present but not populated here — the leader's placement
+                // (P3) stamps host_id/placement_epoch. Single-node leaves them at their
+                // defaults (empty / 0), identical to pre-HA records.
+                host_id: String::new(),
+                placement_epoch: 0,
             };
             plat.store.save_vm_allocation(&alloc)?;
             info!(project = %project_id, ip = %alloc.ip, "allocated new IP");
