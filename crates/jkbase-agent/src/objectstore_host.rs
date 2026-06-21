@@ -27,8 +27,10 @@ use jkbase::objectstore::store::Host;
 
 /// The project's default binding bucket. The WIT exposes no bucket surface; every key lives
 /// under this one bucket in the project's own object-store namespace (the function can also
-/// use the SigV4-secret path for other buckets). Auto-created on first `put`.
-const BINDING_BUCKET: &str = "fn";
+/// use the SigV4-secret path for other buckets). Auto-created on first `put`. MUST satisfy
+/// the object store's bucket-name rule (3–63 lowercase alnum/hyphen); "fn" (2 chars) is
+/// rejected as InvalidBucketName.
+const BINDING_BUCKET: &str = "functions";
 /// SigV4 region — self-consistent (the verify path derives the region from the signed scope),
 /// matches the rest of the platform's `us-east-1` convention.
 const REGION: &str = "us-east-1";
@@ -297,6 +299,20 @@ pub fn add_to_linker(linker: &mut wasmtime::component::Linker<HostState>) -> was
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binding_bucket_is_a_valid_s3_bucket_name() {
+        // The object store enforces 3–63 lowercase alnum/hyphen, no leading/trailing hyphen
+        // (jkbase-objectstore validate_bucket). A too-short name → InvalidBucketName (400 →
+        // opaque Internal), which silently broke the binding before. Lock it.
+        let b = BINDING_BUCKET;
+        assert!((3..=63).contains(&b.len()), "binding bucket must be 3-63 chars: {b:?}");
+        assert!(
+            b.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+            "binding bucket must be lowercase alnum/hyphen: {b:?}"
+        );
+        assert!(!b.starts_with('-') && !b.ends_with('-'));
+    }
 
     #[test]
     fn key_validation() {
