@@ -13,8 +13,8 @@ use jkbase_common::config::PlatformEgress;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    month_start_epoch, DomainKind, DomainRecord, DomainStatus, ProjectState, QuotaStatus,
-    SnapshotMeta, Store, VmAllocation,
+    month_start_epoch, DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord,
+    ProjectState, QuotaStatus, SnapshotMeta, Store, VmAllocation,
 };
 use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
@@ -528,6 +528,50 @@ async fn self_fence_project(
     let _ = data_disk.detach(project_id).await;
 }
 
+/// HA P3 — hosts whose heartbeat has gone stale (last beat older than `threshold_secs`
+/// before `now`), excluding `self_id` (we're alive) and never-beaten rows
+/// (`last_heartbeat == 0`, e.g. a peer that just registered). The leader reassigns these
+/// (P3 reconciler/placement); this card only DETECTS them.
+fn dead_hosts<'a>(
+    hosts: &'a [HostRecord],
+    now: u64,
+    threshold_secs: u64,
+    self_id: &str,
+) -> Vec<&'a HostRecord> {
+    hosts
+        .iter()
+        .filter(|h| h.host_id != self_id)
+        .filter(|h| h.last_heartbeat != 0)
+        .filter(|h| now.saturating_sub(h.last_heartbeat) > threshold_secs)
+        .collect()
+}
+
+/// HA P3 — the cluster heartbeat. Upserts THIS host's HOSTS row with a fresh
+/// `last_heartbeat` every [`HEARTBEAT_INTERVAL`] (re-registering if the row vanished), so
+/// peers/the leader can tell it is alive WITHOUT a cross-host TCP probe (which can't cross
+/// the per-host network islands). When this host is the leader it also scans for peers
+/// whose heartbeat has gone stale and logs them — the P3 reconciler consumes those to
+/// reassign their projects. Single-node: the one host beats itself and sees no dead peers.
+async fn host_heartbeat_loop(store: Store, mut self_host: HostRecord, is_leader: Arc<AtomicBool>) {
+    loop {
+        self_host.last_heartbeat = jkbase_control::auth::timestamp();
+        if let Err(e) = store.save_host(&self_host) {
+            warn!(host_id = %self_host.host_id, error = %e, "failed to write host heartbeat");
+        }
+        if is_leader.load(Ordering::Relaxed)
+            && let Ok(hosts) = store.list_hosts()
+        {
+            let now = jkbase_control::auth::timestamp();
+            for h in dead_hosts(&hosts, now, DEAD_HOST_THRESHOLD.as_secs(), &self_host.host_id) {
+                warn!(host_id = %h.host_id, region = %h.region,
+                      stale_secs = now.saturating_sub(h.last_heartbeat),
+                      "dead host detected (stale heartbeat) — pending reconcile");
+            }
+        }
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmLifecycle {
     Running,
@@ -590,6 +634,12 @@ const DISK_FENCE_DEADLINE: Duration = Duration::from_secs(15);
 /// Bounding each attempt turns a hang into a prompt transient error, so the deadline clock
 /// (anchored at last success) keeps advancing and the host self-fences in time.
 const RENEW_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a host re-asserts its own liveness into HOSTS (the cluster heartbeat).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Past this with no heartbeat, the leader treats a host as dead and (P3 reconciler/
+/// placement) reassigns its projects. Tunable for the RTO budget; kept above a few
+/// heartbeat intervals so one missed beat / a brief GC pause is not a false positive.
+const DEAD_HOST_THRESHOLD: Duration = Duration::from_secs(15);
 
 impl PlatformState {
     /// HA P2: whether this host currently holds cluster leadership. Advisory until P3
@@ -807,6 +857,8 @@ async fn main() -> Result<()> {
     let lease_for_election = lease.clone();
     let lease_for_fence = lease.clone();
     let host_id_for_election = host_id.clone();
+    let host_id_for_heartbeat = host_id.clone();
+    let is_leader_for_heartbeat = is_leader.clone();
 
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
@@ -840,6 +892,27 @@ async fn main() -> Result<()> {
     // before a survivor attaches. Inert on a single node (FlockLease renew always
     // succeeds while we hold the lock).
     tokio::spawn(disk_fence_loop(platform.clone(), lease_for_fence));
+
+    // HA P3: register THIS host in the fleet (HOSTS) and heartbeat it so peers/the leader
+    // know it is alive without a cross-host TCP probe; when leader, it detects stale peers.
+    let self_host = HostRecord {
+        host_id: host_id_for_heartbeat,
+        region: args.region.clone(),
+        public_addr: args.public_addr.clone(),
+        last_heartbeat: 0,
+        cpu_template_id: args.cpu_template_id.clone(),
+        kernel_id: args.kernel_id.clone(),
+        capacity: HostCapacity {
+            vcpus: args.host_vcpus,
+            mem_mib: args.host_mem_mib,
+            max_vms: args.host_max_vms,
+        },
+    };
+    tokio::spawn(host_heartbeat_loop(
+        store.clone(),
+        self_host,
+        is_leader_for_heartbeat,
+    ));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
@@ -1273,12 +1346,20 @@ async fn shutdown_signal(
 
 async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
     let plat = platform.lock().await;
+    let me_host = plat.host_id.clone();
     let allocs = match plat.store.list_vm_allocations() {
         Ok(a) => a,
         Err(_) => return,
     };
 
     for alloc in &allocs {
+        // Only probe our OWN VMs. A peer host's VM IP lives on its own network island,
+        // unreachable from here, so a TCP probe would false-negative and wrongly reap a
+        // live peer's allocation; peer/host liveness is via heartbeats (HOSTS), not TCP.
+        // (Empty host_id = single-node / pre-placement = treat as local.)
+        if !alloc.host_id.is_empty() && alloc.host_id != me_host {
+            continue;
+        }
         let reachable = tokio::time::timeout(
             Duration::from_secs(2),
             tokio::net::TcpStream::connect(format!("{}:80", alloc.ip)),
@@ -3651,6 +3732,33 @@ mod tests {
         assert!(a.renew(&ta, ttl).await.is_err());
 
         let _ = std::fs::remove_dir_all(&leases);
+    }
+
+    #[test]
+    fn dead_hosts_flags_only_stale_peers() {
+        // HA P3: the leader treats a peer as dead only when its heartbeat is genuinely
+        // stale — never itself, and never a just-registered peer that hasn't beat yet.
+        let h = |id: &str, hb: u64| HostRecord {
+            host_id: id.into(),
+            region: "r".into(),
+            public_addr: None,
+            last_heartbeat: hb,
+            cpu_template_id: None,
+            kernel_id: None,
+            capacity: HostCapacity::default(),
+        };
+        let now = 1000;
+        let hosts = vec![
+            h("self", 999),  // me — excluded even though "fresh"
+            h("fresh", 990), // 10s ago, within threshold → alive
+            h("stale", 980), // 20s ago, past 15s → dead
+            h("never", 0),   // registered, never beat → excluded (not a false positive)
+        ];
+        let dead: Vec<&str> = dead_hosts(&hosts, now, 15, "self")
+            .iter()
+            .map(|h| h.host_id.as_str())
+            .collect();
+        assert_eq!(dead, vec!["stale"]);
     }
 
     #[test]
