@@ -4,6 +4,7 @@ mod dmverity;
 mod function_egress;
 mod function_runtime;
 mod log_sink;
+mod objectstore_host;
 mod static_server;
 
 use anyhow::{Context, Result};

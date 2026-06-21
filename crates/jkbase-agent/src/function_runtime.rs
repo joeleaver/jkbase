@@ -240,7 +240,8 @@ fn resolve_kind(declared: Option<RuntimeKind>, bytes: &[u8]) -> Result<RuntimeKi
 /// `WasiHttpView` (incoming + the host-mediated outgoing gate), and holds the memory
 /// limiter. Carries the function's immutable resolved egress policy + the shared egress
 /// context (pinned resolver, platform facts, DoS limiters), snapshotted per invocation.
-struct HostState {
+/// `pub(crate)` so the `objectstore_host` module can impl the generated `store::Host` on it.
+pub(crate) struct HostState {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     table: ResourceTable,
@@ -438,6 +439,10 @@ impl FunctionRuntime {
                 // outgoing-handler routes through our denying `send_request`.
                 wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
                 wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+                // The own-bucket capability (jkbase:objectstore/store). A component that does
+                // not import it is unaffected — an extra linker definition is harmless, so the
+                // legacy/HTTP-only functions still instantiate.
+                crate::objectstore_host::add_to_linker(&mut linker)?;
                 let pre =
                     ProxyPre::new(linker.instantiate_pre(&component)?).with_context(|| {
                         format!("pre-instantiate component {}", wasm_path.display())
