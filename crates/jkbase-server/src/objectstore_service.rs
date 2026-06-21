@@ -1612,6 +1612,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn write_with_decoded_content_length_is_accepted() {
+        // The SDK's streaming uploads (put_object_stream / upload_part_stream) go out
+        // chunked with NO Content-Length but DO set x-amz-decoded-content-length. Prove the
+        // front's write_len() picks that up so the write passes the 411 gate and stores —
+        // the production-front proof for the streaming fix (the bare-engine e2e can't show
+        // this, as it has no 411 gate).
+        let dir = tmp("declen");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let app = svc.into_router();
+
+        // Create the bucket (signed; this one carries Content-Length naturally).
+        assert_eq!(
+            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        // A write with NO Content-Length, length declared only via x-amz-decoded-content-length.
+        let body = "streamed-bytes"; // 14 bytes
+        let (auth, amzd) = sigv4::sign_header(
+            "PUT", "storage.test", "/bkt/s.bin", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+        );
+        let req = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bkt/s.bin")
+            .header("host", "storage.test")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-decoded-content-length", body.len().to_string())
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        // It reads back intact.
+        let (st, got) =
+            status_body(app.clone().oneshot(signed("GET", "/bkt/s.bin", &a.access_key_id, &a.secret_key, "")).await.unwrap())
+                .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(got, body);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- console (Bearer) object API ---------------------------------------
 
     /// Create a tenant + a session API token; returns the raw bearer token string.

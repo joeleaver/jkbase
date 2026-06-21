@@ -1,11 +1,16 @@
-//! AWS Signature Version 4 (query-string / presigned form) for the object store.
-//! One implementation serves both presigned URLs (this card) and request auth (the
-//! auth card): [`presign`] mints a time-limited signed URL, [`verify_presigned`]
-//! validates one against the access key's secret + expiry.
+//! AWS Signature Version 4 for the jkbase S3-compatible object store — the **one**
+//! canonicalisation shared by every party so none can diverge: the server verify
+//! path ([`verify_header`] / [`verify_presigned`]), the agent's own-bucket sign
+//! path, and the tenant-facing `jkbase-objectstore-client`. A leaf crate (pure
+//! `hmac`/`sha2`, no other deps) precisely so a tenant SDK can sign without pulling
+//! in the server surface, while staying byte-identical to what the server verifies.
 //!
-//! Canonicalisation follows the SigV4 spec (UNSIGNED-PAYLOAD, `host` the only
-//! signed header) so the round-trip is self-consistent; byte-exact interop with
-//! the AWS SDKs should be spot-checked against a real client when wired up.
+//! [`sign_header`] / [`presign`] produce a signature; [`verify_header`] /
+//! [`verify_presigned`] check one against the access key's secret (+ expiry, for
+//! presigned). Canonicalisation follows the SigV4 spec (header-auth signs
+//! `host;x-amz-content-sha256;x-amz-date`; presign signs `host` only). The
+//! `cross_vector` tests pin the exact signatures the JS SDK
+//! (`sdk/js/objectstore.test.mjs`) and the Rust client must reproduce.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -50,7 +55,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// RFC 3986 percent-encoding as SigV4 requires (encode everything but the
 /// unreserved set; `/` is left intact in paths when `encode_slash` is false).
-fn uri_encode(s: &str, encode_slash: bool) -> String {
+///
+/// Public so the tenant client can build the on-the-wire request-target (path with
+/// `encode_slash=false`, query keys/values with `encode_slash=true`) using the *same*
+/// encoder it signs with — guaranteeing the bytes the server canonicalises match the
+/// bytes that were signed, for any key (spaces, `%`, unicode, …).
+pub fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -150,7 +160,9 @@ fn parse_amz_date(s: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
 }
 
-/// Mint a presigned URL `"<path>?<query>"` valid for `expires_secs` from `now_unix`.
+/// Mint a presigned URL `"<encoded-path>?<query>"` valid for `expires_secs` from `now_unix`.
+/// The path is returned percent-encoded (the same form the signature covers), so the URL is
+/// usable verbatim and verifies after the server percent-decodes it.
 #[allow(clippy::too_many_arguments)] // inherent to a SigV4 signer; all distinct inputs
 pub fn presign(
     method: &str,
@@ -182,7 +194,11 @@ pub fn presign(
         .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
         .collect::<Vec<_>>()
         .join("&");
-    format!("{path}?{qs}")
+    // Return the ENCODED path — the same form the signature covers (build_canonical_request
+    // signs `uri_encode(path, false)`). Returning the raw path would put literal bytes
+    // (spaces, `%`, …) in the URL that an HTTP client re-encodes differently, so the
+    // signature would not verify.
+    format!("{}?{qs}", uri_encode(path, false))
 }
 
 /// Validate a presigned request. `query` is the request's parsed query params.
@@ -398,6 +414,25 @@ mod tests {
             verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW + 100),
             Ok(KEY.to_string())
         );
+    }
+
+    #[test]
+    fn presign_with_special_char_key_round_trips() {
+        // The minted URL must carry the ENCODED path (the form the signature covers); the
+        // server pct-decodes the received path before verifying, so decode-then-verify
+        // passes. (Before the fix the URL embedded the raw key, so a space/& key never
+        // verified.)
+        for key in ["/b/a b", "/b/a&b", "/b/p l/u s"] {
+            let url = presign("GET", "s3.jkbase.app", key, KEY, SECRET, "us-east-1", 900, NOW);
+            let (enc_path, q) = split(&url);
+            assert!(!enc_path.contains(' '), "path left unencoded: {enc_path}");
+            let decoded = pct_decode(&enc_path); // what the server does before verify_presigned
+            assert_eq!(
+                verify_presigned("GET", "s3.jkbase.app", &decoded, &q, lookup, NOW + 10),
+                Ok(KEY.to_string()),
+                "key {key:?}"
+            );
+        }
     }
 
     #[test]
