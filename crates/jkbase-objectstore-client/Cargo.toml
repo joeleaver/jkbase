@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 description = "Tenant-facing Rust client for the jkbase S3-compatible object store (SigV4, streaming, multipart, presigned URLs)."
+readme = "README.md"
+keywords = ["s3", "object-storage", "sigv4", "jkbase", "client"]
+categories = ["api-bindings", "web-programming::http-client"]
 
 [dependencies]
 # Just the shared SigV4 signer + an HTTP client — NOT the server engine. This is the
