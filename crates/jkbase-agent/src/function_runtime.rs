@@ -207,6 +207,19 @@ struct FunctionSidecar {
     /// (deny public; OWN-stuff still reachable), never silently allow-all.
     #[serde(default)]
     egress: Option<ResolvedEgress>,
+    /// The platform-managed own-bucket binding credential (reserved channel, NOT in `env` —
+    /// P0-OBJ-RESERVED-CHANNEL/-NOKEY). Present only when the host minted one this deploy;
+    /// the agent signs SigV4 to the pinned storage host with it. Absent ⇒ the `store`
+    /// capability fails closed (access-denied).
+    #[serde(default)]
+    storage_credential: Option<StorageCredential>,
+}
+
+/// The own-bucket binding credential read from the function sidecar's reserved channel.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct StorageCredential {
+    pub access_key_id: String,
+    pub secret_key: String,
 }
 
 /// Classify a wasm blob by its 8-byte preamble: `\0asm` magic + a u16 version and a u16
@@ -247,9 +260,13 @@ pub(crate) struct HostState {
     table: ResourceTable,
     limits: StoreLimits,
     egress: ResolvedEgress,
-    egress_ctx: Arc<EgressContext>,
+    pub(crate) egress_ctx: Arc<EgressContext>,
     /// This function's name — stamped onto each egress observe record.
     function: String,
+    /// The own-bucket binding credential, if the host minted one this deploy. The
+    /// `store::Host` impl (objectstore_host.rs) signs SigV4 with it to the pinned storage
+    /// host; `None` ⇒ the `store` capability fails closed.
+    pub(crate) storage_cred: Option<StorageCredential>,
 }
 
 impl IoView for HostState {
@@ -298,6 +315,7 @@ impl HostState {
         egress: ResolvedEgress,
         egress_ctx: Arc<EgressContext>,
         function: String,
+        storage_cred: Option<StorageCredential>,
     ) -> Self {
         let mut builder = WasiCtxBuilder::new();
         // `wasi:sockets` STAYS denied — HTTP egress is enabled ONLY through `send_request`,
@@ -322,6 +340,7 @@ impl HostState {
             egress,
             egress_ctx,
             function,
+            storage_cred,
         }
     }
 }
@@ -340,6 +359,8 @@ enum LoadedFunction {
         env: BTreeMap<String, String>,
         /// Immutable host-resolved PUBLIC-egress policy for this function.
         egress: ResolvedEgress,
+        /// Own-bucket binding credential (reserved sidecar channel), if minted.
+        storage_cred: Option<StorageCredential>,
     },
 }
 
@@ -404,6 +425,7 @@ impl FunctionRuntime {
         // Absent ⇒ a function the host never processed (hand-placed/legacy): fail closed to
         // Sandbox (deny public; OWN-stuff still reachable), never silently allow-all.
         let egress = sidecar.egress.unwrap_or(ResolvedEgress::Sandbox);
+        let storage_cred = sidecar.storage_credential;
         // Prefer a precompiled sibling `.cwasm` (deploy-time AOT) — deserialize is ~ms vs
         // seconds to recompile the big JS engine. Falls back to compiling the `.wasm` if
         // the `.cwasm` is absent or incompatible (e.g. a CPU/wasmtime skew).
@@ -451,6 +473,7 @@ impl FunctionRuntime {
                     pre: Arc::new(pre),
                     env,
                     egress,
+                    storage_cred,
                 }
             }
         };
@@ -513,7 +536,12 @@ impl FunctionRuntime {
                     }
                 }
             }
-            LoadedFunction::Component { pre, env, egress } => {
+            LoadedFunction::Component {
+                pre,
+                env,
+                egress,
+                storage_cred,
+            } => {
                 // The wall-clock bound + task abort live inside invoke_component (it owns the
                 // handler task, which must be aborted — not merely dropped — on timeout).
                 invoke_component(
@@ -522,6 +550,7 @@ impl FunctionRuntime {
                     egress.clone(),
                     self.egress_ctx.clone(),
                     name.to_string(),
+                    storage_cred.clone(),
                     req,
                 )
                 .await
@@ -612,15 +641,20 @@ fn invoke_wasip1(func: &LoadedFunction, req: &FunctionRequest) -> Result<Functio
 /// `FunctionRequest`, runs the exported `incoming-handler`, and reads back the
 /// `OutgoingResponse` under a size cap. Bounded by fuel + the shared epoch deadline; the
 /// caller wraps this in the outer wall-clock timeout.
+#[allow(clippy::too_many_arguments)] // per-invocation host-state inputs; all load-bearing
 async fn invoke_component(
     pre: Arc<ProxyPre<HostState>>,
     env: BTreeMap<String, String>,
     egress: ResolvedEgress,
     egress_ctx: Arc<EgressContext>,
     function: String,
+    storage_cred: Option<StorageCredential>,
     req: FunctionRequest,
 ) -> Result<FunctionResponse> {
-    let mut store = Store::new(pre.engine(), HostState::new(&env, egress, egress_ctx, function));
+    let mut store = Store::new(
+        pre.engine(),
+        HostState::new(&env, egress, egress_ctx, function, storage_cred),
+    );
     store.set_epoch_deadline(epoch_deadline_ticks());
     store.limiter(|s| &mut s.limits);
 

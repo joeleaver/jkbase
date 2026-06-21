@@ -1710,8 +1710,10 @@ name = "jkbase-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "toml 0.8.23",
 ]
 
@@ -1751,6 +1753,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "http-body-util",
+ "jkbase-common",
  "md-5",
  "reqwest",
  "serde",

@@ -1452,6 +1452,23 @@ async fn handle_deploy(
     // Host-asserted platform egress facts, stamped into this VM's metadata image as
     // `_platform.json` (the agent's OWN-storage host + Zone-2 deny-set). Read under the lock.
     let platform_egress = plat.platform_egress.clone();
+    // Mint (rotate) the project's own-bucket binding credential and write it into the
+    // function sidecars' reserved channel below. Owner-bound to the project's CURRENT tenant
+    // (the object-store owner re-bind fail-closes a stale one); a fresh secret each deploy.
+    // Only when the project has an owner — an ownerless project gets no binding (the SigV4
+    // owner re-check would reject it anyway). Best-effort: a mint failure must not fail the
+    // deploy (functions just can't use the typed binding until the next deploy).
+    let storage_binding: Option<layer_plan::StorageBinding> = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.tenant_id)
+        .and_then(|tenant| plat.store.mint_binding_key(project_id, &tenant).ok())
+        .map(|k| layer_plan::StorageBinding {
+            access_key_id: k.access_key_id,
+            secret_key: k.secret_key,
+        });
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -1471,7 +1488,14 @@ async fn handle_deploy(
             // verify=true: cold-boot deploy re-checks every tenant + platform blob's
             // sha256 before it can be attached to a VM.
             let plan = layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, true)?;
-            layer_plan::build_metadata_image(&content_dir, &plan, &secrets, &platform_egress, &out)?;
+            layer_plan::build_metadata_image(
+                &content_dir,
+                &plan,
+                &secrets,
+                &platform_egress,
+                storage_binding.as_ref(),
+                &out,
+            )?;
             Ok(plan)
         })
         .await

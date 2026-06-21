@@ -3575,6 +3575,7 @@ name = "api"
             &plan,
             &Default::default(),
             &Default::default(),
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -3715,6 +3716,7 @@ name = "api"
             &plan,
             &Default::default(),
             &Default::default(),
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -3927,6 +3929,7 @@ name = "api"
             &plan,
             &Default::default(),
             &platform,
+            None,
             &meta_img,
         )
         .expect("build the metadata image");

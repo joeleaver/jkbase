@@ -34,7 +34,7 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::HOST;
 use hyper_util::rt::TokioIo;
@@ -138,7 +138,98 @@ impl EgressContext {
             log_sink,
         }))
     }
+
+    /// The host-asserted platform storage host (e.g. `storage.jkbase.app`), if set. The
+    /// own-bucket binding signs SigV4 for this host only.
+    pub fn storage_host(&self) -> Option<&str> {
+        self.storage_host.as_deref()
+    }
+
+    /// Issue a host-built HTTP/1.1 request to the OWN platform storage host over the Zone-1
+    /// path and return `(status, response_body)` buffered. This is how the own-bucket binding
+    /// reaches the object store: resolve `storage_host` via the PINNED resolver, REQUIRE the
+    /// dialed IP to be a platform IP (P0-OBJ-PINNED-DEST — the agent can ONLY ever reach the
+    /// platform storage ingress, never an attacker host, even if other config is wrong),
+    /// connect pinned, TLS with SNI = the storage host (P0-EGRESS-TLS-E2E), send. `headers`
+    /// are extra request headers (the SigV4 Authorization + x-amz-* the caller computed);
+    /// `Host`, `content-length` are set here. The response body is capped at `MAX_RESPONSE_BODY`.
+    pub async fn own_storage_request(
+        &self,
+        method: &str,
+        path_and_query: &str,
+        headers: &[(String, String)],
+        body: Vec<u8>,
+    ) -> Result<(u16, Vec<u8>), ErrorCode> {
+        let host = self.storage_host.as_deref().ok_or(ErrorCode::InternalError(None))?;
+        // Resolve via the pinned resolver; the dial target MUST be a platform IP.
+        let addrs: Vec<IpAddr> = match self.resolver.lookup_ip(host).await {
+            Ok(l) => l.iter().filter(|ip| matches!(ip, IpAddr::V4(_))).collect(),
+            Err(_) => Vec::new(),
+        };
+        let ip = addrs
+            .into_iter()
+            .find(|ip| self.platform_ips.contains(ip))
+            .ok_or(ErrorCode::DestinationIpProhibited)?;
+        let addr = SocketAddr::new(ip, 443);
+
+        let _permit = self
+            .inflight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ErrorCode::ConnectionLimitReached)?;
+
+        let tcp = timeout(CONNECT_TIMEOUT_CAP, TcpStream::connect(addr))
+            .await
+            .map_err(|_| ErrorCode::ConnectionTimeout)?
+            .map_err(|_| ErrorCode::ConnectionRefused)?;
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| ErrorCode::InternalError(None))?
+            .to_owned();
+        let connector = tokio_rustls::TlsConnector::from(self.tls.clone());
+        let tls = timeout(CONNECT_TIMEOUT_CAP, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| ErrorCode::ConnectionTimeout)?
+            .map_err(|_| ErrorCode::TlsProtocolError)?;
+        let (mut sender, conn) =
+            timeout(CONNECT_TIMEOUT_CAP, hyper::client::conn::http1::handshake(TokioIo::new(tls)))
+                .await
+                .map_err(|_| ErrorCode::ConnectionTimeout)?
+                .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let worker = wasmtime_wasi::runtime::spawn(async move {
+            let _permit = _permit;
+            let _ = conn.await;
+        });
+
+        let mut builder = hyper::Request::builder()
+            .method(method)
+            .uri(path_and_query)
+            .header(HOST, host)
+            .header("content-length", body.len());
+        for (k, v) in headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let req = builder
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|_| ErrorCode::InternalError(None))?;
+
+        let resp = timeout(FIRST_BYTE_TIMEOUT_CAP, sender.send_request(req))
+            .await
+            .map_err(|_| ErrorCode::ConnectionReadTimeout)?
+            .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let status = resp.status().as_u16();
+        let body = Limited::new(resp.into_body(), MAX_OWN_STORAGE_BODY)
+            .collect()
+            .await
+            .map_err(|_| ErrorCode::HttpProtocolError)?
+            .to_bytes()
+            .to_vec();
+        worker.abort();
+        Ok((status, body))
+    }
 }
+
+/// Cap on a buffered own-bucket response body (matches the function response ceiling).
+const MAX_OWN_STORAGE_BODY: usize = 10 * 1024 * 1024;
 
 /// Record one egress decision into the reserved `stream == "egress"` channel (host-only,
 /// coalesced; P0-OBS-UNCONDITIONAL / -STREAM-RESERVED). Metadata only — see [`EgressEvent`].

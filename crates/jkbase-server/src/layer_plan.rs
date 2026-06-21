@@ -17,6 +17,15 @@
 use anyhow::{ensure, Context, Result};
 use jkbase_common::config::PlatformEgress;
 use jkbase_common::layers::{RuntimeLayers, ServerLayers, VerityParams};
+
+/// The platform-managed own-bucket binding credential written into each function sidecar's
+/// reserved channel at deploy (see [`inject_function_secrets`]). Minted/rotated per deploy
+/// by the control store; the agent signs SigV4 to the pinned storage host with it.
+#[derive(Debug, Clone, Default)]
+pub struct StorageBinding {
+    pub access_key_id: String,
+    pub secret_key: String,
+}
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -394,6 +403,7 @@ pub fn build_metadata_image(
     plan: &LayerPlan,
     secrets: &BTreeMap<String, String>,
     platform: &PlatformEgress,
+    binding: Option<&StorageBinding>,
     out: &Path,
 ) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
@@ -424,8 +434,12 @@ pub fn build_metadata_image(
     if !secrets.is_empty() {
         inject_secrets(&stage.join("_servers"), secrets)
             .context("inject project secrets into server manifests")?;
-        inject_function_secrets(&stage.join("_functions"), secrets)
-            .context("inject project secrets into function sidecars")?;
+    }
+    // Function sidecars always get a pass when there are secrets OR a binding credential to
+    // write (the own-bucket credential must land even for a secret-less project).
+    if !secrets.is_empty() || binding.is_some() {
+        inject_function_secrets(&stage.join("_functions"), secrets, binding)
+            .context("inject project secrets + binding into function sidecars")?;
     }
 
     // Bake the device map the agent reads at boot...
@@ -554,6 +568,7 @@ fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Res
 fn inject_function_secrets(
     functions_dir: &Path,
     secrets: &BTreeMap<String, String>,
+    binding: Option<&StorageBinding>,
 ) -> Result<()> {
     if !functions_dir.is_dir() {
         return Ok(());
@@ -573,17 +588,35 @@ fn inject_function_secrets(
         let Some(obj) = manifest.as_object_mut() else {
             continue;
         };
-        let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
-        let Some(env) = env.as_object_mut() else {
-            continue;
-        };
-        for (k, v) in secrets {
-            // A key with `=`/NUL/newline, or a NUL in the value, would break
-            // `WasiCtxBuilder::env`; drop just that var rather than fail the whole load.
-            if k.is_empty() || k.contains(['=', '\0', '\n', '\r']) || v.contains('\0') {
+        {
+            let env = obj.entry("env").or_insert_with(|| serde_json::json!({}));
+            let Some(env) = env.as_object_mut() else {
                 continue;
+            };
+            for (k, v) in secrets {
+                // A key with `=`/NUL/newline, or a NUL in the value, would break
+                // `WasiCtxBuilder::env`; drop just that var rather than fail the whole load.
+                if k.is_empty() || k.contains(['=', '\0', '\n', '\r']) || v.contains('\0') {
+                    continue;
+                }
+                env.insert(k.clone(), serde_json::Value::String(v.clone()));
             }
-            env.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
+        // The own-bucket binding credential rides a RESERVED top-level field, NOT `env`
+        // (P0-OBJ-RESERVED-CHANNEL): no namespace overlap with tenant secrets, and never
+        // exposed to the guest's process.env (the agent reads it host-side, P0-OBJ-NOKEY).
+        // Written last so it always wins over anything in the (now host-guarded) sidecar.
+        if let Some(b) = binding {
+            obj.insert(
+                "storage_credential".to_string(),
+                serde_json::json!({
+                    "access_key_id": b.access_key_id,
+                    "secret_key": b.secret_key,
+                }),
+            );
+        } else {
+            // No binding this deploy → ensure no stale credential lingers in the sidecar.
+            obj.remove("storage_credential");
         }
         std::fs::write(&sidecar, serde_json::to_vec_pretty(&manifest)?)?;
     }
@@ -687,7 +720,11 @@ mod tests {
         secrets.insert("BAD=KEY".to_string(), "x".to_string()); // '=' in key → skipped
         secrets.insert("NUL_VAL".to_string(), "a\0b".to_string()); // NUL value → skipped
 
-        inject_function_secrets(&functions, &secrets).unwrap();
+        let binding = StorageBinding {
+            access_key_id: "JKBND-proj".into(),
+            secret_key: "s3cr3t".into(),
+        };
+        inject_function_secrets(&functions, &secrets, Some(&binding)).unwrap();
 
         let api: serde_json::Value =
             serde_json::from_slice(&std::fs::read(functions.join("api.json")).unwrap()).unwrap();
@@ -696,15 +733,26 @@ mod tests {
         assert_eq!(api["env"]["PATH"], "/custom", "no reserved filter for functions");
         assert!(!api["env"].as_object().unwrap().contains_key("BAD=KEY"));
         assert!(!api["env"].as_object().unwrap().contains_key("NUL_VAL"));
+        // The binding rides a reserved top-level field, NOT env (P0-OBJ-RESERVED-CHANNEL).
+        assert_eq!(api["storage_credential"]["access_key_id"], "JKBND-proj");
+        assert_eq!(api["storage_credential"]["secret_key"], "s3cr3t");
+        assert!(!api["env"].as_object().unwrap().contains_key("storage_credential"));
 
         // The function with no prior sidecar gets one created (env only; runtime → sniff).
         let beat: serde_json::Value =
             serde_json::from_slice(&std::fs::read(functions.join("beat.json")).unwrap()).unwrap();
         assert_eq!(beat["env"]["API_KEY"], "sk-live-123");
         assert!(beat.get("runtime").is_none());
+        assert_eq!(beat["storage_credential"]["access_key_id"], "JKBND-proj");
+
+        // A later deploy with NO binding clears the stale credential.
+        inject_function_secrets(&functions, &secrets, None).unwrap();
+        let api2: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(functions.join("api.json")).unwrap()).unwrap();
+        assert!(api2.get("storage_credential").is_none(), "stale credential cleared when binding absent");
 
         // Missing dir is a no-op.
-        inject_function_secrets(&dir.join("_nope"), &secrets).unwrap();
+        inject_function_secrets(&dir.join("_nope"), &secrets, None).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
