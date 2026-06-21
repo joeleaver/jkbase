@@ -172,6 +172,14 @@ impl EgressContext {
             .ok_or(ErrorCode::DestinationIpProhibited)?;
         let addr = SocketAddr::new(ip, 443);
 
+        // Own-bucket traffic is per-VM (= per-project) egress like any other and MUST share
+        // the one connect-storm budget (P0-DOS-CONNECT-STORM, review HIGH): phase 1 has no
+        // keep-alive pool, so each call is a fresh connect+TLS — without this a function could
+        // tight-loop store ops and storm the SHARED storage ingress + burn agent TLS-handshake
+        // CPU, bypassing the rate gate `gate_send` enforces.
+        if !self.rate.lock().expect("rate mutex").try_take() {
+            return Err(ErrorCode::ConnectionLimitReached);
+        }
         let _permit = self
             .inflight
             .clone()
