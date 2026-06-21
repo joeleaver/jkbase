@@ -268,12 +268,13 @@ fn resolve_hostname() -> String {
 
 // HA P2 — cluster leader election parameters.
 const LEADER_SCOPE: &str = "cluster-leader";
-const LEADER_TTL: Duration = Duration::from_secs(15);
+const LEADER_TTL: Duration = Duration::from_secs(20);
 const LEADER_TICK: Duration = Duration::from_secs(5);
-/// How long the leader tolerates TRANSIENT renew failures before stepping down (a real
-/// supersession steps down immediately). Keeps `LEADER_TICK + LEADER_GRACE < LEADER_TTL`
-/// so a deposed leader yields before a peer could steal its still-live key.
-const LEADER_GRACE: Duration = Duration::from_secs(8);
+/// Step down once leadership's time-since-last-successful-renew reaches this (a real
+/// supersession steps down immediately). Keeps
+/// `LEADER_FENCE_DEADLINE + (LEADER_TICK + RENEW_RPC_TIMEOUT) < LEADER_TTL` so a deposed
+/// leader yields before a peer could steal its still-live key.
+const LEADER_FENCE_DEADLINE: Duration = Duration::from_secs(8);
 
 /// Outcome of evaluating one lease renewal in the fence/election loops. We must
 /// discriminate a genuine loss from a transient backend blip: the substrate returns
@@ -282,38 +283,43 @@ const LEADER_GRACE: Duration = Duration::from_secs(8);
 /// [`SubstrateError::Backend`] / I/O error when the authority was momentarily
 /// unreachable while we STILL hold the lease. Acting destructively on the latter (kill
 /// a live VM / drop leadership) on one dropped packet is a self-inflicted outage, so
-/// transient errors are tolerated for `grace` (kept below the lease TTL) before failing
-/// closed.
+/// transient errors are tolerated until a deadline measured from the LAST SUCCESSFUL
+/// renew (the same clock the lease TTL runs on, kept below it) before failing closed.
 #[derive(Debug, PartialEq, Eq)]
 enum FenceDecision {
-    /// Renewal confirmed — we hold the lease; clear any failure window.
+    /// Renewal confirmed — we hold the lease; reset the last-success clock.
     Hold,
-    /// Transient failure, still within grace — keep the lease and retry next tick.
+    /// Transient failure, last success still within the deadline — keep the lease, retry.
     KeepWaiting,
-    /// Definitively lost (superseded/expired), or transient failures exceeded grace —
+    /// Definitively lost (superseded/expired), or last success aged past the deadline —
     /// act now (self-fence / step down), failing closed before the lease can expire.
     FenceNow,
 }
 
-/// Decide what a renewal result means. `failing_since` is when this scope's renewals
-/// first started failing (None if the last attempt succeeded); `now`/`grace` bound how
-/// long transient failures are tolerated before failing closed.
+/// Decide what a renewal result means. `last_success` is when this scope's lease was last
+/// confirmed; `now`/`deadline` bound how long transient failures are tolerated. Anchoring
+/// at last success (not first-observed-failure) and bounding each renew RPC keeps the
+/// self-fence ahead of the lease TTL even when renews hang or fail slowly under a partition.
 fn evaluate_renew(
     result: &Result<FenceToken, SubstrateError>,
-    failing_since: Option<Instant>,
+    last_success: Instant,
     now: Instant,
-    grace: Duration,
+    deadline: Duration,
 ) -> FenceDecision {
     match result {
         Ok(_) => FenceDecision::Hold,
         // A newer token superseded us (etcd also maps an expired/absent key here): lost.
         Err(SubstrateError::Fenced { .. }) => FenceDecision::FenceNow,
-        // Transient (backend unreachable / I/O): we still hold the lease. Tolerate until
-        // the failure window approaches the TTL, then fail closed.
-        Err(_) => match failing_since {
-            Some(since) if now.duration_since(since) >= grace => FenceDecision::FenceNow,
-            _ => FenceDecision::KeepWaiting,
-        },
+        // Transient (backend unreachable / I/O / a timed-out renew RPC): we still hold the
+        // lease. Tolerate until we've been unable to confirm it for `deadline` since the
+        // last success — then fail closed before the TTL can expire and admit a survivor.
+        Err(_) => {
+            if now.duration_since(last_success) >= deadline {
+                FenceDecision::FenceNow
+            } else {
+                FenceDecision::KeepWaiting
+            }
+        }
     }
 }
 
@@ -326,32 +332,34 @@ fn evaluate_renew(
 /// the data-disk write-boundary self-fence, NOT this flag, is the split-brain guarantee.
 async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader: Arc<AtomicBool>) {
     let mut token: Option<FenceToken> = None;
-    let mut failing_since: Option<Instant> = None;
+    let mut last_success = Instant::now();
     loop {
         if let Some(t) = token.take() {
-            // We hold leadership: re-assert it (keepalive). Discriminate a genuine loss
-            // (Fenced → step down now) from a transient blip (retain leadership within
-            // grace) so one dropped packet never flaps leadership.
-            let result = lease.renew(&t, LEADER_TTL).await;
-            match evaluate_renew(&result, failing_since, Instant::now(), LEADER_GRACE) {
+            // Re-assert leadership (keepalive), bounded so a blackhole partition can't hang
+            // the loop. Discriminate a genuine loss (Fenced → step down now) from a transient
+            // blip/timeout (retain within the deadline) so one dropped packet never flaps.
+            let result =
+                match tokio::time::timeout(RENEW_RPC_TIMEOUT, lease.renew(&t, LEADER_TTL)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(SubstrateError::Backend("leader lease renew timed out".into())),
+                };
+            match evaluate_renew(&result, last_success, Instant::now(), LEADER_FENCE_DEADLINE) {
                 FenceDecision::Hold => {
-                    failing_since = None;
+                    last_success = Instant::now();
                     is_leader.store(true, Ordering::Relaxed);
                     token = Some(result.unwrap_or(t)); // adopt the refreshed token
                 }
                 FenceDecision::KeepWaiting => {
-                    // Still leader — the lease is held; the authority is briefly
-                    // unreachable. Keep the token and retry next tick.
-                    failing_since.get_or_insert_with(Instant::now);
+                    // Still leader — the lease is held; the authority is briefly unreachable.
+                    // Keep the token and retry next tick.
                     is_leader.store(true, Ordering::Relaxed);
                     token = Some(t);
                     if let Err(e) = &result {
                         warn!(host_id = %host_id, error = %e,
-                              "cluster-leader renew failed transiently; retaining leadership within grace");
+                              "cluster-leader renew failed transiently; retaining leadership within deadline");
                     }
                 }
                 FenceDecision::FenceNow => {
-                    failing_since = None;
                     is_leader.store(false, Ordering::Relaxed);
                     token = None;
                     warn!(host_id = %host_id, "lost cluster leadership; re-contesting");
@@ -363,7 +371,7 @@ async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader:
                 Ok(t) => {
                     info!(host_id = %host_id, epoch = t.epoch, "acquired cluster leadership");
                     is_leader.store(true, Ordering::Relaxed);
-                    failing_since = None;
+                    last_success = Instant::now();
                     token = Some(t);
                 }
                 // Another live host holds it — stay a follower and retry next tick.
@@ -392,10 +400,10 @@ async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader:
 /// process holds the lock, so the fence never trips. Cross-host correctness rides a
 /// distributed lease (EtcdLease) and is exercised by the split-brain test harness.
 async fn disk_fence_loop(platform: Arc<Mutex<PlatformState>>, lease: Arc<dyn Lease>) {
-    // Per-project window of when renewals first started failing, so a transient backend
-    // blip is tolerated (within DISK_FENCE_GRACE) instead of killing a live VM. A genuine
-    // supersession (Fenced) still self-fences immediately.
-    let mut failing_since: HashMap<String, Instant> = HashMap::new();
+    // Per-project time of last SUCCESSFUL renew — the clock the etcd lease TTL also runs
+    // on. A disk self-fences once its last success ages past DISK_FENCE_DEADLINE; a genuine
+    // supersession (Fenced) self-fences immediately.
+    let mut last_success: HashMap<String, Instant> = HashMap::new();
     loop {
         tokio::time::sleep(DISK_RENEW_INTERVAL).await;
         // Snapshot the held tokens, then renew OFF the platform lock — a slow or
@@ -407,36 +415,56 @@ async fn disk_fence_loop(platform: Arc<Mutex<PlatformState>>, lease: Arc<dyn Lea
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
-        let mut still_held: HashSet<String> = HashSet::new();
+        let still_held: HashSet<String> = held.iter().map(|(p, _)| p.clone()).collect();
+        // Seed last-success for freshly-acquired disks (just fenced + attached).
+        for (project, _) in &held {
+            last_success.entry(project.clone()).or_insert_with(Instant::now);
+        }
+        // Renew every held disk CONCURRENTLY, each bounded by RENEW_RPC_TIMEOUT, so one
+        // slow/hung disk never delays another's self-fence (the serialization the review
+        // flagged) — and a blackhole partition becomes a prompt transient error.
+        let mut set = tokio::task::JoinSet::new();
         for (project, token) in held {
-            still_held.insert(project.clone());
-            let result = lease.renew(&token, DISK_LEASE_TTL).await;
-            match evaluate_renew(
-                &result,
-                failing_since.get(&project).copied(),
-                Instant::now(),
-                DISK_FENCE_GRACE,
-            ) {
+            let lease = lease.clone();
+            set.spawn(async move {
+                let r = match tokio::time::timeout(
+                    RENEW_RPC_TIMEOUT,
+                    lease.renew(&token, DISK_LEASE_TTL),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(SubstrateError::Backend("disk lease renew timed out".into())),
+                };
+                (project, token, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let (project, token, result) = match joined {
+                Ok(tuple) => tuple,
+                Err(_) => continue, // a renew task panicked; next tick retries
+            };
+            let since = last_success.get(&project).copied().unwrap_or_else(Instant::now);
+            match evaluate_renew(&result, since, Instant::now(), DISK_FENCE_DEADLINE) {
                 FenceDecision::Hold => {
-                    failing_since.remove(&project);
+                    last_success.insert(project, Instant::now());
                 }
                 FenceDecision::KeepWaiting => {
-                    failing_since.entry(project.clone()).or_insert_with(Instant::now);
                     if let Err(e) = &result {
                         warn!(project = %project, scope = %token.scope, error = %e,
-                              "data-disk lease renew failed transiently; retrying within grace");
+                              "data-disk lease renew failed transiently; retrying within deadline");
                     }
                 }
                 FenceDecision::FenceNow => {
-                    failing_since.remove(&project);
+                    last_success.remove(&project);
                     warn!(project = %project, scope = %token.scope,
                           "data-disk lease lost — self-fencing");
                     self_fence_project(&platform, &project, &token).await;
                 }
             }
         }
-        // Forget failure windows for disks we no longer hold (torn down / fenced).
-        failing_since.retain(|k, _| still_held.contains(k));
+        // Forget tracking for disks we no longer hold (torn down / fenced).
+        last_success.retain(|k, _| still_held.contains(k));
     }
 }
 
@@ -468,11 +496,15 @@ async fn self_fence_project(
             // Token rotated (redeploy) or already released (teardown) — not ours to fence.
             return;
         }
-        // Don't fence a project mid-transition: hibernate has moved the VM handle out and
-        // its paused-but-alive FC still maps the loop device (detaching it here would yank
-        // the disk from under it), and wake re-fences on its own. The in-flight op owns
-        // teardown; the next tick re-evaluates. A paused FC issues no writes, so deferring
-        // is safe.
+        // Don't fence a project mid-transition: an in-flight hibernate owns the VM handle
+        // (so we can neither kill it nor safely detach the loop device its FC still maps),
+        // and wake re-fences on its own. We cannot act here; during the transition a
+        // survivor is instead held off by the attach-time storage fence (LocalLoop liveness
+        // / Ceph blocklist on `attach_rwo`) until the op releases the token, after which the
+        // next tick self-fences if still lost. (A genuine loss is NOT dropped — FenceNow
+        // recurs every tick and bypasses the deadline.) NB the guest may still be writing
+        // in hibernate's brief pre-pause window, so this is defense-in-depth deferral, not
+        // a "no writes" guarantee — the storage-layer fence is the actual backstop.
         if matches!(
             plat.vm_states.get(project_id),
             Some(VmLifecycle::Hibernating) | Some(VmLifecycle::Waking)
@@ -537,20 +569,27 @@ struct PlatformState {
 const DATA_DISK_MIB: u64 = 1024;
 /// Data-disk lease TTL — the failover horizon. With the node-local FlockLease it is moot
 /// (the lock is held for the life of the process); with a distributed lease (HA) it is
-/// the etcd grant TTL, so a crashed/partitioned holder's key expires this long after its
-/// last successful renew — which is the earliest a survivor may take the disk. Kept short
-/// so that `DISK_RENEW_INTERVAL + DISK_FENCE_GRACE < DISK_LEASE_TTL`: a partitioned host
-/// self-fences BEFORE its lease can expire and admit a survivor. (Renewed every
-/// [`DISK_RENEW_INTERVAL`] by the disk-fence loop.)
+/// the etcd grant TTL: a crashed/partitioned holder's key expires this long after its
+/// LAST SUCCESSFUL renew, which is the earliest a survivor may take the disk. The
+/// disk-fence loop self-fences once a disk's last success ages past [`DISK_FENCE_DEADLINE`]
+/// — anchored at last success (NOT first-observed-failure) and with each renew bounded by
+/// [`RENEW_RPC_TIMEOUT`] — so the safety relation holds even under a blackhole partition:
+///   DISK_FENCE_DEADLINE + (DISK_RENEW_INTERVAL + RENEW_RPC_TIMEOUT) + kill  <  DISK_LEASE_TTL
+/// i.e. the holder kills its Firecracker before its lease can expire and admit a survivor.
 const DISK_LEASE_TTL: Duration = Duration::from_secs(30);
 /// How often the disk-fence loop re-asserts (renews) each held data-disk lease.
 const DISK_RENEW_INTERVAL: Duration = Duration::from_secs(5);
-/// How long the disk-fence loop tolerates TRANSIENT renew failures (backend unreachable
-/// while the lease is still held) before failing closed and self-fencing. A genuine
-/// supersession ([`SubstrateError::Fenced`]) self-fences immediately regardless. Must
-/// keep `DISK_RENEW_INTERVAL + DISK_FENCE_GRACE < DISK_LEASE_TTL` (self-fence before the
-/// lease can expire) while being long enough that one dropped packet never kills a VM.
-const DISK_FENCE_GRACE: Duration = Duration::from_secs(15);
+/// Self-fence once a disk's time-since-last-successful-renew reaches this (fail closed).
+/// A genuine supersession ([`SubstrateError::Fenced`]) self-fences immediately regardless.
+/// Satisfies the relation on [`DISK_LEASE_TTL`]: long enough that a brief blip never kills
+/// a live VM, short enough to beat lease-expiry/takeover by a margin.
+const DISK_FENCE_DEADLINE: Duration = Duration::from_secs(15);
+/// Per-attempt bound on a lease renew RPC. Under a network blackhole an unbounded etcd
+/// renew (`get` + keepalive) can hang for minutes on TCP retransmit, which would stall the
+/// fence loop past the lease TTL and let a survivor attach over a still-live writer.
+/// Bounding each attempt turns a hang into a prompt transient error, so the deadline clock
+/// (anchored at last success) keeps advancing and the host self-fences in time.
+const RENEW_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl PlatformState {
     /// HA P2: whether this host currently holds cluster leadership. Advisory until P3
@@ -3616,9 +3655,10 @@ mod tests {
 
     #[test]
     fn renew_evaluation_discriminates_fenced_from_transient() {
-        // The HIGH-fix core (HA P2): a renew error must NOT be treated uniformly —
-        // a transient backend blip must never self-fence a live VM / flap leadership.
-        let grace = Duration::from_secs(15);
+        // The HIGH-fix core (HA P2): a renew error must NOT be treated uniformly — a
+        // transient blip/timeout must never self-fence a live VM / flap leadership, and the
+        // deadline is anchored at the LAST SUCCESS (the clock the lease TTL runs on).
+        let deadline = Duration::from_secs(12);
         let t0 = Instant::now();
         let tok = FenceToken {
             scope: "disk-p".into(),
@@ -3629,27 +3669,29 @@ mod tests {
         let ok: Result<FenceToken, SubstrateError> = Ok(tok);
         let fenced: Result<FenceToken, SubstrateError> =
             Err(SubstrateError::Fenced { scope: "disk-p".into() });
+        // A timed-out renew is surfaced as Backend, indistinguishable here from any blip.
         let transient: Result<FenceToken, SubstrateError> =
-            Err(SubstrateError::Backend("etcd unreachable".into()));
+            Err(SubstrateError::Backend("etcd unreachable / timed out".into()));
 
-        // A confirmed renew holds (and clears any failure window).
-        assert_eq!(evaluate_renew(&ok, Some(t0), t0, grace), FenceDecision::Hold);
-        // A genuine supersession fences IMMEDIATELY, regardless of the failure window.
-        assert_eq!(evaluate_renew(&fenced, None, t0, grace), FenceDecision::FenceNow);
-        // A first transient blip does NOT fence — it starts the grace window.
+        // A confirmed renew holds (resets the last-success clock).
+        assert_eq!(evaluate_renew(&ok, t0, t0, deadline), FenceDecision::Hold);
+        // A genuine supersession fences IMMEDIATELY, even just after a success.
         assert_eq!(
-            evaluate_renew(&transient, None, t0, grace),
+            evaluate_renew(&fenced, t0, t0 + Duration::from_secs(1), deadline),
+            FenceDecision::FenceNow
+        );
+        // A fresh transient blip (last success just now) → keep waiting; one dropped
+        // packet never kills a live VM.
+        assert_eq!(evaluate_renew(&transient, t0, t0, deadline), FenceDecision::KeepWaiting);
+        // Transient, last success still within the deadline → keep waiting.
+        assert_eq!(
+            evaluate_renew(&transient, t0, t0 + Duration::from_secs(11), deadline),
             FenceDecision::KeepWaiting
         );
-        // Still within grace → keep waiting (one dropped packet never kills a live VM).
+        // Transient and last success aged past the deadline → fail closed before the
+        // lease TTL can expire and admit a survivor.
         assert_eq!(
-            evaluate_renew(&transient, Some(t0), t0 + Duration::from_secs(14), grace),
-            FenceDecision::KeepWaiting
-        );
-        // Transient failures past the grace window → fail closed (assume the lease is
-        // gone before it can expire and admit a survivor).
-        assert_eq!(
-            evaluate_renew(&transient, Some(t0), t0 + Duration::from_secs(15), grace),
+            evaluate_renew(&transient, t0, t0 + Duration::from_secs(12), deadline),
             FenceDecision::FenceNow
         );
     }
