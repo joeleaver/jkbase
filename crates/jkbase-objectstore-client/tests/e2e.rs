@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
 use jkbase_objectstore::{ObjectStore, router};
-use jkbase_objectstore_client::{ListObjectsOptions, ObjectClient};
+use jkbase_objectstore_client::{Error, ListObjectsOptions, ObjectClient};
 use md5::{Digest, Md5};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,7 +50,7 @@ async fn object_lifecycle_buffered_and_streamed() {
         Ok::<_, std::io::Error>(Bytes::from_static(b"AAAA")),
         Ok(Bytes::from_static(b"BB")),
     ]);
-    c.put_object_stream("bkt", "big", reqwest::Body::wrap_stream(parts), "application/octet-stream")
+    c.put_object_stream("bkt", "big", reqwest::Body::wrap_stream(parts), 6, "application/octet-stream")
         .await
         .unwrap();
     let got = c.get_object("bkt", "big").await.unwrap();
@@ -171,15 +171,61 @@ async fn presigned_urls_are_usable() {
     c.create_bucket("presign").await.unwrap();
 
     // presigned PUT: a plain HTTP client uploads to the minted URL.
-    let put_url = c.presigned_put("presign", "k.txt", 900);
+    let put_url = c.presigned_put("presign", "k.txt", 900).unwrap();
     let http = reqwest::Client::new();
     let r = http.put(&put_url).body("presigned body").send().await.unwrap();
     assert!(r.status().is_success(), "PUT {} -> {}", put_url, r.status());
 
     // presigned GET: fetch it back with no auth header.
-    let get_url = c.presigned_get("presign", "k.txt", 900);
+    let get_url = c.presigned_get("presign", "k.txt", 900).unwrap();
     let body = reqwest::get(&get_url).await.unwrap().text().await.unwrap();
     assert_eq!(body, "presigned body");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn keys_with_xml_special_chars_round_trip() {
+    let (c, dir) = spawn().await;
+    c.create_bucket("xkeys").await.unwrap();
+    // Keys exercising the wire-encoding (space, &, <, >, unicode) AND the server's
+    // xml_escape ↔ client unescape seam on the listing path.
+    let keys = ["a&b", "c d", "e<f>g", "u/\u{2713}"];
+    for k in keys {
+        c.put_object("xkeys", k, b"v".to_vec(), "text/plain").await.unwrap();
+    }
+
+    // Listing returns every key byte-identical (escaped server-side, unescaped client-side).
+    let mut got = c.list_all_keys("xkeys", "").await.unwrap();
+    got.sort();
+    let mut want: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want);
+
+    // The trickiest keys also GET back over the real wire (space + ampersand encoding).
+    assert_eq!(&c.get_object_bytes("xkeys", "c d").await.unwrap()[..], b"v");
+    assert_eq!(&c.get_object_bytes("xkeys", "a&b").await.unwrap()[..], b"v");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn dot_segment_keys_are_rejected_client_side() {
+    let (c, dir) = spawn().await;
+    c.create_bucket("dots").await.unwrap();
+
+    // '.'/'..' segments would be normalized away by HTTP clients → signed≠sent. The client
+    // refuses them with a typed InvalidKey BEFORE any request, so nothing is mis-stored.
+    for bad in ["a/../c", "a/./c", "..", "x/.."] {
+        let err = c.put_object("dots", bad, b"v".to_vec(), "text/plain").await.unwrap_err();
+        assert!(matches!(err, Error::InvalidKey(_)), "{bad}: {err:?}");
+        assert!(c.get_object("dots", bad).await.is_err());
+        assert!(c.presigned_get("dots", bad, 900).is_err());
+    }
+
+    // A key that merely CONTAINS dots (not as a whole segment) is fine.
+    c.put_object("dots", "v1.2.3/file.txt", b"v".to_vec(), "text/plain").await.unwrap();
+    assert_eq!(&c.get_object_bytes("dots", "v1.2.3/file.txt").await.unwrap()[..], b"v");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

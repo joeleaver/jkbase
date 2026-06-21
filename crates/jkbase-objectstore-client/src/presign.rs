@@ -1,24 +1,28 @@
 //! Presigned URLs — time-limited, credential-free GET and PUT links anyone can use until
 //! they expire (the server caps the lifetime at 7 days; `0` or `>604800` is rejected).
 
-use crate::{ObjectClient, object_path};
+use crate::{ObjectClient, Result, object_path, validate_object_key};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 impl ObjectClient {
-    /// A presigned GET URL valid for `expires_secs`, usable with no auth header.
-    pub fn presigned_get(&self, bucket: &str, key: &str, expires_secs: u64) -> String {
-        self.presigned("GET", bucket, key, expires_secs, now_unix())
+    /// A presigned GET URL valid for `expires_secs`, usable with no auth header. Errors on a
+    /// key with a `.`/`..` segment (the minted URL would normalize away from its signature).
+    pub fn presigned_get(&self, bucket: &str, key: &str, expires_secs: u64) -> Result<String> {
+        validate_object_key(key)?;
+        Ok(self.presigned("GET", bucket, key, expires_secs, now_unix()))
     }
 
     /// A presigned PUT URL valid for `expires_secs` — hand it out so a client can upload
-    /// directly. The uploader sends the bytes as the request body (no extra headers).
-    pub fn presigned_put(&self, bucket: &str, key: &str, expires_secs: u64) -> String {
-        self.presigned("PUT", bucket, key, expires_secs, now_unix())
+    /// directly. The uploader sends the bytes as the request body (no extra headers). Same
+    /// key restriction as [`presigned_get`](Self::presigned_get).
+    pub fn presigned_put(&self, bucket: &str, key: &str, expires_secs: u64) -> Result<String> {
+        validate_object_key(key)?;
+        Ok(self.presigned("PUT", bucket, key, expires_secs, now_unix()))
     }
 
     /// Mint a presigned URL at a fixed time — exposed so callers can pin the timestamp
-    /// (e.g. tests against shared SigV4 vectors); `presigned_get`/`presigned_put` call it
-    /// with the current time.
+    /// (e.g. tests against shared SigV4 vectors). Low-level: does NOT validate the key;
+    /// `presigned_get`/`presigned_put` call it with the current time after validating.
     pub fn presigned_at(&self, method: &str, bucket: &str, key: &str, expires_secs: u64, now_unix: u64) -> String {
         self.presigned(method, bucket, key, expires_secs, now_unix)
     }

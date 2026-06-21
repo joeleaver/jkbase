@@ -7,7 +7,7 @@
 
 use crate::objects::etag_of;
 use crate::xml::strip_quotes;
-use crate::{Error, ObjectClient, ReqBody, Result, object_path, xml};
+use crate::{Error, ObjectClient, ReqBody, Result, object_path, validate_object_key, xml};
 use bytes::Bytes;
 use reqwest::Method;
 
@@ -39,6 +39,7 @@ impl ObjectClient {
         key: &str,
         content_type: &str,
     ) -> Result<MultipartUpload<'_>> {
+        validate_object_key(key)?;
         let resp = self
             .send(
                 Method::POST,
@@ -98,11 +99,13 @@ impl MultipartUpload<'_> {
         Ok(())
     }
 
-    /// Upload one part by streaming its body (no buffering).
+    /// Upload one part by streaming its body (no buffering). `content_length` is the part's
+    /// exact byte length (the server requires a declared length for each part).
     pub async fn upload_part_stream(
         &mut self,
         part_number: u32,
         body: impl Into<reqwest::Body>,
+        content_length: u64,
     ) -> Result<()> {
         let q = vec![
             ("uploadId".into(), self.upload_id.clone()),
@@ -110,7 +113,13 @@ impl MultipartUpload<'_> {
         ];
         let resp = self
             .client
-            .send(Method::PUT, &object_path(&self.bucket, &self.key), &q, None, ReqBody::Stream(body.into()))
+            .send(
+                Method::PUT,
+                &object_path(&self.bucket, &self.key),
+                &q,
+                None,
+                ReqBody::Stream(body.into(), content_length),
+            )
             .await?;
         self.parts.push((part_number, etag_of(resp.headers())));
         Ok(())
@@ -136,7 +145,12 @@ impl MultipartUpload<'_> {
             )
             .await?;
         let xml_body = resp.text().await?;
-        Ok(strip_quotes(&xml::tag(&xml_body, "ETag").unwrap_or_default()))
+        // A success body always carries <ETag>; its absence means a truncated/garbled
+        // response, not an empty hash — error rather than hand back Ok("") (mirrors
+        // create_multipart's UploadId handling).
+        xml::tag(&xml_body, "ETag")
+            .map(|e| strip_quotes(&e))
+            .ok_or_else(|| Error::Decode("CompleteMultipartUpload: no ETag".into()))
     }
 
     /// Abort the upload, discarding any staged parts.

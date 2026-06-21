@@ -105,9 +105,11 @@ impl ObjectClient {
             }
             let page = self.list_objects(bucket, &opts).await?;
             out.extend(page.objects);
-            // Truncated-but-no-token would loop forever — stop instead.
+            // Stop unless the server both says "more" AND hands back a token that actually
+            // advances. Truncated-but-no-token, or a token that repeats the one we just used
+            // (a buggy/hostile server), would otherwise loop forever / grow unbounded.
             match (page.is_truncated, page.next_continuation_token) {
-                (true, Some(t)) => token = Some(t),
+                (true, Some(t)) if token.as_deref() != Some(t.as_str()) => token = Some(t),
                 _ => break,
             }
         }
@@ -147,10 +149,15 @@ impl ObjectClient {
                     None => return Ok::<Option<(ListPage, Option<Option<String>>)>, crate::Error>(None),
                 };
                 let page = self
-                    .list_objects(bucket, &ListObjectsOptions { prefix, delimiter, max_keys, continuation_token: token })
+                    .list_objects(
+                        bucket,
+                        &ListObjectsOptions { prefix, delimiter, max_keys, continuation_token: token.clone() },
+                    )
                     .await?;
+                // Advance only on a token that differs from the one we just used; otherwise
+                // stop (no-progress / truncated-but-no-token) so the stream can't run forever.
                 let next = match (page.is_truncated, &page.next_continuation_token) {
-                    (true, Some(t)) => Some(Some(t.clone())),
+                    (true, Some(t)) if token.as_deref() != Some(t.as_str()) => Some(Some(t.clone())),
                     _ => None,
                 };
                 Ok(Some((page, next)))
@@ -162,6 +169,8 @@ impl ObjectClient {
 /// Parse a `ListBucketResult` body into a [`ListPage`].
 fn parse_list_page(body: &str) -> ListPage {
     let is_truncated = xml::tag(body, "IsTruncated").as_deref() == Some("true");
+    // jkbase emits NextContinuationToken (V2); the NextMarker fallback is only for a
+    // V1-style S3 endpoint reached via the aws-sdk-s3 escape hatch.
     let next_continuation_token =
         xml::tag(body, "NextContinuationToken").or_else(|| xml::tag(body, "NextMarker"));
     let max_keys = xml::tag(body, "MaxKeys").and_then(|s| s.parse().ok()).unwrap_or(1000);

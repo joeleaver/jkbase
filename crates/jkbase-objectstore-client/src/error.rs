@@ -16,6 +16,9 @@ pub enum S3ErrorCode {
     InvalidBucketName,
     InvalidArgument,
     RequestTimeout,
+    /// An object write reached the server without a declared length (HTTP 411). The
+    /// client sets one for buffered and length-declared streaming uploads.
+    MissingContentLength,
     /// `x-amz-content-sha256` did not match the uploaded bytes.
     ContentSha256Mismatch,
     /// Storage-byte quota exceeded (HTTP 507).
@@ -44,6 +47,7 @@ impl S3ErrorCode {
             S3ErrorCode::InvalidBucketName => "InvalidBucketName",
             S3ErrorCode::InvalidArgument => "InvalidArgument",
             S3ErrorCode::RequestTimeout => "RequestTimeout",
+            S3ErrorCode::MissingContentLength => "MissingContentLength",
             S3ErrorCode::ContentSha256Mismatch => "XAmzContentSHA256Mismatch",
             S3ErrorCode::QuotaExceeded => "QuotaExceeded",
             S3ErrorCode::TooManyObjects => "TooManyObjects",
@@ -65,6 +69,7 @@ impl S3ErrorCode {
             "InvalidBucketName" => S3ErrorCode::InvalidBucketName,
             "InvalidArgument" => S3ErrorCode::InvalidArgument,
             "RequestTimeout" => S3ErrorCode::RequestTimeout,
+            "MissingContentLength" => S3ErrorCode::MissingContentLength,
             "XAmzContentSHA256Mismatch" => S3ErrorCode::ContentSha256Mismatch,
             "QuotaExceeded" => S3ErrorCode::QuotaExceeded,
             "TooManyObjects" => S3ErrorCode::TooManyObjects,
@@ -100,6 +105,11 @@ pub enum Error {
     /// A 2xx response whose body wasn't the expected shape.
     #[error("malformed response: {0}")]
     Decode(String),
+    /// The client refused to send a request because the object key has a `.`/`..` path
+    /// segment HTTP clients normalize away — the signed and sent paths would differ. Pick
+    /// a key without bare dot segments.
+    #[error("invalid object key: {0}")]
+    InvalidKey(String),
 }
 
 impl Error {
@@ -147,7 +157,7 @@ impl Error {
             _ => match self {
                 Error::Api { status, .. } => *status >= 500,
                 Error::Transport(e) => e.is_timeout() || e.is_connect(),
-                Error::Decode(_) => false,
+                Error::Decode(_) | Error::InvalidKey(_) => false,
             },
         }
     }
@@ -180,6 +190,7 @@ fn default_code_for_status(status: u16) -> S3ErrorCode {
         403 => S3ErrorCode::AccessDenied,
         404 => S3ErrorCode::NoSuchKey,
         408 => S3ErrorCode::RequestTimeout,
+        411 => S3ErrorCode::MissingContentLength,
         429 => S3ErrorCode::SlowDown,
         507 => S3ErrorCode::QuotaExceeded,
         s if s >= 500 => S3ErrorCode::InternalError,

@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    let url = s3.presigned_get(bucket, "greeting.txt", 300);
+    let url = s3.presigned_get(bucket, "greeting.txt", 300)?;
     println!("presigned GET (5 min): {url}");
 
     s3.delete_object(bucket, "greeting.txt").await?;

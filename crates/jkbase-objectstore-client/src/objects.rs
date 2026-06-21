@@ -1,7 +1,7 @@
 //! Object operations: put (buffered + streaming), get (buffered + streaming), head, delete.
 
 use crate::xml::strip_quotes;
-use crate::{Error, ObjectClient, ReqBody, Result, object_path};
+use crate::{Error, ObjectClient, ReqBody, Result, object_path, validate_object_key};
 use bytes::Bytes;
 use reqwest::{Method, header};
 
@@ -59,6 +59,7 @@ impl ObjectClient {
         body: impl Into<Bytes>,
         content_type: &str,
     ) -> Result<String> {
+        validate_object_key(key)?;
         let resp = self
             .send(Method::PUT, &object_path(bucket, key), &[], Some(content_type), ReqBody::Bytes(body.into()))
             .await?;
@@ -66,23 +67,35 @@ impl ObjectClient {
     }
 
     /// Upload an object by streaming a body (e.g. `reqwest::Body::wrap_stream(..)` or a
-    /// file) without buffering it. Always uses `UNSIGNED-PAYLOAD` (a stream can't be
-    /// hashed without buffering). Returns the ETag.
+    /// file) without buffering it. `content_length` is the body's exact byte length — the
+    /// server requires a declared length for object writes (411 otherwise) and uses it to
+    /// bound the upload/quota; sending fewer/more bytes than declared will fail server-side.
+    /// Always uses `UNSIGNED-PAYLOAD` (a stream can't be hashed without buffering). Returns
+    /// the ETag.
     pub async fn put_object_stream(
         &self,
         bucket: &str,
         key: &str,
         body: impl Into<reqwest::Body>,
+        content_length: u64,
         content_type: &str,
     ) -> Result<String> {
+        validate_object_key(key)?;
         let resp = self
-            .send(Method::PUT, &object_path(bucket, key), &[], Some(content_type), ReqBody::Stream(body.into()))
+            .send(
+                Method::PUT,
+                &object_path(bucket, key),
+                &[],
+                Some(content_type),
+                ReqBody::Stream(body.into(), content_length),
+            )
             .await?;
         Ok(etag_of(resp.headers()))
     }
 
     /// Fetch an object as a streamed [`GetObject`] (metadata immediately; body on demand).
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObject> {
+        validate_object_key(key)?;
         let resp = self.send(Method::GET, &object_path(bucket, key), &[], None, ReqBody::Empty).await?;
         let meta = meta_of(resp.headers());
         Ok(GetObject { meta, resp })
@@ -95,6 +108,7 @@ impl ObjectClient {
 
     /// Metadata-only fetch (HEAD). `Err(..).is_not_found()` for a missing key.
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta> {
+        validate_object_key(key)?;
         let resp = self.send(Method::HEAD, &object_path(bucket, key), &[], None, ReqBody::Empty).await?;
         Ok(meta_of(resp.headers()))
     }
@@ -102,6 +116,7 @@ impl ObjectClient {
     /// Delete an object. Idempotent server-side (deleting a missing key is not an error
     /// the engine raises).
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        validate_object_key(key)?;
         self.send(Method::DELETE, &object_path(bucket, key), &[], None, ReqBody::Empty).await?;
         Ok(())
     }

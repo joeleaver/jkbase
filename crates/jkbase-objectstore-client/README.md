@@ -51,8 +51,9 @@ async fn main() -> Result<(), jkbase_objectstore_client::Error> {
 
 ### Streaming
 
-`put_object_stream` takes any `reqwest::Body` (a `wrap_stream`ed `Stream`, a file, …) and
-uploads without buffering. `get_object().into_stream()` yields the body in chunks:
+`put_object_stream` takes any `reqwest::Body` (a `wrap_stream`ed `Stream`, a file, …) plus
+the exact `content_length`, and uploads without buffering (the server requires a declared
+length for object writes). `get_object().into_stream()` yields the body in chunks:
 
 ```rust
 use futures_util::StreamExt;

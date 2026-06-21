@@ -158,15 +158,20 @@ impl ObjectClient {
         }
         rb = match body {
             ReqBody::Empty => rb,
+            // A buffered body has a known length, so reqwest sets Content-Length itself.
             ReqBody::Bytes(b) => rb.body(b),
-            ReqBody::Stream(b) => rb.body(b),
+            // A streamed body goes out chunked with no Content-Length; the server REQUIRES a
+            // declared length for object writes (411 MissingContentLength otherwise), so we
+            // pass it via x-amz-decoded-content-length (not a signed header, so it doesn't
+            // affect the signature). It also bounds the server-side write/quota deadline.
+            ReqBody::Stream(b, len) => rb.header("x-amz-decoded-content-length", len.to_string()).body(b),
         };
         let resp = rb.send().await?;
         if resp.status().is_success() {
             Ok(resp)
         } else {
             let status = resp.status().as_u16();
-            // Bounded read — the engine's error bodies are tiny; cap a hostile one anyway.
+            // The engine's error bodies are tiny; parse_api_error caps the fallback message.
             let body = resp.text().await.unwrap_or_default();
             Err(error::parse_api_error(status, &body))
         }
@@ -203,16 +208,31 @@ impl ObjectClient {
     }
 }
 
-/// The body of a request, carrying its own hashing capability.
+/// The body of a request. A streamed body carries its declared length (the server
+/// requires one for object writes).
 pub(crate) enum ReqBody {
     Empty,
     Bytes(Bytes),
-    Stream(reqwest::Body),
+    Stream(reqwest::Body, u64),
 }
 
 /// `/{bucket}/{key}` — the raw object path (encoding happens at send time).
 pub(crate) fn object_path(bucket: &str, key: &str) -> String {
     format!("/{bucket}/{key}")
+}
+
+/// Reject keys with a `.` or `..` path segment. HTTP clients (the `url` crate reqwest
+/// uses, browsers, curl) resolve dot-segments before sending, so the bytes on the wire
+/// would diverge from the signed canonical path — a silent AccessDenied or wrong-object.
+/// Every other byte sequence (spaces, `%`, `&`, unicode, empty segments) is percent-encoded
+/// correctly and round-trips, so only bare dot segments are refused.
+pub(crate) fn validate_object_key(key: &str) -> Result<()> {
+    if key.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(Error::InvalidKey(format!(
+            "{key:?} has a '.' or '..' path segment that HTTP clients normalize away (signed and sent paths would differ)"
+        )));
+    }
+    Ok(())
 }
 
 /// Current unix time in seconds (for SigV4 `x-amz-date`).

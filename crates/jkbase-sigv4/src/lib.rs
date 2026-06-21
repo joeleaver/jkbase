@@ -192,7 +192,11 @@ pub fn presign(
         .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
         .collect::<Vec<_>>()
         .join("&");
-    format!("{path}?{qs}")
+    // Return the ENCODED path — the same form the signature covers (build_canonical_request
+    // signs `uri_encode(path, false)`). Returning the raw path would put literal bytes
+    // (spaces, `%`, …) in the URL that an HTTP client re-encodes differently, so the
+    // signature would not verify.
+    format!("{}?{qs}", uri_encode(path, false))
 }
 
 /// Validate a presigned request. `query` is the request's parsed query params.
@@ -408,6 +412,25 @@ mod tests {
             verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW + 100),
             Ok(KEY.to_string())
         );
+    }
+
+    #[test]
+    fn presign_with_special_char_key_round_trips() {
+        // The minted URL must carry the ENCODED path (the form the signature covers); the
+        // server pct-decodes the received path before verifying, so decode-then-verify
+        // passes. (Before the fix the URL embedded the raw key, so a space/& key never
+        // verified.)
+        for key in ["/b/a b", "/b/a&b", "/b/p l/u s"] {
+            let url = presign("GET", "s3.jkbase.app", key, KEY, SECRET, "us-east-1", 900, NOW);
+            let (enc_path, q) = split(&url);
+            assert!(!enc_path.contains(' '), "path left unencoded: {enc_path}");
+            let decoded = pct_decode(&enc_path); // what the server does before verify_presigned
+            assert_eq!(
+                verify_presigned("GET", "s3.jkbase.app", &decoded, &q, lookup, NOW + 10),
+                Ok(KEY.to_string()),
+                "key {key:?}"
+            );
+        }
     }
 
     #[test]
