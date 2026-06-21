@@ -8,7 +8,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
-# SigV4 (shared by the object-store verify path AND the agent's own-bucket sign path, so
-# both canonicalize byte-identically — no divergence). Pure hmac/sha2, no heavy deps.
+# SigV4 now lives in the `jkbase-sigv4` leaf crate; re-exported as `jkbase_common::sigv4`
+# so existing call sites are unchanged and there's still exactly ONE implementation.
+jkbase-sigv4 = { workspace = true }
+# `sha2` is still used directly here by `layers.rs` (content-addressed layer digests).
 sha2 = { workspace = true }
-hmac = { workspace = true }

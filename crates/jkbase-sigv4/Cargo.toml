@@ -1,0 +1,13 @@
+[package]
+name = "jkbase-sigv4"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+# The single shared SigV4 canonicalisation: server verify path, agent own-bucket
+# sign path, AND the tenant-facing object-store client all depend on this so they
+# canonicalize byte-identically (no divergence). Deliberately a tiny leaf — pure
+# hmac/sha2, no other deps — so a tenant SDK can sign without the server surface.
+[dependencies]
+sha2 = { workspace = true }
+hmac = { workspace = true }

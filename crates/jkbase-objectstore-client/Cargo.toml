@@ -1,0 +1,23 @@
+[package]
+name = "jkbase-objectstore-client"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Tenant-facing Rust client for the jkbase S3-compatible object store (SigV4, streaming, multipart, presigned URLs)."
+
+[dependencies]
+# Just the shared SigV4 signer + an HTTP client — NOT the server engine. This is the
+# whole point of the lean leaf-crate split: a tenant app signs byte-identically to the
+# server without pulling in jkbase-objectstore / jkbase-common / the control plane.
+jkbase-sigv4 = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The live e2e (`#[ignore]`) drives this client against the real engine router,
+# mirroring the server's own `e2e_over_real_http` proof.
+tokio = { workspace = true }
+axum = { workspace = true }
+jkbase-objectstore = { workspace = true }

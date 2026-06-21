@@ -1,11 +1,16 @@
-//! AWS Signature Version 4 (query-string / presigned form) for the object store.
-//! One implementation serves both presigned URLs (this card) and request auth (the
-//! auth card): [`presign`] mints a time-limited signed URL, [`verify_presigned`]
-//! validates one against the access key's secret + expiry.
+//! AWS Signature Version 4 for the jkbase S3-compatible object store — the **one**
+//! canonicalisation shared by every party so none can diverge: the server verify
+//! path ([`verify_header`] / [`verify_presigned`]), the agent's own-bucket sign
+//! path, and the tenant-facing `jkbase-objectstore-client`. A leaf crate (pure
+//! `hmac`/`sha2`, no other deps) precisely so a tenant SDK can sign without pulling
+//! in the server surface, while staying byte-identical to what the server verifies.
 //!
-//! Canonicalisation follows the SigV4 spec (UNSIGNED-PAYLOAD, `host` the only
-//! signed header) so the round-trip is self-consistent; byte-exact interop with
-//! the AWS SDKs should be spot-checked against a real client when wired up.
+//! [`sign_header`] / [`presign`] produce a signature; [`verify_header`] /
+//! [`verify_presigned`] check one against the access key's secret (+ expiry, for
+//! presigned). Canonicalisation follows the SigV4 spec (header-auth signs
+//! `host;x-amz-content-sha256;x-amz-date`; presign signs `host` only). The
+//! `cross_vector` tests pin the exact signatures the JS SDK
+//! (`sdk/js/objectstore.test.mjs`) and the Rust client must reproduce.
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};

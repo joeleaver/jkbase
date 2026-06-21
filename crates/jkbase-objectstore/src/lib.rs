@@ -14,13 +14,14 @@
 //! absolute paths) structurally impossible.
 
 mod http;
-pub mod client;
-/// SigV4 lives in `jkbase-common` so the object-store verify path and the agent's own-bucket
-/// sign path share byte-identical canonicalization (no divergence). Re-exported here so the
-/// existing `crate::sigv4::` / `jkbase_objectstore::sigv4` call sites are unchanged.
+/// SigV4 lives in the `jkbase-sigv4` leaf crate (re-exported via `jkbase-common`) so the
+/// object-store verify path, the agent's own-bucket sign path, AND the tenant-facing
+/// `jkbase-objectstore-client` all share byte-identical canonicalization (no divergence).
+/// Re-exported here so the existing `crate::sigv4::` / `jkbase_objectstore::sigv4` call
+/// sites are unchanged. The tenant client itself lives in its own crate, depending only on
+/// `jkbase-sigv4` + reqwest — never this engine crate.
 pub use jkbase_common::sigv4;
 mod store;
-pub use client::{ClientError, ObjectClient};
 pub use http::router;
 pub use sigv4::{presign, sign_header, verify_header, verify_presigned};
 pub use store::{ListPage, ListV2Page, MultipartUpload, ObjectError, ObjectMeta, ObjectStore};
