@@ -882,6 +882,35 @@ mod tests {
         assert!(text.contains("egress=DENIED"), "egress not denied! got: {text}");
     }
 
+    /// The own-bucket `jkbase:objectstore/store` binding resolves end to end: a real
+    /// component that IMPORTS the interface loads through the linker, runs, and its `put`/`get`
+    /// calls reach the agent's host impl. With no binding credential in the (test) sidecar the
+    /// host fails closed to `access-denied` — which still PROVES the WIT plumbing (import
+    /// resolved, linker wired, host impl invoked), distinct from a trap or an unresolved import.
+    #[tokio::test]
+    async fn component_calls_store_binding() {
+        let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/store-probe.wasm");
+        assert!(probe.exists(), "missing store-probe fixture {}", probe.display());
+        let mut rt = test_rt();
+        rt.load_module("store", &probe).expect("load store-probe component");
+
+        let req = FunctionRequest {
+            method: "GET".into(),
+            path: "/".into(),
+            query: String::new(),
+            headers: vec![],
+            body: vec![],
+        };
+        let resp = rt.invoke("store", req).await.expect("invoke");
+        let text = String::from_utf8_lossy(&resp.body);
+        assert_eq!(resp.status, 200, "body: {text}");
+        // The guest called store::put/get; with no credential the host returns access-denied —
+        // proving the binding is wired (not a trap / unresolved import).
+        assert!(text.contains("put=access-denied"), "store put did not reach the host impl: {text}");
+        assert!(text.contains("get=access-denied"), "store get did not reach the host impl: {text}");
+    }
+
     /// Project secrets injected via the sidecar env reach the component (pre-validates the
     /// secrets mechanism end-to-end through the real runtime).
     #[tokio::test]
