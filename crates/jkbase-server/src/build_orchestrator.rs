@@ -2174,6 +2174,47 @@ mod tests {
     }
 
     #[test]
+    fn copy_filtered_guarded_refuses_underscore_toplevel() {
+        // B-1: a tenant whose single-site root (`public = "."`) carries a planted
+        // `_functions/<fn>.json` must NOT clobber the host-authored sidecar. The guarded copy
+        // refuses `_`-prefixed TOP-LEVEL entries but keeps ordinary content and nested
+        // `_`-prefixed framework dirs.
+        let base = std::env::temp_dir().join(format!("jkb-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(src.join("_functions")).unwrap();
+        std::fs::create_dir_all(src.join("sub/_next")).unwrap();
+        std::fs::write(src.join("_functions/api.json"), "{\"egress\":\"default\"}").unwrap();
+        std::fs::write(src.join("_routes.json"), "tenant").unwrap();
+        std::fs::write(src.join("index.html"), "hi").unwrap();
+        std::fs::write(src.join("sub/_next/app.js"), "ok").unwrap();
+
+        copy_filtered_guarded(&src, &dst).unwrap();
+
+        // Top-level `_`-prefixed tenant entries refused…
+        assert!(!dst.join("_functions").exists(), "top-level _functions must be refused");
+        assert!(!dst.join("_routes.json").exists(), "top-level _routes.json must be refused");
+        // …ordinary content + NESTED `_`-prefixed dirs preserved.
+        assert!(dst.join("index.html").exists());
+        assert!(dst.join("sub/_next/app.js").exists(), "nested _next is fine (guard is top-level only)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_site_name() {
+        // The multi-site `_site_<name>` copy uses the site KEY verbatim; validate_manifest's
+        // name_ok gate (runs before assemble_sites) rejects any `/`-or-`..` key, so a
+        // `../_functions` site cannot traverse into the host artifact dir.
+        let cfg: ProjectConfig = toml::from_str(
+            "[sites.\"../_functions\"]\npublic = \"x\"\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&cfg).unwrap_err().to_string();
+        assert!(err.contains("invalid site name"), "got: {err}");
+    }
+
+    #[test]
     fn validate_rejects_empty_egress_allowlist() {
         let fn_empty: ProjectConfig = toml::from_str(
             "[functions.api]\nsource = \"api\"\negress = []\n",
