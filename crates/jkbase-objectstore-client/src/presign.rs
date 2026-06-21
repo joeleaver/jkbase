@@ -20,10 +20,11 @@ impl ObjectClient {
         Ok(self.presigned("PUT", bucket, key, expires_secs, now_unix()))
     }
 
-    /// Mint a presigned URL at a fixed time — exposed so callers can pin the timestamp
-    /// (e.g. tests against shared SigV4 vectors). Low-level: does NOT validate the key;
-    /// `presigned_get`/`presigned_put` call it with the current time after validating.
-    pub fn presigned_at(&self, method: &str, bucket: &str, key: &str, expires_secs: u64, now_unix: u64) -> String {
+    /// Mint a presigned URL at a fixed time — test-only, so the cross-vector test can pin
+    /// the timestamp against the shared SigV4 vectors. Not part of the public API: the
+    /// public `presigned_get`/`presigned_put` (which validate the key) are the only minters.
+    #[cfg(test)]
+    pub(crate) fn presigned_at(&self, method: &str, bucket: &str, key: &str, expires_secs: u64, now_unix: u64) -> String {
         self.presigned(method, bucket, key, expires_secs, now_unix)
     }
 

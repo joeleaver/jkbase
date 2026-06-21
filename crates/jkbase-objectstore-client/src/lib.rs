@@ -227,6 +227,11 @@ pub(crate) fn object_path(bucket: &str, key: &str) -> String {
 /// Every other byte sequence (spaces, `%`, `&`, unicode, empty segments) is percent-encoded
 /// correctly and round-trips, so only bare dot segments are refused.
 pub(crate) fn validate_object_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        // An empty key makes the path `/{bucket}/`, which the server routes as a
+        // bucket-level op, not an object write — reject it with a clear error.
+        return Err(Error::InvalidKey("object key must not be empty".into()));
+    }
     if key.split('/').any(|seg| seg == "." || seg == "..") {
         return Err(Error::InvalidKey(format!(
             "{key:?} has a '.' or '..' path segment that HTTP clients normalize away (signed and sent paths would differ)"

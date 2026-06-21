@@ -216,9 +216,9 @@ async fn dot_segment_keys_are_rejected_client_side() {
 
     // '.'/'..' segments would be normalized away by HTTP clients → signed≠sent. The client
     // refuses them with a typed InvalidKey BEFORE any request, so nothing is mis-stored.
-    for bad in ["a/../c", "a/./c", "..", "x/.."] {
+    for bad in ["a/../c", "a/./c", "..", "x/..", ""] {
         let err = c.put_object("dots", bad, b"v".to_vec(), "text/plain").await.unwrap_err();
-        assert!(matches!(err, Error::InvalidKey(_)), "{bad}: {err:?}");
+        assert!(matches!(err, Error::InvalidKey(_)), "{bad:?}: {err:?}");
         assert!(c.get_object("dots", bad).await.is_err());
         assert!(c.presigned_get("dots", bad, 900).is_err());
     }

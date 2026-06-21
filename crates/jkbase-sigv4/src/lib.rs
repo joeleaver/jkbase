@@ -160,7 +160,9 @@ fn parse_amz_date(s: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec).ok()
 }
 
-/// Mint a presigned URL `"<path>?<query>"` valid for `expires_secs` from `now_unix`.
+/// Mint a presigned URL `"<encoded-path>?<query>"` valid for `expires_secs` from `now_unix`.
+/// The path is returned percent-encoded (the same form the signature covers), so the URL is
+/// usable verbatim and verifies after the server percent-decodes it.
 #[allow(clippy::too_many_arguments)] // inherent to a SigV4 signer; all distinct inputs
 pub fn presign(
     method: &str,
