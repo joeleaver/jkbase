@@ -8,6 +8,7 @@ jkbase-common = { workspace = true }
 jkbase-wsproxy = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1"] }
 hyper-util = { workspace = true, features = ["tokio", "client-legacy", "server-auto"] }
 http-body-util = { workspace = true }

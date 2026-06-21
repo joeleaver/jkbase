@@ -11,6 +11,7 @@
 
 use crate::DomainMap;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
     RetryPolicy,
@@ -40,8 +41,10 @@ const ISSUE_BACKOFF: Duration = Duration::from_secs(5 * 60);
 pub struct TlsConfig {
     pub domain: String,
     pub cert_dir: PathBuf,
-    pub cloudflare_token: String,
-    pub cloudflare_zone_id: String,
+    /// The ACME DNS-01 backend used to provision the wildcard cert (Cloudflare,
+    /// RFC2136, …). Behind `Arc<dyn>` so the config stays cheap to clone and the
+    /// vendor choice is made once at startup.
+    pub dns_provider: Arc<dyn DnsProvider>,
     pub acme_email: String,
 }
 
@@ -296,7 +299,7 @@ impl CertManager {
             .await
             .context("failed to create ACME order")?;
 
-        let mut cf_record_ids: Vec<String> = Vec::new();
+        let mut record_handles: Vec<String> = Vec::new();
         {
             let mut authorizations = order.authorizations();
             while let Some(result) = authorizations.next().await {
@@ -305,14 +308,12 @@ impl CertManager {
                     .challenge(ChallengeType::Dns01)
                     .ok_or_else(|| anyhow::anyhow!("no DNS-01 challenge found"))?;
                 let dns_value = challenge.key_authorization().dns_value();
-                let record_id = cloudflare_create_txt(
-                    &self.cfg.cloudflare_token,
-                    &self.cfg.cloudflare_zone_id,
-                    &format!("_acme-challenge.{}", self.cfg.domain),
-                    &dns_value,
-                )
-                .await?;
-                cf_record_ids.push(record_id);
+                let record_id = self
+                    .cfg
+                    .dns_provider
+                    .create_txt(&format!("_acme-challenge.{}", self.cfg.domain), &dns_value)
+                    .await?;
+                record_handles.push(record_id);
                 info!("waiting for DNS propagation...");
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 challenge.set_ready().await.context("failed to mark challenge ready")?;
@@ -341,13 +342,8 @@ impl CertManager {
         tokio::fs::write(self.cfg.cert_dir.join("privkey.pem"), key_pair.serialize_pem()).await?;
         info!("wildcard certificate provisioned");
 
-        for record_id in &cf_record_ids {
-            let _ = cloudflare_delete_txt(
-                &self.cfg.cloudflare_token,
-                &self.cfg.cloudflare_zone_id,
-                record_id,
-            )
-            .await;
+        for handle in &record_handles {
+            let _ = self.cfg.dns_provider.delete_txt(handle).await;
         }
         Ok(())
     }
@@ -457,50 +453,75 @@ fn certified_key_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKe
     CertifiedKey::from_der(certs, key, provider).context("invalid cert/key pair")
 }
 
-async fn cloudflare_create_txt(
-    token: &str,
-    zone_id: &str,
-    name: &str,
-    content: &str,
-) -> Result<String> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-        ))
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "type": "TXT",
-            "name": name,
-            "content": content,
-            "ttl": 120,
-        }))
-        .send()
-        .await
-        .context("failed to create Cloudflare TXT record")?;
-
-    let body: serde_json::Value = resp.json().await?;
-    if !body["success"].as_bool().unwrap_or(false) {
-        anyhow::bail!(
-            "Cloudflare API error: {}",
-            serde_json::to_string_pretty(&body["errors"])?
-        );
-    }
-    body["result"]["id"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("no record ID in Cloudflare response"))
+/// A pluggable ACME **DNS-01** backend: publish the `_acme-challenge` TXT record the CA
+/// validates against, then remove it afterwards. `create_txt` returns an opaque handle
+/// that the SAME provider interprets in `delete_txt` (a Cloudflare record id, an encoded
+/// name+value for RFC2136, …) — so issuance is vendor-neutral above this seam.
+#[async_trait]
+pub trait DnsProvider: Send + Sync {
+    /// Publish a TXT record at `name` (an FQDN like `_acme-challenge.example.com`) with
+    /// `value`; return a handle for later deletion.
+    async fn create_txt(&self, name: &str, value: &str) -> Result<String>;
+    /// Remove the TXT record identified by a handle from [`create_txt`](Self::create_txt).
+    async fn delete_txt(&self, handle: &str) -> Result<()>;
 }
 
-async fn cloudflare_delete_txt(token: &str, zone_id: &str, record_id: &str) -> Result<()> {
-    let client = reqwest::Client::new();
-    client
-        .delete(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-        ))
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("failed to delete Cloudflare TXT record")?;
-    Ok(())
+/// Cloudflare DNS-01 backend (the default; reads the `CLOUDFLARE_*` config for back-compat).
+pub struct CloudflareProvider {
+    token: String,
+    zone_id: String,
+}
+
+impl CloudflareProvider {
+    pub fn new(token: impl Into<String>, zone_id: impl Into<String>) -> Self {
+        Self { token: token.into(), zone_id: zone_id.into() }
+    }
+}
+
+#[async_trait]
+impl DnsProvider for CloudflareProvider {
+    async fn create_txt(&self, name: &str, content: &str) -> Result<String> {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "https://api.cloudflare.com/client/v4/zones/{}/dns_records",
+                self.zone_id
+            ))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "type": "TXT",
+                "name": name,
+                "content": content,
+                "ttl": 120,
+            }))
+            .send()
+            .await
+            .context("failed to create Cloudflare TXT record")?;
+
+        let body: serde_json::Value = resp.json().await?;
+        if !body["success"].as_bool().unwrap_or(false) {
+            anyhow::bail!(
+                "Cloudflare API error: {}",
+                serde_json::to_string_pretty(&body["errors"])?
+            );
+        }
+        body["result"]["id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("no record ID in Cloudflare response"))
+    }
+
+    async fn delete_txt(&self, record_id: &str) -> Result<()> {
+        let client = reqwest::Client::new();
+        client
+            .delete(format!(
+                "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
+                self.zone_id, record_id
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("failed to delete Cloudflare TXT record")?;
+        Ok(())
+    }
 }

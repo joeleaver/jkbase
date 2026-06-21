@@ -64,6 +64,11 @@ struct Args {
     #[arg(long, default_value = "443")]
     https_port: u16,
 
+    /// ACME DNS-01 provider for the wildcard cert: "cloudflare" (default) or "rfc2136".
+    #[arg(long, env = "ACME_DNS_PROVIDER", default_value = "cloudflare")]
+    acme_dns_provider: String,
+
+    // --- Cloudflare provider (ACME_DNS_PROVIDER=cloudflare) ---
     #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
     cloudflare_token: Option<String>,
 
@@ -390,23 +395,30 @@ async fn main() -> Result<()> {
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
     let cert_manager: Option<Arc<CertManager>> = if args.tls {
-        let cf_token = args
-            .cloudflare_token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--cloudflare-token required when --tls is enabled"))?;
-        let cf_zone = args
-            .cloudflare_zone_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--cloudflare-zone-id required when --tls is enabled"))?;
         let acme_email = args
             .acme_email
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--acme-email required when --tls is enabled"))?;
+        // Select the DNS-01 backend; Cloudflare is the default for back-compat.
+        let dns_provider: Arc<dyn jkbase_proxy::tls::DnsProvider> = match args.acme_dns_provider.as_str() {
+            "cloudflare" => {
+                let token = args.cloudflare_token.clone().ok_or_else(|| {
+                    anyhow::anyhow!("CLOUDFLARE_API_TOKEN (--cloudflare-token) required when --tls and ACME_DNS_PROVIDER=cloudflare")
+                })?;
+                let zone = args.cloudflare_zone_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!("CLOUDFLARE_ZONE_ID (--cloudflare-zone-id) required when --tls and ACME_DNS_PROVIDER=cloudflare")
+                })?;
+                Arc::new(jkbase_proxy::tls::CloudflareProvider::new(token, zone))
+            }
+            "rfc2136" => anyhow::bail!("ACME_DNS_PROVIDER=rfc2136 is not yet implemented"),
+            other => anyhow::bail!(
+                "unknown ACME_DNS_PROVIDER '{other}' (expected 'cloudflare' or 'rfc2136')"
+            ),
+        };
         let tls_config = jkbase_proxy::tls::TlsConfig {
             domain: args.domain.clone(),
             cert_dir: data_dir.join("certs"),
-            cloudflare_token: cf_token,
-            cloudflare_zone_id: cf_zone,
+            dns_provider,
             acme_email,
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
