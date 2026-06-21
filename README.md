@@ -353,12 +353,28 @@ One command from your workstation provisions a fresh server end to end — syste
 
 Then, on the server side (`provision.sh` prints these as it finishes):
 
-1. **DNS creds (wildcard TLS via DNS-01)** — fill in `/var/jkbase/.env`:
+1. **DNS creds (wildcard TLS via DNS-01)** — fill in `/var/jkbase/.env`. The wildcard cert
+   is issued over ACME DNS-01, so jkbase needs to write a TXT record to your zone. Pick a
+   provider with `ACME_DNS_PROVIDER` (default `cloudflare`):
    ```
+   ACME_EMAIL=you@example.com
+
+   # ACME_DNS_PROVIDER=cloudflare   (default)
    CLOUDFLARE_API_TOKEN=...
    CLOUDFLARE_ZONE_ID=...
-   ACME_EMAIL=you@example.com
+
+   # …or any RFC2136 (dynamic-update) DNS server — BIND/Knot/PowerDNS/etc:
+   # ACME_DNS_PROVIDER=rfc2136
+   # RFC2136_NAMESERVER=ns1.your-domain.com:53
+   # RFC2136_TSIG_NAME=acme-key
+   # RFC2136_TSIG_SECRET=<base64>          # as in a BIND key file
+   # RFC2136_TSIG_ALGORITHM=hmac-sha256    # or hmac-sha384 / hmac-sha512
+   # RFC2136_ZONE=your-domain.com          # defaults to --domain
    ```
+   With RFC2136, the host must be able to reach the nameserver (UDP/53, the update target),
+   and the zone you update must be the one Let's Encrypt resolves publicly — point
+   `RFC2136_NAMESERVER` at the authoritative primary and make sure the TXT propagates to the
+   public NS set (the apex `_acme-challenge` must be served, or delegated, from there).
 2. **Build toolchains** — provisioning bakes the busybox `default.ext4`. For Bun and Dockerfile builds you also need `bun.ext4` + `dockerfile.ext4` + the shared base layers. Bake them with `apko` + `tools/dev toolchains` / `tools/dev baselayers` and drop the results in `/var/jkbase/toolchains` and `/var/jkbase/baselayers`. *(Automating this in `provision.sh` is on the list.)*
 3. **Start it:** `ssh you@your-server 'sudo systemctl start jkbase'`
 4. **Point DNS:** `*.your-domain.com → your server's IP` (Firecracker-per-project means each app answers on its own subdomain; the wildcard also covers `api.`, `storage.`, and `console.`).

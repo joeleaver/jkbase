@@ -64,6 +64,11 @@ struct Args {
     #[arg(long, default_value = "443")]
     https_port: u16,
 
+    /// ACME DNS-01 provider for the wildcard cert: "cloudflare" (default) or "rfc2136".
+    #[arg(long, env = "ACME_DNS_PROVIDER", default_value = "cloudflare")]
+    acme_dns_provider: String,
+
+    // --- Cloudflare provider (ACME_DNS_PROVIDER=cloudflare) ---
     #[arg(long, env = "CLOUDFLARE_API_TOKEN")]
     cloudflare_token: Option<String>,
 
@@ -72,6 +77,27 @@ struct Args {
 
     #[arg(long, env = "ACME_EMAIL")]
     acme_email: Option<String>,
+
+    // --- RFC2136 provider (ACME_DNS_PROVIDER=rfc2136): dynamic DNS UPDATE + TSIG ---
+    /// Authoritative nameserver to send dynamic updates to, as host:port.
+    #[arg(long, env = "RFC2136_NAMESERVER")]
+    rfc2136_nameserver: Option<String>,
+
+    /// Zone origin to update; defaults to --domain.
+    #[arg(long, env = "RFC2136_ZONE")]
+    rfc2136_zone: Option<String>,
+
+    /// TSIG key name (must match the server's key).
+    #[arg(long, env = "RFC2136_TSIG_NAME")]
+    rfc2136_tsig_name: Option<String>,
+
+    /// TSIG shared secret, base64-encoded (as in a BIND key file).
+    #[arg(long, env = "RFC2136_TSIG_SECRET")]
+    rfc2136_tsig_secret: Option<String>,
+
+    /// TSIG algorithm: hmac-sha256 (default) | hmac-sha384 | hmac-sha512.
+    #[arg(long, env = "RFC2136_TSIG_ALGORITHM", default_value = "hmac-sha256")]
+    rfc2136_tsig_algorithm: String,
 
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
@@ -390,23 +416,48 @@ async fn main() -> Result<()> {
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
     let cert_manager: Option<Arc<CertManager>> = if args.tls {
-        let cf_token = args
-            .cloudflare_token
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--cloudflare-token required when --tls is enabled"))?;
-        let cf_zone = args
-            .cloudflare_zone_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--cloudflare-zone-id required when --tls is enabled"))?;
         let acme_email = args
             .acme_email
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--acme-email required when --tls is enabled"))?;
+        // Select the DNS-01 backend; Cloudflare is the default for back-compat.
+        let dns_provider: Arc<dyn jkbase_proxy::tls::DnsProvider> = match args.acme_dns_provider.as_str() {
+            "cloudflare" => {
+                let token = args.cloudflare_token.clone().ok_or_else(|| {
+                    anyhow::anyhow!("CLOUDFLARE_API_TOKEN (--cloudflare-token) required when --tls and ACME_DNS_PROVIDER=cloudflare")
+                })?;
+                let zone = args.cloudflare_zone_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!("CLOUDFLARE_ZONE_ID (--cloudflare-zone-id) required when --tls and ACME_DNS_PROVIDER=cloudflare")
+                })?;
+                Arc::new(jkbase_proxy::tls::CloudflareProvider::new(token, zone))
+            }
+            "rfc2136" => {
+                let ns = args.rfc2136_nameserver.clone().ok_or_else(|| {
+                    anyhow::anyhow!("RFC2136_NAMESERVER (--rfc2136-nameserver) required when ACME_DNS_PROVIDER=rfc2136")
+                })?;
+                let zone = args.rfc2136_zone.clone().unwrap_or_else(|| args.domain.clone());
+                let key_name = args.rfc2136_tsig_name.clone().ok_or_else(|| {
+                    anyhow::anyhow!("RFC2136_TSIG_NAME (--rfc2136-tsig-name) required when ACME_DNS_PROVIDER=rfc2136")
+                })?;
+                let secret = args.rfc2136_tsig_secret.clone().ok_or_else(|| {
+                    anyhow::anyhow!("RFC2136_TSIG_SECRET (--rfc2136-tsig-secret) required when ACME_DNS_PROVIDER=rfc2136")
+                })?;
+                Arc::new(jkbase_proxy::tls::Rfc2136Provider::new(
+                    &ns,
+                    &zone,
+                    &key_name,
+                    &secret,
+                    &args.rfc2136_tsig_algorithm,
+                )?)
+            }
+            other => anyhow::bail!(
+                "unknown ACME_DNS_PROVIDER '{other}' (expected 'cloudflare' or 'rfc2136')"
+            ),
+        };
         let tls_config = jkbase_proxy::tls::TlsConfig {
             domain: args.domain.clone(),
             cert_dir: data_dir.join("certs"),
-            cloudflare_token: cf_token,
-            cloudflare_zone_id: cf_zone,
+            dns_provider,
             acme_email,
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
