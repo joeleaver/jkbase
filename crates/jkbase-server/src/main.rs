@@ -312,6 +312,86 @@ async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader:
     }
 }
 
+/// HA P2 — the data-disk write-boundary self-fence: the split-brain safety core.
+///
+/// Periodically re-asserts (renews) every data-disk lease this host holds. A renewal
+/// failure means the lease was lost — superseded by a survivor the leader reassigned
+/// this project to, or expired under a network partition. The host then **self-fences**:
+/// it kills its Firecracker process (stopping all writes) BEFORE the survivor attaches,
+/// then detaches the disk. Combined with the restore-path fence (the survivor's
+/// `attach_rwo` fails closed while a prior writer is provably alive), this guarantees a
+/// data disk is never written by two hosts at once.
+///
+/// Inert on a single node: the node-local FlockLease renew always succeeds while this
+/// process holds the lock, so the fence never trips. Cross-host correctness rides a
+/// distributed lease (EtcdLease) and is exercised by the split-brain test harness.
+async fn disk_fence_loop(platform: Arc<Mutex<PlatformState>>, lease: Arc<dyn Lease>) {
+    loop {
+        tokio::time::sleep(DISK_RENEW_INTERVAL).await;
+        // Snapshot the held tokens, then renew OFF the platform lock — a slow or
+        // unreachable lease backend must never block the whole platform.
+        let held: Vec<(String, FenceToken)> = {
+            let plat = platform.lock().await;
+            plat.disk_tokens
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        for (project, token) in held {
+            if let Err(e) = lease.renew(&token, DISK_LEASE_TTL).await {
+                warn!(project = %project, scope = %token.scope, error = %e,
+                      "data-disk lease renewal failed — self-fencing");
+                self_fence_project(&platform, &project, &token).await;
+            }
+        }
+    }
+}
+
+/// True iff `tokens` still maps `project` to EXACTLY `token`. The self-fence guard: a
+/// concurrent (re)deploy may have rotated the disk token (a fresh, higher-epoch token
+/// renewed independently) while a stale renewal was in flight; fencing then would kill
+/// the live, freshly-attached VM — a self-inflicted outage. Fence only the holder of
+/// the precise token whose renewal was lost.
+fn token_still_held(
+    tokens: &HashMap<String, FenceToken>,
+    project: &str,
+    token: &FenceToken,
+) -> bool {
+    tokens.get(project) == Some(token)
+}
+
+/// Self-fence one project whose data-disk lease was lost: kill its Firecracker (stop
+/// writes) and detach the disk, so a survivor can safely take over. Guarded on token
+/// identity so a redeploy that rotated the token is never killed.
+async fn self_fence_project(
+    platform: &Arc<Mutex<PlatformState>>,
+    project_id: &str,
+    lost_token: &FenceToken,
+) {
+    // Take the VM out under the lock, but ONLY if we still hold exactly the lost token.
+    let (vm, data_disk) = {
+        let mut plat = platform.lock().await;
+        if !token_still_held(&plat.disk_tokens, project_id, lost_token) {
+            // Token rotated (redeploy) or already released (teardown) — not ours to fence.
+            return;
+        }
+        tracing::error!(project = %project_id, scope = %lost_token.scope, epoch = lost_token.epoch,
+               "DATA-DISK LEASE LOST — self-fencing: killing Firecracker before any survivor attaches");
+        // Drop our claim first so no other path still treats us as the holder.
+        plat.disk_tokens.remove(project_id);
+        plat.vm_states.remove(project_id);
+        (plat.vms.remove(project_id), plat.data_disk.clone())
+    };
+    // Kill the FC HARD — the safety action — before anything slow.
+    if let Some(mut vm) = vm
+        && let Err(e) = vm.stop().await
+    {
+        tracing::error!(project = %project_id, error = %e, "self-fence: failed to kill Firecracker");
+    }
+    // Best-effort detach so the survivor's attach is unblocked (the lease is already lost).
+    let _ = data_disk.detach(project_id).await;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmLifecycle {
     Running,
@@ -351,8 +431,16 @@ struct PlatformState {
 
 /// Data disk size (MiB) created on first use for projects that declare volumes.
 const DATA_DISK_MIB: u64 = 1024;
-/// Data-disk lease TTL. Renewed implicitly by holding the VM; released on teardown.
+/// Data-disk lease TTL. With the node-local FlockLease this is moot (the lock is held
+/// for the life of the process); with a distributed lease (HA) it is the keepalive
+/// horizon — the disk-fence loop renews every [`DISK_RENEW_INTERVAL`], and a host that
+/// cannot renew within the TTL has lost the disk and self-fences. Shorten it for HA so
+/// a partitioned host expires within the RTO budget before a survivor takes over.
 const DISK_LEASE_TTL: Duration = Duration::from_secs(3600);
+/// How often the disk-fence loop re-asserts (renews) each held data-disk lease. On a
+/// renewal failure the host has lost the disk and self-fences (kills its Firecracker)
+/// before any survivor attaches. Must be well below [`DISK_LEASE_TTL`].
+const DISK_RENEW_INTERVAL: Duration = Duration::from_secs(5);
 
 impl PlatformState {
     /// HA P2: whether this host currently holds cluster leadership. Advisory until P3
@@ -568,6 +656,7 @@ async fn main() -> Result<()> {
     // (the originals are moved into PlatformState below).
     let is_leader = Arc::new(AtomicBool::new(false));
     let lease_for_election = lease.clone();
+    let lease_for_fence = lease.clone();
     let host_id_for_election = host_id.clone();
 
     let platform = Arc::new(Mutex::new(PlatformState {
@@ -596,6 +685,12 @@ async fn main() -> Result<()> {
         host_id_for_election,
         is_leader,
     ));
+
+    // HA P2: the data-disk write-boundary self-fence. Renews each held disk lease and
+    // self-terminates this host's Firecracker for any project whose lease it loses,
+    // before a survivor attaches. Inert on a single node (FlockLease renew always
+    // succeeds while we hold the lock).
+    tokio::spawn(disk_fence_loop(platform.clone(), lease_for_fence));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
@@ -3258,6 +3353,64 @@ mod tests {
         // The deposed host can no longer renew its stale token.
         assert!(a.renew(&ta, ttl).await.is_err());
 
+        let _ = std::fs::remove_dir_all(&leases);
+    }
+
+    #[test]
+    fn self_fence_guard_only_fences_the_exact_lost_token() {
+        // The split-brain safety guard (HA P2): fence ONLY the holder of the precise
+        // token whose renewal was lost, so a redeploy that rotated the token (a live,
+        // freshly-attached VM) is never killed.
+        let tok = |scope: &str, epoch: u64| FenceToken {
+            scope: scope.into(),
+            epoch,
+            holder: "host-a".into(),
+            source_id: "src".into(),
+        };
+        let mut tokens: HashMap<String, FenceToken> = HashMap::new();
+        tokens.insert("p".to_string(), tok("p", 1));
+
+        // Exact token still held → fence it.
+        assert!(token_still_held(&tokens, "p", &tok("p", 1)));
+        // Rotated by a redeploy (higher epoch) → do NOT fence (would kill the live VM).
+        assert!(!token_still_held(&tokens, "p", &tok("p", 2)));
+        // Same epoch but different holder/source → not the same token → do not fence.
+        assert!(!token_still_held(
+            &tokens,
+            "p",
+            &FenceToken {
+                scope: "p".into(),
+                epoch: 1,
+                holder: "host-b".into(),
+                source_id: "src".into()
+            }
+        ));
+        // Already torn down → nothing to fence.
+        tokens.remove("p");
+        assert!(!token_still_held(&tokens, "p", &tok("p", 1)));
+    }
+
+    #[tokio::test]
+    async fn disk_lease_renewal_signals_loss_after_release() {
+        // The self-fence trigger (HA P2): while we hold the disk lease, renew succeeds;
+        // once it is lost (here: released ≈ superseded by a survivor / expired under a
+        // partition), renew fails — that Err is what drives self_fence_project.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let leases = std::env::temp_dir().join(format!("jkbase-diskfence-{nanos}"));
+        let l = jkbase_substrate::FlockLease::open(leases.clone(), "host-a").unwrap();
+        let t = l.acquire("proj-x", "host-a", DISK_LEASE_TTL).await.unwrap();
+        assert!(
+            l.renew(&t, DISK_LEASE_TTL).await.is_ok(),
+            "held → renew succeeds (no fence)"
+        );
+        l.release(&t).await.unwrap();
+        assert!(
+            l.renew(&t, DISK_LEASE_TTL).await.is_err(),
+            "lost → renew fails → self-fence fires"
+        );
         let _ = std::fs::remove_dir_all(&leases);
     }
 
