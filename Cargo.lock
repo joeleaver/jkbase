@@ -1774,6 +1774,7 @@ dependencies = [
  "futures-util",
  "jkbase-objectstore",
  "jkbase-sigv4",
+ "md-5",
  "reqwest",
  "thiserror 2.0.18",
  "tokio",

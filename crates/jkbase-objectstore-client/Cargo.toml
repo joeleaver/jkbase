@@ -16,8 +16,9 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# The live e2e (`#[ignore]`) drives this client against the real engine router,
-# mirroring the server's own `e2e_over_real_http` proof.
+# The live e2e drives this client against the real engine router over real HTTP
+# (hermetic, in-process), mirroring the server's own `e2e_over_real_http` proof.
 tokio = { workspace = true }
 axum = { workspace = true }
 jkbase-objectstore = { workspace = true }
+md-5 = { workspace = true }

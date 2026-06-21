@@ -55,7 +55,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// RFC 3986 percent-encoding as SigV4 requires (encode everything but the
 /// unreserved set; `/` is left intact in paths when `encode_slash` is false).
-fn uri_encode(s: &str, encode_slash: bool) -> String {
+///
+/// Public so the tenant client can build the on-the-wire request-target (path with
+/// `encode_slash=false`, query keys/values with `encode_slash=true`) using the *same*
+/// encoder it signs with — guaranteeing the bytes the server canonicalises match the
+/// bytes that were signed, for any key (spaces, `%`, unicode, …).
+pub fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
