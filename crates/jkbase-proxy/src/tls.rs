@@ -573,7 +573,7 @@ impl Rfc2136Provider {
         let nameserver = nameserver.trim().to_string();
         let shape_ok = nameserver
             .rsplit_once(':')
-            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0));
         if !shape_ok {
             anyhow::bail!(
                 "RFC2136_NAMESERVER must be host:port (e.g. ns1.example.com:53 or 192.0.2.1:53), got {nameserver:?}"
@@ -589,6 +589,9 @@ impl Rfc2136Provider {
         let tsig_secret = base64::engine::general_purpose::STANDARD
             .decode(tsig_secret_b64.trim())
             .context("RFC2136_TSIG_SECRET must be base64")?;
+        if tsig_secret.is_empty() {
+            anyhow::bail!("RFC2136_TSIG_SECRET must not be empty");
+        }
         let tsig_alg = match tsig_alg.trim().to_ascii_lowercase().as_str() {
             "" | "hmac-sha256" => TsigAlgorithm::HmacSha256,
             "hmac-sha384" => TsigAlgorithm::HmacSha384,
@@ -708,8 +711,11 @@ mod tests {
         // Empty zone / key name rejected.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "", "k", "c2VjcmV0", "hmac-sha256").is_err());
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "", "c2VjcmV0", "hmac-sha256").is_err());
-        // Non-base64 secret.
+        // Port 0 rejected (cleaner than a late connect failure).
+        assert!(Rfc2136Provider::new("192.0.2.1:0", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        // Non-base64 secret, and empty secret, rejected.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "!!! not base64 !!!", "hmac-sha256").is_err());
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "", "hmac-sha256").is_err());
         // Unsupported algorithm.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "hmac-md5").is_err());
     }
