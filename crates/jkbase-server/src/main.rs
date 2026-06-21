@@ -78,6 +78,27 @@ struct Args {
     #[arg(long, env = "ACME_EMAIL")]
     acme_email: Option<String>,
 
+    // --- RFC2136 provider (ACME_DNS_PROVIDER=rfc2136): dynamic DNS UPDATE + TSIG ---
+    /// Authoritative nameserver to send dynamic updates to, as host:port.
+    #[arg(long, env = "RFC2136_NAMESERVER")]
+    rfc2136_nameserver: Option<String>,
+
+    /// Zone origin to update; defaults to --domain.
+    #[arg(long, env = "RFC2136_ZONE")]
+    rfc2136_zone: Option<String>,
+
+    /// TSIG key name (must match the server's key).
+    #[arg(long, env = "RFC2136_TSIG_NAME")]
+    rfc2136_tsig_name: Option<String>,
+
+    /// TSIG shared secret, base64-encoded (as in a BIND key file).
+    #[arg(long, env = "RFC2136_TSIG_SECRET")]
+    rfc2136_tsig_secret: Option<String>,
+
+    /// TSIG algorithm: hmac-sha256 (default) | hmac-sha384 | hmac-sha512.
+    #[arg(long, env = "RFC2136_TSIG_ALGORITHM", default_value = "hmac-sha256")]
+    rfc2136_tsig_algorithm: String,
+
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
@@ -410,7 +431,25 @@ async fn main() -> Result<()> {
                 })?;
                 Arc::new(jkbase_proxy::tls::CloudflareProvider::new(token, zone))
             }
-            "rfc2136" => anyhow::bail!("ACME_DNS_PROVIDER=rfc2136 is not yet implemented"),
+            "rfc2136" => {
+                let ns = args.rfc2136_nameserver.clone().ok_or_else(|| {
+                    anyhow::anyhow!("RFC2136_NAMESERVER (--rfc2136-nameserver) required when ACME_DNS_PROVIDER=rfc2136")
+                })?;
+                let zone = args.rfc2136_zone.clone().unwrap_or_else(|| args.domain.clone());
+                let key_name = args.rfc2136_tsig_name.clone().ok_or_else(|| {
+                    anyhow::anyhow!("RFC2136_TSIG_NAME (--rfc2136-tsig-name) required when ACME_DNS_PROVIDER=rfc2136")
+                })?;
+                let secret = args.rfc2136_tsig_secret.clone().ok_or_else(|| {
+                    anyhow::anyhow!("RFC2136_TSIG_SECRET (--rfc2136-tsig-secret) required when ACME_DNS_PROVIDER=rfc2136")
+                })?;
+                Arc::new(jkbase_proxy::tls::Rfc2136Provider::new(
+                    &ns,
+                    &zone,
+                    &key_name,
+                    &secret,
+                    &args.rfc2136_tsig_algorithm,
+                )?)
+            }
             other => anyhow::bail!(
                 "unknown ACME_DNS_PROVIDER '{other}' (expected 'cloudflare' or 'rfc2136')"
             ),

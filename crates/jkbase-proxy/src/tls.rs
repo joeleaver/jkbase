@@ -12,6 +12,16 @@
 use crate::DomainMap;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::Engine as _;
+use hickory_client::client::{AsyncClient, ClientHandle};
+use hickory_client::proto::op::ResponseCode;
+use hickory_client::proto::rr::dnssec::rdata::tsig::TsigAlgorithm;
+use hickory_client::proto::rr::dnssec::tsig::TSigner;
+use hickory_client::proto::rr::rdata::TXT;
+use hickory_client::proto::rr::{Name, RData, Record};
+use hickory_client::proto::udp::UdpClientStream;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
     RetryPolicy,
@@ -523,5 +533,143 @@ impl DnsProvider for CloudflareProvider {
             .await
             .context("failed to delete Cloudflare TXT record")?;
         Ok(())
+    }
+}
+
+/// RFC 2136 (dynamic DNS UPDATE) backend with TSIG auth — vendor-neutral: works against any
+/// compliant authoritative server (BIND/Knot/PowerDNS/…), no proprietary API. Each call opens
+/// a short-lived TSIG-signed UDP client to the nameserver and `append`s / `delete_by_rdata`s
+/// the `_acme-challenge` TXT (append, not create, so the wildcard + apex challenges can share
+/// the name with two distinct values).
+pub struct Rfc2136Provider {
+    nameserver: SocketAddr,
+    zone: String,
+    tsig_name: String,
+    tsig_secret: Vec<u8>,
+    tsig_alg: TsigAlgorithm,
+}
+
+impl Rfc2136Provider {
+    /// `nameserver` is `host:port`; `tsig_secret` is base64 (as in a BIND key file); `tsig_alg`
+    /// is `hmac-sha256` (default) / `hmac-sha384` / `hmac-sha512`.
+    pub fn new(
+        nameserver: &str,
+        zone: &str,
+        tsig_name: &str,
+        tsig_secret_b64: &str,
+        tsig_alg: &str,
+    ) -> Result<Self> {
+        let nameserver: SocketAddr = nameserver
+            .parse()
+            .with_context(|| format!("RFC2136_NAMESERVER must be host:port, got {nameserver:?}"))?;
+        let tsig_secret = base64::engine::general_purpose::STANDARD
+            .decode(tsig_secret_b64.trim())
+            .context("RFC2136_TSIG_SECRET must be base64")?;
+        let tsig_alg = match tsig_alg.trim().to_ascii_lowercase().as_str() {
+            "" | "hmac-sha256" => TsigAlgorithm::HmacSha256,
+            "hmac-sha384" => TsigAlgorithm::HmacSha384,
+            "hmac-sha512" => TsigAlgorithm::HmacSha512,
+            other => anyhow::bail!(
+                "unsupported RFC2136_TSIG_ALGORITHM {other:?} (hmac-sha256 | hmac-sha384 | hmac-sha512)"
+            ),
+        };
+        Ok(Self {
+            nameserver,
+            zone: zone.to_string(),
+            tsig_name: tsig_name.to_string(),
+            tsig_secret,
+            tsig_alg,
+        })
+    }
+
+    fn signer(&self) -> Result<TSigner> {
+        TSigner::new(self.tsig_secret.clone(), self.tsig_alg.clone(), fqdn(&self.tsig_name)?, 300)
+            .context("invalid TSIG signer (key name / secret / algorithm)")
+    }
+
+    /// Open a fresh TSIG-signed UDP client to the nameserver. The background driver is
+    /// spawned for the lifetime of the returned client.
+    async fn client(&self) -> Result<AsyncClient> {
+        let stream = UdpClientStream::<UdpSocket, TSigner>::with_timeout_and_signer(
+            self.nameserver,
+            Duration::from_secs(10),
+            Some(Arc::new(self.signer()?)),
+        );
+        let (client, bg) = AsyncClient::connect(stream).await.context("rfc2136: TSIG client connect failed")?;
+        tokio::spawn(bg);
+        Ok(client)
+    }
+}
+
+/// Parse a DNS name as an FQDN (exactly one trailing dot), so records/zones resolve absolutely.
+fn fqdn(s: &str) -> Result<Name> {
+    Name::from_ascii(format!("{}.", s.trim_end_matches('.')))
+        .with_context(|| format!("invalid DNS name {s:?}"))
+}
+
+#[async_trait]
+impl DnsProvider for Rfc2136Provider {
+    async fn create_txt(&self, name: &str, value: &str) -> Result<String> {
+        let mut client = self.client().await?;
+        let record = Record::from_rdata(fqdn(name)?, 120, RData::TXT(TXT::new(vec![value.to_string()])));
+        // append (must_exist=false): adds this TXT RR, creating the RRset if absent — so the
+        // wildcard and apex challenges (same name, different values) both land.
+        let resp = client
+            .append(record, fqdn(&self.zone)?, false)
+            .await
+            .context("rfc2136: TXT append (dynamic UPDATE) failed")?;
+        if resp.response_code() != ResponseCode::NoError {
+            anyhow::bail!("rfc2136: nameserver rejected append: {}", resp.response_code());
+        }
+        // Handle encodes name+value so delete_by_rdata can remove exactly this RR.
+        Ok(format!("{name}\t{value}"))
+    }
+
+    async fn delete_txt(&self, handle: &str) -> Result<()> {
+        let (name, value) = handle
+            .split_once('\t')
+            .ok_or_else(|| anyhow::anyhow!("malformed rfc2136 record handle"))?;
+        let mut client = self.client().await?;
+        let record = Record::from_rdata(fqdn(name)?, 120, RData::TXT(TXT::new(vec![value.to_string()])));
+        let resp = client
+            .delete_by_rdata(record, fqdn(&self.zone)?)
+            .await
+            .context("rfc2136: TXT delete (dynamic UPDATE) failed")?;
+        if resp.response_code() != ResponseCode::NoError {
+            anyhow::bail!("rfc2136: nameserver rejected delete: {}", resp.response_code());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rfc2136_config_validation() {
+        // Valid config parses.
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").is_ok());
+        // Empty algorithm string defaults to hmac-sha256.
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "").is_ok());
+        // Bad nameserver (not host:port).
+        assert!(Rfc2136Provider::new("not-a-sockaddr", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        // Non-base64 secret.
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "!!! not base64 !!!", "hmac-sha256").is_err());
+        // Unsupported algorithm.
+        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "hmac-md5").is_err());
+    }
+
+    #[test]
+    fn fqdn_normalizes_to_single_trailing_dot() {
+        assert_eq!(fqdn("_acme-challenge.example.com").unwrap().to_string(), "_acme-challenge.example.com.");
+        assert_eq!(fqdn("example.com.").unwrap().to_string(), "example.com.");
+    }
+
+    #[test]
+    fn signer_builds_for_valid_config() {
+        let p =
+            Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha512").unwrap();
+        assert!(p.signer().is_ok());
     }
 }

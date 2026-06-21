@@ -67,6 +67,8 @@ rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 webpki-roots = "0.26"
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
+# hickory-client for ACME DNS-01 via RFC2136 dynamic UPDATE + TSIG (dnssec-ring = TSIG/ring).
+hickory-client = { version = "0.24", features = ["dnssec-ring"] }
 rcgen = "0.13"
 rustls-pemfile = "2"
 argon2 = { version = "0.5", features = ["std", "rand"] }
