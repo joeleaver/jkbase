@@ -730,6 +730,55 @@ mod tests {
         assert!(p2.record_and_zone("_acme-challenge.example.com", "v").is_err());
     }
 
+    /// Execution-backed proof of the RFC2136 wire path: build the EXACT UPDATE messages
+    /// `create_txt`/`delete_txt` send (the same `update_message::append`/`delete_by_rdata` the
+    /// hickory client calls, from our `record_and_zone`, TSIG-signed with our `signer()`), then
+    /// run the SERVER's own verification (`verify_message_byte` — the BADSIG check a real
+    /// BIND/Knot/PowerDNS performs) and assert they're well-formed OpCode::Update messages
+    /// carrying the `_acme-challenge` TXT. This proves the TSIG key/alg/name + message
+    /// construction would be accepted by a real RFC2136 server, without one in the loop.
+    #[test]
+    fn rfc2136_update_messages_are_valid_signed_updates() {
+        use hickory_client::proto::op::{Message, OpCode, update_message};
+        use hickory_client::proto::rr::RecordType;
+        use hickory_client::proto::serialize::binary::BinEncodable;
+
+        let p =
+            Rfc2136Provider::new("ns1.example.com:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").unwrap();
+        let (record, zone) = p.record_and_zone("_acme-challenge.example.com", "tok-base64url-value").unwrap();
+        let signer = p.signer().unwrap();
+        let now = 1_700_000_000u32;
+
+        // create_txt path: client.append(record, zone, false) == update_message::append + TSIG.
+        let mut add = update_message::append(record.clone().into(), zone.clone(), false, true);
+        add.finalize(&signer, now).expect("TSIG-sign append");
+        let add_bytes = add.to_bytes().expect("encode append");
+        signer.verify_message_byte(None, &add_bytes, true).expect("a real server's TSIG verify accepts the append");
+        let parsed = Message::from_vec(&add_bytes).unwrap();
+        assert_eq!(parsed.op_code(), OpCode::Update);
+        assert!(
+            parsed.name_servers().iter().any(|r| {
+                r.record_type() == RecordType::TXT
+                    && r.name().to_ascii().starts_with("_acme-challenge.example.com")
+            }),
+            "append UPDATE must carry the _acme-challenge TXT in the update section: {parsed:?}"
+        );
+
+        // delete_txt path: client.delete_by_rdata(record, zone) == update_message::delete_by_rdata + TSIG.
+        let mut del = update_message::delete_by_rdata(record.into(), zone, true);
+        del.finalize(&signer, now).expect("TSIG-sign delete");
+        let del_bytes = del.to_bytes().expect("encode delete");
+        signer.verify_message_byte(None, &del_bytes, true).expect("a real server's TSIG verify accepts the delete");
+        assert_eq!(Message::from_vec(&del_bytes).unwrap().op_code(), OpCode::Update);
+
+        // A DIFFERENT key must NOT verify our message (proves the check is real, not a no-op).
+        let other = Rfc2136Provider::new("ns1.example.com:53", "example.com", "acme-key", "ZGlmZmVyZW50", "hmac-sha256")
+            .unwrap()
+            .signer()
+            .unwrap();
+        assert!(other.verify_message_byte(None, &add_bytes, true).is_err(), "wrong TSIG key must be rejected");
+    }
+
     #[test]
     fn fqdn_normalizes_to_single_trailing_dot() {
         assert_eq!(fqdn("_acme-challenge.example.com").unwrap().to_string(), "_acme-challenge.example.com.");
