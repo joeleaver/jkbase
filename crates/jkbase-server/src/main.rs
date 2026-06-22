@@ -860,20 +860,29 @@ impl PlatformState {
 
     fn allocate_ip(&self) -> Result<(String, String, String)> {
         let existing = self.store.list_vm_allocations()?;
-        let used_octets: HashSet<u8> = existing
-            .iter()
-            .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
-            .collect();
-
-        for octet in 2..=254u8 {
-            if !used_octets.contains(&octet) {
+        match next_free_octet(&existing, &self.host_id) {
+            Some(octet) => {
                 let (tap, ip, mac) = slot_identity(octet);
-                return Ok((ip, tap, mac));
+                Ok((ip, tap, mac))
             }
+            None => anyhow::bail!("no available IP addresses in this host's 172.16.0.0/24 island"),
         }
-
-        anyhow::bail!("no available IP addresses in 172.16.0.0/24");
     }
+}
+
+/// HA P4 — the next free last-octet in THIS host's `172.16.0.0/24` island, considering
+/// only allocations owned by `host_id` (empty host_id = single-node / pre-placement =
+/// ours). Each host runs the same /24 on its own L2 bridge, so a peer's IPs are on a
+/// separate segment — they neither collide with ours nor count against our range. This
+/// also removes the cross-host uniqueness race on the shared control store (each host
+/// allocates independently). `None` when the island is full.
+fn next_free_octet(allocations: &[VmAllocation], host_id: &str) -> Option<u8> {
+    let used: HashSet<u8> = allocations
+        .iter()
+        .filter(|a| a.host_id.is_empty() || a.host_id == host_id)
+        .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
+        .collect();
+    (2..=254u8).find(|o| !used.contains(o))
 }
 
 /// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
@@ -3990,6 +3999,34 @@ mod tests {
             host_id: host.into(),
             placement_epoch: 1,
         }
+    }
+
+    #[test]
+    fn next_free_octet_is_scoped_per_host_island() {
+        // HA P4: each host's /24 is its own L2 island, so only OUR allocations (and legacy
+        // empty-host_id ones) constrain the next octet; a peer reusing the same octets on
+        // its own segment must not block us or exhaust our range.
+        let a = |pid: &str, ip: &str, host: &str| VmAllocation {
+            project_id: pid.into(),
+            ip: ip.into(),
+            tap_device: "t".into(),
+            mac: "AA".into(),
+            host_id: host.into(),
+            placement_epoch: 1,
+        };
+        let allocs = vec![
+            a("p1", "172.16.0.2", "me"),
+            a("p2", "172.16.0.3", "me"),
+            a("peer1", "172.16.0.2", "peer"), // peer reuses .2 on ITS island — ignored for us
+            a("peer2", "172.16.0.4", "peer"), // peer's .4 — ignored for us
+            a("legacy", "172.16.0.5", ""),    // empty host_id = ours
+        ];
+        // me: own {2,3} + legacy {5}; peer's {2,4} ignored → next free = 4.
+        assert_eq!(next_free_octet(&allocs, "me"), Some(4));
+        // peer: own {2,4} + legacy {5} → next free = 3.
+        assert_eq!(next_free_octet(&allocs, "peer"), Some(3));
+        // Empty pool starts at .2.
+        assert_eq!(next_free_octet(&[], "me"), Some(2));
     }
 
     #[test]
