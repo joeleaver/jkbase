@@ -13,8 +13,8 @@ use jkbase_common::config::PlatformEgress;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    month_start_epoch, DomainKind, DomainRecord, DomainStatus, ProjectState, QuotaStatus,
-    SnapshotMeta, Store, VmAllocation,
+    month_start_epoch, DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, Project,
+    ProjectState, QuotaStatus, SnapshotMeta, Store, VmAllocation,
 };
 use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
@@ -27,6 +27,7 @@ use jkbase_proxy::{
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -175,6 +176,607 @@ struct Args {
     /// to be explicit / on hosts where auto-discovery is wrong (e.g. behind NAT).
     #[arg(long, env = "JKBASE_PLATFORM_IPS", value_delimiter = ',')]
     platform_ips: Vec<String>,
+
+    // --- HA cluster identity (HA P0: schema/config only — parsed, validated, and
+    // logged, but NOT yet wired into placement/failover; later phases consume it) ---
+    /// Stable, cluster-unique id for THIS server instance. Unset = derive from the
+    /// system hostname (single-node default); give each node a distinct id to form a
+    /// cluster (and a distinct id per process for a single-box sim cluster).
+    #[arg(long, env = "JKBASE_HOST_ID")]
+    host_id: Option<String>,
+
+    /// Placement region for this host; projects are placed least-loaded WITHIN a
+    /// region (P3). Default "default" = one flat region (single-node).
+    #[arg(long, env = "JKBASE_REGION", default_value = "default")]
+    region: String,
+
+    /// Address peers/the proxy use to forward to THIS host (deploy forwarding P3,
+    /// routing backend P4). Unset on single-node.
+    #[arg(long, env = "JKBASE_PUBLIC_ADDR")]
+    public_addr: Option<String>,
+
+    /// Firecracker CPU template this host bakes into its VMs from first boot (P5); a
+    /// warm cross-host restore needs source+target to match. Unset = cold-boot only.
+    #[arg(long, env = "JKBASE_CPU_TEMPLATE_ID")]
+    cpu_template_id: Option<String>,
+
+    /// Guest-kernel identity for warm/cold migration decisions (P5). Unset = derived
+    /// later from the resolved guest kernel.
+    #[arg(long, env = "JKBASE_KERNEL_ID")]
+    kernel_id: Option<String>,
+
+    /// Declared scheduling capacity for placement bin-packing (P3): host vCPUs.
+    /// 0 = unset/auto (no declared bound).
+    #[arg(long, default_value_t = 0)]
+    host_vcpus: u32,
+    /// Declared host memory (MiB) for placement (P3). 0 = unset/auto.
+    #[arg(long, default_value_t = 0)]
+    host_mem_mib: u64,
+    /// Declared max concurrent VMs for placement (P3). 0 = unset/auto.
+    #[arg(long, default_value_t = 0)]
+    host_max_vms: u32,
+
+    // --- [substrate] backend selection (HA P0: schema/config only) ---
+    /// Control-store backend: "redb" (default, single-node) | "etcd" (clustered).
+    #[arg(long, env = "JKBASE_SUBSTRATE_CONTROL_STORE", default_value = "redb")]
+    substrate_control_store: String,
+    /// Lease backend: "flock" (default, single-node) | "etcd" (clustered).
+    #[arg(long, env = "JKBASE_SUBSTRATE_LEASE", default_value = "flock")]
+    substrate_lease: String,
+    /// Data-disk provider: "localloop" (default) | "cephrbd" (clustered).
+    #[arg(long, env = "JKBASE_SUBSTRATE_DATA_DISK", default_value = "localloop")]
+    substrate_data_disk: String,
+    /// Blob store: "localfs" (default) | "s3" (clustered/offsite).
+    #[arg(long, env = "JKBASE_SUBSTRATE_BLOB_STORE", default_value = "localfs")]
+    substrate_blob_store: String,
+}
+
+/// Validate the `[substrate]` backend selection (HA P0). Accepts the single-node
+/// defaults and the known clustered backends; bails on an unknown name so a typo
+/// fails fast instead of silently falling back. A non-default (clustered) backend is
+/// accepted as config but warns that it is NOT wired until HA P1+.
+fn validate_substrate_selection(args: &Args) -> Result<()> {
+    fn check(role: &str, val: &str, allowed: &[&str]) -> Result<()> {
+        if !allowed.contains(&val) {
+            anyhow::bail!("unknown substrate {role} backend {val:?}; expected one of {allowed:?}");
+        }
+        Ok(())
+    }
+    check("control-store", &args.substrate_control_store, &["redb", "etcd"])?;
+    check("lease", &args.substrate_lease, &["flock", "etcd"])?;
+    check("data-disk", &args.substrate_data_disk, &["localloop", "cephrbd"])?;
+    check("blob-store", &args.substrate_blob_store, &["localfs", "s3"])?;
+    let clustered = args.substrate_control_store != "redb"
+        || args.substrate_lease != "flock"
+        || args.substrate_data_disk != "localloop"
+        || args.substrate_blob_store != "localfs";
+    if clustered {
+        warn!("non-default substrate backend selected; accepted as config but NOT wired until HA P1");
+    }
+    Ok(())
+}
+
+/// This host's identity when `--host-id` is unset: the system hostname, or
+/// "node-local" if that can't be read. (Single-node default; a cluster sets --host-id.)
+fn resolve_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node-local".to_string())
+}
+
+// HA P2 — cluster leader election parameters.
+const LEADER_SCOPE: &str = "cluster-leader";
+const LEADER_TTL: Duration = Duration::from_secs(20);
+const LEADER_TICK: Duration = Duration::from_secs(5);
+/// Step down once leadership's time-since-last-successful-renew reaches this (a real
+/// supersession steps down immediately). Keeps
+/// `LEADER_FENCE_DEADLINE + (LEADER_TICK + RENEW_RPC_TIMEOUT) < LEADER_TTL` so a deposed
+/// leader yields before a peer could steal its still-live key.
+const LEADER_FENCE_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Outcome of evaluating one lease renewal in the fence/election loops. We must
+/// discriminate a genuine loss from a transient backend blip: the substrate returns
+/// [`SubstrateError::Fenced`] only when a newer token has superseded us (etcd maps an
+/// expired/absent key here too) — a definitive loss — and a catch-all
+/// [`SubstrateError::Backend`] / I/O error when the authority was momentarily
+/// unreachable while we STILL hold the lease. Acting destructively on the latter (kill
+/// a live VM / drop leadership) on one dropped packet is a self-inflicted outage, so
+/// transient errors are tolerated until a deadline measured from the LAST SUCCESSFUL
+/// renew (the same clock the lease TTL runs on, kept below it) before failing closed.
+#[derive(Debug, PartialEq, Eq)]
+enum FenceDecision {
+    /// Renewal confirmed — we hold the lease; reset the last-success clock.
+    Hold,
+    /// Transient failure, last success still within the deadline — keep the lease, retry.
+    KeepWaiting,
+    /// Definitively lost (superseded/expired), or last success aged past the deadline —
+    /// act now (self-fence / step down), failing closed before the lease can expire.
+    FenceNow,
+}
+
+/// Decide what a renewal result means. `last_success` is when this scope's lease was last
+/// confirmed; `now`/`deadline` bound how long transient failures are tolerated. Anchoring
+/// at last success (not first-observed-failure) and bounding each renew RPC keeps the
+/// self-fence ahead of the lease TTL even when renews hang or fail slowly under a partition.
+fn evaluate_renew(
+    result: &Result<FenceToken, SubstrateError>,
+    last_success: Instant,
+    now: Instant,
+    deadline: Duration,
+) -> FenceDecision {
+    match result {
+        Ok(_) => FenceDecision::Hold,
+        // A newer token superseded us (etcd also maps an expired/absent key here): lost.
+        Err(SubstrateError::Fenced { .. }) => FenceDecision::FenceNow,
+        // Transient (backend unreachable / I/O / a timed-out renew RPC): we still hold the
+        // lease. Tolerate until we've been unable to confirm it for `deadline` since the
+        // last success — then fail closed before the TTL can expire and admit a survivor.
+        Err(_) => {
+            if now.duration_since(last_success) >= deadline {
+                FenceDecision::FenceNow
+            } else {
+                FenceDecision::KeepWaiting
+            }
+        }
+    }
+}
+
+/// HA P2 — cluster leader election. The elected leader (holder of the `cluster-leader`
+/// lease) will own cluster-wide placement (P3); followers reconcile only their own host.
+/// On a single node the one process wins the lease and stays leader. Backend-agnostic:
+/// acquire once, then renew each tick — a no-op re-assert for `FlockLease`, the TTL
+/// keepalive for a distributed lease — and on a lost/expired token drop back to
+/// contender and re-acquire. `is_leader` is advisory at P2 (nothing gates on it yet);
+/// the data-disk write-boundary self-fence, NOT this flag, is the split-brain guarantee.
+async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader: Arc<AtomicBool>) {
+    let mut token: Option<FenceToken> = None;
+    let mut last_success = Instant::now();
+    loop {
+        if let Some(t) = token.take() {
+            // Re-assert leadership (keepalive), bounded so a blackhole partition can't hang
+            // the loop. Discriminate a genuine loss (Fenced → step down now) from a transient
+            // blip/timeout (retain within the deadline) so one dropped packet never flaps.
+            let result =
+                match tokio::time::timeout(RENEW_RPC_TIMEOUT, lease.renew(&t, LEADER_TTL)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(SubstrateError::Backend("leader lease renew timed out".into())),
+                };
+            match evaluate_renew(&result, last_success, Instant::now(), LEADER_FENCE_DEADLINE) {
+                FenceDecision::Hold => {
+                    last_success = Instant::now();
+                    is_leader.store(true, Ordering::Relaxed);
+                    token = Some(result.unwrap_or(t)); // adopt the refreshed token
+                }
+                FenceDecision::KeepWaiting => {
+                    // Still leader — the lease is held; the authority is briefly unreachable.
+                    // Keep the token and retry next tick.
+                    is_leader.store(true, Ordering::Relaxed);
+                    token = Some(t);
+                    if let Err(e) = &result {
+                        warn!(host_id = %host_id, error = %e,
+                              "cluster-leader renew failed transiently; retaining leadership within deadline");
+                    }
+                }
+                FenceDecision::FenceNow => {
+                    is_leader.store(false, Ordering::Relaxed);
+                    token = None;
+                    warn!(host_id = %host_id, "lost cluster leadership; re-contesting");
+                }
+            }
+        } else {
+            // We are a contender: try to win the lease.
+            match lease.acquire(LEADER_SCOPE, &host_id, LEADER_TTL).await {
+                Ok(t) => {
+                    info!(host_id = %host_id, epoch = t.epoch, "acquired cluster leadership");
+                    is_leader.store(true, Ordering::Relaxed);
+                    last_success = Instant::now();
+                    token = Some(t);
+                }
+                // Another live host holds it — stay a follower and retry next tick.
+                Err(SubstrateError::LeaseHeld { .. }) => is_leader.store(false, Ordering::Relaxed),
+                Err(e) => {
+                    is_leader.store(false, Ordering::Relaxed);
+                    warn!(host_id = %host_id, error = %e, "cluster leader election error");
+                }
+            }
+        }
+        tokio::time::sleep(LEADER_TICK).await;
+    }
+}
+
+/// HA P2 — the data-disk write-boundary self-fence: the split-brain safety core.
+///
+/// Periodically re-asserts (renews) every data-disk lease this host holds. A renewal
+/// failure means the lease was lost — superseded by a survivor the leader reassigned
+/// this project to, or expired under a network partition. The host then **self-fences**:
+/// it kills its Firecracker process (stopping all writes) BEFORE the survivor attaches,
+/// then detaches the disk. Combined with the restore-path fence (the survivor's
+/// `attach_rwo` fails closed while a prior writer is provably alive), this guarantees a
+/// data disk is never written by two hosts at once.
+///
+/// Inert on a single node: the node-local FlockLease renew always succeeds while this
+/// process holds the lock, so the fence never trips. Cross-host correctness rides a
+/// distributed lease (EtcdLease) and is exercised by the split-brain test harness.
+async fn disk_fence_loop(platform: Arc<Mutex<PlatformState>>, lease: Arc<dyn Lease>) {
+    // Per-project time of last SUCCESSFUL renew — the clock the etcd lease TTL also runs
+    // on. A disk self-fences once its last success ages past DISK_FENCE_DEADLINE; a genuine
+    // supersession (Fenced) self-fences immediately.
+    let mut last_success: HashMap<String, Instant> = HashMap::new();
+    loop {
+        tokio::time::sleep(DISK_RENEW_INTERVAL).await;
+        // Snapshot the held tokens, then renew OFF the platform lock — a slow or
+        // unreachable lease backend must never block the whole platform.
+        let held: Vec<(String, FenceToken)> = {
+            let plat = platform.lock().await;
+            plat.disk_tokens
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        let still_held: HashSet<String> = held.iter().map(|(p, _)| p.clone()).collect();
+        // Seed last-success for freshly-acquired disks (just fenced + attached).
+        for (project, _) in &held {
+            last_success.entry(project.clone()).or_insert_with(Instant::now);
+        }
+        // Renew every held disk CONCURRENTLY, each bounded by RENEW_RPC_TIMEOUT, so one
+        // slow/hung disk never delays another's self-fence (the serialization the review
+        // flagged) — and a blackhole partition becomes a prompt transient error.
+        let mut set = tokio::task::JoinSet::new();
+        for (project, token) in held {
+            let lease = lease.clone();
+            set.spawn(async move {
+                let r = match tokio::time::timeout(
+                    RENEW_RPC_TIMEOUT,
+                    lease.renew(&token, DISK_LEASE_TTL),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(SubstrateError::Backend("disk lease renew timed out".into())),
+                };
+                (project, token, r)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let (project, token, result) = match joined {
+                Ok(tuple) => tuple,
+                Err(_) => continue, // a renew task panicked; next tick retries
+            };
+            let since = last_success.get(&project).copied().unwrap_or_else(Instant::now);
+            match evaluate_renew(&result, since, Instant::now(), DISK_FENCE_DEADLINE) {
+                FenceDecision::Hold => {
+                    last_success.insert(project, Instant::now());
+                }
+                FenceDecision::KeepWaiting => {
+                    if let Err(e) = &result {
+                        warn!(project = %project, scope = %token.scope, error = %e,
+                              "data-disk lease renew failed transiently; retrying within deadline");
+                    }
+                }
+                FenceDecision::FenceNow => {
+                    last_success.remove(&project);
+                    warn!(project = %project, scope = %token.scope,
+                          "data-disk lease lost — self-fencing");
+                    self_fence_project(&platform, &project, &token).await;
+                }
+            }
+        }
+        // Forget tracking for disks we no longer hold (torn down / fenced).
+        last_success.retain(|k, _| still_held.contains(k));
+    }
+}
+
+/// True iff `tokens` still maps `project` to EXACTLY `token`. The self-fence guard: a
+/// concurrent (re)deploy may have rotated the disk token (a fresh, higher-epoch token
+/// renewed independently) while a stale renewal was in flight; fencing then would kill
+/// the live, freshly-attached VM — a self-inflicted outage. Fence only the holder of
+/// the precise token whose renewal was lost.
+fn token_still_held(
+    tokens: &HashMap<String, FenceToken>,
+    project: &str,
+    token: &FenceToken,
+) -> bool {
+    tokens.get(project) == Some(token)
+}
+
+/// Self-fence one project whose data-disk lease was lost: kill its Firecracker (stop
+/// writes) and detach the disk, so a survivor can safely take over. Guarded on token
+/// identity so a redeploy that rotated the token is never killed.
+async fn self_fence_project(
+    platform: &Arc<Mutex<PlatformState>>,
+    project_id: &str,
+    lost_token: &FenceToken,
+) {
+    // Take the VM out under the lock, but ONLY if we still hold exactly the lost token.
+    let (vm, data_disk) = {
+        let mut plat = platform.lock().await;
+        if !token_still_held(&plat.disk_tokens, project_id, lost_token) {
+            // Token rotated (redeploy) or already released (teardown) — not ours to fence.
+            return;
+        }
+        // Don't fence a project mid-transition: an in-flight hibernate owns the VM handle
+        // (so we can neither kill it nor safely detach the loop device its FC still maps),
+        // and wake re-fences on its own. We cannot act here; during the transition a
+        // survivor is instead held off by the attach-time storage fence (LocalLoop liveness
+        // / Ceph blocklist on `attach_rwo`) until the op releases the token, after which the
+        // next tick self-fences if still lost. (A genuine loss is NOT dropped — FenceNow
+        // recurs every tick and bypasses the deadline.) NB the guest may still be writing
+        // in hibernate's brief pre-pause window, so this is defense-in-depth deferral, not
+        // a "no writes" guarantee — the storage-layer fence is the actual backstop.
+        if matches!(
+            plat.vm_states.get(project_id),
+            Some(VmLifecycle::Hibernating) | Some(VmLifecycle::Waking)
+        ) {
+            return;
+        }
+        tracing::error!(project = %project_id, scope = %lost_token.scope, epoch = lost_token.epoch,
+               "DATA-DISK LEASE LOST — self-fencing: killing Firecracker before any survivor attaches");
+        // Drop our claim first so no other path still treats us as the holder.
+        plat.disk_tokens.remove(project_id);
+        plat.vm_states.remove(project_id);
+        (plat.vms.remove(project_id), plat.data_disk.clone())
+    };
+    // Kill the FC HARD — the safety action — before anything slow.
+    if let Some(mut vm) = vm
+        && let Err(e) = vm.stop().await
+    {
+        tracing::error!(project = %project_id, error = %e, "self-fence: failed to kill Firecracker");
+    }
+    // Best-effort detach so the survivor's attach is unblocked (the lease is already lost).
+    let _ = data_disk.detach(project_id).await;
+}
+
+/// A host is live iff it has beaten at least once and its last heartbeat is within
+/// `threshold_secs` of `now`. The single liveness predicate the heartbeat detection,
+/// reconciler, and placement all share.
+fn host_is_live(h: &HostRecord, now: u64, threshold_secs: u64) -> bool {
+    h.last_heartbeat != 0 && now.saturating_sub(h.last_heartbeat) <= threshold_secs
+}
+
+/// HA P3 — hosts whose heartbeat has gone stale, excluding `self_id` (we're alive) and
+/// never-beaten rows (`last_heartbeat == 0`, e.g. a peer that just registered). The leader
+/// reassigns these; the heartbeat loop only DETECTS them.
+fn dead_hosts<'a>(
+    hosts: &'a [HostRecord],
+    now: u64,
+    threshold_secs: u64,
+    self_id: &str,
+) -> Vec<&'a HostRecord> {
+    hosts
+        .iter()
+        .filter(|h| h.host_id != self_id)
+        .filter(|h| h.last_heartbeat != 0)
+        .filter(|h| !host_is_live(h, now, threshold_secs))
+        .collect()
+}
+
+/// Current allocation count per host (the placement load). Skips unplaced (empty host_id).
+fn current_load(allocations: &[VmAllocation]) -> HashMap<String, u32> {
+    let mut load: HashMap<String, u32> = HashMap::new();
+    for a in allocations {
+        if !a.host_id.is_empty() {
+            *load.entry(a.host_id.clone()).or_insert(0) += 1;
+        }
+    }
+    load
+}
+
+/// HA P3 placement — the least-loaded LIVE host in `region` that still has spare capacity
+/// (`capacity.max_vms == 0` means unbounded). Ties broken by host_id for determinism.
+/// `None` if no live host in the region can take it (region at capacity / empty).
+fn place_project<'a>(
+    hosts: &'a [HostRecord],
+    load: &HashMap<String, u32>,
+    region: &str,
+    now: u64,
+    dead_threshold_secs: u64,
+) -> Option<&'a HostRecord> {
+    hosts
+        .iter()
+        .filter(|h| h.region == region)
+        .filter(|h| host_is_live(h, now, dead_threshold_secs))
+        .filter(|h| {
+            h.capacity.max_vms == 0
+                || load.get(&h.host_id).copied().unwrap_or(0) < h.capacity.max_vms
+        })
+        .min_by(|a, b| {
+            let la = load.get(&a.host_id).copied().unwrap_or(0);
+            let lb = load.get(&b.host_id).copied().unwrap_or(0);
+            la.cmp(&lb).then_with(|| a.host_id.cmp(&b.host_id))
+        })
+}
+
+/// HA P3 — assign each orphaned project to a freshly-placed live host, in the SAME region
+/// as its (now-dead) prior host so it stays near its data. Spreads multiple orphans by
+/// simulating load as it assigns. Returns `(project_id, new_host_id)`; an orphan with no
+/// available host in its region is omitted (the caller logs — region at capacity). Pure.
+fn reassign_plan(
+    orphaned: &[String],
+    hosts: &[HostRecord],
+    allocations: &[VmAllocation],
+    now: u64,
+    dead_threshold_secs: u64,
+) -> Vec<(String, String)> {
+    let alloc_by_project: HashMap<&str, &VmAllocation> =
+        allocations.iter().map(|a| (a.project_id.as_str(), a)).collect();
+    let mut load = current_load(allocations);
+    let mut out = Vec::new();
+    for pid in orphaned {
+        let region = alloc_by_project
+            .get(pid.as_str())
+            .and_then(|a| hosts.iter().find(|h| h.host_id == a.host_id))
+            .map(|h| h.region.clone())
+            .unwrap_or_else(|| "default".to_string());
+        if let Some(h) = place_project(hosts, &load, &region, now, dead_threshold_secs) {
+            *load.entry(h.host_id.clone()).or_insert(0) += 1; // simulate the assignment
+            out.push((pid.clone(), h.host_id.clone()));
+        }
+    }
+    out
+}
+
+/// HA P3 — the cluster heartbeat. Upserts THIS host's HOSTS row with a fresh
+/// `last_heartbeat` every [`HEARTBEAT_INTERVAL`] (re-registering if the row vanished), so
+/// peers/the leader can tell it is alive WITHOUT a cross-host TCP probe (which can't cross
+/// the per-host network islands). When this host is the leader it also scans for peers
+/// whose heartbeat has gone stale and logs them — the P3 reconciler consumes those to
+/// reassign their projects. Single-node: the one host beats itself and sees no dead peers.
+async fn host_heartbeat_loop(store: Store, mut self_host: HostRecord, is_leader: Arc<AtomicBool>) {
+    loop {
+        self_host.last_heartbeat = jkbase_control::auth::timestamp();
+        if let Err(e) = store.save_host(&self_host) {
+            warn!(host_id = %self_host.host_id, error = %e, "failed to write host heartbeat");
+        }
+        if is_leader.load(Ordering::Relaxed)
+            && let Ok(hosts) = store.list_hosts()
+        {
+            let now = jkbase_control::auth::timestamp();
+            for h in dead_hosts(&hosts, now, DEAD_HOST_THRESHOLD.as_secs(), &self_host.host_id) {
+                warn!(host_id = %h.host_id, region = %h.region,
+                      stale_secs = now.saturating_sub(h.last_heartbeat),
+                      "dead host detected (stale heartbeat) — pending reconcile");
+            }
+        }
+        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+    }
+}
+
+/// What the leader's reconcile tick found needs doing to converge running → desired.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReconcilePlan {
+    /// Deployed, wakeable projects whose owning host is dead or absent — they need
+    /// (re)placement onto a live host. Computed by the leader; APPLIED by placement (the
+    /// next P3 card). Empty on a healthy single node (allocations are unplaced/local).
+    orphaned: Vec<String>,
+}
+
+/// Compare desired (deployed, wakeable projects) vs running (allocations + live hosts) and
+/// return the drift the leader must act on. Pure + deterministic. A host counts as live
+/// iff its heartbeat is within `dead_threshold_secs`; an allocation with an empty host_id
+/// is single-node/pre-placement (local) and never orphaned.
+fn reconcile_plan(
+    projects: &[Project],
+    allocations: &[VmAllocation],
+    hosts: &[HostRecord],
+    now: u64,
+    dead_threshold_secs: u64,
+) -> ReconcilePlan {
+    let live: HashSet<&str> = hosts
+        .iter()
+        .filter(|h| host_is_live(h, now, dead_threshold_secs))
+        .map(|h| h.host_id.as_str())
+        .collect();
+    let alloc_by_project: HashMap<&str, &VmAllocation> =
+        allocations.iter().map(|a| (a.project_id.as_str(), a)).collect();
+    let mut orphaned = Vec::new();
+    for p in projects {
+        if p.current_version.is_none() {
+            continue; // never deployed → nothing to place
+        }
+        if !matches!(p.state, ProjectState::Active | ProjectState::Hibernated) {
+            continue; // NeedsRedeploy / Stopped are not wakeable
+        }
+        if let Some(alloc) = alloc_by_project.get(p.id.as_str())
+            && !alloc.host_id.is_empty()
+            && !live.contains(alloc.host_id.as_str())
+        {
+            // Owned by a host that is no longer live → needs (re)placement.
+            orphaned.push(p.id.clone());
+        }
+    }
+    orphaned.sort();
+    ReconcilePlan { orphaned }
+}
+
+/// HA P3 — the continuous cluster reconciler. Only the leader reconciles cluster-wide
+/// (followers no-op here and reconcile their own host via the wake/boot paths). Each tick
+/// it compares desired (deployed projects) vs running (allocations + live hosts) via
+/// [`reconcile_plan`] and surfaces the drift; the actual (re)placement of orphaned
+/// projects onto live hosts is the next P3 card (placement + ownership + deploy
+/// forwarding) — this loop is the engine that drives it. Inert on a single node (no
+/// placed allocations, so nothing is ever orphaned).
+async fn reconcile_loop(platform: Arc<Mutex<PlatformState>>, is_leader: Arc<AtomicBool>) {
+    loop {
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+        if !is_leader.load(Ordering::Relaxed) {
+            continue;
+        }
+        // Hold the platform lock for the read + reassign writes — all fast redb ops, no VM
+        // work here. On a single node `orphaned` is empty, so this is lock + 3 reads + bail.
+        let plat = platform.lock().await;
+        let projects = plat.store.list_projects().unwrap_or_default();
+        let allocs = plat.store.list_vm_allocations().unwrap_or_default();
+        let hosts = plat.store.list_hosts().unwrap_or_default();
+        let now = jkbase_control::auth::timestamp();
+        let plan = reconcile_plan(&projects, &allocs, &hosts, now, DEAD_HOST_THRESHOLD.as_secs());
+        if plan.orphaned.is_empty() {
+            continue;
+        }
+        // Place each orphan on a live host (least-loaded in its region) and reassign: update
+        // the allocation's owner + bump placement_epoch. The new owner boots it on its next
+        // wake/reconcile, acquiring the disk lease (whose epoch the old host has already
+        // self-fenced from); the data disk moves via the substrate DataDiskProvider (Ceph).
+        let reassignments =
+            reassign_plan(&plan.orphaned, &hosts, &allocs, now, DEAD_HOST_THRESHOLD.as_secs());
+        for (pid, new_host) in &reassignments {
+            match plat.store.get_vm_allocation(pid) {
+                Ok(Some(mut alloc)) => {
+                    let from = alloc.host_id.clone();
+                    alloc.host_id = new_host.clone();
+                    alloc.placement_epoch = alloc.placement_epoch.saturating_add(1);
+                    if let Err(e) = plat.store.save_vm_allocation(&alloc) {
+                        warn!(project = %pid, error = %e, "reconcile: failed to persist reassignment");
+                    } else {
+                        info!(project = %pid, from = %from, to = %new_host,
+                              epoch = alloc.placement_epoch, "reconcile: reassigned to a live host");
+                    }
+                }
+                _ => warn!(project = %pid, "reconcile: orphan has no allocation to reassign"),
+            }
+        }
+        let unplaced = plan.orphaned.len() - reassignments.len();
+        if unplaced > 0 {
+            warn!(unplaced, "reconcile: orphaned projects with no live host in-region (cluster at capacity)");
+        }
+    }
+}
+
+/// HA P3 — where a deploy for a project must run, given its allocation + the fleet.
+#[derive(Debug, PartialEq, Eq)]
+enum DeployTarget {
+    /// Run here: we own it, or it is unplaced (single-node / pre-placement / first deploy).
+    Local,
+    /// Owned by a live remote host — forward the deploy there.
+    Remote { host_id: String, addr: Option<String> },
+    /// Owned by a host that is no longer live; the reconciler must reassign it first. Fail
+    /// closed (deploy is retryable) rather than have a non-owner boot a second copy.
+    OwnerDead { host_id: String },
+}
+
+/// Decide where `alloc`'s deploy belongs. Local when unplaced / owned-by-me / no-alloc;
+/// Remote when a live peer owns it; OwnerDead when the owner is gone. Pure.
+fn deploy_target(
+    alloc: Option<&VmAllocation>,
+    hosts: &[HostRecord],
+    me: &str,
+    now: u64,
+    dead_threshold_secs: u64,
+) -> DeployTarget {
+    match alloc {
+        None => DeployTarget::Local,
+        Some(a) if a.host_id.is_empty() || a.host_id == me => DeployTarget::Local,
+        Some(a) => match hosts.iter().find(|h| h.host_id == a.host_id) {
+            Some(h) if host_is_live(h, now, dead_threshold_secs) => DeployTarget::Remote {
+                host_id: h.host_id.clone(),
+                addr: h.public_addr.clone(),
+            },
+            _ => DeployTarget::OwnerDead {
+                host_id: a.host_id.clone(),
+            },
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +805,10 @@ struct PlatformState {
     disk_tokens: HashMap<String, FenceToken>,
     /// This host's stable identity, stamped into lease tokens.
     host_id: String,
+    /// HA P2: set while THIS host holds the `cluster-leader` lease. Advisory at P2 —
+    /// nothing gates on it yet (placement is P3) — and the data-disk write-boundary
+    /// self-fence, not this flag, is the split-brain safety guarantee.
+    is_leader: Arc<AtomicBool>,
     /// Host-asserted platform egress facts (OWN object-store host + the platform's own
     /// public IP deny-set), stamped into every per-VM metadata image as `_platform.json`
     /// so the in-VM agent can recognize OWN-storage (Zone 1) and deny the control-plane /
@@ -212,26 +818,71 @@ struct PlatformState {
 
 /// Data disk size (MiB) created on first use for projects that declare volumes.
 const DATA_DISK_MIB: u64 = 1024;
-/// Data-disk lease TTL. Renewed implicitly by holding the VM; released on teardown.
-const DISK_LEASE_TTL: Duration = Duration::from_secs(3600);
+/// Data-disk lease TTL — the failover horizon. With the node-local FlockLease it is moot
+/// (the lock is held for the life of the process); with a distributed lease (HA) it is
+/// the etcd grant TTL: a crashed/partitioned holder's key expires this long after its
+/// LAST SUCCESSFUL renew, which is the earliest a survivor may take the disk. The
+/// disk-fence loop self-fences once a disk's last success ages past [`DISK_FENCE_DEADLINE`]
+/// — anchored at last success (NOT first-observed-failure) and with each renew bounded by
+/// [`RENEW_RPC_TIMEOUT`] — so the safety relation holds even under a blackhole partition:
+///   DISK_FENCE_DEADLINE + (DISK_RENEW_INTERVAL + RENEW_RPC_TIMEOUT) + kill  <  DISK_LEASE_TTL
+/// i.e. the holder kills its Firecracker before its lease can expire and admit a survivor.
+const DISK_LEASE_TTL: Duration = Duration::from_secs(30);
+/// How often the disk-fence loop re-asserts (renews) each held data-disk lease.
+const DISK_RENEW_INTERVAL: Duration = Duration::from_secs(5);
+/// Self-fence once a disk's time-since-last-successful-renew reaches this (fail closed).
+/// A genuine supersession ([`SubstrateError::Fenced`]) self-fences immediately regardless.
+/// Satisfies the relation on [`DISK_LEASE_TTL`]: long enough that a brief blip never kills
+/// a live VM, short enough to beat lease-expiry/takeover by a margin.
+const DISK_FENCE_DEADLINE: Duration = Duration::from_secs(15);
+/// Per-attempt bound on a lease renew RPC. Under a network blackhole an unbounded etcd
+/// renew (`get` + keepalive) can hang for minutes on TCP retransmit, which would stall the
+/// fence loop past the lease TTL and let a survivor attach over a still-live writer.
+/// Bounding each attempt turns a hang into a prompt transient error, so the deadline clock
+/// (anchored at last success) keeps advancing and the host self-fences in time.
+const RENEW_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a host re-asserts its own liveness into HOSTS (the cluster heartbeat).
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Past this with no heartbeat, the leader treats a host as dead and (P3 reconciler/
+/// placement) reassigns its projects. Tunable for the RTO budget; kept above a few
+/// heartbeat intervals so one missed beat / a brief GC pause is not a false positive.
+const DEAD_HOST_THRESHOLD: Duration = Duration::from_secs(15);
+/// How often the leader runs the continuous cluster reconcile (desired vs running).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
 impl PlatformState {
+    /// HA P2: whether this host currently holds cluster leadership. Advisory until P3
+    /// (placement) gates on it.
+    #[allow(dead_code)] // consumed by the P3 placement gate
+    fn is_leader(&self) -> bool {
+        self.is_leader.load(Ordering::Relaxed)
+    }
+
     fn allocate_ip(&self) -> Result<(String, String, String)> {
         let existing = self.store.list_vm_allocations()?;
-        let used_octets: HashSet<u8> = existing
-            .iter()
-            .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
-            .collect();
-
-        for octet in 2..=254u8 {
-            if !used_octets.contains(&octet) {
+        match next_free_octet(&existing, &self.host_id) {
+            Some(octet) => {
                 let (tap, ip, mac) = slot_identity(octet);
-                return Ok((ip, tap, mac));
+                Ok((ip, tap, mac))
             }
+            None => anyhow::bail!("no available IP addresses in this host's 172.16.0.0/24 island"),
         }
-
-        anyhow::bail!("no available IP addresses in 172.16.0.0/24");
     }
+}
+
+/// HA P4 — the next free last-octet in THIS host's `172.16.0.0/24` island, considering
+/// only allocations owned by `host_id` (empty host_id = single-node / pre-placement =
+/// ours). Each host runs the same /24 on its own L2 bridge, so a peer's IPs are on a
+/// separate segment — they neither collide with ours nor count against our range. This
+/// also removes the cross-host uniqueness race on the shared control store (each host
+/// allocates independently). `None` when the island is full.
+fn next_free_octet(allocations: &[VmAllocation], host_id: &str) -> Option<u8> {
+    let used: HashSet<u8> = allocations
+        .iter()
+        .filter(|a| a.host_id.is_empty() || a.host_id == host_id)
+        .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
+        .collect();
+    (2..=254u8).find(|o| !used.contains(o))
 }
 
 /// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
@@ -287,6 +938,32 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // HA cluster identity (P0/P2) + [substrate] backend selection. The host id is the
+    // configured --host-id, else the system hostname (single-node default); it names
+    // this server in lease tokens and the P2 leader election. Validate the substrate
+    // backend selection up front so a typo fails fast (the factory itself is not wired
+    // until P1+).
+    validate_substrate_selection(&args)?;
+    let host_id = args
+        .host_id
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(resolve_hostname);
+    info!(
+        host_id = %host_id,
+        region = %args.region,
+        public_addr = ?args.public_addr,
+        cap_vcpus = args.host_vcpus,
+        cap_mem_mib = args.host_mem_mib,
+        cap_max_vms = args.host_max_vms,
+        control_store = %args.substrate_control_store,
+        lease = %args.substrate_lease,
+        data_disk = %args.substrate_data_disk,
+        blob_store = %args.substrate_blob_store,
+        "cluster config"
+    );
+
     let data_dir = args.data_dir.clone();
     let guest_kernel = resolve_guest_kernel(&args.fc_dir);
     tracing::info!(kernel = %guest_kernel.display(), "guest kernel selected");
@@ -353,12 +1030,8 @@ async fn main() -> Result<()> {
 
     // Data-disk RWO substrate: R3 LocalLoop (loop-device exclusivity) + R2 FlockLease
     // (monotonic fence token). Migrate any legacy `{id}.ext4` disks to LocalLoop's
-    // `{id}.img` naming so they become loop-managed + fenced.
-    let host_id = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "node-local".to_string());
+    // `{id}.img` naming so they become loop-managed + fenced. (`host_id` was resolved
+    // from --host-id / the hostname at startup, above.)
     let data_disks_dir = data_dir.join("data-disks");
     migrate_legacy_data_disks(&data_disks_dir).await?;
     let data_disk: Arc<dyn DataDiskProvider> = Arc::new(LocalLoop::open(&data_disks_dir)?);
@@ -396,6 +1069,16 @@ async fn main() -> Result<()> {
         platform_ips,
     };
 
+    // HA P2: cluster leadership flag + the lease/host_id the election loop needs
+    // (the originals are moved into PlatformState below).
+    let is_leader = Arc::new(AtomicBool::new(false));
+    let lease_for_election = lease.clone();
+    let lease_for_fence = lease.clone();
+    let host_id_for_election = host_id.clone();
+    let host_id_for_heartbeat = host_id.clone();
+    let is_leader_for_heartbeat = is_leader.clone();
+    let is_leader_for_reconcile = is_leader.clone();
+
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         vm_states: HashMap::new(),
@@ -411,7 +1094,48 @@ async fn main() -> Result<()> {
         disk_tokens: HashMap::new(),
         host_id,
         platform_egress,
+        is_leader: is_leader.clone(),
     }));
+
+    // HA P2: elect a single cluster leader (the holder of the `cluster-leader` lease).
+    // On a single node this process simply wins and stays leader. Advisory at P2 — P3's
+    // placement gate reads `is_leader`; the data-disk self-fence is the real safety net.
+    tokio::spawn(leader_election_loop(
+        lease_for_election,
+        host_id_for_election,
+        is_leader,
+    ));
+
+    // HA P2: the data-disk write-boundary self-fence. Renews each held disk lease and
+    // self-terminates this host's Firecracker for any project whose lease it loses,
+    // before a survivor attaches. Inert on a single node (FlockLease renew always
+    // succeeds while we hold the lock).
+    tokio::spawn(disk_fence_loop(platform.clone(), lease_for_fence));
+
+    // HA P3: register THIS host in the fleet (HOSTS) and heartbeat it so peers/the leader
+    // know it is alive without a cross-host TCP probe; when leader, it detects stale peers.
+    let self_host = HostRecord {
+        host_id: host_id_for_heartbeat,
+        region: args.region.clone(),
+        public_addr: args.public_addr.clone(),
+        last_heartbeat: 0,
+        cpu_template_id: args.cpu_template_id.clone(),
+        kernel_id: args.kernel_id.clone(),
+        capacity: HostCapacity {
+            vcpus: args.host_vcpus,
+            mem_mib: args.host_mem_mib,
+            max_vms: args.host_max_vms,
+        },
+    };
+    tokio::spawn(host_heartbeat_loop(
+        store.clone(),
+        self_host,
+        is_leader_for_heartbeat,
+    ));
+
+    // HA P3: the continuous cluster reconciler — the leader compares desired vs running
+    // each tick and surfaces drift (placement applies it, next card). Inert single-node.
+    tokio::spawn(reconcile_loop(platform.clone(), is_leader_for_reconcile));
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
@@ -845,12 +1569,20 @@ async fn shutdown_signal(
 
 async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
     let plat = platform.lock().await;
+    let me_host = plat.host_id.clone();
     let allocs = match plat.store.list_vm_allocations() {
         Ok(a) => a,
         Err(_) => return,
     };
 
     for alloc in &allocs {
+        // Only probe our OWN VMs. A peer host's VM IP lives on its own network island,
+        // unreachable from here, so a TCP probe would false-negative and wrongly reap a
+        // live peer's allocation; peer/host liveness is via heartbeats (HOSTS), not TCP.
+        // (Empty host_id = single-node / pre-placement = treat as local.)
+        if !alloc.host_id.is_empty() && alloc.host_id != me_host {
+            continue;
+        }
         let reachable = tokio::time::timeout(
             Duration::from_secs(2),
             tokio::net::TcpStream::connect(format!("{}:80", alloc.ip)),
@@ -1426,6 +2158,28 @@ async fn handle_deploy(
         }
     };
 
+    // HA P3: only the OWNER host may deploy a project. On a single node every project is
+    // local (unplaced / owned by this host), so this is a no-op; in a cluster a deploy that
+    // reached a non-owner fails closed (retry) rather than booting a second owner.
+    {
+        let me = plat.host_id.clone();
+        let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+        let hosts = plat.store.list_hosts().unwrap_or_default();
+        let now = jkbase_control::auth::timestamp();
+        match deploy_target(alloc.as_ref(), &hosts, &me, now, DEAD_HOST_THRESHOLD.as_secs()) {
+            DeployTarget::Local => {}
+            DeployTarget::Remote { host_id, addr } => anyhow::bail!(
+                "project {project_id} is owned by host {host_id} ({}); the deploy must run there \
+                 (cross-host deploy forwarding not yet wired)",
+                addr.as_deref().unwrap_or("addr unknown")
+            ),
+            DeployTarget::OwnerDead { host_id } => anyhow::bail!(
+                "project {project_id}'s owner host {host_id} is down; the reconciler will reassign \
+                 it — retry the deploy shortly"
+            ),
+        }
+    }
+
     // If hibernated, clear stale snapshot
     if plat.vm_states.get(project_id) == Some(&VmLifecycle::Hibernated) {
         info!(project = %project_id, "clearing snapshot for fresh deploy");
@@ -1469,6 +2223,11 @@ async fn handle_deploy(
                 ip,
                 tap_device: tap,
                 mac,
+                // HA P3: the host that first deploys a project owns it (initial placement);
+                // the leader reassigns on host death (reconcile_loop). On a single node this
+                // is the one live host, so ownership is a no-op for routing.
+                host_id: plat.host_id.clone(),
+                placement_epoch: 1,
             };
             plat.store.save_vm_allocation(&alloc)?;
             info!(project = %project_id, ip = %alloc.ip, "allocated new IP");
@@ -3031,9 +3790,490 @@ async fn wait_for_agent(ip: &str) -> Result<()> {
     anyhow::bail!("agent at {ip} did not become ready within 10 seconds");
 }
 
+/// HA P2 — the split-brain GATE. Deterministic tests of the COORDINATION layer of the
+/// data-disk fence the self-fence (`disk_fence_loop`/`self_fence_project`) and the
+/// restore-path fence rely on: that the lease + epoch + renew-or-die logic admit at most
+/// one writer per disk scope. **GATE: the coordination layer must be green before any
+/// failover automation (P3+) is wired** — the cluster BLOCK-DEVICE exclusivity gate (a
+/// live partition actually being prevented from writing) is the substrate's on-box test
+/// plus the EtcdLease 2-host run noted below.
+///
+/// Admission model: a host may write a disk iff it still holds the lease. Production
+/// de-admits (self-fences) on a renew that is `Fenced` (superseded) or that stays failing
+/// past the grace window — see `evaluate_renew`, unit-tested for the transient-vs-fenced
+/// discrimination by `renew_evaluation_discriminates_fenced_from_transient`. The four
+/// scenarios below walk the split-brain space and assert `at most one host is admitted at
+/// any moment`.
+///
+/// Coverage boundary (honest — not silently capped):
+///  - These run against the node-local `FlockLease` (no root, CI-deterministic) and so
+///    prove the COORDINATION layer (mutual exclusion, de-admission on loss, epoch
+///    monotonicity). A voluntary `release` models a definitive (`Fenced`) loss.
+///  - The transient-blip-vs-real-loss discrimination (so an etcd hiccup never kills a
+///    live VM) is covered separately + deterministically by `evaluate_renew`'s unit test.
+///  - The real BLOCK-DEVICE exclusivity (a live prior writer blocks `attach_rwo`) is the
+///    substrate's on-box `attach_refuses_while_prior_writer_is_alive`.
+///  - The live-partition case (holder still alive while the AUTHORITY expired its lease)
+///    needs the distributed `EtcdLease` + a real 2-host/partition run — the rented-
+///    hardware last mile, NOT proven here.
+#[cfg(test)]
+mod split_brain_gate {
+    use jkbase_substrate::{FenceToken, FlockLease, Lease, SubstrateError};
+    use std::time::Duration;
+
+    const TTL: Duration = Duration::from_secs(15);
+
+    fn leases_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("jkbase-gate-{tag}-{nanos}"))
+    }
+
+    /// The production admission gate: a host may write iff its lease token still renews.
+    async fn may_write(lease: &FlockLease, token: &FenceToken) -> bool {
+        lease.renew(token, TTL).await.is_ok()
+    }
+
+    /// S1 — racing writers: two hosts contend for one disk; mutual exclusion admits
+    /// at most one. The loser never even gets a token.
+    #[tokio::test]
+    async fn racing_writers_admit_at_most_one() {
+        let dir = leases_dir("race");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        // host-b races for the same disk and is refused while a live holder owns it.
+        assert!(matches!(
+            b.acquire("disk-p", "host-b", TTL).await,
+            Err(SubstrateError::LeaseHeld { .. })
+        ));
+        assert!(may_write(&a, &ta).await, "exactly one admitted writer (a)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S2 — lease loss mid-write: the holder's admission is revoked the instant it loses
+    /// the lease (→ self-fence), and a survivor can be admitted ONLY afterwards, with a
+    /// strictly higher epoch. There is never a moment with two admitted writers.
+    #[tokio::test]
+    async fn lease_loss_revokes_admission_before_survivor_is_admitted() {
+        let dir = leases_dir("loss");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        assert!(may_write(&a, &ta).await, "a is the writer");
+        // While a holds, the survivor CANNOT acquire — so two are never admitted at once.
+        assert!(b.acquire("disk-p", "host-b", TTL).await.is_err());
+
+        // a loses the lease (partition / TTL expiry ≈ the OS releasing its flock).
+        a.release(&ta).await.unwrap();
+        assert!(
+            !may_write(&a, &ta).await,
+            "a self-fences the instant it loses the lease"
+        );
+        // Only NOW can the survivor be admitted, with a strictly higher epoch.
+        let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
+        assert!(tb.epoch > ta.epoch);
+        assert!(may_write(&b, &tb).await);
+        assert!(!may_write(&a, &ta).await, "deposed a stays de-admitted (no double writer)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S3 — TTL clock skew: authority is by epoch (monotonic, lease-issued), NOT by any
+    /// host's wall clock. A clock-skewed old host's token can never supersede the newer
+    /// holder's, so skew cannot revive a stale writer.
+    #[tokio::test]
+    async fn clock_skew_cannot_revive_a_stale_token() {
+        let dir = leases_dir("skew");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        a.release(&ta).await.unwrap();
+        let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
+        assert!(tb.supersedes(&ta).unwrap(), "newer epoch supersedes");
+        assert!(
+            !ta.supersedes(&tb).unwrap(),
+            "a clock-skewed stale token never supersedes the live holder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S4 — zombie double-write: a hung old writer that still 'believes' it holds the
+    /// disk after a takeover is denied on both axes — its stale token neither renews nor
+    /// supersedes the live holder.
+    #[tokio::test]
+    async fn zombie_holder_cannot_write_after_takeover() {
+        let dir = leases_dir("zombie");
+        // Shared source_id = the (single) lease authority — so tokens are globally
+        // comparable by epoch, as a distributed lease (etcd) issues them; distinct
+        // `holder`s on acquire identify the two hosts. Mutual exclusion still comes
+        // from the two separate flock handles over the shared lock file.
+        let a = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let b = FlockLease::open(dir.clone(), "cluster").unwrap();
+        let ta = a.acquire("disk-p", "host-a", TTL).await.unwrap();
+        // a hangs/partitions; its flock is released (OS on crash, modelled by release).
+        a.release(&ta).await.unwrap();
+        let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
+        // The zombie keeps trying to use its stale token — denied both ways:
+        assert!(!may_write(&a, &ta).await, "stale token can't renew → denied admission");
+        assert!(
+            !ta.supersedes(&tb).unwrap(),
+            "stale token can't supersede the live holder"
+        );
+        assert!(may_write(&b, &tb).await, "the live holder is the sole writer");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn flock_lease_elects_single_leader() {
+        // The election primitive (HA P2): with a SHARED lease backend, exactly one host
+        // holds `cluster-leader` at a time; a contender wins only after the holder
+        // releases (≈ the holder dying, which the OS does for flock), with a strictly
+        // higher epoch. Two FlockLease instances over one leases dir = a single-box sim
+        // cluster of two hosts.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let leases = std::env::temp_dir().join(format!("jkbase-leader-{nanos}"));
+        let a = jkbase_substrate::FlockLease::open(leases.clone(), "host-a").unwrap();
+        let b = jkbase_substrate::FlockLease::open(leases.clone(), "host-b").unwrap();
+        let ttl = Duration::from_secs(15);
+
+        // host-a wins leadership.
+        let ta = a.acquire(LEADER_SCOPE, "host-a", ttl).await.unwrap();
+        // host-b cannot while a live holder owns it.
+        assert!(matches!(
+            b.acquire(LEADER_SCOPE, "host-b", ttl).await,
+            Err(SubstrateError::LeaseHeld { .. })
+        ));
+        // host-a re-asserts (the loop's keepalive) — same token, no epoch churn.
+        assert_eq!(a.renew(&ta, ttl).await.unwrap().epoch, ta.epoch);
+
+        // host-a steps down (≈ crash); host-b now wins, with a higher epoch (fence
+        // monotonicity across the leadership change).
+        a.release(&ta).await.unwrap();
+        let tb = b.acquire(LEADER_SCOPE, "host-b", ttl).await.unwrap();
+        assert!(tb.epoch > ta.epoch, "new leader's epoch must supersede the old");
+        // The deposed host can no longer renew its stale token.
+        assert!(a.renew(&ta, ttl).await.is_err());
+
+        let _ = std::fs::remove_dir_all(&leases);
+    }
+
+    fn test_host(id: &str, region: &str, hb: u64, max_vms: u32) -> HostRecord {
+        HostRecord {
+            host_id: id.into(),
+            region: region.into(),
+            public_addr: Some(format!("{id}:9090")),
+            last_heartbeat: hb,
+            cpu_template_id: None,
+            kernel_id: None,
+            capacity: HostCapacity { vcpus: 0, mem_mib: 0, max_vms },
+        }
+    }
+    fn test_alloc(pid: &str, host: &str) -> VmAllocation {
+        VmAllocation {
+            project_id: pid.into(),
+            ip: "172.16.0.2".into(),
+            tap_device: "tap".into(),
+            mac: "AA".into(),
+            host_id: host.into(),
+            placement_epoch: 1,
+        }
+    }
+
+    #[test]
+    fn next_free_octet_is_scoped_per_host_island() {
+        // HA P4: each host's /24 is its own L2 island, so only OUR allocations (and legacy
+        // empty-host_id ones) constrain the next octet; a peer reusing the same octets on
+        // its own segment must not block us or exhaust our range.
+        let a = |pid: &str, ip: &str, host: &str| VmAllocation {
+            project_id: pid.into(),
+            ip: ip.into(),
+            tap_device: "t".into(),
+            mac: "AA".into(),
+            host_id: host.into(),
+            placement_epoch: 1,
+        };
+        let allocs = vec![
+            a("p1", "172.16.0.2", "me"),
+            a("p2", "172.16.0.3", "me"),
+            a("peer1", "172.16.0.2", "peer"), // peer reuses .2 on ITS island — ignored for us
+            a("peer2", "172.16.0.4", "peer"), // peer's .4 — ignored for us
+            a("legacy", "172.16.0.5", ""),    // empty host_id = ours
+        ];
+        // me: own {2,3} + legacy {5}; peer's {2,4} ignored → next free = 4.
+        assert_eq!(next_free_octet(&allocs, "me"), Some(4));
+        // peer: own {2,4} + legacy {5} → next free = 3.
+        assert_eq!(next_free_octet(&allocs, "peer"), Some(3));
+        // Empty pool starts at .2.
+        assert_eq!(next_free_octet(&[], "me"), Some(2));
+    }
+
+    #[test]
+    fn place_project_picks_least_loaded_live_in_region_with_capacity() {
+        let now = 1000;
+        let hosts = vec![
+            test_host("a", "east", 995, 0), // live, region east, unbounded
+            test_host("b", "east", 995, 0), // live, region east
+            test_host("c", "west", 995, 0), // live, wrong region
+            test_host("d", "east", 900, 0), // east but DEAD (100s stale)
+            test_host("full", "east", 995, 1), // east, live, but at capacity (1)
+        ];
+        // a has 2 allocations, b has 0, full has 1 (at its cap).
+        let allocs = vec![
+            test_alloc("p1", "a"),
+            test_alloc("p2", "a"),
+            test_alloc("p3", "full"),
+        ];
+        let load = current_load(&allocs);
+        let pick = place_project(&hosts, &load, "east", now, 15).unwrap();
+        assert_eq!(pick.host_id, "b", "least-loaded live in-region with capacity");
+        // No host in an empty region.
+        assert!(place_project(&hosts, &load, "north", now, 15).is_none());
+    }
+
+    #[test]
+    fn reassign_plan_spreads_orphans_across_live_in_region() {
+        let now = 1000;
+        let hosts = vec![
+            test_host("dead", "east", 900, 0), // dead owner of the orphans
+            test_host("a", "east", 995, 0),
+            test_host("b", "east", 995, 0),
+        ];
+        // Two orphans, both previously on the dead east host → spread across a and b.
+        let allocs = vec![test_alloc("p1", "dead"), test_alloc("p2", "dead")];
+        let orphaned = vec!["p1".to_string(), "p2".to_string()];
+        let plan = reassign_plan(&orphaned, &hosts, &allocs, now, 15);
+        let targets: HashSet<&str> = plan.iter().map(|(_, h)| h.as_str()).collect();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(targets, HashSet::from(["a", "b"]), "spread, not piled onto one host");
+    }
+
+    #[test]
+    fn deploy_target_routes_by_ownership() {
+        let now = 1000;
+        let hosts = vec![test_host("me", "east", 995, 0), test_host("peer", "east", 995, 0)];
+        // No allocation (first deploy) → local.
+        assert_eq!(deploy_target(None, &hosts, "me", now, 15), DeployTarget::Local);
+        // Unplaced (empty host_id) → local.
+        assert_eq!(
+            deploy_target(Some(&test_alloc("p", "")), &hosts, "me", now, 15),
+            DeployTarget::Local
+        );
+        // Owned by me → local.
+        assert_eq!(
+            deploy_target(Some(&test_alloc("p", "me")), &hosts, "me", now, 15),
+            DeployTarget::Local
+        );
+        // Owned by a live peer → forward.
+        assert!(matches!(
+            deploy_target(Some(&test_alloc("p", "peer")), &hosts, "me", now, 15),
+            DeployTarget::Remote { ref host_id, .. } if host_id == "peer"
+        ));
+        // Owned by a host that is gone (not in HOSTS / dead) → fail closed.
+        assert!(matches!(
+            deploy_target(Some(&test_alloc("p", "ghost")), &hosts, "me", now, 15),
+            DeployTarget::OwnerDead { ref host_id } if host_id == "ghost"
+        ));
+    }
+
+    #[test]
+    fn reconcile_plan_orphans_only_projects_on_dead_hosts() {
+        // HA P3: the leader's desired-vs-running drift. A deployed, wakeable project is
+        // orphaned iff its owning host is no longer live; unplaced (empty host_id),
+        // live-owned, never-deployed, and non-wakeable projects are left alone.
+        let proj = |id: &str, ver: Option<u64>, state: ProjectState| Project {
+            id: id.into(),
+            name: id.into(),
+            tenant_id: Some("t".into()),
+            current_version: ver,
+            state,
+            vm_ip: None,
+            domains: vec![],
+        };
+        let alloc = |pid: &str, host: &str| VmAllocation {
+            project_id: pid.into(),
+            ip: "172.16.0.2".into(),
+            tap_device: "tap".into(),
+            mac: "AA".into(),
+            host_id: host.into(),
+            placement_epoch: 1,
+        };
+        let host = |id: &str, hb: u64| HostRecord {
+            host_id: id.into(),
+            region: "r".into(),
+            public_addr: None,
+            last_heartbeat: hb,
+            cpu_template_id: None,
+            kernel_id: None,
+            capacity: HostCapacity::default(),
+        };
+        let now = 1000;
+        let projects = vec![
+            proj("on-dead", Some(1), ProjectState::Hibernated), // owner dead → orphan
+            proj("on-live", Some(1), ProjectState::Active),     // owner live → ok
+            proj("unplaced", Some(1), ProjectState::Hibernated), // empty host_id → ok
+            proj("undeployed", None, ProjectState::Active),     // no version → ignored
+            proj("needs", Some(1), ProjectState::NeedsRedeploy), // not wakeable → ignored
+        ];
+        let allocs = vec![
+            alloc("on-dead", "host-dead"),
+            alloc("on-live", "host-live"),
+            alloc("unplaced", ""),
+            alloc("needs", "host-dead"),
+        ];
+        let hosts = vec![host("host-live", 995), host("host-dead", 970)]; // dead = 30s stale
+        let plan = reconcile_plan(&projects, &allocs, &hosts, now, 15);
+        assert_eq!(plan.orphaned, vec!["on-dead".to_string()]);
+    }
+
+    #[test]
+    fn dead_hosts_flags_only_stale_peers() {
+        // HA P3: the leader treats a peer as dead only when its heartbeat is genuinely
+        // stale — never itself, and never a just-registered peer that hasn't beat yet.
+        let h = |id: &str, hb: u64| HostRecord {
+            host_id: id.into(),
+            region: "r".into(),
+            public_addr: None,
+            last_heartbeat: hb,
+            cpu_template_id: None,
+            kernel_id: None,
+            capacity: HostCapacity::default(),
+        };
+        let now = 1000;
+        let hosts = vec![
+            h("self", 999),  // me — excluded even though "fresh"
+            h("fresh", 990), // 10s ago, within threshold → alive
+            h("stale", 980), // 20s ago, past 15s → dead
+            h("never", 0),   // registered, never beat → excluded (not a false positive)
+        ];
+        let dead: Vec<&str> = dead_hosts(&hosts, now, 15, "self")
+            .iter()
+            .map(|h| h.host_id.as_str())
+            .collect();
+        assert_eq!(dead, vec!["stale"]);
+    }
+
+    #[test]
+    fn renew_evaluation_discriminates_fenced_from_transient() {
+        // The HIGH-fix core (HA P2): a renew error must NOT be treated uniformly — a
+        // transient blip/timeout must never self-fence a live VM / flap leadership, and the
+        // deadline is anchored at the LAST SUCCESS (the clock the lease TTL runs on).
+        let deadline = Duration::from_secs(12);
+        let t0 = Instant::now();
+        let tok = FenceToken {
+            scope: "disk-p".into(),
+            epoch: 1,
+            holder: "host-a".into(),
+            source_id: "cluster".into(),
+        };
+        let ok: Result<FenceToken, SubstrateError> = Ok(tok);
+        let fenced: Result<FenceToken, SubstrateError> =
+            Err(SubstrateError::Fenced { scope: "disk-p".into() });
+        // A timed-out renew is surfaced as Backend, indistinguishable here from any blip.
+        let transient: Result<FenceToken, SubstrateError> =
+            Err(SubstrateError::Backend("etcd unreachable / timed out".into()));
+
+        // A confirmed renew holds (resets the last-success clock).
+        assert_eq!(evaluate_renew(&ok, t0, t0, deadline), FenceDecision::Hold);
+        // A genuine supersession fences IMMEDIATELY, even just after a success.
+        assert_eq!(
+            evaluate_renew(&fenced, t0, t0 + Duration::from_secs(1), deadline),
+            FenceDecision::FenceNow
+        );
+        // A fresh transient blip (last success just now) → keep waiting; one dropped
+        // packet never kills a live VM.
+        assert_eq!(evaluate_renew(&transient, t0, t0, deadline), FenceDecision::KeepWaiting);
+        // Transient, last success still within the deadline → keep waiting.
+        assert_eq!(
+            evaluate_renew(&transient, t0, t0 + Duration::from_secs(11), deadline),
+            FenceDecision::KeepWaiting
+        );
+        // Transient and last success aged past the deadline → fail closed before the
+        // lease TTL can expire and admit a survivor.
+        assert_eq!(
+            evaluate_renew(&transient, t0, t0 + Duration::from_secs(12), deadline),
+            FenceDecision::FenceNow
+        );
+    }
+
+    #[test]
+    fn self_fence_guard_only_fences_the_exact_lost_token() {
+        // The split-brain safety guard (HA P2): fence ONLY the holder of the precise
+        // token whose renewal was lost, so a redeploy that rotated the token (a live,
+        // freshly-attached VM) is never killed.
+        let tok = |scope: &str, epoch: u64| FenceToken {
+            scope: scope.into(),
+            epoch,
+            holder: "host-a".into(),
+            source_id: "src".into(),
+        };
+        let mut tokens: HashMap<String, FenceToken> = HashMap::new();
+        tokens.insert("p".to_string(), tok("p", 1));
+
+        // Exact token still held → fence it.
+        assert!(token_still_held(&tokens, "p", &tok("p", 1)));
+        // Rotated by a redeploy (higher epoch) → do NOT fence (would kill the live VM).
+        assert!(!token_still_held(&tokens, "p", &tok("p", 2)));
+        // Same epoch but different holder/source → not the same token → do not fence.
+        assert!(!token_still_held(
+            &tokens,
+            "p",
+            &FenceToken {
+                scope: "p".into(),
+                epoch: 1,
+                holder: "host-b".into(),
+                source_id: "src".into()
+            }
+        ));
+        // Already torn down → nothing to fence.
+        tokens.remove("p");
+        assert!(!token_still_held(&tokens, "p", &tok("p", 1)));
+    }
+
+    #[tokio::test]
+    async fn disk_lease_renewal_signals_loss_after_release() {
+        // The self-fence trigger (HA P2): while we hold the disk lease, renew succeeds;
+        // once it is lost (here: released ≈ superseded by a survivor / expired under a
+        // partition), renew fails — that Err is what drives self_fence_project.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let leases = std::env::temp_dir().join(format!("jkbase-diskfence-{nanos}"));
+        let l = jkbase_substrate::FlockLease::open(leases.clone(), "host-a").unwrap();
+        let t = l.acquire("proj-x", "host-a", DISK_LEASE_TTL).await.unwrap();
+        assert!(
+            l.renew(&t, DISK_LEASE_TTL).await.is_ok(),
+            "held → renew succeeds (no fence)"
+        );
+        l.release(&t).await.unwrap();
+        assert!(
+            l.renew(&t, DISK_LEASE_TTL).await.is_err(),
+            "lost → renew fails → self-fence fires"
+        );
+        let _ = std::fs::remove_dir_all(&leases);
+    }
 
     #[test]
     fn cron_parse_5field_and_due_since() {

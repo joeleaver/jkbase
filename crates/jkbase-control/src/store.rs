@@ -33,6 +33,10 @@ const ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_k
 /// written in one txn so they never diverge.
 const ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
     TableDefinition::new("access_keys_by_project");
+/// Cluster fleet membership (HA), one row per `jkbase-server` host instance, keyed
+/// by `host_id`. The leader's placement + dead-host detection (P3) read this; at HA
+/// P0 it is schema only — CRUD + tests, no loop touches it yet.
+const HOSTS: TableDefinition<&str, &[u8]> = TableDefinition::new("hosts");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
@@ -81,6 +85,59 @@ pub struct VmAllocation {
     pub ip: String,
     pub tap_device: String,
     pub mac: String,
+    /// The cluster host that currently owns/runs this VM (`HostRecord.host_id`).
+    /// Empty for single-node allocations and for records written before HA P0; the
+    /// leader's placement (P3) populates it. `#[serde(default)]` so pre-HA records
+    /// deserialize unchanged.
+    #[serde(default)]
+    pub host_id: String,
+    /// Monotonic placement epoch, bumped each time the leader (re)assigns this VM to
+    /// a host. The single-writer safety core (P2): a host self-terminates its
+    /// Firecracker before any survivor attaches once its held epoch goes stale. 0 for
+    /// single-node / pre-HA records.
+    #[serde(default)]
+    pub placement_epoch: u64,
+}
+
+/// A host's declared scheduling capacity — the placement bin-packing input (P3).
+/// Zero means "unset/auto": a scheduler treats 0 as no declared bound.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct HostCapacity {
+    pub vcpus: u32,
+    pub mem_mib: u64,
+    pub max_vms: u32,
+}
+
+/// One cluster host: a `jkbase-server` instance, keyed by `host_id` in `HOSTS`. The
+/// fleet's source of truth for placement and failover — the leader reads
+/// `last_heartbeat` for dead-host detection and `capacity` for least-loaded-in-region
+/// placement (P3), and `cpu_template_id`/`kernel_id` decide warm-vs-cold cross-host
+/// restore (P5). Schema only at HA P0: no loop writes or reads these yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostRecord {
+    /// Stable, cluster-unique id for this server instance (`--host-id`).
+    pub host_id: String,
+    /// Placement region; projects are placed least-loaded WITHIN a region.
+    pub region: String,
+    /// Address peers/the proxy use to forward to this host (deploy forwarding in P3,
+    /// routing `Backend.host_addr` in P4). `None` until declared.
+    #[serde(default)]
+    pub public_addr: Option<String>,
+    /// Epoch seconds of this host's last heartbeat; the leader treats a stale value
+    /// as a dead host (P3). 0 = never beaten.
+    #[serde(default)]
+    pub last_heartbeat: u64,
+    /// Firecracker CPU template this host bakes into its VMs from first boot; a warm
+    /// cross-host snapshot restore (P5) is only safe when source+target match. `None`
+    /// = no template pinned (cold-boot only).
+    #[serde(default)]
+    pub cpu_template_id: Option<String>,
+    /// Guest-kernel identity; a warm restore also requires matching kernels (P5).
+    #[serde(default)]
+    pub kernel_id: Option<String>,
+    /// Declared scheduling capacity for placement bin-packing (P3).
+    #[serde(default)]
+    pub capacity: HostCapacity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +475,7 @@ impl Store {
         let _ = txn.open_table(QUOTA_STATUS)?;
         let _ = txn.open_table(ACCESS_KEYS)?;
         let _ = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+        let _ = txn.open_table(HOSTS)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -512,6 +570,68 @@ impl Store {
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    // -- Hosts (HA cluster fleet; schema only at P0) --
+
+    pub fn save_host(&self, host: &HostRecord) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(HOSTS)?;
+            let data = serde_json::to_vec(host)?;
+            table.insert(host.host_id.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_host(&self, host_id: &str) -> Result<Option<HostRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(HOSTS)?;
+        match table.get(host_id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_hosts(&self) -> Result<Vec<HostRecord>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(HOSTS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            out.push(serde_json::from_slice::<HostRecord>(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_host(&self, host_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(HOSTS)?;
+            table.remove(host_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Read-modify-write just `last_heartbeat` (the P3 heartbeat loop's hot path);
+    /// preserves every other field. No-op if the host was removed concurrently.
+    pub fn touch_host_heartbeat(&self, host_id: &str, ts: u64) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(HOSTS)?;
+            // Own the bytes so the read guard's borrow ends before the insert.
+            let existing = table.get(host_id)?.map(|d| d.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut rec: HostRecord = serde_json::from_slice(&bytes)?;
+                rec.last_heartbeat = ts;
+                let out = serde_json::to_vec(&rec)?;
+                table.insert(host_id, out.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     // -- Snapshots --
@@ -1968,5 +2088,76 @@ mod tests {
         assert!(store.get_domain("other").unwrap().is_some()); // b untouched
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn host_crud_and_heartbeat_rmw() {
+        let (store, path) = tmp_db();
+        let h = HostRecord {
+            host_id: "host-a".into(),
+            region: "ca-east".into(),
+            public_addr: Some("10.0.0.1:9090".into()),
+            last_heartbeat: 0,
+            cpu_template_id: None,
+            kernel_id: Some("vmlinux-6.12".into()),
+            capacity: HostCapacity { vcpus: 16, mem_mib: 131072, max_vms: 64 },
+        };
+        store.save_host(&h).unwrap();
+        store
+            .save_host(&HostRecord { host_id: "host-b".into(), region: "eu-west".into(), ..h.clone() })
+            .unwrap();
+        assert_eq!(store.list_hosts().unwrap().len(), 2);
+        assert_eq!(store.get_host("host-a").unwrap().unwrap().region, "ca-east");
+        assert!(store.get_host("ghost").unwrap().is_none());
+
+        // RMW advances only last_heartbeat, preserving the rest.
+        store.touch_host_heartbeat("host-a", 12345).unwrap();
+        let a = store.get_host("host-a").unwrap().unwrap();
+        assert_eq!(a.last_heartbeat, 12345);
+        assert_eq!(a.capacity.vcpus, 16, "capacity preserved across rmw");
+        assert_eq!(a.kernel_id.as_deref(), Some("vmlinux-6.12"));
+        // RMW on a missing host is a silent no-op.
+        store.touch_host_heartbeat("ghost", 1).unwrap();
+        assert!(store.get_host("ghost").unwrap().is_none());
+
+        assert!(store.remove_host("host-a").unwrap());
+        assert!(!store.remove_host("host-a").unwrap(), "second remove false");
+        assert_eq!(store.list_hosts().unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn vm_allocation_new_fields_back_compat() {
+        // An allocation persisted before host_id/placement_epoch existed must
+        // deserialize with those fields defaulted (empty host, epoch 0).
+        let old = r#"{"project_id":"p","ip":"172.16.0.2","tap_device":"jktap-p","mac":"AA:BB:CC:00:00:02"}"#;
+        let a: VmAllocation = serde_json::from_str(old).unwrap();
+        assert_eq!(a.project_id, "p");
+        assert_eq!(a.host_id, "", "host_id defaults empty");
+        assert_eq!(a.placement_epoch, 0, "placement_epoch defaults 0");
+        // New values round-trip through JSON.
+        let mut a2 = a.clone();
+        a2.host_id = "host-a".into();
+        a2.placement_epoch = 7;
+        let back: VmAllocation = serde_json::from_str(&serde_json::to_string(&a2).unwrap()).unwrap();
+        assert_eq!(back.host_id, "host-a");
+        assert_eq!(back.placement_epoch, 7);
+    }
+
+    #[test]
+    fn host_record_back_compat_missing_optionals() {
+        // A minimal host record (only the required fields) deserializes with the
+        // optional/HA fields defaulted — so a record written by an earlier P0 build
+        // (before later phases add fields) still loads.
+        let json = r#"{"host_id":"h","region":"r"}"#;
+        let h: HostRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(h.host_id, "h");
+        assert!(h.public_addr.is_none());
+        assert_eq!(h.last_heartbeat, 0);
+        assert!(h.cpu_template_id.is_none());
+        assert!(h.kernel_id.is_none());
+        assert_eq!(h.capacity.vcpus, 0);
+        assert_eq!(h.capacity.mem_mib, 0);
     }
 }
