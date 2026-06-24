@@ -115,7 +115,7 @@ impl VmInstance {
             "cpuid_modifiers": [{
                 "leaf": "0x7",
                 "subleaf": "0x0",
-                "flags": 2, // KVM_CPUID_FLAG_SIGNIFCANT_INDEX (leaf 0x7 is subleaf-significant)
+                "flags": 2, // KVM_CPUID_FLAG_SIGNIFICANT_INDEX (leaf 0x7 is subleaf-significant)
                 "modifiers": [
                     // EBX: clear AVX512 F(16) DQ(17) IFMA(21) CD(28) BW(30) VL(31).
                     {"register": "ebx", "bitmap": "0b00x0xxxxxx0xxx00xxxxxxxxxxxxxxxx"},

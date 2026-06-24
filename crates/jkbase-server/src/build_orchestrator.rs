@@ -919,11 +919,9 @@ async fn run_inner(
         if let Some(db) = config.database.as_ref() {
             let dbdir = staged.join("_database");
             std::fs::create_dir_all(&dbdir)?;
-            std::fs::copy(src_dir.join(&db.schema), dbdir.join("schema.rhype"))
-                .with_context(|| format!("stage DB schema {}", db.schema))?;
+            stage_db_file(&src_dir, &db.schema, &dbdir.join("schema.rhype"))?;
             if let Some(rules) = db.rules.as_deref() {
-                std::fs::copy(src_dir.join(rules), dbdir.join("rules.rhype"))
-                    .with_context(|| format!("stage DB rules {rules}"))?;
+                stage_db_file(&src_dir, rules, &dbdir.join("rules.rhype"))?;
             }
         }
 
@@ -1735,6 +1733,32 @@ async fn toolchain_builder_digest(toolchain: &Path) -> Option<String> {
 /// hostile manifest can't launch an unbounded number of metered build VMs.
 const MAX_TARGETS: usize = 64;
 
+/// Copy a tenant-named `[database]` file (`schema`/`rules`) from the uploaded source tree
+/// into the host-controlled `_database/` staging dir — **symlink-safe**. The source tar is
+/// tenant-controlled and `unpack_tar_gz` preserves symlinks, while `std::fs::copy` follows
+/// them, so a `schema.rhype` (or a symlinked parent component) pointing at a host path would
+/// otherwise exfiltrate an arbitrary HOST file (e.g. /etc/passwd, another tenant's tree)
+/// into the guest-readable metadata image. `path_ok` already rejected `..`/absolute STRINGS;
+/// this closes the symlink hole by canonicalizing the resolved source and requiring it to
+/// stay inside the project tree (and be a regular file). Mirrors the symlink-skipping
+/// discipline `assemble_sites`/`copy_filtered_inner` already use for committed site content.
+fn stage_db_file(src_dir: &Path, rel: &str, dest: &Path) -> Result<()> {
+    let base = src_dir
+        .canonicalize()
+        .context("canonicalize project source dir")?;
+    let src = base
+        .join(rel)
+        .canonicalize()
+        .with_context(|| format!("resolve [database] file {rel:?}"))?;
+    ensure!(
+        src.starts_with(&base),
+        "[database] file {rel:?} resolves outside the project tree (symlink?) — refusing"
+    );
+    ensure!(src.is_file(), "[database] file {rel:?} is not a regular file");
+    std::fs::copy(&src, dest).with_context(|| format!("stage DB file {rel:?}"))?;
+    Ok(())
+}
+
 fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     let target_count = config.functions.len() + config.servers.len();
     if target_count > MAX_TARGETS {
@@ -1848,6 +1872,34 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
             && !path_ok(rules)
         {
             bail!("[database] rules {:?} must be a relative path inside the project (no '..' or absolute)", rules);
+        }
+    }
+
+    // The managed DB is supervised in-VM under the reserved server name `rhypedb` and is
+    // loopback-only / NEVER routed. Fence that name from tenant input on both axes,
+    // fail-closed at deploy: (1) a tenant server/function/site named `rhypedb` would
+    // collide with the DB in the agent's supervised set; (2) a tenant ROUTE targeting
+    // `rhypedb` would make the agent proxy EXTERNAL traffic to 127.0.0.1:4200 — including
+    // the DB's unauthenticated admin plane — defeating the never-routed invariant (the
+    // agent resolves a route to ANY supervised server of that name).
+    let reserved = crate::layer_plan::RHYPEDB_RUNTIME;
+    for (kind, name) in config
+        .functions
+        .keys()
+        .map(|n| ("function", n))
+        .chain(config.servers.keys().map(|n| ("server", n)))
+        .chain(config.sites.keys().map(|n| ("site", n)))
+    {
+        if name == reserved {
+            bail!("{kind} name {name:?} is reserved for the managed database");
+        }
+    }
+    for (pattern, target) in &config.routes {
+        if target.name == reserved {
+            bail!(
+                "route {pattern:?} targets reserved name {reserved:?}: the managed database \
+                 is loopback-only and cannot be routed"
+            );
         }
     }
     Ok(())
@@ -2575,6 +2627,67 @@ mod tests {
         let host: ProjectConfig =
             toml::from_str("[hosting]\npublic = \"../..\"\n").unwrap();
         assert!(validate_manifest(&host).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_reserves_managed_db_name_and_route() {
+        // A tenant ROUTE targeting the managed DB's reserved name would make the agent
+        // proxy EXTERNAL traffic to the loopback-only DB (incl. its unauthenticated admin
+        // plane) — reject at deploy.
+        let routed: ProjectConfig = toml::from_str(
+            "[database]\nschema = \"s.rhype\"\n[routes.\"/db\"]\nservice = \"server\"\nname = \"rhypedb\"\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&routed).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {err}");
+
+        // The reserved name is also fenced from server/site/function names (a collision
+        // with the DB in the agent's supervised set).
+        for sec in [
+            "[servers.rhypedb]\nsource = \"./s\"\nport = 80\n",
+            "[sites.rhypedb]\npublic = \"./s\"\n",
+            "[functions.rhypedb]\nsource = \"./f\"\n",
+        ] {
+            let c: ProjectConfig = toml::from_str(sec).unwrap();
+            assert!(validate_manifest(&c).is_err(), "must reserve `rhypedb` in: {sec}");
+        }
+
+        // A normal route + normal names still pass.
+        let ok: ProjectConfig = toml::from_str(
+            "[servers.api]\nsource = \"./a\"\nport = 80\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n",
+        )
+        .unwrap();
+        assert!(validate_manifest(&ok).is_ok());
+    }
+
+    #[test]
+    fn stage_db_file_refuses_symlink_escape() {
+        // The uploaded source tar is tenant-controlled and preserves symlinks; a symlinked
+        // schema/rules pointing at a host path must NOT be copied into the staged artifact
+        // (which is baked into the guest-readable metadata image).
+        let tmp = std::env::temp_dir().join(format!("jkb-stagedb-{}", std::process::id()));
+        let src = tmp.join("src");
+        let out = tmp.join("out");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        // A host secret OUTSIDE the project tree.
+        let secret = tmp.join("host-secret");
+        std::fs::write(&secret, b"TOPSECRET").unwrap();
+
+        // schema.rhype is a symlink escaping the project tree → refused, nothing staged.
+        std::os::unix::fs::symlink(&secret, src.join("schema.rhype")).unwrap();
+        let dest = out.join("schema.rhype");
+        assert!(stage_db_file(&src, "schema.rhype", &dest).is_err());
+        assert!(!dest.exists(), "host secret must not be staged");
+
+        // A regular in-tree file → copied fine.
+        std::fs::write(src.join("ok.rhype"), b"type User { name: String }").unwrap();
+        let dest_ok = out.join("ok.rhype");
+        stage_db_file(&src, "ok.rhype", &dest_ok).unwrap();
+        assert_eq!(std::fs::read(&dest_ok).unwrap(), b"type User { name: String }");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

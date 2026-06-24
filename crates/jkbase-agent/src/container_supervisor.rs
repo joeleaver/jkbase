@@ -13,6 +13,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+/// Reserved supervised-server name of the managed database. It is loopback-only and must
+/// NEVER be reachable via a tenant route: `get_server_for_route` excludes it, and the host
+/// fences the name from `[routes.*]`/server/site names at deploy (validate_manifest).
+const DB_SERVER_NAME: &str = "rhypedb";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMount {
     pub name: String,
@@ -197,7 +202,7 @@ impl ContainerSupervisor {
         rules: Option<&[u8]>,
         lowerdirs: Vec<PathBuf>,
     ) -> Result<()> {
-        const NAME: &str = "rhypedb";
+        const NAME: &str = DB_SERVER_NAME;
         if lowerdirs.is_empty() {
             anyhow::bail!("managed DB has no layers");
         }
@@ -360,7 +365,10 @@ impl ContainerSupervisor {
         let servers = self.servers.read().await;
         servers
             .iter()
-            .find(|s| s.name == route_name)
+            // The managed DB is loopback-only and never routed: exclude it so a stray
+            // route named `rhypedb` can never be proxied to (defense in depth — the host
+            // also rejects such a route at deploy). See DB_SERVER_NAME.
+            .find(|s| s.name != DB_SERVER_NAME && s.name == route_name)
             .map(|s| s.manifest.port)
     }
 
