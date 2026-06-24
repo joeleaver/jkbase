@@ -166,6 +166,12 @@ pub enum BuildPhase {
 pub enum TargetKind {
     Function,
     Server,
+    /// A static build target: the build VM runs a buildpack that produces a static
+    /// tree (e.g. `trunk build` → `dist/`), and the host serves that tree as site
+    /// content via `[hosting]`/`[sites]` — no runnable server process. The build
+    /// output is a plain `static.tar.gz` the host untars into the staged site
+    /// location, NOT a server manifest or a wasm function.
+    Static,
 }
 
 /// Per-target status within a build job. One build VM fans out per target

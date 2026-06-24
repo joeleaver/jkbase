@@ -136,6 +136,12 @@ pub struct BuildVmConfig {
     /// of a server — passed as `jkbase.kind=function`. The in-VM lifecycle then runs the
     /// function-builder (language-dispatched) rather than the server buildpacks.
     pub build_function: bool,
+    /// Build a STATIC site (a buildpack that produces a static tree, e.g. trunk →
+    /// `dist/`) instead of a server — passed as `jkbase.kind=static`. The in-VM
+    /// lifecycle runs the normal buildpack detect/build but exports a plain
+    /// `/out/static.tar.gz` the host untars into the served site location. Mutually
+    /// exclusive with `build_function`.
+    pub build_static: bool,
     /// Build strategy override for the in-VM lifecycle's detect, passed via the
     /// kernel cmdline (`jkbase.builder=`). `Some("dockerfile")` forces the
     /// Dockerfile escape-hatch buildpack; `None` → normal language detection.
@@ -398,6 +404,8 @@ impl BuildVm {
         }
         if config.build_function {
             boot_args.push_str(" jkbase.kind=function");
+        } else if config.build_static {
+            boot_args.push_str(" jkbase.kind=static");
         }
         if let Some(builder) = &config.builder_hint
             && !builder.is_empty()

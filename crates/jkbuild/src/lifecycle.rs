@@ -80,12 +80,19 @@ pub fn run() -> Result<i32> {
     let mode = ExportMode::from_cmdline(&cmdline);
     let kind = parse_cmdline_value(&cmdline, "jkbase.kind");
 
-    let result = if kind.as_deref() == Some("function") {
-        // Function target: the curated per-language function-builder → /out/function.wasm,
-        // not the server detect/export path.
-        drive_function(proxy, lang.as_deref())
-    } else {
-        drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode)
+    let result = match kind.as_deref() {
+        Some("function") => {
+            // Function target: the curated per-language function-builder →
+            // /out/function.wasm, not the server detect/export path.
+            drive_function(proxy, lang.as_deref())
+        }
+        Some("static") => {
+            // Static target: run the normal buildpack pipeline (e.g. trunk), but export
+            // the produced static tree as a plain `/out/static.tar.gz` the host untars
+            // into the served site location — no erofs layer, no server manifest.
+            drive_static(proxy, lang.as_deref(), builder.as_deref(), dockerfile)
+        }
+        _ => drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode),
     };
     let code = match &result {
         Ok(()) => 0,
@@ -111,6 +118,37 @@ fn drive(
     dockerfile: Option<String>,
     mode: ExportMode,
 ) -> Result<()> {
+    let output = run_buildpack_pipeline(proxy, lang, builder, dockerfile)?;
+    export_artifact(&output, mode)
+}
+
+/// Static target: run the buildpack pipeline (e.g. trunk) and export the produced
+/// static tree as a plain `/out/static.tar.gz`. This reuses the exact
+/// detect→fetch→seal→compile machinery as the server path; only the EXPORT differs —
+/// a flat tarball of the launch layers (the static bundle) instead of an erofs layer
+/// + server manifest. The host untars it into the served site location.
+fn drive_static(
+    proxy: Option<String>,
+    lang: Option<&str>,
+    builder: Option<&str>,
+    dockerfile: Option<String>,
+) -> Result<()> {
+    let output = run_buildpack_pipeline(proxy, lang, builder, dockerfile)?;
+    let dest = Path::new(OUT).join("static.tar.gz");
+    export::pack_flat_tarball(&output, &dest).context("pack static tarball")?;
+    let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    append_log(&format!("jkbuild: wrote static.tar.gz ({bytes} bytes)\n"))?;
+    Ok(())
+}
+
+/// Shared detect→fetch→seal→compile for the server and static paths. Returns the
+/// buildpack's [`BuildOutput`]; the caller picks the export shape.
+fn run_buildpack_pipeline(
+    proxy: Option<String>,
+    lang: Option<&str>,
+    builder: Option<&str>,
+    dockerfile: Option<String>,
+) -> Result<BuildOutput> {
     // 1. detect against /src (read-only source).
     let registry = buildpacks::registry();
     let chosen = registry
@@ -158,10 +196,7 @@ fn drive(
         // Offline build: no separate fetch window.
         chosen.fetch(&mut ctx).context("fetch phase (offline)")?;
     }
-    let output = chosen.compile(&mut ctx).context("compile phase")?;
-
-    // 4. export.
-    export_artifact(&output, mode)
+    chosen.compile(&mut ctx).context("compile phase")
 }
 
 /// Build a WASM function: detect the language, fetch→seal→compile to ONE `wasi:http`

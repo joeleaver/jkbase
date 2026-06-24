@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         lang_hint: Some(std::env::var("LANG_HINT").unwrap_or_else(|_| "rust".to_string())),
         export_layered: false,
         build_function: true,
+        build_static: false,
         builder_hint: None,
         dockerfile: None,
         fetch_deadline: Duration::from_secs(360),

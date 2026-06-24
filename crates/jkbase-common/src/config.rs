@@ -377,6 +377,11 @@ pub struct HostingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteConfig {
+    /// The static directory served for this site. For a COMMITTED site this is the
+    /// pre-built content (the historical behaviour). For a BUILT site (`build` set)
+    /// it is OPTIONAL and ignored: the platform builds the content from `source` and
+    /// serves the produced tree.
+    #[serde(default = "default_public")]
     pub public: String,
     pub spa: Option<bool>,
     pub prefix: Option<String>,
@@ -384,6 +389,49 @@ pub struct SiteConfig {
     /// full custom domain (`docs.example.com`). When set, this site is served on
     /// that host rather than (only) by path prefix.
     pub domain: Option<String>,
+    /// Source directory the platform BUILDS this site from when `build` is set
+    /// (e.g. a Rust/WASM frontend crate). Relative to the project root. Required
+    /// when `build` is set; ignored otherwise.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Build strategy for this site: `"trunk"` to build a Rust/WASM frontend with
+    /// the trunk buildpack server-side and serve the produced static tree. Absent
+    /// (the default) → a committed static site served from `public`, unchanged.
+    #[serde(default)]
+    pub build: Option<String>,
+}
+
+fn default_public() -> String {
+    ".".to_string()
+}
+
+/// Resolved build strategy for a `[sites.*]` target. `None` (committed content) is
+/// the default; `Trunk` builds a Rust/WASM frontend server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteBuild {
+    /// A Rust/WASM frontend built with the `trunk` buildpack.
+    Trunk,
+}
+
+impl SiteConfig {
+    /// Resolve the `build` field. `None` → a committed static site (no build).
+    /// Errors on an unrecognised value so a typo doesn't silently ship un-built
+    /// source as static content.
+    pub fn build_strategy(&self) -> Result<Option<SiteBuild>> {
+        match self.build.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some("trunk") => Ok(Some(SiteBuild::Trunk)),
+            Some(other) => anyhow::bail!(
+                "unknown site build {other:?} (expected \"trunk\")"
+            ),
+        }
+    }
+
+    /// The source directory the platform builds this site from (built sites only).
+    /// Defaults to the project root when `build` is set but `source` is omitted.
+    pub fn build_source(&self) -> &str {
+        self.source.as_deref().unwrap_or(".")
+    }
 }
 
 impl ProjectConfig {
@@ -417,6 +465,10 @@ impl ProjectConfig {
                 spa: site.spa.unwrap_or(false),
                 prefix: site.prefix.clone().unwrap_or_else(|| "/".to_string()),
                 domain: site.domain.clone(),
+                // A built site's served content comes from the build output, not a
+                // committed `public` dir. Carry the flag so assemble_sites skips the
+                // committed-copy and the static build fills the slot instead.
+                built: site.build.as_deref().map(str::trim).is_some_and(|b| !b.is_empty()),
             });
         }
 
@@ -441,6 +493,7 @@ impl ProjectConfig {
                     spa,
                     prefix: "/".to_string(),
                     domain: None,
+                    built: false,
                 });
             }
         }
@@ -559,6 +612,13 @@ pub struct ResolvedSite {
     pub prefix: String,
     #[serde(default)]
     pub domain: Option<String>,
+    /// True when this site's content is BUILT server-side (a `[sites.<name>]` with
+    /// `build = "..."`) rather than copied from a committed `public` dir. The build
+    /// orchestrator fills the served slot from the build output; `assemble_sites`
+    /// skips the committed-copy for it. Not part of the `_sites.json` routing wire
+    /// shape (it's a build-time concern), so it is skipped when serializing.
+    #[serde(default, skip)]
+    pub built: bool,
 }
 
 #[cfg(test)]
@@ -749,6 +809,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(legacy.servers["api"].source_dir(), "./api");
+    }
+
+    #[test]
+    fn site_build_strategy_resolves_and_marks_resolved_site() {
+        // A built site: `build = "trunk"` resolves to Trunk; `source` is the build dir;
+        // `public` defaults (and is irrelevant for a built site).
+        let cfg: ProjectConfig = toml::from_str(
+            "[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n",
+        )
+        .unwrap();
+        let site = &cfg.sites["app"];
+        assert_eq!(site.build_strategy().unwrap(), Some(SiteBuild::Trunk));
+        assert_eq!(site.build_source(), "./web");
+        // resolved_sites carries the `built` flag so assemble_sites skips its copy.
+        let resolved = cfg.resolved_sites();
+        let app = resolved.iter().find(|s| s.name == "app").unwrap();
+        assert!(app.built);
+
+        // A committed site: no `build` → None, not built.
+        let cfg: ProjectConfig =
+            toml::from_str("[sites.docs]\npublic = \"./docs\"\n").unwrap();
+        assert_eq!(cfg.sites["docs"].build_strategy().unwrap(), None);
+        assert!(!cfg.resolved_sites().iter().any(|s| s.built));
+
+        // An unknown strategy is rejected (typo → never ship un-built source).
+        let cfg: ProjectConfig =
+            toml::from_str("[sites.app]\nsource = \"./web\"\nbuild = \"webpack\"\n").unwrap();
+        assert!(cfg.sites["app"].build_strategy().is_err());
+
+        // `build` defaults `source` to the project root when omitted.
+        let cfg: ProjectConfig = toml::from_str("[sites.app]\nbuild = \"trunk\"\n").unwrap();
+        assert_eq!(cfg.sites["app"].build_source(), ".");
+
+        // The `built` flag is NOT serialized into the _sites.json routing wire shape.
+        let json = serde_json::to_string(&cfg.resolved_sites()).unwrap();
+        assert!(!json.contains("built"));
     }
 
     #[test]

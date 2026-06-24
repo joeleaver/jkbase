@@ -116,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         lang_hint: Some("bun".to_string()),
         export_layered: false,
         build_function: false,
+        build_static: false,
         builder_hint: None,
         dockerfile: None,
         fetch_deadline: Duration::from_secs(120),
