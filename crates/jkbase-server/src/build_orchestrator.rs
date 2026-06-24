@@ -3667,11 +3667,13 @@ name = "api"
     }
 
     /// Build a minimal Trunk (Rust/WASM frontend) STATIC site through the pipeline:
-    /// `cargo fetch` pulls wasm-bindgen through the proxy, `trunk tools install` warms
-    /// the version-matched wasm-bindgen from github (allow-listed), and the offline
-    /// `trunk build --release` produces a `dist/` the host collects into the served
-    /// site slot. Unlike the server fixtures this is a `[sites.*] build = "trunk"`
-    /// target (`TargetKind::Static`) → `/out/static.tar.gz` → staged `_site_<name>/`.
+    /// `cargo fetch` pulls the crates through the proxy, then the buildpack downloads the
+    /// exact version-matched `wasm-bindgen` CLI release from github (allow-listed) onto
+    /// PATH — it deliberately does NOT run `trunk build` during fetch (that would run
+    /// untrusted build code with the network up). The offline `trunk build --release`
+    /// then produces a `dist/` the host collects into the served site slot. Unlike the
+    /// server fixtures this is a `[sites.*] build = "trunk"` target (`TargetKind::Static`)
+    /// → `/out/static.tar.gz` → staged `_site_<name>/`.
     async fn trunk_static_build(build_id: u64) -> Option<BuildFixture> {
         let data = std::env::var("JKB_DATA").ok()?;
         let src = PathBuf::from(data).join("trunk-fixture-src");

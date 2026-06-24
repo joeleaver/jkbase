@@ -257,14 +257,18 @@ fn wasm_bindgen_version(app_dir: &Path) -> Result<Option<String>> {
 /// it on the build PATH (`<cache>/bin/wasm-bindgen`) so the offline compile can run it.
 /// The musl release is statically linked → runs on the Wolfi (glibc) toolchain. Fetched
 /// through the egress proxy from github's release CDN (allow-listed). No build code runs.
+///
+/// We ALWAYS download and OVERWRITE `dest` — never skip on a "cache hit" by executing the
+/// existing binary. `<cache>/bin` is the persistent, tenant-WRITABLE cache drive, so a
+/// prior build's (offline) compile could have planted a trojan there; executing it now —
+/// during the network-UP fetch phase — would run tenant-plantable code online, breaking
+/// the fetch-then-seal fence (adversarial-review finding). So fetch never execs anything
+/// under `/cache`; the fresh download replaces whatever was there before the offline
+/// compile runs it. A mis-served version is caught by trunk at (offline) compile time.
 fn provision_wasm_bindgen(ctx: &BuildContext, trunk_cache: &Path, version: &str) -> Result<()> {
     let cache_dir = trunk_cache.parent().unwrap_or(trunk_cache);
     let bin_dir = cache_dir.join("bin");
     let dest = bin_dir.join("wasm-bindgen");
-    // Cross-build cache hit: already provisioned at the right version → skip the download.
-    if version_matches(&dest, version) {
-        return Ok(());
-    }
     std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
     let asset = format!("wasm-bindgen-{version}-x86_64-unknown-linux-musl");
     let url =
@@ -280,7 +284,8 @@ fn provision_wasm_bindgen(ctx: &BuildContext, trunk_cache: &Path, version: &str)
     run(dl, "curl wasm-bindgen release")?;
 
     // Extract just the `wasm-bindgen` binary (tar-rs refuses path escapes); the archive
-    // top dir is `<asset>/`, so match on the file name.
+    // top dir is `<asset>/`, so match on the file name. `File::create` truncates, so this
+    // OVERWRITES any binary a prior tenant build may have left at `dest`.
     extract_named(&tgz, "wasm-bindgen", &dest)
         .with_context(|| format!("extract wasm-bindgen from {}", tgz.display()))?;
     let _ = std::fs::remove_file(&tgz);
@@ -291,21 +296,6 @@ fn provision_wasm_bindgen(ctx: &BuildContext, trunk_cache: &Path, version: &str)
             .with_context(|| format!("chmod {}", dest.display()))?;
     }
     Ok(())
-}
-
-/// True if `bin` exists and `bin --version` reports `version` (e.g. the line
-/// `wasm-bindgen 0.2.95 (hash)`). Used to skip re-downloading a cached CLI.
-fn version_matches(bin: &Path, version: &str) -> bool {
-    if !bin.exists() {
-        return false;
-    }
-    let Ok(out) = Command::new(bin).arg("--version").output() else {
-        return false;
-    };
-    out.status.success()
-        && String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .any(|t| t == version)
 }
 
 /// Extract the single archive entry whose file name is `filename` from a `.tar.gz` into
@@ -335,7 +325,8 @@ fn cargo_command(bin: &str, cargo_home: &Path, trunk_cache: &Path) -> Command {
 }
 
 /// A `trunk` `Command` with the same env as cargo plus trunk's cache pointed at the
-/// persistent cache drive (so its warmed wasm-bindgen/wasm-opt survive the seal).
+/// persistent cache drive. The exact `wasm-bindgen` is provided on PATH (see
+/// `apply_common_env` + `provision_wasm_bindgen`) and `wasm-opt` is baked (binaryen).
 fn trunk_command(cargo_home: &Path, trunk_cache: &Path) -> Command {
     let mut cmd = Command::new("trunk");
     apply_common_env(&mut cmd, cargo_home, trunk_cache);
@@ -352,8 +343,9 @@ fn apply_common_env(cmd: &mut Command, cargo_home: &Path, trunk_cache: &Path) {
         .env("CARGO_HOME", cargo_home)
         .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
         .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
-        // trunk reads XDG_CACHE_HOME for its tool cache; also set the explicit
-        // TRUNK_TOOLS_* / cache hints so a trunk that ignores XDG still warms here.
+        // trunk reads XDG_CACHE_HOME for its tool cache; point it at the persistent
+        // drive. (The version-matched wasm-bindgen is resolved off the cache `bin` dir
+        // prepended to PATH above, not from this XDG cache.)
         .env("XDG_CACHE_HOME", trunk_cache)
         // A writable HOME on the cache drive (the toolchain root is read-only; some
         // tools write ~/.cache or ~/.cargo state).
