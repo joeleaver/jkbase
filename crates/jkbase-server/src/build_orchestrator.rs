@@ -4526,14 +4526,15 @@ console.log("listening on " + port);
     /// layer plan WITH a forced data disk, and bakes the metadata image. A **real
     /// `jkbase-agent` runtime VM** boots: the agent composes the `rhypedb:base` overlay,
     /// seeds the schema, starts `rhypedb-server` bound to 127.0.0.1:4200, and the app
-    /// `fetch`es it (create + read) → HTTP 200 carrying the round-trip row. Then the VM
-    /// is **hard-killed** (the SIGKILL half of jkbase's Pause+snapshot+SIGKILL hibernate)
-    /// and a **fresh VM reboots over the SAME data disk**: the DB re-opens its persistent
-    /// data dir and replays its WAL, and the previously-created row is served again WITHOUT
-    /// re-seeding — proving on-disk durability + crash recovery (the data survives
-    /// scale-to-zero). A cold reboot is a stronger durability proof than a RAM-snapshot
-    /// resume (it exercises on-disk recovery, not a restored page cache) and is independent
-    /// of the VMM's snapshot/restore path.
+    /// `fetch`es it (create + read) → HTTP 200 carrying the round-trip row. The DB then has
+    /// to survive both halves of scale-to-zero: (1) **hibernate→wake** — Pause + full-mem
+    /// snapshot + SIGKILL, then `restore_from_snapshot` — the restored guest must still serve
+    /// the row (the real on-demand-wake path; depends on the snapshot-safe CPU template in
+    /// jkbase-orch/src/vm.rs, without which a modern-host guest #GPs on XSAVE restore and
+    /// panics ~1s into resume); and (2) a **hard-kill + cold reboot over the SAME data disk**
+    /// — a fresh VM with no memory snapshot must replay the WAL and serve the row WITHOUT
+    /// re-seeding, proving on-disk durability + crash recovery independent of the VMM
+    /// snapshot path.
     ///
     /// JKB_ROOTFS is REQUIRED: the `rhypedb` + `base` shared layers carry dm-verity trees,
     /// so the in-guest agent must `veritysetup` them — only the prebuilt apko rootfs (agent
@@ -4549,10 +4550,10 @@ console.log("listening on " + port);
     ///       JKB_BASELAYERS=/abs/.firecracker/baselayers \
     ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
     ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity.ext4 \
-    ///       <test-bin> --ignored --nocapture managed_db_loopback_roundtrip_survives_reboot
+    ///       <test-bin> --ignored --nocapture managed_db_loopback_roundtrip_survives_hibernate_and_reboot
     #[tokio::test]
     #[ignore = "managed DB pipeline: needs KVM + root + bun.ext4 + baselayers + verity rootfs (JKB_ROOTFS)"]
-    async fn managed_db_loopback_roundtrip_survives_reboot() {
+    async fn managed_db_loopback_roundtrip_survives_hibernate_and_reboot() {
         use jkbase_orch::vm::{VmConfig, VmInstance};
 
         let Some(fx) = bun_pipeline_build("bundb", 1, Workload::OfflineDatabase).await else {
@@ -4652,20 +4653,38 @@ console.log("listening on " + port);
         // + bound (cold open), so poll generously.
         let cold = poll_http_200(guest_ip, 80, Duration::from_secs(75)).await;
         eprintln!("[db-e2e] cold-boot body = {cold:?}");
-        // Hard-kill the VM (SIGKILL — the same abrupt teardown jkbase's hibernate ends in),
-        // so the reboot below is a genuine crash recovery, not a clean shutdown.
-        let _ = vm.stop().await;
 
-        // --- Cold reboot over the SAME data disk: the DB replays its WAL and the row must
-        //     still be served — read back WITHOUT re-seeding (the type is non-empty). Proves
-        //     on-disk durability + crash recovery, independent of the VMM snapshot path.
-        let restart = if cold.as_deref() == Some("users=alpha count=1") {
+        // --- Hibernate (Pause + full-mem snapshot + SIGKILL) then restore: jkbase's actual
+        //     scale-to-zero path. The restored guest resumes from the memory snapshot and
+        //     must still serve the row. (Depends on the snapshot-safe CPU template in
+        //     jkbase-orch/src/vm.rs — without it, a modern-host guest #GPs in
+        //     restore_fpregs_from_fpstate and panics ~1s into resume.)
+        let wake = if cold.as_deref() == Some("users=alpha count=1") {
+            let snap_dir = fx.data.join("dbpipe-snap");
+            let (snap, mem) = vm.hibernate(&snap_dir).await.expect("hibernate the managed-DB VM");
+            let mut woke =
+                VmInstance::restore_from_snapshot(tag, &config, &runtime_dir, &snap, &mem)
+                    .await
+                    .expect("restore the managed-DB VM from snapshot");
+            let body = poll_http_200(guest_ip, 80, Duration::from_secs(45)).await;
+            eprintln!("[db-e2e] hibernate-wake body = {body:?}");
+            let _ = woke.stop().await; // hard-kill the restored VM for the cold reboot below
+            body
+        } else {
+            let _ = vm.stop().await;
+            None
+        };
+
+        // --- Cold reboot over the SAME data disk: a FRESH VM (no memory snapshot) must
+        //     replay the WAL and serve the row WITHOUT re-seeding. Proves on-disk durability
+        //     + crash recovery, independent of the VMM snapshot path.
+        let restart = if wake.as_deref() == Some("users=alpha count=1") {
             let runtime_dir2 = fx.data.join("dbpipe-run2");
             let mut vm2 = VmInstance::start(tag, &config, &runtime_dir2)
                 .await
                 .expect("fresh runtime VM should reboot over the persistent data disk");
             let body = poll_http_200(guest_ip, 80, Duration::from_secs(60)).await;
-            eprintln!("[db-e2e] cold-restart body = {body:?}");
+            eprintln!("[db-e2e] cold-reboot body = {body:?}");
             let _ = vm2.stop().await;
             body
         } else {
@@ -4681,12 +4700,17 @@ console.log("listening on " + port);
             "cold boot: the app must create + read back a row over loopback (DB reachable at 127.0.0.1:4200)"
         );
         assert_eq!(
+            wake.as_deref(),
+            Some("users=alpha count=1"),
+            "after hibernate→wake (scale-to-zero) the restored DB must still serve the row"
+        );
+        assert_eq!(
             restart.as_deref(),
             Some("users=alpha count=1"),
             "after a hard-kill + cold reboot the row must still be served (on-disk persistence + DB WAL recovery)"
         );
         println!(
-            "PASS: managed DB boots in-VM -> loopback round-trip (create+read) -> HTTP 200 -> survives hard-kill + cold reboot ({cold:?})"
+            "PASS: managed DB boots in-VM -> loopback round-trip -> HTTP 200 -> survives hibernate→wake AND hard-kill + cold reboot ({cold:?})"
         );
     }
 
