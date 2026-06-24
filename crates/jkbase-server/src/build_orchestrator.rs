@@ -3666,6 +3666,101 @@ name = "api"
         println!("PASS: rust native-FFI (openssl) build -> app-layer /usr/lib closure -> runtime -> HTTP 200 ({body:?})");
     }
 
+    /// Build a minimal Trunk (Rust/WASM frontend) STATIC site through the pipeline:
+    /// `cargo fetch` pulls wasm-bindgen through the proxy, `trunk tools install` warms
+    /// the version-matched wasm-bindgen from github (allow-listed), and the offline
+    /// `trunk build --release` produces a `dist/` the host collects into the served
+    /// site slot. Unlike the server fixtures this is a `[sites.*] build = "trunk"`
+    /// target (`TargetKind::Static`) → `/out/static.tar.gz` → staged `_site_<name>/`.
+    async fn trunk_static_build(build_id: u64) -> Option<BuildFixture> {
+        let data = std::env::var("JKB_DATA").ok()?;
+        let src = PathBuf::from(data).join("trunk-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        // A built site, not a server: the platform builds ./web with trunk and serves
+        // the produced static tree as site `app` (→ staged `_site_app/`).
+        write(
+            src.join("jkbase.toml"),
+            "[project]\nname = \"trunkfix\"\n\n[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n",
+        );
+        // Canonical minimal trunk app: a wasm-bindgen crate + a Trunk.toml + an
+        // index.html template carrying a marker we assert survives into the bundle.
+        write(
+            src.join("web/Cargo.toml"),
+            "[package]\nname = \"trunkfix\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nwasm-bindgen = \"=0.2.95\"\n",
+        );
+        write(src.join("web/Trunk.toml"), "[build]\n");
+        write(
+            src.join("web/index.html"),
+            "<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"utf-8\"/>\n  <link data-trunk rel=\"rust\"/>\n</head>\n<body><div id=\"app\">trunk-onbox-marker</div></body>\n</html>\n",
+        );
+        write(
+            src.join("web/src/main.rs"),
+            "use wasm_bindgen::prelude::*;\n\nfn main() {\n    // Touch wasm-bindgen so the dep is real and trunk runs wasm-bindgen on the output.\n    let _ = JsValue::from_str(\"trunk-onbox\");\n}\n",
+        );
+        networked_lang_build(
+            // Short project id: the jailer socket path (chroot_base = `bj-<id>`) must stay
+            // under SUN_LEN (108); a long repo data-dir leaves little budget.
+            "trk",
+            "onbox-trunk.redb",
+            "trunk.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                // cargo + wasm build + wasm-bindgen + wasm-opt write a big target/ dir.
+                scratch_mib: 2048,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 300,
+            },
+            build_id,
+        )
+        .await
+    }
+
+    /// Trunk static acceptance (build half): a `[sites.app] build = "trunk"` builds in a
+    /// real build VM and the host collects the produced `dist/` into the served site slot
+    /// `_site_app/`. Asserts the bundle landed — index.html (carrying the source marker)
+    /// plus the trunk-emitted `.wasm` + `.js`. The SERVE half is the committed-static path
+    /// (already proven by www/console), since `collect_static_site` lands content in the
+    /// identical staged location a committed site is copied into.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… \
+    ///       <test-bin> --ignored --nocapture trunk_static_pipeline_emits_site_tree
+    #[tokio::test]
+    #[ignore = "trunk static pipeline: needs KVM + root + trunk.ext4 + build bridge"]
+    async fn trunk_static_pipeline_emits_site_tree() {
+        let Some(fx) = trunk_static_build(1).await else { return };
+        let site = fx.staged.join("_site_app");
+        let index = site.join("index.html");
+        assert!(
+            index.is_file(),
+            "trunk build must land index.html in the served site slot {}",
+            site.display()
+        );
+        let html = std::fs::read_to_string(&index).unwrap();
+        assert!(
+            html.contains("trunk-onbox-marker"),
+            "served index.html must preserve the source template body; got:\n{html}"
+        );
+        // Trunk rewrites index.html to load the produced bundle: a hashed `.js` loader +
+        // a `_bg.wasm`. Their presence proves trunk actually compiled (not just copied).
+        let has_ext = |ext: &str| {
+            std::fs::read_dir(&site)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some(ext))
+        };
+        assert!(has_ext("wasm"), "trunk must emit a .wasm into the site slot");
+        assert!(has_ext("js"), "trunk must emit a .js loader into the site slot");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: trunk static build -> /static.tar.gz -> staged _site_app/ (index.html + wasm + js)");
+    }
+
     async fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
         let status = tokio::process::Command::new(cmd).args(args).status().await?;
         if !status.success() {

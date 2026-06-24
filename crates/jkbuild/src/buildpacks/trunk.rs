@@ -15,15 +15,19 @@
 //!
 //! Phase split mirrors the rust buildpack:
 //!   * `fetch` (network up) — `cargo fetch` (`--locked` when a `Cargo.lock` exists)
-//!     over the sparse registry + git hosts, with `CARGO_HOME` on the persistent
-//!     cache drive; AND warms trunk's version-matched `wasm-bindgen` into the cache
-//!     by pre-running `trunk` against the warmed cache dirs (trunk downloads the
-//!     `wasm-bindgen`/`wasm-opt` build tools it needs from github, which is on the
-//!     egress allowlist).
-//!   * `compile` (offline, post-seal) — `trunk build --release --offline`, then the
-//!     produced `dist/` becomes a single `launch` layer with NO processes (a static
-//!     artifact, not a server). The host's static-output collection arm turns that
-//!     launch tree into served site content.
+//!     over the sparse registry + git hosts, with `CARGO_HOME` on the persistent cache
+//!     drive; THEN provision the exact `wasm-bindgen` CLI onto the build PATH. trunk runs
+//!     wasm-bindgen after the offline cargo build but can only download it online, and
+//!     the required version == the wasm-bindgen CRATE version (read from Cargo.lock, no
+//!     code run) — so we fetch that exact CLI release from github (allow-listed) now.
+//!     Crucially we do NOT run `trunk build` to warm tools: that would run the project's
+//!     untrusted cargo build scripts/proc-macros with the network up, breaking the
+//!     fetch-then-seal fence. `wasm-opt` is baked (binaryen), so no other tool download.
+//!   * `compile` (offline, post-seal) — `trunk build --release --offline`: cargo builds
+//!     offline, trunk picks the provisioned `wasm-bindgen` off PATH + the baked
+//!     `wasm-opt`. The produced `dist/` becomes a single `launch` layer with NO processes
+//!     (a static artifact, not a server). The host's static-output collection arm turns
+//!     that launch tree into served content.
 
 use crate::buildpack::{
     BuildContext, BuildOutput, Buildpack, Decision, DetectContext, Layer, LayerTypes,
@@ -80,22 +84,27 @@ impl Buildpack for TrunkBuildpack {
         apply_proxy(&mut cmd, ctx);
         run(cmd, "cargo fetch")?;
 
-        // 2. Warm trunk's version-matched wasm-bindgen (+ wasm-opt) into the cache while
-        //    the network is up: `trunk` downloads these from github at build time, so the
-        //    offline compile would otherwise fail. `trunk tools install` fetches exactly
-        //    the versions this project pins (Trunk.toml / wasm-bindgen-cli dep) WITHOUT
-        //    running a build, so it's a cheap, deterministic warm. Non-fatal if the trunk
-        //    version predates the subcommand — the offline compile still works when the
-        //    toolchain image bakes a wasm-bindgen on PATH (see the apko image).
-        let mut warm = trunk_command(&cargo_home, &trunk_cache);
-        warm.arg("tools").arg("install");
-        warm.current_dir(ctx.app_dir);
-        apply_proxy(&mut warm, ctx);
-        if let Err(e) = run(warm, "trunk tools install") {
-            // A `trunk` without `tools install` (older releases) errors here; the offline
-            // compile then relies on a PATH `wasm-bindgen`/`wasm-opt` from the toolchain
-            // image. Log and continue rather than fail the fetch.
-            eprintln!("jkbuild: trunk tool warm skipped: {e:#}");
+        // 2. Provision the EXACT `wasm-bindgen` CLI offline-ready WITHOUT compiling.
+        //    trunk runs wasm-bindgen AFTER the (offline) cargo build, downloading from
+        //    github the version embedded in the compiled wasm — which the sealed compile
+        //    cannot do. That required version == the wasm-bindgen CRATE version, which is
+        //    pinned in Cargo.lock and needs NO code execution to read, so we resolve it now
+        //    and fetch the matching CLI onto the build PATH (network up). The offline
+        //    compile then finds it on PATH (trunk resolves tools via PATH and accepts a
+        //    version-matched wasm-bindgen) and uses the baked binaryen `wasm-opt` — no
+        //    network needed.
+        //
+        //    We deliberately do NOT run `trunk build` here to warm tools: that runs the
+        //    project's (untrusted) cargo build scripts + proc-macros with the network UP,
+        //    breaking the fetch-then-seal fence every other buildpack keeps (the actual
+        //    compile is offline). `trunk` (0.21) has no tool-only install, so a real build
+        //    would be the only trunk-driven warm — hence we fetch the binary ourselves.
+        match wasm_bindgen_version(ctx.app_dir)? {
+            Some(ver) => provision_wasm_bindgen(ctx, &trunk_cache, &ver)?,
+            None => eprintln!(
+                "jkbuild: no wasm-bindgen in Cargo.lock — skipping CLI provision; the offline \
+                 compile will rely on trunk's own tool resolution"
+            ),
         }
         Ok(())
     }
@@ -105,9 +114,9 @@ impl Buildpack for TrunkBuildpack {
         let trunk_cache = ctx.cache_dir.join("trunk");
 
         // Offline (post-seal) release build. `--offline` makes cargo fail rather than
-        // touch the network (every crate was fetched above); trunk's tools were warmed
-        // into the cache in fetch. A build that still tries the network fails here by
-        // design.
+        // touch the network (every crate was fetched above); the exact `wasm-bindgen` was
+        // provisioned on PATH in fetch and `wasm-opt` is baked (binaryen), so trunk needs
+        // no network. A build that still tries the network fails here by design.
         let mut cmd = trunk_command(&cargo_home, &trunk_cache);
         cmd.arg("build").arg("--release").arg("--offline");
         cmd.current_dir(ctx.app_dir);
@@ -220,6 +229,103 @@ fn move_tree_contents(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The wasm-bindgen version this project resolves to, read from `Cargo.lock` (written
+/// by `cargo fetch`). `None` when the app doesn't depend on wasm-bindgen. The trunk
+/// CLI version MUST match this crate version exactly (trunk enforces it from the schema
+/// embedded in the compiled wasm), so this is the version we provision for the offline
+/// compile. Reading the lock is pure data — NO build code runs.
+fn wasm_bindgen_version(app_dir: &Path) -> Result<Option<String>> {
+    let raw = match std::fs::read_to_string(app_dir.join("Cargo.lock")) {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // no lock (cargo couldn't resolve) → let compile speak
+    };
+    let doc: toml::Value = raw.parse().context("parse Cargo.lock")?;
+    let Some(pkgs) = doc.get("package").and_then(|p| p.as_array()) else {
+        return Ok(None);
+    };
+    for p in pkgs {
+        if p.get("name").and_then(|n| n.as_str()) == Some("wasm-bindgen")
+            && let Some(v) = p.get("version").and_then(|v| v.as_str())
+        {
+            return Ok(Some(v.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Download the EXACT `wasm-bindgen` CLI release matching the crate version and install
+/// it on the build PATH (`<cache>/bin/wasm-bindgen`) so the offline compile can run it.
+/// The musl release is statically linked → runs on the Wolfi (glibc) toolchain. Fetched
+/// through the egress proxy from github's release CDN (allow-listed). No build code runs.
+fn provision_wasm_bindgen(ctx: &BuildContext, trunk_cache: &Path, version: &str) -> Result<()> {
+    let cache_dir = trunk_cache.parent().unwrap_or(trunk_cache);
+    let bin_dir = cache_dir.join("bin");
+    let dest = bin_dir.join("wasm-bindgen");
+    // Cross-build cache hit: already provisioned at the right version → skip the download.
+    if version_matches(&dest, version) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
+    let asset = format!("wasm-bindgen-{version}-x86_64-unknown-linux-musl");
+    let url =
+        format!("https://github.com/rustwasm/wasm-bindgen/releases/download/{version}/{asset}.tar.gz");
+    let tgz = cache_dir.join("wasm-bindgen-dl.tar.gz");
+
+    // curl through the egress proxy (HTTPS_PROXY set by apply_proxy); -L follows the
+    // github → release-CDN redirect, which the proxy re-checks against the allowlist.
+    let mut dl = Command::new("curl");
+    dl.env("PATH", BUILD_PATH);
+    apply_proxy(&mut dl, ctx);
+    dl.arg("-fSL").arg("--retry").arg("3").arg("-o").arg(&tgz).arg(&url);
+    run(dl, "curl wasm-bindgen release")?;
+
+    // Extract just the `wasm-bindgen` binary (tar-rs refuses path escapes); the archive
+    // top dir is `<asset>/`, so match on the file name.
+    extract_named(&tgz, "wasm-bindgen", &dest)
+        .with_context(|| format!("extract wasm-bindgen from {}", tgz.display()))?;
+    let _ = std::fs::remove_file(&tgz);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod {}", dest.display()))?;
+    }
+    Ok(())
+}
+
+/// True if `bin` exists and `bin --version` reports `version` (e.g. the line
+/// `wasm-bindgen 0.2.95 (hash)`). Used to skip re-downloading a cached CLI.
+fn version_matches(bin: &Path, version: &str) -> bool {
+    if !bin.exists() {
+        return false;
+    }
+    let Ok(out) = Command::new(bin).arg("--version").output() else {
+        return false;
+    };
+    out.status.success()
+        && String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .any(|t| t == version)
+}
+
+/// Extract the single archive entry whose file name is `filename` from a `.tar.gz` into
+/// `dest` (streamed; no shell-out). Errors if the entry is absent.
+fn extract_named(tgz: &Path, filename: &str, dest: &Path) -> Result<()> {
+    let f = std::fs::File::open(tgz).with_context(|| format!("open {}", tgz.display()))?;
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    for entry in ar.entries().context("read tar entries")? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.file_name().and_then(|n| n.to_str()) == Some(filename) {
+            let mut out =
+                std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+            std::io::copy(&mut entry, &mut out).context("write extracted binary")?;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("{filename} not found in {}", tgz.display())
+}
+
 /// A cargo `Command` with a deterministic build `PATH`, `CARGO_HOME` on the cache
 /// drive, and the same git-CLI/sparse-registry settings the rust buildpack uses.
 fn cargo_command(bin: &str, cargo_home: &Path, trunk_cache: &Path) -> Command {
@@ -237,9 +343,12 @@ fn trunk_command(cargo_home: &Path, trunk_cache: &Path) -> Command {
 }
 
 /// Shared build env for cargo + trunk: PATH, CARGO_HOME, sparse-registry + git-CLI
-/// fetch, and the XDG/trunk cache dirs on the persistent cache drive.
+/// fetch, and the XDG/trunk cache dirs on the persistent cache drive. The cache `bin`
+/// dir is prepended to PATH: fetch provisions the exact-version `wasm-bindgen` there,
+/// and trunk (which resolves tools via PATH) picks it up during the offline compile.
 fn apply_common_env(cmd: &mut Command, cargo_home: &Path, trunk_cache: &Path) {
-    cmd.env("PATH", BUILD_PATH)
+    let bin = trunk_cache.parent().unwrap_or(trunk_cache).join("bin");
+    cmd.env("PATH", format!("{}:{BUILD_PATH}", bin.display()))
         .env("CARGO_HOME", cargo_home)
         .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
         .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
