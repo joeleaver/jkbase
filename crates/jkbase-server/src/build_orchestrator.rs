@@ -911,6 +911,21 @@ async fn run_inner(
         assemble_sidecars(&config, &staged).context("assemble config sidecars")?;
         std::fs::create_dir_all(staged.join("_functions"))?;
         std::fs::create_dir_all(staged.join("_servers"))?;
+        // Managed DB: stage the schema (+ optional rules) from the source tree into a
+        // host-namespaced `_database/` dir with FIXED dest names (the tenant can't pick
+        // them). Paths were traversal-guarded in validate_manifest; a missing file fails
+        // the deploy here (the source-tree existence check). Both ride into the metadata
+        // image and drive the agent's rhypedb supervisor.
+        if let Some(db) = config.database.as_ref() {
+            let dbdir = staged.join("_database");
+            std::fs::create_dir_all(&dbdir)?;
+            std::fs::copy(src_dir.join(&db.schema), dbdir.join("schema.rhype"))
+                .with_context(|| format!("stage DB schema {}", db.schema))?;
+            if let Some(rules) = db.rules.as_deref() {
+                std::fs::copy(src_dir.join(rules), dbdir.join("rules.rhype"))
+                    .with_context(|| format!("stage DB rules {rules}"))?;
+            }
+        }
 
         // 5. Enumerate per-target build work.
         let specs = enumerate_targets(&config);
@@ -1821,6 +1836,20 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     {
         bail!("hosting public {public:?} must be a relative path inside the project (no '..' or absolute)");
     }
+    // Managed DB: the engine resolves (reject unknown) + a non-empty schema, and the
+    // schema/rules paths are traversal-guarded — run_inner copies them host-side from
+    // the source tree, so an unguarded `..`/absolute would read outside the project.
+    if let Some(db) = &config.database {
+        db.validate().context("[database] section")?;
+        if !path_ok(&db.schema) {
+            bail!("[database] schema {:?} must be a relative path inside the project (no '..' or absolute)", db.schema);
+        }
+        if let Some(rules) = &db.rules
+            && !path_ok(rules)
+        {
+            bail!("[database] rules {:?} must be a relative path inside the project (no '..' or absolute)", rules);
+        }
+    }
     Ok(())
 }
 
@@ -1905,6 +1934,12 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     }
     if let Some(j) = config.schedules_json() {
         std::fs::write(staged.join("_schedules.json"), j)?;
+    }
+    // Managed DB marker (engine/schema/rules; NEVER the admin token — that rides the
+    // reserved channel, injected host-side at build_metadata_image). Its presence drives
+    // both compute_layer_plan (attach the rhypedb runtime) and the agent's DB supervisor.
+    if let Some(j) = config.database_json() {
+        std::fs::write(staged.join("_database.json"), j)?;
     }
 
     // Stamp each function's RESOLVED public-egress policy into its `_functions/{name}.json`
