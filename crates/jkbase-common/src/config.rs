@@ -19,6 +19,11 @@ pub struct ProjectConfig {
     pub domains: Vec<String>,
     /// Connected-repo build trigger ([build.repo]) — used by git-push / webhooks.
     pub build: Option<BuildConfig>,
+    /// `[database]` — a managed RhypeDB instance for this project. See
+    /// `docs/managed-rhypedb-design.md`. v1 boots one rhypedb-server co-located in
+    /// the project VM, reachable only by the project's own app/functions over
+    /// loopback (no end-user identity yet).
+    pub database: Option<DatabaseConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -433,6 +438,67 @@ impl SiteConfig {
     }
 }
 
+/// `[database]` — a managed RhypeDB instance for the project. Mirrors the
+/// `[servers.*]`/`[sites.*]` typed-section pattern: an `engine` resolver that fails
+/// closed on an unknown value (a typo must abort the deploy, never silently skip
+/// provisioning). See `docs/managed-rhypedb-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// Database engine. Only `rhypedb` is supported today; an unknown value is
+    /// rejected at preflight (mirrors [`SiteConfig::build_strategy`]). Omitted →
+    /// the default (and only) engine.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// Schema file (RhypeDB SDL) in the uploaded source tree, e.g. `"schema.rhype"`.
+    /// REQUIRED — a managed DB with no schema has nothing to serve.
+    pub schema: String,
+    /// Security-rules file (RhypeDB rules) in the source tree. OPTIONAL for v1
+    /// ("managed RhypeDB for your own backend": the DB is reachable only by the
+    /// project's own app, trusted by the tenant). REQUIRED before the DB is exposed
+    /// to untrusted clients (the Firestore-style tier).
+    #[serde(default)]
+    pub rules: Option<String>,
+    /// Persistent data-disk size for the DB, e.g. `"4GiB"`. The platform default
+    /// data disk is too small for a real DB; this sizes the DB's own volume,
+    /// parsed host-side at deploy. Omitted → the platform default.
+    #[serde(default)]
+    pub size: Option<String>,
+}
+
+/// Resolved database engine. Only RhypeDB exists today; the enum is the fail-closed
+/// boundary so the deploy path rejects an unknown `engine` rather than provisioning
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseEngine {
+    Rhypedb,
+}
+
+impl DatabaseConfig {
+    /// Resolve the `engine` field. Omitted/empty → RhypeDB (the only engine);
+    /// errors on an unrecognised value so `engine = "rhypdb"` fails the deploy
+    /// instead of quietly provisioning no database.
+    pub fn engine(&self) -> Result<DatabaseEngine> {
+        match self.engine.as_deref().map(str::trim) {
+            None | Some("") | Some("rhypedb") => Ok(DatabaseEngine::Rhypedb),
+            Some(other) => {
+                anyhow::bail!("unknown database engine {other:?} (expected \"rhypedb\")")
+            }
+        }
+    }
+
+    /// Validate the `[database]` section at deploy preflight: resolve the engine
+    /// (reject unknown) and reject an empty `schema` path. File existence (the
+    /// schema/rules files actually being present) is checked where the source tree
+    /// is available — the CLI and the build VM.
+    pub fn validate(&self) -> Result<()> {
+        self.engine()?;
+        if self.schema.trim().is_empty() {
+            anyhow::bail!("[database]: `schema` must not be empty (path to the RhypeDB SDL file)");
+        }
+        Ok(())
+    }
+}
+
 impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -559,6 +625,27 @@ impl ProjectConfig {
             .map(|(function, cron)| serde_json::json!({ "function": function, "cron": cron }))
             .collect();
         serde_json::to_string_pretty(&json).ok()
+    }
+
+    /// `_database.json` sidecar: the resolved managed-DB facts the host/agent need
+    /// to provision + boot the DB — engine, schema path, rules path. `None` when no
+    /// `[database]` is declared. The admin credential is NEVER in this sidecar: it
+    /// is host-minted per deploy and delivered over the reserved metadata channel,
+    /// never tenant-authored and never derived from `jkbase.toml`.
+    pub fn database_json(&self) -> Option<String> {
+        let db = self.database.as_ref()?;
+        // Preflight `validate()` already rejects an unknown engine; if it somehow
+        // doesn't resolve here, emit nothing rather than a half-formed sidecar.
+        let engine = match db.engine() {
+            Ok(DatabaseEngine::Rhypedb) => "rhypedb",
+            Err(_) => return None,
+        };
+        serde_json::to_string_pretty(&serde_json::json!({
+            "engine": engine,
+            "schema": db.schema,
+            "rules": db.rules,
+        }))
+        .ok()
     }
 }
 
@@ -889,5 +976,47 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.servers["api"].validate("api").is_err());
+    }
+
+    #[test]
+    fn database_section_parses_resolves_and_emits_sidecar() {
+        // Full section: engine omitted defaults to rhypedb; schema required; rules + size optional.
+        let cfg: ProjectConfig = toml::from_str(
+            "[project]\nname = \"d\"\n[database]\nschema = \"schema.rhype\"\nrules = \"rules.rhype\"\nsize = \"4GiB\"\n",
+        )
+        .unwrap();
+        let db = cfg.database.as_ref().unwrap();
+        assert_eq!(db.engine().unwrap(), DatabaseEngine::Rhypedb);
+        assert_eq!(db.schema, "schema.rhype");
+        assert_eq!(db.rules.as_deref(), Some("rules.rhype"));
+        assert_eq!(db.size.as_deref(), Some("4GiB"));
+        db.validate().unwrap();
+
+        // Sidecar emits engine/schema/rules and NEVER a credential.
+        let sidecar = cfg.database_json().unwrap();
+        assert!(sidecar.contains("rhypedb"));
+        assert!(sidecar.contains("schema.rhype"));
+        assert!(sidecar.contains("rules.rhype"));
+        assert!(!sidecar.to_lowercase().contains("token"));
+
+        // Explicit engine = "rhypedb" is accepted.
+        let cfg: ProjectConfig =
+            toml::from_str("[database]\nengine = \"rhypedb\"\nschema = \"s.rhype\"\n").unwrap();
+        assert_eq!(cfg.database.as_ref().unwrap().engine().unwrap(), DatabaseEngine::Rhypedb);
+
+        // Unknown engine is rejected (typo must fail the deploy, not silently skip).
+        let cfg: ProjectConfig =
+            toml::from_str("[database]\nengine = \"rhypdb\"\nschema = \"s.rhype\"\n").unwrap();
+        assert!(cfg.database.as_ref().unwrap().engine().is_err());
+        assert!(cfg.database.as_ref().unwrap().validate().is_err());
+
+        // Empty schema is rejected by validate().
+        let cfg: ProjectConfig = toml::from_str("[database]\nschema = \"\"\n").unwrap();
+        assert!(cfg.database.as_ref().unwrap().validate().is_err());
+
+        // No [database] → no sidecar, no field.
+        let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        assert!(bare.database.is_none());
+        assert!(bare.database_json().is_none());
     }
 }
