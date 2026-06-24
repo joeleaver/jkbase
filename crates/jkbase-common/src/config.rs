@@ -259,12 +259,50 @@ mod egress_policy_tests {
     }
 }
 
+/// Normalise a build-context path: strip a leading `./`, drop a trailing `/`, and
+/// treat the empty string as the project root `"."`. Pure string hygiene — traversal
+/// safety (`..`/absolute) is enforced by `validate_manifest`.
+fn norm_ctx(p: &str) -> &str {
+    let p = p.trim_start_matches("./").trim_end_matches('/');
+    if p.is_empty() { "." } else { p }
+}
+
+/// Express `source` RELATIVE TO `context` (both project-root-relative). Returns `"."`
+/// when they denote the same directory (the common case: `context` unset → equals
+/// `source`). When `source` is `<context>/<rest>` the result is `<rest>`. When
+/// `source` is NOT under `context` (a misconfig that `validate_manifest` rejects),
+/// the un-stripped `source` is returned so callers still produce a deterministic,
+/// traversal-free token (the in-VM build then fails with a clear "dir not found").
+pub fn rel_within(context: &str, source: &str) -> String {
+    let ctx = norm_ctx(context);
+    let src = norm_ctx(source);
+    if ctx == "." {
+        return src.to_string();
+    }
+    if ctx == src {
+        return ".".to_string();
+    }
+    match src.strip_prefix(ctx).and_then(|r| r.strip_prefix('/')) {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => src.to_string(),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Source directory the platform builds (zero-config buildpacks). The
     /// default path; preferred over `dockerfile`.
     #[serde(default)]
     pub source: Option<String>,
+    /// Build CONTEXT directory (relative to the project root) mounted as the build
+    /// root, Docker-context style. Defaults to `source` when omitted, so unset
+    /// behaviour is byte-identical to before this field existed. Set it WIDER than
+    /// `source` (e.g. the workspace root) so a `source` crate that path-depends on an
+    /// in-repo sibling (`plotweb-common = { path = "../crates/plotweb-common" }`)
+    /// builds: the sibling is now inside the mounted context. `source` must be inside
+    /// `context` (validated at deploy). See `docs/monorepo-build-context.md`.
+    #[serde(default)]
+    pub context: Option<String>,
     /// Build strategy: `auto` (buildpack detect, default) or `dockerfile` (the
     /// gated escape hatch). Auto-detected when omitted.
     #[serde(default)]
@@ -311,6 +349,22 @@ impl ServerConfig {
             return Path::new(df).parent().and_then(|p| p.to_str()).unwrap_or(".");
         }
         "."
+    }
+
+    /// The build CONTEXT subdir mounted as the build root. Explicit `context`,
+    /// else the `source_dir()` (so unset → identical to mounting just the source).
+    pub fn context_dir(&self) -> &str {
+        match self.context.as_deref() {
+            Some(c) => c,
+            None => self.source_dir(),
+        }
+    }
+
+    /// The source path interpreted RELATIVE TO [`Self::context_dir`] — i.e. where,
+    /// inside the mounted context, this target's build root lives. `"."` when
+    /// `context` is unset (or equals `source`), preserving today's behaviour.
+    pub fn build_subdir(&self) -> String {
+        rel_within(self.context_dir(), self.source_dir())
     }
 
     /// Resolve the `builder` field to a [`Builder`]. Defaults to `Auto` when
@@ -402,6 +456,14 @@ pub struct SiteConfig {
     /// when `build` is set; ignored otherwise.
     #[serde(default)]
     pub source: Option<String>,
+    /// Build CONTEXT directory mounted as the build root for a BUILT site (Docker-context
+    /// style). Defaults to `source` when omitted, so unset behaviour is byte-identical.
+    /// Set it wider than `source` (e.g. the workspace root) so a `trunk` frontend crate
+    /// that path-depends on an in-repo sibling builds. `source` must be inside `context`
+    /// (validated at deploy). Ignored for a committed site (no `build`). See
+    /// `docs/monorepo-build-context.md`.
+    #[serde(default)]
+    pub context: Option<String>,
     /// Build strategy for this site: `"trunk"` to build a Rust/WASM frontend with
     /// the trunk buildpack server-side and serve the produced static tree. Absent
     /// (the default) → a committed static site served from `public`, unchanged.
@@ -435,6 +497,18 @@ impl SiteConfig {
     /// Defaults to the project root when `build` is set but `source` is omitted.
     pub fn build_source(&self) -> &str {
         self.source.as_deref().unwrap_or(".")
+    }
+
+    /// The build CONTEXT subdir mounted as the build root. Explicit `context`, else
+    /// the `build_source()` (so unset → identical to mounting just the source).
+    pub fn context_dir(&self) -> &str {
+        self.context.as_deref().unwrap_or_else(|| self.build_source())
+    }
+
+    /// The source path relative to [`Self::context_dir`]; `"."` when `context` is
+    /// unset (or equals `source`), preserving today's behaviour.
+    pub fn build_subdir(&self) -> String {
+        rel_within(self.context_dir(), self.build_source())
     }
 }
 
@@ -736,6 +810,50 @@ mod tests {
             Some(&["/opt/bun/bin/bun".to_string(), "run".into(), "--filter".into(), "web".into(), "start".into()][..])
         );
         assert!(cfg.servers["api"].command.is_none(), "command defaults to None");
+    }
+
+    #[test]
+    fn rel_within_expresses_source_relative_to_context() {
+        // Context unset/equal-to-source semantics collapse to ".".
+        assert_eq!(rel_within(".", "."), ".");
+        assert_eq!(rel_within("web", "web"), ".");
+        assert_eq!(rel_within("./web/", "web"), ".");
+        // A wider context yields the source's path within it.
+        assert_eq!(rel_within(".", "web"), "web");
+        assert_eq!(rel_within(".", "./crates/api"), "crates/api");
+        assert_eq!(rel_within("apps", "apps/web"), "web");
+        // Source NOT under context → returned unchanged (validate_manifest rejects it;
+        // the token stays deterministic and traversal-free regardless).
+        assert_eq!(rel_within("apps", "services/api"), "services/api");
+    }
+
+    #[test]
+    fn context_unset_is_identical_to_mounting_source() {
+        // Regression guard for the #1 review concern: when `context` is omitted, the
+        // context subdir IS the source and the build subdir is "." — byte-identical to
+        // the pre-`context` build path (mount the source, build at its root).
+        let server: ServerConfig =
+            toml::from_str("source = \"./web\"\nport = 3000\n").unwrap();
+        assert_eq!(server.context_dir(), "./web");
+        assert_eq!(server.build_subdir(), ".");
+
+        let site: SiteConfig = toml::from_str("source = \"./web\"\nbuild = \"trunk\"\n").unwrap();
+        assert_eq!(site.context_dir(), "./web");
+        assert_eq!(site.build_subdir(), ".");
+    }
+
+    #[test]
+    fn context_set_widens_root_and_keeps_source_as_build_subdir() {
+        // `context = "."`, `source = "web"`: mount the repo root, build in web/.
+        let server: ServerConfig =
+            toml::from_str("source = \"web\"\ncontext = \".\"\nport = 3000\n").unwrap();
+        assert_eq!(server.context_dir(), ".");
+        assert_eq!(server.build_subdir(), "web");
+
+        let site: SiteConfig =
+            toml::from_str("source = \"web\"\ncontext = \".\"\nbuild = \"trunk\"\n").unwrap();
+        assert_eq!(site.context_dir(), ".");
+        assert_eq!(site.build_subdir(), "web");
     }
 
     #[test]
