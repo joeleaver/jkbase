@@ -377,12 +377,15 @@ pub struct HostingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteConfig {
-    /// The static directory served for this site. For a COMMITTED site this is the
-    /// pre-built content (the historical behaviour). For a BUILT site (`build` set)
-    /// it is OPTIONAL and ignored: the platform builds the content from `source` and
-    /// serves the produced tree.
-    #[serde(default = "default_public")]
-    pub public: String,
+    /// The static directory served for this site. For a COMMITTED site (no `build`)
+    /// this is REQUIRED — the pre-built content (the historical behaviour). `None`
+    /// (omitted) is only legal for a BUILT site (`build` set), where it is ignored:
+    /// the platform builds the content from `source` and serves the produced tree.
+    /// Left `Option` (not defaulted to ".") on purpose: a blanket "." default would
+    /// silently serve the entire source tree for a committed site that forgot
+    /// `public` — `validate_manifest` rejects that instead.
+    #[serde(default)]
+    pub public: Option<String>,
     pub spa: Option<bool>,
     pub prefix: Option<String>,
     /// Optional hostname binding: a bare label (`docs` → `docs.jkbase.app`) or a
@@ -399,10 +402,6 @@ pub struct SiteConfig {
     /// (the default) → a committed static site served from `public`, unchanged.
     #[serde(default)]
     pub build: Option<String>,
-}
-
-fn default_public() -> String {
-    ".".to_string()
 }
 
 /// Resolved build strategy for a `[sites.*]` target. `None` (committed content) is
@@ -461,7 +460,9 @@ impl ProjectConfig {
         for (name, site) in &self.sites {
             sites.push(ResolvedSite {
                 name: name.clone(),
-                public: site.public.clone(),
+                // A committed site always has `public` (enforced by validate_manifest at
+                // intake); a built site ignores it, so `None` → "." is a harmless filler.
+                public: site.public.clone().unwrap_or_else(|| ".".to_string()),
                 spa: site.spa.unwrap_or(false),
                 prefix: site.prefix.clone().unwrap_or_else(|| "/".to_string()),
                 domain: site.domain.clone(),
@@ -814,7 +815,7 @@ mod tests {
     #[test]
     fn site_build_strategy_resolves_and_marks_resolved_site() {
         // A built site: `build = "trunk"` resolves to Trunk; `source` is the build dir;
-        // `public` defaults (and is irrelevant for a built site).
+        // `public` is omitted (legal only for a built site → `None`, not defaulted to ".").
         let cfg: ProjectConfig = toml::from_str(
             "[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n",
         )
@@ -822,15 +823,17 @@ mod tests {
         let site = &cfg.sites["app"];
         assert_eq!(site.build_strategy().unwrap(), Some(SiteBuild::Trunk));
         assert_eq!(site.build_source(), "./web");
+        assert_eq!(site.public, None, "omitted `public` must be None, never defaulted to \".\"");
         // resolved_sites carries the `built` flag so assemble_sites skips its copy.
         let resolved = cfg.resolved_sites();
         let app = resolved.iter().find(|s| s.name == "app").unwrap();
         assert!(app.built);
 
-        // A committed site: no `build` → None, not built.
+        // A committed site: no `build` → None, not built; `public` is carried as Some.
         let cfg: ProjectConfig =
             toml::from_str("[sites.docs]\npublic = \"./docs\"\n").unwrap();
         assert_eq!(cfg.sites["docs"].build_strategy().unwrap(), None);
+        assert_eq!(cfg.sites["docs"].public.as_deref(), Some("./docs"));
         assert!(!cfg.resolved_sites().iter().any(|s| s.built));
 
         // An unknown strategy is rejected (typo → never ship un-built source).

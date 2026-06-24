@@ -1802,8 +1802,18 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
             if !path_ok(src) {
                 bail!("site '{name}' source {src:?} must be a relative path inside the project (no '..' or absolute)");
             }
-        } else if !path_ok(&site.public) {
-            bail!("site '{name}' public {:?} must be a relative path inside the project (no '..' or absolute)", site.public);
+        } else {
+            // A COMMITTED site: `public` is REQUIRED. Omitting it must NOT silently
+            // default to the project root — that would package the entire source tree
+            // (Cargo/JS source, configs, …) as served site content, the exact footgun
+            // resolved_sites' synthesize path guards against. Only a built site may omit
+            // `public` (its slot is filled from the build output).
+            let Some(public) = site.public.as_deref() else {
+                bail!("site '{name}' must set `public` (the committed static directory) unless it sets `build`");
+            };
+            if !path_ok(public) {
+                bail!("site '{name}' public {public:?} must be a relative path inside the project (no '..' or absolute)");
+            }
         }
     }
     if let Some(public) = config.hosting.as_ref().and_then(|h| h.public.as_deref())
@@ -2504,6 +2514,20 @@ mod tests {
         let site: ProjectConfig =
             toml::from_str("[sites.docs]\npublic = \"../../root\"\n").unwrap();
         assert!(validate_manifest(&site).is_err());
+
+        // A COMMITTED site that OMITS `public` → reject. Without this guard the missing
+        // `public` would default to the project root and silently serve the whole source
+        // tree as site content (information disclosure on an all-tenants-untrusted host).
+        let no_public: ProjectConfig =
+            toml::from_str("[sites.docs]\nprefix = \"/docs\"\n").unwrap();
+        let err = validate_manifest(&no_public).unwrap_err().to_string();
+        assert!(err.contains("must set `public`"), "got: {err}");
+
+        // A BUILT site is the ONLY one allowed to omit `public` (its slot is filled from
+        // the build output) — must still pass.
+        let built: ProjectConfig =
+            toml::from_str("[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n").unwrap();
+        assert!(validate_manifest(&built).is_ok());
 
         // Name with a path separator → reject (would escape the staged dest).
         let badname: ProjectConfig = toml::from_str(
