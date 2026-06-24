@@ -2420,6 +2420,14 @@ mod tests {
                 .to_vec(),
             "a function must never select a per-language server toolchain"
         );
+        // A STATIC target keys on language like a server (kind != function), so a
+        // trunk static site picks `trunk.ext4` first.
+        assert_eq!(
+            toolchain_candidates("static", Some("trunk")),
+            ["trunk.ext4", "jkbuild-static.ext4", "static.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec()
+        );
     }
 
     #[test]

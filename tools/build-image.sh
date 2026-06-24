@@ -35,6 +35,16 @@ RUST_TOOLCHAIN_DIR="${RUST_TOOLCHAIN_DIR:-}"
 # /opt/js-tools and generates the wasi:http WIT (at the engine's exact version) at
 # /opt/jkbuild/wit/function.wit, for the function toolchain's JS/TS path.
 INJECT_JS="${INJECT_JS:-0}"
+# INJECT_TRUNK=1 bakes a pinned official Rust toolchain WITH the
+# wasm32-unknown-unknown target std at /opt/rust, plus the `trunk` CLI at
+# /usr/local/bin/trunk, for the trunk (Rust/WASM frontend) static toolchain.
+# RUST_TOOLCHAIN_DIR points at a self-contained rustup toolchain dir (bin/ +
+# lib/rustlib/{host,wasm32-unknown-unknown}); the default is the repo-pinned
+# toolchain rustup materialized on this host. TRUNK_BIN points at a prebuilt `trunk`
+# binary (default: the asset dir, staged by install-image-tools.sh). See the
+# build-trunk.apko.yaml header for why this is injected, not an apko package.
+INJECT_TRUNK="${INJECT_TRUNK:-0}"
+TRUNK_BIN="${TRUNK_BIN:-$REPO_ROOT/.firecracker/assets/trunk}"
 export PATH="$HOME/.local/bin:$PATH"
 
 command -v apko >/dev/null || {
@@ -133,6 +143,40 @@ if [ "$INJECT_RUST_WASIP2" = "1" ]; then
     for tool in cargo rustc rustdoc; do
         [ -e "$STAGE/opt/rust/bin/$tool" ] && ln -sf /opt/rust/bin/"$tool" "$STAGE/usr/local/bin/$tool"
     done
+fi
+
+# Inject a pinned official Rust toolchain WITH the wasm32-unknown-unknown target std
+# at /opt/rust, plus the `trunk` CLI, for the trunk static toolchain. Same rationale
+# as INJECT_RUST_WASIP2 (Wolfi ships only the host std; the wasm std must be built by
+# the same rustc) but for the browser-wasm target trunk compiles to.
+if [ "$INJECT_TRUNK" = "1" ]; then
+    src="$RUST_TOOLCHAIN_DIR"
+    if [ -z "$src" ]; then
+        chan="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO_ROOT/rust-toolchain.toml" | head -1)"
+        host="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"
+        src="${RUSTUP_HOME:-$HOME/.rustup}/toolchains/${chan}-${host}"
+    fi
+    if [ ! -x "$src/bin/cargo" ] || [ ! -x "$src/bin/rustc" ]; then
+        echo "[build-image] ERROR: rust toolchain not found at $src (set RUST_TOOLCHAIN_DIR, or run: rustup toolchain install <chan> && rustup target add wasm32-unknown-unknown)" >&2
+        exit 1
+    fi
+    if [ ! -d "$src/lib/rustlib/wasm32-unknown-unknown" ]; then
+        echo "[build-image] ERROR: wasm32-unknown-unknown std missing in $src — run: rustup target add wasm32-unknown-unknown" >&2
+        exit 1
+    fi
+    if [ ! -x "$TRUNK_BIN" ]; then
+        echo "[build-image] ERROR: trunk binary missing at $TRUNK_BIN (set TRUNK_BIN, or stage it via tools/install-image-tools.sh)" >&2
+        exit 1
+    fi
+    echo "[build-image] injecting Rust toolchain + wasm32-unknown-unknown std from $src → /opt/rust"
+    mkdir -p "$STAGE/opt/rust"
+    cp -a "$src/." "$STAGE/opt/rust/"
+    mkdir -p "$STAGE/usr/local/bin"
+    for tool in cargo rustc rustdoc; do
+        [ -e "$STAGE/opt/rust/bin/$tool" ] && ln -sf /opt/rust/bin/"$tool" "$STAGE/usr/local/bin/$tool"
+    done
+    echo "[build-image] injecting trunk CLI from $TRUNK_BIN → /usr/local/bin/trunk"
+    install -Dm0755 "$TRUNK_BIN" "$STAGE/usr/local/bin/trunk"
 fi
 
 # Inject the JS componentizer (jco + componentize-js + esbuild) at /opt/js-tools and
