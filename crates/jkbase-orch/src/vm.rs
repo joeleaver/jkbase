@@ -96,6 +96,40 @@ impl VmInstance {
             })
             .await?;
 
+        // Snapshot-safe CPU baseline (custom CPU template). Firecracker v1.15.1's
+        // snapshot/restore does not faithfully round-trip the guest's newer XSAVE state
+        // (AVX-512 / CET shadow-stack / PKU) on a modern host (e.g. AMD Zen5 + a fresh
+        // kernel): a restored guest task whose XSAVE area carries that state #GPs in
+        // `restore_fpregs_from_fpstate` and the guest kernel panics ~1s into resume —
+        // breaking on-demand wake (the heart of scale-to-zero). The static AMD template
+        // (T2A) is gated to specific CPU models (rejected on Zen5), so we mask the
+        // offending *gating* feature bits with a custom template: the guest kernel's
+        // xstate init drops an xfeature whose CPU-feature bit is absent (xsave_cpuid_
+        // features cross-check), so clearing AVX512F + PKU + CET_SS in CPUID leaf 0x7
+        // keeps those components out of XCR0 entirely — while AVX2 (which Bun/rhypedb
+        // need) stays. A guest cmdline (`clearcpuid`) can't do this: it's applied AFTER
+        // xstate init reads raw CPUID, whereas a template masks CPUID from the first read.
+        // No-op on hosts that lack these features (e.g. the current Intel prod CPU), since
+        // the bits are already 0. Bitmaps are MSB(bit31)→LSB(bit0); '0' clears, 'x' keeps.
+        let cpu_template = serde_json::json!({
+            "cpuid_modifiers": [{
+                "leaf": "0x7",
+                "subleaf": "0x0",
+                "flags": 2, // KVM_CPUID_FLAG_SIGNIFCANT_INDEX (leaf 0x7 is subleaf-significant)
+                "modifiers": [
+                    // EBX: clear AVX512 F(16) DQ(17) IFMA(21) CD(28) BW(30) VL(31).
+                    {"register": "ebx", "bitmap": "0b00x0xxxxxx0xxx00xxxxxxxxxxxxxxxx"},
+                    // ECX: clear PKU(3) OSPKE(4) CET_SS(7).
+                    {"register": "ecx", "bitmap": "0bxxxxxxxxxxxxxxxxxxxxxxxx0xx00xxx"}
+                ]
+            }],
+            "msr_modifiers": []
+        });
+        client
+            .set_cpu_config(&cpu_template)
+            .await
+            .context("set snapshot-safe CPU template")?;
+
         // ipv6.disable=1: runtime egress is IPv4-only (no v6 NAT/forwarding on jkbr0),
         // and the bridge SSRF DROP is IPv4 — so a live guest v6 stack would be an
         // unguarded path to metadata/host. Disable it in the guest entirely (matches the
