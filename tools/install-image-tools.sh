@@ -9,6 +9,7 @@ set -euo pipefail
 APKO_VER="${APKO_VER:-1.2.16}"
 MELANGE_VER="${MELANGE_VER:-0.52.1}" # only needed if/when we package a jkbuild apk
 BUN_VER="${BUN_VER:-1.3.14}"         # standard x64 (AVX2). No FC CPU template is used, so the guest has host AVX2;
+TRUNK_VER="${TRUNK_VER:-0.21.14}"    # the trunk CLI, staged for the build-trunk toolchain (TRUNK=1)
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 ASSET_DIR="${ASSET_DIR:-$REPO_ROOT/.firecracker/assets}"
@@ -61,6 +62,27 @@ fi
 unzip -o -j "$bun_zip" -d "$ASSET_DIR" '*/bun' >/dev/null
 chmod 0755 "$ASSET_DIR/bun"
 echo "[install] bun staged: $("$ASSET_DIR/bun" --version 2>/dev/null || echo '(version check needs glibc match)')"
+
+# Baked trunk CLI (x64), for the build-trunk static toolchain. Gated behind TRUNK=1
+# so the default install (bun/node/rust/etc.) doesn't always pull it. The release
+# tarball is `trunk-x86_64-unknown-linux-gnu.tar.gz` containing a single `trunk`
+# binary. The toolchain ALSO needs the wasm32-unknown-unknown Rust std baked by
+# build-image.sh (INJECT_TRUNK) — run `rustup target add wasm32-unknown-unknown`.
+if [ "${TRUNK:-0}" = "1" ]; then
+    trunk_tgz="$(mktemp -d)/trunk.tar.gz"
+    echo "[install] trunk $TRUNK_VER -> $ASSET_DIR/trunk"
+    curl -fSL -o "$trunk_tgz" \
+        "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VER}/trunk-x86_64-unknown-linux-gnu.tar.gz"
+    if [ -n "${TRUNK_SHA256:-}" ]; then
+        echo "${TRUNK_SHA256}  $trunk_tgz" | sha256sum -c - || {
+            echo "[install] trunk sha256 mismatch" >&2
+            exit 1
+        }
+    fi
+    tar -xzf "$trunk_tgz" -C "$(dirname "$trunk_tgz")"
+    install -m755 "$(find "$(dirname "$trunk_tgz")" -type f -name trunk | head -1)" "$ASSET_DIR/trunk"
+    echo "[install] trunk staged: $("$ASSET_DIR/trunk" --version 2>/dev/null || echo '(version check needs glibc match)')"
+fi
 
 # Host layer tooling for tools/build-base-layer.sh (WS4): mkfs.erofs packs the
 # shared base/runtime erofs layers; fsverity is best-effort defense-in-depth on

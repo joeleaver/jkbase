@@ -33,6 +33,11 @@ pub mod out {
     /// Transitional flat-rootfs tarball (the de-risking rung before the layered
     /// runtime lands; consumed by the existing flat-chroot runtime).
     pub const ROOTFS_TARBALL: &str = "/rootfs.tar.gz";
+    /// Static-build artifact: the produced static tree (e.g. trunk's `dist/`),
+    /// packed as a plain gzip tarball. The host untars it into the served site
+    /// location — no erofs layer, no server manifest, no overlay runtime. Written
+    /// by the lifecycle's static path (`jkbase.kind=static`).
+    pub const STATIC_TARBALL: &str = "/static.tar.gz";
 }
 
 /// Where a layer sits in the runtime overlay stack. `Base` and `Runtime` layers

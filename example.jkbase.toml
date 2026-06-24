@@ -25,5 +25,14 @@ volumes = [{ name = "data", mount = "/app/data" }]
 #   dockerfile = "./Dockerfile"
 #   port = 8080
 
+# Server-side BUILT static site (a Rust/WASM frontend). The platform runs
+# `trunk build --release` from `source` and serves the produced static bundle as
+# this site — no need to commit a pre-built dist/. `build = "trunk"` selects the
+# trunk buildpack; `source` is a crate with a Trunk.toml. A site WITHOUT `build`
+# is a committed static site served from `public`, unchanged.
+#   [sites.app]
+#   source = "./web"
+#   build  = "trunk"
+
 [routes]
 "/api/*" = { service = "server", name = "api" }

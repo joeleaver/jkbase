@@ -1141,6 +1141,7 @@ async fn build_one_target_inner(
     let kind_char = match spec.kind {
         TargetKind::Function => 'f',
         TargetKind::Server => 's',
+        TargetKind::Static => 't',
     };
     let short_name: String = sanitize(&spec.name).chars().take(16).collect();
     let vm_id = format!("b{build_id}-{kind_char}-{short_name}");
@@ -1272,11 +1273,15 @@ async fn build_one_target_inner(
         // Layered: the in-VM exporter emits the app erofs layer + index.json; the
         // host collection arm (below) dumps + sha256-verifies it. The runtime
         // overlays it on the shared base/runtime layers (or, for a dockerfile build,
-        // runs the single self-contained app layer with no base/runtime).
+        // runs the single self-contained app layer with no base/runtime). A static
+        // target ignores this — its lifecycle path always packs a flat
+        // `/out/static.tar.gz`.
         export_layered: true,
-        // Function targets run the in-VM function-builder (→ /out/function.wasm), which
-        // ignores the server export mode above.
+        // Function targets run the in-VM function-builder (→ /out/function.wasm) and
+        // static targets run the buildpack pipeline → /out/static.tar.gz; both ignore
+        // the server export mode above. The two kind flags are mutually exclusive.
         build_function: matches!(spec.kind, TargetKind::Function),
+        build_static: matches!(spec.kind, TargetKind::Static),
         builder_hint: is_dockerfile.then(|| "dockerfile".to_string()),
         dockerfile: spec.dockerfile.clone(),
         fetch_deadline: deps.fetch_deadline,
@@ -1383,6 +1388,9 @@ async fn build_one_target_inner(
                 spec,
                 toolchain_lang.as_deref(),
             )?;
+        }
+        TargetKind::Static => {
+            collect_static_site(&output_img, staged, workspace, &tag, config, spec)?;
         }
     }
 
@@ -1540,6 +1548,61 @@ fn collect_layered_server(
     }
     let json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(staged.join("_servers").join(format!("{}.json", spec.name)), json)?;
+    Ok(())
+}
+
+/// Collect a static build target: dump the build VM's plain `/static.tar.gz`
+/// (trunk's `dist/`, etc.), untar it in a scratch dir, then copy the tree into the
+/// staged SITE location — the same place `assemble_sites` copies committed static
+/// content. A built site thus replaces "commit your pre-built dist/" with "the
+/// platform builds it server-side", with no other change to the serving path.
+///
+/// Destination mirrors `assemble_sites`: the staged ROOT for the single default
+/// site (guarded against `_`-prefixed clobbers, review B-1), or `_site_<name>/` for
+/// a named site in a multi-site deploy. The copy reuses the SAME guard as committed
+/// content, so a built tree gets no extra trust.
+fn collect_static_site(
+    output_img: &Path,
+    staged: &Path,
+    workspace: &Path,
+    tag: &str,
+    config: &ProjectConfig,
+    spec: &TargetSpec,
+) -> Result<()> {
+    // 1. Dump the plain tarball the lifecycle's static path wrote.
+    let tar_tmp = workspace.join(format!("{tag}.static.tar.gz"));
+    if !build_output::dump_file(output_img, jkbuild_types::out::STATIC_TARBALL, &tar_tmp)? {
+        bail!(
+            "static build produced no {} (expected a flat static export)",
+            jkbuild_types::out::STATIC_TARBALL
+        );
+    }
+
+    // 2. Untar into a scratch dir (tar-rs refuses `..`/absolute escapes; the
+    //    hostile-code boundary remains the build VM, this is defense-in-depth).
+    let extract = workspace.join(format!("{tag}.static-tree"));
+    let _ = std::fs::remove_dir_all(&extract);
+    std::fs::create_dir_all(&extract)?;
+    let bytes = std::fs::read(&tar_tmp)
+        .with_context(|| format!("read dumped static tarball {}", tar_tmp.display()))?;
+    unpack_tar_gz(&bytes, &extract).context("unpack built static tarball")?;
+    let _ = std::fs::remove_file(&tar_tmp);
+
+    // 3. Resolve the staged site destination, mirroring assemble_sites' placement.
+    //    A built site is named after its `[sites.<name>]` (the Static target name); a
+    //    single default site lands at the staged root.
+    if config.is_multi_site() {
+        // Named site → its own `_site_<name>/` prefix (no top-level guard needed —
+        // the whole subtree is namespaced and the agent serves it under the prefix).
+        let dest = staged.join(format!("_site_{}", spec.name));
+        let _ = std::fs::remove_dir_all(&dest);
+        copy_filtered(&extract, &dest)?;
+    } else {
+        // Single default site → the staged ROOT alongside the host's `_`-prefixed
+        // control artifacts; guard against a built tree clobbering them (review B-1).
+        copy_filtered_guarded(&extract, staged)?;
+    }
+    let _ = std::fs::remove_dir_all(&extract);
     Ok(())
 }
 
@@ -1728,8 +1791,29 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         }
     }
     for (name, site) in &config.sites {
-        if !path_ok(&site.public) {
-            bail!("site '{name}' public {:?} must be a relative path inside the project (no '..' or absolute)", site.public);
+        // `build = "..."` resolves (reject a typo'd strategy that would otherwise ship
+        // un-built source as static content).
+        let build = site
+            .build_strategy()
+            .with_context(|| format!("site '{name}' build strategy"))?;
+        if build.is_some() {
+            // A BUILT site: its `source` (not `public`) must be a safe relative path.
+            let src = site.build_source();
+            if !path_ok(src) {
+                bail!("site '{name}' source {src:?} must be a relative path inside the project (no '..' or absolute)");
+            }
+        } else {
+            // A COMMITTED site: `public` is REQUIRED. Omitting it must NOT silently
+            // default to the project root — that would package the entire source tree
+            // (Cargo/JS source, configs, …) as served site content, the exact footgun
+            // resolved_sites' synthesize path guards against. Only a built site may omit
+            // `public` (its slot is filled from the build output).
+            let Some(public) = site.public.as_deref() else {
+                bail!("site '{name}' must set `public` (the committed static directory) unless it sets `build`");
+            };
+            if !path_ok(public) {
+                bail!("site '{name}' public {public:?} must be a relative path inside the project (no '..' or absolute)");
+            }
         }
     }
     if let Some(public) = config.hosting.as_ref().and_then(|h| h.public.as_deref())
@@ -1765,6 +1849,26 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language: s.language.clone(),
             builder,
             dockerfile,
+        });
+    }
+    // Built sites ([sites.<name>] with `build = "..."`): one static build target each,
+    // building from `source` and producing a static tree the host serves as that site.
+    // The build strategy (trunk) selects the in-VM buildpack via the language hint.
+    for (name, site) in &config.sites {
+        // `build` was validated at intake; ignore an (already-rejected) bad value here.
+        let Ok(Some(strategy)) = site.build_strategy() else {
+            continue;
+        };
+        let language = match strategy {
+            jkbase_common::config::SiteBuild::Trunk => Some("trunk".to_string()),
+        };
+        specs.push(TargetSpec {
+            name: name.clone(),
+            kind: TargetKind::Static,
+            source_subdir: site.build_source().to_string(),
+            language,
+            builder: Builder::Auto, // built sites take the buildpack path, never a Dockerfile
+            dockerfile: None,
         });
     }
     // Deterministic order regardless of HashMap iteration.
@@ -1837,12 +1941,22 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
     let sites = config.resolved_sites();
     if config.is_multi_site() {
         for site in &sites {
+            // A BUILT site's content comes from its static build target (collected
+            // post-build into the same `_site_<name>/` slot), not from committed source.
+            if site.built {
+                continue;
+            }
             let site_dir = src_dir.join(&site.public);
             if site_dir.is_dir() {
                 copy_filtered(&site_dir, &staged.join(format!("_site_{}", site.name)))?;
             }
         }
     } else if let Some(site) = sites.first() {
+        // Skip the committed-copy for a built default site — the static build fills the
+        // staged root.
+        if site.built {
+            return Ok(());
+        }
         let site_dir = src_dir.join(&site.public);
         if site_dir.is_dir() {
             // Single-site content lands in the staged ROOT alongside the host's `_`-prefixed
@@ -1992,6 +2106,7 @@ fn kind_name(kind: TargetKind) -> &'static str {
     match kind {
         TargetKind::Function => "function",
         TargetKind::Server => "server",
+        TargetKind::Static => "static",
     }
 }
 
@@ -2072,6 +2187,41 @@ mod tests {
         .unwrap();
         let specs = enumerate_targets(&cfg);
         assert_eq!(specs[0].dockerfile.as_deref(), Some("docker/api.Dockerfile"));
+    }
+
+    #[test]
+    fn enumerate_built_site_emits_static_target() {
+        // A `[sites.<name>]` with `build = "trunk"` enumerates a Static target whose
+        // source is the site's `source`, language "trunk", no dockerfile.
+        let cfg: ProjectConfig = toml::from_str(
+            r#"
+            [sites.app]
+            source = "./web"
+            build = "trunk"
+            "#,
+        )
+        .unwrap();
+        let specs = enumerate_targets(&cfg);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].kind, TargetKind::Static);
+        assert_eq!(specs[0].name, "app");
+        assert_eq!(specs[0].source_subdir, "./web");
+        assert_eq!(specs[0].language.as_deref(), Some("trunk"));
+        assert_eq!(specs[0].builder, Builder::Auto);
+        assert!(specs[0].dockerfile.is_none());
+
+        // A COMMITTED site (no `build`) enumerates NO build target — it's copied
+        // from source by assemble_sites, unchanged.
+        let committed: ProjectConfig =
+            toml::from_str("[sites.docs]\npublic = \"./docs\"\n").unwrap();
+        assert!(enumerate_targets(&committed).is_empty());
+    }
+
+    #[test]
+    fn static_target_kind_name_and_static_tarball_contract() {
+        assert_eq!(kind_name(TargetKind::Static), "static");
+        // The host reads the lifecycle's static export by this fixed name.
+        assert_eq!(jkbuild_types::out::STATIC_TARBALL, "/static.tar.gz");
     }
 
     #[test]
@@ -2280,6 +2430,14 @@ mod tests {
                 .to_vec(),
             "a function must never select a per-language server toolchain"
         );
+        // A STATIC target keys on language like a server (kind != function), so a
+        // trunk static site picks `trunk.ext4` first.
+        assert_eq!(
+            toolchain_candidates("static", Some("trunk")),
+            ["trunk.ext4", "jkbuild-static.ext4", "static.ext4", "default.ext4"]
+                .map(String::from)
+                .to_vec()
+        );
     }
 
     #[test]
@@ -2356,6 +2514,20 @@ mod tests {
         let site: ProjectConfig =
             toml::from_str("[sites.docs]\npublic = \"../../root\"\n").unwrap();
         assert!(validate_manifest(&site).is_err());
+
+        // A COMMITTED site that OMITS `public` → reject. Without this guard the missing
+        // `public` would default to the project root and silently serve the whole source
+        // tree as site content (information disclosure on an all-tenants-untrusted host).
+        let no_public: ProjectConfig =
+            toml::from_str("[sites.docs]\nprefix = \"/docs\"\n").unwrap();
+        let err = validate_manifest(&no_public).unwrap_err().to_string();
+        assert!(err.contains("must set `public`"), "got: {err}");
+
+        // A BUILT site is the ONLY one allowed to omit `public` (its slot is filled from
+        // the build output) — must still pass.
+        let built: ProjectConfig =
+            toml::from_str("[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n").unwrap();
+        assert!(validate_manifest(&built).is_ok());
 
         // Name with a path separator → reject (would escape the staged dest).
         let badname: ProjectConfig = toml::from_str(
@@ -2638,6 +2810,7 @@ esac
             lang_hint: None,
             export_layered: false,
             build_function: false,
+            build_static: false,
             builder_hint: None,
             dockerfile: None,
             fetch_deadline: Duration::from_secs(20),
