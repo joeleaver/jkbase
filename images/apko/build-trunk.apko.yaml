@@ -43,6 +43,14 @@ contents:
     - binaryen
     # git deps (`git = "..."` in Cargo.toml) fetched via the git CLI through the proxy.
     - git
+    # liblzma.so.5 — the prebuilt trunk CLI (trunk-x86_64-unknown-linux-gnu) is a glibc
+    # dynamic binary that NEEDs liblzma.so.5; without it `trunk build` dies at load with
+    # "liblzma.so.5: cannot open shared object file". Wolfi's `xz` provides the lib.
+    - xz
+    # curl: the buildpack's fetch phase downloads the exact-version wasm-bindgen CLI
+    # release (through the egress proxy) so the offline compile can run it — see
+    # buildpacks/trunk.rs `provision_wasm_bindgen`.
+    - curl
 
 archs:
   - x86_64

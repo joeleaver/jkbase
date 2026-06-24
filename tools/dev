@@ -14,7 +14,7 @@
 #   assets       download+verify pinned Firecracker release, bun, apko
 #   rust         cargo build host bins + the musl agent + jkbuild-init
 #   kernel       build (or adopt) the 6.12 guest kernel                          [long]
-#   toolchains   bake default/bun/dockerfile/node/rust/python/go/function .ext4 images
+#   toolchains   bake default/bun/dockerfile/node/rust/python/go/function/trunk .ext4 images
 #   baselayers   bake base + bun/node/rust runtime erofs layers + platform.json  [root]
 #   net          provision the build bridge + firewall (3128+3129) + cgroup      [root, per-boot]
 #   all          preflight→deps→assets→rust→kernel→toolchains→baselayers  (NOT net)
@@ -45,6 +45,10 @@ BUN_VER="${BUN_VER:-1.3.14}"
 APKO_VER="${APKO_VER:-1.2.16}"
 # bun release zip sha256 (linux-x64). Empty = unverified (warned). Pin when known:
 BUN_SHA256="${BUN_SHA256:-}"
+# trunk CLI (the Rust/WASM frontend static toolchain). The release tarball sha256
+# (x86_64-unknown-linux-gnu) is pinned for integrity.
+TRUNK_VER="${TRUNK_VER:-0.21.14}"
+TRUNK_SHA256="${TRUNK_SHA256:-f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FC_DIR="$REPO_ROOT/.firecracker"
@@ -248,7 +252,7 @@ cmd_assets() {
     local fc_bin="$RELEASE_DIR/firecracker-v${FC_VERSION}-${FC_ARCH}"
     local need_fc=1 need_tools=1
     [ -x "$fc_bin" ] && need_fc=0
-    { command -v apko >/dev/null && [ -f "$ASSET_DIR/bun" ]; } && need_tools=0
+    { command -v apko >/dev/null && [ -f "$ASSET_DIR/bun" ] && [ -f "$ASSET_DIR/trunk" ]; } && need_tools=0
     if [ "$need_fc" = 0 ] && [ "$need_tools" = 0 ] && [ "$FORCE" != 1 ]; then
         verdict "Firecracker v$FC_VERSION + apko + bun present — SKIP"; RAN[assets]=SKIP; return 0
     fi
@@ -259,12 +263,16 @@ cmd_assets() {
     fi
     if [ "$need_tools" = 1 ] || [ "$FORCE" = 1 ]; then
         [ -n "$BUN_SHA256" ] || warn "BUN_SHA256 unset — bun download will not be checksum-verified (pin it in tools/dev)"
+        # TRUNK=1 also stages the trunk CLI (for the trunk static toolchain).
         run_or_capture env APKO_VER="$APKO_VER" BUN_VER="$BUN_VER" BUN_SHA256="$BUN_SHA256" \
+            TRUNK=1 TRUNK_VER="$TRUNK_VER" TRUNK_SHA256="$TRUNK_SHA256" \
             "$REPO_ROOT/tools/install-image-tools.sh" || die "install-image-tools failed"
-        # A prior root run may have left bun root-owned; normalize so non-root bakes work.
-        [ -f "$ASSET_DIR/bun" ] && [ ! -O "$ASSET_DIR/bun" ] && { sudo_warmup; sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/bun"; }
+        # A prior root run may have left bun/trunk root-owned; normalize so non-root bakes work.
+        for a in bun trunk; do
+            [ -f "$ASSET_DIR/$a" ] && [ ! -O "$ASSET_DIR/$a" ] && { sudo_warmup; sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/$a"; }
+        done
     fi
-    ok "assets ready (FC v$FC_VERSION, apko, bun $BUN_VER)"
+    ok "assets ready (FC v$FC_VERSION, apko, bun $BUN_VER, trunk $TRUNK_VER)"
     RAN[assets]=OK
 }
 
@@ -392,6 +400,17 @@ cmd_toolchains() {
     bake_image jkbuild-function "$TOOLCHAIN_DIR/jkbuild-function.ext4" \
         "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.lock.json"):init:$init_sha:rust:$rust_ver")" \
         env INJECT_BUN=0 INJECT_RUST_WASIP2=1 INJECT_JS=1 CONFIG="$REPO_ROOT/images/apko/build-function.apko.yaml" OUT="$TOOLCHAIN_DIR/jkbuild-function.ext4" "$REPO_ROOT/tools/build-image.sh"
+    # trunk.ext4 (apko + jkbuild-init + a pinned official Rust toolchain WITH the
+    # wasm32-unknown-unknown std injected at /opt/rust + the trunk CLI). Built sites
+    # ([sites.<name>] build="trunk") → static dist/ served as site content. Ensure the
+    # wasm target is materialized before baking; stamp on the lockfile + init + rust
+    # version + the trunk asset so any input change rebakes. (Local bake = no mirror CA,
+    # like the other toolchains; the prod-destined image is a separate BUILD_CA_CERT bake.)
+    if [ "$CHECK" != 1 ]; then rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true; fi
+    local trunk_sha; trunk_sha="$(sha_file "$ASSET_DIR/trunk")"
+    bake_image trunk "$TOOLCHAIN_DIR/trunk.ext4" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-trunk.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-trunk.apko.lock.json"):init:$init_sha:rust:$rust_ver:trunk:$trunk_sha")" \
+        env INJECT_BUN=0 INJECT_TRUNK=1 CONFIG="$REPO_ROOT/images/apko/build-trunk.apko.yaml" OUT="$TOOLCHAIN_DIR/trunk.ext4" "$REPO_ROOT/tools/build-image.sh"
     RAN[toolchains]=OK
 }
 
@@ -465,6 +484,7 @@ cmd_doctor() {
     chk_art "toolchain dockerfile.ext4" "test -f '$TOOLCHAIN_DIR/dockerfile.ext4'"
     chk_art "toolchain node.ext4" "test -f '$TOOLCHAIN_DIR/node.ext4'"
     chk_art "toolchain rust.ext4" "test -f '$TOOLCHAIN_DIR/rust.ext4'"
+    chk_art "toolchain trunk.ext4" "test -f '$TOOLCHAIN_DIR/trunk.ext4'"
     chk_art "baselayers platform.json" "test -f '$BASELAYERS_DIR/platform.json'"
     chk_art "baselayers node+rust runtimes" "python3 -c 'import json,sys; d=json.load(open(\"$BASELAYERS_DIR/platform.json\")); sys.exit(0 if {\"node\",\"rust\"} <= set(d.get(\"runtimes\",{})) else 1)'"
     if baselayers_orphans_present; then err "✗ baselayers has orphan blobs (run \`tools/dev baselayers\`)"; fails=$((fails+1)); else ok "baselayers no orphans"; fi

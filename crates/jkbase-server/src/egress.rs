@@ -65,6 +65,11 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     "github.com",
     "codeload.github.com",
     "objects.githubusercontent.com",
+    // GitHub's current release-asset CDN (release downloads redirect here from
+    // github.com/<o>/<r>/releases/download/...). Needed by the trunk buildpack, whose
+    // `trunk build` downloads the version-matched `wasm-bindgen` release binary; the
+    // older `objects.githubusercontent.com` host no longer serves these.
+    "release-assets.githubusercontent.com",
     "raw.githubusercontent.com",
     "gitlab.com",
 ];
