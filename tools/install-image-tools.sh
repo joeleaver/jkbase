@@ -84,6 +84,26 @@ if [ "${TRUNK:-0}" = "1" ]; then
     echo "[install] trunk staged: $("$ASSET_DIR/trunk" --version 2>/dev/null || echo '(version check needs glibc match)')"
 fi
 
+# Baked rhypedb-server (the managed-DB engine), for the `rhypedb` runtime base layer.
+# Gated behind RHYPEDB=1 so the default install doesn't require the rhypedb checkout.
+# Unlike bun/trunk (release tarballs), rhypedb-server is built locally from the sibling
+# rhypedb repo (RHYPEDB_SRC) as a MUSL-STATIC binary with --no-default-features — that
+# drops the entire ONNX/fastembed stack, yielding a lean single binary that runs on the
+# platform base alone. The bake (build-base-layer.sh) stages it into the rhypedb layer.
+# See docs/managed-rhypedb-design.md.
+if [ "${RHYPEDB:-0}" = "1" ]; then
+    RHYPEDB_SRC="${RHYPEDB_SRC:-$REPO_ROOT/../rhypedb}"
+    [ -d "$RHYPEDB_SRC" ] || { echo "[install] rhypedb source not found at $RHYPEDB_SRC (set RHYPEDB_SRC)" >&2; exit 1; }
+    command -v cargo >/dev/null || { echo "[install] cargo required to build rhypedb-server" >&2; exit 1; }
+    echo "[install] building rhypedb-server (musl-static, --no-default-features) from $RHYPEDB_SRC"
+    rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+    ( cd "$RHYPEDB_SRC" && cargo build -p rhypedb-server --release --no-default-features \
+        --target x86_64-unknown-linux-musl )
+    install -m755 "$RHYPEDB_SRC/target/x86_64-unknown-linux-musl/release/rhypedb-server" \
+        "$ASSET_DIR/rhypedb-server"
+    echo "[install] rhypedb-server staged: $("$ASSET_DIR/rhypedb-server" --version 2>/dev/null | head -1 || echo '(staged)')"
+fi
+
 # Host layer tooling for tools/build-base-layer.sh (WS4): mkfs.erofs packs the
 # shared base/runtime erofs layers; fsverity is best-effort defense-in-depth on
 # the host blobs. These are OS packages, not Chainguard tarballs.

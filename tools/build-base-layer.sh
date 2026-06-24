@@ -35,6 +35,10 @@ GO_CONFIG="${GO_CONFIG:-$REPO_ROOT/images/apko/run-go.apko.yaml}"
 STORE="${STORE:-$REPO_ROOT/.firecracker/baselayers}"
 BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
 BUN_VER="${BUN_VER:-1.3.14}"
+# The managed-DB (RhypeDB) server binary: a musl-static, ONNX-off build of
+# rhypedb-server staged by tools/install-image-tools.sh (RHYPEDB=1). See
+# docs/managed-rhypedb-design.md.
+RHYPEDB_BIN="${RHYPEDB_BIN:-$REPO_ROOT/.firecracker/assets/rhypedb-server}"
 WORK="${WORK:-$REPO_ROOT/.firecracker/work/base-layer}"
 export PATH="$HOME/.local/bin:$PATH"
 
@@ -43,6 +47,7 @@ command -v mkfs.erofs >/dev/null || { echo "mkfs.erofs not found — apt-get ins
 command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync (runtime-layer delta)" >&2; exit 1; }
 command -v veritysetup >/dev/null || { echo "veritysetup not found — apt-get install cryptsetup-bin (dm-verity hash tree)" >&2; exit 1; }
 [ -f "$BUN_BIN" ] || { echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2; exit 1; }
+[ -f "$RHYPEDB_BIN" ] || { echo "rhypedb-server binary missing at $RHYPEDB_BIN — run RHYPEDB=1 tools/install-image-tools.sh" >&2; exit 1; }
 
 # The delta + overlay scheme's load-bearing assumption: base and every per-language
 # runtime closure must link the SAME glibc/ld-linux/libgcc. Base's libs are what is
@@ -243,6 +248,19 @@ build_runtime_layer "$GO_CONFIG" "go"
 GO_DIGEST="$PACK_DIGEST"; GO_FILE="$PACK_FILE"; GO_SIZE="$PACK_SIZE"; GO_VERITY="$PACK_VERITY"
 GO_RH="$PACK_ROOT_HASH"; GO_SALT="$PACK_SALT"; GO_DS="$PACK_DATA_SIZE"
 
+# --- rhypedb runtime layer (the managed-DB server binary) ---
+# A single musl-static rhypedb-server staged at /opt/rhypedb/bin/rhypedb-server, shared
+# across every project that declares [database]. Like the rust/go layers it carries no
+# libc closure (statically linked → runs on base alone); the layer exists to satisfy
+# compute_layer_plan's per-language runtime lookup (key "rhypedb"). The DB overlay is
+# rhypedb:base with no per-tenant app layer. See docs/managed-rhypedb-design.md.
+echo "[rhypedb] staging /opt/rhypedb/bin/rhypedb-server"
+RHYPEDB_STAGE="$WORK/rhypedb-stage"
+install -Dm0755 "$RHYPEDB_BIN" "$RHYPEDB_STAGE/opt/rhypedb/bin/rhypedb-server"
+pack_layer "$RHYPEDB_STAGE" "rhypedb"
+RHYPEDB_DIGEST="$PACK_DIGEST"; RHYPEDB_FILE="$PACK_FILE"; RHYPEDB_SIZE="$PACK_SIZE"; RHYPEDB_VERITY="$PACK_VERITY"
+RHYPEDB_RH="$PACK_ROOT_HASH"; RHYPEDB_SALT="$PACK_SALT"; RHYPEDB_DS="$PACK_DATA_SIZE"
+
 # --- platform manifest (host reads this to inject base + runtime ahead of the app) ---
 # `runtimes` is keyed by the server manifest's stamped `runtime` (= the resolved
 # build language: bun/node/rust); compute_layer_plan looks the language up here.
@@ -279,6 +297,11 @@ cat > "$STORE/platform.json" <<JSON
       "name": "go", "role": "runtime", "media": "erofs",
       "digest": "$GO_DIGEST", "file": "$GO_FILE", "size": $GO_SIZE, "fs_verity": $GO_VERITY,
       "verity": { "root_hash": "$GO_RH", "salt": "$GO_SALT", "data_size": $GO_DS }
+    },
+    "rhypedb": {
+      "name": "rhypedb", "role": "runtime", "media": "erofs",
+      "digest": "$RHYPEDB_DIGEST", "file": "$RHYPEDB_FILE", "size": $RHYPEDB_SIZE, "fs_verity": $RHYPEDB_VERITY,
+      "verity": { "root_hash": "$RHYPEDB_RH", "salt": "$RHYPEDB_SALT", "data_size": $RHYPEDB_DS }
     }
   }
 }
@@ -292,4 +315,5 @@ echo "  node         $NODE_DIGEST ($NODE_SIZE bytes)"
 echo "  rust         $RUST_DIGEST ($RUST_SIZE bytes)"
 echo "  python       $PYTHON_DIGEST ($PYTHON_SIZE bytes)"
 echo "  go           $GO_DIGEST ($GO_SIZE bytes)"
+echo "  rhypedb      $RHYPEDB_DIGEST ($RHYPEDB_SIZE bytes)"
 echo "  manifest     $STORE/platform.json"
