@@ -154,6 +154,13 @@ pub fn detect_decision(app_dir: &Path, language_hint: Option<&str>) -> Decision 
     if matches!(language_hint, Some(h) if h != "rust") {
         return Decision::Fail;
     }
+    // Defer to the Trunk buildpack when the tree is a Rust/WASM frontend: a trunk
+    // project also carries a Cargo.toml, but Trunk.toml means it builds to a static
+    // `dist/`, not a server binary. Stand down so the two never collide (the trunk
+    // buildpack claims it at confidence 95). Mirrors node deferring to bun.
+    if app_dir.join("Trunk.toml").exists() {
+        return Decision::Fail;
+    }
     if !app_dir.join("Cargo.toml").exists() {
         return Decision::Fail;
     }
@@ -483,6 +490,18 @@ mod tests {
 
         write(d.path(), "Cargo.lock", "");
         assert_eq!(detect_decision(d.path(), None).confidence(), 90);
+    }
+
+    #[test]
+    fn detect_defers_to_trunk() {
+        // A Cargo.toml + Trunk.toml is a Rust/WASM frontend — the trunk buildpack's
+        // job. Rust stands down even though it sees the Cargo.toml.
+        let d = tempdir().unwrap();
+        write(d.path(), "Cargo.toml", "[package]\nname=\"x\"\n");
+        write(d.path(), "Trunk.toml", "[build]\n");
+        assert!(!detect_decision(d.path(), None).is_pass());
+        // An explicit rust hint still claims it (operator override).
+        assert_eq!(detect_decision(d.path(), Some("rust")).confidence(), 100);
     }
 
     #[test]
