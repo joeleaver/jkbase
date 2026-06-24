@@ -252,7 +252,7 @@ cmd_assets() {
     local fc_bin="$RELEASE_DIR/firecracker-v${FC_VERSION}-${FC_ARCH}"
     local need_fc=1 need_tools=1
     [ -x "$fc_bin" ] && need_fc=0
-    { command -v apko >/dev/null && [ -f "$ASSET_DIR/bun" ] && [ -f "$ASSET_DIR/trunk" ]; } && need_tools=0
+    { command -v apko >/dev/null && [ -f "$ASSET_DIR/bun" ] && [ -f "$ASSET_DIR/trunk" ] && [ -f "$ASSET_DIR/rhypedb-server" ]; } && need_tools=0
     if [ "$need_fc" = 0 ] && [ "$need_tools" = 0 ] && [ "$FORCE" != 1 ]; then
         verdict "Firecracker v$FC_VERSION + apko + bun present — SKIP"; RAN[assets]=SKIP; return 0
     fi
@@ -264,11 +264,14 @@ cmd_assets() {
     if [ "$need_tools" = 1 ] || [ "$FORCE" = 1 ]; then
         [ -n "$BUN_SHA256" ] || warn "BUN_SHA256 unset — bun download will not be checksum-verified (pin it in tools/dev)"
         # TRUNK=1 also stages the trunk CLI (for the trunk static toolchain).
+        # RHYPEDB=1 builds + stages the rhypedb-server binary (for the rhypedb base
+        # runtime layer) from the sibling rhypedb checkout (RHYPEDB_SRC default
+        # ../rhypedb). The managed-DB offering needs it baked into baselayers.
         run_or_capture env APKO_VER="$APKO_VER" BUN_VER="$BUN_VER" BUN_SHA256="$BUN_SHA256" \
-            TRUNK=1 TRUNK_VER="$TRUNK_VER" TRUNK_SHA256="$TRUNK_SHA256" \
+            TRUNK=1 TRUNK_VER="$TRUNK_VER" TRUNK_SHA256="$TRUNK_SHA256" RHYPEDB=1 \
             "$REPO_ROOT/tools/install-image-tools.sh" || die "install-image-tools failed"
         # A prior root run may have left bun/trunk root-owned; normalize so non-root bakes work.
-        for a in bun trunk; do
+        for a in bun trunk rhypedb-server; do
             [ -f "$ASSET_DIR/$a" ] && [ ! -O "$ASSET_DIR/$a" ] && { sudo_warmup; sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/$a"; }
         done
     fi
@@ -429,7 +432,8 @@ baselayers_orphans_present() {
 cmd_baselayers() {
     banner "baselayers"
     local bun_sha; bun_sha="$(sha_file "$ASSET_DIR/bun")"
-    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.lock.json"):node:$(sha_file "$REPO_ROOT/images/apko/run-node.apko.yaml"):nodelk:$(sha_file "$REPO_ROOT/images/apko/run-node.apko.lock.json"):rust:$(sha_file "$REPO_ROOT/images/apko/run-rust.apko.yaml"):rustlk:$(sha_file "$REPO_ROOT/images/apko/run-rust.apko.lock.json"):bun:$bun_sha:bunver:$BUN_VER")"
+    local rhypedb_sha; rhypedb_sha="$(sha_file "$ASSET_DIR/rhypedb-server")"
+    local desired; desired="$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/run-base.apko.lock.json"):node:$(sha_file "$REPO_ROOT/images/apko/run-node.apko.yaml"):nodelk:$(sha_file "$REPO_ROOT/images/apko/run-node.apko.lock.json"):rust:$(sha_file "$REPO_ROOT/images/apko/run-rust.apko.yaml"):rustlk:$(sha_file "$REPO_ROOT/images/apko/run-rust.apko.lock.json"):bun:$bun_sha:bunver:$BUN_VER:rhypedb:$rhypedb_sha")"
     if [ -f "$BASELAYERS_DIR/platform.json" ] && fresh baselayers "$desired" && ! baselayers_orphans_present; then
         verdict "baselayers present + stamp matches + no orphans — SKIP"; RAN[baselayers]=SKIP; return 0
     fi
@@ -439,6 +443,7 @@ cmd_baselayers() {
     # 0444 blobs from a prior root bake that `install` (non-root) can't overwrite.
     [ -d "$BASELAYERS_DIR" ] && sudo chown -R "$(id -u):$(id -g)" "$BASELAYERS_DIR"
     [ -f "$ASSET_DIR/bun" ] && sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/bun"
+    [ -f "$ASSET_DIR/rhypedb-server" ] && sudo chown "$(id -u):$(id -g)" "$ASSET_DIR/rhypedb-server"
     run_or_capture env BUN_VER="$BUN_VER" "$REPO_ROOT/tools/build-base-layer.sh" || die "baselayers bake failed"
     # Prune orphan blobs (content-addressing leaves the prior set behind on a rebuild).
     local keep; keep="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["base"]["file"]);[print(r["file"]) for r in d.get("runtimes",{}).values()]' "$BASELAYERS_DIR/platform.json")"
@@ -486,7 +491,7 @@ cmd_doctor() {
     chk_art "toolchain rust.ext4" "test -f '$TOOLCHAIN_DIR/rust.ext4'"
     chk_art "toolchain trunk.ext4" "test -f '$TOOLCHAIN_DIR/trunk.ext4'"
     chk_art "baselayers platform.json" "test -f '$BASELAYERS_DIR/platform.json'"
-    chk_art "baselayers node+rust runtimes" "python3 -c 'import json,sys; d=json.load(open(\"$BASELAYERS_DIR/platform.json\")); sys.exit(0 if {\"node\",\"rust\"} <= set(d.get(\"runtimes\",{})) else 1)'"
+    chk_art "baselayers node+rust+rhypedb runtimes" "python3 -c 'import json,sys; d=json.load(open(\"$BASELAYERS_DIR/platform.json\")); sys.exit(0 if {\"node\",\"rust\",\"rhypedb\"} <= set(d.get(\"runtimes\",{})) else 1)'"
     if baselayers_orphans_present; then err "✗ baselayers has orphan blobs (run \`tools/dev baselayers\`)"; fails=$((fails+1)); else ok "baselayers no orphans"; fi
     # Net (per-boot) — report, don't hard-fail the whole doctor. The 3128 allowlist
     # ACCEPT is the always-present static rule; the public-any (3129) port is granted

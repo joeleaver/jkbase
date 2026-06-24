@@ -107,6 +107,12 @@ fn is_self_contained(s: &ServerLayerInfo) -> bool {
     s.runtime.as_deref() == Some(IMAGE_SELF_RUNTIME)
 }
 
+/// `platform.json` `runtimes` key for the shared RhypeDB server-binary layer. A
+/// project that declares `[database]` (detected by a baked `_database.json`) attaches
+/// this runtime over the platform base — `lowerdir=rhypedb:base`, no per-tenant app
+/// layer — and the agent runs it as a dedicated loopback-only supervised process.
+pub const RHYPEDB_RUNTIME: &str = "rhypedb";
+
 /// Guest device node for the i-th virtio-blk drive (PUT order): 0→vda, 1→vdb, ….
 /// Single-letter only (vda..vdz); the caller bounds the layer count so this never
 /// overflows.
@@ -195,15 +201,22 @@ pub fn compute_layer_plan(
         }
     }
 
-    if servers.is_empty() {
+    // The managed DB (RhypeDB), if declared, is driven by a host-baked `_database.json`
+    // (NOT a `_servers/*.json` entry — the DB is not a tenant server). It attaches the
+    // shared rhypedb runtime layer over the platform base even for a DB-only project
+    // (no tenant servers at all).
+    let has_db = deployment_dir.join("_database.json").exists();
+
+    if servers.is_empty() && !has_db {
         return Ok(LayerPlan::empty(has_data_disk));
     }
 
     // Self-contained "image/self" servers (the dockerfile escape hatch) are a single
     // App layer that IS the whole rootfs — its own libc/init/entrypoint — so they
     // skip the shared base + per-language runtime layers entirely. Layered servers
-    // (bun &c.) stack `app:runtime:base`.
-    let any_layered = servers.iter().any(|(_, s)| !is_self_contained(s));
+    // (bun &c.) stack `app:runtime:base`; the managed DB stacks `rhypedb:base`. Both
+    // need the shared platform base+runtime store.
+    let any_layered = has_db || servers.iter().any(|(_, s)| !is_self_contained(s));
 
     // Only read/require the platform base+runtime store when a layered server needs
     // it — an all-image/self deployment has no platform dependency at all.
@@ -234,6 +247,11 @@ pub fn compute_layer_plan(
             .filter(|(_, s)| !is_self_contained(s))
             .map(|(_, s)| s.runtime.clone().unwrap_or_else(|| "bun".to_string()))
             .collect();
+        // The managed DB attaches the shared rhypedb runtime layer (deduped with any
+        // tenant runtime of the same name, though tenants never use it).
+        if has_db {
+            langs.push(RHYPEDB_RUNTIME.to_string());
+        }
         langs.sort();
         langs.dedup();
         for lang in &langs {
@@ -320,6 +338,15 @@ pub fn compute_layer_plan(
         if let Some(v) = &b.verity {
             runtime_layers.verity.insert(dev(i), v.clone());
         }
+    }
+    // The managed DB's overlay: `lowerdir=rhypedb-runtime:base` (no per-tenant app
+    // layer). Both devices are already in the attach order (base + the rhypedb runtime
+    // pushed into `langs` above), and any verity params on them were recorded by the
+    // loop above keyed by the same device strings.
+    if has_db {
+        let runtime_dev = dev(runtime_idx[RHYPEDB_RUNTIME]);
+        let base_dev = dev(base_dev_idx.expect("managed DB requires a platform base layer"));
+        runtime_layers.database = Some(ServerLayers { layers: vec![runtime_dev, base_dev] });
     }
     if has_data_disk {
         runtime_layers.data_device = Some(device_node(2 + layer_paths.len()));
@@ -1034,5 +1061,117 @@ mod tests {
         let plan = compute_layer_plan(&dir, &dir, true, false).unwrap();
         assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vdc"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn database_only_attaches_rhypedb_over_base() {
+        // A DB-only project (no tenant servers) with a baked _database.json attaches
+        // base + the shared rhypedb runtime; the DB overlay is rhypedb:base (no app
+        // layer), it is NOT in the tenant `servers` map, and the data disk lands after.
+        let root = std::env::temp_dir().join(format!("lp-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+
+        let base_f = format!("sha256-{}.erofs", "a".repeat(64));
+        let rh_f = format!("sha256-{}.erofs", "e".repeat(64));
+        std::fs::write(store.join(&base_f), b"base").unwrap();
+        std::fs::write(store.join(&rh_f), b"rhypedb").unwrap();
+        std::fs::write(
+            store.join("platform.json"),
+            format!(
+                r#"{{"base":{{"digest":"sha256:{a}","file":"{base_f}"}},"runtimes":{{"rhypedb":{{"digest":"sha256:{e}","file":"{rh_f}"}}}}}}"#,
+                a = "a".repeat(64),
+                e = "e".repeat(64),
+            ),
+        )
+        .unwrap();
+        // The host-baked DB marker — presence is the trigger (contents not read here).
+        std::fs::write(
+            deploy.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype"}"#,
+        )
+        .unwrap();
+
+        let plan = compute_layer_plan(&deploy, &store, true, false).unwrap();
+
+        // Attach order: base(vdc), rhypedb-runtime(vdd).
+        assert_eq!(plan.layer_paths.len(), 2);
+        assert!(plan.layer_paths[0].ends_with(&base_f), "vdc = base");
+        assert!(plan.layer_paths[1].ends_with(&rh_f), "vdd = rhypedb runtime");
+
+        // DB overlay = rhypedb:base; the DB is NOT a tenant server.
+        let db = plan.runtime_layers.database.as_ref().expect("database overlay present");
+        assert_eq!(db.layers, vec!["/dev/vdd", "/dev/vdc"]);
+        assert!(plan.runtime_layers.servers.is_empty(), "DB is not a tenant server");
+
+        // Data disk attaches after the 2 layers: vd(c+2) = vde.
+        assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vde"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn database_alongside_a_bun_server() {
+        // DB + a bun server share the base; both the bun and rhypedb runtimes attach.
+        let root = std::env::temp_dir().join(format!("lp-db-srv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+
+        let base_f = format!("sha256-{}.erofs", "a".repeat(64));
+        let bun_f = format!("sha256-{}.erofs", "b".repeat(64));
+        let rh_f = format!("sha256-{}.erofs", "e".repeat(64));
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        std::fs::write(store.join(&base_f), b"base").unwrap();
+        std::fs::write(store.join(&bun_f), b"bun").unwrap();
+        std::fs::write(store.join(&rh_f), b"rhypedb").unwrap();
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+        std::fs::write(
+            store.join("platform.json"),
+            format!(
+                r#"{{"base":{{"digest":"sha256:{a}","file":"{base_f}"}},"runtimes":{{"bun":{{"digest":"sha256:{b}","file":"{bun_f}"}},"rhypedb":{{"digest":"sha256:{e}","file":"{rh_f}"}}}}}}"#,
+                a = "a".repeat(64),
+                b = "b".repeat(64),
+                e = "e".repeat(64),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_servers/api.json"),
+            format!(r#"{{"app_layer":"{app_f}","runtime":"bun","port":3000}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"s.rhype"}"#,
+        )
+        .unwrap();
+
+        let plan = compute_layer_plan(&deploy, &store, false, false).unwrap();
+
+        // Runtimes sorted bun,rhypedb. Order: base(vdc), bun(vdd), rhypedb(vde), app(vdf).
+        assert_eq!(plan.layer_paths.len(), 4);
+        assert!(plan.layer_paths[0].ends_with(&base_f));
+        assert!(plan.layer_paths[1].ends_with(&bun_f));
+        assert!(plan.layer_paths[2].ends_with(&rh_f));
+        assert!(plan.layer_paths[3].ends_with(&app_f));
+
+        // bun server overlay app:bun:base; DB overlay rhypedb:base.
+        assert_eq!(
+            plan.runtime_layers.servers["api"].layers,
+            vec!["/dev/vdf", "/dev/vdd", "/dev/vdc"]
+        );
+        assert_eq!(
+            plan.runtime_layers.database.as_ref().unwrap().layers,
+            vec!["/dev/vde", "/dev/vdc"]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

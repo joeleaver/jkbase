@@ -206,10 +206,10 @@ fn mount_erofs_ro(source: &Path, target: &Path) -> std::io::Result<()> {
 }
 
 /// Mount each distinct erofs layer block device read-only under /tmp/layers, and
-/// return `server name` → its ordered lowerdir mountpoints (app first, base last)
-/// for the supervisor to overlay. A server whose layers don't all mount is omitted
-/// (it won't be started layered).
-fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
+/// return (`server name` → its ordered lowerdir mountpoints, the managed DB's ordered
+/// lowerdir mountpoints if declared). App first, base last. A server (or the DB) whose
+/// layers don't all mount is omitted (it won't be started layered).
+fn mount_layers(rl: &RuntimeLayers) -> (HashMap<String, Vec<PathBuf>>, Option<Vec<PathBuf>>) {
     let base = Path::new("/tmp/layers");
     let _ = std::fs::create_dir_all(base);
 
@@ -243,8 +243,13 @@ fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
     // per-tenant app layer — self-affecting + host-sha256-verified at attach — and any
     // pre-verity image) is mounted erofs directly.
     let mut mounted: HashMap<String, PathBuf> = HashMap::new();
-    for server in rl.servers.values() {
-        for device in &server.layers {
+    // Every distinct device referenced by any tenant server OR the managed DB overlay.
+    let mut layer_lists: Vec<&Vec<String>> = rl.servers.values().map(|s| &s.layers).collect();
+    if let Some(db) = &rl.database {
+        layer_lists.push(&db.layers);
+    }
+    for layers in layer_lists {
+        for device in layers {
             if mounted.contains_key(device) {
                 continue;
             }
@@ -308,7 +313,23 @@ fn mount_layers(rl: &RuntimeLayers) -> HashMap<String, Vec<PathBuf>> {
             eprintln!("server '{name}' has unmounted layers; will not start layered");
         }
     }
-    map
+
+    // Resolve the managed DB overlay (lowerdir=rhypedb:base) to mountpoints, if declared.
+    let database = rl.database.as_ref().and_then(|db| {
+        let mut dirs = Vec::with_capacity(db.layers.len());
+        for device in &db.layers {
+            match mounted.get(device) {
+                Some(mp) => dirs.push(mp.clone()),
+                None => {
+                    eprintln!("managed DB has an unmounted layer ({device}); will not start");
+                    return None;
+                }
+            }
+        }
+        (!dirs.is_empty()).then_some(dirs)
+    });
+
+    (map, database)
 }
 
 fn is_pid1() -> bool {
@@ -395,6 +416,7 @@ async fn main() -> Result<()> {
     let servers_dir = serve_dir.join("_servers");
 
     let mut layer_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut db_lowerdirs: Option<Vec<PathBuf>> = None;
     if is_pid1() {
         mount_content_drive(serve_dir.to_str().unwrap_or("/srv/www"));
         // The metadata image carries _layers.json describing this boot's device
@@ -420,7 +442,9 @@ async fn main() -> Result<()> {
                         RuntimeLayers::SCHEMA
                     );
                 } else {
-                    layer_map = mount_layers(&rl);
+                    let (lm, db) = mount_layers(&rl);
+                    layer_map = lm;
+                    db_lowerdirs = db;
                 }
             }
             None => {
@@ -463,6 +487,31 @@ async fn main() -> Result<()> {
         error!(error = %e, "failed to start server containers");
     }
 
+    // Managed database (RhypeDB): a dedicated, loopback-only supervised server composed
+    // from the rhypedb runtime layer (overlay rhypedb:base) — NOT a tenant `_servers`
+    // entry and never routed, reachable only at 127.0.0.1:4200 by the project's own app.
+    // Schema (+ optional rules) are host-baked into `_database/` in the metadata image;
+    // the agent seeds them into the DB's meta volume before the server starts.
+    if let Some(lowerdirs) = db_lowerdirs {
+        let schema_path = serve_dir.join("_database/schema.rhype");
+        match std::fs::read(&schema_path) {
+            Ok(schema) => {
+                let rules = std::fs::read(serve_dir.join("_database/rules.rhype")).ok();
+                if let Err(e) = containers
+                    .start_database(&schema, rules.as_deref(), lowerdirs)
+                    .await
+                {
+                    error!(error = %e, "failed to start managed database");
+                }
+            }
+            Err(e) => error!(
+                error = %e,
+                path = %schema_path.display(),
+                "managed DB declared but schema missing from metadata image"
+            ),
+        }
+    }
+
     let route_config = load_route_config(&serve_dir);
     let sites = load_sites_config(&serve_dir);
 
@@ -478,7 +527,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if containers.has_servers() {
+    if containers.is_supervising().await {
         let containers_for_health = containers.clone();
         tokio::spawn(async move {
             loop {

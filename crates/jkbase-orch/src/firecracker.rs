@@ -124,6 +124,16 @@ impl FirecrackerClient {
             .context("failed to set machine config")
     }
 
+    /// PUT a **custom CPU template** (`/cpu-config`) — a pre-boot CPUID/MSR modifier set
+    /// that masks features from the guest. Unlike a static template it has no host-model
+    /// permission gate, so it applies on any CPU; a modifier that clears a bit already
+    /// absent on the host is a harmless no-op. Must be set before `InstanceStart`.
+    pub async fn set_cpu_config(&self, template: &serde_json::Value) -> Result<()> {
+        self.put("/cpu-config", template)
+            .await
+            .context("failed to set custom CPU template")
+    }
+
     pub async fn set_boot_source(&self, boot: &BootSource) -> Result<()> {
         self.put("/boot-source", boot)
             .await

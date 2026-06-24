@@ -2240,6 +2240,7 @@ async fn handle_deploy(
     // mkfs / reap+300ms / losetup), and the VM boot must NOT head-of-line block every
     // other project on the single platform lock. Re-acquire only to commit.
     let has_disk = check_project_has_volumes(&plat.data_dir, project_id)
+        || check_project_has_database(&plat.data_dir, project_id)
         || plat.data_disk.exists(project_id).await.unwrap_or(false);
     let data_dir = plat.data_dir.clone();
     let dd = plat.data_disk.clone();
@@ -2657,7 +2658,9 @@ async fn wake_project_inner(
     // fence (below) can run AFTER dropping the platform lock. data_disk_path is set
     // by the fence; start with None.
     let has_volumes = check_project_has_volumes(&plat.data_dir, project_id);
-    let has_disk = has_volumes || plat.data_disk.exists(project_id).await.unwrap_or(false);
+    let has_disk = has_volumes
+        || check_project_has_database(&plat.data_dir, project_id)
+        || plat.data_disk.exists(project_id).await.unwrap_or(false);
     let dd = plat.data_disk.clone();
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
@@ -3349,6 +3352,20 @@ fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
                 }
     }
     false
+}
+
+/// True when the project's live deployment declares a managed database (a host-baked
+/// `_database.json`). A managed DB needs a persistent data disk to survive restart and
+/// hibernate/wake even if no server declares a volume, so this forces `has_disk` on —
+/// without it the DB would write to the ephemeral overlay tmpfs and lose data. Mirrors
+/// [`check_project_has_volumes`] (reads the live deployment, set before this boot).
+fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
+    data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_database.json")
+        .exists()
 }
 
 /// Application-level liveness probe. Returns true only if the agent answers HTTP

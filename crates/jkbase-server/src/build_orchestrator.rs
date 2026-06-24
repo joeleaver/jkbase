@@ -911,6 +911,19 @@ async fn run_inner(
         assemble_sidecars(&config, &staged).context("assemble config sidecars")?;
         std::fs::create_dir_all(staged.join("_functions"))?;
         std::fs::create_dir_all(staged.join("_servers"))?;
+        // Managed DB: stage the schema (+ optional rules) from the source tree into a
+        // host-namespaced `_database/` dir with FIXED dest names (the tenant can't pick
+        // them). Paths were traversal-guarded in validate_manifest; a missing file fails
+        // the deploy here (the source-tree existence check). Both ride into the metadata
+        // image and drive the agent's rhypedb supervisor.
+        if let Some(db) = config.database.as_ref() {
+            let dbdir = staged.join("_database");
+            std::fs::create_dir_all(&dbdir)?;
+            stage_db_file(&src_dir, &db.schema, &dbdir.join("schema.rhype"))?;
+            if let Some(rules) = db.rules.as_deref() {
+                stage_db_file(&src_dir, rules, &dbdir.join("rules.rhype"))?;
+            }
+        }
 
         // 5. Enumerate per-target build work.
         let specs = enumerate_targets(&config);
@@ -1720,6 +1733,32 @@ async fn toolchain_builder_digest(toolchain: &Path) -> Option<String> {
 /// hostile manifest can't launch an unbounded number of metered build VMs.
 const MAX_TARGETS: usize = 64;
 
+/// Copy a tenant-named `[database]` file (`schema`/`rules`) from the uploaded source tree
+/// into the host-controlled `_database/` staging dir — **symlink-safe**. The source tar is
+/// tenant-controlled and `unpack_tar_gz` preserves symlinks, while `std::fs::copy` follows
+/// them, so a `schema.rhype` (or a symlinked parent component) pointing at a host path would
+/// otherwise exfiltrate an arbitrary HOST file (e.g. /etc/passwd, another tenant's tree)
+/// into the guest-readable metadata image. `path_ok` already rejected `..`/absolute STRINGS;
+/// this closes the symlink hole by canonicalizing the resolved source and requiring it to
+/// stay inside the project tree (and be a regular file). Mirrors the symlink-skipping
+/// discipline `assemble_sites`/`copy_filtered_inner` already use for committed site content.
+fn stage_db_file(src_dir: &Path, rel: &str, dest: &Path) -> Result<()> {
+    let base = src_dir
+        .canonicalize()
+        .context("canonicalize project source dir")?;
+    let src = base
+        .join(rel)
+        .canonicalize()
+        .with_context(|| format!("resolve [database] file {rel:?}"))?;
+    ensure!(
+        src.starts_with(&base),
+        "[database] file {rel:?} resolves outside the project tree (symlink?) — refusing"
+    );
+    ensure!(src.is_file(), "[database] file {rel:?} is not a regular file");
+    std::fs::copy(&src, dest).with_context(|| format!("stage DB file {rel:?}"))?;
+    Ok(())
+}
+
 fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     let target_count = config.functions.len() + config.servers.len();
     if target_count > MAX_TARGETS {
@@ -1821,6 +1860,48 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     {
         bail!("hosting public {public:?} must be a relative path inside the project (no '..' or absolute)");
     }
+    // Managed DB: the engine resolves (reject unknown) + a non-empty schema, and the
+    // schema/rules paths are traversal-guarded — run_inner copies them host-side from
+    // the source tree, so an unguarded `..`/absolute would read outside the project.
+    if let Some(db) = &config.database {
+        db.validate().context("[database] section")?;
+        if !path_ok(&db.schema) {
+            bail!("[database] schema {:?} must be a relative path inside the project (no '..' or absolute)", db.schema);
+        }
+        if let Some(rules) = &db.rules
+            && !path_ok(rules)
+        {
+            bail!("[database] rules {:?} must be a relative path inside the project (no '..' or absolute)", rules);
+        }
+    }
+
+    // The managed DB is supervised in-VM under the reserved server name `rhypedb` and is
+    // loopback-only / NEVER routed. Fence that name from tenant input on both axes,
+    // fail-closed at deploy: (1) a tenant server/function/site named `rhypedb` would
+    // collide with the DB in the agent's supervised set; (2) a tenant ROUTE targeting
+    // `rhypedb` would make the agent proxy EXTERNAL traffic to 127.0.0.1:4200 — including
+    // the DB's unauthenticated admin plane — defeating the never-routed invariant (the
+    // agent resolves a route to ANY supervised server of that name).
+    let reserved = crate::layer_plan::RHYPEDB_RUNTIME;
+    for (kind, name) in config
+        .functions
+        .keys()
+        .map(|n| ("function", n))
+        .chain(config.servers.keys().map(|n| ("server", n)))
+        .chain(config.sites.keys().map(|n| ("site", n)))
+    {
+        if name == reserved {
+            bail!("{kind} name {name:?} is reserved for the managed database");
+        }
+    }
+    for (pattern, target) in &config.routes {
+        if target.name == reserved {
+            bail!(
+                "route {pattern:?} targets reserved name {reserved:?}: the managed database \
+                 is loopback-only and cannot be routed"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1905,6 +1986,12 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     }
     if let Some(j) = config.schedules_json() {
         std::fs::write(staged.join("_schedules.json"), j)?;
+    }
+    // Managed DB marker (engine/schema/rules; NEVER the admin token — that rides the
+    // reserved channel, injected host-side at build_metadata_image). Its presence drives
+    // both compute_layer_plan (attach the rhypedb runtime) and the agent's DB supervisor.
+    if let Some(j) = config.database_json() {
+        std::fs::write(staged.join("_database.json"), j)?;
     }
 
     // Stamp each function's RESOLVED public-egress policy into its `_functions/{name}.json`
@@ -2541,6 +2628,67 @@ mod tests {
             toml::from_str("[hosting]\npublic = \"../..\"\n").unwrap();
         assert!(validate_manifest(&host).is_err());
     }
+
+    #[test]
+    fn validate_manifest_reserves_managed_db_name_and_route() {
+        // A tenant ROUTE targeting the managed DB's reserved name would make the agent
+        // proxy EXTERNAL traffic to the loopback-only DB (incl. its unauthenticated admin
+        // plane) — reject at deploy.
+        let routed: ProjectConfig = toml::from_str(
+            "[database]\nschema = \"s.rhype\"\n[routes.\"/db\"]\nservice = \"server\"\nname = \"rhypedb\"\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&routed).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "got: {err}");
+
+        // The reserved name is also fenced from server/site/function names (a collision
+        // with the DB in the agent's supervised set).
+        for sec in [
+            "[servers.rhypedb]\nsource = \"./s\"\nport = 80\n",
+            "[sites.rhypedb]\npublic = \"./s\"\n",
+            "[functions.rhypedb]\nsource = \"./f\"\n",
+        ] {
+            let c: ProjectConfig = toml::from_str(sec).unwrap();
+            assert!(validate_manifest(&c).is_err(), "must reserve `rhypedb` in: {sec}");
+        }
+
+        // A normal route + normal names still pass.
+        let ok: ProjectConfig = toml::from_str(
+            "[servers.api]\nsource = \"./a\"\nport = 80\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n",
+        )
+        .unwrap();
+        assert!(validate_manifest(&ok).is_ok());
+    }
+
+    #[test]
+    fn stage_db_file_refuses_symlink_escape() {
+        // The uploaded source tar is tenant-controlled and preserves symlinks; a symlinked
+        // schema/rules pointing at a host path must NOT be copied into the staged artifact
+        // (which is baked into the guest-readable metadata image).
+        let tmp = std::env::temp_dir().join(format!("jkb-stagedb-{}", std::process::id()));
+        let src = tmp.join("src");
+        let out = tmp.join("out");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        // A host secret OUTSIDE the project tree.
+        let secret = tmp.join("host-secret");
+        std::fs::write(&secret, b"TOPSECRET").unwrap();
+
+        // schema.rhype is a symlink escaping the project tree → refused, nothing staged.
+        std::os::unix::fs::symlink(&secret, src.join("schema.rhype")).unwrap();
+        let dest = out.join("schema.rhype");
+        assert!(stage_db_file(&src, "schema.rhype", &dest).is_err());
+        assert!(!dest.exists(), "host secret must not be staged");
+
+        // A regular in-tree file → copied fine.
+        std::fs::write(src.join("ok.rhype"), b"type User { name: String }").unwrap();
+        let dest_ok = out.join("ok.rhype");
+        stage_db_file(&src, "ok.rhype", &dest_ok).unwrap();
+        assert_eq!(std::fs::read(&dest_ok).unwrap(), b"type User { name: String }");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 /// On-box validation of the *real* `run_project_build` fan-out (2 functions +
@@ -2927,6 +3075,9 @@ esac
     enum Workload {
         /// No deps, no build script — the offline rung (no bridge/proxy/seal).
         OfflineNoDep,
+        /// Like `OfflineNoDep`, but the app talks to the co-located managed DB over
+        /// loopback at runtime (no build network — the query is a runtime `fetch`).
+        OfflineDatabase,
         /// Workspace monorepo with transitive deps + a dev dep to prune (fetch-then-seal).
         NetworkedMonorepo,
         /// A Solid/Vite app whose `bun run build` (`vite build`) only resolves
@@ -2938,7 +3089,7 @@ esac
     }
     impl Workload {
         fn networked(self) -> bool {
-            !matches!(self, Workload::OfflineNoDep)
+            matches!(self, Workload::NetworkedMonorepo | Workload::NetworkedSolidVite)
         }
     }
 
@@ -2996,6 +3147,48 @@ name = "api"
                 write(
                     src.join("server/server.ts"),
                     "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+            }
+            // The managed-DB rung: a no-dep Bun server that talks to the co-located
+            // RhypeDB over loopback (127.0.0.1:4200) at RUNTIME (the query is a `fetch`,
+            // so no build network is needed). On each request it reads all `User` rows;
+            // when none exist it seeds one ("alpha") and re-reads, echoing the round-trip
+            // in the body. A 200 proves the DB booted in-VM, is reachable on loopback, and
+            // create+read work. Until the DB has opened + bound (cold open) the `fetch`
+            // throws and the handler returns 503 (caught) so the poll keeps retrying.
+            // Seeding only-when-empty makes it idempotent against poll retries AND lets a
+            // post-reboot request read "alpha" back WITHOUT re-seeding — proving persistence.
+            Workload::OfflineDatabase => {
+                write(
+                    src.join("server/server.ts"),
+                    r#"const port = Number(process.env.PORT) || 3000;
+const DB = "http://127.0.0.1:4200/query";
+async function q(query) {
+  const r = await fetch(DB, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query }) });
+  if (!r.ok) throw new Error("db status " + r.status);
+  return await r.json();
+}
+Bun.serve({ port, async fetch() {
+  try {
+    let res = await q("User");
+    let objs = res.objects || [];
+    if (objs.length === 0) {
+      await q('User.create({ name: "alpha" })');
+      res = await q("User");
+      objs = res.objects || [];
+    }
+    const names = objs.map((o) => o.fields.name).sort();
+    return new Response("users=" + names.join(",") + " count=" + objs.length + "\n");
+  } catch (e) {
+    return new Response("db-not-ready: " + e + "\n", { status: 503 });
+  }
+} });
+console.log("listening on " + port);
+"#,
                 );
                 write(
                     src.join("server/package.json"),
@@ -4437,6 +4630,201 @@ name = "api"
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
         println!("PASS: build -> layered collection -> metadata image -> real agent runtime -> HTTP 200 ({body:?})");
+    }
+
+    /// Managed-DB acceptance (P0.5) — the full managed-RhypeDB SERVE path end to end. A
+    /// real Bun server is built through `run_project_build`; the host then stages the
+    /// managed-DB sidecars (`_database.json` + a host-baked `_database/schema.rhype`)
+    /// exactly as the deploy path (`run_inner` + `assemble_sidecars`) does, resolves the
+    /// layer plan WITH a forced data disk, and bakes the metadata image. A **real
+    /// `jkbase-agent` runtime VM** boots: the agent composes the `rhypedb:base` overlay,
+    /// seeds the schema, starts `rhypedb-server` bound to 127.0.0.1:4200, and the app
+    /// `fetch`es it (create + read) → HTTP 200 carrying the round-trip row. The DB then has
+    /// to survive both halves of scale-to-zero: (1) **hibernate→wake** — Pause + full-mem
+    /// snapshot + SIGKILL, then `restore_from_snapshot` — the restored guest must still serve
+    /// the row (the real on-demand-wake path; depends on the snapshot-safe CPU template in
+    /// jkbase-orch/src/vm.rs, without which a modern-host guest #GPs on XSAVE restore and
+    /// panics ~1s into resume); and (2) a **hard-kill + cold reboot over the SAME data disk**
+    /// — a fresh VM with no memory snapshot must replay the WAL and serve the row WITHOUT
+    /// re-seeding, proving on-disk durability + crash recovery independent of the VMM
+    /// snapshot path.
+    ///
+    /// JKB_ROOTFS is REQUIRED: the `rhypedb` + `base` shared layers carry dm-verity trees,
+    /// so the in-guest agent must `veritysetup` them — only the prebuilt apko rootfs (agent
+    /// as /sbin/init + cryptsetup) can; the hand-rolled minimal rootfs would (correctly)
+    /// fail those layers closed.
+    ///
+    ///   cargo build -p jkbase-agent --release --target x86_64-unknown-linux-musl
+    ///   OUT=.firecracker/base-rootfs-verity.ext4 \
+    ///       AGENT_BIN=target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       tools/build-runtime-rootfs.sh
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/.firecracker JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_BASELAYERS=/abs/.firecracker/baselayers \
+    ///       JKB_AGENT=/abs/target/x86_64-unknown-linux-musl/release/jkbase-agent \
+    ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity.ext4 \
+    ///       <test-bin> --ignored --nocapture managed_db_loopback_roundtrip_survives_hibernate_and_reboot
+    #[tokio::test]
+    #[ignore = "managed DB pipeline: needs KVM + root + bun.ext4 + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn managed_db_loopback_roundtrip_survives_hibernate_and_reboot() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Some(fx) = bun_pipeline_build("bundb", 1, Workload::OfflineDatabase).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else { return };
+
+        // The verity-capable rootfs (agent as /sbin/init + veritysetup) — without it the
+        // dm-verity'd rhypedb/base layers fail closed and the DB never starts.
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs (tools/build-runtime-rootfs.sh)");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Stage the managed-DB sidecars into the built deployment, mirroring the deploy
+        // path: `_database.json` (drives compute_layer_plan + the agent supervisor; the
+        // admin token is NEVER in it) and the host-baked schema seeded into the DB meta
+        // volume at boot. `run_project_build` is the BUILD half and ignores `[database]`;
+        // this test exercises the SERVE half the deploy path hands the agent.
+        std::fs::write(
+            fx.staged.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":null}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.staged.join("_database")).unwrap();
+        std::fs::write(
+            fx.staged.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+
+        // Host glue under test: resolve the layer plan WITH a forced data disk (a managed
+        // DB MUST have persistent storage — the agent fails closed without /mnt/data) and
+        // bake the metadata image (carrying `_database.json` + `_database/` + the device
+        // map incl. `data_device`).
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, true, true)
+            .expect("compute layer plan with a managed DB + data disk");
+        assert!(
+            plan.runtime_layers.database.is_some(),
+            "_layers.json must map the managed DB overlay (rhypedb:base)"
+        );
+        assert!(
+            plan.runtime_layers.data_device.is_some(),
+            "a managed DB forces a data-disk device"
+        );
+
+        let meta_img = fx.data.join("dbpipe-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            &meta_img,
+        )
+        .expect("build the metadata image");
+
+        // A formatted ext4 data disk attached LAST (after the layers): the agent mounts it
+        // at /mnt/data and the DB persists to /mnt/data/volumes/rhypedb-data.
+        let data_disk = fx.data.join("dbpipe-data.ext4");
+        let _ = std::fs::remove_file(&data_disk);
+        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()]).await.unwrap();
+        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()]).await.unwrap();
+
+        // Point-to-point tap (clear of jkbuild0's 172.31.x and the other pipeline tests).
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("dbpipe", "172.27.0.1", "172.27.0.2", "AA:FC:00:00:27:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: Some(data_disk.clone()),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = fx.data.join("dbpipe-run");
+
+        // --- Cold boot: the DB opens its data dir, binds loopback; the app round-trips it.
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("runtime VM with a managed DB should start");
+        // First request seeds "alpha" + reads it back; 503 (caught) until the DB has opened
+        // + bound (cold open), so poll generously.
+        let cold = poll_http_200(guest_ip, 80, Duration::from_secs(75)).await;
+        eprintln!("[db-e2e] cold-boot body = {cold:?}");
+
+        // --- Hibernate (Pause + full-mem snapshot + SIGKILL) then restore: jkbase's actual
+        //     scale-to-zero path. The restored guest resumes from the memory snapshot and
+        //     must still serve the row. (Depends on the snapshot-safe CPU template in
+        //     jkbase-orch/src/vm.rs — without it, a modern-host guest #GPs in
+        //     restore_fpregs_from_fpstate and panics ~1s into resume.)
+        let wake = if cold.as_deref() == Some("users=alpha count=1") {
+            let snap_dir = fx.data.join("dbpipe-snap");
+            let (snap, mem) = vm.hibernate(&snap_dir).await.expect("hibernate the managed-DB VM");
+            let mut woke =
+                VmInstance::restore_from_snapshot(tag, &config, &runtime_dir, &snap, &mem)
+                    .await
+                    .expect("restore the managed-DB VM from snapshot");
+            let body = poll_http_200(guest_ip, 80, Duration::from_secs(45)).await;
+            eprintln!("[db-e2e] hibernate-wake body = {body:?}");
+            let _ = woke.stop().await; // hard-kill the restored VM for the cold reboot below
+            body
+        } else {
+            let _ = vm.stop().await;
+            None
+        };
+
+        // --- Cold reboot over the SAME data disk: a FRESH VM (no memory snapshot) must
+        //     replay the WAL and serve the row WITHOUT re-seeding. Proves on-disk durability
+        //     + crash recovery, independent of the VMM snapshot path.
+        let restart = if wake.as_deref() == Some("users=alpha count=1") {
+            let runtime_dir2 = fx.data.join("dbpipe-run2");
+            let mut vm2 = VmInstance::start(tag, &config, &runtime_dir2)
+                .await
+                .expect("fresh runtime VM should reboot over the persistent data disk");
+            let body = poll_http_200(guest_ip, 80, Duration::from_secs(60)).await;
+            eprintln!("[db-e2e] cold-reboot body = {body:?}");
+            let _ = vm2.stop().await;
+            body
+        } else {
+            None
+        };
+
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+
+        assert_eq!(
+            cold.as_deref(),
+            Some("users=alpha count=1"),
+            "cold boot: the app must create + read back a row over loopback (DB reachable at 127.0.0.1:4200)"
+        );
+        assert_eq!(
+            wake.as_deref(),
+            Some("users=alpha count=1"),
+            "after hibernate→wake (scale-to-zero) the restored DB must still serve the row"
+        );
+        assert_eq!(
+            restart.as_deref(),
+            Some("users=alpha count=1"),
+            "after a hard-kill + cold reboot the row must still be served (on-disk persistence + DB WAL recovery)"
+        );
+        println!(
+            "PASS: managed DB boots in-VM -> loopback round-trip -> HTTP 200 -> survives hibernate→wake AND hard-kill + cold reboot ({cold:?})"
+        );
     }
 
     /// Networked — the real-dependency proof. A Bun server importing `ms` is built

@@ -40,6 +40,14 @@ pub struct RuntimeLayers {
     /// pre-verity deployment. Keyed by the same device strings used in `servers`.
     #[serde(default)]
     pub verity: BTreeMap<String, VerityParams>,
+    /// The managed-database (RhypeDB) overlay stack, when the project declares
+    /// `[database]`. The DB is NOT a tenant server — it has no per-tenant app layer
+    /// and never appears in `servers`/`_routes.json` (reachable only over loopback by
+    /// the project's own app). Its overlay is `lowerdir=rhypedb-runtime:base` (the
+    /// shared rhypedb-server binary layer over the platform base); the agent runs it
+    /// as a dedicated supervised process. `None` ⇒ no managed DB this deploy.
+    #[serde(default)]
+    pub database: Option<ServerLayers>,
 }
 
 /// One server's overlay stack: erofs layer block devices in `lowerdir` order
@@ -85,6 +93,7 @@ impl RuntimeLayers {
             data_device: None,
             servers: BTreeMap::new(),
             verity: BTreeMap::new(),
+            database: None,
         }
     }
 }
@@ -114,6 +123,19 @@ mod tests {
         assert_eq!(back.schema, RuntimeLayers::SCHEMA);
         assert_eq!(back.data_device.as_deref(), Some("/dev/vdf"));
         assert_eq!(back.servers["api"].layers, vec!["/dev/vde", "/dev/vdd", "/dev/vdc"]);
+    }
+
+    #[test]
+    fn database_overlay_round_trips_and_defaults_none() {
+        // Absent `database` ⇒ None (a project with no managed DB).
+        let rl: RuntimeLayers = serde_json::from_str(r#"{"schema":2,"servers":{}}"#).unwrap();
+        assert!(rl.database.is_none());
+        // Present ⇒ round-trips the rhypedb:base overlay device list.
+        let mut rl = RuntimeLayers::new();
+        rl.database = Some(ServerLayers { layers: vec!["/dev/vdd".into(), "/dev/vdc".into()] });
+        let json = serde_json::to_string(&rl).unwrap();
+        let back: RuntimeLayers = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.database.unwrap().layers, vec!["/dev/vdd", "/dev/vdc"]);
     }
 
     #[test]
