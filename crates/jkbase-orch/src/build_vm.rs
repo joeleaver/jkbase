@@ -146,9 +146,15 @@ pub struct BuildVmConfig {
     /// kernel cmdline (`jkbase.builder=`). `Some("dockerfile")` forces the
     /// Dockerfile escape-hatch buildpack; `None` → normal language detection.
     pub builder_hint: Option<String>,
-    /// Dockerfile path relative to `/src`, passed via `jkbase.dockerfile=` when
-    /// `builder = "dockerfile"`. `None` → the buildpack defaults to `Dockerfile`.
+    /// Dockerfile path relative to the build subdir (the app_dir), passed via
+    /// `jkbase.dockerfile=` when `builder = "dockerfile"`. `None` → the buildpack
+    /// defaults to `Dockerfile`.
     pub dockerfile: Option<String>,
+    /// Build SUBDIR within the mounted context (`/src`) where detect/build run, passed
+    /// via `jkbase.build_subdir=`. `None` or `"."` → the build runs at the context root
+    /// (today's behaviour). A non-`.` value is set when a monorepo `context` is mounted
+    /// wider than the target's `source`, so `../sibling` path-deps resolve inside `/src`.
+    pub build_subdir: Option<String>,
     /// Max wall-time the FETCH phase may hold the network before the host
     /// force-seals — even if the guest never signals fetch-complete (so a hostile
     /// build gets the network for at most this long).
@@ -419,6 +425,15 @@ impl BuildVm {
             // Path token (may contain '/' and '.'); validated to stay a single,
             // shell-meta-free kernel cmdline token.
             boot_args.push_str(&format!(" jkbase.dockerfile={df}"));
+        }
+        if let Some(sub) = &config.build_subdir
+            && sub != "."
+            && is_safe_cmdline_path(sub)
+        {
+            // The build subdir within the mounted context. `"."` (build at context
+            // root) is the default and emits nothing — identical to a non-monorepo
+            // build. Same single-token / no-traversal guarantee as `dockerfile`.
+            boot_args.push_str(&format!(" jkbase.build_subdir={sub}"));
         }
         client
             .set_boot_source(&BootSource {
