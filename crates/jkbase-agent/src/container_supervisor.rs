@@ -184,6 +184,87 @@ impl ContainerSupervisor {
         Ok(())
     }
 
+    /// Start the managed database (RhypeDB) as a dedicated, loopback-only supervised
+    /// server composed from the rhypedb runtime layer (`lowerdir=rhypedb:base`). This is
+    /// NOT a tenant server: it never appears in `_servers/` or the route table, binds only
+    /// 127.0.0.1:4200/4201, and is reachable solely by the project's own app over loopback.
+    /// The schema (+ optional rules) are seeded into a meta volume bound at `/etc/rhypedb`;
+    /// data lives on the persistent disk at `/data`. Runs through the same overlay+pivot,
+    /// restart, health, and log machinery as every other layered server.
+    pub async fn start_database(
+        &self,
+        schema: &[u8],
+        rules: Option<&[u8]>,
+        lowerdirs: Vec<PathBuf>,
+    ) -> Result<()> {
+        const NAME: &str = "rhypedb";
+        if lowerdirs.is_empty() {
+            anyhow::bail!("managed DB has no layers");
+        }
+        // The DB MUST have a persistent disk (the host forces one when [database] is
+        // declared); without /mnt/data its data would land on the ephemeral overlay
+        // tmpfs and vanish on restart/hibernate — fail closed rather than lose data.
+        if !Path::new("/mnt/data").exists() {
+            anyhow::bail!("no data disk mounted; refusing to start the managed DB on ephemeral storage");
+        }
+
+        // Seed the schema (+ rules) into the meta volume BEFORE the bind — spawn binds
+        // /mnt/data/volumes/rhypedb-meta → /etc/rhypedb, so the files must already exist.
+        // Rewritten every boot from the current metadata image, so a redeploy's schema
+        // takes effect on the next boot.
+        let meta_src = PathBuf::from("/mnt/data/volumes/rhypedb-meta");
+        std::fs::create_dir_all(&meta_src).context("create rhypedb meta volume dir")?;
+        std::fs::write(meta_src.join("schema.rhype"), schema).context("seed DB schema")?;
+        if let Some(r) = rules {
+            std::fs::write(meta_src.join("rules.rhype"), r).context("seed DB rules")?;
+        }
+        let _ = std::fs::create_dir_all("/mnt/data/volumes/rhypedb-data");
+
+        // NB: rhypedb-server has no `--rules` flag yet (the security-rules engine is the
+        // upstream RBAC epic). v1 is backend-only — the DB is reachable only by the
+        // tenant's own app over loopback — so no rules are enforced; rules are staged for
+        // when the engine gains them. The data plane (/query) is open on loopback by design.
+        let cmd = vec![
+            "/opt/rhypedb/bin/rhypedb-server".to_string(),
+            "--data-dir".into(),
+            "/data".into(),
+            "--schema".into(),
+            "/etc/rhypedb/schema.rhype".into(),
+            "--listen".into(),
+            "127.0.0.1:4200".into(),
+            "--tcp-listen".into(),
+            "127.0.0.1:4201".into(),
+        ];
+        let manifest = ServerManifest {
+            port: 4200,
+            cmd,
+            env: HashMap::new(),
+            working_dir: None,
+            health_check: None,
+            volumes: vec![
+                VolumeMount { name: "rhypedb-data".into(), mount: "/data".into() },
+                VolumeMount { name: "rhypedb-meta".into(), mount: "/etc/rhypedb".into() },
+            ],
+        };
+
+        info!(
+            port = manifest.port,
+            layers = lowerdirs.len(),
+            "starting managed database (rhypedb, loopback-only)"
+        );
+        let process = spawn_server_layered(NAME, &manifest, &lowerdirs, &self.logs)?;
+        let mut servers = self.servers.write().await;
+        servers.push(ManagedServer {
+            name: NAME.to_string(),
+            manifest,
+            rootfs_dir: PathBuf::from("/"),
+            layers: Some(lowerdirs),
+            process: Some(process),
+            healthy: false,
+        });
+        Ok(())
+    }
+
     pub async fn status(&self) -> Vec<ServerStatus> {
         let servers = self.servers.read().await;
         servers
@@ -268,11 +349,11 @@ impl ContainerSupervisor {
         }
     }
 
-    pub fn has_servers(&self) -> bool {
-        self.servers_dir.exists()
-            && std::fs::read_dir(&self.servers_dir)
-                .map(|mut d| d.any(|e| e.is_ok()))
-                .unwrap_or(false)
+    /// True when the supervisor manages at least one process — tenant servers AND/OR the
+    /// managed DB. (Counts the DB, which is not a `_servers/` entry, so a DB-only project
+    /// still gets the health/respawn loop.) Call after `start_all` + `start_database`.
+    pub async fn is_supervising(&self) -> bool {
+        !self.servers.read().await.is_empty()
     }
 
     pub async fn get_server_for_route(&self, route_name: &str) -> Option<u16> {
