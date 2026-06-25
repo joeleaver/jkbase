@@ -225,6 +225,10 @@ fn run_buildpack_pipeline(
 
     let mut ctx = BuildContext {
         app_dir: &app_dir,
+        // The whole copied context. For a monorepo (`subdir` != "."), `app_dir` is the
+        // member within it; bun/node install + ship from this root so hoisted
+        // node_modules + sibling sources are present. Equal to `app_dir` otherwise.
+        workspace_root: Path::new(WORKSPACE),
         layers_dir: Path::new(LAYERS),
         cache_dir: Path::new(CACHE),
         env: BuildEnv::new(),

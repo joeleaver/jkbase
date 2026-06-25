@@ -70,7 +70,10 @@ impl Buildpack for TrunkBuildpack {
         // the tools survive across builds and the offline compile finds them.
         let trunk_cache = ctx.cache_dir.join("trunk");
         std::fs::create_dir_all(&trunk_cache).ok();
-        let has_lock = ctx.app_dir.join("Cargo.lock").exists();
+        // `cargo fetch` (run in the member) writes the resolved Cargo.lock at the
+        // WORKSPACE ROOT, not the member — so a committed lock and the wasm-bindgen
+        // version below are both read from the root (== app_dir for a normal app).
+        let has_lock = ctx.root_dir().join("Cargo.lock").exists();
 
         // 1. Resolve + download every crate dependency through the proxy. Same registry
         //    + git egress as the rust server buildpack (index.crates.io / static.crates.io
@@ -99,7 +102,7 @@ impl Buildpack for TrunkBuildpack {
         //    breaking the fetch-then-seal fence every other buildpack keeps (the actual
         //    compile is offline). `trunk` (0.21) has no tool-only install, so a real build
         //    would be the only trunk-driven warm — hence we fetch the binary ourselves.
-        match wasm_bindgen_version(ctx.app_dir)? {
+        match wasm_bindgen_version(ctx.root_dir())? {
             Some(ver) => provision_wasm_bindgen(ctx, &trunk_cache, &ver)?,
             None => eprintln!(
                 "jkbuild: no wasm-bindgen in Cargo.lock — skipping CLI provision; the offline \
