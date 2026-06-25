@@ -75,8 +75,18 @@ pub struct DetectContext<'a> {
 /// Mutable context threaded through [`Buildpack::fetch`] and
 /// [`Buildpack::compile`]. The driver advances `offline`/`proxy` across the seal.
 pub struct BuildContext<'a> {
-    /// Application source root (`/src`).
+    /// The build target's source dir — where detect matched and the build runs (the
+    /// buildpack's working dir + launch dir). For a monorepo `context` this is the
+    /// MEMBER subdir; equals [`Self::workspace_root`] for a normal build.
     pub app_dir: &'a Path,
+    /// The build CONTEXT root: the whole mounted/copied tree. Equals `app_dir` for a
+    /// normal build; for a monorepo `context` it's the WIDER workspace root, and
+    /// `app_dir` is a member subdir within it. Interpreted-language buildpacks
+    /// (bun/node) install + ship from HERE — package managers hoist `node_modules` to
+    /// the workspace root and sibling package SOURCE lives above `app_dir`, so neither
+    /// is reachable from `app_dir` alone. Compiled buildpacks (rust/go) ignore it: the
+    /// sibling is linked into the self-contained artifact.
+    pub workspace_root: &'a Path,
     /// Where the buildpack creates its layer directories (under the writable
     /// overlay root). Each becomes a content-addressed layer at export.
     pub layers_dir: &'a Path,
@@ -90,6 +100,29 @@ pub struct BuildContext<'a> {
     /// Dockerfile path relative to `app_dir` for `builder = "dockerfile"`
     /// (`jkbase.dockerfile=`). `None` → the buildpack defaults to `Dockerfile`.
     pub dockerfile: Option<String>,
+}
+
+impl BuildContext<'_> {
+    /// The install/ship ROOT: [`Self::workspace_root`] when `app_dir` is a member
+    /// subdir of a monorepo `context`, else `app_dir` itself. node_modules (hoisted to
+    /// the workspace root), the production-prune dance, and the shipped `/app` tree are
+    /// all rooted here; the LAUNCH (start script + working dir) stays at `app_dir`.
+    /// Equals `app_dir` for a normal build, so the non-monorepo path is byte-identical.
+    pub fn root_dir(&self) -> &Path {
+        if self.app_dir != self.workspace_root && self.app_dir.starts_with(self.workspace_root) {
+            self.workspace_root
+        } else {
+            self.app_dir
+        }
+    }
+
+    /// `app_dir` relative to [`Self::root_dir`] — empty for a normal build, the member
+    /// subpath (e.g. `server`) for a monorepo member. Drives the launch working dir.
+    pub fn member_subpath(&self) -> &Path {
+        self.app_dir
+            .strip_prefix(self.root_dir())
+            .unwrap_or_else(|_| Path::new(""))
+    }
 }
 
 /// What a buildpack's build produces. The exporter turns this into `/out`.
@@ -145,4 +178,47 @@ pub trait Buildpack {
     fn fetch(&self, ctx: &mut BuildContext) -> Result<()>;
     /// Offline phase: compile, assemble layers, declare launch processes.
     fn compile(&self, ctx: &mut BuildContext) -> Result<BuildOutput>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx<'a>(app: &'a Path, root: &'a Path) -> BuildContext<'a> {
+        BuildContext {
+            app_dir: app,
+            workspace_root: root,
+            layers_dir: Path::new("/layers"),
+            cache_dir: Path::new("/cache"),
+            env: BuildEnv::new(),
+            proxy: None,
+            dockerfile: None,
+        }
+    }
+
+    #[test]
+    fn root_dir_and_member_subpath() {
+        // Normal build (workspace_root == app_dir): root is the app, member empty —
+        // bun/node behave byte-identically to before this field existed.
+        let c = ctx(Path::new("/scratch/workspace"), Path::new("/scratch/workspace"));
+        assert_eq!(c.root_dir(), Path::new("/scratch/workspace"));
+        assert_eq!(c.member_subpath(), Path::new(""));
+
+        // Monorepo member: app under the wider workspace root → root is the workspace,
+        // member is the subpath (where launch/working-dir lands).
+        let c = ctx(
+            Path::new("/scratch/workspace/server"),
+            Path::new("/scratch/workspace"),
+        );
+        assert_eq!(c.root_dir(), Path::new("/scratch/workspace"));
+        assert_eq!(c.member_subpath(), Path::new("server"));
+
+        // Nested member.
+        let c = ctx(
+            Path::new("/scratch/workspace/crates/api"),
+            Path::new("/scratch/workspace"),
+        );
+        assert_eq!(c.root_dir(), Path::new("/scratch/workspace"));
+        assert_eq!(c.member_subpath(), Path::new("crates/api"));
+    }
 }

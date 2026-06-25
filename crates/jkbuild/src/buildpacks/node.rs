@@ -132,12 +132,15 @@ impl Buildpack for NodeBuildpack {
         let home = ctx.cache_dir.join("node-home");
         std::fs::create_dir_all(&home).ok();
 
-        // 1. Full install — the build (compile) needs dev deps (bundlers, tsc, …).
+        // 1. Full install — the build (compile) needs dev deps (bundlers, tsc, …). Run
+        //    at the workspace root (== app_dir for a normal app): npm/pnpm/yarn hoist
+        //    node_modules to the root, so a member-dir install would miss the workspace.
+        let root = ctx.root_dir();
         let mut cmd = node_command(pm.bin(), &home);
-        for a in pm.full_install_args(has_lockfile(ctx.app_dir)) {
+        for a in pm.full_install_args(has_lockfile(root)) {
             cmd.arg(a);
         }
-        cmd.current_dir(ctx.app_dir);
+        cmd.current_dir(root);
         pm.apply_cache(&mut cmd, &cache);
         apply_proxy(&mut cmd, ctx);
         run(cmd, &format!("{} install", pm.bin()))?;
@@ -146,7 +149,8 @@ impl Buildpack for NodeBuildpack {
         //    compile to swap in — so the runtime app layer carries no dev tooling. We
         //    can't reinstall offline post-seal, so build the production tree here. No-op
         //    when there are no devDependencies (nothing to prune).
-        if has_dev_dependencies(ctx.app_dir) {
+        // devDeps may be at the workspace root OR the member; both hoist to the root.
+        if has_dev_dependencies(root) || has_dev_dependencies(ctx.app_dir) {
             stage_production_modules(ctx, pm, &cache, &home)?;
         }
         Ok(())
@@ -184,11 +188,15 @@ impl Buildpack for NodeBuildpack {
         // Root the tree at /app (= working_dir): overlayfs cannot relocate a lowerdir,
         // so the content must PHYSICALLY live at /app inside the app layer image. Move
         // the workspace under <layers>/app/app (cheap same-fs rename; both on /scratch).
+        // Ship the ROOT tree (== app_dir for a normal app; the workspace root for a
+        // monorepo member, carrying the hoisted node_modules + sibling packages) rooted
+        // at /app. The server runs from /app/<member> and Node resolution walks up to
+        // /app/node_modules — exactly how the workspace runs in place.
         let app_layer_root = ctx.layers_dir.join("app");
         let app_at = app_layer_root.join("app");
         std::fs::create_dir_all(&app_layer_root)
             .with_context(|| format!("creating app layer root {}", app_layer_root.display()))?;
-        std::fs::rename(ctx.app_dir, &app_at)
+        std::fs::rename(ctx.root_dir(), &app_at)
             .with_context(|| format!("rooting workspace at {}", app_at.display()))?;
         let app_layer = Layer {
             name: "app".to_string(),
@@ -209,8 +217,19 @@ impl Buildpack for NodeBuildpack {
                 default: true,
             }],
             env,
-            working_dir: Some("/app".to_string()),
+            working_dir: Some(app_working_dir(ctx)),
         })
+    }
+}
+
+/// The launch working dir: `/app` for a normal app, `/app/<member>` for a monorepo
+/// member (the start script runs in the member; node_modules resolves from `/app`).
+fn app_working_dir(ctx: &BuildContext) -> String {
+    let sub = ctx.member_subpath();
+    if sub.as_os_str().is_empty() {
+        "/app".to_string()
+    } else {
+        format!("/app/{}", sub.display())
     }
 }
 
@@ -461,11 +480,13 @@ fn apply_proxy(cmd: &mut Command, ctx: &BuildContext) {
 
 /// Sibling dirs (next to the workspace, same scratch fs) holding the staged trees.
 fn prod_modules_dir(ctx: &BuildContext) -> std::path::PathBuf {
-    ctx.app_dir.parent().unwrap_or(ctx.app_dir).join("jkbuild-prod-modules")
+    let root = ctx.root_dir();
+    root.parent().unwrap_or(root).join("jkbuild-prod-modules")
 }
 
 fn full_modules_dir(ctx: &BuildContext) -> std::path::PathBuf {
-    ctx.app_dir.parent().unwrap_or(ctx.app_dir).join("jkbuild-full-modules")
+    let root = ctx.root_dir();
+    root.parent().unwrap_or(root).join("jkbuild-full-modules")
 }
 
 /// Build a PRODUCTION-only `node_modules` while the network is up (fetch phase), so
@@ -480,7 +501,9 @@ fn stage_production_modules(
     cache: &Path,
     home: &Path,
 ) -> Result<()> {
-    let app_nm = ctx.app_dir.join("node_modules");
+    // The hoisted node_modules lives at the ROOT (== app_dir for a normal app).
+    let root = ctx.root_dir();
+    let app_nm = root.join("node_modules");
     let full_save = full_modules_dir(ctx);
     let prod_save = prod_modules_dir(ctx);
     let _ = std::fs::remove_dir_all(&full_save);
@@ -492,10 +515,10 @@ fn stage_production_modules(
     }
     // 2. Clean production install IN-PLACE.
     let mut cmd = node_command(pm.bin(), home);
-    for a in pm.prod_install_args(has_lockfile(ctx.app_dir)) {
+    for a in pm.prod_install_args(has_lockfile(root)) {
         cmd.arg(a);
     }
-    cmd.current_dir(ctx.app_dir);
+    cmd.current_dir(root);
     pm.apply_cache(&mut cmd, cache);
     apply_proxy(&mut cmd, ctx);
     let status = cmd
@@ -529,7 +552,7 @@ fn swap_in_production_modules(ctx: &BuildContext) -> Result<()> {
     if !prod_save.exists() {
         return Ok(());
     }
-    let app_nm = ctx.app_dir.join("node_modules");
+    let app_nm = ctx.root_dir().join("node_modules");
     let _ = std::fs::remove_dir_all(&app_nm);
     std::fs::rename(&prod_save, &app_nm)
         .with_context(|| format!("swap production node_modules into {}", app_nm.display()))?;
