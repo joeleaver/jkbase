@@ -751,11 +751,14 @@ async fn drain_into<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// A Dockerfile path is safe to land verbatim on the kernel cmdline iff it is a
-/// single token of path-y characters only: alphanumerics plus `._-/`, non-empty,
-/// no leading `/` or `-`, and no `..` traversal. Anything else (spaces, quotes,
-/// shell metacharacters) is rejected so it cannot inject extra cmdline tokens.
-fn is_safe_cmdline_path(p: &str) -> bool {
+/// A path is safe to land verbatim on the kernel cmdline (as `jkbase.dockerfile=`
+/// or `jkbase.build_subdir=`) iff it is a single token of path-y characters only:
+/// alphanumerics plus `._-/`, non-empty, no leading `/` or `-`, and no `..`
+/// traversal. Anything else (spaces, quotes, shell metacharacters) is rejected so it
+/// cannot inject extra cmdline tokens. Shared so the orchestrator can reject such a
+/// path at deploy time (`validate_manifest`) rather than silently dropping the token
+/// here and building at the wrong dir — the two checks must use the same predicate.
+pub fn is_safe_cmdline_path(p: &str) -> bool {
     !p.is_empty()
         && !p.starts_with('/')
         && !p.starts_with('-')
