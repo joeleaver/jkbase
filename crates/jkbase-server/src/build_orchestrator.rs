@@ -3513,6 +3513,22 @@ console.log("listening on " + port);
         t: BuildTuning,
         build_id: u64,
     ) -> Option<BuildFixture> {
+        networked_lang_build_try(project_id, redb, toolchain, src, t, build_id)
+            .await
+            .map(|r| r.expect("language server build should succeed"))
+    }
+
+    /// Like [`networked_lang_build`] but hands back the raw `run_project_build`
+    /// RESULT instead of unwrapping it — so a NEGATIVE test (e.g. a monorepo build
+    /// with the `context` widening OMITTED) can assert the build *fails*.
+    async fn networked_lang_build_try(
+        project_id: &str,
+        redb: &str,
+        toolchain: &str,
+        src: &Path,
+        t: BuildTuning,
+        build_id: u64,
+    ) -> Option<Result<BuildFixture>> {
         let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
             eprintln!("skip: set JKB_DATA");
             return None;
@@ -3608,11 +3624,8 @@ console.log("listening on " + port);
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
-        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
-            .await
-            .expect("language server build should succeed");
-
-        Some(BuildFixture { data, fc_release, kernel, store, staged })
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone()).await;
+        Some(staged.map(|staged| BuildFixture { data, fc_release, kernel, store, staged }))
     }
 
     /// Write the shared single-`api`-server jkbase.toml the boot helper expects
@@ -5248,25 +5261,158 @@ console.log("listening on " + port);
         println!("PASS: builder=dockerfile (buildah FROM via 3129 public-any + RUN via crun) -> single image/self erofs layer -> runtime -> HTTP 200 ({body:?})");
     }
 
+    /// Write a Rust WORKSPACE fixture into `src`: a virtual-workspace root, a `common`
+    /// library crate, and a `server` bin crate that path-depends on `../common` AND on
+    /// the registry crate `tiny_http`. The served HTTP body comes from the SIBLING
+    /// crate (`common::body()`), so a 200 proves `common` actually linked — not just
+    /// that the build ran. `with_context` picks the manifest: `true` adds
+    /// `context = "."` (mount the whole workspace → `../common` resolves); `false`
+    /// omits it (only `server/` is mounted → the sibling is absent → the build fails).
+    fn write_rust_monorepo(src: &Path, with_context: bool) {
+        let _ = std::fs::remove_dir_all(src);
+        write(
+            src.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"common\", \"server\"]\nresolver = \"2\"\n",
+        );
+        write(
+            src.join("common/Cargo.toml"),
+            "[package]\nname = \"common\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            src.join("common/src/lib.rs"),
+            "/// The HTTP body lives in the SIBLING crate — a 200 proves it linked.\npub fn body() -> &'static str {\n    \"ok\\n\"\n}\n",
+        );
+        write(
+            src.join("server/Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncommon = { path = \"../common\" }\ntiny_http = \"0.12\"\n",
+        );
+        write(
+            src.join("server/src/main.rs"),
+            "fn main() {\n    let port: u16 = std::env::var(\"PORT\").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);\n    let server = tiny_http::Server::http((\"0.0.0.0\", port)).unwrap();\n    println!(\"listening on {port}\");\n    for req in server.incoming_requests() {\n        // The body is the SIBLING crate's — proves `../common` resolved + linked.\n        let _ = req.respond(tiny_http::Response::from_string(common::body()));\n    }\n}\n",
+        );
+        // `context = "."` mounts the whole workspace at /src and builds in `server`;
+        // omitting it mounts only `server/`, so `../common` points outside the mount.
+        let context_line = if with_context { "context = \".\"\n" } else { "" };
+        write(
+            src.join("jkbase.toml"),
+            &format!(
+                "[project]\nname = \"monofix\"\n\n[servers.api]\nsource = \"server\"\n{context_line}language = \"rust\"\nport = 3000\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
+            ),
+        );
+    }
+
     /// E2E for the monorepo build `context`: a Rust workspace whose `[servers.api]`
     /// crate path-depends on an in-repo SIBLING crate. With `context = "."` the whole
-    /// workspace is mounted at `/src`, the build runs in `build_subdir`, and the
-    /// `../sibling` path-dep RESOLVES — the exact case that fails today when only the
-    /// target's source subdir is mounted. This needs a real build VM (KVM + root +
-    /// rust.ext4 + network), so it is ignored here; the host-side plumbing (config
-    /// resolvers, enumerate_targets, validate_manifest, cmdline emission, the lifecycle
-    /// subdir join) is covered by the non-ignored unit tests above. STUB: the fixture
-    /// + assertion belong here when this path is exercised on the KVM box.
+    /// workspace is mounted at `/src`, the build runs in `build_subdir = "server"`, the
+    /// `../common` path-dep RESOLVES, and the layered runtime serves the sibling's
+    /// bytes → HTTP 200. This is the exact case that FAILS today (only `server/` is
+    /// mounted) — see `monorepo_without_context_fails` for the negative control.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo tools/setup-build-net.sh   # once
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       <test-bin> --ignored --nocapture monorepo_context_resolves_sibling_path_dep
     #[tokio::test]
-    #[ignore = "monorepo context e2e: KVM + root + rust.ext4 + network; sibling path-dep must resolve. Stub — wire the fixture on-box."]
+    #[ignore = "monorepo context e2e: KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
     async fn monorepo_context_resolves_sibling_path_dep() {
-        // On-box shape (mirrors networked_lang_build): write a workspace fixture
-        //   /Cargo.toml         [workspace] members = ["crates/common", "crates/api"]
-        //   /crates/common/...  a library crate
-        //   /crates/api/...     bin crate with `common = { path = "../common" }`
-        //   /jkbase.toml        [servers.api] source = "crates/api" context = "." port = 3000
-        // then run run_project_build and assert the server layer built (today it FAILS
-        // because only crates/api is mounted, so ../common is absent).
-        eprintln!("stub: monorepo `context` e2e belongs on the KVM box (see test doc)");
+        let data = match std::env::var("JKB_DATA") {
+            Ok(d) => PathBuf::from(d),
+            Err(_) => {
+                eprintln!("skip: set JKB_DATA");
+                return;
+            }
+        };
+        let src = data.join("monorepo-fixture-src");
+        write_rust_monorepo(&src, /* with_context */ true);
+        // Keep project_id SHORT: it feeds the jailer chroot + Firecracker UNIX socket
+        // path, which must stay under SUN_LEN (108 bytes).
+        let Some(fx) = networked_lang_build(
+            "mono",
+            "onbox-mono.redb",
+            "rust.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                // cargo release build of tiny_http + deps writes a big target/ dir.
+                scratch_mib: 2048,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 240,
+            },
+            1,
+        )
+        .await
+        else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let body = boot_layered_and_curl(
+            &fx, &store_dir, &agent_bin, "monop", "172.25.0.1", "172.25.0.2", "AA:FC:00:00:25:02",
+        )
+        .await
+        .expect("agent should serve HTTP 200 from the monorepo server (sibling path-dep linked)");
+        assert_eq!(body, "ok", "the served body is the SIBLING crate's `common::body()`");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!(
+            "PASS: monorepo `context = \".\"` -> ../common resolves -> layered rust runtime -> HTTP 200 ({body:?})"
+        );
+    }
+
+    /// Negative control proving the feature is load-bearing: the SAME workspace fixture
+    /// WITHOUT `context` mounts only `server/`, so `../common` is absent and the build
+    /// MUST fail (cargo can't load the path-dep). If this ever passes, the positive test
+    /// above proves nothing.
+    #[tokio::test]
+    #[ignore = "monorepo context e2e (negative): KVM + root + rust.ext4 + build bridge"]
+    async fn monorepo_without_context_fails() {
+        let data = match std::env::var("JKB_DATA") {
+            Ok(d) => PathBuf::from(d),
+            Err(_) => {
+                eprintln!("skip: set JKB_DATA");
+                return;
+            }
+        };
+        let src = data.join("monorepo-fixture-src-nocontext");
+        write_rust_monorepo(&src, /* with_context */ false);
+        let Some(res) = networked_lang_build_try(
+            "moneg",
+            "onbox-moneg.redb",
+            "rust.ext4",
+            &src,
+            BuildTuning {
+                vcpu: 4,
+                guest_mem_mib: 2048,
+                cgroup_mem_mib: 2560,
+                cgroup_cpu_max: "400000 100000",
+                scratch_mib: 2048,
+                output_mib: 128,
+                timeout_secs: 600,
+                fetch_deadline_secs: 240,
+            },
+            1,
+        )
+        .await
+        else {
+            return;
+        };
+        let err = match res {
+            Ok(_) => panic!(
+                "build WITHOUT `context` unexpectedly SUCCEEDED — only server/ is mounted, so the \
+                 `../common` sibling path-dep should be absent and cargo should fail"
+            ),
+            Err(e) => format!("{e:#}"),
+        };
+        // Must fail INSIDE the build (the buildpack/cargo can't load the path-dep), not
+        // earlier on some unrelated host-side precheck (e.g. the SUN_LEN socket-path
+        // guard) — otherwise this control proves nothing about the `context` feature.
+        let lc = err.to_lowercase();
+        assert!(
+            err.contains("api:") && !lc.contains("socket") && !lc.contains("sun_len"),
+            "expected an in-VM build failure for the missing `../common` sibling, got: {err}"
+        );
+        println!("PASS (negative): no `context` -> ../common absent -> build fails as expected\n  error: {err}");
     }
 }
