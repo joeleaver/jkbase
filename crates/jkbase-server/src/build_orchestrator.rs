@@ -28,7 +28,7 @@ use jkbase_common::config::{resolve_egress, Builder, EgressPolicy, ProjectConfig
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
-use jkbase_orch::build_vm::{BuildOutcome, BuildVm, BuildVmConfig, SealFn};
+use jkbase_orch::build_vm::{is_safe_cmdline_path, BuildOutcome, BuildVm, BuildVmConfig, SealFn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1866,6 +1866,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         if !source_within_context(ctx, sd) {
             bail!("server '{name}' source {sd:?} must be inside its build context {ctx:?}");
         }
+        // When `context` widens the mount, `source`-within-`context` rides the kernel
+        // cmdline as `jkbase.build_subdir=`. `path_ok` permits chars the cmdline guard
+        // rejects (e.g. a space), and the emitter would then SILENTLY drop the token and
+        // build at the context root — fail loud at deploy instead. (No-op for the common
+        // `build_subdir == "."`, so a plain non-monorepo source is unaffected.)
+        let bs = s.build_subdir();
+        if bs != "." && !is_safe_cmdline_path(&bs) {
+            bail!("server '{name}' source {sd:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]");
+        }
         // builder = auto|dockerfile, and (for dockerfile) language/dockerfile coherence.
         s.validate(name)?;
         // The Dockerfile must live inside the project tree (it becomes a /src path).
@@ -1895,6 +1904,13 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
             }
             if !source_within_context(ctx, src) {
                 bail!("site '{name}' source {src:?} must be inside its build context {ctx:?}");
+            }
+            // Same as servers: a `context`-derived build subdir must be cmdline-safe so
+            // the `jkbase.build_subdir=` token isn't silently dropped (→ build at the
+            // context root). No-op when `build_subdir == "."` (no `context` widening).
+            let bs = site.build_subdir();
+            if bs != "." && !is_safe_cmdline_path(&bs) {
+                bail!("site '{name}' source {src:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]");
             }
         } else {
             // A COMMITTED site: `public` is REQUIRED. Omitting it must NOT silently
@@ -2747,6 +2763,22 @@ mod tests {
         )
         .unwrap();
         assert!(validate_manifest(&site_bad).is_err());
+
+        // A `context`-derived build subdir with a cmdline-unsafe char (a space) →
+        // reject at deploy. `path_ok` alone would PASS this (it permits spaces), but
+        // the `jkbase.build_subdir=` emitter would then silently drop the token and
+        // build at the context root. Guard so the failure is a clear deploy error.
+        let spacey: ProjectConfig = toml::from_str(
+            "[servers.web]\nsource = \"my app\"\ncontext = \".\"\nport = 80\n",
+        )
+        .unwrap();
+        let err = validate_manifest(&spacey).unwrap_err().to_string();
+        assert!(err.contains("can't be passed to the build VM"), "got: {err}");
+        // …but the SAME spacey source with NO `context` is unchanged (build_subdir is
+        // ".", no token emitted) — today's behaviour must still validate.
+        let spacey_ok: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"my app\"\nport = 80\n").unwrap();
+        assert!(validate_manifest(&spacey_ok).is_ok());
     }
 
     #[test]
