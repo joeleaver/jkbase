@@ -119,6 +119,7 @@ A server runs inside your project's microVM with its own port and optional persi
 ```toml
 [servers.api]
 source = "./server"           # build subdir (default ".")
+# context = "."               # monorepo: mount a WIDER tree so sibling path-deps resolve (default = source)
 # language = "bun"            # optional hint; auto-detected (bun|node|rust|python|go)
 port = 8080                   # required — authoritative for routing
 # command = ["/opt/bun/bin/bun", "run", "start"]   # optional: override the launch argv (argv[0] absolute)
@@ -136,6 +137,45 @@ port = 8080
 ```
 
 Volumes persist across deploys. Build output does not — that's the point.
+
+### Monorepos & workspaces
+
+By default a target is built from **just its `source` subdir** — that subdir is all that's
+mounted in the build VM. So a crate or package that depends on an **in-repo sibling** by
+relative path fails to build, because the sibling lives outside the mount:
+
+```toml
+# jkbase.toml at a Rust workspace root
+[servers.api]
+source = "crates/api"   # depends on `common = { path = "../common" }`
+```
+
+Add an optional **`context`** — the directory mounted as the build root, exactly like a
+**Docker build context**. `source` is then the working directory *within* it:
+
+```toml
+[servers.api]
+source  = "crates/api"   # WHERE the build runs (the app dir)
+context = "."            # WHAT is mounted as the build root (the whole workspace)
+port    = 8080
+```
+
+Now the whole workspace is mounted, so `../common` resolves. This is buildpack-agnostic —
+it works the same for Rust workspaces, pnpm/yarn/npm workspaces, Go multi-module repos,
+Python monorepos, and `build = "trunk"` sites. `context` also works on a built site:
+
+```toml
+[sites.app]
+source  = "plotweb-web"   # a trunk frontend crate that path-deps a sibling
+context = "."
+build   = "trunk"
+```
+
+Rules: `context` defaults to `source`, so **omitting it changes nothing** — an existing
+manifest builds exactly as before. `source` must live **inside** `context`, and both must
+be relative paths inside the project (no `..`/absolute). Keep `context` no wider than the
+path-deps require: a wide context mounts more of your repo into the build (bigger build,
+weaker reproducibility), so prefer `apps/` over `.` when that's enough.
 
 ### Functions (WASI components)
 

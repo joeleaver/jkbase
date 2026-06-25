@@ -141,16 +141,26 @@ and defaults to a no-op. **This is the field we'd like signed off.**
   as narrow as the path-deps require (e.g. `apps/`, not `.`) preserves the tightest
   reproducibility. The default (unset → `source`) stays maximally deterministic.
 
-## Status / what couldn't be verified
+## Status / verification
 
 - `cargo build --workspace`, `cargo build --workspace --examples`, and
-  `cargo test --workspace` are clean; all existing tests pass and the `onbox::*` KVM
-  tests stay `#[ignore]`d.
+  `cargo test --workspace` are clean; all existing tests pass.
 - New unit tests guard: (a) unset `context` → staging + `app_dir` identical to today
   (the regression guard); (b) `context = "."` + `source = "web"` → image from root,
   `build_subdir = "web"`, detect runs in `web/`; (c) validation rejects
   source-outside-context and `..`/absolute escapes.
-- A **real build VM cannot run here** (needs KVM/Firecracker + baked toolchain images +
-  root). The end-to-end proof — a monorepo target whose build resolves a sibling
-  path-dep — is added as an **ignored `onbox::*` stub**
-  (`monorepo_context_resolves_sibling_path_dep`) to be wired on the KVM box.
+- **On-box e2e — PROVEN** (`onbox::monorepo_context_resolves_sibling_path_dep`, gated on
+  KVM + root + a freshly-baked `rust.ext4`). A Rust workspace whose `[servers.api]` crate
+  path-deps a sibling `common` crate builds with `context = "."`, the layered runtime
+  boots, and it serves **HTTP 200 whose body comes from `common::body()`** — so the
+  sibling was actually *linked*, not merely present. A **negative control**
+  (`onbox::monorepo_without_context_fails`) proves the feature is load-bearing: the same
+  fixture *without* `context` fails in-VM at `cargo` (`failed to read
+  /scratch/common/Cargo.toml: No such file or directory`), because only `server/` is
+  mounted.
+- **Gotcha for re-running on-box:** the in-VM build driver (`jkbuild-init`) is baked into
+  each toolchain image, so a guest-side change here only takes effect after the toolchain
+  is **rebaked** (`tools/dev toolchains`, or `build-image.sh` for one image). The runtime
+  boot also needs the verity-capable agent rootfs (`JKB_ROOTFS=…/base-rootfs-verity.ext4`);
+  the minimal hand-rolled rootfs can't activate the dm-verity shared layers and the server
+  correctly fails closed.
