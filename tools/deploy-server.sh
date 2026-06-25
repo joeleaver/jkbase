@@ -7,6 +7,12 @@
 #
 # Pulls latest code, rebuilds, restarts the service.
 #
+# NOTE: this does NOT rebake the build toolchain images (rust/node/bun/… .ext4), which
+# bake jkbuild-init (the in-VM build driver). After a change to the jkbuild lifecycle or
+# a toolchain input, refresh them with tools/rebake-toolchains.sh (it injects the
+# build-mirror CA and verifies it landed before swapping) — otherwise the host emits new
+# build behaviour the stale baked jkbuild-init ignores.
+#
 
 set -euo pipefail
 
