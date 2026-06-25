@@ -124,6 +124,7 @@ esac
         build_static: false,
         builder_hint: None,
         dockerfile: None,
+        build_subdir: None,
         fetch_deadline: Duration::from_secs(20),
         seal: Some(seal),
     };

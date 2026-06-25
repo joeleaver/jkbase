@@ -57,6 +57,40 @@ pub fn parse_cmdline_value(cmdline: &str, key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The build subdir within the mounted context (`jkbase.build_subdir=`), defaulting to
+/// `"."` (build at the context root — the non-monorepo case). A value with a traversal
+/// component (`..`), an absolute path, or a leading `-` is REJECTED (falls back to ".")
+/// so a hostile/garbled cmdline token can't escape `/src` or the workspace — defence in
+/// depth atop the host-side `is_safe_cmdline_path` guard that gates emission.
+fn build_subdir(cmdline: &str) -> String {
+    match parse_cmdline_value(cmdline, "jkbase.build_subdir") {
+        Some(s) if is_safe_subdir(&s) => s,
+        _ => ".".to_string(),
+    }
+}
+
+/// Join a context-relative build subdir onto a base. `"."` returns the base UNCHANGED
+/// (the common, non-monorepo case) so paths are byte-identical to the pre-`context`
+/// build. The subdir is assumed already validated by [`is_safe_subdir`].
+fn join_subdir(base: &Path, subdir: &str) -> std::path::PathBuf {
+    if subdir == "." {
+        base.to_path_buf()
+    } else {
+        base.join(subdir)
+    }
+}
+
+/// A safe, context-relative subdir: non-empty, not absolute, no `-` flag prefix, no
+/// `..` traversal, ordinary path chars only. (Mirrors the host's `is_safe_cmdline_path`.)
+fn is_safe_subdir(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with('-')
+        && !p.contains("..")
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
 fn is_pid1() -> bool {
     std::process::id() == 1
 }
@@ -79,20 +113,24 @@ pub fn run() -> Result<i32> {
     let dockerfile = parse_cmdline_value(&cmdline, "jkbase.dockerfile");
     let mode = ExportMode::from_cmdline(&cmdline);
     let kind = parse_cmdline_value(&cmdline, "jkbase.kind");
+    // The build subdir WITHIN the mounted context (`/src`). Absent → `"."` (build at
+    // the context root), the non-monorepo default. `build_subdir` validates the token
+    // (no traversal/absolute) and falls back to "." on a bad value.
+    let subdir = build_subdir(&cmdline);
 
     let result = match kind.as_deref() {
         Some("function") => {
             // Function target: the curated per-language function-builder →
             // /out/function.wasm, not the server detect/export path.
-            drive_function(proxy, lang.as_deref())
+            drive_function(proxy, lang.as_deref(), &subdir)
         }
         Some("static") => {
             // Static target: run the normal buildpack pipeline (e.g. trunk), but export
             // the produced static tree as a plain `/out/static.tar.gz` the host untars
             // into the served site location — no erofs layer, no server manifest.
-            drive_static(proxy, lang.as_deref(), builder.as_deref(), dockerfile)
+            drive_static(proxy, lang.as_deref(), builder.as_deref(), dockerfile, &subdir)
         }
-        _ => drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode),
+        _ => drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode, &subdir),
     };
     let code = match &result {
         Ok(()) => 0,
@@ -117,8 +155,9 @@ fn drive(
     builder: Option<&str>,
     dockerfile: Option<String>,
     mode: ExportMode,
+    subdir: &str,
 ) -> Result<()> {
-    let output = run_buildpack_pipeline(proxy, lang, builder, dockerfile)?;
+    let output = run_buildpack_pipeline(proxy, lang, builder, dockerfile, subdir)?;
     export_artifact(&output, mode)
 }
 
@@ -132,8 +171,9 @@ fn drive_static(
     lang: Option<&str>,
     builder: Option<&str>,
     dockerfile: Option<String>,
+    subdir: &str,
 ) -> Result<()> {
-    let output = run_buildpack_pipeline(proxy, lang, builder, dockerfile)?;
+    let output = run_buildpack_pipeline(proxy, lang, builder, dockerfile, subdir)?;
     let dest = Path::new(OUT).join("static.tar.gz");
     export::pack_flat_tarball(&output, &dest).context("pack static tarball")?;
     let bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
@@ -148,14 +188,21 @@ fn run_buildpack_pipeline(
     lang: Option<&str>,
     builder: Option<&str>,
     dockerfile: Option<String>,
+    subdir: &str,
 ) -> Result<BuildOutput> {
-    // 1. detect against /src (read-only source).
+    // The build root WITHIN the mounted context: `/src/<subdir>` (subdir `"."` →
+    // `/src`, today's behaviour). With a monorepo `context` mounted wider than the
+    // target's source, the whole context is at `/src` so a `../sibling` path-dep
+    // resolves, while detect + the buildpack app_dir stay scoped to the subdir.
+    let src_root = join_subdir(Path::new(SRC), subdir);
+
+    // 1. detect against the (read-only) build root.
     let registry = buildpacks::registry();
     let chosen = registry
         .iter()
         .filter_map(|bp| {
             let d = bp.detect(&DetectContext {
-                app_dir: Path::new(SRC),
+                app_dir: &src_root,
                 language_hint: lang,
                 builder_hint: builder,
             });
@@ -170,12 +217,14 @@ fn run_buildpack_pipeline(
         .context("no buildpack matched the source")?;
     append_log(&format!("jkbuild: matched buildpack {}\n", chosen.id()))?;
 
-    // 2. copy source into a writable workspace (the build mutates it: node_modules,
-    //    bun run build output). /src stays read-only.
+    // 2. copy the WHOLE context into a writable workspace (the build mutates it:
+    //    node_modules, bun run build output). /src stays read-only. Copying the whole
+    //    context (not just the subdir) is what makes sibling path-deps available.
     prepare_workspace()?;
+    let app_dir = join_subdir(Path::new(WORKSPACE), subdir);
 
     let mut ctx = BuildContext {
-        app_dir: Path::new(WORKSPACE),
+        app_dir: &app_dir,
         layers_dir: Path::new(LAYERS),
         cache_dir: Path::new(CACHE),
         env: BuildEnv::new(),
@@ -202,15 +251,17 @@ fn run_buildpack_pipeline(
 /// Build a WASM function: detect the language, fetch→seal→compile to ONE `wasi:http`
 /// component, and write it to `/out/function.wasm` (the artifact the host collects). Same
 /// host-enforced network boundary as the server path — network only during fetch.
-fn drive_function(proxy: Option<String>, lang: Option<&str>) -> Result<()> {
+fn drive_function(proxy: Option<String>, lang: Option<&str>, subdir: &str) -> Result<()> {
+    let src_root = join_subdir(Path::new(SRC), subdir);
     let registry = function_build::registry();
-    let chosen = function_build::select(&registry, Path::new(SRC), lang)
+    let chosen = function_build::select(&registry, &src_root, lang)
         .context("no function builder matched the source")?;
     append_log(&format!("jkbuild: matched function builder {}\n", chosen.id()))?;
 
     prepare_workspace()?;
+    let app_dir = join_subdir(Path::new(WORKSPACE), subdir);
     let mut ctx = function_build::FunctionContext {
-        app_dir: Path::new(WORKSPACE),
+        app_dir: &app_dir,
         cache_dir: Path::new(CACHE),
         proxy: proxy.clone(),
     };
@@ -469,6 +520,29 @@ mod tests {
         assert_eq!(
             split_proxy("10.0.0.1"),
             ("10.0.0.1".to_string(), "80".to_string())
+        );
+    }
+
+    #[test]
+    fn build_subdir_defaults_dot_and_rejects_traversal() {
+        // Absent → "." (build at the context root; today's behaviour).
+        assert_eq!(build_subdir("ro console=ttyS0"), ".");
+        // A safe subdir is honoured.
+        assert_eq!(build_subdir("jkbase.build_subdir=web"), "web");
+        assert_eq!(build_subdir("jkbase.build_subdir=crates/api"), "crates/api");
+        // Hostile/garbled tokens fall back to "." rather than escaping /src.
+        assert_eq!(build_subdir("jkbase.build_subdir=../etc"), ".");
+        assert_eq!(build_subdir("jkbase.build_subdir=/etc/passwd"), ".");
+        assert_eq!(build_subdir("jkbase.build_subdir=-rf"), ".");
+    }
+
+    #[test]
+    fn join_subdir_dot_is_identity() {
+        // "." must NOT change the path — the regression guard for the default path.
+        assert_eq!(join_subdir(Path::new("/scratch/workspace"), "."), Path::new("/scratch/workspace"));
+        assert_eq!(
+            join_subdir(Path::new("/scratch/workspace"), "web"),
+            Path::new("/scratch/workspace/web")
         );
     }
 
