@@ -3526,6 +3526,161 @@ esac
         );
     }
 
+    /// The load-bearing proof for `docs/rootfs-cas-snapshot-durability.md`: a base-image
+    /// redeploy must NOT brick a hibernated project. Boots a real microVM from the
+    /// CONTENT-ADDRESSED rootfs path, hibernates it, then simulates a redeploy by minting a
+    /// NEW rootfs blob alongside the old one (the old in-place rewrite would have poisoned the
+    /// snapshot here), and restores the snapshot — which must still serve HTTP 200 against the
+    /// RETAINED immutable blob. Finally asserts the GC is reference-counted (keeps a referenced
+    /// blob; reaps an unreferenced one). Mirrors the managed-DB hibernate/restore harness.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/jkbob JKB_FC_RELEASE=/abs/.../release-v1.15.1-x86_64 \
+    ///       JKB_BASELAYERS=/abs/baselayers JKB_AGENT=/abs/jkbase-agent \
+    ///       JKB_ROOTFS=/abs/base-rootfs.ext4 \
+    ///       <test-bin> --ignored --nocapture cas_rootfs_survives_simulated_base_image_redeploy
+    #[tokio::test]
+    #[ignore = "needs KVM + root + baked bun.ext4 + JKB_ROOTFS; proves CAS rootfs durability across a redeploy"]
+    async fn cas_rootfs_survives_simulated_base_image_redeploy() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Some(fx) = bun_pipeline_build("casredeploy", 1, Workload::OfflineNoDep).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the agent rootfs (tools/build-runtime-rootfs.sh)");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Plain server (no managed DB, no data disk): layer plan + metadata image.
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, true)
+            .expect("compute layer plan for a plain server");
+        let meta_img = fx.data.join("casredeploy-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            &meta_img,
+        )
+        .expect("build the metadata image");
+
+        // Content-address the rootfs exactly as server startup does — this is blob "A".
+        let cas_dir = fx.data.join("base-rootfs");
+        let (rootfs_a, hash_a) =
+            crate::rootfs_cas::place(&rootfs, &cas_dir).expect("CAS-place rootfs A");
+        eprintln!("[cas-e2e] rootfs A = {} ({}…)", rootfs_a.display(), &hash_a[..12]);
+
+        // Point-to-point tap on its own /24 (clear of the other pipeline tests).
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("casredeploy", "172.28.0.1", "172.28.0.2", "AA:FC:00:00:28:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let cfg_a = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs_a.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+        };
+        let runtime_dir = fx.data.join("casredeploy-run");
+
+        // --- Cold boot from the CAS rootfs path (proves base-rootfs/<hash>.ext4 boots + serves).
+        let mut vm = VmInstance::start(tag, &cfg_a, &runtime_dir)
+            .await
+            .expect("VM should boot from the content-addressed rootfs path");
+        let cold = poll_http_200(guest_ip, 80, Duration::from_secs(75)).await;
+        eprintln!("[cas-e2e] cold-boot from CAS rootfs → 200 = {}", cold.is_some());
+        assert!(cold.is_some(), "VM booted from the CAS rootfs must serve HTTP 200");
+
+        // --- Hibernate: the snapshot bakes rootfs path A.
+        let snap_dir = fx.data.join("casredeploy-snap");
+        let (snap, mem) = vm.hibernate(&snap_dir).await.expect("hibernate");
+
+        // --- Simulate a base-image redeploy: a changed agent ⇒ different rootfs bytes ⇒ a NEW
+        //     CAS blob "B" minted ALONGSIDE A. The OLD in-place rewrite would have clobbered the
+        //     one fixed path and poisoned this snapshot; CAS keeps A immutable + retained.
+        let tweaked = fx.data.join("rootfs-b.ext4");
+        std::fs::copy(&rootfs, &tweaked).unwrap();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tweaked)
+                .unwrap();
+            f.write_all(b"\0simulated-redeploy").unwrap();
+        }
+        let (_rootfs_b, hash_b) =
+            crate::rootfs_cas::place(&tweaked, &cas_dir).expect("CAS-place rootfs B");
+        assert_ne!(hash_a, hash_b, "a changed agent must mint a new rootfs hash");
+        assert!(
+            rootfs_a.exists(),
+            "the OLD rootfs blob MUST be retained so the snapshot can restore"
+        );
+        eprintln!(
+            "[cas-e2e] redeploy minted rootfs B ({}…); A retained = {}",
+            &hash_b[..12],
+            rootfs_a.exists()
+        );
+
+        // --- Restore the snapshot AFTER the redeploy. Byte-correct against the retained immutable
+        //     A → still serves 200. THIS is the durability the fix delivers.
+        let mut woke = VmInstance::restore_from_snapshot(tag, &cfg_a, &runtime_dir, &snap, &mem)
+            .await
+            .expect("restore from snapshot against the retained CAS rootfs blob");
+        let restored = poll_http_200(guest_ip, 80, Duration::from_secs(45)).await;
+        eprintln!(
+            "[cas-e2e] restore-after-redeploy → 200 = {}",
+            restored.is_some()
+        );
+        let _ = woke.stop().await;
+        assert!(
+            restored.is_some(),
+            "restore against the retained CAS blob must still serve 200 after a redeploy"
+        );
+
+        // --- GC is reference-counted: A is kept while referenced, reaped once it isn't (at which
+        //     point a wake fails OPEN to a cold boot from B — see the decision unit test).
+        let keep_both: std::collections::HashSet<String> =
+            [hash_a.clone(), hash_b.clone()].into_iter().collect();
+        let removed = crate::rootfs_cas::gc(&cas_dir, &keep_both).unwrap();
+        assert!(
+            removed.is_empty() && rootfs_a.exists(),
+            "GC must keep a referenced blob"
+        );
+        let keep_b_only: std::collections::HashSet<String> = [hash_b].into_iter().collect();
+        let removed = crate::rootfs_cas::gc(&cas_dir, &keep_b_only).unwrap();
+        assert_eq!(removed, vec![hash_a], "GC must reap the now-unreferenced blob");
+        assert!(!rootfs_a.exists(), "the reaped blob must be gone");
+
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!(
+            "PASS: CAS rootfs durability — boot from CAS path + restore against retained blob after a simulated redeploy + reference-counted GC"
+        );
+    }
+
     /// Everything the on-box pipeline tests share after a successful build.
     struct BuildFixture {
         data: PathBuf,

@@ -2831,6 +2831,37 @@ async fn wake_project(
         .map_err(|e| jkbase_proxy::WakeError::Unavailable(e.to_string()))
 }
 
+/// Decide whether a hibernation snapshot can be restored **byte-correct**, or whether the wake
+/// must fail OPEN to a clean cold boot from the current rootfs. Returns `(Some(hash)` to restore
+/// against that immutable CAS blob | `None` to cold-boot, a `wake_outcome` label`)`.
+///
+/// A restore is viable iff the snapshot stamps the rootfs it actually ran (present + valid-hex,
+/// its CAS blob still on disk) AND its deployment version still matches the project's current
+/// version — which transitively guarantees the metadata image + erofs layers it bakes by fixed
+/// path are the current, coherent set. Every other case (no snapshot, missing files, a legacy
+/// unstamped record, a reaped/renamed rootfs blob, or version drift) cold-boots — never a brick.
+fn snapshot_restore_decision(
+    snap_meta: Option<&SnapshotMeta>,
+    current_version: Option<u64>,
+    cas_dir: &Path,
+) -> (Option<String>, &'static str) {
+    let Some(m) = snap_meta else {
+        return (None, "coldboot_fresh");
+    };
+    if !(Path::new(&m.snapshot_path).exists() && Path::new(&m.mem_file_path).exists()) {
+        return (None, "skipped_snapshot_files_missing");
+    }
+    match m.base_rootfs_hash.as_deref() {
+        None => (None, "skipped_legacy_unstamped"),
+        Some(h) if !rootfs_cas::is_sha256_hex(h) => (None, "skipped_bad_hash"),
+        Some(h) if !rootfs_cas::blob_path(cas_dir, h).is_file() => {
+            (None, "skipped_rootfs_blob_missing")
+        }
+        Some(_) if m.deployment_version != current_version => (None, "skipped_version_drift"),
+        Some(h) => (Some(h.to_string()), "restored"),
+    }
+}
+
 async fn wake_project_inner(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
@@ -2944,29 +2975,8 @@ async fn wake_project_inner(
     let current_rootfs_hash = plat.base_rootfs_hash.clone();
     let cas_dir = plat.data_dir.join("base-rootfs");
     let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
-    let (restore_hash, nonviable_outcome): (Option<String>, &'static str) = match snap_meta.as_ref()
-    {
-        None => (None, "coldboot_fresh"),
-        Some(m) => {
-            let files_ok = PathBuf::from(&m.snapshot_path).exists()
-                && PathBuf::from(&m.mem_file_path).exists();
-            if !files_ok {
-                (None, "skipped_snapshot_files_missing")
-            } else {
-                match m.base_rootfs_hash.as_deref() {
-                    None => (None, "skipped_legacy_unstamped"),
-                    Some(h) if !rootfs_cas::is_sha256_hex(h) => (None, "skipped_bad_hash"),
-                    Some(h) if !rootfs_cas::blob_path(&cas_dir, h).is_file() => {
-                        (None, "skipped_rootfs_blob_missing")
-                    }
-                    Some(_) if m.deployment_version != current_version => {
-                        (None, "skipped_version_drift")
-                    }
-                    Some(h) => (Some(h.to_string()), "restored"),
-                }
-            }
-        }
-    };
+    let (restore_hash, nonviable_outcome) =
+        snapshot_restore_decision(snap_meta.as_ref(), current_version, &cas_dir);
 
     // Whether this project has a data disk, plus clones of the RWO substrate so the
     // fence (below) can run AFTER dropping the platform lock. data_disk_path is set
@@ -4430,6 +4440,84 @@ mod split_brain_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
+    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
+    /// (stamped+present rootfs blob + matching deployment version) restores.
+    #[test]
+    fn snapshot_restore_decision_fails_open_on_every_mismatch() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkbase-decision-{nanos}"));
+        let cas = root.join("base-rootfs");
+        std::fs::create_dir_all(&cas).unwrap();
+        let snap = root.join("snapshot");
+        let mem = root.join("mem");
+        std::fs::write(&snap, b"s").unwrap();
+        std::fs::write(&mem, b"m").unwrap();
+        let good_hash = "a".repeat(64);
+        std::fs::write(rootfs_cas::blob_path(&cas, &good_hash), b"rootfs").unwrap();
+
+        let base = |hash: Option<String>, ver: Option<u64>| SnapshotMeta {
+            project_id: "p".into(),
+            snapshot_path: snap.to_string_lossy().into_owned(),
+            mem_file_path: mem.to_string_lossy().into_owned(),
+            created_at: 0,
+            vcpu_count: 1,
+            mem_size_mib: 1024,
+            base_rootfs_hash: hash,
+            deployment_version: ver,
+        };
+
+        // No snapshot at all → fresh cold boot.
+        assert_eq!(
+            snapshot_restore_decision(None, Some(3), &cas),
+            (None, "coldboot_fresh")
+        );
+        // Fully coherent → restore against the stamped blob.
+        let m = base(Some(good_hash.clone()), Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas),
+            (Some(good_hash.clone()), "restored")
+        );
+        // Legacy unstamped → cold boot.
+        let m = base(None, Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_legacy_unstamped"
+        );
+        // Stamped hash whose blob was reaped/never-placed → cold boot (this is the exact
+        // self-healing path that saves a project from a GC over-deletion).
+        let m = base(Some("b".repeat(64)), Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_rootfs_blob_missing"
+        );
+        // Non-hex stamp → cold boot (never trust it as a path component).
+        let m = base(Some("../etc".to_string()), Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_bad_hash"
+        );
+        // Version drift (project redeployed since hibernate) → cold boot, so a stale metadata
+        // image / secrets / layers can't be restored under the wrong version.
+        let m = base(Some(good_hash.clone()), Some(2));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_version_drift"
+        );
+        // Snapshot files reaped out from under the record → cold boot.
+        let m = base(Some(good_hash.clone()), Some(3));
+        std::fs::remove_file(&snap).unwrap();
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_snapshot_files_missing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn flock_lease_elects_single_leader() {
