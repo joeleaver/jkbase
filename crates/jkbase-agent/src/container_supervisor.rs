@@ -210,7 +210,9 @@ impl ContainerSupervisor {
         // declared); without /mnt/data its data would land on the ephemeral overlay
         // tmpfs and vanish on restart/hibernate — fail closed rather than lose data.
         if !Path::new("/mnt/data").exists() {
-            anyhow::bail!("no data disk mounted; refusing to start the managed DB on ephemeral storage");
+            anyhow::bail!(
+                "no data disk mounted; refusing to start the managed DB on ephemeral storage"
+            );
         }
 
         // Seed the schema (+ rules) into the meta volume BEFORE the bind — spawn binds
@@ -247,8 +249,14 @@ impl ContainerSupervisor {
             working_dir: None,
             health_check: None,
             volumes: vec![
-                VolumeMount { name: "rhypedb-data".into(), mount: "/data".into() },
-                VolumeMount { name: "rhypedb-meta".into(), mount: "/etc/rhypedb".into() },
+                VolumeMount {
+                    name: "rhypedb-data".into(),
+                    mount: "/data".into(),
+                },
+                VolumeMount {
+                    name: "rhypedb-meta".into(),
+                    mount: "/etc/rhypedb".into(),
+                },
             ],
         };
 
@@ -371,7 +379,6 @@ impl ContainerSupervisor {
             .find(|s| s.name != DB_SERVER_NAME && s.name == route_name)
             .map(|s| s.manifest.port)
     }
-
 }
 
 fn remount_rw(target: &str) {
@@ -671,9 +678,12 @@ fn spawn_server_layered(
         std_cmd.pre_exec(move || setup.enter());
     }
 
-    let mut child = Command::from(std_cmd)
-        .spawn()
-        .with_context(|| format!("failed to spawn layered server '{name}': {:?}", manifest.cmd))?;
+    let mut child = Command::from(std_cmd).spawn().with_context(|| {
+        format!(
+            "failed to spawn layered server '{name}': {:?}",
+            manifest.cmd
+        )
+    })?;
 
     attach_log_readers(&mut child, name, logs);
     info!(
@@ -728,7 +738,9 @@ impl LayeredSetup {
             work.to_string_lossy()
         );
         let cstr = |s: &str| CString::new(s).context("path contains NUL");
-        let cpath = |p: &Path| CString::new(p.to_string_lossy().as_bytes().to_vec()).context("path contains NUL");
+        let cpath = |p: &Path| {
+            CString::new(p.to_string_lossy().as_bytes().to_vec()).context("path contains NUL")
+        };
 
         let volume_binds = volumes
             .iter()
@@ -793,15 +805,36 @@ impl LayeredSetup {
             // proc/sys/dev inside the new root (mkdir best-effort — the base layer
             // already carries the skeleton; ignore EEXIST).
             libc::mkdir(self.proc_target.as_ptr(), 0o555);
-            if libc::mount(self.c_proc.as_ptr(), self.proc_target.as_ptr(), self.c_proc.as_ptr(), 0, ptr::null()) != 0 {
+            if libc::mount(
+                self.c_proc.as_ptr(),
+                self.proc_target.as_ptr(),
+                self.c_proc.as_ptr(),
+                0,
+                ptr::null(),
+            ) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             libc::mkdir(self.sys_target.as_ptr(), 0o555);
-            if libc::mount(self.c_sysfs.as_ptr(), self.sys_target.as_ptr(), self.c_sysfs.as_ptr(), 0, ptr::null()) != 0 {
+            if libc::mount(
+                self.c_sysfs.as_ptr(),
+                self.sys_target.as_ptr(),
+                self.c_sysfs.as_ptr(),
+                0,
+                ptr::null(),
+            ) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             libc::mkdir(self.dev_target.as_ptr(), 0o755);
-            if libc::mount(self.c_devtmpfs.as_ptr(), self.dev_target.as_ptr(), self.c_devtmpfs.as_ptr(), 0, ptr::null()) != 0 {
+            if libc::mount(
+                self.c_devtmpfs.as_ptr(),
+                self.dev_target.as_ptr(),
+                self.c_devtmpfs.as_ptr(),
+                0,
+                ptr::null(),
+            ) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             // Bind persistent volumes (data disk) into the new root. Best-effort: a
@@ -810,14 +843,25 @@ impl LayeredSetup {
             // graceful skip (the host-side check above is the observable warning).
             for (src, dst) in &self.volume_binds {
                 libc::mkdir(dst.as_ptr(), 0o755);
-                let _ = libc::mount(src.as_ptr(), dst.as_ptr(), ptr::null(), libc::MS_BIND | libc::MS_REC, ptr::null());
+                let _ = libc::mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    ptr::null(),
+                    libc::MS_BIND | libc::MS_REC,
+                    ptr::null(),
+                );
             }
             // pivot_root into the composed view.
             libc::mkdir(self.oldroot_dir.as_ptr(), 0o755);
             if libc::chdir(self.merged.as_ptr()) != 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::syscall(libc::SYS_pivot_root, self.merged.as_ptr(), self.put_old.as_ptr()) != 0 {
+            if libc::syscall(
+                libc::SYS_pivot_root,
+                self.merged.as_ptr(),
+                self.put_old.as_ptr(),
+            ) != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             // Now rooted at the overlay; detach the old root lazily.
@@ -891,11 +935,22 @@ mod tests {
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
             .collect();
         // Injected env/secret reaches the container...
-        assert_eq!(envs.get("DOMAIN").map(String::as_str), Some("forumall.jkbase.app"));
+        assert_eq!(
+            envs.get("DOMAIN").map(String::as_str),
+            Some("forumall.jkbase.app")
+        );
         assert_eq!(envs.get("NODE_ENV").map(String::as_str), Some("production"));
         // ...but the platform sets the reserved vars authoritatively (manifest loses).
-        assert_eq!(envs.get("PORT").map(String::as_str), Some("3000"), "platform PORT wins");
-        assert_ne!(envs.get("PATH").map(String::as_str), Some("/evil"), "platform PATH wins");
+        assert_eq!(
+            envs.get("PORT").map(String::as_str),
+            Some("3000"),
+            "platform PORT wins"
+        );
+        assert_ne!(
+            envs.get("PATH").map(String::as_str),
+            Some("/evil"),
+            "platform PATH wins"
+        );
         assert!(envs.get("PATH").is_some_and(|p| p.contains("/opt/bun/bin")));
         assert_eq!(envs.get("HOME").map(String::as_str), Some("/root"));
     }
@@ -925,11 +980,21 @@ mod tests {
             .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
             .collect();
         // The image's own PATH/HOME win (NOT clobbered, no /opt/bun appended).
-        assert_eq!(envs.get("PATH").map(String::as_str), Some("/usr/local/bin:/sbin:/bin"));
+        assert_eq!(
+            envs.get("PATH").map(String::as_str),
+            Some("/usr/local/bin:/sbin:/bin")
+        );
         assert_eq!(envs.get("HOME").map(String::as_str), Some("/home/node"));
-        assert!(!envs["PATH"].contains("/opt/bun"), "no bun PATH for an image server");
+        assert!(
+            !envs["PATH"].contains("/opt/bun"),
+            "no bun PATH for an image server"
+        );
         // PORT remains the routing contract regardless of mode.
-        assert_eq!(envs.get("PORT").map(String::as_str), Some("3000"), "platform PORT wins");
+        assert_eq!(
+            envs.get("PORT").map(String::as_str),
+            Some("3000"),
+            "platform PORT wins"
+        );
         assert_eq!(envs.get("NODE_ENV").map(String::as_str), Some("production"));
 
         // And when the image sets NO PATH/HOME, the platform defaults fill in.

@@ -188,7 +188,8 @@ mod tests {
             env: BTreeMap::from([("NODE_ENV".into(), "production".into())]),
             working_dir: "/app".into(),
         };
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(v["cmd"][0], "/opt/bun/bin/bun");
         assert_eq!(v["working_dir"], "/app");
         assert_eq!(v["env"]["NODE_ENV"], "production");

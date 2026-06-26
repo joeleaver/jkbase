@@ -212,11 +212,17 @@ mod tests {
     #[tokio::test]
     async fn epochs_are_monotonic_across_acquire_release() {
         let l = FlockLease::open(tmp("mono"), "node-a").unwrap();
-        let t1 = l.acquire("proj", "h1", Duration::from_secs(30)).await.unwrap();
+        let t1 = l
+            .acquire("proj", "h1", Duration::from_secs(30))
+            .await
+            .unwrap();
         assert_eq!(t1.epoch, 1);
         assert_eq!(t1.source_id, "node-a");
         l.release(&t1).await.unwrap();
-        let t2 = l.acquire("proj", "h2", Duration::from_secs(30)).await.unwrap();
+        let t2 = l
+            .acquire("proj", "h2", Duration::from_secs(30))
+            .await
+            .unwrap();
         assert_eq!(t2.epoch, 2);
         assert!(t2.supersedes(&t1).unwrap());
     }
@@ -225,7 +231,10 @@ mod tests {
     async fn second_acquire_while_held_is_rejected() {
         let l = FlockLease::open(tmp("held"), "node-a").unwrap();
         let _t = l.acquire("p", "h1", Duration::from_secs(30)).await.unwrap();
-        let err = l.acquire("p", "h2", Duration::from_secs(30)).await.unwrap_err();
+        let err = l
+            .acquire("p", "h2", Duration::from_secs(30))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SubstrateError::LeaseHeld { .. }));
     }
 
@@ -246,7 +255,10 @@ mod tests {
     async fn current_reports_holder_then_free() {
         let l = FlockLease::open(tmp("current"), "node-a").unwrap();
         assert!(l.current("p").await.unwrap().is_none());
-        let t = l.acquire("p", "holder-x", Duration::from_secs(30)).await.unwrap();
+        let t = l
+            .acquire("p", "holder-x", Duration::from_secs(30))
+            .await
+            .unwrap();
         let cur = l.current("p").await.unwrap().unwrap();
         assert_eq!(cur.epoch, t.epoch);
         assert_eq!(cur.holder, "holder-x");
@@ -257,7 +269,10 @@ mod tests {
     #[tokio::test]
     async fn advertises_node_local_fence_caps() {
         let l = FlockLease::open(tmp("caps"), "n").unwrap();
-        assert!(l.caps().contains(Caps::MONOTONIC_FENCE | Caps::NODE_LOCAL_EXCLUSIVE));
+        assert!(
+            l.caps()
+                .contains(Caps::MONOTONIC_FENCE | Caps::NODE_LOCAL_EXCLUSIVE)
+        );
         assert!(!l.caps().contains(Caps::CLUSTER_EXCLUSIVE_FENCE));
         assert_eq!(l.backend_name(), "flock");
     }

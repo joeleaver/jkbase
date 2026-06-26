@@ -104,12 +104,7 @@ impl LogShipper {
             return;
         }
 
-        let new_seq = resp
-            .lines
-            .iter()
-            .map(|l| l.seq)
-            .max()
-            .unwrap_or(used_since);
+        let new_seq = resp.lines.iter().map(|l| l.seq).max().unwrap_or(used_since);
         let boot_id = resp.boot_id.clone();
 
         if let Err(e) = self.log_store.append(project_id, &resp.lines) {

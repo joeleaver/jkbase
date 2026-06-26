@@ -154,7 +154,11 @@ mod tests {
             "/assets/../_servers/api.json",
             "/_layerpaths.json",
         ] {
-            assert_eq!(status(&dir, p, true).await, 404, "fallthrough must block {p}");
+            assert_eq!(
+                status(&dir, p, true).await,
+                404,
+                "fallthrough must block {p}"
+            );
         }
 
         // Legit non-internal content is still served.
@@ -164,8 +168,16 @@ mod tests {
         // Site serving (block_internal=false) keeps `_`-prefixed framework dirs.
         fs::create_dir_all(dir.join("_next")).unwrap();
         fs::write(dir.join("_next/app.js"), "x").unwrap();
-        assert_eq!(status(&dir, "/_next/app.js", false).await, 200, "sites allow _next/");
-        assert_eq!(status(&dir, "/_next/app.js", true).await, 404, "fallthrough blocks _next/");
+        assert_eq!(
+            status(&dir, "/_next/app.js", false).await,
+            200,
+            "sites allow _next/"
+        );
+        assert_eq!(
+            status(&dir, "/_next/app.js", true).await,
+            404,
+            "fallthrough blocks _next/"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

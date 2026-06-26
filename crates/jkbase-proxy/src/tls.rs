@@ -20,7 +20,6 @@ use hickory_client::proto::rr::dnssec::tsig::TSigner;
 use hickory_client::proto::rr::rdata::TXT;
 use hickory_client::proto::rr::{Name, RData, Record};
 use hickory_client::proto::udp::UdpClientStream;
-use tokio::net::UdpSocket;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
     RetryPolicy,
@@ -30,12 +29,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock as AsyncRwLock;
+use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
 use tokio_rustls::rustls::sign::CertifiedKey;
-use tokio_rustls::rustls::ServerConfig;
 use tracing::{info, warn};
 
 /// Renew a cert once it's within this window of (assumed 90-day) expiry. We track
@@ -155,7 +155,8 @@ impl CertManager {
                 if have_cached {
                     warn!(error = %e, "wildcard provisioning failed; using existing cert, will retry");
                 } else {
-                    return Err(e).context("wildcard provisioning failed and no cached cert exists");
+                    return Err(e)
+                        .context("wildcard provisioning failed and no cached cert exists");
                 }
             }
         }
@@ -175,7 +176,11 @@ impl CertManager {
             let key = entry.path().join("privkey.pem");
             match read_certified_key(&cert, &key) {
                 Ok(ck) => {
-                    self.resolver.hosts.write().unwrap().insert(host.clone(), Arc::new(ck));
+                    self.resolver
+                        .hosts
+                        .write()
+                        .unwrap()
+                        .insert(host.clone(), Arc::new(ck));
                     info!(host = %host, "loaded cached custom-domain certificate");
                 }
                 Err(e) => warn!(host = %host, error = %e, "failed to load cached cert"),
@@ -199,7 +204,12 @@ impl CertManager {
         if !self.resolver.hosts.read().unwrap().contains_key(host) {
             return false;
         }
-        let cert = self.cfg.cert_dir.join("custom").join(host).join("fullchain.pem");
+        let cert = self
+            .cfg
+            .cert_dir
+            .join("custom")
+            .join(host)
+            .join("fullchain.pem");
         cert.exists() && !needs_renewal(&cert)
     }
 
@@ -215,7 +225,10 @@ impl CertManager {
         // Dedupe / backoff.
         {
             let mut inflight = self.inflight.lock().unwrap();
-            if inflight.get(host).is_some_and(|last| last.elapsed() < ISSUE_BACKOFF) {
+            if inflight
+                .get(host)
+                .is_some_and(|last| last.elapsed() < ISSUE_BACKOFF)
+            {
                 return;
             }
             inflight.insert(host.to_string(), Instant::now());
@@ -224,7 +237,11 @@ impl CertManager {
         info!(host = %host, "issuing custom-domain certificate via ACME HTTP-01");
         match self.issue_http01(host).await {
             Ok(ck) => {
-                self.resolver.hosts.write().unwrap().insert(host.to_string(), Arc::new(ck));
+                self.resolver
+                    .hosts
+                    .write()
+                    .unwrap()
+                    .insert(host.to_string(), Arc::new(ck));
                 info!(host = %host, "custom-domain certificate issued");
             }
             Err(e) => warn!(host = %host, error = %e, "custom-domain issuance failed (will retry)"),
@@ -248,9 +265,15 @@ impl CertManager {
                     .ok_or_else(|| anyhow::anyhow!("no HTTP-01 challenge offered"))?;
                 let token = challenge.token.clone();
                 let key_auth = challenge.key_authorization().as_str().to_string();
-                self.challenges.write().await.insert(token.clone(), key_auth);
+                self.challenges
+                    .write()
+                    .await
+                    .insert(token.clone(), key_auth);
                 tokens.push(token);
-                challenge.set_ready().await.context("failed to mark challenge ready")?;
+                challenge
+                    .set_ready()
+                    .await
+                    .context("failed to mark challenge ready")?;
             }
         }
 
@@ -280,7 +303,10 @@ impl CertManager {
         let mut params = CertificateParams::new(vec![host.to_string()])?;
         params.distinguished_name = DistinguishedName::new();
         let csr = params.serialize_request(&key_pair)?;
-        order.finalize_csr(csr.der()).await.context("failed to finalize order")?;
+        order
+            .finalize_csr(csr.der())
+            .await
+            .context("failed to finalize order")?;
         let cert_chain = order
             .poll_certificate(&RetryPolicy::default())
             .await
@@ -338,11 +364,17 @@ impl CertManager {
                 record_handles.push(record_id);
                 info!("waiting for DNS propagation...");
                 tokio::time::sleep(Duration::from_secs(15)).await;
-                challenge.set_ready().await.context("failed to mark challenge ready")?;
+                challenge
+                    .set_ready()
+                    .await
+                    .context("failed to mark challenge ready")?;
             }
         }
 
-        order.poll_ready(&RetryPolicy::default()).await.context("order not ready")?;
+        order
+            .poll_ready(&RetryPolicy::default())
+            .await
+            .context("order not ready")?;
         let key_pair = KeyPair::generate()?;
         let domain_names: Vec<String> = identifiers
             .iter()
@@ -354,14 +386,21 @@ impl CertManager {
         let mut params = CertificateParams::new(domain_names)?;
         params.distinguished_name = DistinguishedName::new();
         let csr = params.serialize_request(&key_pair)?;
-        order.finalize_csr(csr.der()).await.context("failed to finalize order")?;
+        order
+            .finalize_csr(csr.der())
+            .await
+            .context("failed to finalize order")?;
         let cert_chain = order
             .poll_certificate(&RetryPolicy::default())
             .await
             .context("failed to get certificate")?;
 
         tokio::fs::write(self.cfg.cert_dir.join("fullchain.pem"), &cert_chain).await?;
-        tokio::fs::write(self.cfg.cert_dir.join("privkey.pem"), key_pair.serialize_pem()).await?;
+        tokio::fs::write(
+            self.cfg.cert_dir.join("privkey.pem"),
+            key_pair.serialize_pem(),
+        )
+        .await?;
         info!("wildcard certificate provisioned");
         Ok(())
     }
@@ -387,8 +426,7 @@ impl CertManager {
                     map.keys()
                         .filter(|h| h.contains('.'))
                         .filter(|h| {
-                            **h != mgr.cfg.domain
-                                && !h.ends_with(&format!(".{}", mgr.cfg.domain))
+                            **h != mgr.cfg.domain && !h.ends_with(&format!(".{}", mgr.cfg.domain))
                         })
                         .cloned()
                         .collect()
@@ -447,14 +485,17 @@ fn needs_renewal(cert_path: &Path) -> bool {
     let Ok(modified) = meta.modified() else {
         return true;
     };
-    modified.elapsed().map(|age| age > RENEW_AFTER).unwrap_or(true)
+    modified
+        .elapsed()
+        .map(|age| age > RENEW_AFTER)
+        .unwrap_or(true)
 }
 
 fn read_certified_key(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
-    let cert_pem = std::fs::read(cert_path)
-        .with_context(|| format!("read {}", cert_path.display()))?;
-    let key_pem = std::fs::read(key_path)
-        .with_context(|| format!("read {}", key_path.display()))?;
+    let cert_pem =
+        std::fs::read(cert_path).with_context(|| format!("read {}", cert_path.display()))?;
+    let key_pem =
+        std::fs::read(key_path).with_context(|| format!("read {}", key_path.display()))?;
     certified_key_from_pem(&cert_pem, &key_pem)
 }
 
@@ -492,7 +533,10 @@ pub struct CloudflareProvider {
 
 impl CloudflareProvider {
     pub fn new(token: impl Into<String>, zone_id: impl Into<String>) -> Self {
-        Self { token: token.into(), zone_id: zone_id.into() }
+        Self {
+            token: token.into(),
+            zone_id: zone_id.into(),
+        }
     }
 }
 
@@ -571,9 +615,9 @@ impl Rfc2136Provider {
         // Validate the host:port shape now; the host is resolved at connect time so a hostname
         // (ns1.example.com:53) works — std::net::SocketAddr's parser only accepts IP:port.
         let nameserver = nameserver.trim().to_string();
-        let shape_ok = nameserver
-            .rsplit_once(':')
-            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0));
+        let shape_ok = nameserver.rsplit_once(':').is_some_and(|(host, port)| {
+            !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p != 0)
+        });
         if !shape_ok {
             anyhow::bail!(
                 "RFC2136_NAMESERVER must be host:port (e.g. ns1.example.com:53 or 192.0.2.1:53), got {nameserver:?}"
@@ -610,8 +654,13 @@ impl Rfc2136Provider {
     }
 
     fn signer(&self) -> Result<TSigner> {
-        TSigner::new(self.tsig_secret.clone(), self.tsig_alg.clone(), fqdn(&self.tsig_name)?, 300)
-            .context("invalid TSIG signer (key name / secret / algorithm)")
+        TSigner::new(
+            self.tsig_secret.clone(),
+            self.tsig_alg.clone(),
+            fqdn(&self.tsig_name)?,
+            300,
+        )
+        .context("invalid TSIG signer (key name / secret / algorithm)")
     }
 
     /// Open a fresh TSIG-signed UDP client to the nameserver. The background driver is
@@ -623,14 +672,19 @@ impl Rfc2136Provider {
             .with_context(|| format!("RFC2136_NAMESERVER {:?} failed to resolve", self.nameserver))?
             .next()
             .ok_or_else(|| {
-                anyhow::anyhow!("RFC2136_NAMESERVER {:?} resolved to no addresses", self.nameserver)
+                anyhow::anyhow!(
+                    "RFC2136_NAMESERVER {:?} resolved to no addresses",
+                    self.nameserver
+                )
             })?;
         let stream = UdpClientStream::<UdpSocket, TSigner>::with_timeout_and_signer(
             addr,
             Duration::from_secs(10),
             Some(Arc::new(self.signer()?)),
         );
-        let (client, bg) = AsyncClient::connect(stream).await.context("rfc2136: TSIG client connect failed")?;
+        let (client, bg) = AsyncClient::connect(stream)
+            .await
+            .context("rfc2136: TSIG client connect failed")?;
         tokio::spawn(bg);
         Ok(client)
     }
@@ -647,7 +701,8 @@ impl Rfc2136Provider {
                 self.zone
             );
         }
-        let record = Record::from_rdata(rec_name, 120, RData::TXT(TXT::new(vec![value.to_string()])));
+        let record =
+            Record::from_rdata(rec_name, 120, RData::TXT(TXT::new(vec![value.to_string()])));
         Ok((record, zone))
     }
 }
@@ -670,7 +725,10 @@ impl DnsProvider for Rfc2136Provider {
             .await
             .context("rfc2136: TXT append (dynamic UPDATE) failed")?;
         if resp.response_code() != ResponseCode::NoError {
-            anyhow::bail!("rfc2136: nameserver rejected append: {}", resp.response_code());
+            anyhow::bail!(
+                "rfc2136: nameserver rejected append: {}",
+                resp.response_code()
+            );
         }
         // Handle encodes name+value so delete_by_rdata can remove exactly this RR.
         Ok(format!("{name}\t{value}"))
@@ -687,7 +745,10 @@ impl DnsProvider for Rfc2136Provider {
             .await
             .context("rfc2136: TXT delete (dynamic UPDATE) failed")?;
         if resp.response_code() != ResponseCode::NoError {
-            anyhow::bail!("rfc2136: nameserver rejected delete: {}", resp.response_code());
+            anyhow::bail!(
+                "rfc2136: nameserver rejected delete: {}",
+                resp.response_code()
+            );
         }
         Ok(())
     }
@@ -700,34 +761,110 @@ mod tests {
     #[test]
     fn rfc2136_config_validation() {
         // Valid config parses (IP:port).
-        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").is_ok());
+        assert!(
+            Rfc2136Provider::new(
+                "192.0.2.1:53",
+                "example.com",
+                "acme-key",
+                "c2VjcmV0",
+                "hmac-sha256"
+            )
+            .is_ok()
+        );
         // A HOSTNAME:port is accepted at construction (resolved later, not via SocketAddr parse).
-        assert!(Rfc2136Provider::new("ns1.example.com:53", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_ok());
+        assert!(
+            Rfc2136Provider::new(
+                "ns1.example.com:53",
+                "example.com",
+                "k",
+                "c2VjcmV0",
+                "hmac-sha256"
+            )
+            .is_ok()
+        );
         // Empty algorithm string defaults to hmac-sha256.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "").is_ok());
         // Bad nameserver (no port).
-        assert!(Rfc2136Provider::new("ns1.example.com", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
-        assert!(Rfc2136Provider::new("not-a-nameserver", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        assert!(
+            Rfc2136Provider::new(
+                "ns1.example.com",
+                "example.com",
+                "k",
+                "c2VjcmV0",
+                "hmac-sha256"
+            )
+            .is_err()
+        );
+        assert!(
+            Rfc2136Provider::new(
+                "not-a-nameserver",
+                "example.com",
+                "k",
+                "c2VjcmV0",
+                "hmac-sha256"
+            )
+            .is_err()
+        );
         // Empty zone / key name rejected.
         assert!(Rfc2136Provider::new("192.0.2.1:53", "", "k", "c2VjcmV0", "hmac-sha256").is_err());
-        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "", "c2VjcmV0", "hmac-sha256").is_err());
+        assert!(
+            Rfc2136Provider::new("192.0.2.1:53", "example.com", "", "c2VjcmV0", "hmac-sha256")
+                .is_err()
+        );
         // Port 0 rejected (cleaner than a late connect failure).
-        assert!(Rfc2136Provider::new("192.0.2.1:0", "example.com", "k", "c2VjcmV0", "hmac-sha256").is_err());
+        assert!(
+            Rfc2136Provider::new("192.0.2.1:0", "example.com", "k", "c2VjcmV0", "hmac-sha256")
+                .is_err()
+        );
         // Non-base64 secret, and empty secret, rejected.
-        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "!!! not base64 !!!", "hmac-sha256").is_err());
-        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "", "hmac-sha256").is_err());
+        assert!(
+            Rfc2136Provider::new(
+                "192.0.2.1:53",
+                "example.com",
+                "k",
+                "!!! not base64 !!!",
+                "hmac-sha256"
+            )
+            .is_err()
+        );
+        assert!(
+            Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "", "hmac-sha256").is_err()
+        );
         // Unsupported algorithm.
-        assert!(Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "hmac-md5").is_err());
+        assert!(
+            Rfc2136Provider::new("192.0.2.1:53", "example.com", "k", "c2VjcmV0", "hmac-md5")
+                .is_err()
+        );
     }
 
     #[test]
     fn record_and_zone_rejects_record_outside_zone() {
-        let p = Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").unwrap();
+        let p = Rfc2136Provider::new(
+            "192.0.2.1:53",
+            "example.com",
+            "acme-key",
+            "c2VjcmV0",
+            "hmac-sha256",
+        )
+        .unwrap();
         // In-zone record is accepted (no panic, builds record+zone).
-        assert!(p.record_and_zone("_acme-challenge.example.com", "v").is_ok());
+        assert!(
+            p.record_and_zone("_acme-challenge.example.com", "v")
+                .is_ok()
+        );
         // Out-of-zone record is a clean error, NOT a hickory zone_of panic.
-        let p2 = Rfc2136Provider::new("192.0.2.1:53", "other.net", "acme-key", "c2VjcmV0", "hmac-sha256").unwrap();
-        assert!(p2.record_and_zone("_acme-challenge.example.com", "v").is_err());
+        let p2 = Rfc2136Provider::new(
+            "192.0.2.1:53",
+            "other.net",
+            "acme-key",
+            "c2VjcmV0",
+            "hmac-sha256",
+        )
+        .unwrap();
+        assert!(
+            p2.record_and_zone("_acme-challenge.example.com", "v")
+                .is_err()
+        );
     }
 
     /// Execution-backed proof of the RFC2136 wire path: build the EXACT UPDATE messages
@@ -743,9 +880,17 @@ mod tests {
         use hickory_client::proto::rr::RecordType;
         use hickory_client::proto::serialize::binary::BinEncodable;
 
-        let p =
-            Rfc2136Provider::new("ns1.example.com:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha256").unwrap();
-        let (record, zone) = p.record_and_zone("_acme-challenge.example.com", "tok-base64url-value").unwrap();
+        let p = Rfc2136Provider::new(
+            "ns1.example.com:53",
+            "example.com",
+            "acme-key",
+            "c2VjcmV0",
+            "hmac-sha256",
+        )
+        .unwrap();
+        let (record, zone) = p
+            .record_and_zone("_acme-challenge.example.com", "tok-base64url-value")
+            .unwrap();
         let signer = p.signer().unwrap();
         let now = 1_700_000_000u32;
 
@@ -753,13 +898,17 @@ mod tests {
         let mut add = update_message::append(record.clone().into(), zone.clone(), false, true);
         add.finalize(&signer, now).expect("TSIG-sign append");
         let add_bytes = add.to_bytes().expect("encode append");
-        signer.verify_message_byte(None, &add_bytes, true).expect("a real server's TSIG verify accepts the append");
+        signer
+            .verify_message_byte(None, &add_bytes, true)
+            .expect("a real server's TSIG verify accepts the append");
         let parsed = Message::from_vec(&add_bytes).unwrap();
         assert_eq!(parsed.op_code(), OpCode::Update);
         assert!(
             parsed.name_servers().iter().any(|r| {
                 r.record_type() == RecordType::TXT
-                    && r.name().to_ascii().starts_with("_acme-challenge.example.com")
+                    && r.name()
+                        .to_ascii()
+                        .starts_with("_acme-challenge.example.com")
             }),
             "append UPDATE must carry the _acme-challenge TXT in the update section: {parsed:?}"
         );
@@ -768,27 +917,50 @@ mod tests {
         let mut del = update_message::delete_by_rdata(record.into(), zone, true);
         del.finalize(&signer, now).expect("TSIG-sign delete");
         let del_bytes = del.to_bytes().expect("encode delete");
-        signer.verify_message_byte(None, &del_bytes, true).expect("a real server's TSIG verify accepts the delete");
-        assert_eq!(Message::from_vec(&del_bytes).unwrap().op_code(), OpCode::Update);
+        signer
+            .verify_message_byte(None, &del_bytes, true)
+            .expect("a real server's TSIG verify accepts the delete");
+        assert_eq!(
+            Message::from_vec(&del_bytes).unwrap().op_code(),
+            OpCode::Update
+        );
 
         // A DIFFERENT key must NOT verify our message (proves the check is real, not a no-op).
-        let other = Rfc2136Provider::new("ns1.example.com:53", "example.com", "acme-key", "ZGlmZmVyZW50", "hmac-sha256")
-            .unwrap()
-            .signer()
-            .unwrap();
-        assert!(other.verify_message_byte(None, &add_bytes, true).is_err(), "wrong TSIG key must be rejected");
+        let other = Rfc2136Provider::new(
+            "ns1.example.com:53",
+            "example.com",
+            "acme-key",
+            "ZGlmZmVyZW50",
+            "hmac-sha256",
+        )
+        .unwrap()
+        .signer()
+        .unwrap();
+        assert!(
+            other.verify_message_byte(None, &add_bytes, true).is_err(),
+            "wrong TSIG key must be rejected"
+        );
     }
 
     #[test]
     fn fqdn_normalizes_to_single_trailing_dot() {
-        assert_eq!(fqdn("_acme-challenge.example.com").unwrap().to_string(), "_acme-challenge.example.com.");
+        assert_eq!(
+            fqdn("_acme-challenge.example.com").unwrap().to_string(),
+            "_acme-challenge.example.com."
+        );
         assert_eq!(fqdn("example.com.").unwrap().to_string(), "example.com.");
     }
 
     #[test]
     fn signer_builds_for_valid_config() {
-        let p =
-            Rfc2136Provider::new("192.0.2.1:53", "example.com", "acme-key", "c2VjcmV0", "hmac-sha512").unwrap();
+        let p = Rfc2136Provider::new(
+            "192.0.2.1:53",
+            "example.com",
+            "acme-key",
+            "c2VjcmV0",
+            "hmac-sha512",
+        )
+        .unwrap();
         assert!(p.signer().is_ok());
     }
 }

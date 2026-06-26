@@ -35,13 +35,18 @@ const SERVER_TS: &str = r#"const port = Number(process.env.PORT) || 3000;
 Bun.serve({ port, fetch() { return new Response("ok\n"); } });
 console.log("layered server listening on " + port);
 "#;
-const PACKAGE_JSON: &str =
-    r#"{ "name": "layered-agent-smoke", "module": "server.ts", "scripts": { "start": "bun run server.ts" } }"#;
+const PACKAGE_JSON: &str = r#"{ "name": "layered-agent-smoke", "module": "server.ts", "scripts": { "start": "bun run server.ts" } }"#;
 
 async fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new(cmd).args(args).output().await?;
+    let out = tokio::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success() {
-        anyhow::bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{cmd} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -59,7 +64,11 @@ async fn main() -> anyhow::Result<()> {
     let fc_bin = fc.join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64");
     let store = fc.join("baselayers");
     let agent_bin = repo.join("target/x86_64-unknown-linux-musl/release/jkbase-agent");
-    for (label, p) in [("kernel", &kernel), ("firecracker", &fc_bin), ("agent", &agent_bin)] {
+    for (label, p) in [
+        ("kernel", &kernel),
+        ("firecracker", &fc_bin),
+        ("agent", &agent_bin),
+    ] {
         anyhow::ensure!(
             p.exists(),
             "{label} not found at {} (agent: cargo build --release -p jkbase-agent --target x86_64-unknown-linux-musl)",
@@ -80,7 +89,11 @@ async fn main() -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(store.join("platform.json"))?)?;
     let base_blob = store.join(manifest["base"]["file"].as_str().unwrap());
     let runtime_blob = store.join(manifest["runtimes"]["bun"]["file"].as_str().unwrap());
-    println!("[1/6] layer store: base={} runtime={}", base_blob.display(), runtime_blob.display());
+    println!(
+        "[1/6] layer store: base={} runtime={}",
+        base_blob.display(),
+        runtime_blob.display()
+    );
 
     // --- per-app erofs layer (workspace rooted at /app) ---
     let app_stage = work.join("app-stage");
@@ -88,8 +101,19 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(app_stage.join("app/server.ts"), SERVER_TS)?;
     std::fs::write(app_stage.join("app/package.json"), PACKAGE_JSON)?;
     let app_blob = work.join("app.erofs");
-    run("mkfs.erofs", &["-zlz4hc", "--all-root", "-T", "0", "--mkfs-time",
-        app_blob.to_str().unwrap(), app_stage.to_str().unwrap()]).await?;
+    run(
+        "mkfs.erofs",
+        &[
+            "-zlz4hc",
+            "--all-root",
+            "-T",
+            "0",
+            "--mkfs-time",
+            app_blob.to_str().unwrap(),
+            app_stage.to_str().unwrap(),
+        ],
+    )
+    .await?;
     println!("[2/6] built app layer {}", app_blob.display());
 
     // --- agent base rootfs (vda): the musl agent as PID1 + the mount skeleton ---
@@ -119,7 +143,10 @@ async fn main() -> anyhow::Result<()> {
         serde_json::to_vec_pretty(&server_manifest)?,
     )?;
     let routes = serde_json::json!({ "/": { "service": "server", "name": "api" } });
-    std::fs::write(meta_stage.join("_routes.json"), serde_json::to_vec_pretty(&routes)?)?;
+    std::fs::write(
+        meta_stage.join("_routes.json"),
+        serde_json::to_vec_pretty(&routes)?,
+    )?;
     // Device assignment committed below: vdc=base, vdd=runtime, vde=app. The layer
     // order is the overlayfs lowerdir order (app first, base last).
     let layers = serde_json::json!({
@@ -127,7 +154,10 @@ async fn main() -> anyhow::Result<()> {
         "data_device": null,
         "servers": { "api": { "layers": ["/dev/vde", "/dev/vdd", "/dev/vdc"] } },
     });
-    std::fs::write(meta_stage.join("_layers.json"), serde_json::to_vec_pretty(&layers)?)?;
+    std::fs::write(
+        meta_stage.join("_layers.json"),
+        serde_json::to_vec_pretty(&layers)?,
+    )?;
     let meta_img = work.join("metadata.ext4");
     build_ro_ext4_from_dir(&meta_stage, &meta_img, 8)?;
     println!("[4/6] built metadata image {}", meta_img.display());
@@ -181,13 +211,22 @@ async fn main() -> anyhow::Result<()> {
         Ok(body) => {
             println!("[6/6] HTTP 200 from the agent-routed layered server: {body:?}");
             let _ = std::fs::remove_dir_all(&work);
-            println!("\n✅ real agent serves a layered server on 6.12: _layers.json -> erofs mounts -> per-server overlay+pivot_root -> bun -> agent proxy -> 200.");
+            println!(
+                "\n✅ real agent serves a layered server on 6.12: _layers.json -> erofs mounts -> per-server overlay+pivot_root -> bun -> agent proxy -> 200."
+            );
             Ok(())
         }
         Err(e) => {
             eprintln!("--- console.log (tail) ---");
             if let Ok(s) = std::fs::read_to_string(&console_log) {
-                for line in s.lines().rev().take(60).collect::<Vec<_>>().into_iter().rev() {
+                for line in s
+                    .lines()
+                    .rev()
+                    .take(60)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     eprintln!("{line}");
                 }
             }

@@ -11,7 +11,7 @@
 //! Derived from the reviewed hardening spec. Items that can only be confirmed on
 //! a real KVM host are marked `// VERIFY(build/jailer):`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -192,8 +192,7 @@ pub fn assert_same_fs(a: &Path, b: &Path) -> Result<()> {
 /// the dropped build uid must be able to `open()` it.
 pub fn stage_ro(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     std::fs::hard_link(src, dst).with_context(|| {
         format!(
@@ -211,8 +210,7 @@ pub fn stage_ro(src: &Path, dst: &Path) -> Result<()> {
 /// growth.
 pub fn stage_rw_prealloc(dst: &Path, size_bytes: u64, uid: u32, gid: u32) -> Result<()> {
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     // `fallocate` reserves real blocks. (util-linux; orch runs as root.)
     let status = std::process::Command::new("fallocate")
@@ -359,14 +357,19 @@ mod tests {
         );
         assert_eq!(
             l.host_socket,
-            PathBuf::from("/data/jailer/firecracker-v1.15.1-x86_64/abc/root/run/firecracker.socket")
+            PathBuf::from(
+                "/data/jailer/firecracker-v1.15.1-x86_64/abc/root/run/firecracker.socket"
+            )
         );
         assert_eq!(l.api_sock_arg, "run/firecracker.socket");
         assert_eq!(
             l.drives_dir,
             PathBuf::from("/data/jailer/firecracker-v1.15.1-x86_64/abc/root/drives")
         );
-        assert_eq!(l.cgroup_dir, PathBuf::from("/sys/fs/cgroup/jkbase-build/abc"));
+        assert_eq!(
+            l.cgroup_dir,
+            PathBuf::from("/sys/fs/cgroup/jkbase-build/abc")
+        );
         assert_eq!(
             l.parent_cgroup_dir,
             PathBuf::from("/sys/fs/cgroup/jkbase-build")

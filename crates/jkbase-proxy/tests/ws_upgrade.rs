@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use jkbase_proxy::{DomainTarget, ProxyConfig, RoutingTable, new_domain_map, new_routing_table, serve};
+use jkbase_proxy::{
+    DomainTarget, ProxyConfig, RoutingTable, new_domain_map, new_routing_table, serve,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, oneshot};
@@ -198,11 +200,20 @@ async fn proxy_relays_websocket_upgrade_via_api() {
         .unwrap();
 
     let head = read_head(&mut client).await;
-    assert!(head.starts_with("HTTP/1.1 101"), "expected 101, got: {head:?}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected 101, got: {head:?}"
+    );
     let lower = head.to_ascii_lowercase();
     // The switch headers must survive sanitization (preserve_upgrade).
-    assert!(lower.contains("upgrade: websocket"), "missing Upgrade: {head:?}");
-    assert!(lower.contains("connection: upgrade"), "missing Connection: {head:?}");
+    assert!(
+        lower.contains("upgrade: websocket"),
+        "missing Upgrade: {head:?}"
+    );
+    assert!(
+        lower.contains("connection: upgrade"),
+        "missing Connection: {head:?}"
+    );
 
     client.write_all(b"hello-ws").await.unwrap();
     let mut echo = [0u8; 8];
@@ -223,10 +234,16 @@ async fn proxy_relays_websocket_upgrade_via_tenant_path() {
     let domains = new_domain_map();
     domains.write().await.insert(
         "myapp".to_string(),
-        DomainTarget { project_id: "myapp".to_string(), site: None },
+        DomainTarget {
+            project_id: "myapp".to_string(),
+            site: None,
+        },
     );
     let routes = new_routing_table();
-    routes.write().await.insert("myapp".to_string(), "127.0.0.1".to_string());
+    routes
+        .write()
+        .await
+        .insert("myapp".to_string(), "127.0.0.1".to_string());
 
     let mut config = base_config(proxy_port);
     config.domains = Some(domains);
@@ -247,7 +264,10 @@ async fn proxy_relays_websocket_upgrade_via_tenant_path() {
         .unwrap();
 
     let head = read_head(&mut client).await;
-    assert!(head.starts_with("HTTP/1.1 101"), "expected 101 on tenant path, got: {head:?}");
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected 101 on tenant path, got: {head:?}"
+    );
 
     client.write_all(b"tenant-ws").await.unwrap();
     let mut echo = [0u8; 9];
@@ -266,10 +286,16 @@ async fn non_upgrade_response_is_buffered_and_sanitized() {
     let domains = new_domain_map();
     domains.write().await.insert(
         "myapp".to_string(),
-        DomainTarget { project_id: "myapp".to_string(), site: None },
+        DomainTarget {
+            project_id: "myapp".to_string(),
+            site: None,
+        },
     );
     let routes = new_routing_table();
-    routes.write().await.insert("myapp".to_string(), "127.0.0.1".to_string());
+    routes
+        .write()
+        .await
+        .insert("myapp".to_string(), "127.0.0.1".to_string());
 
     let mut config = base_config(proxy_port);
     config.domains = Some(domains);
@@ -300,10 +326,19 @@ async fn non_upgrade_response_is_buffered_and_sanitized() {
     }
     let resp = String::from_utf8_lossy(&all);
     let lower = resp.to_ascii_lowercase();
-    assert!(resp.starts_with("HTTP/1.1 200"), "expected 200, got: {resp:?}");
-    assert!(resp.contains("hello-body"), "body must pass through: {resp:?}");
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {resp:?}"
+    );
+    assert!(
+        resp.contains("hello-body"),
+        "body must pass through: {resp:?}"
+    );
     // Sanitization: apex Domain stripped, HSTS stripped, hop-by-hop not forwarded.
-    assert!(lower.contains("set-cookie"), "the cookie itself is kept: {resp:?}");
+    assert!(
+        lower.contains("set-cookie"),
+        "the cookie itself is kept: {resp:?}"
+    );
     assert!(
         !lower.contains("domain=.test.local") && !lower.contains("domain=test.local"),
         "apex-scoped cookie Domain must be stripped: {resp:?}"
@@ -324,10 +359,16 @@ async fn unsolicited_backend_101_becomes_502() {
     let domains = new_domain_map();
     domains.write().await.insert(
         "myapp".to_string(),
-        DomainTarget { project_id: "myapp".to_string(), site: None },
+        DomainTarget {
+            project_id: "myapp".to_string(),
+            site: None,
+        },
     );
     let routes = new_routing_table();
-    routes.write().await.insert("myapp".to_string(), "127.0.0.1".to_string());
+    routes
+        .write()
+        .await
+        .insert("myapp".to_string(), "127.0.0.1".to_string());
 
     let mut config = base_config(proxy_port);
     config.domains = Some(domains);

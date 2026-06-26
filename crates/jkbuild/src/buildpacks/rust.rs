@@ -81,9 +81,7 @@ impl Buildpack for RustBuildpack {
             cmd.arg("--locked");
         }
         cmd.current_dir(ctx.app_dir);
-        let out = cmd
-            .output()
-            .context("spawning `cargo build --release`")?;
+        let out = cmd.output().context("spawning `cargo build --release`")?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let lines: Vec<&str> = err.lines().collect();
@@ -199,7 +197,8 @@ pub fn preferred_bin(app_dir: &Path) -> Option<String> {
 /// carrying `executable` wins). Non-bin / library artifacts (null `executable`) and
 /// non-artifact messages are ignored.
 fn parse_bin_artifacts(stdout: &[u8]) -> Vec<(String, PathBuf)> {
-    let mut by_name: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> =
+        std::collections::BTreeMap::new();
     for line in stdout.split(|b| *b == b'\n') {
         if line.is_empty() {
             continue;
@@ -219,7 +218,10 @@ fn parse_bin_artifacts(stdout: &[u8]) -> Vec<(String, PathBuf)> {
             continue;
         }
         let exe = v.get("executable").and_then(|e| e.as_str());
-        let name = v.get("target").and_then(|t| t.get("name")).and_then(|n| n.as_str());
+        let name = v
+            .get("target")
+            .and_then(|t| t.get("name"))
+            .and_then(|n| n.as_str());
         if let (Some(exe), Some(name)) = (exe, name) {
             by_name.insert(name.to_string(), PathBuf::from(exe));
         }
@@ -262,12 +264,15 @@ fn assemble_app_layer(app_dir: &Path, app_at: &Path, bins: &[(String, PathBuf)])
     // rename; both are on /scratch). Permissions, symlinks, and a committed-executable
     // entrypoint are preserved.
     const EXCLUDE: &[&str] = &["target", ".git"];
-    for entry in std::fs::read_dir(app_dir)
-        .with_context(|| format!("read app dir {}", app_dir.display()))?
+    for entry in
+        std::fs::read_dir(app_dir).with_context(|| format!("read app dir {}", app_dir.display()))?
     {
         let entry = entry?;
         let name = entry.file_name();
-        if EXCLUDE.iter().any(|e| name.as_os_str() == std::ffi::OsStr::new(e)) {
+        if EXCLUDE
+            .iter()
+            .any(|e| name.as_os_str() == std::ffi::OsStr::new(e))
+        {
             continue;
         }
         std::fs::rename(entry.path(), app_at.join(&name))
@@ -295,9 +300,20 @@ fn assemble_app_layer(app_dir: &Path, app_at: &Path, bins: &[(String, PathBuf)])
 /// glibc `.so` would shadow base's and risk a version skew.
 fn is_base_lib(soname: &str) -> bool {
     const BASE: &[&str] = &[
-        "libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "libresolv.so",
-        "libnsl.so", "libutil.so", "libcrypt.so", "libanl.so", "libnss_", "libgcc_s.so",
-        "ld-linux", "linux-vdso",
+        "libc.so",
+        "libm.so",
+        "libdl.so",
+        "libpthread.so",
+        "librt.so",
+        "libresolv.so",
+        "libnsl.so",
+        "libutil.so",
+        "libcrypt.so",
+        "libanl.so",
+        "libnss_",
+        "libgcc_s.so",
+        "ld-linux",
+        "linux-vdso",
     ];
     BASE.iter().any(|b| soname.starts_with(b))
 }
@@ -342,7 +358,9 @@ fn read_pt_interp(bin: &Path) -> Option<String> {
             let off = rd_u64(ph + 8)?;
             let sz = rd_u64(ph + 32)?;
             let raw = data.get(off..(off + sz).min(data.len()))?;
-            let s = String::from_utf8_lossy(raw).trim_end_matches('\0').to_string();
+            let s = String::from_utf8_lossy(raw)
+                .trim_end_matches('\0')
+                .to_string();
             if !s.is_empty() {
                 return Some(s);
             }
@@ -360,7 +378,10 @@ fn lib_trace(bin: &Path) -> Vec<String> {
     if let Ok(out) = std::process::Command::new("ldd").arg(bin).output()
         && (out.status.success() || String::from_utf8_lossy(&out.stdout).contains(" => "))
     {
-        return String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect();
+        return String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
     }
     let mut loaders: Vec<String> = Vec::new();
     if let Some(interp) = read_pt_interp(bin) {
@@ -372,7 +393,11 @@ fn lib_trace(bin: &Path) -> Vec<String> {
         if !Path::new(&loader).exists() {
             continue;
         }
-        if let Ok(out) = std::process::Command::new(&loader).arg("--list").arg(bin).output() {
+        if let Ok(out) = std::process::Command::new(&loader)
+            .arg("--list")
+            .arg(bin)
+            .output()
+        {
             let text = String::from_utf8_lossy(&out.stdout);
             if text.contains(" => ") || text.contains("not a dynamic") {
                 return text.lines().map(String::from).collect();
@@ -388,7 +413,11 @@ fn lib_trace(bin: &Path) -> Vec<String> {
 /// full closure (libstdc++ → its own deps, etc.). A static binary or an empty trace
 /// ships nothing — that is correct, not an error. Runs inside the sealed build VM on
 /// the tenant's own binary, within the existing VM trust boundary.
-fn ship_native_lib_closure(app_at: &Path, bins: &[(String, PathBuf)], lib_dir: &Path) -> Result<()> {
+fn ship_native_lib_closure(
+    app_at: &Path,
+    bins: &[(String, PathBuf)],
+    lib_dir: &Path,
+) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut shipped: std::collections::BTreeSet<String> = Default::default();
     for (name, _) in bins {
@@ -448,7 +477,11 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         let lines: Vec<&str> = combined.lines().collect();
         let tail = lines[lines.len().saturating_sub(40)..].join("\n");
-        anyhow::bail!("`{what}` failed: {}\n--- output (tail) ---\n{}", out.status, tail);
+        anyhow::bail!(
+            "`{what}` failed: {}\n--- output (tail) ---\n{}",
+            out.status,
+            tail
+        );
     }
     Ok(())
 }
@@ -523,7 +556,11 @@ mod tests {
     #[test]
     fn preferred_bin_reads_package_then_bin_override() {
         let d = tempdir().unwrap();
-        write(d.path(), "Cargo.toml", "[package]\nname = \"my-app\"\nversion=\"0.1.0\"\n");
+        write(
+            d.path(),
+            "Cargo.toml",
+            "[package]\nname = \"my-app\"\nversion=\"0.1.0\"\n",
+        );
         assert_eq!(preferred_bin(d.path()).as_deref(), Some("my-app"));
 
         let d2 = tempdir().unwrap();
@@ -538,7 +575,11 @@ mod tests {
     #[test]
     fn preferred_bin_none_for_virtual_workspace() {
         let d = tempdir().unwrap();
-        write(d.path(), "Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+        write(
+            d.path(),
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"a\", \"b\"]\n",
+        );
         assert_eq!(preferred_bin(d.path()), None);
     }
 
@@ -547,16 +588,24 @@ mod tests {
         // A realistic cargo --message-format=json stream: a lib artifact (null
         // executable), a build-script message, then two bin artifacts.
         let stream = concat!(
-            r#"{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}"#, "\n",
-            r#"{"reason":"build-script-executed","package_id":"x"}"#, "\n",
-            r#"{"reason":"compiler-artifact","target":{"name":"server","kind":["bin"]},"executable":"/scratch/workspace/target/release/server"}"#, "\n",
-            r#"{"reason":"compiler-artifact","target":{"name":"worker","kind":["bin"]},"executable":"/scratch/workspace/target/x86_64-unknown-linux-gnu/release/worker"}"#, "\n",
-            r#"{"reason":"build-finished","success":true}"#, "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"mylib","kind":["lib"]},"executable":null}"#,
+            "\n",
+            r#"{"reason":"build-script-executed","package_id":"x"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"server","kind":["bin"]},"executable":"/scratch/workspace/target/release/server"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"worker","kind":["bin"]},"executable":"/scratch/workspace/target/x86_64-unknown-linux-gnu/release/worker"}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
         );
         let bins = parse_bin_artifacts(stream.as_bytes());
         assert_eq!(bins.len(), 2);
         let map: std::collections::BTreeMap<_, _> = bins.iter().cloned().collect();
-        assert_eq!(map["server"], PathBuf::from("/scratch/workspace/target/release/server"));
+        assert_eq!(
+            map["server"],
+            PathBuf::from("/scratch/workspace/target/release/server")
+        );
         // The custom-target path is honoured verbatim (no FS guessing).
         assert_eq!(
             map["worker"],
@@ -591,13 +640,23 @@ mod tests {
         assemble_app_layer(&app, &app_at, &bins).unwrap();
 
         // Assets + source + entrypoint shipped.
-        assert_eq!(fs::read_to_string(app_at.join("data/seed.txt")).unwrap(), "asset-payload");
+        assert_eq!(
+            fs::read_to_string(app_at.join("data/seed.txt")).unwrap(),
+            "asset-payload"
+        );
         assert!(app_at.join("src/main.rs").exists());
         assert!(app_at.join("Cargo.toml").exists());
         assert!(app_at.join("entrypoint.sh").exists());
         // Binary placed + executable.
         assert!(app_at.join("svc").exists());
-        assert_eq!(fs::metadata(app_at.join("svc")).unwrap().permissions().mode() & 0o111, 0o111);
+        assert_eq!(
+            fs::metadata(app_at.join("svc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o111
+        );
         // Build artifacts + VCS metadata excluded.
         assert!(!app_at.join("target").exists(), "target/ must not ship");
         assert!(!app_at.join(".git").exists(), ".git must not ship");
@@ -614,7 +673,10 @@ mod tests {
             Some(("libstdc++.so.6", "/usr/lib/libstdc++.so.6"))
         );
         // loader + vDSO (no " => ") and unresolved entries are skipped.
-        assert_eq!(parse_ldd_line("\t/lib/ld-linux-x86-64.so.2 (0x00007f0000)"), None);
+        assert_eq!(
+            parse_ldd_line("\t/lib/ld-linux-x86-64.so.2 (0x00007f0000)"),
+            None
+        );
         assert_eq!(parse_ldd_line("\tlinux-vdso.so.1 (0x00007ffd)"), None);
         assert_eq!(parse_ldd_line("\tlibfoo.so.1 => not found"), None);
     }
@@ -623,15 +685,23 @@ mod tests {
     fn base_libs_excluded_native_libs_shipped() {
         // glibc closure + libgcc_s + loader come from the base layer (don't ship).
         for b in [
-            "libc.so.6", "libm.so.6", "libgcc_s.so.1", "libpthread.so.0",
-            "ld-linux-x86-64.so.2", "linux-vdso.so.1",
+            "libc.so.6",
+            "libm.so.6",
+            "libgcc_s.so.1",
+            "libpthread.so.0",
+            "ld-linux-x86-64.so.2",
+            "linux-vdso.so.1",
         ] {
             assert!(is_base_lib(b), "{b} should be base-provided");
         }
         // native-FFI libs are shipped per-app into the app layer's /usr/lib.
         for n in [
-            "libstdc++.so.6", "libssl.so.3", "libcrypto.so.3", "libz.so.1",
-            "libzstd.so.1", "libonnxruntime.so",
+            "libstdc++.so.6",
+            "libssl.so.3",
+            "libcrypto.so.3",
+            "libz.so.1",
+            "libzstd.so.1",
+            "libonnxruntime.so",
         ] {
             assert!(!is_base_lib(n), "{n} should be shipped");
         }

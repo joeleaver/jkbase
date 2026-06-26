@@ -13,8 +13,8 @@
 //!   ceremony is needed.
 //! - **JS/TS** → ComponentizeJS (added in the JS phase).
 
-use crate::buildpack::{apply_mirror_ca, Decision};
-use anyhow::{bail, Context, Result};
+use crate::buildpack::{Decision, apply_mirror_ca};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -273,7 +273,11 @@ fn has_npm_dependencies(package_json: &Path) -> bool {
     };
     ["dependencies", "devDependencies", "optionalDependencies"]
         .iter()
-        .any(|k| pkg.get(k).and_then(|v| v.as_object()).is_some_and(|o| !o.is_empty()))
+        .any(|k| {
+            pkg.get(k)
+                .and_then(|v| v.as_object())
+                .is_some_and(|o| !o.is_empty())
+        })
 }
 
 /// Find the single `wasi:http` component cargo produced in the wasip2 release dir.
@@ -339,7 +343,11 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         let lines: Vec<&str> = combined.lines().collect();
         let tail = lines[lines.len().saturating_sub(40)..].join("\n");
-        bail!("`{what}` failed: {}\n--- output (tail) ---\n{}", out.status, tail);
+        bail!(
+            "`{what}` failed: {}\n--- output (tail) ---\n{}",
+            out.status,
+            tail
+        );
     }
     Ok(())
 }

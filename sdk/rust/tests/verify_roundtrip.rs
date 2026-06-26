@@ -25,7 +25,10 @@ const AK: &str = "AKIDTESTKEY";
 const SK: &str = "test-secret-key";
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Percent-decode `%XX` from raw bytes (mirrors the front's `pct_decode`).
@@ -69,8 +72,11 @@ fn parse_query(q: &str) -> Vec<(String, String)> {
 /// Spin up the engine wrapped in a SigV4-verifying layer (the production gate), and an
 /// `ObjectClient` whose credentials + signed host match it. Returns (client, dir).
 async fn spawn_verifying() -> (ObjectClient, std::path::PathBuf) {
-    let dir = std::env::temp_dir()
-        .join(format!("jkb-objclient-verify-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let dir = std::env::temp_dir().join(format!(
+        "jkb-objclient-verify-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Arc::new(ObjectStore::open(&dir).unwrap());
 
@@ -91,14 +97,34 @@ async fn spawn_verifying() -> (ObjectClient, std::path::PathBuf) {
             let is_presigned = query.iter().any(|(k, _)| k == "X-Amz-Signature");
 
             let ok = if is_presigned {
-                jkbase_sigv4::verify_presigned(&method, &host, &path, &query, lookup, now_secs()).is_ok()
-            } else if let Some(auth) = req.headers().get("authorization").and_then(|v| v.to_str().ok()) {
+                jkbase_sigv4::verify_presigned(&method, &host, &path, &query, lookup, now_secs())
+                    .is_ok()
+            } else if let Some(auth) = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+            {
                 let headers: HashMap<String, String> = req
                     .headers()
                     .iter()
-                    .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_lowercase(),
+                            v.to_str().unwrap_or("").to_string(),
+                        )
+                    })
                     .collect();
-                jkbase_sigv4::verify_header(&method, &host, &path, &query, &headers, auth, lookup, now_secs()).is_ok()
+                jkbase_sigv4::verify_header(
+                    &method,
+                    &host,
+                    &path,
+                    &query,
+                    &headers,
+                    auth,
+                    lookup,
+                    now_secs(),
+                )
+                .is_ok()
             } else {
                 false
             };
@@ -106,7 +132,12 @@ async fn spawn_verifying() -> (ObjectClient, std::path::PathBuf) {
             if ok {
                 next.run(req).await
             } else {
-                (StatusCode::FORBIDDEN, Body::from("<Error><Code>AccessDenied</Code><Message>signature</Message></Error>"))
+                (
+                    StatusCode::FORBIDDEN,
+                    Body::from(
+                        "<Error><Code>AccessDenied</Code><Message>signature</Message></Error>",
+                    ),
+                )
                     .into_response()
             }
         }
@@ -126,14 +157,29 @@ async fn header_signed_requests_verify_for_all_key_classes() {
     c.create_bucket("vbkt").await.unwrap();
 
     // Space, &, <, >, =, +, unicode, multi-segment, dotted-but-not-a-segment.
-    let keys = ["plain.txt", "a b", "a&b", "x<y>z", "p=q+r", "u/\u{2713}.bin", "d/e/f", "report.v2..bak"];
+    let keys = [
+        "plain.txt",
+        "a b",
+        "a&b",
+        "x<y>z",
+        "p=q+r",
+        "u/\u{2713}.bin",
+        "d/e/f",
+        "report.v2..bak",
+    ];
     for (i, k) in keys.iter().enumerate() {
         let body = format!("body-{i}");
         // PUT must verify (a sign≠send divergence would 403 here, not at the bare engine).
-        c.put_object("vbkt", k, body.clone().into_bytes(), "text/plain").await.unwrap();
+        c.put_object("vbkt", k, body.clone().into_bytes(), "text/plain")
+            .await
+            .unwrap();
         // HEAD + GET must verify and return the same bytes.
         c.head_object("vbkt", k).await.unwrap();
-        assert_eq!(&c.get_object_bytes("vbkt", k).await.unwrap()[..], body.as_bytes(), "key {k:?}");
+        assert_eq!(
+            &c.get_object_bytes("vbkt", k).await.unwrap()[..],
+            body.as_bytes(),
+            "key {k:?}"
+        );
     }
 
     // A signed LIST (with a special-char prefix) also verifies and returns the keys.
@@ -155,19 +201,30 @@ async fn presigned_urls_verify_for_special_char_keys() {
         // presigned PUT: a bare HTTP client uploads to the minted URL; the gate must verify.
         let put_url = c.presigned_put("pbkt", key, 900).unwrap();
         let r = http.put(&put_url).body("presigned").send().await.unwrap();
-        assert!(r.status().is_success(), "PUT {key:?} -> {} ({put_url})", r.status());
+        assert!(
+            r.status().is_success(),
+            "PUT {key:?} -> {} ({put_url})",
+            r.status()
+        );
 
         // presigned GET: fetch with no auth header; the gate must verify and return it.
         let get_url = c.presigned_get("pbkt", key, 900).unwrap();
         let resp = http.get(&get_url).send().await.unwrap();
-        assert!(resp.status().is_success(), "GET {key:?} -> {} ({get_url})", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "GET {key:?} -> {} ({get_url})",
+            resp.status()
+        );
         assert_eq!(resp.text().await.unwrap(), "presigned", "key {key:?}");
     }
 
     // A tampered presigned URL is rejected by the gate (proves the gate is real, not a no-op).
     let url = c.presigned_get("pbkt", "a b.txt", 900).unwrap();
     let tampered = url.replace("X-Amz-Signature=", "X-Amz-Signature=0");
-    assert_eq!(http.get(&tampered).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        http.get(&tampered).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

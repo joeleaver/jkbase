@@ -22,9 +22,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initiate, upload a few parts, then complete (parts are concatenated in order).
-    let mut upload = s3.create_multipart(bucket, "report.bin", "application/octet-stream").await?;
+    let mut upload = s3
+        .create_multipart(bucket, "report.bin", "application/octet-stream")
+        .await?;
     println!("upload id: {}", upload.upload_id());
-    for (n, chunk) in [(1, vec![b'A'; 64]), (2, vec![b'B'; 32]), (3, vec![b'C'; 16])] {
+    for (n, chunk) in [
+        (1, vec![b'A'; 64]),
+        (2, vec![b'B'; 32]),
+        (3, vec![b'C'; 16]),
+    ] {
         upload.upload_part(n, chunk).await?;
         println!("uploaded part {n}");
     }

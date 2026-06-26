@@ -172,8 +172,13 @@ mod tests {
     #[tokio::test]
     async fn put_then_get_round_trips() {
         let s = RedbControlStore::open(db_path("rt")).unwrap();
-        s.transact(vec![], vec![put("projects", b"p1", b"v1")]).await.unwrap();
-        assert_eq!(s.get("projects", b"p1").await.unwrap().as_deref(), Some(&b"v1"[..]));
+        s.transact(vec![], vec![put("projects", b"p1", b"v1")])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get("projects", b"p1").await.unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
         assert!(s.get("projects", b"absent").await.unwrap().is_none());
         // Table namespacing: same key in another table is independent.
         assert!(s.get("domains", b"p1").await.unwrap().is_none());
@@ -182,29 +187,49 @@ mod tests {
     #[tokio::test]
     async fn absent_guard_gives_create_if_absent() {
         let s = RedbControlStore::open(db_path("absent")).unwrap();
-        let g = || vec![Guard::Absent { table: "t".into(), key: Bytes::from_static(b"k") }];
-        s.transact(g(), vec![put("t", b"k", b"first")]).await.unwrap();
+        let g = || {
+            vec![Guard::Absent {
+                table: "t".into(),
+                key: Bytes::from_static(b"k"),
+            }]
+        };
+        s.transact(g(), vec![put("t", b"k", b"first")])
+            .await
+            .unwrap();
         // Second create must conflict (key now present).
         assert!(matches!(
             s.transact(g(), vec![put("t", b"k", b"second")]).await,
             Err(SubstrateError::TxnConflict)
         ));
-        assert_eq!(s.get("t", b"k").await.unwrap().as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            s.get("t", b"k").await.unwrap().as_deref(),
+            Some(&b"first"[..])
+        );
     }
 
     #[tokio::test]
     async fn equals_guard_is_compare_and_set() {
         let s = RedbControlStore::open(db_path("cas")).unwrap();
-        s.transact(vec![], vec![put("t", b"k", b"v0")]).await.unwrap();
+        s.transact(vec![], vec![put("t", b"k", b"v0")])
+            .await
+            .unwrap();
         // CAS with the wrong expected value conflicts and writes nothing.
-        let bad = vec![Guard::Equals { table: "t".into(), key: Bytes::from_static(b"k"), value: Bytes::from_static(b"WRONG") }];
+        let bad = vec![Guard::Equals {
+            table: "t".into(),
+            key: Bytes::from_static(b"k"),
+            value: Bytes::from_static(b"WRONG"),
+        }];
         assert!(matches!(
             s.transact(bad, vec![put("t", b"k", b"v1")]).await,
             Err(SubstrateError::TxnConflict)
         ));
         assert_eq!(s.get("t", b"k").await.unwrap().as_deref(), Some(&b"v0"[..]));
         // CAS with the right value commits.
-        let good = vec![Guard::Equals { table: "t".into(), key: Bytes::from_static(b"k"), value: Bytes::from_static(b"v0") }];
+        let good = vec![Guard::Equals {
+            table: "t".into(),
+            key: Bytes::from_static(b"k"),
+            value: Bytes::from_static(b"v0"),
+        }];
         s.transact(good, vec![put("t", b"k", b"v1")]).await.unwrap();
         assert_eq!(s.get("t", b"k").await.unwrap().as_deref(), Some(&b"v1"[..]));
     }
@@ -225,7 +250,10 @@ mod tests {
         .unwrap();
         let got = s.scan_prefix("p", b"a/").await.unwrap();
         let keys: Vec<_> = got.iter().map(|(k, _)| k.clone()).collect();
-        assert_eq!(keys, vec![Bytes::from_static(b"a/1"), Bytes::from_static(b"a/2")]);
+        assert_eq!(
+            keys,
+            vec![Bytes::from_static(b"a/1"), Bytes::from_static(b"a/2")]
+        );
         // Empty prefix returns the whole table, not other tables.
         assert_eq!(s.scan_prefix("p", b"").await.unwrap().len(), 3);
         assert_eq!(s.scan_prefix("other", b"").await.unwrap().len(), 1);
@@ -234,10 +262,18 @@ mod tests {
     #[tokio::test]
     async fn delete_write_removes_key_and_caps() {
         let s = RedbControlStore::open(db_path("del")).unwrap();
-        s.transact(vec![], vec![put("t", b"k", b"v")]).await.unwrap();
-        s.transact(vec![], vec![Write::Delete { table: "t".into(), key: Bytes::from_static(b"k") }])
+        s.transact(vec![], vec![put("t", b"k", b"v")])
             .await
             .unwrap();
+        s.transact(
+            vec![],
+            vec![Write::Delete {
+                table: "t".into(),
+                key: Bytes::from_static(b"k"),
+            }],
+        )
+        .await
+        .unwrap();
         assert!(s.get("t", b"k").await.unwrap().is_none());
         assert_eq!(s.caps(), Caps::SINGLE_NODE_TXN);
         assert_eq!(s.backend_name(), "redb");

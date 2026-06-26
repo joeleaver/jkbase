@@ -61,7 +61,13 @@ impl ObjectClient {
     ) -> Result<String> {
         validate_object_key(key)?;
         let resp = self
-            .send(Method::PUT, &object_path(bucket, key), &[], Some(content_type), ReqBody::Bytes(body.into()))
+            .send(
+                Method::PUT,
+                &object_path(bucket, key),
+                &[],
+                Some(content_type),
+                ReqBody::Bytes(body.into()),
+            )
             .await?;
         Ok(etag_of(resp.headers()))
     }
@@ -96,7 +102,15 @@ impl ObjectClient {
     /// Fetch an object as a streamed [`GetObject`] (metadata immediately; body on demand).
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<GetObject> {
         validate_object_key(key)?;
-        let resp = self.send(Method::GET, &object_path(bucket, key), &[], None, ReqBody::Empty).await?;
+        let resp = self
+            .send(
+                Method::GET,
+                &object_path(bucket, key),
+                &[],
+                None,
+                ReqBody::Empty,
+            )
+            .await?;
         let meta = meta_of(resp.headers());
         Ok(GetObject { meta, resp })
     }
@@ -109,7 +123,15 @@ impl ObjectClient {
     /// Metadata-only fetch (HEAD). `Err(..).is_not_found()` for a missing key.
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta> {
         validate_object_key(key)?;
-        let resp = self.send(Method::HEAD, &object_path(bucket, key), &[], None, ReqBody::Empty).await?;
+        let resp = self
+            .send(
+                Method::HEAD,
+                &object_path(bucket, key),
+                &[],
+                None,
+                ReqBody::Empty,
+            )
+            .await?;
         Ok(meta_of(resp.headers()))
     }
 
@@ -117,7 +139,14 @@ impl ObjectClient {
     /// the engine raises).
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         validate_object_key(key)?;
-        self.send(Method::DELETE, &object_path(bucket, key), &[], None, ReqBody::Empty).await?;
+        self.send(
+            Method::DELETE,
+            &object_path(bucket, key),
+            &[],
+            None,
+            ReqBody::Empty,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -131,14 +160,21 @@ pub(crate) fn etag_of(h: &header::HeaderMap) -> String {
 }
 
 fn meta_of(h: &header::HeaderMap) -> ObjectMeta {
-    let str_of = |name: &header::HeaderName| h.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let str_of = |name: &header::HeaderName| {
+        h.get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
     ObjectMeta {
         content_type: str_of(&header::CONTENT_TYPE),
         content_length: h
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse().ok()),
-        etag: h.get(header::ETAG).and_then(|v| v.to_str().ok()).map(strip_quotes),
+        etag: h
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(strip_quotes),
         last_modified: str_of(&header::LAST_MODIFIED),
     }
 }

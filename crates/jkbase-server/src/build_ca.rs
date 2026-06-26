@@ -37,11 +37,11 @@ use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
+use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::ServerConfig;
 use time::{Duration, OffsetDateTime};
 
 /// The registry hosts the mirror is allowed to TLS-terminate. EVERYTHING else —
@@ -350,7 +350,10 @@ mod tests {
         let signer = CertSigner::new(ca);
         let a = signer.leaf_for("registry.npmjs.org").unwrap();
         let b = signer.leaf_for("registry.npmjs.org").unwrap();
-        assert!(Arc::ptr_eq(&a, &b), "same SNI must return the memoized leaf");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same SNI must return the memoized leaf"
+        );
         assert!(signer.leaf_for("github.com").is_none());
         assert!(signer.leaf_for("evil.com").is_none());
         let _ = std::fs::remove_dir_all(&dir);

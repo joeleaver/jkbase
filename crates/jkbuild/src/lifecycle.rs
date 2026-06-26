@@ -16,7 +16,7 @@ use crate::buildpack::{BuildContext, BuildOutput, DetectContext};
 use crate::env::BuildEnv;
 use crate::{buildpacks, export, function_build};
 use anyhow::{Context, Result};
-use jkbuild_types::{CacheMeta, Index, FETCH_COMPLETE_MARKER};
+use jkbuild_types::{CacheMeta, FETCH_COMPLETE_MARKER, Index};
 use std::ffi::CString;
 use std::io::Write;
 use std::net::TcpStream;
@@ -128,9 +128,22 @@ pub fn run() -> Result<i32> {
             // Static target: run the normal buildpack pipeline (e.g. trunk), but export
             // the produced static tree as a plain `/out/static.tar.gz` the host untars
             // into the served site location — no erofs layer, no server manifest.
-            drive_static(proxy, lang.as_deref(), builder.as_deref(), dockerfile, &subdir)
+            drive_static(
+                proxy,
+                lang.as_deref(),
+                builder.as_deref(),
+                dockerfile,
+                &subdir,
+            )
         }
-        _ => drive(proxy, lang.as_deref(), builder.as_deref(), dockerfile, mode, &subdir),
+        _ => drive(
+            proxy,
+            lang.as_deref(),
+            builder.as_deref(),
+            dockerfile,
+            mode,
+            &subdir,
+        ),
     };
     let code = match &result {
         Ok(()) => 0,
@@ -260,7 +273,10 @@ fn drive_function(proxy: Option<String>, lang: Option<&str>, subdir: &str) -> Re
     let registry = function_build::registry();
     let chosen = function_build::select(&registry, &src_root, lang)
         .context("no function builder matched the source")?;
-    append_log(&format!("jkbuild: matched function builder {}\n", chosen.id()))?;
+    append_log(&format!(
+        "jkbuild: matched function builder {}\n",
+        chosen.id()
+    ))?;
 
     prepare_workspace()?;
     let app_dir = join_subdir(Path::new(WORKSPACE), subdir);
@@ -278,7 +294,9 @@ fn drive_function(proxy: Option<String>, lang: Option<&str>, subdir: &str) -> Re
         wait_for_seal(proxy.as_deref());
         ctx.proxy = None;
     } else {
-        chosen.fetch(&mut ctx).context("function fetch phase (offline)")?;
+        chosen
+            .fetch(&mut ctx)
+            .context("function fetch phase (offline)")?;
     }
 
     let wasm = chosen.compile(&mut ctx).context("function compile phase")?;
@@ -493,7 +511,10 @@ mod tests {
             parse_cmdline_value(c, "jkbase.proxy").as_deref(),
             Some("http://10.0.0.1:3128")
         );
-        assert_eq!(parse_cmdline_value(c, "jkbase.lang").as_deref(), Some("bun"));
+        assert_eq!(
+            parse_cmdline_value(c, "jkbase.lang").as_deref(),
+            Some("bun")
+        );
         assert_eq!(parse_cmdline_value(c, "jkbase.missing"), None);
     }
 
@@ -504,7 +525,10 @@ mod tests {
 
     #[test]
     fn export_mode_defaults_flat() {
-        assert_eq!(ExportMode::from_cmdline("ro console=ttyS0"), ExportMode::Flat);
+        assert_eq!(
+            ExportMode::from_cmdline("ro console=ttyS0"),
+            ExportMode::Flat
+        );
         assert_eq!(
             ExportMode::from_cmdline("jkbase.export=layered"),
             ExportMode::Layered
@@ -543,7 +567,10 @@ mod tests {
     #[test]
     fn join_subdir_dot_is_identity() {
         // "." must NOT change the path — the regression guard for the default path.
-        assert_eq!(join_subdir(Path::new("/scratch/workspace"), "."), Path::new("/scratch/workspace"));
+        assert_eq!(
+            join_subdir(Path::new("/scratch/workspace"), "."),
+            Path::new("/scratch/workspace")
+        );
         assert_eq!(
             join_subdir(Path::new("/scratch/workspace"), "web"),
             Path::new("/scratch/workspace/web")
@@ -564,7 +591,12 @@ mod tests {
         copy_tree(&src, &dst).unwrap();
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
         assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"world");
-        assert!(std::fs::symlink_metadata(dst.join("link")).unwrap().file_type().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(dst.join("link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }

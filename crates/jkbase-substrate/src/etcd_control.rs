@@ -45,14 +45,30 @@ fn guard_compares(g: &Guard, out: &mut Vec<Compare>) {
     match g {
         Guard::Absent { table, key } => {
             // create_revision == 0 ⇔ the key has never existed (or was deleted).
-            out.push(Compare::create_revision(ekey(table, key), CompareOp::Equal, 0));
+            out.push(Compare::create_revision(
+                ekey(table, key),
+                CompareOp::Equal,
+                0,
+            ));
         }
         Guard::Present { table, key } => {
-            out.push(Compare::create_revision(ekey(table, key), CompareOp::Greater, 0));
+            out.push(Compare::create_revision(
+                ekey(table, key),
+                CompareOp::Greater,
+                0,
+            ));
         }
         Guard::Equals { table, key, value } => {
-            out.push(Compare::create_revision(ekey(table, key), CompareOp::Greater, 0));
-            out.push(Compare::value(ekey(table, key), CompareOp::Equal, value.to_vec()));
+            out.push(Compare::create_revision(
+                ekey(table, key),
+                CompareOp::Greater,
+                0,
+            ));
+            out.push(Compare::value(
+                ekey(table, key),
+                CompareOp::Equal,
+                value.to_vec(),
+            ));
         }
     }
 }
@@ -75,7 +91,10 @@ impl ControlStore for EtcdControlStore {
     async fn get(&self, table: &str, key: &[u8]) -> Result<Option<Bytes>> {
         let mut client = self.client.clone();
         let resp = client.get(ekey(table, key), None).await.map_err(be)?;
-        Ok(resp.kvs().first().map(|kv| Bytes::copy_from_slice(kv.value())))
+        Ok(resp
+            .kvs()
+            .first()
+            .map(|kv| Bytes::copy_from_slice(kv.value())))
     }
 
     async fn scan_prefix(&self, table: &str, prefix: &[u8]) -> Result<Vec<(Bytes, Bytes)>> {
@@ -153,12 +172,22 @@ mod tests {
         // Absent/Present are a single comparison each.
         let mut v = Vec::new();
         guard_compares(
-            &Guard::Equals { table: "t".into(), key: Bytes::from_static(b"k"), value: Bytes::from_static(b"x") },
+            &Guard::Equals {
+                table: "t".into(),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"x"),
+            },
             &mut v,
         );
         assert_eq!(v.len(), 2);
         let mut a = Vec::new();
-        guard_compares(&Guard::Absent { table: "t".into(), key: Bytes::from_static(b"k") }, &mut a);
+        guard_compares(
+            &Guard::Absent {
+                table: "t".into(),
+                key: Bytes::from_static(b"k"),
+            },
+            &mut a,
+        );
         assert_eq!(a.len(), 1);
     }
 }

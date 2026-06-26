@@ -30,7 +30,10 @@ pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
     let connection_upgrade = headers
         .get(hyper::header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+        .map(|v| {
+            v.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+        })
         .unwrap_or(false);
     connection_upgrade && headers.contains_key(hyper::header::UPGRADE)
 }
@@ -116,7 +119,10 @@ fn sanitize_set_cookies(headers: &mut HeaderMap, platform_domain: &str) {
 /// leading `name=value` pair is kept verbatim (a cookie literally named `domain` is
 /// not the Domain attribute).
 fn strip_apex_domain(set_cookie: &str, platform_domain: &str) -> String {
-    let apex = platform_domain.trim().trim_matches('.').to_ascii_lowercase();
+    let apex = platform_domain
+        .trim()
+        .trim_matches('.')
+        .to_ascii_lowercase();
     let mut parts = set_cookie.split(';');
     let mut out = match parts.next() {
         Some(name_value) => name_value.to_string(),
@@ -247,7 +253,8 @@ pub fn spawn_upgrade_relay(
         let _permit = permit; // released when the relay ends
         match tokio::join!(client_upgrade, backend_upgrade) {
             (Ok(client), Ok(backend)) => {
-                relay_bidirectional(TokioIo::new(client), TokioIo::new(backend), idle_timeout).await;
+                relay_bidirectional(TokioIo::new(client), TokioIo::new(backend), idle_timeout)
+                    .await;
             }
             (c, b) => error!(
                 client_err = ?c.err(),
@@ -297,7 +304,10 @@ mod tests {
     fn strips_apex_domain_only() {
         // Apex Domain (with leading dot) → dropped, cookie becomes host-only.
         assert_eq!(
-            strip_apex_domain("sid=abc; Domain=.jkbase.app; Path=/; HttpOnly", "jkbase.app"),
+            strip_apex_domain(
+                "sid=abc; Domain=.jkbase.app; Path=/; HttpOnly",
+                "jkbase.app"
+            ),
             "sid=abc; Path=/; HttpOnly"
         );
         // Apex Domain, no dot, mixed case → dropped.
@@ -325,11 +335,20 @@ mod tests {
     #[test]
     fn strip_apex_domain_resists_parsing_bypasses() {
         // Stray space before '=' (a UA still honours it as Domain) → still dropped.
-        assert_eq!(strip_apex_domain("sid=x; Domain =jkbase.app", "jkbase.app"), "sid=x");
+        assert_eq!(
+            strip_apex_domain("sid=x; Domain =jkbase.app", "jkbase.app"),
+            "sid=x"
+        );
         // Trailing-dot apex → dropped.
-        assert_eq!(strip_apex_domain("sid=x; Domain=jkbase.app.", "jkbase.app"), "sid=x");
+        assert_eq!(
+            strip_apex_domain("sid=x; Domain=jkbase.app.", "jkbase.app"),
+            "sid=x"
+        );
         // Leading dot + trailing dot + odd case → dropped.
-        assert_eq!(strip_apex_domain("sid=x; domain = .JKBASE.APP.", "jkbase.app"), "sid=x");
+        assert_eq!(
+            strip_apex_domain("sid=x; domain = .JKBASE.APP.", "jkbase.app"),
+            "sid=x"
+        );
         // A cookie literally NAMED "domain" with the apex value is NOT the Domain
         // attribute (it's the name=value pair) → kept verbatim.
         assert_eq!(
@@ -348,7 +367,10 @@ mod tests {
         let mut h = headers(&[
             ("transfer-encoding", "chunked"),
             ("connection", "keep-alive"),
-            ("strict-transport-security", "max-age=63072000; includeSubDomains"),
+            (
+                "strict-transport-security",
+                "max-age=63072000; includeSubDomains",
+            ),
             ("set-cookie", "sid=abc; Domain=.jkbase.app; Path=/"),
             ("content-type", "text/html"),
         ]);
@@ -384,10 +406,20 @@ mod tests {
     #[test]
     fn sanitize_handles_multiple_set_cookies() {
         let mut h = HeaderMap::new();
-        h.append(SET_COOKIE, HeaderValue::from_static("a=1; Domain=.jkbase.app"));
-        h.append(SET_COOKIE, HeaderValue::from_static("b=2; Domain=a.jkbase.app"));
+        h.append(
+            SET_COOKIE,
+            HeaderValue::from_static("a=1; Domain=.jkbase.app"),
+        );
+        h.append(
+            SET_COOKIE,
+            HeaderValue::from_static("b=2; Domain=a.jkbase.app"),
+        );
         sanitize_response_headers(&mut h, "jkbase.app", true, false);
-        let got: Vec<&str> = h.get_all(SET_COOKIE).iter().map(|v| v.to_str().unwrap()).collect();
+        let got: Vec<&str> = h
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
         assert_eq!(got, vec!["a=1", "b=2; Domain=a.jkbase.app"]);
     }
 }

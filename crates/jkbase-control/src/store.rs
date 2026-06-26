@@ -64,6 +64,27 @@ pub struct SnapshotMeta {
     pub created_at: u64,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
+    /// sha256 of the content-addressed base rootfs (`base-rootfs/<hash>.ext4`) the VM was
+    /// ACTUALLY running when snapshotted (cold boot = the current hash; a restored VM = the
+    /// hash it restored against, NOT the process's current hash). The restore is byte-correct
+    /// ONLY against that exact blob; a redeploy that ships a new agent mints a NEW hash/blob
+    /// alongside the old, so this pins the restore to the bytes its guest RAM expects. `None`
+    /// for legacy records written before content-addressing — the wake path treats those as
+    /// non-restorable (fail open to cold boot).
+    #[serde(default)]
+    pub base_rootfs_hash: Option<String>,
+    /// `project.current_version` at hibernate. The metadata image (`content-images/{id}.ext4`,
+    /// carrying secrets + routes), the app layer, and the baselayers are ALL rebuilt/repinned
+    /// per deploy and snapshot-baked by fixed path — so a single equality check vs the project's
+    /// current version gates restore on all of them at once: version drift ⇒ fail open to a cold
+    /// boot (which re-injects current secrets) and clears the stale snapshot. `None` = legacy.
+    #[serde(default)]
+    pub deployment_version: Option<u64>,
+    // NB: the two fields above are `#[serde(default)] Option` and the SNAPSHOTS table is encoded
+    // with serde_json (self-describing, no `deny_unknown_fields`) — so a legacy record reads back
+    // as `None` AND an older binary ignores these unknown keys on rollback. That back/forward
+    // compatibility is load-bearing: switching this table to bincode/postcard would silently
+    // reintroduce the brick (a trailing Option EOFs on legacy reads).
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,7 +388,7 @@ fn default_max_buckets() -> u64 {
 }
 
 pub const DEFAULT_QUOTA: QuotaLimits = QuotaLimits {
-    storage_bytes_max: 16 * 1024 * 1024 * 1024,        // 16 GiB
+    storage_bytes_max: 16 * 1024 * 1024 * 1024, // 16 GiB
     bandwidth_bytes_per_month: 100 * 1024 * 1024 * 1024, // 100 GiB/month
     build_seconds_per_month: DEFAULT_BUILD_SECONDS_PER_MONTH,
     max_objects: DEFAULT_MAX_OBJECTS,
@@ -660,6 +681,21 @@ impl Store {
             Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
             None => Ok(None),
         }
+    }
+
+    /// Every snapshot record, across all projects. Used by the startup CAS-rootfs GC to
+    /// build the set of base-rootfs blobs still referenced by a restorable snapshot, so it
+    /// never reaps a blob a hibernated project needs to wake.
+    pub fn list_snapshot_metas(&self) -> Result<Vec<SnapshotMeta>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SNAPSHOTS)?;
+        let mut metas = Vec::new();
+        for entry in table.iter()? {
+            let (_key, value) = entry?;
+            let meta: SnapshotMeta = serde_json::from_slice(value.value())?;
+            metas.push(meta);
+        }
+        Ok(metas)
     }
 
     pub fn remove_snapshot_meta(&self, project_id: &str) -> Result<bool> {
@@ -988,7 +1024,11 @@ impl Store {
 
     /// Sum of all buckets at/after `month_start_epoch`. Storage is the latest
     /// gauge (newest bucket), not summed.
-    pub fn sum_month_to_date(&self, project_id: &str, month_start_epoch: u64) -> Result<MonthToDate> {
+    pub fn sum_month_to_date(
+        &self,
+        project_id: &str,
+        month_start_epoch: u64,
+    ) -> Result<MonthToDate> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(USAGE)?;
         let prefix = format!("{project_id}:");
@@ -1095,7 +1135,9 @@ impl Store {
 
     /// The project's effective limits: its override, else [`DEFAULT_QUOTA`].
     pub fn get_quota(&self, project_id: &str) -> Result<QuotaLimits> {
-        Ok(self.get_quota_override(project_id)?.unwrap_or(DEFAULT_QUOTA))
+        Ok(self
+            .get_quota_override(project_id)?
+            .unwrap_or(DEFAULT_QUOTA))
     }
 
     pub fn remove_quota(&self, project_id: &str) -> Result<bool> {
@@ -1397,7 +1439,12 @@ impl Store {
     ///
     /// Returns an error if the project already holds [`Self::MAX_ACCESS_KEYS_PER_PROJECT`]
     /// keys; the check and insert share a write txn so the count is exact.
-    pub fn create_access_key(&self, project_id: &str, tenant_id: &str, label: &str) -> Result<AccessKey> {
+    pub fn create_access_key(
+        &self,
+        project_id: &str,
+        tenant_id: &str,
+        label: &str,
+    ) -> Result<AccessKey> {
         let key = AccessKey {
             access_key_id: auth::generate_access_key_id(),
             project_id: project_id.to_string(),
@@ -1542,7 +1589,12 @@ impl Store {
             let entries: Vec<(String, String)> = index
                 .range(lo.as_str()..hi.as_str())?
                 .filter_map(|e| e.ok())
-                .map(|(k, v)| (k.value().to_string(), String::from_utf8_lossy(v.value()).into_owned()))
+                .map(|(k, v)| {
+                    (
+                        k.value().to_string(),
+                        String::from_utf8_lossy(v.value()).into_owned(),
+                    )
+                })
                 .collect();
             let mut primary = txn.open_table(ACCESS_KEYS)?;
             for (index_key, akid) in entries {
@@ -1609,10 +1661,11 @@ impl Store {
             let (_key, value) = entry?;
             let api_token: ApiToken = serde_json::from_slice(value.value())?;
             if auth::verify_token(raw_token, &api_token.token_hash)
-                && let Some(tenant_data) = tenants_table.get(api_token.tenant_id.as_str())? {
-                    let tenant: Tenant = serde_json::from_slice(tenant_data.value())?;
-                    return Ok(Some(tenant));
-                }
+                && let Some(tenant_data) = tenants_table.get(api_token.tenant_id.as_str())?
+            {
+                let tenant: Tenant = serde_json::from_slice(tenant_data.value())?;
+                return Ok(Some(tenant));
+            }
         }
 
         Ok(None)
@@ -1644,7 +1697,9 @@ mod tests {
     #[test]
     fn delete_all_secrets_purges_only_the_target_project() {
         let (store, path) = tmp_db();
-        store.set_secret("forumall", "DOMAIN", "forumall.jkbase.app").unwrap();
+        store
+            .set_secret("forumall", "DOMAIN", "forumall.jkbase.app")
+            .unwrap();
         store.set_secret("forumall", "DATA_DIR", "/data").unwrap();
         // A slug that shares a prefix must NOT be swept (the ':' separator is exact).
         store.set_secret("forumall2", "OTHER", "keep").unwrap();
@@ -1653,7 +1708,11 @@ mod tests {
         let removed = store.delete_all_secrets("forumall").unwrap();
         assert_eq!(removed, 2);
         assert!(store.list_secrets("forumall").unwrap().is_empty());
-        assert_eq!(store.list_secrets("forumall2").unwrap().len(), 1, "prefix boundary");
+        assert_eq!(
+            store.list_secrets("forumall2").unwrap().len(),
+            1,
+            "prefix boundary"
+        );
         assert_eq!(store.list_secrets("other").unwrap().len(), 1);
         // Idempotent.
         assert_eq!(store.delete_all_secrets("forumall").unwrap(), 0);
@@ -1675,7 +1734,12 @@ mod tests {
         let got = store.lookup_access_key(&a.access_key_id).unwrap().unwrap();
         assert_eq!(got.project_id, "proj-a");
         assert_eq!(got.secret_key, a.secret_key);
-        assert!(store.lookup_access_key("JKBADEADBEEF00000000").unwrap().is_none());
+        assert!(
+            store
+                .lookup_access_key("JKBADEADBEEF00000000")
+                .unwrap()
+                .is_none()
+        );
 
         // List is per-project.
         assert_eq!(store.list_access_keys("proj-a").unwrap().len(), 1);
@@ -1704,10 +1768,24 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(store.list_access_keys("forumall").unwrap().is_empty());
         // Primary records are gone too (not just the index) — no orphaned secrets.
-        assert!(store.lookup_access_key(&k1.access_key_id).unwrap().is_none());
+        assert!(
+            store
+                .lookup_access_key(&k1.access_key_id)
+                .unwrap()
+                .is_none()
+        );
         // Prefix boundary: forumall2's key survives and still resolves.
-        assert_eq!(store.list_access_keys("forumall2").unwrap().len(), 1, "prefix boundary");
-        assert!(store.lookup_access_key(&keep.access_key_id).unwrap().is_some());
+        assert_eq!(
+            store.list_access_keys("forumall2").unwrap().len(),
+            1,
+            "prefix boundary"
+        );
+        assert!(
+            store
+                .lookup_access_key(&keep.access_key_id)
+                .unwrap()
+                .is_some()
+        );
         // Idempotent.
         assert_eq!(store.delete_all_access_keys("forumall").unwrap(), 0);
 
@@ -1719,24 +1797,49 @@ mod tests {
         let (store, path) = tmp_db();
         // Fill the project to the user-key cap; the binding key must NOT count against it.
         for i in 0..Store::MAX_ACCESS_KEYS_PER_PROJECT {
-            store.create_access_key("p", "t1", &format!("k{i}")).unwrap();
+            store
+                .create_access_key("p", "t1", &format!("k{i}"))
+                .unwrap();
         }
         let b1 = store.mint_binding_key("p", "t1").unwrap();
         assert_eq!(b1.access_key_id, Store::binding_access_key_id("p"));
         // Resolvable by the SigV4 path…
-        assert!(store.lookup_access_key(&b1.access_key_id).unwrap().is_some());
+        assert!(
+            store
+                .lookup_access_key(&b1.access_key_id)
+                .unwrap()
+                .is_some()
+        );
         // …but invisible to the user key list (not in the per-project index).
-        assert!(store.list_access_keys("p").unwrap().iter().all(|k| k.access_key_id != b1.access_key_id));
-        assert_eq!(store.list_access_keys("p").unwrap().len(), Store::MAX_ACCESS_KEYS_PER_PROJECT);
+        assert!(
+            store
+                .list_access_keys("p")
+                .unwrap()
+                .iter()
+                .all(|k| k.access_key_id != b1.access_key_id)
+        );
+        assert_eq!(
+            store.list_access_keys("p").unwrap().len(),
+            Store::MAX_ACCESS_KEYS_PER_PROJECT
+        );
 
         // Re-mint rotates the SECRET under the stable id (one entry, fresh secret).
         let b2 = store.mint_binding_key("p", "t1").unwrap();
         assert_eq!(b1.access_key_id, b2.access_key_id);
-        assert_ne!(b1.secret_key, b2.secret_key, "deploy re-mint rotates the secret");
+        assert_ne!(
+            b1.secret_key, b2.secret_key,
+            "deploy re-mint rotates the secret"
+        );
 
         // Teardown purges it (by stable id) along with the user keys.
         store.delete_all_access_keys("p").unwrap();
-        assert!(store.lookup_access_key(&b1.access_key_id).unwrap().is_none(), "binding key purged on teardown");
+        assert!(
+            store
+                .lookup_access_key(&b1.access_key_id)
+                .unwrap()
+                .is_none(),
+            "binding key purged on teardown"
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -1802,13 +1905,20 @@ mod tests {
     fn quota_limits_back_compat_missing_new_fields() {
         // A QuotaLimits JSON that was serialized before max_objects / max_buckets
         // existed must deserialize with those fields set to the platform defaults.
-        let old_json = r#"{"storage_bytes_max":1,"bandwidth_bytes_per_month":2,"build_seconds_per_month":3}"#;
+        let old_json =
+            r#"{"storage_bytes_max":1,"bandwidth_bytes_per_month":2,"build_seconds_per_month":3}"#;
         let q: QuotaLimits = serde_json::from_str(old_json).unwrap();
         assert_eq!(q.storage_bytes_max, 1);
         assert_eq!(q.bandwidth_bytes_per_month, 2);
         assert_eq!(q.build_seconds_per_month, 3);
-        assert_eq!(q.max_objects, DEFAULT_MAX_OBJECTS, "max_objects should default");
-        assert_eq!(q.max_buckets, DEFAULT_MAX_BUCKETS, "max_buckets should default");
+        assert_eq!(
+            q.max_objects, DEFAULT_MAX_OBJECTS,
+            "max_objects should default"
+        );
+        assert_eq!(
+            q.max_buckets, DEFAULT_MAX_BUCKETS,
+            "max_buckets should default"
+        );
     }
 
     #[test]
@@ -1863,7 +1973,10 @@ mod tests {
         // A build before the month boundary is excluded.
         store.add_build_usage("p", month_start - 3600, 100).unwrap();
         assert_eq!(
-            store.sum_month_to_date("p", month_start).unwrap().build_seconds,
+            store
+                .sum_month_to_date("p", month_start)
+                .unwrap()
+                .build_seconds,
             50
         );
     }
@@ -1891,7 +2004,12 @@ mod tests {
 
         assert!(store.remove_deployment("a", 2).unwrap());
         assert_eq!(
-            store.list_deployments("a").unwrap().iter().map(|d| d.version).collect::<Vec<_>>(),
+            store
+                .list_deployments("a")
+                .unwrap()
+                .iter()
+                .map(|d| d.version)
+                .collect::<Vec<_>>(),
             vec![10, 1]
         );
 
@@ -1935,9 +2053,16 @@ mod tests {
         store.update_schedule_last_run("a", "ghost", 1).unwrap();
 
         assert!(store.remove_schedule("a", "f1").unwrap());
-        assert!(!store.remove_schedule("a", "f1").unwrap(), "second remove false");
+        assert!(
+            !store.remove_schedule("a", "f1").unwrap(),
+            "second remove false"
+        );
         assert_eq!(store.list_schedules_for_project("a").unwrap().len(), 1);
-        assert_eq!(store.list_schedules_for_project("b").unwrap().len(), 1, "b intact");
+        assert_eq!(
+            store.list_schedules_for_project("b").unwrap().len(),
+            1,
+            "b intact"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1973,11 +2098,22 @@ mod tests {
         // prune older than h1 drops h0 only (for all projects)
         let pruned = store.prune_usage(h1).unwrap();
         assert_eq!(pruned, 2, "a@h0 and b@h0");
-        assert_eq!(store.list_usage_for_project("a", 0, u64::MAX).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_usage_for_project("a", 0, u64::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // purge drops the rest for a, leaves nothing
         store.purge_usage("a").unwrap();
-        assert!(store.list_usage_for_project("a", 0, u64::MAX).unwrap().is_empty());
+        assert!(
+            store
+                .list_usage_for_project("a", 0, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -2024,7 +2160,13 @@ mod tests {
                 blocked_month: month_start_epoch(1_700_000_000),
             })
             .unwrap();
-        assert!(store.get_quota_status("p").unwrap().unwrap().bandwidth_blocked);
+        assert!(
+            store
+                .get_quota_status("p")
+                .unwrap()
+                .unwrap()
+                .bandwidth_blocked
+        );
         assert!(store.remove_quota_status("p").unwrap());
 
         let _ = std::fs::remove_file(&path);
@@ -2050,13 +2192,17 @@ mod tests {
     #[test]
     fn claim_is_atomic_and_unique() {
         let (store, path) = tmp_db();
-        assert!(store
-            .claim_domain(&domain("docs", "a", "t1", DomainStatus::Active))
-            .unwrap());
+        assert!(
+            store
+                .claim_domain(&domain("docs", "a", "t1", DomainStatus::Active))
+                .unwrap()
+        );
         // Second claim of the same host fails, even for a different tenant.
-        assert!(!store
-            .claim_domain(&domain("docs", "b", "t2", DomainStatus::Active))
-            .unwrap());
+        assert!(
+            !store
+                .claim_domain(&domain("docs", "b", "t2", DomainStatus::Active))
+                .unwrap()
+        );
         assert_eq!(store.get_domain("docs").unwrap().unwrap().project_id, "a");
 
         // Reserved labels are never available; free labels are.
@@ -2074,7 +2220,12 @@ mod tests {
             .claim_domain(&domain("blog", "a", "t1", DomainStatus::Active))
             .unwrap();
         store
-            .claim_domain(&domain("docs.example.com", "a", "t1", DomainStatus::Pending))
+            .claim_domain(&domain(
+                "docs.example.com",
+                "a",
+                "t1",
+                DomainStatus::Pending,
+            ))
             .unwrap();
         store
             .claim_domain(&domain("other", "b", "t2", DomainStatus::Active))
@@ -2106,11 +2257,19 @@ mod tests {
             last_heartbeat: 0,
             cpu_template_id: None,
             kernel_id: Some("vmlinux-6.12".into()),
-            capacity: HostCapacity { vcpus: 16, mem_mib: 131072, max_vms: 64 },
+            capacity: HostCapacity {
+                vcpus: 16,
+                mem_mib: 131072,
+                max_vms: 64,
+            },
         };
         store.save_host(&h).unwrap();
         store
-            .save_host(&HostRecord { host_id: "host-b".into(), region: "eu-west".into(), ..h.clone() })
+            .save_host(&HostRecord {
+                host_id: "host-b".into(),
+                region: "eu-west".into(),
+                ..h.clone()
+            })
             .unwrap();
         assert_eq!(store.list_hosts().unwrap().len(), 2);
         assert_eq!(store.get_host("host-a").unwrap().unwrap().region, "ca-east");
@@ -2146,7 +2305,8 @@ mod tests {
         let mut a2 = a.clone();
         a2.host_id = "host-a".into();
         a2.placement_epoch = 7;
-        let back: VmAllocation = serde_json::from_str(&serde_json::to_string(&a2).unwrap()).unwrap();
+        let back: VmAllocation =
+            serde_json::from_str(&serde_json::to_string(&a2).unwrap()).unwrap();
         assert_eq!(back.host_id, "host-a");
         assert_eq!(back.placement_epoch, 7);
     }

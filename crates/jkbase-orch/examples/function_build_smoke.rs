@@ -53,7 +53,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("kernel not found at {} (set KERNEL=)", kernel.display());
     }
     if !fn_src.join("Cargo.toml").exists() && !fn_src.join("package.json").exists() {
-        anyhow::bail!("FN_SRC {} has neither Cargo.toml nor package.json", fn_src.display());
+        anyhow::bail!(
+            "FN_SRC {} has neither Cargo.toml nor package.json",
+            fn_src.display()
+        );
     }
 
     std::fs::create_dir_all(&data)?;
@@ -63,7 +66,10 @@ async fn main() -> anyhow::Result<()> {
 
     let source_img = workspace.join("fn.source.img");
     let output_img = workspace.join("fn.output.img");
-    println!("[1/4] baking RO source drive from {} (no mount) ...", fn_src.display());
+    println!(
+        "[1/4] baking RO source drive from {} (no mount) ...",
+        fn_src.display()
+    );
     // The vendored tree can be tens of MiB; give the source fs generous slack.
     build_ro_ext4_from_dir(&fn_src, &source_img, 64)?;
 
@@ -120,7 +126,10 @@ async fn main() -> anyhow::Result<()> {
     );
     let run = BuildVm::run("fn", &cfg, &data.join("run")).await?;
     let outcome = run.outcome;
-    println!("    outcome: {outcome:?} (cpu={:?}us wall={:?})", run.cpu_usec, run.wall);
+    println!(
+        "    outcome: {outcome:?} (cpu={:?}us wall={:?})",
+        run.cpu_usec, run.wall
+    );
 
     if let Some(log) = build_output::read_capped(&output_img, "/build.log", 32 * 1024)? {
         println!(

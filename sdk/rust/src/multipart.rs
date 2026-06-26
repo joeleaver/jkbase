@@ -50,8 +50,8 @@ impl ObjectClient {
             )
             .await?;
         let body = resp.text().await?;
-        let upload_id =
-            xml::tag(&body, "UploadId").ok_or_else(|| Error::Decode("InitiateMultipartUpload: no UploadId".into()))?;
+        let upload_id = xml::tag(&body, "UploadId")
+            .ok_or_else(|| Error::Decode("InitiateMultipartUpload: no UploadId".into()))?;
         Ok(MultipartUpload {
             client: self,
             bucket: bucket.to_string(),
@@ -64,7 +64,13 @@ impl ObjectClient {
     /// List the pending multipart uploads in a bucket.
     pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<PendingUpload>> {
         let resp = self
-            .send(Method::GET, &format!("/{bucket}"), &[("uploads".into(), String::new())], None, ReqBody::Empty)
+            .send(
+                Method::GET,
+                &format!("/{bucket}"),
+                &[("uploads".into(), String::new())],
+                None,
+                ReqBody::Empty,
+            )
             .await?;
         let body = resp.text().await?;
         Ok(xml::blocks(&body, "Upload")
@@ -93,7 +99,13 @@ impl MultipartUpload<'_> {
         ];
         let resp = self
             .client
-            .send(Method::PUT, &object_path(&self.bucket, &self.key), &q, None, ReqBody::Bytes(body.into()))
+            .send(
+                Method::PUT,
+                &object_path(&self.bucket, &self.key),
+                &q,
+                None,
+                ReqBody::Bytes(body.into()),
+            )
             .await?;
         self.parts.push((part_number, etag_of(resp.headers())));
         Ok(())

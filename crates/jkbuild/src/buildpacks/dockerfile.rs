@@ -118,7 +118,10 @@ impl Buildpack for DockerfileBuildpack {
         let mountpoint = capture("buildah mount", mount)?;
         let mountpoint = PathBuf::from(mountpoint.trim());
         if !mountpoint.is_dir() {
-            anyhow::bail!("buildah mount returned a non-directory: {}", mountpoint.display());
+            anyhow::bail!(
+                "buildah mount returned a non-directory: {}",
+                mountpoint.display()
+            );
         }
 
         // OCI image config → launch command/env/working_dir.
@@ -277,7 +280,15 @@ fn run(what: &str, mut cmd: Command) -> Result<()> {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            combined.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+            combined
+                .lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         anyhow::bail!("{what} failed: {}\n{}", out.status, tail);
     }

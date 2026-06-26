@@ -113,7 +113,9 @@ fn which_veritysetup() -> Option<PathBuf> {
 /// output is tiny, so polling `try_wait` without draining the pipes can't deadlock (the
 /// pipe buffer never fills before the child exits).
 fn run_bounded(mut cmd: Command, timeout: Duration) -> io::Result<std::process::Output> {
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let start = Instant::now();
     loop {
@@ -124,7 +126,10 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> io::Result<std::process::
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "veritysetup timed out"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "veritysetup timed out",
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -149,7 +154,9 @@ fn verify_first_block(node: &Path) -> io::Result<()> {
 /// erofs from. Fail-closed: any malformed param or a `veritysetup` failure is an error.
 pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Result<VerityDevice> {
     if !is_hex(&params.root_hash) {
-        return Err(io::Error::other(format!("dm-verity: malformed root_hash for {name}")));
+        return Err(io::Error::other(format!(
+            "dm-verity: malformed root_hash for {name}"
+        )));
     }
     if params.data_size == 0 || !params.data_size.is_multiple_of(VERITY_BLOCK_SIZE) {
         return Err(io::Error::other(format!(
@@ -159,8 +166,14 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
     }
     // The device name is host-controlled (a layer slug), but validate it can't smuggle
     // shell/arg trickery — exec'd argv is not a shell, yet keep it strict.
-    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-        return Err(io::Error::other(format!("dm-verity: bad device name {name:?}")));
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(io::Error::other(format!(
+            "dm-verity: bad device name {name:?}"
+        )));
     }
     // data_dev is host-generated (`/dev/vd[a-z]` from the layer plan), but it is the one
     // field reaching the security-load-bearing exec, so validate it defensively: a real
@@ -169,7 +182,9 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
     {
         use std::os::unix::fs::FileTypeExt;
         let under_dev = data_dev.starts_with("/dev/")
-            && !data_dev.components().any(|c| c == std::path::Component::ParentDir);
+            && !data_dev
+                .components()
+                .any(|c| c == std::path::Component::ParentDir);
         let is_block = std::fs::metadata(data_dev)
             .map(|m| m.file_type().is_block_device())
             .unwrap_or(false);
@@ -226,8 +241,8 @@ pub fn activate(name: &str, data_dev: &Path, params: &VerityParams) -> io::Resul
 /// Tear down a verity mapping by name (`veritysetup close`). Best-effort, time-bounded so
 /// a hung teardown (invoked from `Drop` on the boot path) can't wedge PID1 either.
 pub fn close(name: &str) -> io::Result<()> {
-    let tool = which_veritysetup()
-        .ok_or_else(|| io::Error::other("dm-verity: veritysetup not found"))?;
+    let tool =
+        which_veritysetup().ok_or_else(|| io::Error::other("dm-verity: veritysetup not found"))?;
     // DM_DISABLE_UDEV=1: mirror activation — no udevd in the guest, so libdevmapper
     // tears the node down directly rather than waiting on a udev cookie.
     let mut cmd = Command::new(&tool);
@@ -250,11 +265,23 @@ mod tests {
 
     #[test]
     fn activate_rejects_bad_params() {
-        let bad_hash = VerityParams { root_hash: "nothex!".into(), salt: "00".into(), data_size: 4096 };
+        let bad_hash = VerityParams {
+            root_hash: "nothex!".into(),
+            salt: "00".into(),
+            data_size: 4096,
+        };
         assert!(activate("jkv", Path::new("/dev/null"), &bad_hash).is_err());
-        let bad_size = VerityParams { root_hash: "ab".into(), salt: "cd".into(), data_size: 4097 };
+        let bad_size = VerityParams {
+            root_hash: "ab".into(),
+            salt: "cd".into(),
+            data_size: 4097,
+        };
         assert!(activate("jkv", Path::new("/dev/null"), &bad_size).is_err());
-        let bad_name = VerityParams { root_hash: "ab".into(), salt: "cd".into(), data_size: 4096 };
+        let bad_name = VerityParams {
+            root_hash: "ab".into(),
+            salt: "cd".into(),
+            data_size: 4096,
+        };
         assert!(activate("bad name!", Path::new("/dev/null"), &bad_name).is_err());
     }
 
@@ -284,38 +311,91 @@ mod tests {
             std::fs::write(dir.join(format!("tree/etc/f{i}")), vec![b'x'; 8192]).unwrap();
         }
         let blob = dir.join("layer.erofs");
-        assert!(C::new("mkfs.erofs").args(["-zlz4hc", "--all-root"]).arg(&blob).arg(dir.join("tree")).output().unwrap().status.success());
+        assert!(
+            C::new("mkfs.erofs")
+                .args(["-zlz4hc", "--all-root"])
+                .arg(&blob)
+                .arg(dir.join("tree"))
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         // 4096-align the erofs blob, then append the verity tree there.
         let sz = std::fs::metadata(&blob).unwrap().len();
         let data_size = sz.div_ceil(4096) * 4096;
         if data_size > sz {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&blob).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&blob)
+                .unwrap();
             f.write_all(&vec![0u8; (data_size - sz) as usize]).unwrap();
         }
         let salt = "ab".repeat(32);
         let fmt = C::new("veritysetup")
-            .args(["format", "--data-block-size=4096", "--hash-block-size=4096", &format!("--hash-offset={data_size}"), &format!("--salt={salt}")])
-            .arg(&blob).arg(&blob).output().unwrap();
-        assert!(fmt.status.success(), "format: {}", String::from_utf8_lossy(&fmt.stderr));
+            .args([
+                "format",
+                "--data-block-size=4096",
+                "--hash-block-size=4096",
+                &format!("--hash-offset={data_size}"),
+                &format!("--salt={salt}"),
+            ])
+            .arg(&blob)
+            .arg(&blob)
+            .output()
+            .unwrap();
+        assert!(
+            fmt.status.success(),
+            "format: {}",
+            String::from_utf8_lossy(&fmt.stderr)
+        );
         let stdout = String::from_utf8_lossy(&fmt.stdout);
-        let root_hash = stdout.lines().find(|l| l.to_lowercase().contains("root hash"))
-            .and_then(|l| l.split_whitespace().find(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())))
-            .expect("root hash").to_string();
+        let root_hash = stdout
+            .lines()
+            .find(|l| l.to_lowercase().contains("root hash"))
+            .and_then(|l| {
+                l.split_whitespace()
+                    .find(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            .expect("root hash")
+            .to_string();
 
-        let lo = C::new("losetup").args(["-f", "--show"]).arg(&blob).output().unwrap();
+        let lo = C::new("losetup")
+            .args(["-f", "--show"])
+            .arg(&blob)
+            .output()
+            .unwrap();
         let loopdev = String::from_utf8_lossy(&lo.stdout).trim().to_string();
-        let cleanup = || { let _ = C::new("losetup").arg("-d").arg(&loopdev).status(); };
-        let params = VerityParams { root_hash: root_hash.clone(), salt: salt.clone(), data_size };
+        let cleanup = || {
+            let _ = C::new("losetup").arg("-d").arg(&loopdev).status();
+        };
+        let params = VerityParams {
+            root_hash: root_hash.clone(),
+            salt: salt.clone(),
+            data_size,
+        };
         let mnt = dir.join("mnt");
         std::fs::create_dir_all(&mnt).unwrap();
 
         // (1) clean activation → erofs mounts → marker reads.
         {
             let dev = activate(&format!("jkvd-ok-{pid}"), Path::new(&loopdev), &params)
-                .unwrap_or_else(|e| { cleanup(); panic!("activate(clean): {e}") });
-            let m = C::new("mount").args(["-t", "erofs", "-o", "ro"]).arg(dev.path()).arg(&mnt).output().unwrap();
-            assert!(m.status.success(), "mount: {}", String::from_utf8_lossy(&m.stderr));
+                .unwrap_or_else(|e| {
+                    cleanup();
+                    panic!("activate(clean): {e}")
+                });
+            let m = C::new("mount")
+                .args(["-t", "erofs", "-o", "ro"])
+                .arg(dev.path())
+                .arg(&mnt)
+                .output()
+                .unwrap();
+            assert!(
+                m.status.success(),
+                "mount: {}",
+                String::from_utf8_lossy(&m.stderr)
+            );
             let marker = std::fs::read_to_string(mnt.join("etc/marker")).unwrap();
             assert_eq!(marker.trim(), "verity-ok");
             let _ = C::new("umount").arg(&mnt).status();
@@ -332,7 +412,12 @@ mod tests {
             let failed = match res {
                 Err(_) => true, // verity rejected at activation
                 Ok(dev) => {
-                    let m = C::new("mount").args(["-t", "erofs", "-o", "ro"]).arg(dev.path()).arg(&mnt).output().unwrap();
+                    let m = C::new("mount")
+                        .args(["-t", "erofs", "-o", "ro"])
+                        .arg(dev.path())
+                        .arg(&mnt)
+                        .output()
+                        .unwrap();
                     let read_fail = !m.status.success()
                         || std::fs::read_to_string(mnt.join("etc/marker")).is_err();
                     let _ = C::new("umount").arg(&mnt).status();

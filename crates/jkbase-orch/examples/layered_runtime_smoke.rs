@@ -32,8 +32,7 @@ const SERVER_TS: &str = r#"const port = Number(process.env.PORT) || 3000;
 Bun.serve({ port, fetch() { return new Response("ok\n"); } });
 console.log("listening on " + port);
 "#;
-const PACKAGE_JSON: &str =
-    r#"{ "name": "layered-smoke", "module": "server.ts", "scripts": { "start": "bun run server.ts" } }"#;
+const PACKAGE_JSON: &str = r#"{ "name": "layered-smoke", "module": "server.ts", "scripts": { "start": "bun run server.ts" } }"#;
 
 /// The guest PID1: compose the erofs layer stack and hand off to Bun. This is the
 /// shape the real agent's mount_layers + compose_overlay + pivot_root will take.
@@ -67,9 +66,15 @@ exec /opt/bun/bin/bun run start
 "#;
 
 async fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new(cmd).args(args).output().await?;
+    let out = tokio::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success() {
-        anyhow::bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{cmd} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -86,8 +91,16 @@ async fn main() -> anyhow::Result<()> {
     let fc_bin = base.join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64");
     let store = base.join("baselayers");
     let busybox = PathBuf::from("/usr/bin/busybox");
-    for (label, p) in [("kernel", &kernel), ("firecracker", &fc_bin), ("busybox", &busybox)] {
-        anyhow::ensure!(p.exists(), "{label} not found at {} (busybox: apt-get install busybox-static)", p.display());
+    for (label, p) in [
+        ("kernel", &kernel),
+        ("firecracker", &fc_bin),
+        ("busybox", &busybox),
+    ] {
+        anyhow::ensure!(
+            p.exists(),
+            "{label} not found at {} (busybox: apt-get install busybox-static)",
+            p.display()
+        );
     }
     anyhow::ensure!(
         store.join("platform.json").exists(),
@@ -103,7 +116,11 @@ async fn main() -> anyhow::Result<()> {
         serde_json::from_slice(&std::fs::read(store.join("platform.json"))?)?;
     let base_blob = store.join(manifest["base"]["file"].as_str().unwrap());
     let runtime_blob = store.join(manifest["runtimes"]["bun"]["file"].as_str().unwrap());
-    println!("[1/5] layer store: base={} runtime={}", base_blob.display(), runtime_blob.display());
+    println!(
+        "[1/5] layer store: base={} runtime={}",
+        base_blob.display(),
+        runtime_blob.display()
+    );
 
     // --- build the per-app erofs layer (workspace rooted at /app) ---
     let app_stage = work.join("app-stage");
@@ -111,13 +128,34 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(app_stage.join("app/server.ts"), SERVER_TS)?;
     std::fs::write(app_stage.join("app/package.json"), PACKAGE_JSON)?;
     let app_blob = work.join("app.erofs");
-    run("mkfs.erofs", &["-zlz4hc", "--all-root", "-T", "0", "--mkfs-time",
-        app_blob.to_str().unwrap(), app_stage.to_str().unwrap()]).await?;
+    run(
+        "mkfs.erofs",
+        &[
+            "-zlz4hc",
+            "--all-root",
+            "-T",
+            "0",
+            "--mkfs-time",
+            app_blob.to_str().unwrap(),
+            app_stage.to_str().unwrap(),
+        ],
+    )
+    .await?;
     println!("[2/5] built app layer {}", app_blob.display());
 
     // --- build the tiny busybox init rootfs (vda) ---
     let vda_stage = work.join("vda-stage");
-    for d in ["bin", "proc", "sys", "dev", "ovl", "merged", "layers/base", "layers/runtime", "layers/app"] {
+    for d in [
+        "bin",
+        "proc",
+        "sys",
+        "dev",
+        "ovl",
+        "merged",
+        "layers/base",
+        "layers/runtime",
+        "layers/app",
+    ] {
         std::fs::create_dir_all(vda_stage.join(d))?;
     }
     std::fs::copy(&busybox, vda_stage.join("bin/busybox"))?;
@@ -176,13 +214,22 @@ async fn main() -> anyhow::Result<()> {
         Ok(body) => {
             println!("[5/5] HTTP 200 from the composed layered runtime: {body:?}");
             let _ = std::fs::remove_dir_all(&work);
-            println!("\n✅ layered runtime mechanism validated on 6.12: erofs layers -> overlay -> pivot_root -> bun serves over virtio-net.");
+            println!(
+                "\n✅ layered runtime mechanism validated on 6.12: erofs layers -> overlay -> pivot_root -> bun serves over virtio-net."
+            );
             Ok(())
         }
         Err(e) => {
             eprintln!("--- console.log (tail) ---");
             if let Ok(s) = std::fs::read_to_string(&console_log) {
-                for line in s.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+                for line in s
+                    .lines()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     eprintln!("{line}");
                 }
             }

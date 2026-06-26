@@ -17,7 +17,7 @@
 //! agent seq it does not reset across guest cold boots.
 
 use anyhow::Result;
-use jkbase_common::logs::{LogLine, EGRESS_STREAM};
+use jkbase_common::logs::{EGRESS_STREAM, LogLine};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -111,7 +111,13 @@ impl LogStore {
         }
 
         append_stream(&dir, "app.log", &app_buf, MAX_FILE_BYTES, MAX_ROTATED)?;
-        append_stream(&dir, "egress.log", &egr_buf, EGRESS_MAX_FILE_BYTES, EGRESS_MAX_ROTATED)?;
+        append_stream(
+            &dir,
+            "egress.log",
+            &egr_buf,
+            EGRESS_MAX_FILE_BYTES,
+            EGRESS_MAX_ROTATED,
+        )?;
         Ok(())
     }
 
@@ -181,7 +187,13 @@ fn file_len(path: &Path) -> u64 {
 /// Append `buf` to `dir/{base}`, rotating that base's file set first if the active file is
 /// already at `max_bytes`. No-op on an empty buffer. Each stream (app/egress) rotates
 /// independently, which is the whole point of H-1: app churn never touches egress files.
-fn append_stream(dir: &Path, base: &str, buf: &str, max_bytes: u64, max_rotated: usize) -> Result<()> {
+fn append_stream(
+    dir: &Path,
+    base: &str,
+    buf: &str,
+    max_bytes: u64,
+    max_rotated: usize,
+) -> Result<()> {
     if buf.is_empty() {
         return Ok(());
     }
@@ -262,11 +274,7 @@ fn sanitize(project_id: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() {
-        "_".to_string()
-    } else {
-        s
-    }
+    if s.is_empty() { "_".to_string() } else { s }
 }
 
 #[cfg(test)]
@@ -374,22 +382,36 @@ mod tests {
         // churn never rotates.
         let root = tmp_root();
         let store = LogStore::new(root.clone());
-        store.append("p", &[egress_line("{\"dest_host\":\"c2.evil\"}")]).unwrap();
+        store
+            .append("p", &[egress_line("{\"dest_host\":\"c2.evil\"}")])
+            .unwrap();
 
         let big = "x".repeat(64 * 1024);
         for i in 0..400 {
-            store.append("p", &[line("web", &format!("{i}:{big}"))]).unwrap();
+            store
+                .append("p", &[line("web", &format!("{i}:{big}"))])
+                .unwrap();
         }
 
         // App logs rotated hard (oldest gone), but the egress row is still readable.
         let all = store.read("p", 100_000, None, None).unwrap();
         let egress: Vec<&LogLine> = all.iter().filter(|l| l.stream == EGRESS_STREAM).collect();
-        assert_eq!(egress.len(), 1, "the egress audit row must survive the app-log flood");
+        assert_eq!(
+            egress.len(),
+            1,
+            "the egress audit row must survive the app-log flood"
+        );
         assert!(egress[0].line.contains("c2.evil"));
-        assert_eq!(egress[0].seq, 1, "it kept its unified seq and read-merges in order");
+        assert_eq!(
+            egress[0].seq, 1,
+            "it kept its unified seq and read-merges in order"
+        );
         // Sanity: the app flood DID rotate (oldest app lines gone).
         let app: Vec<&LogLine> = all.iter().filter(|l| l.stream != EGRESS_STREAM).collect();
-        assert!(app.iter().all(|l| !l.line.starts_with("0:")), "oldest app lines rotated off");
+        assert!(
+            app.iter().all(|l| !l.line.starts_with("0:")),
+            "oldest app lines rotated off"
+        );
 
         store.clear("p").unwrap();
         let _ = std::fs::remove_dir_all(&root);

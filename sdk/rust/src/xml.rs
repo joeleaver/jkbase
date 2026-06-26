@@ -82,7 +82,10 @@ pub(crate) fn unescape(s: &str) -> String {
                 ('>', rest.len() - r.len())
             } else if let Some(r) = rest.strip_prefix("&quot;") {
                 ('"', rest.len() - r.len())
-            } else if let Some(r) = rest.strip_prefix("&#39;").or_else(|| rest.strip_prefix("&apos;")) {
+            } else if let Some(r) = rest
+                .strip_prefix("&#39;")
+                .or_else(|| rest.strip_prefix("&apos;"))
+            {
                 ('\'', rest.len() - r.len())
             } else {
                 // A bare '&' that isn't a known entity — emit it literally and move on.
@@ -130,7 +133,10 @@ mod tests {
 
     #[test]
     fn unescapes_entities_without_double_decoding() {
-        assert_eq!(unescape("a &amp; b &lt;x&gt; &quot;q&quot;"), "a & b <x> \"q\"");
+        assert_eq!(
+            unescape("a &amp; b &lt;x&gt; &quot;q&quot;"),
+            "a & b <x> \"q\""
+        );
         assert_eq!(unescape("&amp;lt;"), "&lt;"); // not double-decoded
         assert_eq!(unescape("plain"), "plain");
         assert_eq!(unescape("trailing &"), "trailing &");

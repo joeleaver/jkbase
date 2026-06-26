@@ -61,7 +61,14 @@ async fn put_dispatch(
         };
         let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
         return match store
-            .upload_part_capped(&bucket, uid, part_number, reader, sha256.as_deref(), declared)
+            .upload_part_capped(
+                &bucket,
+                uid,
+                part_number,
+                reader,
+                sha256.as_deref(),
+                declared,
+            )
             .await
         {
             Ok(etag) => ([(header::ETAG, quoted(&etag))], StatusCode::OK).into_response(),
@@ -72,7 +79,14 @@ async fn put_dispatch(
     let content_type = content_type_of(&headers);
     let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
     match store
-        .put_object_capped(&bucket, &key, reader, &content_type, sha256.as_deref(), declared)
+        .put_object_capped(
+            &bucket,
+            &key,
+            reader,
+            &content_type,
+            sha256.as_deref(),
+            declared,
+        )
         .await
     {
         Ok(meta) => ([(header::ETAG, quoted(&meta.etag))], StatusCode::OK).into_response(),
@@ -85,7 +99,11 @@ async fn get_object(
     Path((bucket, key)): Path<(String, String)>,
 ) -> Response {
     match store.get_object(&bucket, &key).await {
-        Ok((meta, file)) => (object_headers(&meta), Body::from_stream(ReaderStream::new(file))).into_response(),
+        Ok((meta, file)) => (
+            object_headers(&meta),
+            Body::from_stream(ReaderStream::new(file)),
+        )
+            .into_response(),
         Err(e) => s3_error(e),
     }
 }
@@ -162,7 +180,9 @@ async fn post_dispatch(
             Err(e) => s3_error(e),
         };
     }
-    s3_error(ObjectError::InvalidArgument("missing ?uploads or ?uploadId".into()))
+    s3_error(ObjectError::InvalidArgument(
+        "missing ?uploads or ?uploadId".into(),
+    ))
 }
 
 // ---- buckets --------------------------------------------------------------
@@ -177,14 +197,20 @@ async fn create_bucket(
     }
 }
 
-async fn delete_bucket(State(store): State<Arc<ObjectStore>>, Path(bucket): Path<String>) -> Response {
+async fn delete_bucket(
+    State(store): State<Arc<ObjectStore>>,
+    Path(bucket): Path<String>,
+) -> Response {
     match store.delete_bucket(&bucket).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => s3_error(e),
     }
 }
 
-async fn head_bucket(State(store): State<Arc<ObjectStore>>, Path(bucket): Path<String>) -> StatusCode {
+async fn head_bucket(
+    State(store): State<Arc<ObjectStore>>,
+    Path(bucket): Path<String>,
+) -> StatusCode {
     match store.bucket_exists(&bucket).await {
         Ok(true) => StatusCode::OK,
         Ok(false) => StatusCode::NOT_FOUND,
@@ -240,7 +266,10 @@ async fn list_objects(
     // `?delimiter=` switches to V2 folding (CommonPrefixes), e.g. for the own-bucket binding's
     // `list-objects` and S3 clients that pass a delimiter.
     if let Some(delim) = q.get("delimiter").filter(|d| !d.is_empty()) {
-        return match store.list_v2(&bucket, prefix, Some(delim), start_after, max_keys).await {
+        return match store
+            .list_v2(&bucket, prefix, Some(delim), start_after, max_keys)
+            .await
+        {
             Ok(page) => {
                 let mut x = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -255,7 +284,10 @@ async fn list_objects(
                     page.is_truncated,
                 );
                 if let Some(ref tok) = page.next_continuation_token {
-                    x.push_str(&format!("<NextContinuationToken>{}</NextContinuationToken>", xml_escape(tok)));
+                    x.push_str(&format!(
+                        "<NextContinuationToken>{}</NextContinuationToken>",
+                        xml_escape(tok)
+                    ));
                 }
                 for m in page.objects {
                     x.push_str(&format!(
@@ -267,7 +299,10 @@ async fn list_objects(
                     ));
                 }
                 for p in page.common_prefixes {
-                    x.push_str(&format!("<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>", xml_escape(&p)));
+                    x.push_str(&format!(
+                        "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                        xml_escape(&p)
+                    ));
                 }
                 x.push_str("</ListBucketResult>");
                 xml_ok(x)
@@ -276,7 +311,10 @@ async fn list_objects(
         };
     }
 
-    match store.list_objects(&bucket, prefix, start_after, max_keys).await {
+    match store
+        .list_objects(&bucket, prefix, start_after, max_keys)
+        .await
+    {
         Ok(page) => {
             let key_count = page.objects.len();
             let mut x = format!(
@@ -292,12 +330,18 @@ async fn list_objects(
             );
             // Pagination tokens — emit both V1 and V2 forms when truncated.
             if let Some(ref tok) = page.next_continuation_token {
-                x.push_str(&format!("<NextContinuationToken>{}</NextContinuationToken>", xml_escape(tok)));
+                x.push_str(&format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    xml_escape(tok)
+                ));
                 x.push_str(&format!("<NextMarker>{}</NextMarker>", xml_escape(tok)));
             }
             // Echo the input tokens so V2 clients can round-trip.
             if let Some(ct) = q.get("continuation-token") {
-                x.push_str(&format!("<ContinuationToken>{}</ContinuationToken>", xml_escape(ct)));
+                x.push_str(&format!(
+                    "<ContinuationToken>{}</ContinuationToken>",
+                    xml_escape(ct)
+                ));
             }
             if let Some(sa) = q.get("start-after") {
                 x.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(sa)));
@@ -449,7 +493,9 @@ fn s3_error(e: ObjectError) -> Response {
         ObjectError::NoSuchUpload(_) => (StatusCode::NOT_FOUND, "NoSuchUpload"),
         ObjectError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
         ObjectError::Timeout(_) => (StatusCode::REQUEST_TIMEOUT, "RequestTimeout"),
-        ObjectError::ContentSha256Mismatch => (StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch"),
+        ObjectError::ContentSha256Mismatch => {
+            (StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch")
+        }
         ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
         }
@@ -473,7 +519,10 @@ mod tests {
     static TMP: AtomicU64 = AtomicU64::new(0);
 
     fn store() -> (Arc<ObjectStore>, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("jkb-objhttp-{}", TMP.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "jkb-objhttp-{}",
+            TMP.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         (Arc::new(ObjectStore::open(&dir).unwrap()), dir)
     }
@@ -482,7 +531,11 @@ mod tests {
         let status = resp.status();
         let headers = resp.headers().clone();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        (status, headers, String::from_utf8_lossy(&bytes).into_owned())
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
     }
 
     #[tokio::test]
@@ -510,13 +563,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        let etag = r.headers().get("etag").unwrap().to_str().unwrap().to_string();
+        let etag = r
+            .headers()
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert_eq!(etag, format!("\"{:x}\"", Md5::digest(b"hello http")));
 
         // GET it back.
         let r = app
             .clone()
-            .oneshot(Request::get("/my-bucket/dir/obj.txt").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/my-bucket/dir/obj.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let (status, headers, text) = body_str(r).await;
@@ -537,7 +600,11 @@ mod tests {
         // DELETE -> 204.
         let r = app
             .clone()
-            .oneshot(Request::delete("/my-bucket/dir/obj.txt").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::delete("/my-bucket/dir/obj.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
@@ -549,16 +616,27 @@ mod tests {
     async fn list_objects_returns_s3_xml() {
         let (s, dir) = store();
         let app = router(s);
-        app.clone().oneshot(Request::put("/b-ucket").body(Body::empty()).unwrap()).await.unwrap();
+        app.clone()
+            .oneshot(Request::put("/b-ucket").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         for k in ["img/a", "img/b", "doc/c"] {
             app.clone()
-                .oneshot(Request::put(format!("/b-ucket/{k}")).body(Body::from("x")).unwrap())
+                .oneshot(
+                    Request::put(format!("/b-ucket/{k}"))
+                        .body(Body::from("x"))
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
         }
         let r = app
             .clone()
-            .oneshot(Request::get("/b-ucket?prefix=img/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/b-ucket?prefix=img/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let (status, _, xml) = body_str(r).await;
@@ -574,17 +652,28 @@ mod tests {
     async fn list_objects_pagination_over_http() {
         let (s, dir) = store();
         let app = router(s.clone());
-        app.clone().oneshot(Request::put("/pg-bucket").body(Body::empty()).unwrap()).await.unwrap();
+        app.clone()
+            .oneshot(Request::put("/pg-bucket").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         for k in ["a", "b", "c", "d", "e"] {
             app.clone()
-                .oneshot(Request::put(format!("/pg-bucket/{k}")).body(Body::from("x")).unwrap())
+                .oneshot(
+                    Request::put(format!("/pg-bucket/{k}"))
+                        .body(Body::from("x"))
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
         }
         // First page of 2.
         let r = app
             .clone()
-            .oneshot(Request::get("/pg-bucket?max-keys=2").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/pg-bucket?max-keys=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let (status, _, xml) = body_str(r).await;
@@ -592,7 +681,8 @@ mod tests {
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
         assert!(xml.contains("<NextContinuationToken>"));
         // Extract token.
-        let tok_start = xml.find("<NextContinuationToken>").unwrap() + "<NextContinuationToken>".len();
+        let tok_start =
+            xml.find("<NextContinuationToken>").unwrap() + "<NextContinuationToken>".len();
         let tok_end = xml.find("</NextContinuationToken>").unwrap();
         let token = &xml[tok_start..tok_end];
         assert_eq!(token, "b");
@@ -624,12 +714,19 @@ mod tests {
     async fn multipart_over_http() {
         let (s, dir) = store();
         let app = router(s);
-        app.clone().oneshot(Request::put("/mp-bucket").body(Body::empty()).unwrap()).await.unwrap();
+        app.clone()
+            .oneshot(Request::put("/mp-bucket").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
         // Initiate.
         let r = app
             .clone()
-            .oneshot(Request::post("/mp-bucket/big.bin?uploads").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post("/mp-bucket/big.bin?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let (_, _, xml) = body_str(r).await;
@@ -652,7 +749,11 @@ mod tests {
         // ListMultipartUploads.
         let r = app
             .clone()
-            .oneshot(Request::get("/mp-bucket?uploads").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/mp-bucket?uploads")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let (status, _, xml) = body_str(r).await;
@@ -680,7 +781,11 @@ mod tests {
         // GET returns the concatenation.
         let r = app
             .clone()
-            .oneshot(Request::get("/mp-bucket/big.bin").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/mp-bucket/big.bin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let (_, _, text) = body_str(r).await;
@@ -693,7 +798,10 @@ mod tests {
         use sha2::{Digest as Sha2Digest, Sha256};
         let (s, dir) = store();
         let app = router(s);
-        app.clone().oneshot(Request::put("/sha-bucket").body(Body::empty()).unwrap()).await.unwrap();
+        app.clone()
+            .oneshot(Request::put("/sha-bucket").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
 
         let body = b"payload bytes";
         let good_hash = format!("{:x}", Sha256::digest(body));

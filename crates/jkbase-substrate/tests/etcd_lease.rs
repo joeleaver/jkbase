@@ -20,7 +20,9 @@ fn endpoint() -> String {
 }
 
 async fn lease() -> EtcdLease {
-    EtcdLease::connect(&[endpoint()], "test-cluster").await.expect("connect etcd")
+    EtcdLease::connect(&[endpoint()], "test-cluster")
+        .await
+        .expect("connect etcd")
 }
 
 #[tokio::test]
@@ -39,7 +41,12 @@ async fn etcd_lease_contract_and_steal_on_expiry() {
     assert_eq!(t1.source_id, "test-cluster");
     l.release(&t1).await.unwrap();
     let t2 = l.acquire(&proj, "h2", ttl).await.unwrap();
-    assert!(t2.epoch > t1.epoch, "epoch monotonic: {} > {}", t2.epoch, t1.epoch);
+    assert!(
+        t2.epoch > t1.epoch,
+        "epoch monotonic: {} > {}",
+        t2.epoch,
+        t1.epoch
+    );
     assert!(t2.supersedes(&t1).unwrap());
     l.release(&t2).await.unwrap();
 
@@ -58,7 +65,10 @@ async fn etcd_lease_contract_and_steal_on_expiry() {
     assert_eq!(cur.holder, "h");
     l.release(&tr).await.unwrap();
     assert!(l.current(&ren).await.unwrap().is_none());
-    assert!(matches!(l.renew(&tr, ttl).await, Err(SubstrateError::Fenced { .. })));
+    assert!(matches!(
+        l.renew(&tr, ttl).await,
+        Err(SubstrateError::Fenced { .. })
+    ));
 
     // Steal-on-expiry: a holder that stops renewing loses the lease (etcd expires
     // it and deletes the key), so a later acquire wins with a strictly higher epoch.
@@ -77,11 +87,20 @@ async fn etcd_lease_contract_and_steal_on_expiry() {
     let stolen = l.acquire(&exp, "successor", ttl).await.unwrap();
     assert!(stolen.epoch > dying.epoch, "stolen epoch strictly higher");
     // The fenced-out original holder can neither renew nor wrongly release.
-    assert!(matches!(l.renew(&dying, ttl).await, Err(SubstrateError::Fenced { .. })));
-    assert!(matches!(l.release(&dying).await, Err(SubstrateError::Fenced { .. })));
+    assert!(matches!(
+        l.renew(&dying, ttl).await,
+        Err(SubstrateError::Fenced { .. })
+    ));
+    assert!(matches!(
+        l.release(&dying).await,
+        Err(SubstrateError::Fenced { .. })
+    ));
     l.release(&stolen).await.unwrap();
 
     // Honest cluster caps.
-    assert!(l.caps().contains(Caps::CLUSTER_EXCLUSIVE_FENCE | Caps::MONOTONIC_FENCE));
+    assert!(
+        l.caps()
+            .contains(Caps::CLUSTER_EXCLUSIVE_FENCE | Caps::MONOTONIC_FENCE)
+    );
     assert_eq!(l.backend_name(), "etcd-lease");
 }

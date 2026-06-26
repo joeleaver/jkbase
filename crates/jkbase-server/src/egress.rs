@@ -182,7 +182,11 @@ pub async fn serve(listener: TcpListener, cfg: Arc<EgressConfig>) {
         !(cfg.allow_any && cfg.mirror.is_some()),
         "I-4 violated: mirror attached to an allow_any egress config"
     );
-    info!(allowlist = cfg.allowlist.len(), allow_any = cfg.allow_any, "egress proxy listening");
+    info!(
+        allowlist = cfg.allowlist.len(),
+        allow_any = cfg.allow_any,
+        "egress proxy listening"
+    );
     let sem = Arc::new(Semaphore::new(MAX_CONNS));
     loop {
         let (client, peer) = match listener.accept().await {
@@ -407,7 +411,10 @@ mod tests {
         // I-4: an allow_any (dockerfile) proxy NEVER MITMs. with_mirror DROPS the mirror
         // on an allow_any config (type-gate, not just the runtime should_mirror check).
         let any = EgressConfig::allow_any_public().with_mirror(Some(test_mirror("a")));
-        assert!(any.mirror.is_none(), "with_mirror must refuse on allow_any (I-4)");
+        assert!(
+            any.mirror.is_none(),
+            "with_mirror must refuse on allow_any (I-4)"
+        );
         assert!(!should_mirror(&any, "registry.npmjs.org", 443));
     }
 
@@ -455,10 +462,10 @@ mod tests {
         for s in [
             "1.1.1.1",
             "8.8.8.8",
-            "140.82.112.3",        // github
-            "151.101.0.1",         // fastly (crates/pypi CDN)
+            "140.82.112.3",         // github
+            "151.101.0.1",          // fastly (crates/pypi CDN)
             "2606:4700:4700::1111", // cloudflare v6
-            "2620:0:861:ed1a::1",  // public v6
+            "2620:0:861:ed1a::1",   // public v6
         ] {
             assert!(ip_is_public(ip(s)), "{s} must be allowed");
         }
@@ -484,9 +491,9 @@ mod tests {
     #[test]
     fn pick_safe_addr_skips_unsafe() {
         let addrs = vec![
-            "10.0.0.1:443".parse().unwrap(),          // private — skip
-            "169.254.169.254:443".parse().unwrap(),   // metadata — skip
-            "140.82.112.3:443".parse().unwrap(),      // public — take this
+            "10.0.0.1:443".parse().unwrap(),        // private — skip
+            "169.254.169.254:443".parse().unwrap(), // metadata — skip
+            "140.82.112.3:443".parse().unwrap(),    // public — take this
             "8.8.8.8:443".parse().unwrap(),
         ];
         let picked = pick_safe_addr(addrs).unwrap();
@@ -502,10 +509,22 @@ mod tests {
 
     #[test]
     fn authority_parsing() {
-        assert_eq!(split_authority("crates.io:443", 80), Some(("crates.io".into(), 443)));
-        assert_eq!(split_authority("crates.io", 443), Some(("crates.io".into(), 443)));
-        assert_eq!(split_authority("[::1]:8443", 443), Some(("::1".into(), 8443)));
-        assert_eq!(split_authority("[2606:4700::1111]", 443), Some(("2606:4700::1111".into(), 443)));
+        assert_eq!(
+            split_authority("crates.io:443", 80),
+            Some(("crates.io".into(), 443))
+        );
+        assert_eq!(
+            split_authority("crates.io", 443),
+            Some(("crates.io".into(), 443))
+        );
+        assert_eq!(
+            split_authority("[::1]:8443", 443),
+            Some(("::1".into(), 8443))
+        );
+        assert_eq!(
+            split_authority("[2606:4700::1111]", 443),
+            Some(("2606:4700::1111".into(), 443))
+        );
         assert_eq!(split_authority("", 443), None);
 
         assert_eq!(
@@ -589,7 +608,16 @@ mod tests {
 
         async fn curl(proxy: &str, url: &str) -> std::process::Output {
             tokio::process::Command::new("curl")
-                .args(["-sS", "--max-time", "20", "-x", proxy, "-o", "/dev/null", url])
+                .args([
+                    "-sS",
+                    "--max-time",
+                    "20",
+                    "-x",
+                    proxy,
+                    "-o",
+                    "/dev/null",
+                    url,
+                ])
                 .output()
                 .await
                 .unwrap()
@@ -606,7 +634,10 @@ mod tests {
 
         // Off-allowlist host: the proxy 403s the CONNECT, so curl fails.
         let denied = curl(&proxy, "https://example.com/").await;
-        assert!(!denied.status.success(), "off-allowlist host must be denied");
+        assert!(
+            !denied.status.success(),
+            "off-allowlist host must be denied"
+        );
         let err = String::from_utf8_lossy(&denied.stderr);
         assert!(
             err.contains("403"),

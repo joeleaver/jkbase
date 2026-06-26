@@ -22,8 +22,8 @@ wasmtime::component::bindgen!({
     async: true,
 });
 
-pub use jkbase::objectstore::store::{Error as StoreError, ListPage, ObjectMeta};
 use jkbase::objectstore::store::Host;
+pub use jkbase::objectstore::store::{Error as StoreError, ListPage, ObjectMeta};
 
 /// The project's default binding bucket. The WIT exposes no bucket surface; every key lives
 /// under this one bucket in the project's own object-store namespace (the function can also
@@ -115,7 +115,9 @@ impl HostState {
 
     /// Create the binding bucket (idempotent: an already-existing bucket is success).
     async fn ensure_bucket(&mut self) -> Result<(), StoreError> {
-        let (status, _) = self.s3("PUT", &format!("/{BINDING_BUCKET}"), &[], Vec::new()).await?;
+        let (status, _) = self
+            .s3("PUT", &format!("/{BINDING_BUCKET}"), &[], Vec::new())
+            .await?;
         match status {
             200 | 204 | 409 => Ok(()), // 409 = BucketAlreadyExists
             403 => Err(StoreError::AccessDenied),
@@ -140,7 +142,9 @@ impl Host for HostState {
         if !key_ok(&key) {
             return Err(StoreError::InvalidKey);
         }
-        let (status, body) = self.s3("GET", &format!("/{BINDING_BUCKET}/{key}"), &[], Vec::new()).await?;
+        let (status, body) = self
+            .s3("GET", &format!("/{BINDING_BUCKET}/{key}"), &[], Vec::new())
+            .await?;
         match status {
             200 => Ok(body),
             other => Err(status_err(other)),
@@ -172,7 +176,14 @@ impl Host for HostState {
         if !key_ok(&key) {
             return Err(StoreError::InvalidKey);
         }
-        let (status, _) = self.s3("DELETE", &format!("/{BINDING_BUCKET}/{key}"), &[], Vec::new()).await?;
+        let (status, _) = self
+            .s3(
+                "DELETE",
+                &format!("/{BINDING_BUCKET}/{key}"),
+                &[],
+                Vec::new(),
+            )
+            .await?;
         match status {
             200 | 204 | 404 => Ok(()), // delete is idempotent (S3 semantics)
             other => Err(status_err(other)),
@@ -198,7 +209,9 @@ impl Host for HostState {
         if let Some(c) = cursor.filter(|c| !c.is_empty()) {
             query.push(("continuation-token".into(), c));
         }
-        let (status, body) = self.s3("GET", &format!("/{BINDING_BUCKET}"), &query, Vec::new()).await?;
+        let (status, body) = self
+            .s3("GET", &format!("/{BINDING_BUCKET}"), &query, Vec::new())
+            .await?;
         match status {
             200 => Ok(parse_list_xml(&String::from_utf8_lossy(&body))),
             404 => Ok(ListPage {
@@ -243,7 +256,9 @@ fn parse_list_xml(xml: &str) -> ListPage {
         .map(|c| ObjectMeta {
             key: unescape(inner(c, "Key").unwrap_or("")),
             size: inner(c, "Size").and_then(|s| s.parse().ok()).unwrap_or(0),
-            etag: unescape(inner(c, "ETag").unwrap_or("")).trim_matches('"').to_string(),
+            etag: unescape(inner(c, "ETag").unwrap_or(""))
+                .trim_matches('"')
+                .to_string(),
             last_modified: inner(c, "LastModified").map(parse_iso8601).unwrap_or(0),
         })
         .collect();
@@ -251,7 +266,9 @@ fn parse_list_xml(xml: &str) -> ListPage {
         .into_iter()
         .filter_map(|c| inner(c, "Prefix").map(unescape))
         .collect();
-    let next_cursor = inner(xml, "NextContinuationToken").map(unescape).filter(|s| !s.is_empty());
+    let next_cursor = inner(xml, "NextContinuationToken")
+        .map(unescape)
+        .filter(|s| !s.is_empty());
     ListPage {
         objects,
         common_prefixes,
@@ -270,7 +287,13 @@ fn unescape(s: &str) -> String {
 /// Parse an ISO-8601 `YYYY-MM-DDTHH:MM:SS[.fff]Z` to unix seconds (best-effort, 0 on miss).
 fn parse_iso8601(s: &str) -> u64 {
     let b = s.as_bytes();
-    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 19
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return 0;
     }
     let n = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<i64>().ok());
@@ -306,9 +329,13 @@ mod tests {
         // (jkbase-objectstore validate_bucket). A too-short name → InvalidBucketName (400 →
         // opaque Internal), which silently broke the binding before. Lock it.
         let b = BINDING_BUCKET;
-        assert!((3..=63).contains(&b.len()), "binding bucket must be 3-63 chars: {b:?}");
         assert!(
-            b.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+            (3..=63).contains(&b.len()),
+            "binding bucket must be 3-63 chars: {b:?}"
+        );
+        assert!(
+            b.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
             "binding bucket must be lowercase alnum/hyphen: {b:?}"
         );
         assert!(!b.starts_with('-') && !b.ends_with('-'));

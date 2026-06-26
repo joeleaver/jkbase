@@ -3,7 +3,6 @@ use crate::logstore::LogStore;
 use crate::store::{
     BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, Project, Store,
 };
-use jkbase_common::routing::DomainTarget;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -12,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use http_body_util::BodyExt;
+use jkbase_common::routing::DomainTarget;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,19 +22,14 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 pub type DeployCallback = Box<
-    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
 >;
 
 /// Fully reap a deleted project's runtime resources — stop its VM, free the
 /// IP/TAP allocation, and remove its on-disk artifacts. Mirrors `DeployCallback`
 /// (control owns no orch dependency); the server binary provides the impl.
-pub type TeardownCallback = Box<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
-        + Send
-        + Sync,
->;
+pub type TeardownCallback =
+    Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
 /// Inputs handed to the server-provided build orchestrator for one build job.
 pub struct BuildContext {
@@ -209,10 +204,7 @@ struct DeployLockGuard {
 impl DeployLockGuard {
     /// Lock `id`, or `None` if a deploy/build/rollback is already in progress.
     fn try_acquire(state: &Arc<AppState>, id: &str) -> Option<Self> {
-        let mut locks = state
-            .deploy_locks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut locks = state.deploy_locks.lock().unwrap_or_else(|p| p.into_inner());
         if locks.insert(id.to_string()) {
             Some(Self {
                 state: state.clone(),
@@ -249,34 +241,23 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
                 .unwrap(),
             "http://localhost:3000".parse::<HeaderValue>().unwrap(),
         ])
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers([
-            hyper::header::AUTHORIZATION,
-            hyper::header::CONTENT_TYPE,
-        ])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([hyper::header::AUTHORIZATION, hyper::header::CONTENT_TYPE])
         .max_age(std::time::Duration::from_secs(86400));
 
     let authenticated = Router::new()
         .route("/projects", get(list_projects).post(create_project))
-        .route(
-            "/projects/{id}",
-            get(get_project).delete(delete_project),
-        )
+        .route("/projects/{id}", get(get_project).delete(delete_project))
         .route("/projects/{id}/deploy", post(deploy))
         .route("/projects/{id}/build", post(build))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
         .route("/projects/{id}/builds", get(list_builds))
         .route("/projects/{id}/builds/{build_id}", get(get_build))
+        .route("/projects/{id}/secrets", get(list_secrets).post(set_secret))
         .route(
-            "/projects/{id}/secrets",
-            get(list_secrets).post(set_secret),
+            "/projects/{id}/secrets/{key}",
+            axum::routing::delete(delete_secret),
         )
-        .route("/projects/{id}/secrets/{key}", axum::routing::delete(delete_secret))
         .route(
             "/projects/{id}/access-keys",
             get(list_access_keys).post(issue_access_key),
@@ -285,10 +266,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             "/projects/{id}/access-keys/{akid}",
             axum::routing::delete(revoke_access_key),
         )
-        .route(
-            "/projects/{id}/repo",
-            get(get_repo_trigger_status),
-        )
+        .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
             post(mint_git_token).delete(revoke_git_token),
@@ -303,15 +281,18 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(get_project_quota).post(set_project_quota),
         )
         .route("/projects/{id}/domains", get(list_domains).post(add_domain))
-        .route("/projects/{id}/domains/{domain}/verify", post(verify_domain))
-        .route("/projects/{id}/domains/{domain}", axum::routing::delete(remove_domain))
+        .route(
+            "/projects/{id}/domains/{domain}/verify",
+            post(verify_domain),
+        )
+        .route(
+            "/projects/{id}/domains/{domain}",
+            axum::routing::delete(remove_domain),
+        )
         .route("/me", get(get_me))
         .route("/me/token", post(generate_new_token))
         .route("/me/password", post(change_password))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_auth,
-        ));
+        .layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let public = Router::new()
         .route("/init", post(init_platform))
@@ -467,7 +448,7 @@ async fn register(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -506,7 +487,7 @@ async fn login(
                     error: "invalid email or password".to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
@@ -515,7 +496,7 @@ async fn login(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -549,7 +530,7 @@ async fn login(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -726,7 +707,7 @@ async fn create_project(
                     error: format!("'{id}' is already in use"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => return internal_error(e),
     }
@@ -819,7 +800,8 @@ async fn delete_project(
                 return (
                     StatusCode::CONFLICT,
                     Json(ErrorResponse {
-                        error: "a deploy/build/rollback is in progress for this project".to_string(),
+                        error: "a deploy/build/rollback is in progress for this project"
+                            .to_string(),
                     }),
                 )
                     .into_response();
@@ -853,10 +835,9 @@ async fn delete_project(
                     // same-slug project must not inherit a prior tenant's S3
                     // credentials or stored objects (keys gate cross-tenant access).
                     let _ = state.store.delete_all_access_keys(&id);
-                    let _ = tokio::fs::remove_dir_all(
-                        data_dir(&state).join("objectstore").join(&id),
-                    )
-                    .await;
+                    let _ =
+                        tokio::fs::remove_dir_all(data_dir(&state).join("objectstore").join(&id))
+                            .await;
                     // Reap the git-push credential + bare repo so a recreated
                     // project of the same slug can't inherit a prior tenant's
                     // token or pushed objects (the auth tenant-check is the
@@ -927,7 +908,7 @@ async fn deploy(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
@@ -936,7 +917,7 @@ async fn deploy(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -977,11 +958,7 @@ async fn deploy(
 /// HTTP error response (404 if missing/foreign, 500 on store error).
 type ApiError = (StatusCode, Json<ErrorResponse>);
 
-fn require_project_owner(
-    state: &AppState,
-    tenant: &Tenant,
-    id: &str,
-) -> Result<Project, ApiError> {
+fn require_project_owner(state: &AppState, tenant: &Tenant, id: &str) -> Result<Project, ApiError> {
     match state.store.get_project(id) {
         Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => Ok(p),
         Ok(Some(_)) | Ok(None) => Err((
@@ -1053,7 +1030,11 @@ async fn mint_git_token(
         "{}/git/{id}",
         api_base_url(&state).replace("https://", &format!("https://jkbase:{token}@"))
     );
-    (StatusCode::CREATED, Json(GitTokenResponse { token, push_url })).into_response()
+    (
+        StatusCode::CREATED,
+        Json(GitTokenResponse { token, push_url }),
+    )
+        .into_response()
 }
 
 /// `DELETE /projects/{id}/repo/git-token` — revoke the git-push token.
@@ -1100,7 +1081,8 @@ async fn get_repo_trigger_status(
         StatusCode::OK,
         Json(RepoTriggerStatusResponse {
             git_token_configured: cfg.git_token_fingerprint.is_some(),
-            git_token_created_at: (cfg.git_token_created_at != 0).then_some(cfg.git_token_created_at),
+            git_token_created_at: (cfg.git_token_created_at != 0)
+                .then_some(cfg.git_token_created_at),
             push_url: format!("{}/git/{id}", api_base_url(&state)),
         }),
     )
@@ -1145,7 +1127,9 @@ fn basic_auth_token(headers: &HeaderMap) -> Option<String> {
 fn is_valid_project_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 63
-        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// Validate the presented git-push token for `project_id`. Three gates, in order:
@@ -1603,7 +1587,9 @@ async fn run_build_job(
     build_id: u64,
     source_tar_gz: Vec<u8>,
 ) {
-    update_build(&state, project_id, build_id, |r| r.phase = BuildPhase::Building);
+    update_build(&state, project_id, build_id, |r| {
+        r.phase = BuildPhase::Building
+    });
 
     let Some(cb) = state.build_callback.clone() else {
         update_build(&state, project_id, build_id, |r| {
@@ -1650,9 +1636,13 @@ async fn run_build_job(
                 r.phase = BuildPhase::Succeeded;
                 r.deployed_version = Some(version);
                 r.phase_timings_ms.insert("fanout".to_string(), fanout_ms);
-                r.phase_timings_ms.insert("activate".to_string(), activate_ms);
+                r.phase_timings_ms
+                    .insert("activate".to_string(), activate_ms);
             });
-            info!(project_id, build_id, version, "build succeeded; deployment activated");
+            info!(
+                project_id,
+                build_id, version, "build succeeded; deployment activated"
+            );
         }
         Err(e) => {
             update_build(&state, project_id, build_id, |r| {
@@ -1716,11 +1706,7 @@ async fn list_builds(
     }
 }
 
-async fn do_deploy(
-    state: &AppState,
-    project: &mut Project,
-    tarball: &[u8],
-) -> anyhow::Result<u64> {
+async fn do_deploy(state: &AppState, project: &mut Project, tarball: &[u8]) -> anyhow::Result<u64> {
     // Unpack the uploaded artifact tarball into a staging dir on the same
     // filesystem as the deployment tree, then activate it via the shared tail.
     let staged = state.deploy_dir.join(&project.id).join(".staging-deploy");
@@ -1968,7 +1954,7 @@ async fn list_deployments(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2056,7 +2042,7 @@ async fn get_project_usage(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
     let month_start = crate::store::month_start_epoch(auth::timestamp());
@@ -2094,10 +2080,13 @@ async fn get_project_quota(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
-    let limits = state.store.get_quota(&id).unwrap_or(crate::store::DEFAULT_QUOTA);
+    let limits = state
+        .store
+        .get_quota(&id)
+        .unwrap_or(crate::store::DEFAULT_QUOTA);
     let overridden = state.store.get_quota_override(&id).ok().flatten().is_some();
     let status = state.store.get_quota_status(&id).ok().flatten();
     Json(QuotaResponse {
@@ -2107,7 +2096,10 @@ async fn get_project_quota(
         max_objects: limits.max_objects,
         max_buckets: limits.max_buckets,
         overridden,
-        bandwidth_blocked: status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false),
+        bandwidth_blocked: status
+            .as_ref()
+            .map(|s| s.bandwidth_blocked)
+            .unwrap_or(false),
         blocked_reason: status.and_then(|s| s.blocked_reason),
     })
     .into_response()
@@ -2163,14 +2155,8 @@ async fn set_project_quota(
             req.build_seconds_per_month,
             crate::store::DEFAULT_QUOTA.build_seconds_per_month,
         ),
-        max_objects: limit(
-            req.max_objects,
-            crate::store::DEFAULT_QUOTA.max_objects,
-        ),
-        max_buckets: limit(
-            req.max_buckets,
-            crate::store::DEFAULT_QUOTA.max_buckets,
-        ),
+        max_objects: limit(req.max_objects, crate::store::DEFAULT_QUOTA.max_objects),
+        max_buckets: limit(req.max_buckets, crate::store::DEFAULT_QUOTA.max_buckets),
     };
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
@@ -2214,7 +2200,7 @@ async fn rollback(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => {
             return (
@@ -2223,7 +2209,7 @@ async fn rollback(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2338,7 +2324,7 @@ async fn get_project_status(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -2382,16 +2368,14 @@ async fn get_project_logs(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
     // Served from the host-persisted log store (populated by the server's log
     // shipper), so logs remain available even while the VM is hibernated.
     let query = req.uri().query().unwrap_or("");
-    let param = |key: &str| -> Option<&str> {
-        query.split('&').find_map(|p| p.strip_prefix(key))
-    };
+    let param = |key: &str| -> Option<&str> { query.split('&').find_map(|p| p.strip_prefix(key)) };
     let limit: usize = param("limit=")
         .and_then(|v| v.parse().ok())
         .unwrap_or(200)
@@ -2399,10 +2383,7 @@ async fn get_project_logs(
     let since: Option<u64> = param("since=").and_then(|v| v.parse().ok());
     let service = param("service=").map(|s| s.to_string());
 
-    match state
-        .log_store
-        .read(&id, limit, service.as_deref(), since)
-    {
+    match state.log_store.read(&id, limit, service.as_deref(), since) {
         Ok(lines) => (
             StatusCode::OK,
             [(hyper::header::CONTENT_TYPE, "application/json")],
@@ -2450,7 +2431,7 @@ async fn generate_new_token(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2525,7 +2506,7 @@ async fn change_password(
                     error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2570,7 +2551,7 @@ async fn set_secret(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -2580,7 +2561,10 @@ async fn set_secret(
     // (inject_secrets skips bad keys), but reject here so the caller gets a clear error.
     let key = req.key.as_str();
     let key_ok = !key.is_empty()
-        && key.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && key
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
     if !key_ok {
         return (
@@ -2630,7 +2614,7 @@ async fn list_secrets(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -2638,9 +2622,7 @@ async fn list_secrets(
         Ok(secrets) => {
             let keys: Vec<SecretResponse> = secrets
                 .iter()
-                .map(|s| SecretResponse {
-                    key: s.key.clone(),
-                })
+                .map(|s| SecretResponse { key: s.key.clone() })
                 .collect();
             Json(keys).into_response()
         }
@@ -2668,7 +2650,7 @@ async fn delete_secret(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -2736,7 +2718,7 @@ async fn issue_access_key(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -2793,7 +2775,7 @@ async fn list_access_keys(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -2835,7 +2817,7 @@ async fn revoke_access_key(
                     error: format!("project '{id}' not found"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     }
 
@@ -3015,7 +2997,7 @@ async fn add_domain(
                     error: format!("'{host}' was just claimed by someone else"),
                 }),
             )
-                .into_response()
+                .into_response();
         }
         Err(e) => return internal_error(e),
     }
@@ -3139,10 +3121,8 @@ fn derive_host_key(input: &str, platform_domain: &str) -> Result<(String, Domain
     }
     if let Some(label) = d.strip_suffix(&suffix) {
         if label.is_empty() || label.contains('.') {
-            return Err("only flat subdomains (<label>.{platform}) are supported".replace(
-                "{platform}",
-                platform_domain,
-            ));
+            return Err("only flat subdomains (<label>.{platform}) are supported"
+                .replace("{platform}", platform_domain));
         }
         return Ok((label.to_string(), DomainKind::Subdomain));
     }
@@ -3272,7 +3252,11 @@ fn reconcile_deploy_schedules(state: &AppState, project: &Project, deploy_path: 
     }
 }
 
-async fn reconcile_deploy_domains(state: &AppState, project: &Project, deploy_path: &std::path::Path) {
+async fn reconcile_deploy_domains(
+    state: &AppState,
+    project: &Project,
+    deploy_path: &std::path::Path,
+) {
     let Some(tenant_id) = project.tenant_id.clone() else {
         return;
     };
@@ -3280,10 +3264,11 @@ async fn reconcile_deploy_domains(state: &AppState, project: &Project, deploy_pa
     // (raw host, optional site name)
     let mut declared: Vec<(String, Option<String>)> = Vec::new();
 
-    let sites: Vec<jkbase_common::config::ResolvedSite> = std::fs::read_to_string(deploy_path.join("_sites.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default();
+    let sites: Vec<jkbase_common::config::ResolvedSite> =
+        std::fs::read_to_string(deploy_path.join("_sites.json"))
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
     for s in sites {
         if let Some(domain) = s.domain {
             declared.push((domain, Some(s.name)));

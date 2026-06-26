@@ -58,7 +58,11 @@ async fn s3_blob_contract_round_trips_against_minio() {
 
     let dst = std::env::temp_dir().join(format!("jkb-s3-it-{pid}-out.bin"));
     bs.get_to_file(&key, &dst).await.expect("get_to_file");
-    assert_eq!(tokio::fs::read(&dst).await.unwrap(), payload, "round-trip bytes");
+    assert_eq!(
+        tokio::fs::read(&dst).await.unwrap(),
+        payload,
+        "round-trip bytes"
+    );
 
     // head reports the size + an etag; a missing key heads to None.
     let meta = bs.head(&key).await.expect("head").expect("present");
@@ -70,11 +74,21 @@ async fn s3_blob_contract_round_trips_against_minio() {
     let dkey = format!("layers/{pid}/dedup");
     let first = write_tmp("first", b"first-content").await;
     let second = write_tmp("second", b"SECOND-content").await;
-    assert!(bs.put_if_absent_file(&dkey, &first).await.unwrap(), "first write");
-    assert!(!bs.put_if_absent_file(&dkey, &second).await.unwrap(), "already present");
+    assert!(
+        bs.put_if_absent_file(&dkey, &first).await.unwrap(),
+        "first write"
+    );
+    assert!(
+        !bs.put_if_absent_file(&dkey, &second).await.unwrap(),
+        "already present"
+    );
     let dout = std::env::temp_dir().join(format!("jkb-s3-it-{pid}-dedup.out"));
     bs.get_to_file(&dkey, &dout).await.unwrap();
-    assert_eq!(tokio::fs::read(&dout).await.unwrap(), b"first-content", "unchanged");
+    assert_eq!(
+        tokio::fs::read(&dout).await.unwrap(),
+        b"first-content",
+        "unchanged"
+    );
 
     // list honors the raw-prefix semantics of the trait.
     let listed = bs.list(&format!("layers/{pid}/")).await.unwrap();
@@ -85,6 +99,11 @@ async fn s3_blob_contract_round_trips_against_minio() {
     );
 
     // get on a missing key is a typed NotFound, not a generic backend error.
-    let miss = bs.get_to_file("nope/missing", Path::new("/tmp/never")).await;
-    assert!(matches!(miss, Err(SubstrateError::NotFound(_))), "got {miss:?}");
+    let miss = bs
+        .get_to_file("nope/missing", Path::new("/tmp/never"))
+        .await;
+    assert!(
+        matches!(miss, Err(SubstrateError::NotFound(_))),
+        "got {miss:?}"
+    );
 }

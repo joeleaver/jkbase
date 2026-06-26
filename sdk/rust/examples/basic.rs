@@ -23,7 +23,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("created bucket {bucket}");
     }
 
-    let etag = s3.put_object(bucket, "greeting.txt", b"hello from rust".to_vec(), "text/plain").await?;
+    let etag = s3
+        .put_object(
+            bucket,
+            "greeting.txt",
+            b"hello from rust".to_vec(),
+            "text/plain",
+        )
+        .await?;
     println!("put greeting.txt (etag {etag})");
 
     let body = s3.get_object_bytes(bucket, "greeting.txt").await?;

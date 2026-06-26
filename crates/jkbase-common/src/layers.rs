@@ -122,7 +122,10 @@ mod tests {
         let back: RuntimeLayers = serde_json::from_str(&json).unwrap();
         assert_eq!(back.schema, RuntimeLayers::SCHEMA);
         assert_eq!(back.data_device.as_deref(), Some("/dev/vdf"));
-        assert_eq!(back.servers["api"].layers, vec!["/dev/vde", "/dev/vdd", "/dev/vdc"]);
+        assert_eq!(
+            back.servers["api"].layers,
+            vec!["/dev/vde", "/dev/vdd", "/dev/vdc"]
+        );
     }
 
     #[test]
@@ -132,7 +135,9 @@ mod tests {
         assert!(rl.database.is_none());
         // Present ⇒ round-trips the rhypedb:base overlay device list.
         let mut rl = RuntimeLayers::new();
-        rl.database = Some(ServerLayers { layers: vec!["/dev/vdd".into(), "/dev/vdc".into()] });
+        rl.database = Some(ServerLayers {
+            layers: vec!["/dev/vdd".into(), "/dev/vdc".into()],
+        });
         let json = serde_json::to_string(&rl).unwrap();
         let back: RuntimeLayers = serde_json::from_str(&json).unwrap();
         assert_eq!(back.database.unwrap().layers, vec!["/dev/vdd", "/dev/vdc"]);
@@ -154,7 +159,11 @@ mod tests {
         let mut rl = RuntimeLayers::new();
         rl.verity.insert(
             "/dev/vdc".into(),
-            VerityParams { root_hash: "deadbeef".into(), salt: "cafe".into(), data_size: 8192 },
+            VerityParams {
+                root_hash: "deadbeef".into(),
+                salt: "cafe".into(),
+                data_size: 8192,
+            },
         );
         let json = serde_json::to_string(&rl).unwrap();
         let back: RuntimeLayers = serde_json::from_str(&json).unwrap();

@@ -15,7 +15,7 @@
 //! collide the shipper cursor and the egress audit trail would fail **open**
 //! (unobserved egress while the operator believes it is observed).
 
-use jkbase_common::logs::{EgressEvent, LogLine, Verdict, EGRESS_STREAM};
+use jkbase_common::logs::{EGRESS_STREAM, EgressEvent, LogLine, Verdict};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
@@ -214,7 +214,10 @@ impl LogSink {
         let mut merged: Vec<LogLine> = {
             let buf = self.buffer.lock().await;
             let egress = self.egress.lock().await;
-            buf.iter().cloned().chain(Self::egress_lines(&egress)).collect()
+            buf.iter()
+                .cloned()
+                .chain(Self::egress_lines(&egress))
+                .collect()
         };
         merged.sort_by_key(|l| l.seq);
         let start = merged.len().saturating_sub(limit);
@@ -230,7 +233,11 @@ impl LogSink {
             buf.iter()
                 .filter(|l| l.seq > since)
                 .cloned()
-                .chain(Self::egress_lines(&egress).into_iter().filter(|l| l.seq > since))
+                .chain(
+                    Self::egress_lines(&egress)
+                        .into_iter()
+                        .filter(|l| l.seq > since),
+                )
                 .collect()
         };
         merged.sort_by_key(|l| l.seq);
@@ -327,7 +334,8 @@ mod tests {
         // App line first (seq 1), then a tight deny loop to the same dest, then a distinct dest.
         sink.push("web", "stdout", "boot".into()).await;
         for _ in 0..5 {
-            sink.push_egress(ev("evil.example", Verdict::DenySandbox)).await;
+            sink.push_egress(ev("evil.example", Verdict::DenySandbox))
+                .await;
         }
         sink.push_egress(ev("api.stripe.com", Verdict::Allow)).await;
 
@@ -335,9 +343,14 @@ mod tests {
         // 1 app line + 2 egress rows (the 5 evil hits coalesced into one).
         let egress: Vec<&LogLine> = all.iter().filter(|l| l.stream == EGRESS_STREAM).collect();
         assert_eq!(egress.len(), 2, "repeats must coalesce to one row");
-        let evil: EgressEvent =
-            serde_json::from_str(&egress.iter().find(|l| l.line.contains("evil")).unwrap().line)
-                .unwrap();
+        let evil: EgressEvent = serde_json::from_str(
+            &egress
+                .iter()
+                .find(|l| l.line.contains("evil"))
+                .unwrap()
+                .line,
+        )
+        .unwrap();
         assert_eq!(evil.count, 5, "coalesced count");
         // Unified, strictly-increasing cursor across app + egress streams.
         let seqs: Vec<u64> = all.iter().map(|l| l.seq).collect();
@@ -357,10 +370,12 @@ mod tests {
         // overruns the ring. The Allow row (the real exfil destination) must survive, and a
         // dropped-marker must record that a flood happened.
         let sink = LogSink::new();
-        sink.push_egress(ev("real-exfil.example", Verdict::Allow)).await;
+        sink.push_egress(ev("real-exfil.example", Verdict::Allow))
+            .await;
         for i in 0..(MAX_EGRESS_LINES + 200) {
             // distinct host each time → never coalesces → forces eviction
-            sink.push_egress(ev(&format!("d{i}.evil"), Verdict::DenyPlatform)).await;
+            sink.push_egress(ev(&format!("d{i}.evil"), Verdict::DenyPlatform))
+                .await;
         }
 
         let all = sink.get_logs(100_000).await;
@@ -370,11 +385,15 @@ mod tests {
             .filter_map(|l| serde_json::from_str(&l.line).ok())
             .collect();
         assert!(
-            events.iter().any(|e| e.verdict == Verdict::Allow && e.dest_host == "real-exfil.example"),
+            events
+                .iter()
+                .any(|e| e.verdict == Verdict::Allow && e.dest_host == "real-exfil.example"),
             "the buffered Allow contact must survive a distinct-deny flood"
         );
         assert!(
-            events.iter().any(|e| e.dest_host == EGRESS_DROPPED_MARKER_HOST && e.count > 0),
+            events
+                .iter()
+                .any(|e| e.dest_host == EGRESS_DROPPED_MARKER_HOST && e.count > 0),
             "a dropped-marker must record the flood overflow"
         );
         // The ring stays bounded (plus the one marker row).
@@ -391,6 +410,10 @@ mod tests {
         }
         let all = sink.get_logs(100).await;
         let egress: Vec<&LogLine> = all.iter().filter(|l| l.stream == EGRESS_STREAM).collect();
-        assert_eq!(egress.len(), 2, "interleaved repeats coalesce within the window");
+        assert_eq!(
+            egress.len(),
+            2,
+            "interleaved repeats coalesce within the window"
+        );
     }
 }

@@ -23,7 +23,9 @@ fn endpoint() -> String {
 }
 
 async fn store() -> EtcdControlStore {
-    EtcdControlStore::connect(&[endpoint()]).await.expect("connect etcd")
+    EtcdControlStore::connect(&[endpoint()])
+        .await
+        .expect("connect etcd")
 }
 
 fn put(table: &str, key: &[u8], value: &[u8]) -> Write {
@@ -47,34 +49,64 @@ async fn etcd_control_contract_matches_redb() {
     let other = format!("{pid}_other");
 
     // put → get round-trips; absent key is None; table namespacing is independent.
-    s.transact(vec![], vec![put(&projects, b"p1", b"v1")]).await.unwrap();
-    assert_eq!(s.get(&projects, b"p1").await.unwrap().as_deref(), Some(&b"v1"[..]));
+    s.transact(vec![], vec![put(&projects, b"p1", b"v1")])
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get(&projects, b"p1").await.unwrap().as_deref(),
+        Some(&b"v1"[..])
+    );
     assert!(s.get(&projects, b"absent").await.unwrap().is_none());
     assert!(s.get(&domains, b"p1").await.unwrap().is_none());
 
     // Absent guard = create-if-absent: the second create must conflict.
-    let g = || vec![Guard::Absent { table: t.clone(), key: Bytes::from_static(b"k") }];
-    s.transact(g(), vec![put(&t, b"k", b"first")]).await.unwrap();
+    let g = || {
+        vec![Guard::Absent {
+            table: t.clone(),
+            key: Bytes::from_static(b"k"),
+        }]
+    };
+    s.transact(g(), vec![put(&t, b"k", b"first")])
+        .await
+        .unwrap();
     assert!(matches!(
         s.transact(g(), vec![put(&t, b"k", b"second")]).await,
         Err(SubstrateError::TxnConflict)
     ));
-    assert_eq!(s.get(&t, b"k").await.unwrap().as_deref(), Some(&b"first"[..]));
+    assert_eq!(
+        s.get(&t, b"k").await.unwrap().as_deref(),
+        Some(&b"first"[..])
+    );
 
     // Equals guard = compare-and-set. Wrong expected value conflicts, writes nothing.
-    let bad = vec![Guard::Equals { table: t.clone(), key: Bytes::from_static(b"k"), value: Bytes::from_static(b"WRONG") }];
+    let bad = vec![Guard::Equals {
+        table: t.clone(),
+        key: Bytes::from_static(b"k"),
+        value: Bytes::from_static(b"WRONG"),
+    }];
     assert!(matches!(
         s.transact(bad, vec![put(&t, b"k", b"v1")]).await,
         Err(SubstrateError::TxnConflict)
     ));
-    assert_eq!(s.get(&t, b"k").await.unwrap().as_deref(), Some(&b"first"[..]));
-    let good = vec![Guard::Equals { table: t.clone(), key: Bytes::from_static(b"k"), value: Bytes::from_static(b"first") }];
+    assert_eq!(
+        s.get(&t, b"k").await.unwrap().as_deref(),
+        Some(&b"first"[..])
+    );
+    let good = vec![Guard::Equals {
+        table: t.clone(),
+        key: Bytes::from_static(b"k"),
+        value: Bytes::from_static(b"first"),
+    }];
     s.transact(good, vec![put(&t, b"k", b"v1")]).await.unwrap();
     assert_eq!(s.get(&t, b"k").await.unwrap().as_deref(), Some(&b"v1"[..]));
 
     // CAS against a MISSING key never matches (even though etcd treats absent as
     // empty) — Equals emits an existence check too.
-    let miss = vec![Guard::Equals { table: t.clone(), key: Bytes::from_static(b"ghost"), value: Bytes::from_static(b"") }];
+    let miss = vec![Guard::Equals {
+        table: t.clone(),
+        key: Bytes::from_static(b"ghost"),
+        value: Bytes::from_static(b""),
+    }];
     assert!(matches!(
         s.transact(miss, vec![put(&t, b"ghost", b"x")]).await,
         Err(SubstrateError::TxnConflict)
@@ -92,15 +124,30 @@ async fn etcd_control_contract_matches_redb() {
     )
     .await
     .unwrap();
-    let keys: Vec<_> = s.scan_prefix(&p, b"a/").await.unwrap().into_iter().map(|(k, _)| k).collect();
-    assert_eq!(keys, vec![Bytes::from_static(b"a/1"), Bytes::from_static(b"a/2")]);
+    let keys: Vec<_> = s
+        .scan_prefix(&p, b"a/")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![Bytes::from_static(b"a/1"), Bytes::from_static(b"a/2")]
+    );
     assert_eq!(s.scan_prefix(&p, b"").await.unwrap().len(), 3);
     assert_eq!(s.scan_prefix(&other, b"").await.unwrap().len(), 1);
 
     // Delete removes the key.
-    s.transact(vec![], vec![Write::Delete { table: t.clone(), key: Bytes::from_static(b"k") }])
-        .await
-        .unwrap();
+    s.transact(
+        vec![],
+        vec![Write::Delete {
+            table: t.clone(),
+            key: Bytes::from_static(b"k"),
+        }],
+    )
+    .await
+    .unwrap();
     assert!(s.get(&t, b"k").await.unwrap().is_none());
 
     // Honest cluster cap.

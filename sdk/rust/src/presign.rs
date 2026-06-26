@@ -24,11 +24,25 @@ impl ObjectClient {
     /// the timestamp against the shared SigV4 vectors. Not part of the public API: the
     /// public `presigned_get`/`presigned_put` (which validate the key) are the only minters.
     #[cfg(test)]
-    pub(crate) fn presigned_at(&self, method: &str, bucket: &str, key: &str, expires_secs: u64, now_unix: u64) -> String {
+    pub(crate) fn presigned_at(
+        &self,
+        method: &str,
+        bucket: &str,
+        key: &str,
+        expires_secs: u64,
+        now_unix: u64,
+    ) -> String {
         self.presigned(method, bucket, key, expires_secs, now_unix)
     }
 
-    fn presigned(&self, method: &str, bucket: &str, key: &str, expires_secs: u64, now_unix: u64) -> String {
+    fn presigned(
+        &self,
+        method: &str,
+        bucket: &str,
+        key: &str,
+        expires_secs: u64,
+        now_unix: u64,
+    ) -> String {
         let signed = jkbase_sigv4::presign(
             method,
             self.host(),
@@ -44,5 +58,8 @@ impl ObjectClient {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

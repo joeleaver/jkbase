@@ -183,14 +183,25 @@ pub enum Guard {
     /// `key` must currently be present (any value).
     Present { table: String, key: Bytes },
     /// `key` must currently equal `value` (compare-and-set).
-    Equals { table: String, key: Bytes, value: Bytes },
+    Equals {
+        table: String,
+        key: Bytes,
+        value: Bytes,
+    },
 }
 
 /// A mutation applied atomically by [`ControlStore::transact`].
 #[derive(Debug, Clone)]
 pub enum Write {
-    Put { table: String, key: Bytes, value: Bytes },
-    Delete { table: String, key: Bytes },
+    Put {
+        table: String,
+        key: Bytes,
+        value: Bytes,
+    },
+    Delete {
+        table: String,
+        key: Bytes,
+    },
 }
 
 /// R1 — the authoritative, transactional metadata store (projects, deployments,
@@ -341,7 +352,8 @@ mod tests {
 
     #[test]
     fn caps_negotiation_flags_compose() {
-        let cluster = Caps::REPLICATED_TXN | Caps::CLUSTER_EXCLUSIVE_FENCE | Caps::STORAGE_ENFORCED_RWO;
+        let cluster =
+            Caps::REPLICATED_TXN | Caps::CLUSTER_EXCLUSIVE_FENCE | Caps::STORAGE_ENFORCED_RWO;
         assert!(cluster.contains(Caps::CLUSTER_EXCLUSIVE_FENCE));
         assert!(!cluster.contains(Caps::NODE_LOCAL_RWO));
     }

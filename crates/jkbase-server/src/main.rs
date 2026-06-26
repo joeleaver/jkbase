@@ -6,6 +6,7 @@ mod log_shipper;
 mod metering;
 mod mirror;
 mod objectstore_service;
+mod rootfs_cas;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -13,22 +14,24 @@ use jkbase_common::config::PlatformEgress;
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    month_start_epoch, DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, Project,
-    ProjectState, QuotaStatus, SnapshotMeta, Store, VmAllocation,
+    DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, Project, ProjectState,
+    QuotaStatus, SnapshotMeta, Store, VmAllocation, month_start_epoch,
 };
-use log_shipper::LogShipper;
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
-use jkbase_substrate::{DataDiskProvider, FenceToken, FlockLease, Lease, LocalLoop, SubstrateError};
 use jkbase_proxy::tls::CertManager;
 use jkbase_proxy::{
-    self, new_domain_map, new_routing_table, ActivityTracker, DomainMap, DomainTarget, ProxyConfig,
+    self, ActivityTracker, DomainMap, DomainTarget, ProxyConfig, new_domain_map, new_routing_table,
 };
+use jkbase_substrate::{
+    DataDiskProvider, FenceToken, FlockLease, Lease, LocalLoop, SubstrateError,
+};
+use log_shipper::LogShipper;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -242,16 +245,26 @@ fn validate_substrate_selection(args: &Args) -> Result<()> {
         }
         Ok(())
     }
-    check("control-store", &args.substrate_control_store, &["redb", "etcd"])?;
+    check(
+        "control-store",
+        &args.substrate_control_store,
+        &["redb", "etcd"],
+    )?;
     check("lease", &args.substrate_lease, &["flock", "etcd"])?;
-    check("data-disk", &args.substrate_data_disk, &["localloop", "cephrbd"])?;
+    check(
+        "data-disk",
+        &args.substrate_data_disk,
+        &["localloop", "cephrbd"],
+    )?;
     check("blob-store", &args.substrate_blob_store, &["localfs", "s3"])?;
     let clustered = args.substrate_control_store != "redb"
         || args.substrate_lease != "flock"
         || args.substrate_data_disk != "localloop"
         || args.substrate_blob_store != "localfs";
     if clustered {
-        warn!("non-default substrate backend selected; accepted as config but NOT wired until HA P1");
+        warn!(
+            "non-default substrate backend selected; accepted as config but NOT wired until HA P1"
+        );
     }
     Ok(())
 }
@@ -341,7 +354,9 @@ async fn leader_election_loop(lease: Arc<dyn Lease>, host_id: String, is_leader:
             let result =
                 match tokio::time::timeout(RENEW_RPC_TIMEOUT, lease.renew(&t, LEADER_TTL)).await {
                     Ok(r) => r,
-                    Err(_) => Err(SubstrateError::Backend("leader lease renew timed out".into())),
+                    Err(_) => Err(SubstrateError::Backend(
+                        "leader lease renew timed out".into(),
+                    )),
                 };
             match evaluate_renew(&result, last_success, Instant::now(), LEADER_FENCE_DEADLINE) {
                 FenceDecision::Hold => {
@@ -418,7 +433,9 @@ async fn disk_fence_loop(platform: Arc<Mutex<PlatformState>>, lease: Arc<dyn Lea
         let still_held: HashSet<String> = held.iter().map(|(p, _)| p.clone()).collect();
         // Seed last-success for freshly-acquired disks (just fenced + attached).
         for (project, _) in &held {
-            last_success.entry(project.clone()).or_insert_with(Instant::now);
+            last_success
+                .entry(project.clone())
+                .or_insert_with(Instant::now);
         }
         // Renew every held disk CONCURRENTLY, each bounded by RENEW_RPC_TIMEOUT, so one
         // slow/hung disk never delays another's self-fence (the serialization the review
@@ -444,7 +461,10 @@ async fn disk_fence_loop(platform: Arc<Mutex<PlatformState>>, lease: Arc<dyn Lea
                 Ok(tuple) => tuple,
                 Err(_) => continue, // a renew task panicked; next tick retries
             };
-            let since = last_success.get(&project).copied().unwrap_or_else(Instant::now);
+            let since = last_success
+                .get(&project)
+                .copied()
+                .unwrap_or_else(Instant::now);
             match evaluate_renew(&result, since, Instant::now(), DISK_FENCE_DEADLINE) {
                 FenceDecision::Hold => {
                     last_success.insert(project, Instant::now());
@@ -516,6 +536,7 @@ async fn self_fence_project(
         // Drop our claim first so no other path still treats us as the holder.
         plat.disk_tokens.remove(project_id);
         plat.vm_states.remove(project_id);
+        plat.vm_rootfs_hashes.remove(project_id);
         (plat.vms.remove(project_id), plat.data_disk.clone())
     };
     // Kill the FC HARD — the safety action — before anything slow.
@@ -599,8 +620,10 @@ fn reassign_plan(
     now: u64,
     dead_threshold_secs: u64,
 ) -> Vec<(String, String)> {
-    let alloc_by_project: HashMap<&str, &VmAllocation> =
-        allocations.iter().map(|a| (a.project_id.as_str(), a)).collect();
+    let alloc_by_project: HashMap<&str, &VmAllocation> = allocations
+        .iter()
+        .map(|a| (a.project_id.as_str(), a))
+        .collect();
     let mut load = current_load(allocations);
     let mut out = Vec::new();
     for pid in orphaned {
@@ -633,7 +656,12 @@ async fn host_heartbeat_loop(store: Store, mut self_host: HostRecord, is_leader:
             && let Ok(hosts) = store.list_hosts()
         {
             let now = jkbase_control::auth::timestamp();
-            for h in dead_hosts(&hosts, now, DEAD_HOST_THRESHOLD.as_secs(), &self_host.host_id) {
+            for h in dead_hosts(
+                &hosts,
+                now,
+                DEAD_HOST_THRESHOLD.as_secs(),
+                &self_host.host_id,
+            ) {
                 warn!(host_id = %h.host_id, region = %h.region,
                       stale_secs = now.saturating_sub(h.last_heartbeat),
                       "dead host detected (stale heartbeat) — pending reconcile");
@@ -668,8 +696,10 @@ fn reconcile_plan(
         .filter(|h| host_is_live(h, now, dead_threshold_secs))
         .map(|h| h.host_id.as_str())
         .collect();
-    let alloc_by_project: HashMap<&str, &VmAllocation> =
-        allocations.iter().map(|a| (a.project_id.as_str(), a)).collect();
+    let alloc_by_project: HashMap<&str, &VmAllocation> = allocations
+        .iter()
+        .map(|a| (a.project_id.as_str(), a))
+        .collect();
     let mut orphaned = Vec::new();
     for p in projects {
         if p.current_version.is_none() {
@@ -710,7 +740,13 @@ async fn reconcile_loop(platform: Arc<Mutex<PlatformState>>, is_leader: Arc<Atom
         let allocs = plat.store.list_vm_allocations().unwrap_or_default();
         let hosts = plat.store.list_hosts().unwrap_or_default();
         let now = jkbase_control::auth::timestamp();
-        let plan = reconcile_plan(&projects, &allocs, &hosts, now, DEAD_HOST_THRESHOLD.as_secs());
+        let plan = reconcile_plan(
+            &projects,
+            &allocs,
+            &hosts,
+            now,
+            DEAD_HOST_THRESHOLD.as_secs(),
+        );
         if plan.orphaned.is_empty() {
             continue;
         }
@@ -718,8 +754,13 @@ async fn reconcile_loop(platform: Arc<Mutex<PlatformState>>, is_leader: Arc<Atom
         // the allocation's owner + bump placement_epoch. The new owner boots it on its next
         // wake/reconcile, acquiring the disk lease (whose epoch the old host has already
         // self-fenced from); the data disk moves via the substrate DataDiskProvider (Ceph).
-        let reassignments =
-            reassign_plan(&plan.orphaned, &hosts, &allocs, now, DEAD_HOST_THRESHOLD.as_secs());
+        let reassignments = reassign_plan(
+            &plan.orphaned,
+            &hosts,
+            &allocs,
+            now,
+            DEAD_HOST_THRESHOLD.as_secs(),
+        );
         for (pid, new_host) in &reassignments {
             match plat.store.get_vm_allocation(pid) {
                 Ok(Some(mut alloc)) => {
@@ -738,7 +779,10 @@ async fn reconcile_loop(platform: Arc<Mutex<PlatformState>>, is_leader: Arc<Atom
         }
         let unplaced = plan.orphaned.len() - reassignments.len();
         if unplaced > 0 {
-            warn!(unplaced, "reconcile: orphaned projects with no live host in-region (cluster at capacity)");
+            warn!(
+                unplaced,
+                "reconcile: orphaned projects with no live host in-region (cluster at capacity)"
+            );
         }
     }
 }
@@ -749,7 +793,10 @@ enum DeployTarget {
     /// Run here: we own it, or it is unplaced (single-node / pre-placement / first deploy).
     Local,
     /// Owned by a live remote host — forward the deploy there.
-    Remote { host_id: String, addr: Option<String> },
+    Remote {
+        host_id: String,
+        addr: Option<String>,
+    },
     /// Owned by a host that is no longer live; the reconciler must reassign it first. Fail
     /// closed (deploy is retryable) rather than have a non-owner boot a second copy.
     OwnerDead { host_id: String },
@@ -790,10 +837,28 @@ enum VmLifecycle {
 struct PlatformState {
     vms: HashMap<String, VmInstance>,
     vm_states: HashMap<String, VmLifecycle>,
+    /// The base-rootfs hash each RUNNING VM is ACTUALLY mapped against (cold boot ⇒ the current
+    /// hash; a restored VM ⇒ the hash it restored from, which after a redeploy is the OLD blob,
+    /// not `base_rootfs_hash`). Stamped into the snapshot at hibernate so the next restore + the
+    /// GC reference set point at the bytes the guest RAM truly depends on. Keyed by project_id;
+    /// set on commit-to-Running, removed on hibernate/teardown.
+    vm_rootfs_hashes: HashMap<String, String>,
+    /// Last failed-wake instant per project — the wake path fast-fails (Retry-After) within
+    /// [`WAKE_BACKOFF`] of it so a doomed project can't be spun into unbounded boot attempts by
+    /// continuous traffic. Cleared on a successful wake.
+    wake_failures: HashMap<String, std::time::Instant>,
     store: Store,
     firecracker_bin: PathBuf,
     kernel_path: PathBuf,
+    /// The content-addressed base rootfs every VM boots from: `base-rootfs/<hash>.ext4`,
+    /// an IMMUTABLE blob. A redeploy that ships a new agent mints a new hash/blob next to
+    /// the old one, so a snapshot taken before the redeploy still restores byte-correct
+    /// against the bytes its guest RAM expects (vs. the old in-place rewrite that poisoned
+    /// every pre-existing snapshot). See `base_rootfs_hash` and the startup CAS placement.
     base_rootfs_path: PathBuf,
+    /// sha256 of `base_rootfs_path` — stamped into each snapshot at hibernate time and the
+    /// "keep" root of the startup CAS GC.
+    base_rootfs_hash: String,
     data_dir: PathBuf,
     /// Read-write-once data-disk provider (R3) + exclusive lease (R2) — every data
     /// disk is fenced through these so a restored/relocated VM can never write a disk
@@ -915,7 +980,10 @@ async fn main() -> Result<()> {
         //   2) {--data-dir}/build-ca if --data-dir is on the command line, else
         //   3) /var/jkbase/build-ca (the server's default data dir).
         let argv: Vec<String> = std::env::args().collect();
-        let explicit = argv.get(2).filter(|a| !a.starts_with("--")).map(PathBuf::from);
+        let explicit = argv
+            .get(2)
+            .filter(|a| !a.starts_with("--"))
+            .map(PathBuf::from);
         let dir = explicit.unwrap_or_else(|| {
             let data_dir = argv
                 .windows(2)
@@ -927,7 +995,11 @@ async fn main() -> Result<()> {
         let ca = build_ca::BuildCa::load_or_generate(&dir)?;
         println!(
             "build-mirror CA ready ({}): key={} cert={} fingerprint={}",
-            if ca.generated { "generated" } else { "loaded existing" },
+            if ca.generated {
+                "generated"
+            } else {
+                "loaded existing"
+            },
             dir.join("ca.key").display(),
             dir.join("ca.crt").display(),
             ca.fingerprint(),
@@ -1025,8 +1097,54 @@ async fn main() -> Result<()> {
     let domain_map: DomainMap = new_domain_map();
     let activity_tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
 
-    let base_rootfs_path = data_dir.join("base-rootfs.ext4");
-    rootfs::build_base_rootfs(&args.agent_bin, &base_rootfs_path).await?;
+    // Content-address the base rootfs so a redeploy that ships a new agent can never poison a
+    // pre-existing hibernation snapshot (incident: nlnwt, 2026-06-26). The staging artifact at
+    // `base-rootfs.ext4` is built by the deploy script in prod (apko may not be on the service's
+    // PATH) or the local-dev fallback; we hash it and pin it immutably at `base-rootfs/<hash>.ext4`.
+    // ORDER IS LOAD-BEARING (see docs/rootfs-cas-snapshot-durability.md): reap orphan FCs → CAS-ize
+    // → GC, ALL synchronously here, before any loop that can boot/restore a VM is spawned (the HA
+    // reconciler/disk-fence below) and before the proxy binds — so the GC reference set is computed
+    // while zero VMs are running and no wake can race a blob mid-sweep.
+    let staging_rootfs = data_dir.join("base-rootfs.ext4");
+    rootfs::build_base_rootfs(&args.agent_bin, &staging_rootfs).await?;
+    let cas_dir = data_dir.join("base-rootfs");
+    let reaped = rootfs_cas::reap_orphan_firecrackers(&data_dir.join("run"));
+    if reaped > 0 {
+        warn!(
+            count = reaped,
+            "reaped orphaned Firecrackers from a prior incarnation before rootfs GC"
+        );
+    }
+    let (base_rootfs_path, base_rootfs_hash) = rootfs_cas::place(&staging_rootfs, &cas_dir)?;
+    // FAIL CLOSED: only reap a blob we can PROVE no restorable snapshot references. If we can't
+    // enumerate every snapshot's stamped hash, skip all deletes (a partial set would reap a live
+    // blob). Over-deletion is self-healing anyway (missing blob ⇒ non-viable restore ⇒ cold boot).
+    match store.list_snapshot_metas() {
+        Ok(metas) => {
+            let mut keep: HashSet<String> = HashSet::new();
+            keep.insert(base_rootfs_hash.clone());
+            for m in &metas {
+                if let Some(h) = &m.base_rootfs_hash
+                    && rootfs_cas::is_sha256_hex(h)
+                {
+                    keep.insert(h.clone());
+                }
+            }
+            match rootfs_cas::gc(&cas_dir, &keep) {
+                Ok(removed) if !removed.is_empty() => {
+                    info!(
+                        count = removed.len(),
+                        "GC: reaped unreferenced base-rootfs blobs"
+                    )
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "base-rootfs GC failed; skipped (no blobs reaped)"),
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "could not enumerate snapshots; skipping base-rootfs GC (fail closed)")
+        }
+    }
 
     // Data-disk RWO substrate: R3 LocalLoop (loop-device exclusivity) + R2 FlockLease
     // (monotonic fence token). Migrate any legacy `{id}.ext4` disks to LocalLoop's
@@ -1060,7 +1178,9 @@ async fn main() -> Result<()> {
         // layer denying a function the control plane on those ports. Empty = that agent-side
         // Zone-2 deny is disabled — loudly flag it (the control API is still loopback-bound +
         // auth-gated, but this is a real gap to close before tenant exposure).
-        warn!("no platform uplink IPs (auto-discovery empty and --platform-ips unset); function egress Zone-2 deny by IP is DISABLED — set --platform-ips");
+        warn!(
+            "no platform uplink IPs (auto-discovery empty and --platform-ips unset); function egress Zone-2 deny by IP is DISABLED — set --platform-ips"
+        );
     } else {
         info!(ips = ?platform_ips, "platform egress deny-set (Zone-2 platform IPs)");
     }
@@ -1082,12 +1202,15 @@ async fn main() -> Result<()> {
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         vm_states: HashMap::new(),
+        vm_rootfs_hashes: HashMap::new(),
+        wake_failures: HashMap::new(),
         store: store.clone(),
         firecracker_bin: args
             .fc_dir
             .join("release-v1.15.1-x86_64/firecracker-v1.15.1-x86_64"),
         kernel_path: guest_kernel.clone(),
         base_rootfs_path,
+        base_rootfs_hash,
         data_dir: data_dir.clone(),
         data_disk,
         lease,
@@ -1145,7 +1268,10 @@ async fn main() -> Result<()> {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("--acme-email required when --tls is enabled"))?;
         // Select the DNS-01 backend; Cloudflare is the default for back-compat.
-        let dns_provider: Arc<dyn jkbase_proxy::tls::DnsProvider> = match args.acme_dns_provider.as_str() {
+        let dns_provider: Arc<dyn jkbase_proxy::tls::DnsProvider> = match args
+            .acme_dns_provider
+            .as_str()
+        {
             "cloudflare" => {
                 let token = args.cloudflare_token.clone().ok_or_else(|| {
                     anyhow::anyhow!("CLOUDFLARE_API_TOKEN (--cloudflare-token) required when --tls and ACME_DNS_PROVIDER=cloudflare")
@@ -1159,7 +1285,10 @@ async fn main() -> Result<()> {
                 let ns = args.rfc2136_nameserver.clone().ok_or_else(|| {
                     anyhow::anyhow!("RFC2136_NAMESERVER (--rfc2136-nameserver) required when ACME_DNS_PROVIDER=rfc2136")
                 })?;
-                let zone = args.rfc2136_zone.clone().unwrap_or_else(|| args.domain.clone());
+                let zone = args
+                    .rfc2136_zone
+                    .clone()
+                    .unwrap_or_else(|| args.domain.clone());
                 let key_name = args.rfc2136_tsig_name.clone().ok_or_else(|| {
                     anyhow::anyhow!("RFC2136_TSIG_NAME (--rfc2136-tsig-name) required when ACME_DNS_PROVIDER=rfc2136")
                 })?;
@@ -1214,7 +1343,9 @@ async fn main() -> Result<()> {
         let routing = routing_for_cb.clone();
         let domains = domain_for_cb.clone();
         let shipper = shipper_for_cb.clone();
-        Box::pin(async move { handle_deploy(&project_id, platform, routing, domains, shipper).await })
+        Box::pin(
+            async move { handle_deploy(&project_id, platform, routing, domains, shipper).await },
+        )
     }));
 
     let platform_for_teardown = platform.clone();
@@ -1334,7 +1465,11 @@ async fn main() -> Result<()> {
     let _ = std::fs::create_dir_all(&build_deps.toolchain_dir);
     build_orchestrator::provision_cgroup(&build_deps.cgroup_mount, &build_deps.parent_cgroup);
     // Fail builds left mid-flight by a previous crash + reap their orphan dirs.
-    build_orchestrator::reconcile_on_boot(&build_deps.store, &build_deps.data_dir, &build_deps.deploy_dir);
+    build_orchestrator::reconcile_on_boot(
+        &build_deps.store,
+        &build_deps.data_dir,
+        &build_deps.deploy_dir,
+    );
     state.build_callback = Some(build_orchestrator::build_callback(build_deps));
 
     let state = Arc::new(state);
@@ -1345,19 +1480,24 @@ async fn main() -> Result<()> {
     let routing_for_wake = routing_table.clone();
     let domain_for_wake = domain_map.clone();
     let shipper_for_wake = log_shipper.clone();
-    let wake_callback: jkbase_proxy::WakeCallback =
-        Arc::new(move |project_id: String| {
-            let platform = platform_for_wake.clone();
-            let routing = routing_for_wake.clone();
-            let domains = domain_for_wake.clone();
-            let shipper = shipper_for_wake.clone();
-            Box::pin(async move { wake_project(&project_id, platform, routing, domains, shipper).await })
-        });
+    let wake_callback: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
+        let platform = platform_for_wake.clone();
+        let routing = routing_for_wake.clone();
+        let domains = domain_for_wake.clone();
+        let shipper = shipper_for_wake.clone();
+        Box::pin(
+            async move { wake_project(&project_id, platform, routing, domains, shipper).await },
+        )
+    });
 
     let api_addr = format!("127.0.0.1:{}", args.api_port);
     let proxy_config = ProxyConfig {
         http_port: args.proxy_port,
-        https_port: if args.tls { Some(args.https_port) } else { None },
+        https_port: if args.tls {
+            Some(args.https_port)
+        } else {
+            None
+        },
         platform_domain: args.domain,
         cert_manager: cert_manager.clone(),
         api_addr: Some(api_addr),
@@ -1392,7 +1532,10 @@ async fn main() -> Result<()> {
     // Spawn idle detection loop
     if args.idle_timeout_secs > 0 {
         let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
-        info!(timeout_secs = args.idle_timeout_secs, "idle detection enabled");
+        info!(
+            timeout_secs = args.idle_timeout_secs,
+            "idle detection enabled"
+        );
         tokio::spawn(idle_detection_loop(
             platform.clone(),
             routing_table.clone(),
@@ -1554,8 +1697,13 @@ async fn shutdown_signal(
 
     for project_id in &running_projects {
         info!(project = %project_id, "hibernating for shutdown");
-        if let Err(e) =
-            hibernate_project(project_id, platform.clone(), routing.clone(), shipper.clone()).await
+        if let Err(e) = hibernate_project(
+            project_id,
+            platform.clone(),
+            routing.clone(),
+            shipper.clone(),
+        )
+        .await
         {
             // hibernate_project self-cleans its own wedge/timeout paths; this is a
             // last-resort catch for an unexpected Err, routed through the same helper.
@@ -1647,6 +1795,7 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             let dd = plat.data_disk.clone();
             let _ = dd.destroy(project_id).await;
             plat.vm_states.remove(project_id);
+            plat.vm_rootfs_hashes.remove(project_id);
             let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
             let _ = plat.store.remove_snapshot_meta(project_id);
             let _ = plat.store.remove_vm_allocation(project_id);
@@ -1670,12 +1819,19 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 /// Remove every per-project on-disk artifact (content image, data disk, snapshot,
 /// run dir, hosting tree, build workspace). Best-effort; absent paths are ignored.
 async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
-    let _ =
-        tokio::fs::remove_file(data_dir.join("content-images").join(format!("{project_id}.ext4")))
-            .await;
+    let _ = tokio::fs::remove_file(
+        data_dir
+            .join("content-images")
+            .join(format!("{project_id}.ext4")),
+    )
+    .await;
     // Data disk: legacy `.ext4` plus the loop-managed `.img` + its holder record.
     let disks = data_dir.join("data-disks");
-    for f in [format!("{project_id}.ext4"), format!("{project_id}.img"), format!("{project_id}.holder")] {
+    for f in [
+        format!("{project_id}.ext4"),
+        format!("{project_id}.img"),
+        format!("{project_id}.holder"),
+    ] {
         let _ = tokio::fs::remove_file(disks.join(f)).await;
     }
     for dir in ["snapshots", "run", "hosting", "builds", "buildcache"] {
@@ -1686,8 +1842,7 @@ async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
         let _ = tokio::fs::remove_dir_all(data_dir.join(dir).join(project_id)).await;
     }
     // Per-project git bare repo (build·D push-to-deploy): `git/{id}.git`.
-    let _ =
-        tokio::fs::remove_dir_all(data_dir.join("git").join(format!("{project_id}.git"))).await;
+    let _ = tokio::fs::remove_dir_all(data_dir.join("git").join(format!("{project_id}.git"))).await;
 }
 
 /// Reap every runtime Firecracker left over from a previous (crashed/restarted) server
@@ -1724,7 +1879,9 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     if let Ok(entries) = std::fs::read_dir(data_dir.join("content-images")) {
         for entry in entries.flatten().collect::<Vec<_>>() {
             let name = entry.file_name().to_string_lossy().to_string();
-            let Some(id) = name.strip_suffix(".ext4") else { continue };
+            let Some(id) = name.strip_suffix(".ext4") else {
+                continue;
+            };
             if !registered.contains(id) {
                 let _ = std::fs::remove_file(entry.path());
                 info!(project = %id, artifact = "content-images", "reaped orphaned artifact");
@@ -1866,7 +2023,11 @@ async fn reconcile_baselayers_on_boot(platform: &Arc<Mutex<PlatformState>>) {
         warn!("baselayers GC: platform.json missing/unreadable/unparseable; skipping sweep");
         return;
     };
-    if let Some(f) = v.get("base").and_then(|b| b.get("file")).and_then(|f| f.as_str()) {
+    if let Some(f) = v
+        .get("base")
+        .and_then(|b| b.get("file"))
+        .and_then(|f| f.as_str())
+    {
         live.insert(f.to_string());
     }
     if let Some(rts) = v.get("runtimes").and_then(|r| r.as_object()) {
@@ -2041,7 +2202,10 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
             count += 1;
         }
     }
-    info!(domains = count, "domain map built; projects registered for on-demand wake");
+    info!(
+        domains = count,
+        "domain map built; projects registered for on-demand wake"
+    );
 }
 
 /// Ensure an Active DomainRecord exists for `host` (idempotent). Used by backfill
@@ -2080,17 +2244,15 @@ fn discover_uplink_ips() -> Vec<String> {
         Ok(o) if o.status.success() => {
             let text = String::from_utf8_lossy(&o.stdout);
             // "default via <gw> dev <iface> ..." — take the token after `dev`.
-            text.lines()
-                .next()
-                .and_then(|l| {
-                    let mut it = l.split_whitespace();
-                    while let Some(tok) = it.next() {
-                        if tok == "dev" {
-                            return it.next().map(str::to_string);
-                        }
+            text.lines().next().and_then(|l| {
+                let mut it = l.split_whitespace();
+                while let Some(tok) = it.next() {
+                    if tok == "dev" {
+                        return it.next().map(str::to_string);
                     }
-                    None
-                })
+                }
+                None
+            })
         }
         _ => None,
     };
@@ -2166,7 +2328,13 @@ async fn handle_deploy(
         let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
         let hosts = plat.store.list_hosts().unwrap_or_default();
         let now = jkbase_control::auth::timestamp();
-        match deploy_target(alloc.as_ref(), &hosts, &me, now, DEAD_HOST_THRESHOLD.as_secs()) {
+        match deploy_target(
+            alloc.as_ref(),
+            &hosts,
+            &me,
+            now,
+            DEAD_HOST_THRESHOLD.as_secs(),
+        ) {
             DeployTarget::Local => {}
             DeployTarget::Remote { host_id, addr } => anyhow::bail!(
                 "project {project_id} is owned by host {host_id} ({}); the deploy must run there \
@@ -2180,15 +2348,21 @@ async fn handle_deploy(
         }
     }
 
-    // If hibernated, clear stale snapshot
-    if plat.vm_states.get(project_id) == Some(&VmLifecycle::Hibernated) {
-        info!(project = %project_id, "clearing snapshot for fresh deploy");
+    // A deploy/rollback supersedes any prior snapshot UNCONDITIONALLY — not only when
+    // `Hibernated`. A VM that was restored-then-Running still carries its snapshot (restore
+    // doesn't delete it), and the metadata image / layers it baked are about to be rewritten in
+    // place; leaving that snapshot would let a later restart restore stale guest RAM against the
+    // new bytes if the version happened to re-match (e.g. a rollback). Clearing here closes that
+    // window — the `deployment_version` viability gate is then defence in depth, not the only guard.
+    {
+        info!(project = %project_id, "clearing any stale snapshot for fresh deploy");
         let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
         let _ = std::fs::remove_dir_all(&snapshot_dir);
         let _ = plat.store.remove_snapshot_meta(project_id);
     }
 
     if let Some(mut old_vm) = plat.vms.remove(project_id) {
+        plat.vm_rootfs_hashes.remove(project_id);
         info!(project = %project_id, "syncing and stopping old VM for redeploy");
         if let Ok(Some(alloc)) = plat.store.get_vm_allocation(project_id) {
             let _ = sync_agent(&alloc.ip).await;
@@ -2359,11 +2533,19 @@ async fn handle_deploy(
         if let Some(pid) = vm.pid() {
             let _ = dd.set_writer_pid(project_id, guard.token(), pid).await;
         }
-        plat.disk_tokens.insert(project_id.to_string(), guard.disarm());
+        plat.disk_tokens
+            .insert(project_id.to_string(), guard.disarm());
     }
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
+    // Cold boot always runs the CURRENT rootfs; track it so a later hibernate stamps the truthful
+    // hash (and keeps the GC reference set honest). Clear any wake-failure throttle: this project
+    // is now freshly booted, so a stale entry mustn't fast-fail a routing-miss request.
+    let ran_hash = plat.base_rootfs_hash.clone();
+    plat.vm_rootfs_hashes
+        .insert(project_id.to_string(), ran_hash);
+    plat.wake_failures.remove(project_id);
     let active_domains = plat
         .store
         .list_active_domains_for_project(project_id)
@@ -2372,7 +2554,14 @@ async fn handle_deploy(
 
     wait_for_agent(&alloc.ip).await?;
 
-    register_active_routes(&routing, &domain_map, &active_domains, project_id, &alloc.ip).await;
+    register_active_routes(
+        &routing,
+        &domain_map,
+        &active_domains,
+        project_id,
+        &alloc.ip,
+    )
+    .await;
 
     info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");
     Ok(())
@@ -2391,10 +2580,11 @@ async fn register_active_routes(
     let mut map = domain_map.write().await;
     // The primary label always routes, even if its DomainRecord predates the registry.
     table.insert(project_id.to_string(), ip.to_string());
-    map.entry(project_id.to_string()).or_insert_with(|| DomainTarget {
-        project_id: project_id.to_string(),
-        site: None,
-    });
+    map.entry(project_id.to_string())
+        .or_insert_with(|| DomainTarget {
+            project_id: project_id.to_string(),
+            site: None,
+        });
     for d in active_domains {
         table.insert(d.host.clone(), ip.to_string());
         map.insert(
@@ -2476,22 +2666,26 @@ async fn hibernate_project(
     // Bound pause+snapshot so one bad VM can't stall the drain of the rest. The
     // budget is generous because snapshotting a 1 GiB mem file is legit slow I/O
     // (Pause itself is sub-second). Any timeout or error -> clean force-stop.
-    let (snapshot_path, mem_file_path) =
-        match tokio::time::timeout(Duration::from_secs(60), vm.hibernate(&snapshot_dir)).await {
-            Ok(Ok(paths)) => paths,
-            Ok(Err(e)) => {
-                tracing::error!(project = %project_id, error = %e, "hibernate failed, force-stopping");
-                drop(vm); // Drop SIGKILLs the process; force_stop handles the rest.
-                force_stop_and_cleanup(project_id, &platform).await;
-                return Ok(());
-            }
-            Err(_elapsed) => {
-                tracing::error!(project = %project_id, "hibernate timed out (VM wedged), force-stopping");
-                drop(vm);
-                force_stop_and_cleanup(project_id, &platform).await;
-                return Ok(());
-            }
-        };
+    let (snapshot_path, mem_file_path) = match tokio::time::timeout(
+        Duration::from_secs(60),
+        vm.hibernate(&snapshot_dir),
+    )
+    .await
+    {
+        Ok(Ok(paths)) => paths,
+        Ok(Err(e)) => {
+            tracing::error!(project = %project_id, error = %e, "hibernate failed, force-stopping");
+            drop(vm); // Drop SIGKILLs the process; force_stop handles the rest.
+            force_stop_and_cleanup(project_id, &platform).await;
+            return Ok(());
+        }
+        Err(_elapsed) => {
+            tracing::error!(project = %project_id, "hibernate timed out (VM wedged), force-stopping");
+            drop(vm);
+            force_stop_and_cleanup(project_id, &platform).await;
+            return Ok(());
+        }
+    };
 
     let mut plat = platform.lock().await;
 
@@ -2505,6 +2699,20 @@ async fn hibernate_project(
         release_data_disk(&dd, &ls, project_id, token).await;
     }
 
+    // Stamp the snapshot with what the restore will byte-depend on: the rootfs the VM was
+    // ACTUALLY mapped against (NOT the process's current hash — a restored-then-rehibernated VM
+    // runs the OLD blob), and the deployment version (gates the metadata image + layers, which
+    // are rebuilt-in-place per deploy and snapshot-baked by fixed path). Either being absent on
+    // the next wake ⇒ non-viable ⇒ fail open to a clean cold boot. Drop the per-VM hash now: the
+    // VM is down.
+    let base_rootfs_hash = plat.vm_rootfs_hashes.remove(project_id);
+    let deployment_version = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.current_version);
+
     let meta = SnapshotMeta {
         project_id: project_id.to_string(),
         snapshot_path: snapshot_path.to_string_lossy().to_string(),
@@ -2515,6 +2723,8 @@ async fn hibernate_project(
             .as_secs(),
         vcpu_count: 4,
         mem_size_mib: 3072,
+        base_rootfs_hash,
+        deployment_version,
     };
     plat.store.save_snapshot_meta(&meta)?;
 
@@ -2531,6 +2741,59 @@ async fn hibernate_project(
     Ok(())
 }
 
+/// RAII reset of the in-memory `Waking` lifecycle for the task that elected itself the wake
+/// driver. On drop WITHOUT an explicit `commit()`, it removes the project's `Waking` entry so
+/// the project can be re-driven on the next request. This closes the brick (incident: nlnwt)
+/// where a client disconnect — the proxy awaits the wake inline per-request, so a disconnect
+/// DROPS this future mid-boot — or ANY early `?` exit (alloc read, `setup_tap`, `fence_data_disk`,
+/// the boot block) left `vm_states` stuck at `Waking` forever, recoverable only by a full service
+/// restart. Drop can't await the async mutex, so it spawns the removal (eventually-consistent),
+/// but it ALWAYS fires: the success path `commit()`s (disarming it); every other exit, including
+/// cancel/unwind, runs Drop. It only removes an entry that is STILL `Waking`, so it can't stomp a
+/// concurrent transition.
+struct WakingGuard {
+    platform: Arc<Mutex<PlatformState>>,
+    project_id: String,
+    committed: bool,
+}
+
+impl WakingGuard {
+    fn new(platform: Arc<Mutex<PlatformState>>, project_id: String) -> Self {
+        Self {
+            platform,
+            project_id,
+            committed: false,
+        }
+    }
+    /// The wake reached `Running`; disarm the reset.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WakingGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let platform = self.platform.clone();
+        let pid = self.project_id.clone();
+        tokio::spawn(async move {
+            let mut plat = platform.lock().await;
+            if plat.vm_states.get(&pid) == Some(&VmLifecycle::Waking) {
+                plat.vm_states.remove(&pid);
+                plat.vm_rootfs_hashes.remove(&pid);
+            }
+        });
+    }
+}
+
+/// How long after a failed wake to fast-fail subsequent wakes of the same project, so a broken
+/// app (or hostile traffic at a doomed project) can't spin unbounded full boot attempts — each
+/// of which bumps the data-disk lease epoch and spawns Firecracker(s). Short enough to keep the
+/// self-healing "next request re-drives a boot" property.
+const WAKE_BACKOFF: Duration = Duration::from_secs(5);
+
 /// Wake a project, refusing if it is over an enforced quota. The quota gate
 /// reads QUOTA_STATUS (the metering loop's source of truth) so a request racing
 /// the over-quota hibernation is still refused. All other failures are transient
@@ -2545,13 +2808,14 @@ async fn wake_project(
     {
         let plat = platform.lock().await;
         if let Ok(Some(status)) = plat.store.get_quota_status(project_id)
-            && status.bandwidth_blocked {
-                return Err(jkbase_proxy::WakeError::OverQuota(
-                    status
-                        .blocked_reason
-                        .unwrap_or_else(|| "over quota".to_string()),
-                ));
-            }
+            && status.bandwidth_blocked
+        {
+            return Err(jkbase_proxy::WakeError::OverQuota(
+                status
+                    .blocked_reason
+                    .unwrap_or_else(|| "over quota".to_string()),
+            ));
+        }
         // Authoritative gate: a registered project with no deployable artifacts can
         // never wake (cold-boot content + snapshot both gone). Persist NeedsRedeploy
         // and surface a clear "redeploy" rather than looping the proxy on the
@@ -2575,6 +2839,37 @@ async fn wake_project(
         .map_err(|e| jkbase_proxy::WakeError::Unavailable(e.to_string()))
 }
 
+/// Decide whether a hibernation snapshot can be restored **byte-correct**, or whether the wake
+/// must fail OPEN to a clean cold boot from the current rootfs. Returns `(Some(hash)` to restore
+/// against that immutable CAS blob | `None` to cold-boot, a `wake_outcome` label`)`.
+///
+/// A restore is viable iff the snapshot stamps the rootfs it actually ran (present + valid-hex,
+/// its CAS blob still on disk) AND its deployment version still matches the project's current
+/// version — which transitively guarantees the metadata image + erofs layers it bakes by fixed
+/// path are the current, coherent set. Every other case (no snapshot, missing files, a legacy
+/// unstamped record, a reaped/renamed rootfs blob, or version drift) cold-boots — never a brick.
+fn snapshot_restore_decision(
+    snap_meta: Option<&SnapshotMeta>,
+    current_version: Option<u64>,
+    cas_dir: &Path,
+) -> (Option<String>, &'static str) {
+    let Some(m) = snap_meta else {
+        return (None, "coldboot_fresh");
+    };
+    if !(Path::new(&m.snapshot_path).exists() && Path::new(&m.mem_file_path).exists()) {
+        return (None, "skipped_snapshot_files_missing");
+    }
+    match m.base_rootfs_hash.as_deref() {
+        None => (None, "skipped_legacy_unstamped"),
+        Some(h) if !rootfs_cas::is_sha256_hex(h) => (None, "skipped_bad_hash"),
+        Some(h) if !rootfs_cas::blob_path(cas_dir, h).is_file() => {
+            (None, "skipped_rootfs_blob_missing")
+        }
+        Some(_) if m.deployment_version != current_version => (None, "skipped_version_drift"),
+        Some(h) => (Some(h.to_string()), "restored"),
+    }
+}
+
 async fn wake_project_inner(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
@@ -2584,6 +2879,16 @@ async fn wake_project_inner(
 ) -> Result<String> {
     let mut plat = platform.lock().await;
 
+    // Throttle a project that just failed to wake: fast-fail (the proxy retries) within
+    // WAKE_BACKOFF, so continuous traffic at a broken/doomed project can't spin unbounded full
+    // boot attempts — each of which bumps the data-disk lease epoch and spawns Firecracker(s).
+    if let Some(t) = plat.wake_failures.get(project_id)
+        && t.elapsed() < WAKE_BACKOFF
+    {
+        drop(plat);
+        anyhow::bail!("project {project_id} recently failed to wake; retry shortly");
+    }
+
     match plat.vm_states.get(project_id) {
         Some(VmLifecycle::Hibernated) => {
             plat.vm_states
@@ -2591,7 +2896,7 @@ async fn wake_project_inner(
         }
         Some(VmLifecycle::Waking) => {
             drop(plat);
-            return wait_for_route(project_id, &routing).await;
+            return wait_for_route(project_id, &platform, &routing).await;
         }
         Some(VmLifecycle::Running) => {
             let table = routing.read().await;
@@ -2627,15 +2932,23 @@ async fn wake_project_inner(
         }
     }
 
+    // We are now the elected wake driver in `Waking`. This guard resets that state on ANY exit
+    // that doesn't reach `Running` — including a client-disconnect cancellation that DROPS this
+    // future mid-boot, and every early `?` below — so the project can never get stuck `Waking`
+    // (the nlnwt brick). The success path `commit()`s it.
+    let waking_guard = WakingGuard::new(platform.clone(), project_id.to_string());
+
     // Try snapshot restore first, fall back to cold boot
     let snap_meta = plat.store.get_snapshot_meta(project_id)?;
 
     let alloc = match plat.store.get_vm_allocation(project_id)? {
         Some(a) => a,
         None => {
-            // No allocation — need full cold boot via handle_deploy
+            // No allocation — need full cold boot via handle_deploy (which drives its own
+            // lifecycle); drop our Waking driver state and disarm the guard so it no-ops.
             plat.vm_states.remove(project_id);
             drop(plat);
+            waking_guard.commit();
             info!(project = %project_id, "no allocation, cold booting");
             let routing_clone = routing.clone();
             handle_deploy(project_id, platform, routing, domain_map, shipper).await?;
@@ -2653,6 +2966,25 @@ async fn wake_project_inner(
         .data_dir
         .join("content-images")
         .join(format!("{project_id}.ext4"));
+
+    // Decide restore-vs-cold-boot while we still hold the lock (needs the store + data_dir). A
+    // restore is byte-correct ONLY if the snapshot stamps the rootfs it ACTUALLY ran (valid hex,
+    // its immutable CAS blob still present) AND its deployment version still matches the project's
+    // current version (so the metadata image + erofs layers it bakes by fixed path are the
+    // current, coherent set). Anything else fails OPEN to a clean cold boot from the current
+    // rootfs — never a brick. The reason becomes the `wake_outcome` so a post-deploy spike in
+    // cold-boot fallbacks (e.g. a bad staged rootfs) is visible instead of silent.
+    let current_version = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.current_version);
+    let current_rootfs_hash = plat.base_rootfs_hash.clone();
+    let cas_dir = plat.data_dir.join("base-rootfs");
+    let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
+    let (restore_hash, nonviable_outcome) =
+        snapshot_restore_decision(snap_meta.as_ref(), current_version, &cas_dir);
 
     // Whether this project has a data disk, plus clones of the RWO substrate so the
     // fence (below) can run AFTER dropping the platform lock. data_disk_path is set
@@ -2709,52 +3041,108 @@ async fn wake_project_inner(
         None
     };
 
-    // Boot (restore-or-cold) + agent readiness, fenced by `disk_guard`. Any `?` in here
-    // returns into `boot`; on Err we release the fenced disk + lease AWAITED (not via the
-    // Drop backstop) so a re-wake/re-deploy can't race a fire-and-forget cleanup and fail
-    // transiently with LeaseHeld/RwoUnsafe.
-    let boot: Result<VmInstance> = async {
-        let vm = if let Some(ref meta) = snap_meta {
+    // Boot (restore-or-cold) + agent readiness, fenced by `disk_guard`. Returns the VM, the
+    // rootfs hash it ACTUALLY ran (stamped into the next snapshot), and a `wake_outcome` for
+    // observability. On Err we release the fenced disk + lease AWAITED (not via the Drop
+    // backstop) so a re-wake/re-deploy can't race a fire-and-forget cleanup and fail transiently
+    // with LeaseHeld/RwoUnsafe.
+    let boot: Result<(VmInstance, String, &'static str)> = async {
+        // Cold boot the CURRENT rootfs; shared by the non-viable path and the restore fallbacks.
+        // Reuses the already-held `disk_guard` (config.data_disk_path) — never re-fences — so a
+        // restore fallback can't self-deadlock against its own just-released lease.
+        async fn cold_boot(
+            project_id: &str,
+            config: &VmConfig,
+            runtime_dir: &Path,
+            agent_ip: &str,
+            current_hash: &str,
+            outcome: &'static str,
+        ) -> Result<(VmInstance, String, &'static str)> {
+            let vm = VmInstance::start(project_id, config, runtime_dir).await?;
+            wait_for_agent(agent_ip).await?;
+            Ok((vm, current_hash.to_string(), outcome))
+        }
+
+        let (vm, ran_hash, outcome) = if let (Some(meta), Some(hash)) =
+            (snap_meta.as_ref(), restore_hash.as_ref())
+        {
             let snap_path = PathBuf::from(&meta.snapshot_path);
             let mem_path = PathBuf::from(&meta.mem_file_path);
-            if snap_path.exists() && mem_path.exists() {
-                info!(project = %project_id, "restoring from snapshot");
-                match VmInstance::restore_from_snapshot(
-                    project_id,
-                    &config,
-                    &runtime_dir,
-                    &snap_path,
-                    &mem_path,
-                )
-                .await
-                {
-                    Ok(vm) => vm,
+            info!(project = %project_id, "restoring from snapshot");
+            match VmInstance::restore_from_snapshot(
+                project_id,
+                &config,
+                &runtime_dir,
+                &snap_path,
+                &mem_path,
+            )
+            .await
+            {
+                Ok(mut restored) => match wait_for_agent(&alloc.ip).await {
+                    Ok(()) => (restored, hash.clone(), "restored"),
                     Err(e) => {
-                        tracing::warn!(project = %project_id, error = %e, "snapshot restore failed, cold booting");
-                        // Clean up the failed restore's Firecracker process and socket
-                        let failed_sock = runtime_dir.join(project_id).join("firecracker.sock");
-                        if failed_sock.exists() {
-                            let _ = tokio::fs::remove_file(&failed_sock).await;
+                        // Restore resumed the guest but its agent never came ready (corrupt/wedged
+                        // snapshot, or a tenant pinned hostile RAM before hibernate). Synchronously
+                        // REAP the restored FC (stop = SIGKILL + waitpid, so it releases the fenced
+                        // data loop BEFORE the cold boot reopens it — never two Firecrackers on one
+                        // RWO disk), POISON the snapshot (so subsequent wakes cold-boot directly
+                        // rather than repeating this ~10s+ cycle every wake), then cold-boot the
+                        // current rootfs reusing the held fence.
+                        tracing::warn!(project = %project_id, error = %e, "restored VM agent not ready; reaping + poisoning snapshot + cold booting");
+                        // The whole no-double-writer guarantee rests on FC1 being dead before the
+                        // cold boot reopens the fenced loop — surface (don't swallow) a reap error.
+                        if let Err(re) = restored.stop().await {
+                            tracing::warn!(project = %project_id, error = %re, "reap of restored FC before cold boot reported an error");
                         }
-                        // Kill any leftover Firecracker for this project
-                        let _ = tokio::process::Command::new("pkill")
-                            .args(["-f", &format!("firecracker.*{project_id}")])
-                            .status()
-                            .await;
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        VmInstance::start(project_id, &config, &runtime_dir).await?
+                        {
+                            let p = platform.lock().await;
+                            let _ = p.store.remove_snapshot_meta(project_id);
+                        }
+                        let _ = tokio::fs::remove_dir_all(&snapshot_dir).await;
+                        cold_boot(
+                            project_id,
+                            &config,
+                            &runtime_dir,
+                            &alloc.ip,
+                            &current_rootfs_hash,
+                            "restore_ok_agent_fail_coldboot",
+                        )
+                        .await?
                     }
+                },
+                Err(e) => {
+                    tracing::warn!(project = %project_id, error = %e, "snapshot restore failed, cold booting");
+                    // Defensive cleanup of a half-spawned restore FC, by EXACT socket path —
+                    // never a `pkill -f firecracker.*{id}` substring (which could reap a project
+                    // whose id contains this one).
+                    let failed_sock = runtime_dir.join(project_id).join("firecracker.sock");
+                    if failed_sock.exists() {
+                        let _ = tokio::fs::remove_file(&failed_sock).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    cold_boot(
+                        project_id,
+                        &config,
+                        &runtime_dir,
+                        &alloc.ip,
+                        &current_rootfs_hash,
+                        "restore_failed_coldboot",
+                    )
+                    .await?
                 }
-            } else {
-                info!(project = %project_id, "snapshot files missing, cold booting");
-                VmInstance::start(project_id, &config, &runtime_dir).await?
             }
         } else {
-            info!(project = %project_id, "no snapshot, cold booting");
-            VmInstance::start(project_id, &config, &runtime_dir).await?
+            info!(project = %project_id, reason = nonviable_outcome, "cold booting (no viable snapshot)");
+            cold_boot(
+                project_id,
+                &config,
+                &runtime_dir,
+                &alloc.ip,
+                &current_rootfs_hash,
+                nonviable_outcome,
+            )
+            .await?
         };
-
-        wait_for_agent(&alloc.ip).await?;
 
         // A restored snapshot resumes with its wall clock frozen at snapshot time, so
         // it lags by the whole hibernation; a cold boot's tsc clock is undisciplined.
@@ -2762,15 +3150,23 @@ async fn wake_project_inner(
         // so the first request after wake sees correct time instead of waiting for the
         // agent's periodic discipline tick. Best-effort — never fail a wake on this.
         resync_clock_agent(&alloc.ip).await;
-        Ok(vm)
+        Ok((vm, ran_hash, outcome))
     }
     .await;
-    let vm = match boot {
-        Ok(vm) => vm,
+    let (vm, ran_hash, outcome) = match boot {
+        Ok(t) => t,
         Err(e) => {
+            // Release the fenced disk AWAITED, THEN record the failure. Ordering matters: the
+            // disk is fully released before the next request can re-fence, so the retry doesn't
+            // hit a transient LeaseHeld/RwoUnsafe. `waking_guard` (dropped on return) resets the
+            // `Waking` state so the project isn't bricked.
             if let Some(g) = disk_guard {
                 g.release().await;
             }
+            let mut p = platform.lock().await;
+            p.wake_failures
+                .insert(project_id.to_string(), std::time::Instant::now());
+            drop(p);
             return Err(e);
         }
     };
@@ -2786,6 +3182,7 @@ async fn wake_project_inner(
     // release's losetup I/O isn't held under the mutex.
     if plat.store.get_project(project_id).ok().flatten().is_none() {
         plat.vm_states.remove(project_id);
+        plat.vm_rootfs_hashes.remove(project_id);
         drop(plat);
         drop(vm); // SIGKILL the FC before detaching the disk it still maps
         if let Some(g) = disk_guard {
@@ -2801,33 +3198,63 @@ async fn wake_project_inner(
             let dd2 = plat.data_disk.clone();
             let _ = dd2.set_writer_pid(project_id, guard.token(), pid).await;
         }
-        plat.disk_tokens.insert(project_id.to_string(), guard.disarm());
+        plat.disk_tokens
+            .insert(project_id.to_string(), guard.disarm());
     }
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
+    // Track the rootfs this VM actually ran so the NEXT hibernate stamps the truthful hash
+    // (a restored VM ran the OLD blob, not `current`). Clear any prior wake-failure throttle.
+    plat.vm_rootfs_hashes
+        .insert(project_id.to_string(), ran_hash);
+    plat.wake_failures.remove(project_id);
 
     if let Ok(Some(mut proj)) = plat.store.get_project(project_id) {
         proj.state = ProjectState::Active;
         plat.store.update_project(&proj)?;
     }
     drop(plat);
+    waking_guard.commit();
 
-    register_active_routes(&routing, &domain_map, &active_domains, project_id, &alloc.ip).await;
+    register_active_routes(
+        &routing,
+        &domain_map,
+        &active_domains,
+        project_id,
+        &alloc.ip,
+    )
+    .await;
 
-    info!(project = %project_id, ip = %alloc.ip, "VM awake, routing active");
+    info!(project = %project_id, ip = %alloc.ip, wake_outcome = outcome, "VM awake, routing active");
     Ok(alloc.ip)
 }
 
+/// A non-driver request waits here for the elected wake driver to publish the project's route.
+/// It also fast-fails the moment the driver leaves `Waking`/`Running` WITHOUT a route — i.e. the
+/// driver failed and reset the state — instead of hanging the full 30s, so the proxy returns
+/// Retry-After promptly and a fresh request re-drives a boot. (`Running` is tolerated: there's a
+/// brief window where the driver set `Running` but hasn't registered the route yet.)
 async fn wait_for_route(
     project_id: &str,
+    platform: &Arc<Mutex<PlatformState>>,
     routing: &jkbase_proxy::RoutingTable,
 ) -> Result<String> {
     for _ in 0..150 {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let table = routing.read().await;
-        if let Some(ip) = table.get(project_id) {
-            return Ok(ip.clone());
+        {
+            let table = routing.read().await;
+            if let Some(ip) = table.get(project_id) {
+                return Ok(ip.clone());
+            }
+        }
+        let p = platform.lock().await;
+        match p.vm_states.get(project_id) {
+            Some(VmLifecycle::Waking) | Some(VmLifecycle::Running) => {}
+            _ => {
+                drop(p);
+                anyhow::bail!("wake of {project_id} did not complete; retry");
+            }
         }
     }
     anyhow::bail!("timed out waiting for {project_id} to wake");
@@ -2957,7 +3384,16 @@ async fn setup_tap(tap_name: &str) -> Result<()> {
     // the ebtables L2 source-guard installed below closes *spoofing* (the other half).
     run_cmd(
         "ip",
-        &["link", "set", "dev", tap_name, "type", "bridge_slave", "isolated", "on"],
+        &[
+            "link",
+            "set",
+            "dev",
+            tap_name,
+            "type",
+            "bridge_slave",
+            "isolated",
+            "on",
+        ],
     )
     .await?;
     // Disable IPv6 on the TAP so a guest can't pivot to metadata/host over v6 around the
@@ -3065,7 +3501,16 @@ fn runtime_ebtables_lock() -> &'static tokio::sync::Mutex<()> {
 async fn ensure_runtime_source_guard_chain() -> Result<()> {
     let _ = run_ebtables(&["-t", "filter", "-N", RUNTIME_SOURCE_GUARD_CHAIN]).await;
     for hook in ["INPUT", "FORWARD"] {
-        if !ebtables_ok(&["-t", "filter", "--check", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN]).await {
+        if !ebtables_ok(&[
+            "-t",
+            "filter",
+            "--check",
+            hook,
+            "-j",
+            RUNTIME_SOURCE_GUARD_CHAIN,
+        ])
+        .await
+        {
             run_ebtables(&["-t", "filter", "-I", hook, "-j", RUNTIME_SOURCE_GUARD_CHAIN])
                 .await
                 .with_context(|| format!("hook runtime source-guard into ebtables {hook}"))?;
@@ -3086,7 +3531,17 @@ async fn install_tap_source_guard(tap: &str, ip: &str, mac: &str) -> Result<()> 
         vec!["-i", tap, "-p", "802_1Q", "-j", "DROP"],
         vec!["-i", tap, "!", "-s", mac, "-j", "DROP"],
         vec!["-i", tap, "-p", "IPv4", "!", "--ip-src", ip, "-j", "DROP"],
-        vec!["-i", tap, "-p", "ARP", "!", "--arp-ip-src", ip, "-j", "DROP"],
+        vec![
+            "-i",
+            tap,
+            "-p",
+            "ARP",
+            "!",
+            "--arp-ip-src",
+            ip,
+            "-j",
+            "DROP",
+        ],
     ];
     for r in &rules {
         let mut check = vec!["-t", "filter", "--check", RUNTIME_SOURCE_GUARD_CHAIN];
@@ -3232,7 +3687,13 @@ impl DiskLeaseGuard {
             return;
         }
         self.armed = false;
-        release_data_disk(&self.data_disk, &self.lease, &self.project_id, self.token.clone()).await;
+        release_data_disk(
+            &self.data_disk,
+            &self.lease,
+            &self.project_id,
+            self.token.clone(),
+        )
+        .await;
     }
 }
 
@@ -3347,9 +3808,11 @@ fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
             && let Ok(content) = std::fs::read_to_string(&path)
-                && content.contains("\"volumes\"") && content.contains("\"mount\"") {
-                    return true;
-                }
+            && content.contains("\"volumes\"")
+            && content.contains("\"mount\"")
+        {
+            return true;
+        }
     }
     false
 }
@@ -3374,7 +3837,9 @@ fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
 /// must hit `/_jkbase/health` and bound it with a timeout.
 async fn agent_alive(ip: &str) -> bool {
     let probe = async {
-        let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await.ok()?;
+        let stream = tokio::net::TcpStream::connect(format!("{ip}:80"))
+            .await
+            .ok()?;
         let io = hyper_util::rt::TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
         tokio::spawn(conn);
@@ -3404,6 +3869,7 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
     if let Some(mut vm) = plat.vms.remove(project_id) {
         let _ = vm.stop().await;
     }
+    plat.vm_rootfs_hashes.remove(project_id);
     // Release the data-disk hold so the next wake re-fences (the FC is reaped below).
     if let Some(token) = plat.disk_tokens.remove(project_id) {
         let dd = plat.data_disk.clone();
@@ -3653,7 +4119,10 @@ async fn metering_loop(
                 .iter()
                 .filter(|(_, s)| **s == VmLifecycle::Running)
                 .filter_map(|(id, _)| {
-                    plat.vms.get(id).and_then(|vm| vm.pid()).map(|pid| (id.clone(), pid))
+                    plat.vms
+                        .get(id)
+                        .and_then(|vm| vm.pid())
+                        .map(|pid| (id.clone(), pid))
                 })
                 .collect();
             let allocs: Vec<(String, String)> = plat
@@ -3670,7 +4139,13 @@ async fn metering_loop(
                 .into_iter()
                 .map(|p| p.id)
                 .collect();
-            (running_pids, allocs, projects, plat.data_dir.clone(), plat.store.clone())
+            (
+                running_pids,
+                allocs,
+                projects,
+                plat.data_dir.clone(),
+                plat.store.clone(),
+            )
         };
 
         // CPU deltas (only Running VMs have a live pid).
@@ -3705,11 +4180,17 @@ async fn metering_loop(
         // --- Quota enforcement (monthly bandwidth cap) ---
         let month_start = month_start_epoch(now);
         for id in &projects {
-            let cap = store.get_quota(id).map(|q| q.bandwidth_bytes_per_month).unwrap_or(u64::MAX);
+            let cap = store
+                .get_quota(id)
+                .map(|q| q.bandwidth_bytes_per_month)
+                .unwrap_or(u64::MAX);
             let mtd = store.sum_month_to_date(id, month_start).unwrap_or_default();
             let used = mtd.rx_bytes.saturating_add(mtd.tx_bytes);
             let status = store.get_quota_status(id).ok().flatten();
-            let blocked = status.as_ref().map(|s| s.bandwidth_blocked).unwrap_or(false);
+            let blocked = status
+                .as_ref()
+                .map(|s| s.bandwidth_blocked)
+                .unwrap_or(false);
 
             if used > cap && !blocked {
                 // Write the block FIRST (source of truth for the wake gate) so a
@@ -3722,20 +4203,22 @@ async fn metering_loop(
                     blocked_month: month_start,
                 });
                 tracing::warn!(project = %id, used, cap, "bandwidth cap exceeded; hibernating + blocking wake");
-                let is_running = {
-                    platform.lock().await.vm_states.get(id) == Some(&VmLifecycle::Running)
-                };
+                let is_running =
+                    { platform.lock().await.vm_states.get(id) == Some(&VmLifecycle::Running) };
                 if is_running
                     && let Err(e) =
-                        hibernate_project(id, platform.clone(), routing.clone(), shipper.clone()).await
-                    {
-                        tracing::error!(project = %id, error = %e, "failed to hibernate over-quota project");
-                    }
+                        hibernate_project(id, platform.clone(), routing.clone(), shipper.clone())
+                            .await
+                {
+                    tracing::error!(project = %id, error = %e, "failed to hibernate over-quota project");
+                }
             } else if blocked {
                 // Clear on month rollover (new period) or if usage is back under
                 // cap (e.g. an admin raised the override).
-                let stale_month =
-                    status.as_ref().map(|s| s.blocked_month != month_start).unwrap_or(false);
+                let stale_month = status
+                    .as_ref()
+                    .map(|s| s.blocked_month != month_start)
+                    .unwrap_or(false);
                 if stale_month || used <= cap {
                     let _ = store.save_quota_status(&QuotaStatus {
                         project_id: id.clone(),
@@ -3753,9 +4236,10 @@ async fn metering_loop(
         if ticks.is_multiple_of(60) {
             let cutoff_hour = now.saturating_sub(USAGE_RETENTION_SECS) / 3600 * 3600;
             if let Ok(n) = store.prune_usage(cutoff_hour)
-                && n > 0 {
-                    tracing::info!(pruned = n, "metering: pruned old usage buckets");
-                }
+                && n > 0
+            {
+                tracing::info!(pruned = n, "metering: pruned old usage buckets");
+            }
         }
     }
 }
@@ -3780,7 +4264,9 @@ async fn sync_agent(ip: &str) -> Result<()> {
 /// next poll. Best-effort and bounded: a clock nudge must never block a wake.
 async fn resync_clock_agent(ip: &str) {
     let send = async {
-        let stream = tokio::net::TcpStream::connect(format!("{ip}:80")).await.ok()?;
+        let stream = tokio::net::TcpStream::connect(format!("{ip}:80"))
+            .await
+            .ok()?;
         let io = hyper_util::rt::TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
         tokio::spawn(conn);
@@ -3901,7 +4387,10 @@ mod split_brain_gate {
         let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
         assert!(tb.epoch > ta.epoch);
         assert!(may_write(&b, &tb).await);
-        assert!(!may_write(&a, &ta).await, "deposed a stays de-admitted (no double writer)");
+        assert!(
+            !may_write(&a, &ta).await,
+            "deposed a stays de-admitted (no double writer)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3945,12 +4434,18 @@ mod split_brain_gate {
         a.release(&ta).await.unwrap();
         let tb = b.acquire("disk-p", "host-b", TTL).await.unwrap();
         // The zombie keeps trying to use its stale token — denied both ways:
-        assert!(!may_write(&a, &ta).await, "stale token can't renew → denied admission");
+        assert!(
+            !may_write(&a, &ta).await,
+            "stale token can't renew → denied admission"
+        );
         assert!(
             !ta.supersedes(&tb).unwrap(),
             "stale token can't supersede the live holder"
         );
-        assert!(may_write(&b, &tb).await, "the live holder is the sole writer");
+        assert!(
+            may_write(&b, &tb).await,
+            "the live holder is the sole writer"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -3958,6 +4453,84 @@ mod split_brain_gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
+    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
+    /// (stamped+present rootfs blob + matching deployment version) restores.
+    #[test]
+    fn snapshot_restore_decision_fails_open_on_every_mismatch() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkbase-decision-{nanos}"));
+        let cas = root.join("base-rootfs");
+        std::fs::create_dir_all(&cas).unwrap();
+        let snap = root.join("snapshot");
+        let mem = root.join("mem");
+        std::fs::write(&snap, b"s").unwrap();
+        std::fs::write(&mem, b"m").unwrap();
+        let good_hash = "a".repeat(64);
+        std::fs::write(rootfs_cas::blob_path(&cas, &good_hash), b"rootfs").unwrap();
+
+        let base = |hash: Option<String>, ver: Option<u64>| SnapshotMeta {
+            project_id: "p".into(),
+            snapshot_path: snap.to_string_lossy().into_owned(),
+            mem_file_path: mem.to_string_lossy().into_owned(),
+            created_at: 0,
+            vcpu_count: 1,
+            mem_size_mib: 1024,
+            base_rootfs_hash: hash,
+            deployment_version: ver,
+        };
+
+        // No snapshot at all → fresh cold boot.
+        assert_eq!(
+            snapshot_restore_decision(None, Some(3), &cas),
+            (None, "coldboot_fresh")
+        );
+        // Fully coherent → restore against the stamped blob.
+        let m = base(Some(good_hash.clone()), Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas),
+            (Some(good_hash.clone()), "restored")
+        );
+        // Legacy unstamped → cold boot.
+        let m = base(None, Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_legacy_unstamped"
+        );
+        // Stamped hash whose blob was reaped/never-placed → cold boot (this is the exact
+        // self-healing path that saves a project from a GC over-deletion).
+        let m = base(Some("b".repeat(64)), Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_rootfs_blob_missing"
+        );
+        // Non-hex stamp → cold boot (never trust it as a path component).
+        let m = base(Some("../etc".to_string()), Some(3));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_bad_hash"
+        );
+        // Version drift (project redeployed since hibernate) → cold boot, so a stale metadata
+        // image / secrets / layers can't be restored under the wrong version.
+        let m = base(Some(good_hash.clone()), Some(2));
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_version_drift"
+        );
+        // Snapshot files reaped out from under the record → cold boot.
+        let m = base(Some(good_hash.clone()), Some(3));
+        std::fs::remove_file(&snap).unwrap();
+        assert_eq!(
+            snapshot_restore_decision(Some(&m), Some(3), &cas).1,
+            "skipped_snapshot_files_missing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[tokio::test]
     async fn flock_lease_elects_single_leader() {
@@ -3989,7 +4562,10 @@ mod tests {
         // monotonicity across the leadership change).
         a.release(&ta).await.unwrap();
         let tb = b.acquire(LEADER_SCOPE, "host-b", ttl).await.unwrap();
-        assert!(tb.epoch > ta.epoch, "new leader's epoch must supersede the old");
+        assert!(
+            tb.epoch > ta.epoch,
+            "new leader's epoch must supersede the old"
+        );
         // The deposed host can no longer renew its stale token.
         assert!(a.renew(&ta, ttl).await.is_err());
 
@@ -4004,7 +4580,11 @@ mod tests {
             last_heartbeat: hb,
             cpu_template_id: None,
             kernel_id: None,
-            capacity: HostCapacity { vcpus: 0, mem_mib: 0, max_vms },
+            capacity: HostCapacity {
+                vcpus: 0,
+                mem_mib: 0,
+                max_vms,
+            },
         }
     }
     fn test_alloc(pid: &str, host: &str) -> VmAllocation {
@@ -4050,10 +4630,10 @@ mod tests {
     fn place_project_picks_least_loaded_live_in_region_with_capacity() {
         let now = 1000;
         let hosts = vec![
-            test_host("a", "east", 995, 0), // live, region east, unbounded
-            test_host("b", "east", 995, 0), // live, region east
-            test_host("c", "west", 995, 0), // live, wrong region
-            test_host("d", "east", 900, 0), // east but DEAD (100s stale)
+            test_host("a", "east", 995, 0),    // live, region east, unbounded
+            test_host("b", "east", 995, 0),    // live, region east
+            test_host("c", "west", 995, 0),    // live, wrong region
+            test_host("d", "east", 900, 0),    // east but DEAD (100s stale)
             test_host("full", "east", 995, 1), // east, live, but at capacity (1)
         ];
         // a has 2 allocations, b has 0, full has 1 (at its cap).
@@ -4064,7 +4644,10 @@ mod tests {
         ];
         let load = current_load(&allocs);
         let pick = place_project(&hosts, &load, "east", now, 15).unwrap();
-        assert_eq!(pick.host_id, "b", "least-loaded live in-region with capacity");
+        assert_eq!(
+            pick.host_id, "b",
+            "least-loaded live in-region with capacity"
+        );
         // No host in an empty region.
         assert!(place_project(&hosts, &load, "north", now, 15).is_none());
     }
@@ -4083,15 +4666,25 @@ mod tests {
         let plan = reassign_plan(&orphaned, &hosts, &allocs, now, 15);
         let targets: HashSet<&str> = plan.iter().map(|(_, h)| h.as_str()).collect();
         assert_eq!(plan.len(), 2);
-        assert_eq!(targets, HashSet::from(["a", "b"]), "spread, not piled onto one host");
+        assert_eq!(
+            targets,
+            HashSet::from(["a", "b"]),
+            "spread, not piled onto one host"
+        );
     }
 
     #[test]
     fn deploy_target_routes_by_ownership() {
         let now = 1000;
-        let hosts = vec![test_host("me", "east", 995, 0), test_host("peer", "east", 995, 0)];
+        let hosts = vec![
+            test_host("me", "east", 995, 0),
+            test_host("peer", "east", 995, 0),
+        ];
         // No allocation (first deploy) → local.
-        assert_eq!(deploy_target(None, &hosts, "me", now, 15), DeployTarget::Local);
+        assert_eq!(
+            deploy_target(None, &hosts, "me", now, 15),
+            DeployTarget::Local
+        );
         // Unplaced (empty host_id) → local.
         assert_eq!(
             deploy_target(Some(&test_alloc("p", "")), &hosts, "me", now, 15),
@@ -4205,11 +4798,13 @@ mod tests {
             source_id: "cluster".into(),
         };
         let ok: Result<FenceToken, SubstrateError> = Ok(tok);
-        let fenced: Result<FenceToken, SubstrateError> =
-            Err(SubstrateError::Fenced { scope: "disk-p".into() });
+        let fenced: Result<FenceToken, SubstrateError> = Err(SubstrateError::Fenced {
+            scope: "disk-p".into(),
+        });
         // A timed-out renew is surfaced as Backend, indistinguishable here from any blip.
-        let transient: Result<FenceToken, SubstrateError> =
-            Err(SubstrateError::Backend("etcd unreachable / timed out".into()));
+        let transient: Result<FenceToken, SubstrateError> = Err(SubstrateError::Backend(
+            "etcd unreachable / timed out".into(),
+        ));
 
         // A confirmed renew holds (resets the last-success clock).
         assert_eq!(evaluate_renew(&ok, t0, t0, deadline), FenceDecision::Hold);
@@ -4220,7 +4815,10 @@ mod tests {
         );
         // A fresh transient blip (last success just now) → keep waiting; one dropped
         // packet never kills a live VM.
-        assert_eq!(evaluate_renew(&transient, t0, t0, deadline), FenceDecision::KeepWaiting);
+        assert_eq!(
+            evaluate_renew(&transient, t0, t0, deadline),
+            FenceDecision::KeepWaiting
+        );
         // Transient, last success still within the deadline → keep waiting.
         assert_eq!(
             evaluate_renew(&transient, t0, t0 + Duration::from_secs(11), deadline),
@@ -4304,7 +4902,11 @@ mod tests {
         // 2021-01-01T00:00:00Z. Occurrences are strictly AFTER last_run, so the
         // 00:00:00 instant itself is excluded.
         let base: u64 = 1_609_459_200;
-        let due = due_since(&parse_unix_5field("*/5 * * * *").unwrap(), base, base + 12 * 60);
+        let due = due_since(
+            &parse_unix_5field("*/5 * * * *").unwrap(),
+            base,
+            base + 12 * 60,
+        );
         assert_eq!(due, vec![base + 5 * 60, base + 10 * 60]);
         // The loop fires only the latest (collapse-to-one catch-up).
         assert_eq!(due.last().copied(), Some(base + 10 * 60));
@@ -4331,6 +4933,8 @@ mod tests {
             created_at: 0,
             vcpu_count: 1,
             mem_size_mib: 1024,
+            base_rootfs_hash: None,
+            deployment_version: None,
         };
 
         // Nothing on disk, no snapshot → cannot wake.

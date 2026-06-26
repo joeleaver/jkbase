@@ -42,12 +42,18 @@ impl EtcdLease {
     /// which must be the SAME string on every node sharing this cluster.
     pub async fn connect(endpoints: &[String], cluster_id: impl Into<String>) -> Result<Self> {
         let client = Client::connect(endpoints, None).await.map_err(be)?;
-        Ok(Self { client, source_id: cluster_id.into() })
+        Ok(Self {
+            client,
+            source_id: cluster_id.into(),
+        })
     }
 
     /// Wrap an already-connected client (used by tests).
     pub fn from_client(client: Client, cluster_id: impl Into<String>) -> Self {
-        Self { client, source_id: cluster_id.into() }
+        Self {
+            client,
+            source_id: cluster_id.into(),
+        }
     }
 
     /// Current holder of `scope`: `(holder, epoch = mod_revision, etcd lease id)`.
@@ -86,7 +92,11 @@ impl Lease for EtcdLease {
         // Atomic, cluster-wide create-if-absent: only one node wins; an expired
         // holder's key is already gone (etcd deleted it), so the winner steals it.
         let txn = Txn::new()
-            .when(vec![Compare::create_revision(key.clone(), CompareOp::Equal, 0)])
+            .when(vec![Compare::create_revision(
+                key.clone(),
+                CompareOp::Equal,
+                0,
+            )])
             .and_then(vec![TxnOp::put(
                 key,
                 holder.to_string(),
@@ -96,11 +106,16 @@ impl Lease for EtcdLease {
         if !resp.succeeded() {
             // A live holder owns it — revoke our just-granted lease so it doesn't leak.
             let _ = c.lease_revoke(lease_id).await;
-            return Err(SubstrateError::LeaseHeld { scope: scope.to_string() });
+            return Err(SubstrateError::LeaseHeld {
+                scope: scope.to_string(),
+            });
         }
         // The commit revision IS the holder key's mod_revision — a race-free,
         // strictly-increasing fence epoch.
-        let epoch = resp.header().map(|h| h.revision()).ok_or_else(|| be("txn missing header"))? as u64;
+        let epoch = resp
+            .header()
+            .map(|h| h.revision())
+            .ok_or_else(|| be("txn missing header"))? as u64;
         Ok(self.token(scope, epoch, holder))
     }
 
@@ -109,9 +124,13 @@ impl Lease for EtcdLease {
         // change the TTL), so `_ttl` is advisory here.
         match self.read_holder(&token.scope).await? {
             // Absent, re-acquired (higher epoch), or different holder => fenced out.
-            None => Err(SubstrateError::Fenced { scope: token.scope.clone() }),
+            None => Err(SubstrateError::Fenced {
+                scope: token.scope.clone(),
+            }),
             Some((holder, epoch, _)) if epoch != token.epoch || holder != token.holder => {
-                Err(SubstrateError::Fenced { scope: token.scope.clone() })
+                Err(SubstrateError::Fenced {
+                    scope: token.scope.clone(),
+                })
             }
             Some((_, _, lease_id)) => {
                 let mut c = self.client.clone();
@@ -129,7 +148,9 @@ impl Lease for EtcdLease {
             None => Ok(()), // already released/expired
             Some((holder, epoch, _)) if epoch != token.epoch || holder != token.holder => {
                 // Not our hold (re-acquired) — must not touch the new holder.
-                Err(SubstrateError::Fenced { scope: token.scope.clone() })
+                Err(SubstrateError::Fenced {
+                    scope: token.scope.clone(),
+                })
             }
             Some((_, _, lease_id)) => {
                 // Revoking our lease atomically deletes the holder key. Best-effort:
