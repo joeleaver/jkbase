@@ -85,7 +85,9 @@ impl ObjectClient {
         if let Some(t) = opts.continuation_token.as_deref().filter(|t| !t.is_empty()) {
             q.push(("continuation-token".into(), t.into()));
         }
-        let resp = self.send(Method::GET, &format!("/{bucket}"), &q, None, ReqBody::Empty).await?;
+        let resp = self
+            .send(Method::GET, &format!("/{bucket}"), &q, None, ReqBody::Empty)
+            .await?;
         let body = resp.text().await?;
         Ok(parse_list_page(&body))
     }
@@ -118,7 +120,12 @@ impl ObjectClient {
 
     /// Convenience: just the keys, auto-paged.
     pub async fn list_all_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
-        Ok(self.list_all(bucket, prefix).await?.into_iter().map(|o| o.key).collect())
+        Ok(self
+            .list_all(bucket, prefix)
+            .await?
+            .into_iter()
+            .map(|o| o.key)
+            .collect())
     }
 
     /// A lazy auto-paging stream of [`ListPage`]s, honouring the delimiter in `opts`.
@@ -137,7 +144,12 @@ impl ObjectClient {
         bucket: &'a str,
         opts: ListObjectsOptions,
     ) -> impl futures_util::Stream<Item = Result<ListPage>> + 'a {
-        let ListObjectsOptions { prefix, delimiter, max_keys, continuation_token } = opts;
+        let ListObjectsOptions {
+            prefix,
+            delimiter,
+            max_keys,
+            continuation_token,
+        } = opts;
         // State: `Some(token)` = fetch next with this continuation token; `None` = done.
         let init: Option<Option<String>> = Some(continuation_token);
         futures_util::stream::try_unfold(init, move |state| {
@@ -146,18 +158,27 @@ impl ObjectClient {
             async move {
                 let token = match state {
                     Some(t) => t,
-                    None => return Ok::<Option<(ListPage, Option<Option<String>>)>, crate::Error>(None),
+                    None => {
+                        return Ok::<Option<(ListPage, Option<Option<String>>)>, crate::Error>(None);
+                    }
                 };
                 let page = self
                     .list_objects(
                         bucket,
-                        &ListObjectsOptions { prefix, delimiter, max_keys, continuation_token: token.clone() },
+                        &ListObjectsOptions {
+                            prefix,
+                            delimiter,
+                            max_keys,
+                            continuation_token: token.clone(),
+                        },
                     )
                     .await?;
                 // Advance only on a token that differs from the one we just used; otherwise
                 // stop (no-progress / truncated-but-no-token) so the stream can't run forever.
                 let next = match (page.is_truncated, &page.next_continuation_token) {
-                    (true, Some(t)) if token.as_deref() != Some(t.as_str()) => Some(Some(t.clone())),
+                    (true, Some(t)) if token.as_deref() != Some(t.as_str()) => {
+                        Some(Some(t.clone()))
+                    }
                     _ => None,
                 };
                 Ok(Some((page, next)))
@@ -173,7 +194,9 @@ fn parse_list_page(body: &str) -> ListPage {
     // V1-style S3 endpoint reached via the aws-sdk-s3 escape hatch.
     let next_continuation_token =
         xml::tag(body, "NextContinuationToken").or_else(|| xml::tag(body, "NextMarker"));
-    let max_keys = xml::tag(body, "MaxKeys").and_then(|s| s.parse().ok()).unwrap_or(1000);
+    let max_keys = xml::tag(body, "MaxKeys")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
     let common_prefixes = xml::blocks(body, "CommonPrefixes")
         .iter()
         .filter_map(|b| xml::tag(b, "Prefix"))
@@ -183,12 +206,23 @@ fn parse_list_page(body: &str) -> ListPage {
         .map(|b| ObjectEntry {
             key: xml::tag(b, "Key").unwrap_or_default(),
             etag: xml::tag(b, "ETag").map(|e| strip_quotes(&e)),
-            size: xml::tag(b, "Size").and_then(|s| s.parse().ok()).unwrap_or(0),
+            size: xml::tag(b, "Size")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             last_modified: xml::tag(b, "LastModified"),
         })
         .collect();
-    let key_count = xml::tag(body, "KeyCount").and_then(|s| s.parse().ok()).unwrap_or(objects.len());
-    ListPage { objects, common_prefixes, is_truncated, next_continuation_token, key_count, max_keys }
+    let key_count = xml::tag(body, "KeyCount")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(objects.len());
+    ListPage {
+        objects,
+        common_prefixes,
+        is_truncated,
+        next_continuation_token,
+        key_count,
+        max_keys,
+    }
 }
 
 #[cfg(test)]
@@ -226,7 +260,10 @@ mod tests {
         assert!(!page.is_truncated);
         assert_eq!(page.objects.len(), 1);
         assert_eq!(page.objects[0].key, "top.txt");
-        assert_eq!(page.common_prefixes, vec!["img/".to_string(), "doc/".to_string()]);
+        assert_eq!(
+            page.common_prefixes,
+            vec!["img/".to_string(), "doc/".to_string()]
+        );
         // The top-level <Prefix> (none here) must never leak into common_prefixes.
     }
 }

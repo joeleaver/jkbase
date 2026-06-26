@@ -124,7 +124,10 @@ impl ObjectStoreService {
                     .delete(console_delete_object),
             )
             .layer(cors);
-        Router::new().merge(console).fallback(dispatch).with_state(self)
+        Router::new()
+            .merge(console)
+            .fallback(dispatch)
+            .with_state(self)
     }
 
     /// CORS for the Bearer console API: allow the platform's console origins (mirrors
@@ -181,7 +184,10 @@ impl ObjectStoreService {
             Ok(None) => return Err(json_error(StatusCode::UNAUTHORIZED, "invalid token")),
             Err(e) => {
                 warn!(error = %e, "console: authenticate failed");
-                return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "auth unavailable"));
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "auth unavailable",
+                ));
             }
         };
         match self.control.get_project(project_id) {
@@ -189,12 +195,18 @@ impl ObjectStoreService {
             Ok(_) => return Err(json_error(StatusCode::NOT_FOUND, "project not found")),
             Err(e) => {
                 warn!(error = %e, "console: get_project failed");
-                return Err(json_error(StatusCode::INTERNAL_SERVER_ERROR, "lookup failed"));
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "lookup failed",
+                ));
             }
         }
         self.project_entry(project_id).map_err(|e| {
             warn!(project = %project_id, error = %e, "console: object store open failed");
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "object store unavailable")
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "object store unavailable",
+            )
         })
     }
 
@@ -234,7 +246,8 @@ impl ObjectStoreService {
         });
         // Keep the cache bounded: evict an arbitrary entry once at capacity (cheap to
         // reopen). Never evicts the one we're about to insert.
-        if map.len() >= PROJECT_CACHE_CAP && !map.contains_key(project_id)
+        if map.len() >= PROJECT_CACHE_CAP
+            && !map.contains_key(project_id)
             && let Some(victim) = map.keys().next().cloned()
         {
             map.remove(&victim);
@@ -330,7 +343,10 @@ impl ObjectStoreService {
             return Some(resp);
         }
         let mut u = entry.usage.lock().unwrap();
-        let projected_bytes = u.base_bytes.saturating_add(u.reserved_bytes).saturating_add(len);
+        let projected_bytes = u
+            .base_bytes
+            .saturating_add(u.reserved_bytes)
+            .saturating_add(len);
         if projected_bytes > quota.storage_bytes_max {
             return Some(s3_error(
                 StatusCode::INSUFFICIENT_STORAGE,
@@ -342,7 +358,10 @@ impl ObjectStoreService {
             ));
         }
         if adds_object {
-            let projected_objs = u.base_objects.saturating_add(u.reserved_objects).saturating_add(1);
+            let projected_objs = u
+                .base_objects
+                .saturating_add(u.reserved_objects)
+                .saturating_add(1);
             if projected_objs > quota.max_objects {
                 return Some(s3_error(
                     StatusCode::INSUFFICIENT_STORAGE,
@@ -372,7 +391,10 @@ impl ObjectStoreService {
             return Some(resp);
         }
         let mut u = entry.usage.lock().unwrap();
-        let projected = u.base_buckets.saturating_add(u.reserved_buckets).saturating_add(1);
+        let projected = u
+            .base_buckets
+            .saturating_add(u.reserved_buckets)
+            .saturating_add(1);
         if projected > quota.max_buckets {
             return Some(s3_error(
                 StatusCode::CONFLICT,
@@ -454,7 +476,11 @@ impl ObjectStoreService {
         let mut auth = Err("anonymous requests are not allowed".to_string());
         for host in self.host_candidates() {
             let lookup = |akid: &str| {
-                self.control.lookup_access_key(akid).ok().flatten().map(|k| k.secret_key)
+                self.control
+                    .lookup_access_key(akid)
+                    .ok()
+                    .flatten()
+                    .map(|k| k.secret_key)
             };
             auth = if is_presigned {
                 sigv4::verify_presigned(&method, &host, &path, &query, lookup, now)
@@ -758,7 +784,11 @@ async fn console_create_bucket(
         svc.release_bucket_reservation(&entry);
     }
     match res {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({ "name": name }))).into_response(),
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "name": name })),
+        )
+            .into_response(),
         Err(ObjectError::BucketAlreadyExists(_)) => {
             json_error(StatusCode::CONFLICT, "bucket already exists")
         }
@@ -807,10 +837,7 @@ async fn console_list_objects(
     // Default to folder-style "/" folding; an explicit empty delimiter means "flat".
     let delim = q.get("delimiter").map(String::as_str).unwrap_or("/");
     let delimiter = if delim.is_empty() { None } else { Some(delim) };
-    let token = q
-        .get("token")
-        .map(String::as_str)
-        .filter(|s| !s.is_empty());
+    let token = q.get("token").map(String::as_str).filter(|s| !s.is_empty());
     let max_keys = q
         .get("max_keys")
         .and_then(|s| s.parse::<usize>().ok())
@@ -855,7 +882,10 @@ async fn console_get_object(
         Some(k) => k,
         None => return json_error(StatusCode::BAD_REQUEST, "missing key"),
     };
-    let download = matches!(q.get("download").map(String::as_str), Some("1") | Some("true"));
+    let download = matches!(
+        q.get("download").map(String::as_str),
+        Some("1") | Some("true")
+    );
     match entry.store.get_object(&bucket, key).await {
         Ok((meta, file)) => {
             let disp = if download {
@@ -902,7 +932,12 @@ async fn console_put_object(
     // A declared length is required to gate the byte quota AND cap the streamed body.
     let len = match write_len(&req) {
         Some(l) => l,
-        None => return json_error(StatusCode::LENGTH_REQUIRED, "upload requires a Content-Length"),
+        None => {
+            return json_error(
+                StatusCode::LENGTH_REQUIRED,
+                "upload requires a Content-Length",
+            );
+        }
     };
     let content_type = req
         .headers()
@@ -927,7 +962,11 @@ async fn console_put_object(
     // quota — and then stream unbounded onto the shared disk. Exceeding the cap
     // aborts the write; a genuine 0-byte object (empty body) still succeeds.
     let req = limit_body(req, len);
-    let reader = StreamReader::new(req.into_body().into_data_stream().map_err(std::io::Error::other));
+    let reader = StreamReader::new(
+        req.into_body()
+            .into_data_stream()
+            .map_err(std::io::Error::other),
+    );
     match entry
         .store
         .put_object_capped(&bucket, &key, reader, &content_type, None, Some(len))
@@ -941,9 +980,13 @@ async fn console_put_object(
         Err(e) => {
             svc.release_reservation(&entry, net_bytes, adds_object);
             match e {
-                ObjectError::NoSuchBucket(_) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
+                ObjectError::NoSuchBucket(_) => {
+                    json_error(StatusCode::NOT_FOUND, "bucket not found")
+                }
                 ObjectError::InvalidKey(_) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
-                ObjectError::Timeout(_) => json_error(StatusCode::REQUEST_TIMEOUT, "upload timed out"),
+                ObjectError::Timeout(_) => {
+                    json_error(StatusCode::REQUEST_TIMEOUT, "upload timed out")
+                }
                 _ => console_internal("put_object", e),
             }
         }
@@ -1015,12 +1058,20 @@ fn object_key(path: &str) -> Option<(&str, &str)> {
 fn is_valid_project_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 63
-        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// A bucket create = `PUT /{bucket}` with no key segment.
 fn is_bucket_create(method: &str, path: &str) -> bool {
-    method == "PUT" && !path_has_key(path) && path.trim_start_matches('/').split('/').next().is_some_and(|b| !b.is_empty())
+    method == "PUT"
+        && !path_has_key(path)
+        && path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .is_some_and(|b| !b.is_empty())
 }
 
 /// InitiateMultipartUpload = `POST …?uploads`.
@@ -1049,7 +1100,9 @@ fn uri_encode_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             b'/' => out.push('/'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -1091,7 +1144,11 @@ fn write_len(req: &Request) -> Option<u64> {
 fn lower_headers(req: &Request) -> HashMap<String, String> {
     req.headers()
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_lowercase(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_lowercase(), s.to_string()))
+        })
         .collect()
 }
 
@@ -1210,11 +1267,21 @@ mod tests {
             let secret = k.secret_key.clone();
             async move {
                 let (auth, amzd) = sigv4::sign_header(
-                    method, "storage.jkbase.app", &path, &[], "UNSIGNED-PAYLOAD",
-                    &akid, &secret, "us-east-1", now_secs(),
+                    method,
+                    "storage.jkbase.app",
+                    &path,
+                    &[],
+                    "UNSIGNED-PAYLOAD",
+                    &akid,
+                    &secret,
+                    "us-east-1",
+                    now_secs(),
                 );
                 let rb = client
-                    .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("{base}{path}"))
+                    .request(
+                        reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                        format!("{base}{path}"),
+                    )
                     .header("authorization", auth)
                     .header("x-amz-date", amzd)
                     .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
@@ -1237,7 +1304,11 @@ mod tests {
         assert_eq!(send("GET", "/photos/cat.txt".into(), "").await.0, 404);
 
         // An unsigned request is refused over the wire too.
-        let anon = client.get(format!("{base}/photos/cat.txt")).send().await.unwrap();
+        let anon = client
+            .get(format!("{base}/photos/cat.txt"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(anon.status().as_u16(), 403);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1272,27 +1343,49 @@ mod tests {
         let bget = |p: String, t: String| {
             let c = c.clone();
             let base = base.clone();
-            async move { c.get(format!("{base}{p}")).bearer_auth(t).send().await.unwrap() }
+            async move {
+                c.get(format!("{base}{p}"))
+                    .bearer_auth(t)
+                    .send()
+                    .await
+                    .unwrap()
+            }
         };
 
         // CORS preflight from the console origin is allowed + echoes the origin.
         let pre = c
-            .request(reqwest::Method::OPTIONS, format!("{base}/_console/projects/proj-a/buckets"))
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{base}/_console/projects/proj-a/buckets"),
+            )
             .header("origin", "https://console.jkbase.app")
             .header("access-control-request-method", "POST")
-            .header("access-control-request-headers", "authorization,content-type")
+            .header(
+                "access-control-request-headers",
+                "authorization,content-type",
+            )
             .send()
             .await
             .unwrap();
-        assert!(pre.status().is_success(), "preflight status {}", pre.status());
+        assert!(
+            pre.status().is_success(),
+            "preflight status {}",
+            pre.status()
+        );
         assert_eq!(
-            pre.headers().get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            pre.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
             Some("https://console.jkbase.app"),
             "CORS must allow the console origin"
         );
 
         // No token -> 401.
-        let r = c.get(format!("{base}/_console/projects/proj-a/buckets")).send().await.unwrap();
+        let r = c
+            .get(format!("{base}/_console/projects/proj-a/buckets"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status().as_u16(), 401);
 
         // Create a bucket.
@@ -1306,9 +1399,15 @@ mod tests {
         assert_eq!(r.status().as_u16(), 201, "create bucket");
 
         // Streamed uploads: two under "a/", one at the root.
-        for (key, body) in [("a/1.txt", "hello"), ("a/2.txt", "world"), ("readme.txt", "top")] {
+        for (key, body) in [
+            ("a/1.txt", "hello"),
+            ("a/2.txt", "world"),
+            ("readme.txt", "top"),
+        ] {
             let r = c
-                .put(format!("{base}/_console/projects/proj-a/buckets/docs/object?key={key}"))
+                .put(format!(
+                    "{base}/_console/projects/proj-a/buckets/docs/object?key={key}"
+                ))
                 .bearer_auth(&tok_a)
                 .header("content-type", "text/plain")
                 .body(body)
@@ -1319,26 +1418,64 @@ mod tests {
         }
 
         // Bucket list reflects the new bucket.
-        let buckets = bget("/_console/projects/proj-a/buckets".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        let buckets = bget("/_console/projects/proj-a/buckets".into(), tok_a.clone())
+            .await
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
         assert_eq!(buckets["buckets"][0]["name"], "docs");
 
         // Folder listing at root: folder "a/" folded, "readme.txt" listed.
-        let root = bget("/_console/projects/proj-a/buckets/docs/objects".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        let root = bget(
+            "/_console/projects/proj-a/buckets/docs/objects".into(),
+            tok_a.clone(),
+        )
+        .await
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
         assert_eq!(root["prefixes"][0], "a/");
         assert_eq!(root["objects"][0]["key"], "readme.txt");
 
         // Pagination over "a/": max_keys=1 -> truncated, token "a/1.txt".
-        let p1 = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        let p1 = bget(
+            "/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1".into(),
+            tok_a.clone(),
+        )
+        .await
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
         assert_eq!(p1["is_truncated"], true);
         assert_eq!(p1["next_token"], "a/1.txt");
-        let p2 = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1&token=a%2F1.txt".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
+        let p2 = bget(
+            "/_console/projects/proj-a/buckets/docs/objects?prefix=a/&max_keys=1&token=a%2F1.txt"
+                .into(),
+            tok_a.clone(),
+        )
+        .await
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
         assert_eq!(p2["objects"][0]["key"], "a/2.txt");
 
         // Authenticated download with attachment disposition + body round-trip.
-        let dl = bget("/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt&download=1".into(), tok_a.clone()).await;
+        let dl = bget(
+            "/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt&download=1".into(),
+            tok_a.clone(),
+        )
+        .await;
         assert_eq!(dl.status().as_u16(), 200);
-        let cd = dl.headers().get("content-disposition").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-        assert!(cd.starts_with("attachment") && cd.contains("1.txt"), "disposition: {cd}");
+        let cd = dl
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            cd.starts_with("attachment") && cd.contains("1.txt"),
+            "disposition: {cd}"
+        );
         assert_eq!(dl.text().await.unwrap(), "hello");
 
         // Cross-tenant: tenant-b's valid token must 404 on proj-a.
@@ -1346,10 +1483,29 @@ mod tests {
         assert_eq!(x.status().as_u16(), 404, "cross-tenant must 404");
 
         // Delete an object, then it's gone.
-        let d = c.delete(format!("{base}/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt")).bearer_auth(&tok_a).send().await.unwrap();
+        let d = c
+            .delete(format!(
+                "{base}/_console/projects/proj-a/buckets/docs/object?key=a%2F1.txt"
+            ))
+            .bearer_auth(&tok_a)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(d.status().as_u16(), 204);
-        let after = bget("/_console/projects/proj-a/buckets/docs/objects?prefix=a/".into(), tok_a.clone()).await.json::<serde_json::Value>().await.unwrap();
-        let keys: Vec<String> = after["objects"].as_array().unwrap().iter().map(|o| o["key"].as_str().unwrap().to_string()).collect();
+        let after = bget(
+            "/_console/projects/proj-a/buckets/docs/objects?prefix=a/".into(),
+            tok_a.clone(),
+        )
+        .await
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+        let keys: Vec<String> = after["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["key"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(keys, vec!["a/2.txt".to_string()], "deleted object gone");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1386,7 +1542,15 @@ mod tests {
     /// Build a SigV4 header-signed request for the service's public host.
     fn signed(method: &str, path: &str, akid: &str, secret: &str, body: &str) -> Request {
         let (auth, amzd) = sigv4::sign_header(
-            method, "storage.test", path, &[], "UNSIGNED-PAYLOAD", akid, secret, "us-east-1", now_secs(),
+            method,
+            "storage.test",
+            path,
+            &[],
+            "UNSIGNED-PAYLOAD",
+            akid,
+            secret,
+            "us-east-1",
+            now_secs(),
         );
         HttpRequest::builder()
             .method(method)
@@ -1431,15 +1595,38 @@ mod tests {
 
         // tenant-a: create bucket + put + get.
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt/hello.txt", &a.access_key_id, &a.secret_key, "hi there")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed(
+                    "PUT",
+                    "/bkt/hello.txt",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "hi there"
+                ))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         let (st, body) = status_body(
-            app.clone().oneshot(signed("GET", "/bkt/hello.txt", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+            app.clone()
+                .oneshot(signed(
+                    "GET",
+                    "/bkt/hello.txt",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "",
+                ))
+                .await
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -1448,7 +1635,13 @@ mod tests {
         // tenant-b signs validly but has its OWN store root -> /bkt doesn't exist for it.
         let r = app
             .clone()
-            .oneshot(signed("GET", "/bkt/hello.txt", &b.access_key_id, &b.secret_key, ""))
+            .oneshot(signed(
+                "GET",
+                "/bkt/hello.txt",
+                &b.access_key_id,
+                &b.secret_key,
+                "",
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND); // NoSuchBucket in b's namespace
@@ -1456,7 +1649,13 @@ mod tests {
         // Wrong secret -> 403.
         let r = app
             .clone()
-            .oneshot(signed("GET", "/bkt/hello.txt", &a.access_key_id, "WRONG", ""))
+            .oneshot(signed(
+                "GET",
+                "/bkt/hello.txt",
+                &a.access_key_id,
+                "WRONG",
+                "",
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
@@ -1476,14 +1675,22 @@ mod tests {
         // Simulate same-slug recreate by a different tenant (key left orphaned).
         store.delete_project("proj").unwrap();
         mk_project(&store, "proj", "tenant-b");
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         let r = app
             .clone()
             .oneshot(signed("GET", "/bkt/x", &k.access_key_id, &k.secret_key, ""))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN, "orphaned key must not work after owner change");
+        assert_eq!(
+            r.status(),
+            StatusCode::FORBIDDEN,
+            "orphaned key must not work after owner change"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1496,18 +1703,33 @@ mod tests {
         let store = store_at(&dir);
         let data = dir.join("data");
         // A real victim project with a bucket sitting under the shared objectstore root.
-        std::fs::create_dir_all(data.join("objectstore").join("victim-proj").join("secret-bkt")).unwrap();
+        std::fs::create_dir_all(
+            data.join("objectstore")
+                .join("victim-proj")
+                .join("secret-bkt"),
+        )
+        .unwrap();
         let bad = store.create_access_key("", "attacker", "evil").unwrap(); // empty project id
-        let svc = Arc::new(ObjectStoreService::new(data, store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            data,
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
 
         // GET / would, without the guard, list the shared root (every project id).
         let (st, body) = status_body(
-            app.clone().oneshot(signed("GET", "/", &bad.access_key_id, &bad.secret_key, "")).await.unwrap(),
+            app.clone()
+                .oneshot(signed("GET", "/", &bad.access_key_id, &bad.secret_key, ""))
+                .await
+                .unwrap(),
         )
         .await;
         assert_ne!(st, StatusCode::OK, "empty-project key must not succeed");
-        assert!(!body.contains("victim-proj"), "must not leak other projects' ids");
+        assert!(
+            !body.contains("victim-proj"),
+            "must not leak other projects' ids"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1519,15 +1741,31 @@ mod tests {
         let store = store_at(&dir);
         mk_project(&store, "proj", "tenant-x");
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         // Declare length 2 but send 100 bytes.
         let (auth, amzd) = sigv4::sign_header(
-            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+            "PUT",
+            "storage.test",
+            "/bkt/k",
+            &[],
+            "UNSIGNED-PAYLOAD",
+            &a.access_key_id,
+            &a.secret_key,
+            "us-east-1",
+            now_secs(),
         );
         let req = HttpRequest::builder()
             .method("PUT")
@@ -1543,10 +1781,16 @@ mod tests {
         assert_ne!(st, StatusCode::OK, "over-length write must not succeed");
         // And the object must not be readable as the full 100 bytes.
         let (gst, gbody) = status_body(
-            app.clone().oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+            app.clone()
+                .oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap(),
         )
         .await;
-        assert!(gst != StatusCode::OK || gbody.len() <= 2, "must not store beyond the reservation");
+        assert!(
+            gst != StatusCode::OK || gbody.len() <= 2,
+            "must not store beyond the reservation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1558,14 +1802,30 @@ mod tests {
         let store = store_at(&dir);
         mk_project(&store, "proj", "tenant-x");
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         let (auth, amzd) = sigv4::sign_header(
-            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+            "PUT",
+            "storage.test",
+            "/bkt/k",
+            &[],
+            "UNSIGNED-PAYLOAD",
+            &a.access_key_id,
+            &a.secret_key,
+            "us-east-1",
+            now_secs(),
         );
         let req = HttpRequest::builder()
             .method("PUT")
@@ -1580,10 +1840,16 @@ mod tests {
         let st = app.clone().oneshot(req).await.unwrap().status();
         assert_ne!(st, StatusCode::OK, "CL:0 + streamed body must not succeed");
         let (gst, gbody) = status_body(
-            app.clone().oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+            app.clone()
+                .oneshot(signed("GET", "/bkt/k", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap(),
         )
         .await;
-        assert!(gst != StatusCode::OK || gbody.is_empty(), "must not store beyond the 0-byte reservation");
+        assert!(
+            gst != StatusCode::OK || gbody.is_empty(),
+            "must not store beyond the 0-byte reservation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1593,11 +1859,23 @@ mod tests {
         let store = store_at(&dir);
         mk_project(&store, "proj", "tenant-x");
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         // Sign a PUT but strip content-length -> 411 (can't dodge the quota gate).
         let (auth, amzd) = sigv4::sign_header(
-            "PUT", "storage.test", "/bkt/k", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+            "PUT",
+            "storage.test",
+            "/bkt/k",
+            &[],
+            "UNSIGNED-PAYLOAD",
+            &a.access_key_id,
+            &a.secret_key,
+            "us-east-1",
+            now_secs(),
         );
         let req = HttpRequest::builder()
             .method("PUT")
@@ -1608,7 +1886,10 @@ mod tests {
             .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
             .body(Body::from("data"))
             .unwrap();
-        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::LENGTH_REQUIRED);
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::LENGTH_REQUIRED
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1623,19 +1904,35 @@ mod tests {
         let store = store_at(&dir);
         mk_project(&store, "proj", "tenant-x");
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
 
         // Create the bucket (signed; this one carries Content-Length naturally).
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
 
         // A write with NO Content-Length, length declared only via x-amz-decoded-content-length.
         let body = "streamed-bytes"; // 14 bytes
         let (auth, amzd) = sigv4::sign_header(
-            "PUT", "storage.test", "/bkt/s.bin", &[], "UNSIGNED-PAYLOAD", &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+            "PUT",
+            "storage.test",
+            "/bkt/s.bin",
+            &[],
+            "UNSIGNED-PAYLOAD",
+            &a.access_key_id,
+            &a.secret_key,
+            "us-east-1",
+            now_secs(),
         );
         let req = HttpRequest::builder()
             .method("PUT")
@@ -1647,12 +1944,25 @@ mod tests {
             .header("x-amz-decoded-content-length", body.len().to_string())
             .body(Body::from(body))
             .unwrap();
-        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         // It reads back intact.
-        let (st, got) =
-            status_body(app.clone().oneshot(signed("GET", "/bkt/s.bin", &a.access_key_id, &a.secret_key, "")).await.unwrap())
-                .await;
+        let (st, got) = status_body(
+            app.clone()
+                .oneshot(signed(
+                    "GET",
+                    "/bkt/s.bin",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(got, body);
 
@@ -1752,7 +2062,11 @@ mod tests {
         assert_eq!(st, StatusCode::CREATED);
 
         // Upload three objects: two under folder "a/", one at the root.
-        for (key, body) in [("a/1.txt", "hello"), ("a/2.txt", "world"), ("readme.txt", "top")] {
+        for (key, body) in [
+            ("a/1.txt", "hello"),
+            ("a/2.txt", "world"),
+            ("readme.txt", "top"),
+        ] {
             let (st, _) = go(bearer(
                 "PUT",
                 &format!("/_console/projects/proj-a/buckets/docs/object?key={key}"),
@@ -1775,8 +2089,14 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert!(body.contains("\"a/\""), "prefixes should hold a/: {body}");
-        assert!(body.contains("readme.txt"), "objects should hold readme.txt: {body}");
-        assert!(!body.contains("a/1.txt"), "nested keys must be folded, not listed: {body}");
+        assert!(
+            body.contains("readme.txt"),
+            "objects should hold readme.txt: {body}"
+        );
+        assert!(
+            !body.contains("a/1.txt"),
+            "nested keys must be folded, not listed: {body}"
+        );
 
         // Descend into "a/" -> its two members, no sub-folders.
         let (st, body) = go(bearer(
@@ -1788,7 +2108,10 @@ mod tests {
         ))
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert!(body.contains("a/1.txt") && body.contains("a/2.txt"), "{body}");
+        assert!(
+            body.contains("a/1.txt") && body.contains("a/2.txt"),
+            "{body}"
+        );
 
         // Pagination: max_keys=1 over "a/" pages cleanly via next_token.
         let (st, body) = go(bearer(
@@ -1822,7 +2145,10 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        assert!(cd.starts_with("attachment") && cd.contains("1.txt"), "cd: {cd}");
+        assert!(
+            cd.starts_with("attachment") && cd.contains("1.txt"),
+            "cd: {cd}"
+        );
         let (_, dl) = status_body(resp).await;
         assert_eq!(dl, "hello");
 
@@ -1888,7 +2214,20 @@ mod tests {
         ));
         let app = svc.into_router();
         assert_eq!(
-            status_body(app.clone().oneshot(bearer("POST", "/_console/projects/proj/buckets", &tok, "application/json", "{\"name\":\"bkt\"}")).await.unwrap()).await.0,
+            status_body(
+                app.clone()
+                    .oneshot(bearer(
+                        "POST",
+                        "/_console/projects/proj/buckets",
+                        &tok,
+                        "application/json",
+                        "{\"name\":\"bkt\"}"
+                    ))
+                    .await
+                    .unwrap()
+            )
+            .await
+            .0,
             StatusCode::CREATED
         );
         // Declare 0 but stream 100 bytes -> aborted (non-2xx), object not stored as 100B.
@@ -1903,12 +2242,21 @@ mod tests {
         assert_ne!(st, StatusCode::OK, "CL:0 + streamed body must not succeed");
         let (gst, gbody) = status_body(
             app.clone()
-                .oneshot(bearer("GET", "/_console/projects/proj/buckets/bkt/object?key=k", &tok, "", ""))
+                .oneshot(bearer(
+                    "GET",
+                    "/_console/projects/proj/buckets/bkt/object?key=k",
+                    &tok,
+                    "",
+                    "",
+                ))
                 .await
                 .unwrap(),
         )
         .await;
-        assert!(gst != StatusCode::OK || gbody.is_empty(), "must not store beyond the 0-byte reservation");
+        assert!(
+            gst != StatusCode::OK || gbody.is_empty(),
+            "must not store beyond the 0-byte reservation"
+        );
 
         // A genuine empty (0-byte) object still uploads fine.
         let ok = HttpRequest::builder()
@@ -1918,7 +2266,11 @@ mod tests {
             .header("content-length", "0")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(app.oneshot(ok).await.unwrap().status(), StatusCode::OK, "empty object should upload");
+        assert_eq!(
+            app.oneshot(ok).await.unwrap().status(),
+            StatusCode::OK,
+            "empty object should upload"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1976,14 +2328,25 @@ mod tests {
         q.max_buckets = 1;
         store.set_quota("proj", &q).unwrap();
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         let (st, body) = status_body(
-            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+            app.clone()
+                .oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
@@ -2003,19 +2366,33 @@ mod tests {
         q.max_buckets = 1;
         store.set_quota("proj", &q).unwrap();
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         // Re-PUT the same bucket while at the cap: engine idempotency, not the quota gate.
         let (st, body) = status_body(
-            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap(),
+            app.clone()
+                .oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::CONFLICT);
-        assert!(body.contains("BucketAlreadyExists"), "expected BucketAlreadyExists, got: {body}");
+        assert!(
+            body.contains("BucketAlreadyExists"),
+            "expected BucketAlreadyExists, got: {body}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2030,24 +2407,50 @@ mod tests {
         q.max_buckets = 1;
         store.set_quota("proj", &q).unwrap();
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         // At the cap with one bucket; a second create is refused.
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/aaa", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::CONFLICT
         );
         // Delete frees the slot; the re-create must succeed IMMEDIATELY (no TTL wait).
         assert_eq!(
-            app.clone().oneshot(signed("DELETE", "/aaa", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed(
+                    "DELETE",
+                    "/aaa",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    ""
+                ))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::NO_CONTENT
         );
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bbb", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK,
             "freed bucket slot must be credited without waiting out the TTL"
         );
@@ -2063,19 +2466,46 @@ mod tests {
         q.max_objects = 1;
         store.set_quota("proj", &q).unwrap();
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "x")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed(
+                    "PUT",
+                    "/bkt/o1",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "x"
+                ))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         // A second object exceeds the count cap within the TTL window -> 507.
         let (st, body) = status_body(
-            app.clone().oneshot(signed("PUT", "/bkt/o2", &a.access_key_id, &a.secret_key, "y")).await.unwrap(),
+            app.clone()
+                .oneshot(signed(
+                    "PUT",
+                    "/bkt/o2",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "y",
+                ))
+                .await
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);
@@ -2095,26 +2525,63 @@ mod tests {
         q.max_objects = 1;
         store.set_quota("proj", &q).unwrap();
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, "")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &a.access_key_id, &a.secret_key, ""))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         // First write of the key consumes the 1-object budget.
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "v1")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed(
+                    "PUT",
+                    "/bkt/o1",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "v1"
+                ))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
         // Overwriting the SAME key (even with a larger body) must still succeed.
         assert_eq!(
-            app.clone().oneshot(signed("PUT", "/bkt/o1", &a.access_key_id, &a.secret_key, "v2-longer")).await.unwrap().status(),
+            app.clone()
+                .oneshot(signed(
+                    "PUT",
+                    "/bkt/o1",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "v2-longer"
+                ))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK,
             "re-PUT of an existing key must not trip the object-count cap"
         );
         // A genuinely new key still trips the cap.
         let (st, body) = status_body(
-            app.clone().oneshot(signed("PUT", "/bkt/o2", &a.access_key_id, &a.secret_key, "x")).await.unwrap(),
+            app.clone()
+                .oneshot(signed(
+                    "PUT",
+                    "/bkt/o2",
+                    &a.access_key_id,
+                    &a.secret_key,
+                    "x",
+                ))
+                .await
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);
@@ -2130,11 +2597,22 @@ mod tests {
         let store = store_at(&dir);
         mk_project(&store, "proj", "tenant-x");
         let a = store.create_access_key("proj", "tenant-x", "").unwrap();
-        let svc = Arc::new(ObjectStoreService::new(dir.join("data"), store, "storage.test".to_string()));
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
         let app = svc.into_router();
         let (auth, amzd) = sigv4::sign_header(
-            "PUT", "storage.test:443", "/bkt", &[], "UNSIGNED-PAYLOAD",
-            &a.access_key_id, &a.secret_key, "us-east-1", now_secs(),
+            "PUT",
+            "storage.test:443",
+            "/bkt",
+            &[],
+            "UNSIGNED-PAYLOAD",
+            &a.access_key_id,
+            &a.secret_key,
+            "us-east-1",
+            now_secs(),
         );
         let req = HttpRequest::builder()
             .method("PUT")

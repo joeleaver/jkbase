@@ -71,8 +71,12 @@ echo "[runtime-rootfs] mkfs.ext4 -d (no mount)"
 chmod -R u+rwX "$STAGE"
 content_kib="$(du -sk "$STAGE" | cut -f1)"
 size_kib=$((content_kib + content_kib / 2 + 32768)) # +50% metadata slack +32MiB headroom
-rm -f "$OUT"
+# Write atomically: mkfs into a temp then rename, so the server (which content-addresses this
+# staging artifact on startup) can never hash a half-written file if it races a build/crash.
 mkdir -p "$(dirname "$OUT")"
-truncate -s "${size_kib}K" "$OUT"
-mkfs.ext4 -F -q -O ^has_journal -d "$STAGE" "$OUT"
+TMP_OUT="$OUT.tmp.$$"
+rm -f "$TMP_OUT"
+truncate -s "${size_kib}K" "$TMP_OUT"
+mkfs.ext4 -F -q -O ^has_journal -d "$STAGE" "$TMP_OUT"
+mv -f "$TMP_OUT" "$OUT"
 echo "[runtime-rootfs] done: $OUT ($(du -h "$OUT" | cut -f1)); init=/sbin/init=jkbase-agent, chrony present"

@@ -129,7 +129,10 @@ mod tests {
             "140.82.112.3:443".parse().unwrap(),
             "8.8.8.8:443".parse().unwrap(),
         ];
-        assert_eq!(pick_safe_addr(addrs).map(|a| a.ip()), Some(ip("140.82.112.3")));
+        assert_eq!(
+            pick_safe_addr(addrs).map(|a| a.ip()),
+            Some(ip("140.82.112.3"))
+        );
         let unsafe_only: Vec<SocketAddr> = vec![
             "10.0.0.1:443".parse().unwrap(),
             "127.0.0.1:443".parse().unwrap(),

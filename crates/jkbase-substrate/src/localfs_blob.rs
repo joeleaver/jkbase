@@ -30,10 +30,7 @@ impl LocalFsBlobStore {
     /// traversal so a key can never escape the store.
     fn resolve(&self, key: &str) -> Result<PathBuf> {
         let rel = Path::new(key);
-        let safe = !key.is_empty()
-            && rel
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)));
+        let safe = !key.is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_)));
         if !safe {
             return Err(SubstrateError::Backend(format!(
                 "invalid blob key {key:?} (must be a relative path with no traversal)"
@@ -145,7 +142,9 @@ impl BlobStore for LocalFsBlobStore {
                 } else if ft.is_file()
                     && let Ok(rel) = path.strip_prefix(&self.root)
                 {
-                    let key = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                    let key = rel
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
                     // Skip in-flight temp siblings; surface only committed objects.
                     if !key.contains(".tmp.") && key.starts_with(prefix) {
                         out.push(key);

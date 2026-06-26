@@ -130,9 +130,13 @@ pub fn resolve_egress(
         // Sandbox ceiling: nothing can widen it.
         (Some(Toggle(false)), _) => ResolvedEgress::Sandbox,
         // Allowlist ceiling P: narrow freely; a widening request is intersected against P.
-        (Some(Allowlist(p)), None | Some(Toggle(true))) => ResolvedEgress::Allowlist(dedup_hosts(p)),
+        (Some(Allowlist(p)), None | Some(Toggle(true))) => {
+            ResolvedEgress::Allowlist(dedup_hosts(p))
+        }
         (Some(Allowlist(_)), Some(Toggle(false))) => ResolvedEgress::Sandbox,
-        (Some(Allowlist(p)), Some(Allowlist(f))) => ResolvedEgress::Allowlist(intersect_hosts(p, f)),
+        (Some(Allowlist(p)), Some(Allowlist(f))) => {
+            ResolvedEgress::Allowlist(intersect_hosts(p, f))
+        }
     }
 }
 
@@ -184,7 +188,10 @@ fn dedup_hosts(hosts: &[String]) -> Vec<String> {
 
 fn intersect_hosts(ceiling: &[String], req: &[String]) -> Vec<String> {
     let c = dedup_hosts(ceiling);
-    dedup_hosts(req).into_iter().filter(|h| c.contains(h)).collect()
+    dedup_hosts(req)
+        .into_iter()
+        .filter(|h| c.contains(h))
+        .collect()
 }
 
 #[cfg(test)]
@@ -220,7 +227,10 @@ mod egress_policy_tests {
             Some(EgressPolicy::Toggle(true)),
             Some(EgressPolicy::Allowlist(vec!["x.com".into()])),
         ] {
-            assert_eq!(resolve_egress(Some(&p), f.as_ref()), ResolvedEgress::Sandbox);
+            assert_eq!(
+                resolve_egress(Some(&p), f.as_ref()),
+                ResolvedEgress::Sandbox
+            );
         }
     }
 
@@ -252,7 +262,10 @@ mod egress_policy_tests {
         assert_eq!(
             resolve_egress(
                 None,
-                Some(&EgressPolicy::Allowlist(vec!["A.com.".into(), "a.com".into()]))
+                Some(&EgressPolicy::Allowlist(vec![
+                    "A.com.".into(),
+                    "a.com".into()
+                ]))
             ),
             ResolvedEgress::Allowlist(vec!["a.com".into()])
         );
@@ -346,7 +359,10 @@ impl ServerConfig {
             return s;
         }
         if let Some(df) = self.dockerfile.as_deref() {
-            return Path::new(df).parent().and_then(|p| p.to_str()).unwrap_or(".");
+            return Path::new(df)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or(".");
         }
         "."
     }
@@ -374,9 +390,9 @@ impl ServerConfig {
         match self.builder.as_deref().map(str::trim) {
             None | Some("") | Some("auto") => Ok(Builder::Auto),
             Some("dockerfile") => Ok(Builder::Dockerfile),
-            Some(other) => anyhow::bail!(
-                "unknown builder {other:?} (expected \"auto\" or \"dockerfile\")"
-            ),
+            Some(other) => {
+                anyhow::bail!("unknown builder {other:?} (expected \"auto\" or \"dockerfile\")")
+            }
         }
     }
 
@@ -487,9 +503,7 @@ impl SiteConfig {
         match self.build.as_deref().map(str::trim) {
             None | Some("") => Ok(None),
             Some("trunk") => Ok(Some(SiteBuild::Trunk)),
-            Some(other) => anyhow::bail!(
-                "unknown site build {other:?} (expected \"trunk\")"
-            ),
+            Some(other) => anyhow::bail!("unknown site build {other:?} (expected \"trunk\")"),
         }
     }
 
@@ -502,7 +516,9 @@ impl SiteConfig {
     /// The build CONTEXT subdir mounted as the build root. Explicit `context`, else
     /// the `build_source()` (so unset → identical to mounting just the source).
     pub fn context_dir(&self) -> &str {
-        self.context.as_deref().unwrap_or_else(|| self.build_source())
+        self.context
+            .as_deref()
+            .unwrap_or_else(|| self.build_source())
     }
 
     /// The source path relative to [`Self::context_dir`]; `"."` when `context` is
@@ -609,7 +625,11 @@ impl ProjectConfig {
                 // A built site's served content comes from the build output, not a
                 // committed `public` dir. Carry the flag so assemble_sites skips the
                 // committed-copy and the static build fills the slot instead.
-                built: site.build.as_deref().map(str::trim).is_some_and(|b| !b.is_empty()),
+                built: site
+                    .build
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|b| !b.is_empty()),
             });
         }
 
@@ -683,11 +703,7 @@ impl ProjectConfig {
         let mut scheds: Vec<_> = self
             .functions
             .iter()
-            .filter_map(|(name, f)| {
-                f.schedule
-                    .as_ref()
-                    .map(|c| (name.clone(), c.clone()))
-            })
+            .filter_map(|(name, f)| f.schedule.as_ref().map(|c| (name.clone(), c.clone())))
             .collect();
         if scheds.is_empty() {
             return None;
@@ -807,9 +823,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.servers["web"].command.as_deref(),
-            Some(&["/opt/bun/bin/bun".to_string(), "run".into(), "--filter".into(), "web".into(), "start".into()][..])
+            Some(
+                &[
+                    "/opt/bun/bin/bun".to_string(),
+                    "run".into(),
+                    "--filter".into(),
+                    "web".into(),
+                    "start".into()
+                ][..]
+            )
         );
-        assert!(cfg.servers["api"].command.is_none(), "command defaults to None");
+        assert!(
+            cfg.servers["api"].command.is_none(),
+            "command defaults to None"
+        );
     }
 
     #[test]
@@ -832,8 +859,7 @@ mod tests {
         // Regression guard for the #1 review concern: when `context` is omitted, the
         // context subdir IS the source and the build subdir is "." — byte-identical to
         // the pre-`context` build path (mount the source, build at its root).
-        let server: ServerConfig =
-            toml::from_str("source = \"./web\"\nport = 3000\n").unwrap();
+        let server: ServerConfig = toml::from_str("source = \"./web\"\nport = 3000\n").unwrap();
         assert_eq!(server.context_dir(), "./web");
         assert_eq!(server.build_subdir(), ".");
 
@@ -909,7 +935,10 @@ mod tests {
         // everything to the container).
         let server: ProjectConfig =
             toml::from_str("[project]\nname = \"app\"\n[servers.app]\nport = 3000\n").unwrap();
-        assert!(server.resolved_sites().is_empty(), "server app gets no default static site");
+        assert!(
+            server.resolved_sites().is_empty(),
+            "server app gets no default static site"
+        );
         assert!(!server.is_multi_site());
         assert!(server.sites_json().is_none());
 
@@ -1010,10 +1039,9 @@ mod tests {
         assert_eq!(m["volumes"][0]["mount"], "/data");
 
         // Legacy dockerfile manifests still parse and resolve a source dir.
-        let legacy: ProjectConfig = toml::from_str(
-            "[servers.api]\ndockerfile = \"./api/Dockerfile\"\nport = 3000\n",
-        )
-        .unwrap();
+        let legacy: ProjectConfig =
+            toml::from_str("[servers.api]\ndockerfile = \"./api/Dockerfile\"\nport = 3000\n")
+                .unwrap();
         assert_eq!(legacy.servers["api"].source_dir(), "./api");
     }
 
@@ -1021,22 +1049,22 @@ mod tests {
     fn site_build_strategy_resolves_and_marks_resolved_site() {
         // A built site: `build = "trunk"` resolves to Trunk; `source` is the build dir;
         // `public` is omitted (legal only for a built site → `None`, not defaulted to ".").
-        let cfg: ProjectConfig = toml::from_str(
-            "[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n",
-        )
-        .unwrap();
+        let cfg: ProjectConfig =
+            toml::from_str("[sites.app]\nsource = \"./web\"\nbuild = \"trunk\"\n").unwrap();
         let site = &cfg.sites["app"];
         assert_eq!(site.build_strategy().unwrap(), Some(SiteBuild::Trunk));
         assert_eq!(site.build_source(), "./web");
-        assert_eq!(site.public, None, "omitted `public` must be None, never defaulted to \".\"");
+        assert_eq!(
+            site.public, None,
+            "omitted `public` must be None, never defaulted to \".\""
+        );
         // resolved_sites carries the `built` flag so assemble_sites skips its copy.
         let resolved = cfg.resolved_sites();
         let app = resolved.iter().find(|s| s.name == "app").unwrap();
         assert!(app.built);
 
         // A committed site: no `build` → None, not built; `public` is carried as Some.
-        let cfg: ProjectConfig =
-            toml::from_str("[sites.docs]\npublic = \"./docs\"\n").unwrap();
+        let cfg: ProjectConfig = toml::from_str("[sites.docs]\npublic = \"./docs\"\n").unwrap();
         assert_eq!(cfg.sites["docs"].build_strategy().unwrap(), None);
         assert_eq!(cfg.sites["docs"].public.as_deref(), Some("./docs"));
         assert!(!cfg.resolved_sites().iter().any(|s| s.built));
@@ -1075,9 +1103,10 @@ mod tests {
         api.validate("api").unwrap();
 
         // Dockerfile path defaults to <source_dir>/Dockerfile when unspecified.
-        let cfg: ProjectConfig =
-            toml::from_str("[servers.api]\nbuilder = \"dockerfile\"\nsource = \"./svc\"\nport = 3000\n")
-                .unwrap();
+        let cfg: ProjectConfig = toml::from_str(
+            "[servers.api]\nbuilder = \"dockerfile\"\nsource = \"./svc\"\nport = 3000\n",
+        )
+        .unwrap();
         assert_eq!(cfg.servers["api"].dockerfile_path(), "./svc/Dockerfile");
         let cfg: ProjectConfig =
             toml::from_str("[servers.api]\nbuilder = \"dockerfile\"\nport = 3000\n").unwrap();
@@ -1120,7 +1149,10 @@ mod tests {
         // Explicit engine = "rhypedb" is accepted.
         let cfg: ProjectConfig =
             toml::from_str("[database]\nengine = \"rhypedb\"\nschema = \"s.rhype\"\n").unwrap();
-        assert_eq!(cfg.database.as_ref().unwrap().engine().unwrap(), DatabaseEngine::Rhypedb);
+        assert_eq!(
+            cfg.database.as_ref().unwrap().engine().unwrap(),
+            DatabaseEngine::Rhypedb
+        );
 
         // Unknown engine is rejected (typo must fail the deploy, not silently skip).
         let cfg: ProjectConfig =

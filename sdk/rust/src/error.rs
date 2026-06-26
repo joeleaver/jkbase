@@ -141,7 +141,11 @@ impl Error {
     pub fn is_quota(&self) -> bool {
         matches!(
             self.code(),
-            Some(S3ErrorCode::QuotaExceeded | S3ErrorCode::TooManyObjects | S3ErrorCode::TooManyBuckets)
+            Some(
+                S3ErrorCode::QuotaExceeded
+                    | S3ErrorCode::TooManyObjects
+                    | S3ErrorCode::TooManyBuckets
+            )
         )
     }
 
@@ -152,7 +156,9 @@ impl Error {
         match self.code() {
             Some(S3ErrorCode::SlowDown) => true,
             Some(
-                S3ErrorCode::QuotaExceeded | S3ErrorCode::TooManyObjects | S3ErrorCode::TooManyBuckets,
+                S3ErrorCode::QuotaExceeded
+                | S3ErrorCode::TooManyObjects
+                | S3ErrorCode::TooManyBuckets,
             ) => false,
             _ => match self {
                 Error::Api { status, .. } => *status >= 500,
@@ -181,7 +187,11 @@ pub(crate) fn parse_api_error(status: u16, body: &str) -> Error {
             body.chars().take(512).collect()
         }
     });
-    Error::Api { status, code, message }
+    Error::Api {
+        status,
+        code,
+        message,
+    }
 }
 
 /// Best-effort code when a response carries no `<Code>` (bodyless errors).
@@ -217,10 +227,16 @@ mod tests {
 
     #[test]
     fn quota_and_retry_classification() {
-        let e = parse_api_error(507, "<Error><Code>TooManyObjects</Code><Message>cap</Message></Error>");
+        let e = parse_api_error(
+            507,
+            "<Error><Code>TooManyObjects</Code><Message>cap</Message></Error>",
+        );
         assert!(e.is_quota());
         assert!(!e.is_retryable()); // a quota cap is not worth retrying
-        let e = parse_api_error(503, "<Error><Code>SlowDown</Code><Message>busy</Message></Error>");
+        let e = parse_api_error(
+            503,
+            "<Error><Code>SlowDown</Code><Message>busy</Message></Error>",
+        );
         assert!(e.is_retryable());
     }
 
@@ -233,7 +249,13 @@ mod tests {
 
     #[test]
     fn unknown_code_is_preserved() {
-        let e = parse_api_error(400, "<Error><Code>WeirdNewCode</Code><Message>x</Message></Error>");
-        assert_eq!(e.code(), Some(&S3ErrorCode::Other("WeirdNewCode".to_string())));
+        let e = parse_api_error(
+            400,
+            "<Error><Code>WeirdNewCode</Code><Message>x</Message></Error>",
+        );
+        assert_eq!(
+            e.code(),
+            Some(&S3ErrorCode::Other("WeirdNewCode".to_string()))
+        );
     }
 }

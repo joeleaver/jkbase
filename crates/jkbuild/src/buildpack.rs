@@ -200,7 +200,10 @@ mod tests {
     fn root_dir_and_member_subpath() {
         // Normal build (workspace_root == app_dir): root is the app, member empty —
         // bun/node behave byte-identically to before this field existed.
-        let c = ctx(Path::new("/scratch/workspace"), Path::new("/scratch/workspace"));
+        let c = ctx(
+            Path::new("/scratch/workspace"),
+            Path::new("/scratch/workspace"),
+        );
         assert_eq!(c.root_dir(), Path::new("/scratch/workspace"));
         assert_eq!(c.member_subpath(), Path::new(""));
 

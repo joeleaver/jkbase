@@ -47,10 +47,19 @@ async fn zero_vendor_boot_uses_only_local_backends() {
     let base = tmp("boot");
     let s = build_substrate(SubstrateConfig {
         node_count: 1,
-        control: ControlBackend::Redb { path: base.join("c.redb") },
-        blob: BlobBackend::LocalFs { root: base.join("b") },
-        lease: LeaseBackend::Flock { dir: base.join("l"), source_id: "n1".into() },
-        data_disk: DataDiskBackend::LocalLoop { dir: base.join("d") },
+        control: ControlBackend::Redb {
+            path: base.join("c.redb"),
+        },
+        blob: BlobBackend::LocalFs {
+            root: base.join("b"),
+        },
+        lease: LeaseBackend::Flock {
+            dir: base.join("l"),
+            source_id: "n1".into(),
+        },
+        data_disk: DataDiskBackend::LocalLoop {
+            dir: base.join("d"),
+        },
         tenant_object_store_host: Some("s3.jkbase.app".into()),
     })
     .unwrap();
@@ -79,11 +88,16 @@ async fn fence_holds_across_restore() {
     let dir = tmp("fence");
     let token_old = {
         let l = FlockLease::open(&dir, "node-a").unwrap();
-        l.acquire("vm1", "node-a", Duration::from_secs(30)).await.unwrap()
+        l.acquire("vm1", "node-a", Duration::from_secs(30))
+            .await
+            .unwrap()
         // dropped here WITHOUT release => simulates a crash; OS frees the flock.
     };
     let l2 = FlockLease::open(&dir, "node-a").unwrap();
-    let token_new = l2.acquire("vm1", "node-a", Duration::from_secs(30)).await.unwrap();
+    let token_new = l2
+        .acquire("vm1", "node-a", Duration::from_secs(30))
+        .await
+        .unwrap();
     assert!(
         token_new.supersedes(&token_old).unwrap(),
         "restored token must fence the crashed writer's token"
@@ -105,8 +119,14 @@ async fn token_non_portability_across_backend_swap() {
     let b = FlockLease::open(&d2, "backend-B").unwrap();
     let ta = a.acquire("x", "h", Duration::from_secs(30)).await.unwrap();
     let tb = b.acquire("x", "h", Duration::from_secs(30)).await.unwrap();
-    assert!(matches!(ta.supersedes(&tb), Err(SubstrateError::IncomparableToken)));
-    assert!(matches!(tb.supersedes(&ta), Err(SubstrateError::IncomparableToken)));
+    assert!(matches!(
+        ta.supersedes(&tb),
+        Err(SubstrateError::IncomparableToken)
+    ));
+    assert!(matches!(
+        tb.supersedes(&ta),
+        Err(SubstrateError::IncomparableToken)
+    ));
     let _ = std::fs::remove_dir_all(&d1);
     let _ = std::fs::remove_dir_all(&d2);
 }
@@ -128,10 +148,16 @@ async fn blob_streams_large_file_correctly() {
         f.flush().await.unwrap();
     }
     bs.put_file("big", &src).await.unwrap();
-    assert_eq!(bs.head("big").await.unwrap().unwrap().size, 64 * 1024 * 1024);
+    assert_eq!(
+        bs.head("big").await.unwrap().unwrap().size,
+        64 * 1024 * 1024
+    );
     let out = base.join("out.bin");
     bs.get_to_file("big", &out).await.unwrap();
-    assert!(files_equal(&src, &out).await, "streamed blob must round-trip exactly");
+    assert!(
+        files_equal(&src, &out).await,
+        "streamed blob must round-trip exactly"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -139,8 +165,14 @@ async fn blob_streams_large_file_correctly() {
 /// object store is refused; an external store is fine.
 #[test]
 fn no_tenant_s3_circularity() {
-    assert!(assert_not_self_referential("https://s3.jkbase.app/cluster", Some("s3.jkbase.app")).is_err());
-    assert!(assert_not_self_referential("https://minio.internal:9000/cluster", Some("s3.jkbase.app")).is_ok());
+    assert!(
+        assert_not_self_referential("https://s3.jkbase.app/cluster", Some("s3.jkbase.app"))
+            .is_err()
+    );
+    assert!(
+        assert_not_self_referential("https://minio.internal:9000/cluster", Some("s3.jkbase.app"))
+            .is_ok()
+    );
 }
 
 /// Full 2 GiB streaming stress (bounded memory). Heavy on disk + time, so ignored;
@@ -158,6 +190,9 @@ async fn blob_streams_2gib_without_oom() {
         f.set_len(2 * 1024 * 1024 * 1024).await.unwrap();
     }
     bs.put_file("huge", &src).await.unwrap();
-    assert_eq!(bs.head("huge").await.unwrap().unwrap().size, 2 * 1024 * 1024 * 1024);
+    assert_eq!(
+        bs.head("huge").await.unwrap().unwrap().size,
+        2 * 1024 * 1024 * 1024
+    );
     let _ = std::fs::remove_dir_all(&base);
 }

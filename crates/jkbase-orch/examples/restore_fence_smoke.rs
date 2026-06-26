@@ -21,9 +21,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 async fn run(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new(cmd).args(args).output().await?;
+    let out = tokio::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success() {
-        anyhow::bail!("{cmd} {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{cmd} {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
@@ -46,7 +52,16 @@ async fn main() -> anyhow::Result<()> {
     let runtime_dir = work.join("run");
 
     // 1. Create + format a 16 MiB data disk image.
-    run("dd", &["if=/dev/zero", &format!("of={}", data_img.display()), "bs=1M", "count=16"]).await?;
+    run(
+        "dd",
+        &[
+            "if=/dev/zero",
+            &format!("of={}", data_img.display()),
+            "bs=1M",
+            "count=16",
+        ],
+    )
+    .await?;
     run("mkfs.ext4", &["-F", "-q", data_img.to_str().unwrap()]).await?;
 
     let mk_config = |dev: &str| VmConfig {
@@ -83,15 +98,26 @@ async fn main() -> anyhow::Result<()> {
     //    restore — load paused, patch the data drive to loop_b, resume.
     let loop_b = run("losetup", &["--find", "--show", data_img.to_str().unwrap()]).await?;
     run("losetup", &["-d", &loop_a]).await?;
-    assert_ne!(loop_a, loop_b, "expected a different loop device on restore");
+    assert_ne!(
+        loop_a, loop_b,
+        "expected a different loop device on restore"
+    );
     println!("[restore] re-bound at {loop_b}; restoring with data drive patched...");
-    let mut vm2 =
-        VmInstance::restore_from_snapshot("rf-smoke", &mk_config(&loop_b), &runtime_dir, &snap, &mem)
-            .await?;
+    let mut vm2 = VmInstance::restore_from_snapshot(
+        "rf-smoke",
+        &mk_config(&loop_b),
+        &runtime_dir,
+        &snap,
+        &mem,
+    )
+    .await?;
     println!("[restore] RESTORE OK, FC pid {:?}", vm2.pid());
     assert!(vm2.pid().is_some(), "restored VM must be running");
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(vm2.pid().is_some(), "restored VM must still be running after resume");
+    assert!(
+        vm2.pid().is_some(),
+        "restored VM must still be running after resume"
+    );
 
     // 5. Cleanup.
     vm2.stop().await?;

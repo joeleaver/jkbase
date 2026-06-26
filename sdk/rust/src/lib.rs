@@ -100,7 +100,11 @@ impl ObjectClient {
     /// Bind in-memory uploads to a payload SHA-256 (`x-amz-content-sha256`) so the server
     /// rejects a body that doesn't match what was signed. Streaming uploads stay unsigned.
     pub fn with_payload_signing(mut self, on: bool) -> Self {
-        self.payload_mode = if on { PayloadMode::Signed } else { PayloadMode::Unsigned };
+        self.payload_mode = if on {
+            PayloadMode::Signed
+        } else {
+            PayloadMode::Unsigned
+        };
         self
     }
 
@@ -164,7 +168,9 @@ impl ObjectClient {
             // declared length for object writes (411 MissingContentLength otherwise), so we
             // pass it via x-amz-decoded-content-length (not a signed header, so it doesn't
             // affect the signature). It also bounds the server-side write/quota deadline.
-            ReqBody::Stream(b, len) => rb.header("x-amz-decoded-content-length", len.to_string()).body(b),
+            ReqBody::Stream(b, len) => rb
+                .header("x-amz-decoded-content-length", len.to_string())
+                .body(b),
         };
         let resp = rb.send().await?;
         if resp.status().is_success() {
@@ -185,7 +191,13 @@ impl ObjectClient {
             url.push('?');
             let qs = query
                 .iter()
-                .map(|(k, v)| format!("{}={}", jkbase_sigv4::uri_encode(k, true), jkbase_sigv4::uri_encode(v, true)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}={}",
+                        jkbase_sigv4::uri_encode(k, true),
+                        jkbase_sigv4::uri_encode(v, true)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("&");
             url.push_str(&qs);
@@ -242,7 +254,10 @@ pub(crate) fn validate_object_key(key: &str) -> Result<()> {
 
 /// Current unix time in seconds (for SigV4 `x-amz-date`).
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `host[:port]` from a `scheme://host[:port]/…` base URL — the SigV4 `Host`.
@@ -263,8 +278,14 @@ mod tests {
 
     #[test]
     fn authority_strips_scheme_and_path() {
-        assert_eq!(authority("https://storage.jkbase.app"), "storage.jkbase.app");
-        assert_eq!(authority("https://storage.jkbase.app:443/foo"), "storage.jkbase.app:443");
+        assert_eq!(
+            authority("https://storage.jkbase.app"),
+            "storage.jkbase.app"
+        );
+        assert_eq!(
+            authority("https://storage.jkbase.app:443/foo"),
+            "storage.jkbase.app:443"
+        );
         assert_eq!(authority("http://127.0.0.1:9091"), "127.0.0.1:9091");
     }
 
@@ -288,7 +309,9 @@ mod tests {
         let url = c.presigned_at("GET", "b", "k", 900, NOW);
         assert!(url.starts_with("http://s3.test/b/k?"), "{url}");
         assert!(
-            url.ends_with("X-Amz-Signature=67dfd03db2009a8216e3779a68cb239b0ba9579b44c4b3fe168cd0b0bab28614"),
+            url.ends_with(
+                "X-Amz-Signature=67dfd03db2009a8216e3779a68cb239b0ba9579b44c4b3fe168cd0b0bab28614"
+            ),
             "{url}"
         );
     }

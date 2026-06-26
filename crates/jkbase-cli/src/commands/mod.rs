@@ -259,7 +259,16 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             set_bandwidth_gib,
             admin_token,
             api,
-        } => run_quota(project, set_storage_gib, set_bandwidth_gib, admin_token, api).await,
+        } => {
+            run_quota(
+                project,
+                set_storage_gib,
+                set_bandwidth_gib,
+                admin_token,
+                api,
+            )
+            .await
+        }
         Command::Init { email, api } => {
             let client = reqwest::Client::new();
             let resp = client
@@ -330,8 +339,8 @@ async fn run_logs(
     use jkbase_common::logs::LogLine;
 
     let project_id = resolve_project_id(project)?;
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
     let client = crate::credentials::authenticated_client(&token);
     let url = format!("{api}/projects/{project_id}/logs");
 
@@ -427,8 +436,8 @@ async fn fetch_deployments(
 
 async fn run_deployments(project: Option<String>, api: String) -> anyhow::Result<()> {
     let project_id = resolve_project_id(project)?;
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
     let client = crate::credentials::authenticated_client(&token);
 
     let deployments = fetch_deployments(&client, &api, &project_id).await?;
@@ -466,8 +475,8 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     let project_id = resolve_project_id(project)?;
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
     let client = crate::credentials::authenticated_client(&token);
 
     let resp = client
@@ -503,8 +512,8 @@ async fn run_quota(
     api: String,
 ) -> anyhow::Result<()> {
     let project_id = resolve_project_id(project)?;
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
     let client = crate::credentials::authenticated_client(&token);
     let url = format!("{api}/projects/{project_id}/quota");
 
@@ -572,8 +581,8 @@ async fn run_rollback(
     api: String,
 ) -> anyhow::Result<()> {
     let project_id = resolve_project_id(project)?;
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
     let client = crate::credentials::authenticated_client(&token);
 
     // Resolve the target version: explicit, or the one just before the active deploy.
@@ -583,14 +592,18 @@ async fn run_rollback(
             let deployments = fetch_deployments(&client, &api, &project_id).await?;
             let active_idx = deployments.iter().position(|d| d.active);
             match active_idx {
-                Some(i) => deployments
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("no previous deployment to roll back to"))?
-                    .version,
-                None => deployments
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("no deployments to roll back to"))?
-                    .version,
+                Some(i) => {
+                    deployments
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("no previous deployment to roll back to"))?
+                        .version
+                }
+                None => {
+                    deployments
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("no deployments to roll back to"))?
+                        .version
+                }
             }
         }
     };
@@ -686,7 +699,9 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
             let project_id = resolve_project_id(project)?;
             let client = auth_client()?;
             let resp = client
-                .post(format!("{api}/projects/{project_id}/domains/{domain}/verify"))
+                .post(format!(
+                    "{api}/projects/{project_id}/domains/{domain}/verify"
+                ))
                 .send()
                 .await
                 .context("failed to connect to API")?;
@@ -712,7 +727,10 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
             for d in &domains {
-                let site = d["site"].as_str().map(|s| format!(" -> site {s}")).unwrap_or_default();
+                let site = d["site"]
+                    .as_str()
+                    .map(|s| format!(" -> site {s}"))
+                    .unwrap_or_default();
                 println!(
                     "  {:<28} {:<8} {}{}",
                     d["host"].as_str().unwrap_or(""),
@@ -750,8 +768,8 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
 }
 
 fn auth_client() -> anyhow::Result<reqwest::Client> {
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
     Ok(crate::credentials::authenticated_client(&token))
 }
 
@@ -773,7 +791,11 @@ fn storage_endpoint(api: &str) -> String {
 
 async fn run_access_key(cmd: AccessKeyCommand) -> anyhow::Result<()> {
     match cmd {
-        AccessKeyCommand::Issue { label, project, api } => {
+        AccessKeyCommand::Issue {
+            label,
+            project,
+            api,
+        } => {
             let project_id = resolve_project_id(project)?;
             let token = crate::credentials::load_token()?
                 .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
@@ -836,14 +858,20 @@ async fn run_access_key(cmd: AccessKeyCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        AccessKeyCommand::Rm { access_key_id, project, api } => {
+        AccessKeyCommand::Rm {
+            access_key_id,
+            project,
+            api,
+        } => {
             let project_id = resolve_project_id(project)?;
             let token = crate::credentials::load_token()?
                 .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
             let client = crate::credentials::authenticated_client(&token);
 
             let resp = client
-                .delete(format!("{api}/projects/{project_id}/access-keys/{access_key_id}"))
+                .delete(format!(
+                    "{api}/projects/{project_id}/access-keys/{access_key_id}"
+                ))
                 .send()
                 .await
                 .context("failed to connect to API")?;

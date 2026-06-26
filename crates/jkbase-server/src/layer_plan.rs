@@ -14,7 +14,7 @@
 //! deployment's manifests/static-sites/functions into a read-only ext4 image (no
 //! mount, no root — `mkfs.ext4 -d`, threat-model P0-3).
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use jkbase_common::config::PlatformEgress;
 use jkbase_common::layers::{RuntimeLayers, ServerLayers, VerityParams};
 
@@ -49,7 +49,10 @@ impl LayerPlan {
         if has_data_disk {
             rl.data_device = Some(device_node(2));
         }
-        Self { layer_paths: Vec::new(), runtime_layers: rl }
+        Self {
+            layer_paths: Vec::new(),
+            runtime_layers: rl,
+        }
     }
 }
 
@@ -255,10 +258,9 @@ pub fn compute_layer_plan(
         langs.sort();
         langs.dedup();
         for lang in &langs {
-            let desc = platform
-                .runtimes
-                .get(lang)
-                .ok_or_else(|| anyhow::anyhow!("no platform runtime layer for language '{lang}'"))?;
+            let desc = platform.runtimes.get(lang).ok_or_else(|| {
+                anyhow::anyhow!("no platform runtime layer for language '{lang}'")
+            })?;
             runtime_idx.insert(lang.clone(), order.len());
             order.push(BlobRef {
                 path: store_dir.join(&desc.file),
@@ -327,7 +329,9 @@ pub fn compute_layer_plan(
             let base_dev = dev(base_dev_idx.expect("layered server requires a base layer"));
             vec![app_dev, runtime_dev, base_dev]
         };
-        runtime_layers.servers.insert(name.clone(), ServerLayers { layers });
+        runtime_layers
+            .servers
+            .insert(name.clone(), ServerLayers { layers });
     }
     // Carry the shared layers' dm-verity params into the device map, keyed by the SAME
     // device strings the server overlay stacks reference (the agent activates a verity
@@ -346,13 +350,18 @@ pub fn compute_layer_plan(
     if has_db {
         let runtime_dev = dev(runtime_idx[RHYPEDB_RUNTIME]);
         let base_dev = dev(base_dev_idx.expect("managed DB requires a platform base layer"));
-        runtime_layers.database = Some(ServerLayers { layers: vec![runtime_dev, base_dev] });
+        runtime_layers.database = Some(ServerLayers {
+            layers: vec![runtime_dev, base_dev],
+        });
     }
     if has_data_disk {
         runtime_layers.data_device = Some(device_node(2 + layer_paths.len()));
     }
 
-    Ok(LayerPlan { layer_paths, runtime_layers })
+    Ok(LayerPlan {
+        layer_paths,
+        runtime_layers,
+    })
 }
 
 /// Host-only file embedded in the metadata image holding the ordered erofs layer
@@ -391,9 +400,17 @@ pub(crate) fn try_read_layer_paths(metadata_image: &Path) -> Result<Vec<PathBuf>
     let _ = std::fs::remove_file(&dest);
     // Remove the dump on EVERY return path (incl. the read/parse `?` below).
     let _cleanup = TempCleanup(vec![dest.clone()]);
-    let found =
-        jkbase_orch::build_output::dump_file(metadata_image, &format!("/{LAYER_PATHS_FILE}"), &dest)
-            .with_context(|| format!("extract {LAYER_PATHS_FILE} from {}", metadata_image.display()))?;
+    let found = jkbase_orch::build_output::dump_file(
+        metadata_image,
+        &format!("/{LAYER_PATHS_FILE}"),
+        &dest,
+    )
+    .with_context(|| {
+        format!(
+            "extract {LAYER_PATHS_FILE} from {}",
+            metadata_image.display()
+        )
+    })?;
     if !found {
         return Ok(Vec::new());
     }
@@ -434,7 +451,10 @@ pub fn build_metadata_image(
     out: &Path,
 ) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
-    let base = out.file_name().and_then(|n| n.to_str()).unwrap_or("metadata.ext4");
+    let base = out
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("metadata.ext4");
     let uniq = format!(
         "{base}.{}.{}",
         std::process::id(),
@@ -481,7 +501,10 @@ pub fn build_metadata_image(
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    std::fs::write(stage.join(LAYER_PATHS_FILE), serde_json::to_vec_pretty(&paths)?)?;
+    std::fs::write(
+        stage.join(LAYER_PATHS_FILE),
+        serde_json::to_vec_pretty(&paths)?,
+    )?;
 
     // Host-asserted platform egress facts (`_platform.json`): the OWN object-store host
     // (Zone 1) + the platform's own public IP set (Zone 2 deny). Written LAST, into the
@@ -693,12 +716,18 @@ mod tests {
             serde_json::from_slice(&std::fs::read(servers.join("app.json")).unwrap()).unwrap();
         let env = v["env"].as_object().unwrap();
         assert_eq!(env["DOMAIN"], "forumall.jkbase.app");
-        assert_eq!(env["NODE_ENV"], "staging", "secret overrides build-time env");
+        assert_eq!(
+            env["NODE_ENV"], "staging",
+            "secret overrides build-time env"
+        );
         assert!(!env.contains_key("PORT"), "reserved PORT must be filtered");
         assert!(!env.contains_key("PATH"), "reserved PATH must be filtered");
         // Spawn-breaking keys/values are dropped (never reach the agent's Command::env).
         assert!(!env.contains_key("BAD=KEY"), "key with '=' must be skipped");
-        assert!(!env.contains_key("NUL_VAL"), "value with NUL must be skipped");
+        assert!(
+            !env.contains_key("NUL_VAL"),
+            "value with NUL must be skipped"
+        );
         assert!(
             env.keys().all(|k| !k.is_empty() && !k.contains('\0')),
             "empty/NUL keys must be skipped"
@@ -757,13 +786,21 @@ mod tests {
             serde_json::from_slice(&std::fs::read(functions.join("api.json")).unwrap()).unwrap();
         assert_eq!(api["runtime"], "wasi-http", "existing runtime preserved");
         assert_eq!(api["env"]["API_KEY"], "sk-live-123");
-        assert_eq!(api["env"]["PATH"], "/custom", "no reserved filter for functions");
+        assert_eq!(
+            api["env"]["PATH"], "/custom",
+            "no reserved filter for functions"
+        );
         assert!(!api["env"].as_object().unwrap().contains_key("BAD=KEY"));
         assert!(!api["env"].as_object().unwrap().contains_key("NUL_VAL"));
         // The binding rides a reserved top-level field, NOT env (P0-OBJ-RESERVED-CHANNEL).
         assert_eq!(api["storage_credential"]["access_key_id"], "JKBND-proj");
         assert_eq!(api["storage_credential"]["secret_key"], "s3cr3t");
-        assert!(!api["env"].as_object().unwrap().contains_key("storage_credential"));
+        assert!(
+            !api["env"]
+                .as_object()
+                .unwrap()
+                .contains_key("storage_credential")
+        );
 
         // The function with no prior sidecar gets one created (env only; runtime → sniff).
         let beat: serde_json::Value =
@@ -776,7 +813,10 @@ mod tests {
         inject_function_secrets(&functions, &secrets, None).unwrap();
         let api2: serde_json::Value =
             serde_json::from_slice(&std::fs::read(functions.join("api.json")).unwrap()).unwrap();
-        assert!(api2.get("storage_credential").is_none(), "stale credential cleared when binding absent");
+        assert!(
+            api2.get("storage_credential").is_none(),
+            "stale credential cleared when binding absent"
+        );
 
         // Missing dir is a no-op.
         inject_function_secrets(&dir.join("_nope"), &secrets, None).unwrap();
@@ -1003,23 +1043,31 @@ mod tests {
 
         // Attach order [base(vdc), runtime(vdd), app(vde)] ⇒ verity keyed by vdc/vdd only.
         let verity = &plan.runtime_layers.verity;
-        assert_eq!(verity.len(), 2, "base + runtime have verity; the app layer does not");
+        assert_eq!(
+            verity.len(),
+            2,
+            "base + runtime have verity; the app layer does not"
+        );
         assert_eq!(verity["/dev/vdc"].root_hash, base_root);
         assert_eq!(verity["/dev/vdc"].data_size, 8192);
         assert_eq!(verity["/dev/vdd"].root_hash, rt_root);
         assert_eq!(verity["/dev/vdd"].data_size, 4096);
-        assert!(!verity.contains_key("/dev/vde"), "app layer mounts directly (no verity)");
+        assert!(
+            !verity.contains_key("/dev/vde"),
+            "app layer mounts directly (no verity)"
+        );
 
         // Every verity key must be a device the server overlay actually stacks.
-        let stacked: std::collections::BTreeSet<&str> = plan
-            .runtime_layers
-            .servers["api"]
+        let stacked: std::collections::BTreeSet<&str> = plan.runtime_layers.servers["api"]
             .layers
             .iter()
             .map(|s| s.as_str())
             .collect();
         for dev in verity.keys() {
-            assert!(stacked.contains(dev.as_str()), "{dev} must be in the overlay stack");
+            assert!(
+                stacked.contains(dev.as_str()),
+                "{dev} must be in the overlay stack"
+            );
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1100,12 +1148,22 @@ mod tests {
         // Attach order: base(vdc), rhypedb-runtime(vdd).
         assert_eq!(plan.layer_paths.len(), 2);
         assert!(plan.layer_paths[0].ends_with(&base_f), "vdc = base");
-        assert!(plan.layer_paths[1].ends_with(&rh_f), "vdd = rhypedb runtime");
+        assert!(
+            plan.layer_paths[1].ends_with(&rh_f),
+            "vdd = rhypedb runtime"
+        );
 
         // DB overlay = rhypedb:base; the DB is NOT a tenant server.
-        let db = plan.runtime_layers.database.as_ref().expect("database overlay present");
+        let db = plan
+            .runtime_layers
+            .database
+            .as_ref()
+            .expect("database overlay present");
         assert_eq!(db.layers, vec!["/dev/vdd", "/dev/vdc"]);
-        assert!(plan.runtime_layers.servers.is_empty(), "DB is not a tenant server");
+        assert!(
+            plan.runtime_layers.servers.is_empty(),
+            "DB is not a tenant server"
+        );
 
         // Data disk attaches after the 2 layers: vd(c+2) = vde.
         assert_eq!(plan.runtime_layers.data_device.as_deref(), Some("/dev/vde"));

@@ -46,11 +46,15 @@ fn validate_id(id: &str) -> Result<()> {
     let ok = !id.is_empty()
         && id != "."
         && id != ".."
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
     if ok {
         Ok(())
     } else {
-        Err(SubstrateError::Backend(format!("invalid data-disk id {id:?} (must be a plain id)")))
+        Err(SubstrateError::Backend(format!(
+            "invalid data-disk id {id:?} (must be a plain id)"
+        )))
     }
 }
 
@@ -72,7 +76,11 @@ async fn run(cmd: &str, args: &[String]) -> Result<String> {
 impl CephRbd {
     /// A provider over `pool`, using the system Ceph config + default (admin) user.
     pub fn new(pool: impl Into<String>) -> Self {
-        Self { pool: pool.into(), conf: None, user: None }
+        Self {
+            pool: pool.into(),
+            conf: None,
+            user: None,
+        }
     }
     /// Override the ceph config path (`--conf`).
     pub fn with_conf(mut self, conf: impl Into<String>) -> Self {
@@ -151,8 +159,12 @@ impl CephRbd {
         while let Some(entry) = rd.next_entry().await? {
             let n = entry.file_name();
             let base = entry.path();
-            let pool = tokio::fs::read_to_string(base.join("pool")).await.unwrap_or_default();
-            let name = tokio::fs::read_to_string(base.join("name")).await.unwrap_or_default();
+            let pool = tokio::fs::read_to_string(base.join("pool"))
+                .await
+                .unwrap_or_default();
+            let name = tokio::fs::read_to_string(base.join("name"))
+                .await
+                .unwrap_or_default();
             if pool.trim() == self.pool && name.trim() == id {
                 devs.push(format!("/dev/rbd{}", n.to_string_lossy()));
             }
@@ -179,8 +191,15 @@ impl DataDiskProvider for CephRbd {
         }
         // RBD --size is in MiB; round up so we never under-provision.
         let size_mib = size_bytes.div_ceil(1024 * 1024).max(1).to_string();
-        self.rbd(&["create", &self.spec(id), "--size", &size_mib, "--image-feature", "exclusive-lock"])
-            .await?;
+        self.rbd(&[
+            "create",
+            &self.spec(id),
+            "--size",
+            &size_mib,
+            "--image-feature",
+            "exclusive-lock",
+        ])
+        .await?;
         // Format on first creation only: map -> mkfs.ext4 -> unmap.
         let dev = self
             .parse_device(&self.rbd(&["map", &self.spec(id)]).await?)
@@ -206,17 +225,19 @@ impl DataDiskProvider for CephRbd {
         if let Some(e) = self.current_epoch(id).await
             && e > token.epoch
         {
-            return Err(SubstrateError::Fenced { scope: id.to_string() });
+            return Err(SubstrateError::Fenced {
+                scope: id.to_string(),
+            });
         }
         // Storage-enforced fence: blocklist EVERY live prior writer before we map,
         // so its I/O is rejected cluster-wide. If we cannot fence one, refuse rather
         // than risk a second writer.
         for addr in self.watchers(id).await? {
-            self.ceph(&["osd", "blocklist", "add", &addr]).await.map_err(|e| {
-                SubstrateError::RwoUnsafe {
+            self.ceph(&["osd", "blocklist", "add", &addr])
+                .await
+                .map_err(|e| SubstrateError::RwoUnsafe {
                     scope: format!("{id}: could not blocklist prior writer {addr}: {e}"),
-                }
-            })?;
+                })?;
         }
         // Drop any STALE mapping this host still has for the image (e.g. a prior
         // holder on this same host that crashed without detaching, now blocklisted)
@@ -231,10 +252,27 @@ impl DataDiskProvider for CephRbd {
             .await
             .ok_or_else(|| be("rbd map returned no device"))?;
         let epoch = token.epoch.to_string();
-        self.rbd(&["image-meta", "set", &self.spec(id), EPOCH_KEY, &epoch]).await?;
-        self.rbd(&["image-meta", "set", &self.spec(id), HOLDER_KEY, &token.holder]).await?;
-        self.rbd(&["image-meta", "set", &self.spec(id), SOURCE_KEY, &token.source_id]).await?;
-        Ok(BlockDevice { path: PathBuf::from(dev) })
+        self.rbd(&["image-meta", "set", &self.spec(id), EPOCH_KEY, &epoch])
+            .await?;
+        self.rbd(&[
+            "image-meta",
+            "set",
+            &self.spec(id),
+            HOLDER_KEY,
+            &token.holder,
+        ])
+        .await?;
+        self.rbd(&[
+            "image-meta",
+            "set",
+            &self.spec(id),
+            SOURCE_KEY,
+            &token.source_id,
+        ])
+        .await?;
+        Ok(BlockDevice {
+            path: PathBuf::from(dev),
+        })
     }
 
     async fn detach(&self, id: &str) -> Result<()> {

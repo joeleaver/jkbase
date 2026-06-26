@@ -152,7 +152,9 @@ impl LocalLoop {
             h.pid, h.pid_starttime, h.epoch, h.source_id, h.loop_dev
         );
         let dest = self.holder_path(id);
-        let tmp = self.dir.join(format!("{id}.holder.tmp.{}", std::process::id()));
+        let tmp = self
+            .dir
+            .join(format!("{id}.holder.tmp.{}", std::process::id()));
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &dest)?;
         Ok(())
@@ -183,7 +185,9 @@ impl DataDiskProvider for LocalLoop {
 
     async fn exists(&self, id: &str) -> Result<bool> {
         validate_id(id)?;
-        Ok(tokio::fs::try_exists(self.img_path(id)).await.unwrap_or(false))
+        Ok(tokio::fs::try_exists(self.img_path(id))
+            .await
+            .unwrap_or(false))
     }
 
     async fn attach_rwo(&self, id: &str, token: &FenceToken) -> Result<BlockDevice> {
@@ -250,7 +254,9 @@ impl DataDiskProvider for LocalLoop {
                     },
                 )
             }
-            _ => Err(SubstrateError::Fenced { scope: id.to_string() }),
+            _ => Err(SubstrateError::Fenced {
+                scope: id.to_string(),
+            }),
         }
     }
 
@@ -374,7 +380,13 @@ mod tests {
         let me = std::process::id();
         p.write_holder(
             "d",
-            &Holder { pid: me, pid_starttime: process_starttime(me).unwrap(), epoch: 7, source_id: "src".into(), loop_dev: "/dev/loopX".into() },
+            &Holder {
+                pid: me,
+                pid_starttime: process_starttime(me).unwrap(),
+                epoch: 7,
+                source_id: "src".into(),
+                loop_dev: "/dev/loopX".into(),
+            },
         )
         .unwrap();
         // The current holder refines the writer pid to the (now-known) FC pid.

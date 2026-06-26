@@ -23,12 +23,12 @@
 //! output names are contract. Richer toolchains (CNB for servers,
 //! cargo-component for functions) are B2 and keep this contract unchanged.
 
-use anyhow::{bail, ensure, Context, Result};
-use jkbase_common::config::{resolve_egress, Builder, EgressPolicy, ProjectConfig};
+use anyhow::{Context, Result, bail, ensure};
+use jkbase_common::config::{Builder, EgressPolicy, ProjectConfig, resolve_egress};
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
-use jkbase_orch::build_vm::{is_safe_cmdline_path, BuildOutcome, BuildVm, BuildVmConfig, SealFn};
+use jkbase_orch::build_vm::{BuildOutcome, BuildVm, BuildVmConfig, SealFn, is_safe_cmdline_path};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -570,7 +570,14 @@ impl BuildNet {
         // actually blocks VM-to-VM lateral movement (the L3 FORWARD DROP never
         // sees intra-bridge frames).
         run_ip(&[
-            "link", "set", "dev", tap, "type", "bridge_slave", "isolated", "on",
+            "link",
+            "set",
+            "dev",
+            tap,
+            "type",
+            "bridge_slave",
+            "isolated",
+            "on",
         ])
         .await?;
         // Belt-and-suspenders: drop IPv6 on the port (the guest also boots with
@@ -603,8 +610,24 @@ impl BuildNet {
         }
         // FATAL: the isolation rules. Without these a build VM could reach the host
         // / other VMs / the internet — refuse to run builds at all.
-        let input_hook = ["-w", "-C", "INPUT", "-i", self.bridge.as_str(), "-j", "JKBUILD"];
-        let fwd_drop = ["-w", "-C", "FORWARD", "-i", self.bridge.as_str(), "-j", "DROP"];
+        let input_hook = [
+            "-w",
+            "-C",
+            "INPUT",
+            "-i",
+            self.bridge.as_str(),
+            "-j",
+            "JKBUILD",
+        ];
+        let fwd_drop = [
+            "-w",
+            "-C",
+            "FORWARD",
+            "-i",
+            self.bridge.as_str(),
+            "-j",
+            "DROP",
+        ];
         for check in [input_hook, fwd_drop] {
             let ok = tokio::process::Command::new("iptables")
                 .args(check)
@@ -627,8 +650,17 @@ impl BuildNet {
         // this only trips on a truly source-unrestricted rule.)
         if let Some(any) = self.proxy_any_port {
             let blanket = [
-                "-w", "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
-                "--dport", &any.to_string(), "-j", "ACCEPT",
+                "-w",
+                "-C",
+                "JKBUILD",
+                "-p",
+                "tcp",
+                "-d",
+                self.gateway.as_str(),
+                "--dport",
+                &any.to_string(),
+                "-j",
+                "ACCEPT",
             ];
             let present = tokio::process::Command::new("iptables")
                 .args(blanket)
@@ -650,8 +682,17 @@ impl BuildNet {
         // fail at fetch (fail-safe), so surface it loudly but don't refuse to start
         // (and never outage the runtime over an iptables rule-form mismatch).
         let proxy_accept = [
-            "-w", "-C", "JKBUILD", "-p", "tcp", "-d", self.gateway.as_str(),
-            "--dport", &self.proxy_port.to_string(), "-j", "ACCEPT",
+            "-w",
+            "-C",
+            "JKBUILD",
+            "-p",
+            "tcp",
+            "-d",
+            self.gateway.as_str(),
+            "--dport",
+            &self.proxy_port.to_string(),
+            "-j",
+            "ACCEPT",
         ];
         let ok = tokio::process::Command::new("iptables")
             .args(proxy_accept)
@@ -705,23 +746,62 @@ impl BuildNet {
             // pins. Build VMs have no VLAN use case, so this closes that bypass at the
             // source rather than relying on the host never decapsulating VLAN tags.
             run_ebtables(&[
-                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "802_1Q",
-                "-j", "DROP",
+                "-t",
+                "filter",
+                "-A",
+                SOURCE_GUARD_CHAIN,
+                "-i",
+                tap.as_str(),
+                "-p",
+                "802_1Q",
+                "-j",
+                "DROP",
             ])
             .await?;
             run_ebtables(&[
-                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "!", "-s",
-                mac.as_str(), "-j", "DROP",
+                "-t",
+                "filter",
+                "-A",
+                SOURCE_GUARD_CHAIN,
+                "-i",
+                tap.as_str(),
+                "!",
+                "-s",
+                mac.as_str(),
+                "-j",
+                "DROP",
             ])
             .await?;
             run_ebtables(&[
-                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "IPv4",
-                "!", "--ip-src", ip.as_str(), "-j", "DROP",
+                "-t",
+                "filter",
+                "-A",
+                SOURCE_GUARD_CHAIN,
+                "-i",
+                tap.as_str(),
+                "-p",
+                "IPv4",
+                "!",
+                "--ip-src",
+                ip.as_str(),
+                "-j",
+                "DROP",
             ])
             .await?;
             run_ebtables(&[
-                "-t", "filter", "-A", SOURCE_GUARD_CHAIN, "-i", tap.as_str(), "-p", "ARP",
-                "!", "--arp-ip-src", ip.as_str(), "-j", "DROP",
+                "-t",
+                "filter",
+                "-A",
+                SOURCE_GUARD_CHAIN,
+                "-i",
+                tap.as_str(),
+                "-p",
+                "ARP",
+                "!",
+                "--arp-ip-src",
+                ip.as_str(),
+                "-j",
+                "DROP",
             ])
             .await?;
         }
@@ -753,12 +833,19 @@ fn build_quota_state(deps: &BuildDeps, project_id: &str) -> Option<(u64, u64)> {
         .sum_month_to_date(project_id, month_start)
         .ok()?
         .build_seconds;
-    let cap = deps.store.get_quota(project_id).ok()?.build_seconds_per_month;
+    let cap = deps
+        .store
+        .get_quota(project_id)
+        .ok()?
+        .build_seconds_per_month;
     Some((used, cap))
 }
 
 async fn run_ip(args: &[&str]) -> Result<()> {
-    let status = tokio::process::Command::new("ip").args(args).status().await?;
+    let status = tokio::process::Command::new("ip")
+        .args(args)
+        .status()
+        .await?;
     if !status.success() {
         bail!("ip {args:?} failed: {status}");
     }
@@ -939,7 +1026,10 @@ async fn run_inner(
         // 5. Enumerate per-target build work.
         let specs = enumerate_targets(&config);
         if specs.is_empty() {
-            info!(project_id, build_id, "no build targets; static/site-only deploy");
+            info!(
+                project_id,
+                build_id, "no build targets; static/site-only deploy"
+            );
             return Ok(());
         }
         seed_targets(&deps.store, project_id, build_id, &specs);
@@ -961,7 +1051,14 @@ async fn run_inner(
             set.spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("build semaphore closed");
                 let r = build_one_target(
-                    &spec, &config, &deps, &src_dir, &workspace, &staged, &project_id, build_id,
+                    &spec,
+                    &config,
+                    &deps,
+                    &src_dir,
+                    &workspace,
+                    &staged,
+                    &project_id,
+                    build_id,
                     &record_lock,
                 )
                 .await;
@@ -1295,11 +1392,13 @@ async fn build_one_target_inner(
         // writes past 64 MiB of scratch). The artifact size is already bounded by
         // the fixed output-drive size; the cache image's logical size must be
         // covered too when one is attached.
-        fsize_limit_bytes: Some(
-            scratch_size_bytes
-                .max(output_size_bytes)
-                .max(if cache_drive.is_some() { deps.cache_size_bytes } else { 0 }),
-        ),
+        fsize_limit_bytes: Some(scratch_size_bytes.max(output_size_bytes).max(
+            if cache_drive.is_some() {
+                deps.cache_size_bytes
+            } else {
+                0
+            },
+        )),
         console_log_max_bytes: deps.console_log_max_bytes,
         seccomp_filter: None,
         netns: None,
@@ -1367,7 +1466,11 @@ async fn build_one_target_inner(
     match outcome {
         BuildOutcome::Completed => {}
         BuildOutcome::TimedOut => {
-            bail!("build timed out after {}s\n{}", deps.timeout.as_secs(), log_str())
+            bail!(
+                "build timed out after {}s\n{}",
+                deps.timeout.as_secs(),
+                log_str()
+            )
         }
         BuildOutcome::Crashed { code, signal } => {
             // Firecracker's RLIMIT_FSIZE is process-wide: a guest write past the
@@ -1404,7 +1507,9 @@ async fn build_one_target_inner(
 
     match spec.kind {
         TargetKind::Function => {
-            let dest = staged.join("_functions").join(format!("{}.wasm", spec.name));
+            let dest = staged
+                .join("_functions")
+                .join(format!("{}.wasm", spec.name));
             if !build_output::dump_file(&output_img, "/function.wasm", &dest)? {
                 bail!("function build produced no /function.wasm artifact");
             }
@@ -1499,7 +1604,10 @@ fn collect_layered_server(
     // Read the layered index the in-VM exporter wrote.
     let index_tmp = workspace.join(format!("{tag}.index.json"));
     if !build_output::dump_file(output_img, jkbuild_types::out::INDEX, &index_tmp)? {
-        bail!("server build produced no {} (expected a layered export)", jkbuild_types::out::INDEX);
+        bail!(
+            "server build produced no {} (expected a layered export)",
+            jkbuild_types::out::INDEX
+        );
     }
     let index: jkbuild_types::Index = serde_json::from_slice(&std::fs::read(&index_tmp)?)
         .context("parse layers/index.json from the build output")?;
@@ -1511,12 +1619,19 @@ fn collect_layered_server(
         .iter()
         .find(|l| l.role == jkbuild_types::LayerRole::App)
         .ok_or_else(|| anyhow::anyhow!("layered build has no app layer in index.json"))?;
-    ensure!(app.media == "erofs", "unexpected app layer media {:?}", app.media);
+    ensure!(
+        app.media == "erofs",
+        "unexpected app layer media {:?}",
+        app.media
+    );
 
     // The blob filename becomes a dest path — it is fully attacker-controlled, so
     // bound it to `sha256-<64hex>.erofs` (no separators, no traversal).
     let file = app.file.clone();
-    ensure!(is_safe_blob_filename(&file), "unsafe app layer filename {file:?}");
+    ensure!(
+        is_safe_blob_filename(&file),
+        "unsafe app layer filename {file:?}"
+    );
 
     let layers_dir = staged.join("_layers");
     std::fs::create_dir_all(&layers_dir)?;
@@ -1555,7 +1670,10 @@ fn collect_layered_server(
     let mut manifest = server_cfg.manifest_value(cmd, built.env, &built.working_dir);
     if let Some(obj) = manifest.as_object_mut() {
         obj.insert("app_layer".to_string(), serde_json::Value::String(file));
-        obj.insert("app_digest".to_string(), serde_json::Value::String(app.digest.clone()));
+        obj.insert(
+            "app_digest".to_string(),
+            serde_json::Value::String(app.digest.clone()),
+        );
         // A dockerfile build is a single self-contained image layer — mark it so the
         // host layer plan runs it standalone (no base/runtime stack) and the agent
         // honours the image's own env. Otherwise it's a language runtime layer keyed
@@ -1590,7 +1708,10 @@ fn collect_layered_server(
         obj.insert("runtime".to_string(), serde_json::Value::String(runtime));
     }
     let json = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(staged.join("_servers").join(format!("{}.json", spec.name)), json)?;
+    std::fs::write(
+        staged.join("_servers").join(format!("{}.json", spec.name)),
+        json,
+    )?;
     Ok(())
 }
 
@@ -1676,7 +1797,11 @@ fn sha256_hex(path: &Path) -> Result<String> {
 }
 
 /// Read the build-derived `/manifest.json` (server targets), or defaults if absent.
-fn read_built_manifest(output_img: &Path, workspace: &Path, tag: &str) -> Result<BuiltServerManifest> {
+fn read_built_manifest(
+    output_img: &Path,
+    workspace: &Path,
+    tag: &str,
+) -> Result<BuiltServerManifest> {
     let tmp = workspace.join(format!("{tag}.manifest.json"));
     if build_output::dump_file(output_img, "/manifest.json", &tmp)? {
         let bytes = std::fs::read(&tmp)?;
@@ -1784,7 +1909,10 @@ fn stage_db_file(src_dir: &Path, rel: &str, dest: &Path) -> Result<()> {
         src.starts_with(&base),
         "[database] file {rel:?} resolves outside the project tree (symlink?) — refusing"
     );
-    ensure!(src.is_file(), "[database] file {rel:?} is not a regular file");
+    ensure!(
+        src.is_file(),
+        "[database] file {rel:?} is not a regular file"
+    );
     std::fs::copy(&src, dest).with_context(|| format!("stage DB file {rel:?}"))?;
     Ok(())
 }
@@ -1828,21 +1956,28 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     }
     for (name, f) in &config.functions {
         if !path_ok(&f.source) {
-            bail!("function '{name}' source {:?} must be a relative path inside the project (no '..' or absolute)", f.source);
+            bail!(
+                "function '{name}' source {:?} must be a relative path inside the project (no '..' or absolute)",
+                f.source
+            );
         }
         // `egress = []` is ambiguous: [] and `false` are identical for the PUBLIC zone, but
         // an author writing [] to mean "deny everything incl. own-stuff" would be surprised
         // that own-stuff still works. Make it un-writable rather than silently alias it to
         // `false` (design §3 edge case). Point them at the explicit spelling.
         if matches!(&f.egress, Some(EgressPolicy::Allowlist(a)) if a.is_empty()) {
-            bail!("function '{name}' has `egress = []` (empty allowlist); use `egress = false` to deny all public egress, or list the allowed hosts");
+            bail!(
+                "function '{name}' has `egress = []` (empty allowlist); use `egress = false` to deny all public egress, or list the allowed hosts"
+            );
         }
     }
     if matches!(
         config.hosting.as_ref().and_then(|h| h.function_egress.as_ref()),
         Some(EgressPolicy::Allowlist(a)) if a.is_empty()
     ) {
-        bail!("[hosting] function_egress = [] (empty allowlist); use `false` to sandbox every function, or list the allowed hosts");
+        bail!(
+            "[hosting] function_egress = [] (empty allowlist); use `false` to sandbox every function, or list the allowed hosts"
+        );
     }
     // The `source` of a target must live INSIDE its build `context` — otherwise the
     // wider mount wouldn't contain the source subdir the build runs in. `context`
@@ -1857,11 +1992,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     for (name, s) in &config.servers {
         let sd = s.source_dir();
         if !path_ok(sd) {
-            bail!("server '{name}' source {sd:?} must be a relative path inside the project (no '..' or absolute)");
+            bail!(
+                "server '{name}' source {sd:?} must be a relative path inside the project (no '..' or absolute)"
+            );
         }
         let ctx = s.context_dir();
         if !path_ok(ctx) {
-            bail!("server '{name}' context {ctx:?} must be a relative path inside the project (no '..' or absolute)");
+            bail!(
+                "server '{name}' context {ctx:?} must be a relative path inside the project (no '..' or absolute)"
+            );
         }
         if !source_within_context(ctx, sd) {
             bail!("server '{name}' source {sd:?} must be inside its build context {ctx:?}");
@@ -1873,7 +2012,9 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         // `build_subdir == "."`, so a plain non-monorepo source is unaffected.)
         let bs = s.build_subdir();
         if bs != "." && !is_safe_cmdline_path(&bs) {
-            bail!("server '{name}' source {sd:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]");
+            bail!(
+                "server '{name}' source {sd:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]"
+            );
         }
         // builder = auto|dockerfile, and (for dockerfile) language/dockerfile coherence.
         s.validate(name)?;
@@ -1881,7 +2022,9 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         if s.builder()? == Builder::Dockerfile {
             let df = s.dockerfile_path();
             if !path_ok(&df) {
-                bail!("server '{name}' dockerfile {df:?} must be a relative path inside the project (no '..' or absolute)");
+                bail!(
+                    "server '{name}' dockerfile {df:?} must be a relative path inside the project (no '..' or absolute)"
+                );
             }
         }
     }
@@ -1896,11 +2039,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
             // and (when set) its `context` must be safe and contain that source.
             let src = site.build_source();
             if !path_ok(src) {
-                bail!("site '{name}' source {src:?} must be a relative path inside the project (no '..' or absolute)");
+                bail!(
+                    "site '{name}' source {src:?} must be a relative path inside the project (no '..' or absolute)"
+                );
             }
             let ctx = site.context_dir();
             if !path_ok(ctx) {
-                bail!("site '{name}' context {ctx:?} must be a relative path inside the project (no '..' or absolute)");
+                bail!(
+                    "site '{name}' context {ctx:?} must be a relative path inside the project (no '..' or absolute)"
+                );
             }
             if !source_within_context(ctx, src) {
                 bail!("site '{name}' source {src:?} must be inside its build context {ctx:?}");
@@ -1910,7 +2057,9 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
             // context root). No-op when `build_subdir == "."` (no `context` widening).
             let bs = site.build_subdir();
             if bs != "." && !is_safe_cmdline_path(&bs) {
-                bail!("site '{name}' source {src:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]");
+                bail!(
+                    "site '{name}' source {src:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]"
+                );
             }
         } else {
             // A COMMITTED site: `public` is REQUIRED. Omitting it must NOT silently
@@ -1919,17 +2068,23 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
             // resolved_sites' synthesize path guards against. Only a built site may omit
             // `public` (its slot is filled from the build output).
             let Some(public) = site.public.as_deref() else {
-                bail!("site '{name}' must set `public` (the committed static directory) unless it sets `build`");
+                bail!(
+                    "site '{name}' must set `public` (the committed static directory) unless it sets `build`"
+                );
             };
             if !path_ok(public) {
-                bail!("site '{name}' public {public:?} must be a relative path inside the project (no '..' or absolute)");
+                bail!(
+                    "site '{name}' public {public:?} must be a relative path inside the project (no '..' or absolute)"
+                );
             }
         }
     }
     if let Some(public) = config.hosting.as_ref().and_then(|h| h.public.as_deref())
         && !path_ok(public)
     {
-        bail!("hosting public {public:?} must be a relative path inside the project (no '..' or absolute)");
+        bail!(
+            "hosting public {public:?} must be a relative path inside the project (no '..' or absolute)"
+        );
     }
     // Managed DB: the engine resolves (reject unknown) + a non-empty schema, and the
     // schema/rules paths are traversal-guarded — run_inner copies them host-side from
@@ -1937,12 +2092,18 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
     if let Some(db) = &config.database {
         db.validate().context("[database] section")?;
         if !path_ok(&db.schema) {
-            bail!("[database] schema {:?} must be a relative path inside the project (no '..' or absolute)", db.schema);
+            bail!(
+                "[database] schema {:?} must be a relative path inside the project (no '..' or absolute)",
+                db.schema
+            );
         }
         if let Some(rules) = &db.rules
             && !path_ok(rules)
         {
-            bail!("[database] rules {:?} must be a relative path inside the project (no '..' or absolute)", rules);
+            bail!(
+                "[database] rules {:?} must be a relative path inside the project (no '..' or absolute)",
+                rules
+            );
         }
     }
 
@@ -2083,7 +2244,10 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     if !config.functions.is_empty() {
         let functions_dir = staged.join("_functions");
         std::fs::create_dir_all(&functions_dir)?;
-        let project_ceiling = config.hosting.as_ref().and_then(|h| h.function_egress.as_ref());
+        let project_ceiling = config
+            .hosting
+            .as_ref()
+            .and_then(|h| h.function_egress.as_ref());
         for (name, f) in &config.functions {
             let resolved = resolve_egress(project_ceiling, f.egress.as_ref());
             let sidecar = functions_dir.join(format!("{name}.json"));
@@ -2357,7 +2521,10 @@ mod tests {
         )
         .unwrap();
         let specs = enumerate_targets(&cfg);
-        assert_eq!(specs[0].dockerfile.as_deref(), Some("docker/api.Dockerfile"));
+        assert_eq!(
+            specs[0].dockerfile.as_deref(),
+            Some("docker/api.Dockerfile")
+        );
     }
 
     #[test]
@@ -2399,18 +2566,39 @@ mod tests {
     #[test]
     fn proxy_url_selects_public_any_only_for_dockerfile() {
         // With a distinct any-port, dockerfile builds get it; others get the narrow proxy.
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8);
+        let net = BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            Some(3129),
+            100_000,
+            8,
+        );
         assert_eq!(net.proxy_url_for(false), "http://172.31.0.1:3128");
         assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3129");
         assert_eq!(net.proxy_any_port, Some(3129));
 
         // any-port == proxy_port disables the second proxy (dockerfile shares narrow).
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3128), 100_000, 8);
+        let net = BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            Some(3128),
+            100_000,
+            8,
+        );
         assert_eq!(net.proxy_any_port, None);
         assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3128");
 
         // No any-port → dockerfile falls back to the narrow proxy.
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, None, 100_000, 8);
+        let net = BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            None,
+            100_000,
+            8,
+        );
         assert_eq!(net.proxy_url_for(true), "http://172.31.0.1:3128");
     }
 
@@ -2419,24 +2607,51 @@ mod tests {
         // The per-lease grant pins BOTH the source guest IP and the gateway:port, so
         // it admits exactly one VM to the public-any proxy — and `-C` without `-s`
         // (verify_firewall's blanket-rule check) cannot match it.
-        let net = BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8);
+        let net = BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            Some(3129),
+            100_000,
+            8,
+        );
         assert_eq!(
             net.any_egress_rule("172.31.0.5", 3129),
             vec![
-                "-s", "172.31.0.5", "-p", "tcp", "-d", "172.31.0.1", "--dport", "3129",
-                "-j", "ACCEPT",
+                "-s",
+                "172.31.0.5",
+                "-p",
+                "tcp",
+                "-d",
+                "172.31.0.1",
+                "--dport",
+                "3129",
+                "-j",
+                "ACCEPT",
             ]
         );
     }
 
     #[test]
     fn dockerfile_relpath_strips_source_prefix() {
-        assert_eq!(dockerfile_relpath("./api/Dockerfile", "./api"), "Dockerfile");
+        assert_eq!(
+            dockerfile_relpath("./api/Dockerfile", "./api"),
+            "Dockerfile"
+        );
         assert_eq!(dockerfile_relpath("Dockerfile", "."), "Dockerfile");
-        assert_eq!(dockerfile_relpath("docker/Dockerfile", "."), "docker/Dockerfile");
-        assert_eq!(dockerfile_relpath("svc/sub/Dockerfile", "svc"), "sub/Dockerfile");
+        assert_eq!(
+            dockerfile_relpath("docker/Dockerfile", "."),
+            "docker/Dockerfile"
+        );
+        assert_eq!(
+            dockerfile_relpath("svc/sub/Dockerfile", "svc"),
+            "sub/Dockerfile"
+        );
         // Dockerfile not under the source dir (misconfig) → returned unchanged.
-        assert_eq!(dockerfile_relpath("other/Dockerfile", "svc"), "other/Dockerfile");
+        assert_eq!(
+            dockerfile_relpath("other/Dockerfile", "svc"),
+            "other/Dockerfile"
+        );
     }
 
     #[test]
@@ -2444,10 +2659,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("jkb-asm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg: ProjectConfig = toml::from_str(
-            "[routes.\"a.example.com\"]\nservice = \"function\"\nname = \"api\"\n",
-        )
-        .unwrap();
+        let cfg: ProjectConfig =
+            toml::from_str("[routes.\"a.example.com\"]\nservice = \"function\"\nname = \"api\"\n")
+                .unwrap();
         assemble_sidecars(&cfg, &dir).unwrap();
         assert!(dir.join("_routes.json").exists());
         assert!(!dir.join("_sites.json").exists());
@@ -2483,13 +2697,23 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join("_functions").join(n)).unwrap()).unwrap()
         };
         // evil.com intersected out of the ceiling.
-        assert_eq!(read("narrow.json")["egress"]["allowlist"], serde_json::json!(["api.stripe.com"]));
+        assert_eq!(
+            read("narrow.json")["egress"]["allowlist"],
+            serde_json::json!(["api.stripe.com"])
+        );
         // Omitted → the project ceiling verbatim (NOT allow-all).
         let inherit = read("inherit.json");
         let mut got: Vec<String> = inherit["egress"]["allowlist"]
-            .as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
         got.sort();
-        assert_eq!(got, vec!["api.stripe.com".to_string(), "api.twilio.com".to_string()]);
+        assert_eq!(
+            got,
+            vec!["api.stripe.com".to_string(), "api.twilio.com".to_string()]
+        );
         // `false` → sandbox (snake_case unit variant).
         assert_eq!(read("boxed.json")["egress"], serde_json::json!("sandbox"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2515,11 +2739,20 @@ mod tests {
         copy_filtered_guarded(&src, &dst).unwrap();
 
         // Top-level `_`-prefixed tenant entries refused…
-        assert!(!dst.join("_functions").exists(), "top-level _functions must be refused");
-        assert!(!dst.join("_routes.json").exists(), "top-level _routes.json must be refused");
+        assert!(
+            !dst.join("_functions").exists(),
+            "top-level _functions must be refused"
+        );
+        assert!(
+            !dst.join("_routes.json").exists(),
+            "top-level _routes.json must be refused"
+        );
         // …ordinary content + NESTED `_`-prefixed dirs preserved.
         assert!(dst.join("index.html").exists());
-        assert!(dst.join("sub/_next/app.js").exists(), "nested _next is fine (guard is top-level only)");
+        assert!(
+            dst.join("sub/_next/app.js").exists(),
+            "nested _next is fine (guard is top-level only)"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2528,34 +2761,33 @@ mod tests {
         // The multi-site `_site_<name>` copy uses the site KEY verbatim; validate_manifest's
         // name_ok gate (runs before assemble_sites) rejects any `/`-or-`..` key, so a
         // `../_functions` site cannot traverse into the host artifact dir.
-        let cfg: ProjectConfig = toml::from_str(
-            "[sites.\"../_functions\"]\npublic = \"x\"\n",
-        )
-        .unwrap();
+        let cfg: ProjectConfig =
+            toml::from_str("[sites.\"../_functions\"]\npublic = \"x\"\n").unwrap();
         let err = validate_manifest(&cfg).unwrap_err().to_string();
         assert!(err.contains("invalid site name"), "got: {err}");
     }
 
     #[test]
     fn validate_rejects_empty_egress_allowlist() {
-        let fn_empty: ProjectConfig = toml::from_str(
-            "[functions.api]\nsource = \"api\"\negress = []\n",
-        )
-        .unwrap();
+        let fn_empty: ProjectConfig =
+            toml::from_str("[functions.api]\nsource = \"api\"\negress = []\n").unwrap();
         let err = validate_manifest(&fn_empty).unwrap_err().to_string();
         assert!(err.contains("egress = []"), "got: {err}");
 
-        let proj_empty: ProjectConfig = toml::from_str(
-            "[hosting]\nfunction_egress = []\n[functions.api]\nsource = \"api\"\n",
-        )
-        .unwrap();
-        assert!(validate_manifest(&proj_empty).unwrap_err().to_string().contains("function_egress = []"));
+        let proj_empty: ProjectConfig =
+            toml::from_str("[hosting]\nfunction_egress = []\n[functions.api]\nsource = \"api\"\n")
+                .unwrap();
+        assert!(
+            validate_manifest(&proj_empty)
+                .unwrap_err()
+                .to_string()
+                .contains("function_egress = []")
+        );
 
         // A non-empty allowlist is fine.
-        let ok: ProjectConfig = toml::from_str(
-            "[functions.api]\nsource = \"api\"\negress = [\"api.stripe.com\"]\n",
-        )
-        .unwrap();
+        let ok: ProjectConfig =
+            toml::from_str("[functions.api]\nsource = \"api\"\negress = [\"api.stripe.com\"]\n")
+                .unwrap();
         assert!(validate_manifest(&ok).is_ok());
     }
 
@@ -2576,9 +2808,14 @@ mod tests {
     fn toolchain_candidates_prefer_language_then_jkbuild_then_default() {
         assert_eq!(
             toolchain_candidates("server", Some("bun")),
-            ["bun.ext4", "jkbuild-server.ext4", "server.ext4", "default.ext4"]
-                .map(String::from)
-                .to_vec()
+            [
+                "bun.ext4",
+                "jkbuild-server.ext4",
+                "server.ext4",
+                "default.ext4"
+            ]
+            .map(String::from)
+            .to_vec()
         );
         assert_eq!(
             toolchain_candidates("server", None),
@@ -2606,9 +2843,14 @@ mod tests {
         // trunk static site picks `trunk.ext4` first.
         assert_eq!(
             toolchain_candidates("static", Some("trunk")),
-            ["trunk.ext4", "jkbuild-static.ext4", "static.ext4", "default.ext4"]
-                .map(String::from)
-                .to_vec()
+            [
+                "trunk.ext4",
+                "jkbuild-static.ext4",
+                "static.ext4",
+                "default.ext4"
+            ]
+            .map(String::from)
+            .to_vec()
         );
     }
 
@@ -2629,7 +2871,11 @@ mod tests {
         std::fs::remove_file(dir.join("bun.lock")).unwrap();
 
         // package.json declaring bun as the package manager also counts.
-        std::fs::write(dir.join("package.json"), r#"{"packageManager":"bun@1.1.34"}"#).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"packageManager":"bun@1.1.34"}"#,
+        )
+        .unwrap();
         assert_eq!(detect_language(&dir, None).as_deref(), Some("bun"));
 
         // A non-bun package.json sniffs as Node (npm/pnpm/yarn).
@@ -2668,8 +2914,7 @@ mod tests {
         assert!(validate_manifest(&ok).is_ok());
 
         // Absolute source path → reject (would package host files into the VM).
-        let abs: ProjectConfig =
-            toml::from_str("[functions.api]\nsource = \"/etc\"\n").unwrap();
+        let abs: ProjectConfig = toml::from_str("[functions.api]\nsource = \"/etc\"\n").unwrap();
         assert!(validate_manifest(&abs).is_err());
 
         // Parent-dir traversal in a source path → reject.
@@ -2702,32 +2947,27 @@ mod tests {
         assert!(validate_manifest(&built).is_ok());
 
         // Name with a path separator → reject (would escape the staged dest).
-        let badname: ProjectConfig = toml::from_str(
-            "[functions.\"../../evil\"]\nsource = \"./x\"\n",
-        )
-        .unwrap();
+        let badname: ProjectConfig =
+            toml::from_str("[functions.\"../../evil\"]\nsource = \"./x\"\n").unwrap();
         assert!(validate_manifest(&badname).is_err());
 
         // hosting.public traversal → reject.
-        let host: ProjectConfig =
-            toml::from_str("[hosting]\npublic = \"../..\"\n").unwrap();
+        let host: ProjectConfig = toml::from_str("[hosting]\npublic = \"../..\"\n").unwrap();
         assert!(validate_manifest(&host).is_err());
     }
 
     #[test]
     fn validate_manifest_build_context_rules() {
         // Server: a wider context that CONTAINS the source → ok.
-        let ok: ProjectConfig = toml::from_str(
-            "[servers.web]\nsource = \"crates/api\"\ncontext = \".\"\nport = 80\n",
-        )
-        .unwrap();
+        let ok: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"crates/api\"\ncontext = \".\"\nport = 80\n")
+                .unwrap();
         assert!(validate_manifest(&ok).is_ok());
 
         // Context = parent dir of source → ok.
-        let nested: ProjectConfig = toml::from_str(
-            "[servers.web]\nsource = \"apps/api\"\ncontext = \"apps\"\nport = 80\n",
-        )
-        .unwrap();
+        let nested: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"apps/api\"\ncontext = \"apps\"\nport = 80\n")
+                .unwrap();
         assert!(validate_manifest(&nested).is_ok());
 
         // Source OUTSIDE the context (sibling, not contained) → reject.
@@ -2736,27 +2976,27 @@ mod tests {
         )
         .unwrap();
         let err = validate_manifest(&outside).unwrap_err().to_string();
-        assert!(err.contains("must be inside its build context"), "got: {err}");
+        assert!(
+            err.contains("must be inside its build context"),
+            "got: {err}"
+        );
 
         // `..` escape in context → reject.
-        let escape: ProjectConfig = toml::from_str(
-            "[servers.web]\nsource = \"api\"\ncontext = \"../..\"\nport = 80\n",
-        )
-        .unwrap();
+        let escape: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"api\"\ncontext = \"../..\"\nport = 80\n")
+                .unwrap();
         assert!(validate_manifest(&escape).is_err());
 
         // Absolute context → reject.
-        let abs: ProjectConfig = toml::from_str(
-            "[servers.web]\nsource = \"api\"\ncontext = \"/etc\"\nport = 80\n",
-        )
-        .unwrap();
+        let abs: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"api\"\ncontext = \"/etc\"\nport = 80\n")
+                .unwrap();
         assert!(validate_manifest(&abs).is_err());
 
         // Built SITE with a containing context → ok; sibling context → reject.
-        let site_ok: ProjectConfig = toml::from_str(
-            "[sites.app]\nsource = \"web\"\ncontext = \".\"\nbuild = \"trunk\"\n",
-        )
-        .unwrap();
+        let site_ok: ProjectConfig =
+            toml::from_str("[sites.app]\nsource = \"web\"\ncontext = \".\"\nbuild = \"trunk\"\n")
+                .unwrap();
         assert!(validate_manifest(&site_ok).is_ok());
         let site_bad: ProjectConfig = toml::from_str(
             "[sites.app]\nsource = \"frontend/web\"\ncontext = \"backend\"\nbuild = \"trunk\"\n",
@@ -2768,12 +3008,14 @@ mod tests {
         // reject at deploy. `path_ok` alone would PASS this (it permits spaces), but
         // the `jkbase.build_subdir=` emitter would then silently drop the token and
         // build at the context root. Guard so the failure is a clear deploy error.
-        let spacey: ProjectConfig = toml::from_str(
-            "[servers.web]\nsource = \"my app\"\ncontext = \".\"\nport = 80\n",
-        )
-        .unwrap();
+        let spacey: ProjectConfig =
+            toml::from_str("[servers.web]\nsource = \"my app\"\ncontext = \".\"\nport = 80\n")
+                .unwrap();
         let err = validate_manifest(&spacey).unwrap_err().to_string();
-        assert!(err.contains("can't be passed to the build VM"), "got: {err}");
+        assert!(
+            err.contains("can't be passed to the build VM"),
+            "got: {err}"
+        );
         // …but the SAME spacey source with NO `context` is unchanged (build_subdir is
         // ".", no token emitted) — today's behaviour must still validate.
         let spacey_ok: ProjectConfig =
@@ -2798,10 +3040,9 @@ mod tests {
         assert_eq!(plain.build_subdir, "."); // unset context → identical to today
 
         // Built site with a wider context.
-        let site_cfg: ProjectConfig = toml::from_str(
-            "[sites.app]\nsource = \"web\"\ncontext = \".\"\nbuild = \"trunk\"\n",
-        )
-        .unwrap();
+        let site_cfg: ProjectConfig =
+            toml::from_str("[sites.app]\nsource = \"web\"\ncontext = \".\"\nbuild = \"trunk\"\n")
+                .unwrap();
         let s = &enumerate_targets(&site_cfg)[0];
         assert_eq!(s.context_subdir, ".");
         assert_eq!(s.build_subdir, "web");
@@ -2827,7 +3068,10 @@ mod tests {
             "[functions.rhypedb]\nsource = \"./f\"\n",
         ] {
             let c: ProjectConfig = toml::from_str(sec).unwrap();
-            assert!(validate_manifest(&c).is_err(), "must reserve `rhypedb` in: {sec}");
+            assert!(
+                validate_manifest(&c).is_err(),
+                "must reserve `rhypedb` in: {sec}"
+            );
         }
 
         // A normal route + normal names still pass.
@@ -2863,7 +3107,10 @@ mod tests {
         std::fs::write(src.join("ok.rhype"), b"type User { name: String }").unwrap();
         let dest_ok = out.join("ok.rhype");
         stage_db_file(&src, "ok.rhype", &dest_ok).unwrap();
-        assert_eq!(std::fs::read(&dest_ok).unwrap(), b"type User { name: String }");
+        assert_eq!(
+            std::fs::read(&dest_ok).unwrap(),
+            b"type User { name: String }"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2885,7 +3132,8 @@ mod onbox {
     use super::*;
     use jkbase_control::store::{BuildPhase, BuildRecord, Store};
 
-    const FN_BUILD: &str = "#!/bin/sh\nprintf '\\000asm\\001\\000\\000\\000' > \"$OUT/function.wasm\"\necho ok\n";
+    const FN_BUILD: &str =
+        "#!/bin/sh\nprintf '\\000asm\\001\\000\\000\\000' > \"$OUT/function.wasm\"\necho ok\n";
     const SERVER_BUILD: &str = "#!/bin/sh\nmkdir -p /tmp/rf/srv\necho hi > /tmp/rf/srv/index.html\ntar -czf \"$OUT/rootfs.tar.gz\" -C /tmp/rf .\nprintf '{\"cmd\":[\"/srv/app\"],\"working_dir\":\"/srv\",\"env\":{\"K\":\"V\"}}' > \"$OUT/manifest.json\"\n";
 
     fn write(p: std::path::PathBuf, c: &str) {
@@ -3011,7 +3259,10 @@ public = "./public"
         // Sidecars + site content.
         assert!(staged.join("_sites.json").exists(), "_sites.json");
         assert!(staged.join("_schedules.json").exists(), "_schedules.json");
-        assert!(staged.join("_site_docs/index.html").exists(), "site content");
+        assert!(
+            staged.join("_site_docs/index.html").exists(),
+            "site content"
+        );
 
         // Per-target progress recorded for GET /builds/{id}.
         let rec = store.get_build(project_id, build_id).unwrap().unwrap();
@@ -3051,7 +3302,9 @@ public = "./public"
         };
 
         // Egress proxy on the build gateway (firewall lets build VMs reach it).
-        let listener = tokio::net::TcpListener::bind("172.31.0.1:3128").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("172.31.0.1:3128")
+            .await
+            .unwrap();
         tokio::spawn(crate::egress::serve(
             listener,
             Arc::new(crate::egress::EgressConfig::with_default_allowlist()),
@@ -3148,7 +3401,11 @@ esac
         let run = BuildVm::run("netseal", &cfg, &data.join("run")).await;
         net.release(lease).await;
         let run = run.expect("build VM run");
-        assert_eq!(run.outcome, BuildOutcome::Completed, "build VM should complete");
+        assert_eq!(
+            run.outcome,
+            BuildOutcome::Completed,
+            "build VM should complete"
+        );
 
         let read = |name: &str| {
             build_output::read_capped(&output_img, name, 64)
@@ -3157,13 +3414,26 @@ esac
                 .map(|b| String::from_utf8_lossy(&b).trim().to_string())
                 .unwrap_or_else(|| "<missing>".into())
         };
-        let (allow, block, direct, sealed) =
-            (read("/allow"), read("/block"), read("/direct"), read("/sealed"));
+        let (allow, block, direct, sealed) = (
+            read("/allow"),
+            read("/block"),
+            read("/direct"),
+            read("/sealed"),
+        );
         println!("allow={allow} block={block} direct={direct} sealed={sealed}");
 
-        assert_eq!(allow, "200", "allowlisted host must tunnel through the proxy");
-        assert_eq!(block, "403", "off-allowlist host must be refused by the proxy");
-        assert_eq!(direct, "down", "direct egress must be blocked by the firewall");
+        assert_eq!(
+            allow, "200",
+            "allowlisted host must tunnel through the proxy"
+        );
+        assert_eq!(
+            block, "403",
+            "off-allowlist host must be refused by the proxy"
+        );
+        assert_eq!(
+            direct, "down",
+            "direct egress must be blocked by the firewall"
+        );
         assert_eq!(sealed, "down", "compile phase must be sealed (offline)");
         println!("PASS: networked build — proxy allowlist + firewall + fetch-then-seal");
     }
@@ -3189,14 +3459,19 @@ esac
     #[tokio::test]
     #[ignore = "needs KVM + root + baked bun.ext4; set JKB_DATA + JKB_FC_RELEASE"]
     async fn bun_server_build_through_orchestrator() {
-        let Some(fx) = bun_pipeline_build("bunfix", 1, Workload::OfflineNoDep).await else { return };
+        let Some(fx) = bun_pipeline_build("bunfix", 1, Workload::OfflineNoDep).await else {
+            return;
+        };
         let staged = &fx.staged;
         let store = &fx.store;
         let (project_id, build_id) = ("bunfix", 1u64);
 
         // Layered server artifact assembled into the deploy shape: NO flat tarball;
         // instead a content-addressed app erofs blob under _layers/.
-        assert!(!staged.join("_servers/api.tar.gz").exists(), "no flat tarball in layered mode");
+        assert!(
+            !staged.join("_servers/api.tar.gz").exists(),
+            "no flat tarball in layered mode"
+        );
 
         // Manifest = jkbuild launch contract + jkbase.toml port + the layer refs the
         // host deploy path needs (app_layer filename + runtime language).
@@ -3211,16 +3486,25 @@ esac
         );
         assert_eq!(mani["working_dir"], "/app");
         assert_eq!(mani["env"]["NODE_ENV"], "production");
-        assert_eq!(mani["runtime"], "bun", "runtime language recorded for host injection");
+        assert_eq!(
+            mani["runtime"], "bun",
+            "runtime language recorded for host injection"
+        );
         let app_layer = mani["app_layer"].as_str().expect("app_layer recorded");
         assert!(
             app_layer.starts_with("sha256-") && app_layer.ends_with(".erofs"),
             "app_layer is a content-addressed erofs blob name: {app_layer}"
         );
         // The dumped + sha256-verified app blob is staged under _layers/.
-        assert!(staged.join("_layers").join(app_layer).exists(), "app erofs blob staged");
+        assert!(
+            staged.join("_layers").join(app_layer).exists(),
+            "app erofs blob staged"
+        );
         assert_eq!(
-            mani["app_digest"].as_str().map(|d| d.replace("sha256:", "sha256-") + ".erofs").as_deref(),
+            mani["app_digest"]
+                .as_str()
+                .map(|d| d.replace("sha256:", "sha256-") + ".erofs")
+                .as_deref(),
             Some(app_layer),
             "app_digest matches the blob filename"
         );
@@ -3237,7 +3521,9 @@ esac
         assert!(billed >= 1, "expected ≥1 build-second, got {billed}");
 
         let _ = std::fs::remove_dir_all(staged);
-        println!("PASS: run_project_build drove bun.ext4 -> layered app erofs blob + launch manifest");
+        println!(
+            "PASS: run_project_build drove bun.ext4 -> layered app erofs blob + launch manifest"
+        );
     }
 
     /// Everything the on-box pipeline tests share after a successful build.
@@ -3268,7 +3554,10 @@ esac
     }
     impl Workload {
         fn networked(self) -> bool {
-            matches!(self, Workload::NetworkedMonorepo | Workload::NetworkedSolidVite)
+            matches!(
+                self,
+                Workload::NetworkedMonorepo | Workload::NetworkedSolidVite
+            )
         }
     }
 
@@ -3297,7 +3586,11 @@ esac
         // Layered runtime needs the 6.12 LTS kernel (erofs/overlay/pivot_root).
         let kernel = {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         };
 
         // Fixture: a single Bun server, no Dockerfile, no deps. `language="bun"`
@@ -3471,7 +3764,9 @@ console.log("listening on " + port);
                     )))
                 }
                 Err(e) => {
-                    eprintln!("skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`");
+                    eprintln!(
+                        "skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`"
+                    );
                     return None;
                 }
             }
@@ -3517,7 +3812,13 @@ console.log("listening on " + port);
             .await
             .expect("bun server build should succeed");
 
-        Some(BuildFixture { data, fc_release, kernel, store, staged })
+        Some(BuildFixture {
+            data,
+            fc_release,
+            kernel,
+            store,
+            staged,
+        })
     }
 
     /// Per-language build VM tuning (cargo wants more than `npm install`).
@@ -3576,7 +3877,11 @@ console.log("listening on " + port);
         }
         let kernel = {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         };
 
         let mut tarbuf = Vec::new();
@@ -3620,7 +3925,9 @@ console.log("listening on " + port);
                 )))
             }
             Err(e) => {
-                eprintln!("skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`");
+                eprintln!(
+                    "skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`"
+                );
                 return None;
             }
         };
@@ -3657,7 +3964,13 @@ console.log("listening on " + port);
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
         let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone()).await;
-        Some(staged.map(|staged| BuildFixture { data, fc_release, kernel, store, staged }))
+        Some(staged.map(|staged| BuildFixture {
+            data,
+            fc_release,
+            kernel,
+            store,
+            staged,
+        }))
     }
 
     /// Write the shared single-`api`-server jkbase.toml the boot helper expects
@@ -3756,16 +4069,28 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "node pipeline: needs KVM + root + node.ext4 + node runtime layer + agent + build bridge"]
     async fn node_pipeline_to_http_200() {
-        let Some(fx) = node_express_build(1).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = node_express_build(1).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "nodep", "172.27.0.1", "172.27.0.2", "AA:FC:00:00:27:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "nodep",
+            "172.27.0.1",
+            "172.27.0.2",
+            "AA:FC:00:00:27:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the layered express/node server");
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: node(express) build -> layered collection -> node runtime layer -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: node(express) build -> layered collection -> node runtime layer -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Rust acceptance: build → layered collection → metadata image → real agent
@@ -3780,16 +4105,28 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "rust pipeline: needs KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
     async fn rust_pipeline_to_http_200() {
-        let Some(fx) = rust_tiny_http_build(1).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = rust_tiny_http_build(1).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "rustp", "172.26.0.1", "172.26.0.2", "AA:FC:00:00:26:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "rustp",
+            "172.26.0.1",
+            "172.26.0.2",
+            "AA:FC:00:00:26:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the layered tiny_http/rust server");
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: rust(tiny_http) build -> layered collection -> rust runtime layer -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: rust(tiny_http) build -> layered collection -> rust runtime layer -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Build a tiny Python app through the pipeline: `pip install` MUST fetch the dep
@@ -3877,16 +4214,28 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "python pipeline: needs KVM + root + python.ext4 + python runtime layer + agent + build bridge"]
     async fn python_pipeline_to_http_200() {
-        let Some(fx) = python_build(1).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = python_build(1).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "pyp", "172.25.0.1", "172.25.0.2", "AA:FC:00:00:25:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "pyp",
+            "172.25.0.1",
+            "172.25.0.2",
+            "AA:FC:00:00:25:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the layered python server");
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: python(pip+six) build -> layered collection -> python runtime layer -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: python(pip+six) build -> layered collection -> python runtime layer -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Go acceptance: build → layered collection → metadata image → real agent runtime
@@ -3903,15 +4252,25 @@ console.log("listening on " + port);
     #[ignore = "go pipeline: needs KVM + root + go.ext4 + go runtime layer + agent + build bridge"]
     async fn go_pipeline_to_http_200() {
         let Some(fx) = go_build(1).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "gop", "172.24.0.1", "172.24.0.2", "AA:FC:00:00:24:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "gop",
+            "172.24.0.1",
+            "172.24.0.2",
+            "AA:FC:00:00:24:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the layered go server");
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: go(static+uuid) build -> layered collection -> go runtime layer -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: go(static+uuid) build -> layered collection -> go runtime layer -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Build a Rust app that ships a DATA ASSET + an ENTRYPOINT script (the
@@ -3976,16 +4335,25 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "rust assets pipeline: needs KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
     async fn rust_assets_pipeline_to_http_200() {
-        let Some(fx) = rust_assets_build(1).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = rust_assets_build(1).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
             &fx, &store_dir, &agent_bin, "rusta", "172.25.0.1", "172.25.0.2", "AA:FC:00:00:25:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the rust server reading a baked asset via its entrypoint");
-        assert_eq!(body, "asset-ok-seeded", "asset must ship (asset-ok) AND entrypoint must run (seeded)");
+        assert_eq!(
+            body, "asset-ok-seeded",
+            "asset must ship (asset-ok) AND entrypoint must run (seeded)"
+        );
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: rust assets+entrypoint build -> app layer with assets -> entrypoint exec -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: rust assets+entrypoint build -> app layer with assets -> entrypoint exec -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Build a Rust app with a real NATIVE dynamic dependency (`openssl` →
@@ -4039,16 +4407,25 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "rust native-lib pipeline: needs KVM + root + rust.ext4 + rust runtime layer + agent + build bridge"]
     async fn rust_native_lib_pipeline_to_http_200() {
-        let Some(fx) = rust_native_lib_build(1).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = rust_native_lib_build(1).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
             &fx, &store_dir, &agent_bin, "rustn", "172.24.0.1", "172.24.0.2", "AA:FC:00:00:24:02",
         )
         .await
         .expect("agent should serve HTTP 200 from a rust server linking openssl via the per-app native-lib closure");
-        assert_eq!(body, "native-ok OpenSSL", "openssl (libssl/libcrypto) must be shipped into the app layer and resolve at runtime");
+        assert_eq!(
+            body, "native-ok OpenSSL",
+            "openssl (libssl/libcrypto) must be shipped into the app layer and resolve at runtime"
+        );
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: rust native-FFI (openssl) build -> app-layer /usr/lib closure -> runtime -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: rust native-FFI (openssl) build -> app-layer /usr/lib closure -> runtime -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Build a minimal Trunk (Rust/WASM frontend) STATIC site through the pipeline:
@@ -4121,7 +4498,9 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "trunk static pipeline: needs KVM + root + trunk.ext4 + build bridge"]
     async fn trunk_static_pipeline_emits_site_tree() {
-        let Some(fx) = trunk_static_build(1).await else { return };
+        let Some(fx) = trunk_static_build(1).await else {
+            return;
+        };
         let site = fx.staged.join("_site_app");
         let index = site.join("index.html");
         assert!(
@@ -4142,16 +4521,29 @@ console.log("listening on " + port);
                 .filter_map(|e| e.ok())
                 .any(|e| e.path().extension().and_then(|x| x.to_str()) == Some(ext))
         };
-        assert!(has_ext("wasm"), "trunk must emit a .wasm into the site slot");
-        assert!(has_ext("js"), "trunk must emit a .js loader into the site slot");
+        assert!(
+            has_ext("wasm"),
+            "trunk must emit a .wasm into the site slot"
+        );
+        assert!(
+            has_ext("js"),
+            "trunk must emit a .js loader into the site slot"
+        );
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: trunk static build -> /static.tar.gz -> staged _site_app/ (index.html + wasm + js)");
+        println!(
+            "PASS: trunk static build -> /static.tar.gz -> staged _site_app/ (index.html + wasm + js)"
+        );
     }
 
     async fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
-        let status = tokio::process::Command::new(cmd).args(args).status().await?;
+        let status = tokio::process::Command::new(cmd)
+            .args(args)
+            .status()
+            .await?;
         if !status.success() {
-            return Err(std::io::Error::other(format!("{cmd} {args:?} failed ({status})")));
+            return Err(std::io::Error::other(format!(
+                "{cmd} {args:?} failed ({status})"
+            )));
         }
         Ok(())
     }
@@ -4221,8 +4613,14 @@ console.log("listening on " + port);
         // treating the staged build as the deployment dir.
         let plan = crate::layer_plan::compute_layer_plan(&fx.staged, store_dir, false, true)
             .expect("compute layer plan from the built deployment");
-        assert!(!plan.layer_paths.is_empty(), "a layered server must resolve >=1 erofs layer");
-        assert!(plan.runtime_layers.servers.contains_key("api"), "_layers.json maps the api server");
+        assert!(
+            !plan.layer_paths.is_empty(),
+            "a layered server must resolve >=1 erofs layer"
+        );
+        assert!(
+            plan.runtime_layers.servers.contains_key("api"),
+            "_layers.json maps the api server"
+        );
 
         let meta_img = fx.data.join(format!("{tag}-metadata.ext4"));
         crate::layer_plan::build_metadata_image(
@@ -4261,15 +4659,23 @@ console.log("listening on " + port);
                 std::fs::set_permissions(&p, perm).unwrap();
             }
             let rootfs_img = fx.data.join(format!("{tag}-vda.ext4"));
-            jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48).unwrap();
+            jkbase_orch::build_image::build_ro_ext4_from_dir(&rootfs_stage, &rootfs_img, 48)
+                .unwrap();
             rootfs_img
         };
 
         // Point-to-point tap (clear of jkbuild0's 172.31.x).
         let tap = format!("jk{tag}");
         let _ = sh("ip", &["link", "del", &tap]).await;
-        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
-        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
         sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
 
         let config = VmConfig {
@@ -4348,7 +4754,11 @@ console.log("listening on " + port);
         // server's inject_function_secrets produces).
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../jkbase-agent/tests/fixtures/echo-component.wasm");
-        assert!(fixture.exists(), "missing component fixture {}", fixture.display());
+        assert!(
+            fixture.exists(),
+            "missing component fixture {}",
+            fixture.display()
+        );
         let staged = data.join("fn-e2e-staged");
         let _ = std::fs::remove_dir_all(&staged);
         let funcs = staged.join("_functions");
@@ -4364,7 +4774,10 @@ console.log("listening on " + port);
         let plan =
             crate::layer_plan::compute_layer_plan(&staged, &data.join("baselayers"), false, true)
                 .expect("compute layer plan");
-        assert!(plan.layer_paths.is_empty(), "a function-only project has no erofs layers");
+        assert!(
+            plan.layer_paths.is_empty(),
+            "a function-only project has no erofs layers"
+        );
         let meta_img = data.join("fn-e2e-metadata.ext4");
         crate::layer_plan::build_metadata_image(
             &staged,
@@ -4397,8 +4810,15 @@ console.log("listening on " + port);
             ("fne2e", "172.23.0.1", "172.23.0.2", "AA:FC:00:00:23:02");
         let tap = format!("jk{tag}");
         let _ = sh("ip", &["link", "del", &tap]).await;
-        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
-        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
         sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
 
         let config = VmConfig {
@@ -4451,9 +4871,18 @@ console.log("listening on " + port);
 
         let body = body.expect("function should serve HTTP 200 at /functions/hello");
         eprintln!("function response:\n{body}");
-        assert!(body.contains("hello from a wasi:http component"), "got: {body}");
-        assert!(body.contains("DEMO_SECRET=e2e-secret"), "injected secret must be readable: {body}");
-        assert!(body.contains("egress=DENIED"), "egress must be denied: {body}");
+        assert!(
+            body.contains("hello from a wasi:http component"),
+            "got: {body}"
+        );
+        assert!(
+            body.contains("DEMO_SECRET=e2e-secret"),
+            "injected secret must be readable: {body}"
+        );
+        assert!(
+            body.contains("egress=DENIED"),
+            "egress must be denied: {body}"
+        );
     }
 
     /// Build a minimal DNS response: echo the query's header ID + question, append a single
@@ -4542,7 +4971,11 @@ console.log("listening on " + port);
         }
         let kernel = {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         };
         if !kernel.exists() {
             eprintln!("skip: no kernel at {}", kernel.display());
@@ -4552,12 +4985,19 @@ console.log("listening on " + port);
         // Stage two functions sharing the egress-probe fixture: one default, one sandbox.
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../jkbase-agent/tests/fixtures/egress-probe.wasm");
-        assert!(fixture.exists(), "missing egress-probe fixture {}", fixture.display());
+        assert!(
+            fixture.exists(),
+            "missing egress-probe fixture {}",
+            fixture.display()
+        );
         let staged = data.join("egr-e2e-staged");
         let _ = std::fs::remove_dir_all(&staged);
         let funcs = staged.join("_functions");
         std::fs::create_dir_all(&funcs).unwrap();
-        for (name, egress) in [("probe_default", "\"default\""), ("probe_sandbox", "\"sandbox\"")] {
+        for (name, egress) in [
+            ("probe_default", "\"default\""),
+            ("probe_sandbox", "\"sandbox\""),
+        ] {
             std::fs::copy(&fixture, funcs.join(format!("{name}.wasm"))).unwrap();
             std::fs::write(
                 funcs.join(format!("{name}.json")),
@@ -4592,7 +5032,9 @@ console.log("listening on " + port);
         // Minimal agent rootfs (vda): the musl agent as /sbin/init.
         let rootfs_stage = data.join("egr-e2e-vda-stage");
         let _ = std::fs::remove_dir_all(&rootfs_stage);
-        for d in ["sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data", "etc"] {
+        for d in [
+            "sbin", "proc", "sys", "dev", "tmp", "srv/www", "mnt/data", "etc",
+        ] {
             std::fs::create_dir_all(rootfs_stage.join(d)).unwrap();
         }
         std::fs::copy(&agent_bin, rootfs_stage.join("sbin/init")).unwrap();
@@ -4610,8 +5052,15 @@ console.log("listening on " + port);
         let (host_ip, guest_ip, guest_mac) = ("172.16.0.1", "172.16.0.2", "AA:FC:00:00:16:02");
         let tap = "jkegre2e".to_string();
         let _ = sh("ip", &["link", "del", &tap]).await;
-        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
-        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
         sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
         // Host owns the upstream IPs so a guest packet for them is delivered locally.
         for ip in ["9.9.9.9/32", "9.9.9.10/32"] {
@@ -4620,19 +5069,29 @@ console.log("listening on " + port);
 
         // Control plane on the host side of the TAP. Tasks abort when the test's runtime
         // shuts down at return; the TAP/lo teardown below also tears the bindings down.
-        let dns = tokio::net::UdpSocket::bind((host_ip, 53u16)).await.expect("bind DNS :53");
+        let dns = tokio::net::UdpSocket::bind((host_ip, 53u16))
+            .await
+            .expect("bind DNS :53");
         tokio::spawn(async move {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = dns.recv_from(&mut buf).await else { continue };
+                let Ok((n, from)) = dns.recv_from(&mut buf).await else {
+                    continue;
+                };
                 // Decode the QNAME (lowercased) for the map.
                 let mut name = String::new();
                 let mut i = 12usize;
                 while i < n {
                     let len = buf[i] as usize;
-                    if len == 0 { break; }
-                    if !name.is_empty() { name.push('.'); }
-                    if i + 1 + len > n { break; }
+                    if len == 0 {
+                        break;
+                    }
+                    if !name.is_empty() {
+                        name.push('.');
+                    }
+                    if i + 1 + len > n {
+                        break;
+                    }
                     name.push_str(&String::from_utf8_lossy(&buf[i + 1..i + 1 + len]));
                     i += 1 + len;
                 }
@@ -4655,7 +5114,9 @@ console.log("listening on " + port);
                 .unwrap_or_else(|e| panic!("bind upstream {upstream}:80: {e}"));
             tokio::spawn(async move {
                 loop {
-                    let Ok((mut s, _)) = l.accept().await else { continue };
+                    let Ok((mut s, _)) = l.accept().await else {
+                        continue;
+                    };
                     tokio::spawn(async move {
                         let mut b = [0u8; 1024];
                         let _ = s.read(&mut b).await;
@@ -4749,20 +5210,43 @@ console.log("listening on " + port);
             let _ = sh("ip", &["addr", "del", ip, "dev", "lo"]).await;
         }
 
-        eprintln!("allow={allow:?}\nrebind={rebind:?}\nplatform={platform:?}\nipv6={ipv6:?}\nsandbox={sandbox:?}");
+        eprintln!(
+            "allow={allow:?}\nrebind={rebind:?}\nplatform={platform:?}\nipv6={ipv6:?}\nsandbox={sandbox:?}"
+        );
         eprintln!("egress logs:\n{logs}");
 
-        assert_eq!(allow.as_deref(), Some("RESULT:ALLOWED:200"), "default must reach an allowed public upstream");
-        assert_eq!(rebind.as_deref(), Some("RESULT:DENIED"), "a public name resolving to an internal IP must be denied (post-DNS)");
-        assert_eq!(platform.as_deref(), Some("RESULT:DENIED"), "a platform IP must be denied (Zone-2 by IP)");
-        assert_eq!(ipv6.as_deref(), Some("RESULT:DENIED"), "an IPv6 destination must be refused");
-        assert_eq!(sandbox.as_deref(), Some("RESULT:DENIED"), "a sandboxed function must not reach public");
+        assert_eq!(
+            allow.as_deref(),
+            Some("RESULT:ALLOWED:200"),
+            "default must reach an allowed public upstream"
+        );
+        assert_eq!(
+            rebind.as_deref(),
+            Some("RESULT:DENIED"),
+            "a public name resolving to an internal IP must be denied (post-DNS)"
+        );
+        assert_eq!(
+            platform.as_deref(),
+            Some("RESULT:DENIED"),
+            "a platform IP must be denied (Zone-2 by IP)"
+        );
+        assert_eq!(
+            ipv6.as_deref(),
+            Some("RESULT:DENIED"),
+            "an IPv6 destination must be refused"
+        );
+        assert_eq!(
+            sandbox.as_deref(),
+            Some("RESULT:DENIED"),
+            "a sandboxed function must not reach public"
+        );
 
         // #9: the observe manifest recorded the verdicts, via the unified log pipe with the
         // reserved egress stream. Parse the events (the EgressEvent is JSON inside the
         // escaped `line` field) rather than substring-matching the escaped bytes.
         use jkbase_common::logs::{EgressEvent, Verdict};
-        let parsed: serde_json::Value = serde_json::from_str(&logs).unwrap_or(serde_json::Value::Null);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&logs).unwrap_or(serde_json::Value::Null);
         let events: Vec<EgressEvent> = parsed
             .get("lines")
             .and_then(|l| l.as_array())
@@ -4775,7 +5259,9 @@ console.log("listening on " + port);
             })
             .unwrap_or_default();
         assert!(
-            events.iter().any(|e| e.verdict == Verdict::Allow && e.dest_host == "allow.test"),
+            events
+                .iter()
+                .any(|e| e.verdict == Verdict::Allow && e.dest_host == "allow.test"),
             "an allow verdict must be recorded for allow.test: {logs}"
         );
         assert!(
@@ -4783,10 +5269,14 @@ console.log("listening on " + port);
             "the sandboxed function's deny must be recorded: {logs}"
         );
         assert!(
-            events.iter().any(|e| e.verdict == Verdict::DenyPlatform && e.dest_host == "platform.test"),
+            events
+                .iter()
+                .any(|e| e.verdict == Verdict::DenyPlatform && e.dest_host == "platform.test"),
             "the platform-IP deny must be recorded: {logs}"
         );
-        println!("PASS: function_egress_e2e — allow/rebind/platform/ipv6/sandbox + observe manifest");
+        println!(
+            "PASS: function_egress_e2e — allow/rebind/platform/ipv6/sandbox + observe manifest"
+        );
     }
 
     /// F — the WS4 acceptance demo: the **full pipeline** end to end. A real Bun
@@ -4812,16 +5302,28 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "full pipeline: needs KVM + root + bun.ext4 + baselayers + musl agent"]
     async fn bun_layered_pipeline_to_http_200() {
-        let Some(fx) = bun_pipeline_build("bunpipe", 1, Workload::OfflineNoDep).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = bun_pipeline_build("bunpipe", 1, Workload::OfflineNoDep).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "pipe", "172.30.0.1", "172.30.0.2", "AA:FC:00:00:30:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "pipe",
+            "172.30.0.1",
+            "172.30.0.2",
+            "AA:FC:00:00:30:02",
         )
         .await
         .expect("agent should proxy HTTP 200 from the layered bun server");
         assert_eq!(body, "ok");
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: build -> layered collection -> metadata image -> real agent runtime -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: build -> layered collection -> metadata image -> real agent runtime -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Managed-DB acceptance (P0.5) — the full managed-RhypeDB SERVE path end to end. A
@@ -4864,12 +5366,16 @@ console.log("listening on " + port);
         let Some(fx) = bun_pipeline_build("bundb", 1, Workload::OfflineDatabase).await else {
             return;
         };
-        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
 
         // The verity-capable rootfs (agent as /sbin/init + veritysetup) — without it the
         // dm-verity'd rhypedb/base layers fail closed and the DB never starts.
         let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
-            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs (tools/build-runtime-rootfs.sh)");
+            eprintln!(
+                "skip: set JKB_ROOTFS to the verity-capable agent rootfs (tools/build-runtime-rootfs.sh)"
+            );
             return;
         };
         assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
@@ -4921,16 +5427,27 @@ console.log("listening on " + port);
         // at /mnt/data and the DB persists to /mnt/data/volumes/rhypedb-data.
         let data_disk = fx.data.join("dbpipe-data.ext4");
         let _ = std::fs::remove_file(&data_disk);
-        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()]).await.unwrap();
-        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()]).await.unwrap();
+        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
 
         // Point-to-point tap (clear of jkbuild0's 172.31.x and the other pipeline tests).
         let (tag, host_ip, guest_ip, guest_mac) =
             ("dbpipe", "172.27.0.1", "172.27.0.2", "AA:FC:00:00:27:02");
         let tap = format!("jk{tag}");
         let _ = sh("ip", &["link", "del", &tap]).await;
-        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
-        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
         sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
 
         let config = VmConfig {
@@ -4966,7 +5483,10 @@ console.log("listening on " + port);
         //     restore_fpregs_from_fpstate and panics ~1s into resume.)
         let wake = if cold.as_deref() == Some("users=alpha count=1") {
             let snap_dir = fx.data.join("dbpipe-snap");
-            let (snap, mem) = vm.hibernate(&snap_dir).await.expect("hibernate the managed-DB VM");
+            let (snap, mem) = vm
+                .hibernate(&snap_dir)
+                .await
+                .expect("hibernate the managed-DB VM");
             let mut woke =
                 VmInstance::restore_from_snapshot(tag, &config, &runtime_dir, &snap, &mem)
                     .await
@@ -5036,15 +5556,25 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "networked pipeline: + internet + provisioned build bridge (setup-build-net.sh)"]
     async fn bun_networked_pipeline_to_http_200() {
-        let Some(fx) = bun_pipeline_build("bunnet", 1, Workload::NetworkedMonorepo).await else { return };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some(fx) = bun_pipeline_build("bunnet", 1, Workload::NetworkedMonorepo).await else {
+            return;
+        };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
 
         // Lean-layer proof: the built app erofs carries the PRODUCTION deps (ms, debug)
         // but NOT the dev dep (typescript) — pruned out of the runtime layer.
         assert_app_layer_pruned(&fx.staged).await;
 
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "netpipe", "172.28.0.1", "172.28.0.2", "AA:FC:00:00:28:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "netpipe",
+            "172.28.0.1",
+            "172.28.0.2",
+            "AA:FC:00:00:28:02",
         )
         .await
         .expect("agent should serve 200 using the proxy-fetched `ms` dependency");
@@ -5053,7 +5583,9 @@ console.log("listening on " + port);
             "response uses ms(60000)=1m — proves `ms` was fetched through the egress proxy and runs"
         );
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: networked bun install (ms+debug via proxy, sealed) + lean prune (no typescript) -> layered runtime -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: networked bun install (ms+debug via proxy, sealed) + lean prune (no typescript) -> layered runtime -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Mount the staged app erofs layer and assert the lean prune kept production deps
@@ -5068,9 +5600,19 @@ console.log("listening on " + port);
             .expect("app erofs layer present");
         let mnt = staged.join("_probe-mnt");
         let _ = std::fs::create_dir_all(&mnt);
-        sh("mount", &["-t", "erofs", "-o", "ro,loop", app_erofs.to_str().unwrap(), mnt.to_str().unwrap()])
-            .await
-            .expect("mount app erofs");
+        sh(
+            "mount",
+            &[
+                "-t",
+                "erofs",
+                "-o",
+                "ro,loop",
+                app_erofs.to_str().unwrap(),
+                mnt.to_str().unwrap(),
+            ],
+        )
+        .await
+        .expect("mount app erofs");
         let nm = mnt.join("app/node_modules");
         let present = |p: &str| nm.join(p).exists();
         let (has_ms, has_debug, has_ts) = (present("ms"), present("debug"), present("typescript"));
@@ -5078,7 +5620,10 @@ console.log("listening on " + port);
         let _ = std::fs::remove_dir_all(&mnt);
         assert!(has_ms, "production dep `ms` must be in the app layer");
         assert!(has_debug, "production dep `debug` must be in the app layer");
-        assert!(!has_ts, "dev dep `typescript` must be PRUNED from the app layer");
+        assert!(
+            !has_ts,
+            "dev dep `typescript` must be PRUNED from the app layer"
+        );
     }
 
     /// Networked Solid/Vite regression guard. A minimal Solid SPA is built through
@@ -5108,7 +5653,9 @@ console.log("listening on " + port);
         // landed in the app layer.
         assert_app_layer_has_dist(&fx.staged).await;
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: networked Solid/Vite `bun run build` delegated to node -> dist/ in the app layer");
+        println!(
+            "PASS: networked Solid/Vite `bun run build` delegated to node -> dist/ in the app layer"
+        );
     }
 
     /// Mount the staged app erofs layer and assert the Vite build output landed at
@@ -5123,9 +5670,19 @@ console.log("listening on " + port);
             .expect("app erofs layer present");
         let mnt = staged.join("_probe-dist-mnt");
         let _ = std::fs::create_dir_all(&mnt);
-        sh("mount", &["-t", "erofs", "-o", "ro,loop", app_erofs.to_str().unwrap(), mnt.to_str().unwrap()])
-            .await
-            .expect("mount app erofs");
+        sh(
+            "mount",
+            &[
+                "-t",
+                "erofs",
+                "-o",
+                "ro,loop",
+                app_erofs.to_str().unwrap(),
+                mnt.to_str().unwrap(),
+            ],
+        )
+        .await
+        .expect("mount app erofs");
         let has_dist = mnt.join("app/dist/index.html").exists();
         let _ = sh("umount", &[mnt.to_str().unwrap()]).await;
         let _ = std::fs::remove_dir_all(&mnt);
@@ -5151,23 +5708,39 @@ console.log("listening on " + port);
         };
         let toolchain_dir = data.join("toolchains");
         if !toolchain_dir.join("dockerfile.ext4").exists() {
-            eprintln!("skip: {}/dockerfile.ext4 not baked (run `tools/dev toolchains`)", toolchain_dir.display());
+            eprintln!(
+                "skip: {}/dockerfile.ext4 not baked (run `tools/dev toolchains`)",
+                toolchain_dir.display()
+            );
             return None;
         }
         let kernel = {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         };
 
         // Fixture: ONE server built from a user Dockerfile. The image serves "ok" on
         // $PORT (the platform routing contract). builder="dockerfile" → image/self.
         let src = data.join(format!("df-fixture-src-{project_id}"));
         let _ = std::fs::remove_dir_all(&src);
-        write(src.join("jkbase.toml"), "[project]\nname = \"dffix\"\n[servers.api]\nbuilder = \"dockerfile\"\ndockerfile = \"./svc/Dockerfile\"\nport = 8080\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n");
+        write(
+            src.join("jkbase.toml"),
+            "[project]\nname = \"dffix\"\n[servers.api]\nbuilder = \"dockerfile\"\ndockerfile = \"./svc/Dockerfile\"\nport = 8080\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n",
+        );
         // FROM (pull via 3129) + RUN (crun) + COPY + a relative CMD (resolved via the
         // image's own PATH — exercises the image/self non-clobbering env path).
-        write(src.join("svc/Dockerfile"), "FROM python:3.12-alpine\nRUN echo built-in-vm > /built.txt\nCOPY server.py /server.py\nCMD [\"python3\", \"/server.py\"]\n");
-        write(src.join("svc/server.py"), "import os, http.server, socketserver\nport = int(os.environ.get('PORT', '8080'))\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'ok')\n    def log_message(self, *a):\n        pass\nsocketserver.TCPServer(('0.0.0.0', port), H).serve_forever()\n");
+        write(
+            src.join("svc/Dockerfile"),
+            "FROM python:3.12-alpine\nRUN echo built-in-vm > /built.txt\nCOPY server.py /server.py\nCMD [\"python3\", \"/server.py\"]\n",
+        );
+        write(
+            src.join("svc/server.py"),
+            "import os, http.server, socketserver\nport = int(os.environ.get('PORT', '8080'))\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200); self.send_header('Content-Length', '2'); self.end_headers(); self.wfile.write(b'ok')\n    def log_message(self, *a):\n        pass\nsocketserver.TCPServer(('0.0.0.0', port), H).serve_forever()\n",
+        );
 
         let mut tarbuf = Vec::new();
         {
@@ -5200,15 +5773,34 @@ console.log("listening on " + port);
         let net = {
             let allow = match tokio::net::TcpListener::bind("172.31.0.1:3128").await {
                 Ok(l) => l,
-                Err(e) => { eprintln!("skip: cannot bind 172.31.0.1:3128 ({e}); run `sudo tools/dev net`"); return None; }
+                Err(e) => {
+                    eprintln!("skip: cannot bind 172.31.0.1:3128 ({e}); run `sudo tools/dev net`");
+                    return None;
+                }
             };
             let any = match tokio::net::TcpListener::bind("172.31.0.1:3129").await {
                 Ok(l) => l,
-                Err(e) => { eprintln!("skip: cannot bind 172.31.0.1:3129 ({e}); run `sudo tools/dev net`"); return None; }
+                Err(e) => {
+                    eprintln!("skip: cannot bind 172.31.0.1:3129 ({e}); run `sudo tools/dev net`");
+                    return None;
+                }
             };
-            tokio::spawn(crate::egress::serve(allow, Arc::new(crate::egress::EgressConfig::with_default_allowlist())));
-            tokio::spawn(crate::egress::serve(any, Arc::new(crate::egress::EgressConfig::allow_any_public())));
-            Some(Arc::new(BuildNet::new("jkbuild0".into(), "172.31.0.1".into(), 3128, Some(3129), 100_000, 8)))
+            tokio::spawn(crate::egress::serve(
+                allow,
+                Arc::new(crate::egress::EgressConfig::with_default_allowlist()),
+            ));
+            tokio::spawn(crate::egress::serve(
+                any,
+                Arc::new(crate::egress::EgressConfig::allow_any_public()),
+            ));
+            Some(Arc::new(BuildNet::new(
+                "jkbuild0".into(),
+                "172.31.0.1".into(),
+                3128,
+                Some(3129),
+                100_000,
+                8,
+            )))
         };
 
         let deps = Arc::new(BuildDeps {
@@ -5246,7 +5838,13 @@ console.log("listening on " + port);
         let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
             .await
             .expect("dockerfile server build should succeed");
-        Some(BuildFixture { data, fc_release, kernel, store, staged })
+        Some(BuildFixture {
+            data,
+            fc_release,
+            kernel,
+            store,
+            staged,
+        })
     }
 
     /// Assert the dockerfile build produced exactly ONE app erofs layer and the
@@ -5258,10 +5856,18 @@ console.log("listening on " + port);
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "erofs"))
             .collect();
-        assert_eq!(layers.len(), 1, "a dockerfile build is ONE self-contained app layer");
+        assert_eq!(
+            layers.len(),
+            1,
+            "a dockerfile build is ONE self-contained app layer"
+        );
         let mani: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(staged.join("_servers/api.json")).unwrap()).unwrap();
-        assert_eq!(mani["runtime"], "image/self", "dockerfile server runtime must be image/self");
+            serde_json::from_slice(&std::fs::read(staged.join("_servers/api.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            mani["runtime"], "image/self",
+            "dockerfile server runtime must be image/self"
+        );
     }
 
     /// The dockerfile-builder acceptance proof: a user Dockerfile is built
@@ -5280,17 +5886,32 @@ console.log("listening on " + port);
     #[tokio::test]
     #[ignore = "dockerfile pipeline: KVM + root + dockerfile.ext4 + baselayers + agent + internet + `sudo tools/dev net`"]
     async fn dockerfile_pipeline_to_http_200() {
-        let Some(fx) = dockerfile_pipeline_build("dfpipe", 1).await else { return };
+        let Some(fx) = dockerfile_pipeline_build("dfpipe", 1).await else {
+            return;
+        };
         assert_image_self_single_layer(&fx.staged).await;
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "dfpipe", "172.27.0.1", "172.27.0.2", "AA:FC:00:00:27:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "dfpipe",
+            "172.27.0.1",
+            "172.27.0.2",
+            "AA:FC:00:00:27:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the dockerfile-built image/self server");
-        assert_eq!(body, "ok", "the image's own python entrypoint serves 'ok' on $PORT");
+        assert_eq!(
+            body, "ok",
+            "the image's own python entrypoint serves 'ok' on $PORT"
+        );
         let _ = std::fs::remove_dir_all(&fx.staged);
-        println!("PASS: builder=dockerfile (buildah FROM via 3129 public-any + RUN via crun) -> single image/self erofs layer -> runtime -> HTTP 200 ({body:?})");
+        println!(
+            "PASS: builder=dockerfile (buildah FROM via 3129 public-any + RUN via crun) -> single image/self erofs layer -> runtime -> HTTP 200 ({body:?})"
+        );
     }
 
     /// Write a Rust WORKSPACE fixture into `src`: a virtual-workspace root, a `common`
@@ -5324,7 +5945,11 @@ console.log("listening on " + port);
         );
         // `context = "."` mounts the whole workspace at /src and builds in `server`;
         // omitting it mounts only `server/`, so `../common` points outside the mount.
-        let context_line = if with_context { "context = \".\"\n" } else { "" };
+        let context_line = if with_context {
+            "context = \".\"\n"
+        } else {
+            ""
+        };
         write(
             src.join("jkbase.toml"),
             &format!(
@@ -5380,13 +6005,24 @@ console.log("listening on " + port);
         else {
             return;
         };
-        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else { return };
+        let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
         let body = boot_layered_and_curl(
-            &fx, &store_dir, &agent_bin, "monop", "172.25.0.1", "172.25.0.2", "AA:FC:00:00:25:02",
+            &fx,
+            &store_dir,
+            &agent_bin,
+            "monop",
+            "172.25.0.1",
+            "172.25.0.2",
+            "AA:FC:00:00:25:02",
         )
         .await
         .expect("agent should serve HTTP 200 from the monorepo server (sibling path-dep linked)");
-        assert_eq!(body, "ok", "the served body is the SIBLING crate's `common::body()`");
+        assert_eq!(
+            body, "ok",
+            "the served body is the SIBLING crate's `common::body()`"
+        );
         let _ = std::fs::remove_dir_all(&fx.staged);
         println!(
             "PASS: monorepo `context = \".\"` -> ../common resolves -> layered rust runtime -> HTTP 200 ({body:?})"
@@ -5445,6 +6081,8 @@ console.log("listening on " + port);
             err.contains("api:") && !lc.contains("socket") && !lc.contains("sun_len"),
             "expected an in-VM build failure for the missing `../common` sibling, got: {err}"
         );
-        println!("PASS (negative): no `context` -> ../common absent -> build fails as expected\n  error: {err}");
+        println!(
+            "PASS (negative): no `context` -> ../common absent -> build fails as expected\n  error: {err}"
+        );
     }
 }

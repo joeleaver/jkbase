@@ -1,6 +1,6 @@
 use anyhow::Result;
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::password_hash::SaltString;
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use base64::Engine;
 use serde::{Deserialize, Serialize};

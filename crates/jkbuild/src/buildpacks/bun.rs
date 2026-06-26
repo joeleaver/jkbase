@@ -277,10 +277,7 @@ fn package_declares_bun(pkg: &serde_json::Value) -> bool {
         .and_then(|v| v.as_str())
         .map(|s| s.starts_with("bun@"))
         .unwrap_or(false);
-    let engines_bun = pkg
-        .get("engines")
-        .and_then(|e| e.get("bun"))
-        .is_some();
+    let engines_bun = pkg.get("engines").and_then(|e| e.get("bun")).is_some();
     pm_is_bun || engines_bun
 }
 
@@ -365,7 +362,8 @@ fn stage_production_modules(ctx: &BuildContext, bun_cache: &Path) -> Result<()> 
     if has_lockfile(root) {
         cmd.arg("--frozen-lockfile");
     }
-    cmd.current_dir(root).env("BUN_INSTALL_CACHE_DIR", bun_cache);
+    cmd.current_dir(root)
+        .env("BUN_INSTALL_CACHE_DIR", bun_cache);
     apply_proxy(&mut cmd, ctx);
     let status = cmd
         .status()
@@ -432,7 +430,10 @@ mod tests {
     #[test]
     fn app_working_dir_roots_at_app_or_member() {
         // Normal app: working dir is /app (unchanged).
-        let c = ctx(Path::new("/scratch/workspace"), Path::new("/scratch/workspace"));
+        let c = ctx(
+            Path::new("/scratch/workspace"),
+            Path::new("/scratch/workspace"),
+        );
         assert_eq!(app_working_dir(&c), "/app");
         // Monorepo member: working dir is /app/<member>, while node_modules resolves
         // from the shipped workspace root at /app.
@@ -461,7 +462,11 @@ mod tests {
         assert!(detect_decision(d.path(), None).is_pass());
 
         let d2 = tempdir().unwrap();
-        write(d2.path(), "package.json", r#"{"packageManager":"bun@1.1.34"}"#);
+        write(
+            d2.path(),
+            "package.json",
+            r#"{"packageManager":"bun@1.1.34"}"#,
+        );
         assert!(detect_decision(d2.path(), None).is_pass());
     }
 
@@ -533,7 +538,11 @@ mod tests {
         assert_eq!(resolve_bun_version(d.path()).as_deref(), Some("1.1.30"));
 
         let d2 = tempdir().unwrap();
-        write(d2.path(), "package.json", r#"{"packageManager":"bun@1.1.34"}"#);
+        write(
+            d2.path(),
+            "package.json",
+            r#"{"packageManager":"bun@1.1.34"}"#,
+        );
         assert_eq!(resolve_bun_version(d2.path()).as_deref(), Some("1.1.34"));
 
         let d3 = tempdir().unwrap();

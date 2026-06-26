@@ -69,7 +69,11 @@ pub async fn run(cmd: RepoCommand) -> anyhow::Result<()> {
             api,
             no_remote,
         } => connect(project, api, no_remote).await,
-        RepoCommand::Github { project, api, print } => github(project, api, print),
+        RepoCommand::Github {
+            project,
+            api,
+            print,
+        } => github(project, api, print),
         RepoCommand::Token { project, api } => rotate_token(project, api).await,
         RepoCommand::Disconnect { project, api } => disconnect(project, api).await,
     }
@@ -127,8 +131,12 @@ async fn connect(project: Option<String>, api: String, no_remote: bool) -> anyho
         );
     }
 
-    println!("\nThis token is shown once — save it if you'll need it again (`jkbase repo token` re-mints).");
-    println!("Want GitHub Actions push-to-deploy? Run `jkbase repo github` to scaffold the workflow");
+    println!(
+        "\nThis token is shown once — save it if you'll need it again (`jkbase repo token` re-mints)."
+    );
+    println!(
+        "Want GitHub Actions push-to-deploy? Run `jkbase repo github` to scaffold the workflow"
+    );
     println!("(it writes a tracked file, so it's opt-in), and set the token above as the");
     println!("JKBASE_GIT_TOKEN repo secret.");
     Ok(())
@@ -151,9 +159,14 @@ fn github(project: Option<String>, api: String, print: bool) -> anyhow::Result<(
             std::fs::create_dir_all(dir).context("create .github/workflows")?;
         }
         std::fs::write(path, &workflow).context("write workflow file")?;
-        println!("✓ wrote {} (review + commit it to activate CI)", path.display());
+        println!(
+            "✓ wrote {} (review + commit it to activate CI)",
+            path.display()
+        );
     } else {
-        println!("(not in a git repo) add this as .github/workflows/jkbase-deploy.yml:\n\n{workflow}");
+        println!(
+            "(not in a git repo) add this as .github/workflows/jkbase-deploy.yml:\n\n{workflow}"
+        );
     }
 
     println!("\nFinish setup in GitHub:");
@@ -195,7 +208,9 @@ async fn disconnect(project: Option<String>, api: String) -> anyhow::Result<()> 
         );
     }
     if in_git_repo() {
-        let _ = Command::new("git").args(["remote", "remove", "jkbase"]).output();
+        let _ = Command::new("git")
+            .args(["remote", "remove", "jkbase"])
+            .output();
     }
     println!("Revoked the git-push token for '{project_id}'. Pushes to jkbase are now disabled.");
     Ok(())
@@ -234,7 +249,9 @@ fn in_git_repo() -> bool {
 
 /// Add (or replace) a git remote, idempotently.
 fn set_remote(name: &str, url: &str) -> anyhow::Result<()> {
-    let _ = Command::new("git").args(["remote", "remove", name]).output();
+    let _ = Command::new("git")
+        .args(["remote", "remove", name])
+        .output();
     let out = Command::new("git")
         .args(["remote", "add", name, url])
         .output()
@@ -270,8 +287,14 @@ mod tests {
 
     #[test]
     fn split_origin_parses_scheme_and_host() {
-        assert_eq!(split_origin("https://api.jkbase.app").unwrap(), ("https", "api.jkbase.app"));
-        assert_eq!(split_origin("http://127.0.0.1:9090/").unwrap(), ("http", "127.0.0.1:9090"));
+        assert_eq!(
+            split_origin("https://api.jkbase.app").unwrap(),
+            ("https", "api.jkbase.app")
+        );
+        assert_eq!(
+            split_origin("http://127.0.0.1:9090/").unwrap(),
+            ("http", "127.0.0.1:9090")
+        );
         assert!(split_origin("not-a-url").is_err());
     }
 }

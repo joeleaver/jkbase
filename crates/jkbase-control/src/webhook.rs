@@ -33,7 +33,10 @@ impl WebhookVerifier {
     /// `secrets`: the currently-valid secrets (current + any not-yet-expired
     /// previous, for rotation). `max_skew_secs`: the anti-replay window.
     pub fn new(secrets: Vec<String>, max_skew_secs: u64) -> Self {
-        Self { secrets, max_skew_secs }
+        Self {
+            secrets,
+            max_skew_secs,
+        }
     }
 
     /// Verify a push: the timestamp must be within the skew window of `now`, and
@@ -114,16 +117,25 @@ mod tests {
         let v = WebhookVerifier::new(vec!["s".into()], 300);
         let sig = sign("s", NOW, b"payload");
         // Body tampered.
-        assert_eq!(v.verify(b"PAYLOAD", &sig, NOW, NOW), Err(WebhookError::SignatureMismatch));
+        assert_eq!(
+            v.verify(b"PAYLOAD", &sig, NOW, NOW),
+            Err(WebhookError::SignatureMismatch)
+        );
         // Timestamp tampered (it's bound into the signed payload).
-        assert_eq!(v.verify(b"payload", &sig, NOW + 1, NOW + 1), Err(WebhookError::SignatureMismatch));
+        assert_eq!(
+            v.verify(b"payload", &sig, NOW + 1, NOW + 1),
+            Err(WebhookError::SignatureMismatch)
+        );
     }
 
     #[test]
     fn replay_outside_window_rejected() {
         let v = WebhookVerifier::new(vec!["s".into()], 300);
         let sig = sign("s", NOW, b"x");
-        assert_eq!(v.verify(b"x", &sig, NOW, NOW + 301), Err(WebhookError::TimestampSkew));
+        assert_eq!(
+            v.verify(b"x", &sig, NOW, NOW + 301),
+            Err(WebhookError::TimestampSkew)
+        );
     }
 
     #[test]
@@ -134,6 +146,9 @@ mod tests {
         assert_eq!(v.verify(b"x", &sig, NOW, NOW), Ok(()));
         // Once the old secret is retired, the same signature is rejected.
         let v2 = WebhookVerifier::new(vec!["new-secret".into()], 300);
-        assert_eq!(v2.verify(b"x", &sig, NOW, NOW), Err(WebhookError::SignatureMismatch));
+        assert_eq!(
+            v2.verify(b"x", &sig, NOW, NOW),
+            Err(WebhookError::SignatureMismatch)
+        );
     }
 }

@@ -475,7 +475,8 @@ impl MirrorTls {
             }
             None => {
                 a.total = a.total.saturating_add(size);
-                a.blobs.insert(digest_key.to_string(), BlobAcct { size, atime });
+                a.blobs
+                    .insert(digest_key.to_string(), BlobAcct { size, atime });
             }
         }
         if a.total <= a.cap {
@@ -626,7 +627,8 @@ impl MirrorTls {
             if served > MAX_REQUESTS_PER_CONN {
                 return Ok(());
             }
-            let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut *tls)).await {
+            let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut *tls)).await
+            {
                 Ok(Ok(Some(h))) => h,
                 Ok(Ok(None)) => return Ok(()), // clean EOF
                 Ok(Err(e)) => return Err(e),
@@ -785,8 +787,7 @@ impl MirrorTls {
         let digest_key = digest_key(&entry.digest);
         match self.blob_path_len(&digest_key).await {
             Ok((path, len)) => {
-                self.hits
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.touch_blob(&digest_key).await;
                 Ok(Some(MirrorResponse {
                     status: 200,
@@ -915,10 +916,7 @@ impl MirrorTls {
     }
 
     fn index_path(&self, url_key: &str) -> PathBuf {
-        self.root
-            .join("index")
-            .join(&url_key[..2])
-            .join(url_key)
+        self.root.join("index").join(&url_key[..2]).join(url_key)
     }
 
     async fn read_index(&self, url_key: &str) -> Result<Option<IndexEntry>> {
@@ -1206,15 +1204,28 @@ mod tests {
             );
         }
         // A legitimate origin-form target still parses.
-        assert!(parse_request_head(b"GET /lodash/-/x.tgz HTTP/1.1\r\nHost: registry.npmjs.org").is_some());
+        assert!(
+            parse_request_head(b"GET /lodash/-/x.tgz HTTP/1.1\r\nHost: registry.npmjs.org")
+                .is_some()
+        );
     }
 
     #[test]
     fn parse_rejects_smuggling_ambiguity() {
         // Duplicate Content-Length.
-        assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 5").is_none());
+        assert!(
+            parse_request_head(
+                b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 5"
+            )
+            .is_none()
+        );
         // Content-Length + Transfer-Encoding together.
-        assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nTransfer-Encoding: chunked").is_none());
+        assert!(
+            parse_request_head(
+                b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nTransfer-Encoding: chunked"
+            )
+            .is_none()
+        );
         // Non-numeric Content-Length.
         assert!(parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nContent-Length: abc").is_none());
         // Obsolete line folding (continuation starting with whitespace).
@@ -1251,7 +1262,8 @@ mod tests {
         assert!(!r.keep_alive);
         let r = parse_request_head(b"GET /x HTTP/1.0\r\nHost: a").unwrap();
         assert!(!r.keep_alive); // 1.0 defaults to close
-        let r = parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked").unwrap();
+        let r = parse_request_head(b"GET /x HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked")
+            .unwrap();
         assert!(r.has_body);
         assert!(parse_request_head(b"garbage line").is_none());
     }
@@ -1351,7 +1363,9 @@ mod tests {
         async fn put(m: &Arc<MirrorTls>, tag: &str, atime: u64) -> String {
             let dk = digest_key(&sha256_hex_str(tag.as_bytes()));
             let path = m.root.join("blobs").join(&dk);
-            tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
             tokio::fs::write(&path, vec![b'x'; 100]).await.unwrap();
             m.account_blob_at(&dk, 100, atime).await;
             dk
@@ -1403,7 +1417,9 @@ mod tests {
         async fn put_with_index(m: &Arc<MirrorTls>, tag: &str, atime: u64) -> (String, String) {
             let dk = digest_key(&sha256_hex_str(tag.as_bytes()));
             let bp = m.root.join("blobs").join(&dk);
-            tokio::fs::create_dir_all(bp.parent().unwrap()).await.unwrap();
+            tokio::fs::create_dir_all(bp.parent().unwrap())
+                .await
+                .unwrap();
             tokio::fs::write(&bp, vec![b'x'; 100]).await.unwrap();
             let url_key = sha256_hex_str(format!("registry.npmjs.org/{tag}").as_bytes());
             let entry = IndexEntry {
@@ -1517,9 +1533,20 @@ mod tests {
             String::from_utf8_lossy(&r1[..r1.len().min(64)])
         );
         assert_eq!(r1, r2, "served bytes must be identical across tenants");
-        assert_eq!(f1, f0 + 1, "first request must MISS -> exactly one upstream fetch");
-        assert_eq!(f2, f1, "second request must HIT -> NO second upstream fetch (dedup)");
-        assert_eq!(h2, h0 + 1, "second request must be served from the shared store");
+        assert_eq!(
+            f1,
+            f0 + 1,
+            "first request must MISS -> exactly one upstream fetch"
+        );
+        assert_eq!(
+            f2, f1,
+            "second request must HIT -> NO second upstream fetch (dedup)"
+        );
+        assert_eq!(
+            h2,
+            h0 + 1,
+            "second request must be served from the shared store"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

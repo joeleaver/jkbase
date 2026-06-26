@@ -36,9 +36,7 @@ pub enum WakeError {
 }
 
 pub type WakeCallback = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, WakeError>> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, WakeError>> + Send>> + Send + Sync,
 >;
 
 pub use jkbase_common::routing::DomainTarget;
@@ -243,7 +241,11 @@ async fn serve_http_redirect(
                         .and_then(|h| h.to_str().ok())
                         .unwrap_or(&domain)
                         .to_string();
-                    let pq = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+                    let pq = req
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or("/");
                     let location = format!("https://{host}{pq}");
                     Ok::<_, hyper::Error>(
                         Response::builder()
@@ -276,29 +278,31 @@ async fn proxy_request(
 
     // Route api.{domain} to the control plane (infra, never a tenant project).
     if subdomain.as_deref() == Some("api")
-        && let Some(ref addr) = *shared.api_addr {
-            return match forward_to_api(&shared, addr, req).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    error!(error = %e, "API forward failed");
-                    Ok(bad_gateway())
-                }
-            };
-        }
+        && let Some(ref addr) = *shared.api_addr
+    {
+        return match forward_to_api(&shared, addr, req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                error!(error = %e, "API forward failed");
+                Ok(bad_gateway())
+            }
+        };
+    }
 
     // Route storage.{domain} to the tenant object-store service (infra host, never a
     // tenant project). Same local-forward pattern as the API; the service verifies
     // SigV4 against its configured public host, so the Host rewrite here is harmless.
     if subdomain.as_deref() == Some("storage")
-        && let Some(ref addr) = *shared.storage_addr {
-            return match forward_to_api(&shared, addr, req).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    error!(error = %e, "object-store forward failed");
-                    Ok(bad_gateway())
-                }
-            };
-        }
+        && let Some(ref addr) = *shared.storage_addr
+    {
+        return match forward_to_api(&shared, addr, req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                error!(error = %e, "object-store forward failed");
+                Ok(bad_gateway())
+            }
+        };
+    }
 
     // Host-key: bare apex/www both resolve to the "www" landing project.
     let host_key = match subdomain.as_deref() {

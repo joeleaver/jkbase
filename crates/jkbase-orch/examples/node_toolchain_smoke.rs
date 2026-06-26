@@ -61,7 +61,11 @@ async fn main() -> anyhow::Result<()> {
         Ok(k) => PathBuf::from(k),
         Err(_) => {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         }
     };
     if !kernel.exists() {
@@ -125,9 +129,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     std::fs::create_dir_all(&cfg.chroot_base)?;
-    println!("[2/3] booting jailed build VM on the toolchain (timeout {}s) ...", cfg.timeout.as_secs());
+    println!(
+        "[2/3] booting jailed build VM on the toolchain (timeout {}s) ...",
+        cfg.timeout.as_secs()
+    );
     let run = BuildVm::run("np", &cfg, &data.join("run")).await?;
-    println!("    outcome: {:?} (cpu={:?}us wall={:?})", run.outcome, run.cpu_usec, run.wall);
+    println!(
+        "    outcome: {:?} (cpu={:?}us wall={:?})",
+        run.outcome, run.cpu_usec, run.wall
+    );
 
     // The build SUBPROCESS (`node probe.js`) writes to the VM console, captured by the
     // orchestrator at {runtime_dir}/{id}.console.log — NOT /out/build.log, which holds
@@ -135,7 +145,10 @@ async fn main() -> anyhow::Result<()> {
     let console = std::fs::read(data.join("run").join("np.console.log"))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
-    let marker = console.lines().find(|l| l.contains("NODEPROBE")).map(str::trim);
+    let marker = console
+        .lines()
+        .find(|l| l.contains("NODEPROBE"))
+        .map(str::trim);
     println!("    console probe line: {marker:?}");
 
     if run.outcome != BuildOutcome::Completed {
@@ -143,12 +156,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let status = build_output::read_status(&output_img)?;
     if status != Some(0) {
-        anyhow::bail!("jkbuild lifecycle exited non-zero: {status:?} (node missing from the toolchain?)");
+        anyhow::bail!(
+            "jkbuild lifecycle exited non-zero: {status:?} (node missing from the toolchain?)"
+        );
     }
 
     println!("[3/3] asserting `bun run build` ran under REAL node ...");
     if !console.contains("NODEPROBE node v") {
-        anyhow::bail!("probe marker absent in console — `node probe.js` did not run (no node in the toolchain?)");
+        anyhow::bail!(
+            "probe marker absent in console — `node probe.js` did not run (no node in the toolchain?)"
+        );
     }
     if !console.contains("Bun is undefined") {
         anyhow::bail!(
@@ -156,7 +173,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    println!("\nPASS: the toolchain ships real node and `bun run build` delegates to it ({}).",
-        marker.unwrap_or(""));
+    println!(
+        "\nPASS: the toolchain ships real node and `bun run build` delegates to it ({}).",
+        marker.unwrap_or("")
+    );
     Ok(())
 }

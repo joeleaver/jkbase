@@ -15,7 +15,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 fn env_or<T: std::str::FromStr>(k: &str, default: T) -> T {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[tokio::main]
@@ -46,7 +49,8 @@ async fn main() -> anyhow::Result<()> {
         parent_cgroup: "jkbase-build".to_string(),
         cgroup_pids_max: env_or("CGROUP_PIDS_MAX", 512),
         cgroup_mem_max_bytes: env_or("CGROUP_MEM_MAX", 512 * 1024 * 1024),
-        cgroup_cpu_max: std::env::var("CGROUP_CPU_MAX").unwrap_or_else(|_| "100000 100000".to_string()),
+        cgroup_cpu_max: std::env::var("CGROUP_CPU_MAX")
+            .unwrap_or_else(|_| "100000 100000".to_string()),
         fsize_limit_bytes: None,
         console_log_max_bytes: env_or("CONSOLE_MAX", 16 * 1024 * 1024),
         seccomp_filter: None,

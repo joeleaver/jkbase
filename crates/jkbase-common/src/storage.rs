@@ -172,7 +172,11 @@ mod tests {
         write(&dd.join("content-images").join("p.ext4"), &[0u8; 42]);
         // History on disk but no `live` symlink yet -> not billed.
         write(
-            &dd.join("hosting").join(pid).join("deployments").join("v1").join("f"),
+            &dd.join("hosting")
+                .join(pid)
+                .join("deployments")
+                .join("v1")
+                .join("f"),
             &[0u8; 999],
         );
         assert_eq!(project_storage_bytes(&dd, pid), 42);

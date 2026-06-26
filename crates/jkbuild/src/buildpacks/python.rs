@@ -260,9 +260,7 @@ fn python_command(home: &Path) -> Command {
 /// Run a build subprocess, capturing its output so a failure surfaces the actual pip
 /// error in the build log the tenant sees — not just an exit code.
 fn run(mut cmd: Command, what: &str) -> Result<()> {
-    let out = cmd
-        .output()
-        .with_context(|| format!("spawning `{what}`"))?;
+    let out = cmd.output().with_context(|| format!("spawning `{what}`"))?;
     if !out.status.success() {
         anyhow::bail!(
             "`{what}` failed: {}\n--- output (tail) ---\n{}",

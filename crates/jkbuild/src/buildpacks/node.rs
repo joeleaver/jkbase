@@ -102,7 +102,9 @@ impl PackageManager {
             // `--production` is the v1 prod-prune; keep the resolve deterministic with
             // `--frozen-lockfile` when a lockfile exists (same as the full install) so
             // the SHIPPED tree can't drift to a different graph than the audited one.
-            PackageManager::Yarn if has_lock => vec!["install", "--production", "--frozen-lockfile"],
+            PackageManager::Yarn if has_lock => {
+                vec!["install", "--production", "--frozen-lockfile"]
+            }
             PackageManager::Yarn => vec!["install", "--production"],
         }
     }
@@ -355,7 +357,7 @@ fn parse_bare_node_command(script: &str) -> Option<Vec<String>> {
     const SHELL_META: &[char] = &[
         '&', '|', ';', '>', '<', '`', '$', '(', ')', // composition / redirection / subst
         '\'', '"', '\\', // quoting / escaping
-        '#', // comment
+        '#',  // comment
         '*', '?', '[', ']', '{', '}', // globbing / brace expansion
         '~', '!', // home / history expansion
     ];
@@ -405,9 +407,7 @@ fn node_command(bin: &str, home: &Path) -> Command {
 /// tool error (npm/pnpm/yarn) in the build log the tenant sees — not just an exit
 /// code. The output is buffered in-VM and only the tail is kept on failure.
 fn run(mut cmd: Command, what: &str) -> Result<()> {
-    let out = cmd
-        .output()
-        .with_context(|| format!("spawning `{what}`"))?;
+    let out = cmd.output().with_context(|| format!("spawning `{what}`"))?;
     if !out.status.success() {
         anyhow::bail!(
             "`{what}` failed: {}\n--- output (tail) ---\n{}",
@@ -434,9 +434,14 @@ fn read_package_json(app_dir: &Path) -> Option<serde_json::Value> {
 }
 
 fn has_lockfile(app_dir: &Path) -> bool {
-    ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"]
-        .iter()
-        .any(|f| app_dir.join(f).exists())
+    [
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+    ]
+    .iter()
+    .any(|f| app_dir.join(f).exists())
 }
 
 fn has_build_script(app_dir: &Path) -> bool {
@@ -595,7 +600,11 @@ mod tests {
     #[test]
     fn detect_defers_to_bun() {
         let d = tempdir().unwrap();
-        write(d.path(), "package.json", r#"{"packageManager":"bun@1.1.34"}"#);
+        write(
+            d.path(),
+            "package.json",
+            r#"{"packageManager":"bun@1.1.34"}"#,
+        );
         write(d.path(), "bun.lock", "");
         assert!(!detect_decision(d.path(), None).is_pass());
 
@@ -643,13 +652,22 @@ mod tests {
     #[test]
     fn install_args_track_lockfile_presence() {
         assert_eq!(PackageManager::Npm.full_install_args(true), vec!["ci"]);
-        assert_eq!(PackageManager::Npm.full_install_args(false), vec!["install"]);
-        assert_eq!(PackageManager::Npm.prod_install_args(true), vec!["ci", "--omit=dev"]);
+        assert_eq!(
+            PackageManager::Npm.full_install_args(false),
+            vec!["install"]
+        );
+        assert_eq!(
+            PackageManager::Npm.prod_install_args(true),
+            vec!["ci", "--omit=dev"]
+        );
         assert_eq!(
             PackageManager::Pnpm.full_install_args(true),
             vec!["install", "--frozen-lockfile"]
         );
-        assert_eq!(PackageManager::Yarn.prod_install_args(false), vec!["install", "--production"]);
+        assert_eq!(
+            PackageManager::Yarn.prod_install_args(false),
+            vec!["install", "--production"]
+        );
         assert_eq!(
             PackageManager::Yarn.prod_install_args(true),
             vec!["install", "--production", "--frozen-lockfile"]
@@ -659,7 +677,11 @@ mod tests {
     #[test]
     fn launch_parses_bare_node_start_script() {
         let d = tempdir().unwrap();
-        write(d.path(), "package.json", r#"{"scripts":{"start":"node dist/index.js"}}"#);
+        write(
+            d.path(),
+            "package.json",
+            r#"{"scripts":{"start":"node dist/index.js"}}"#,
+        );
         assert_eq!(
             resolve_launch_command(d.path()),
             Some(vec![NODE_BIN.into(), "dist/index.js".into()])
@@ -670,7 +692,11 @@ mod tests {
     fn launch_rejects_non_node_start_and_falls_through() {
         let d = tempdir().unwrap();
         // `next start` is not a bare-node command; fall through to a conventional entry.
-        write(d.path(), "package.json", r#"{"scripts":{"start":"next start"}}"#);
+        write(
+            d.path(),
+            "package.json",
+            r#"{"scripts":{"start":"next start"}}"#,
+        );
         write(d.path(), "server.js", "");
         assert_eq!(
             resolve_launch_command(d.path()),
@@ -683,7 +709,10 @@ mod tests {
         // A start script with shell operators/expansion must NOT be parsed (we exec
         // argv directly, no shell) — bail so the caller falls through to a safe entry.
         assert_eq!(parse_bare_node_command("node a.js && node b.js"), None);
-        assert_eq!(parse_bare_node_command("NODE_ENV=production node a.js"), None); // leader != node
+        assert_eq!(
+            parse_bare_node_command("NODE_ENV=production node a.js"),
+            None
+        ); // leader != node
         assert_eq!(parse_bare_node_command("node"), None); // no script ⇒ would hang
         // Quoting / comments / globs would be mis-split by naive whitespace tokenizing.
         assert_eq!(parse_bare_node_command("node \"my server.js\""), None);
@@ -694,11 +723,19 @@ mod tests {
         // Plain bare-token invocations (incl. `--flag=value` with no quotes) are fine.
         assert_eq!(
             parse_bare_node_command("node --enable-source-maps server.js"),
-            Some(vec![NODE_BIN.into(), "--enable-source-maps".into(), "server.js".into()])
+            Some(vec![
+                NODE_BIN.into(),
+                "--enable-source-maps".into(),
+                "server.js".into()
+            ])
         );
         assert_eq!(
             parse_bare_node_command("node --max-old-space-size=512 dist/index.js"),
-            Some(vec![NODE_BIN.into(), "--max-old-space-size=512".into(), "dist/index.js".into()])
+            Some(vec![
+                NODE_BIN.into(),
+                "--max-old-space-size=512".into(),
+                "dist/index.js".into()
+            ])
         );
     }
 

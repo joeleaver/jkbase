@@ -50,13 +50,14 @@ impl VmInstance {
             tokio::fs::remove_file(&socket_path).await?;
         }
         if let Some(ref vp) = vsock_path
-            && vp.exists() {
-                tokio::fs::remove_file(vp).await?;
-            }
+            && vp.exists()
+        {
+            tokio::fs::remove_file(vp).await?;
+        }
 
         let log_path = vm_dir.join("console.log");
-        let log_file = std::fs::File::create(&log_path)
-            .context("failed to create VM console log")?;
+        let log_file =
+            std::fs::File::create(&log_path).context("failed to create VM console log")?;
         let stderr_log = log_file
             .try_clone()
             .context("failed to clone log file handle")?;
@@ -83,7 +84,10 @@ impl VmInstance {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !socket_path.exists() {
-            anyhow::bail!("Firecracker socket did not appear at {}", socket_path.display());
+            anyhow::bail!(
+                "Firecracker socket did not appear at {}",
+                socket_path.display()
+            );
         }
 
         let client = FirecrackerClient::new(&socket_path);
@@ -254,16 +258,20 @@ impl VmInstance {
 
     pub async fn stop(&mut self) -> Result<()> {
         info!(self.id, "stopping VM");
-        self.process.kill().await.context("failed to kill Firecracker process")?;
+        self.process
+            .kill()
+            .await
+            .context("failed to kill Firecracker process")?;
         self.process.wait().await?;
 
         if self.socket_path.exists() {
             let _ = tokio::fs::remove_file(&self.socket_path).await;
         }
         if let Some(ref vp) = self.vsock_path
-            && vp.exists() {
-                let _ = tokio::fs::remove_file(vp).await;
-            }
+            && vp.exists()
+        {
+            let _ = tokio::fs::remove_file(vp).await;
+        }
 
         info!(self.id, "VM stopped");
         Ok(())
@@ -378,7 +386,9 @@ impl VmInstance {
                 _ => {}
             }
             info!(id, data = %data_path.display(), "repointing data drive to fenced device");
-            client.patch_drive("data", &data_path.to_string_lossy()).await?;
+            client
+                .patch_drive("data", &data_path.to_string_lossy())
+                .await?;
         }
 
         info!(id, "resuming restored VM");

@@ -21,7 +21,9 @@
 //! [`LocalFsBlobStore`](crate::LocalFsBlobStore) (hard-link), and the factory's
 //! capability negotiation sees the difference rather than being lied to.
 
-use crate::{Backend, BlobMeta, BlobStore, Caps, Result, SubstrateError, assert_not_self_referential};
+use crate::{
+    Backend, BlobMeta, BlobStore, Caps, Result, SubstrateError, assert_not_self_referential,
+};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use object_store::aws::AmazonS3Builder;
@@ -73,7 +75,9 @@ impl S3CompatBlobStore {
             .with_allow_http(cfg.allow_http)
             .build()
             .map_err(|e| SubstrateError::Backend(format!("s3 builder: {e}")))?;
-        Ok(Self { store: Arc::new(store) })
+        Ok(Self {
+            store: Arc::new(store),
+        })
     }
 
     /// Construct directly from a prepared [`ObjectStore`] (used by tests).
@@ -87,7 +91,8 @@ fn obj_path(key: &str) -> Result<ObjPath> {
     if key.is_empty() {
         return Err(SubstrateError::Backend("empty blob key".into()));
     }
-    ObjPath::parse(key).map_err(|e| SubstrateError::Backend(format!("invalid blob key {key:?}: {e}")))
+    ObjPath::parse(key)
+        .map_err(|e| SubstrateError::Backend(format!("invalid blob key {key:?}: {e}")))
 }
 
 /// Map object_store errors onto the substrate seam, preserving "not found".
@@ -148,7 +153,10 @@ impl BlobStore for S3CompatBlobStore {
     async fn head(&self, key: &str) -> Result<Option<BlobMeta>> {
         let path = obj_path(key)?;
         // A HEAD via get_opts: fetch metadata without the body (dyn-safe).
-        let opts = GetOptions { head: true, ..Default::default() };
+        let opts = GetOptions {
+            head: true,
+            ..Default::default()
+        };
         match self.store.get_opts(&path, opts).await {
             Ok(res) => Ok(Some(BlobMeta {
                 key: key.to_string(),

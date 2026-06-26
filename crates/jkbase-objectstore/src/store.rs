@@ -276,7 +276,9 @@ impl ObjectStore {
                     last_modified: now_secs(),
                 };
                 let meta_path = dir.join(format!("{hk}.meta"));
-                if let Err(e) = tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await {
+                if let Err(e) =
+                    tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await
+                {
                     // Bytes are committed but unreadable without the sidecar — don't leave
                     // a quota-consuming orphan; drop both and fail.
                     let _ = tokio::fs::remove_file(&obj).await;
@@ -289,7 +291,11 @@ impl ObjectStore {
     }
 
     /// Open `bucket/key` for streaming, returning its metadata + the file handle.
-    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, tokio::fs::File)> {
+    pub async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(ObjectMeta, tokio::fs::File)> {
         let (meta, obj) = self.locate(bucket, key).await?;
         let f = tokio::fs::File::open(&obj).await?;
         Ok((meta, f))
@@ -336,7 +342,9 @@ impl ObjectStore {
         start_after: Option<&str>,
         max_keys: usize,
     ) -> Result<ListPage> {
-        let page = self.list_v2(bucket, prefix, None, start_after, max_keys).await?;
+        let page = self
+            .list_v2(bucket, prefix, None, start_after, max_keys)
+            .await?;
         Ok(ListPage {
             objects: page.objects,
             is_truncated: page.is_truncated,
@@ -404,10 +412,16 @@ impl ObjectStore {
         let mut rd = tokio::fs::read_dir(&dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(hex_key) = name.strip_suffix(".meta") else { continue };
+            let Some(hex_key) = name.strip_suffix(".meta") else {
+                continue;
+            };
             // Hex-decode filename back to the original key bytes.
-            let Ok(key_bytes) = hex_decode(hex_key) else { continue };
-            let Ok(key) = String::from_utf8(key_bytes) else { continue };
+            let Ok(key_bytes) = hex_decode(hex_key) else {
+                continue;
+            };
+            let Ok(key) = String::from_utf8(key_bytes) else {
+                continue;
+            };
             if !key.starts_with(prefix) {
                 continue;
             }
@@ -432,13 +446,19 @@ impl ObjectStore {
             }
             if heap.len() < cap {
                 present.insert(sort_key.clone());
-                heap.push(Entry { sort_key, is_prefix });
+                heap.push(Entry {
+                    sort_key,
+                    is_prefix,
+                });
             } else if sort_key.as_str() < heap.peek().unwrap().sort_key.as_str() {
                 // Evict the current largest to make room for this smaller distinct entry.
                 let popped = heap.pop().unwrap();
                 present.remove(&popped.sort_key);
                 present.insert(sort_key.clone());
-                heap.push(Entry { sort_key, is_prefix });
+                heap.push(Entry {
+                    sort_key,
+                    is_prefix,
+                });
             }
         }
 
@@ -474,13 +494,23 @@ impl ObjectStore {
             objects.push(meta);
         }
 
-        Ok(ListV2Page { objects, common_prefixes, is_truncated, next_continuation_token })
+        Ok(ListV2Page {
+            objects,
+            common_prefixes,
+            is_truncated,
+            next_continuation_token,
+        })
     }
 
     // ---- multipart upload -------------------------------------------------
 
     /// Initiate a multipart upload; returns the opaque upload id.
-    pub async fn create_multipart(&self, bucket: &str, key: &str, content_type: &str) -> Result<String> {
+    pub async fn create_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+    ) -> Result<String> {
         validate_key(key)?;
         let dir = self.require_bucket(bucket).await?;
         let upload_id = new_upload_id();
@@ -508,8 +538,15 @@ impl ObjectStore {
         reader: R,
         expected_sha256: Option<&str>,
     ) -> Result<String> {
-        self.upload_part_capped(bucket, upload_id, part_number, reader, expected_sha256, None)
-            .await
+        self.upload_part_capped(
+            bucket,
+            upload_id,
+            part_number,
+            reader,
+            expected_sha256,
+            None,
+        )
+        .await
     }
 
     /// Like [`upload_part`], but `declared_len` sizes the per-part upload deadline
@@ -524,7 +561,9 @@ impl ObjectStore {
         declared_len: Option<u64>,
     ) -> Result<String> {
         if !(1..=10_000).contains(&part_number) {
-            return Err(ObjectError::InvalidArgument(format!("part number {part_number}")));
+            return Err(ObjectError::InvalidArgument(format!(
+                "part number {part_number}"
+            )));
         }
         let sdir = self.staging(bucket, upload_id).await?;
         let part = sdir.join(format!("part-{part_number}"));
@@ -564,7 +603,9 @@ impl ObjectStore {
             serde_json::from_slice(&tokio::fs::read(sdir.join("info.json")).await?)
                 .map_err(|_| ObjectError::CorruptMeta(upload_id.to_string()))?;
         if info.key != key {
-            return Err(ObjectError::InvalidArgument("key does not match upload".into()));
+            return Err(ObjectError::InvalidArgument(
+                "key does not match upload".into(),
+            ));
         }
         if part_numbers.is_empty() {
             return Err(ObjectError::InvalidArgument("no parts".into()));
@@ -799,8 +840,8 @@ impl ObjectStore {
             }
             Err(e) => return Err(e.into()),
         };
-        let meta: ObjectMeta =
-            serde_json::from_slice(&bytes).map_err(|_| ObjectError::CorruptMeta(key.to_string()))?;
+        let meta: ObjectMeta = serde_json::from_slice(&bytes)
+            .map_err(|_| ObjectError::CorruptMeta(key.to_string()))?;
         Ok((meta, obj))
     }
 }
@@ -858,7 +899,11 @@ async fn write_stream<R: AsyncRead + Unpin>(
 
 async fn mtime_secs(path: &std::path::Path) -> Option<u64> {
     let meta = tokio::fs::metadata(path).await.ok()?;
-    meta.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+    meta.modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 fn now_secs() -> u64 {
@@ -922,7 +967,9 @@ fn validate_upload_id(id: &str) -> Result<()> {
     if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(())
     } else {
-        Err(ObjectError::InvalidArgument(format!("invalid upload id {id:?}")))
+        Err(ObjectError::InvalidArgument(format!(
+            "invalid upload id {id:?}"
+        )))
     }
 }
 
@@ -930,7 +977,9 @@ fn validate_upload_id(id: &str) -> Result<()> {
 /// starting or ending with a hyphen.
 fn validate_bucket(bucket: &str) -> Result<()> {
     let ok = (3..=63).contains(&bucket.len())
-        && bucket.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && bucket
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !bucket.starts_with('-')
         && !bucket.ends_with('-');
     if ok {
@@ -972,7 +1021,10 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("my-bucket").await.unwrap();
         let body = b"hello object store";
-        let meta = s.put_object("my-bucket", "a/b/c.txt", &body[..], "text/plain", None).await.unwrap();
+        let meta = s
+            .put_object("my-bucket", "a/b/c.txt", &body[..], "text/plain", None)
+            .await
+            .unwrap();
         assert_eq!(meta.size, body.len() as u64);
         // S3 etag = hex md5 of the bytes.
         assert_eq!(meta.etag, format!("{:x}", Md5::digest(body)));
@@ -980,10 +1032,19 @@ mod tests {
         let (m2, f) = s.get_object("my-bucket", "a/b/c.txt").await.unwrap();
         assert_eq!(m2, meta);
         assert_eq!(read_all(f).await, body);
-        assert_eq!(s.head_object("my-bucket", "a/b/c.txt").await.unwrap().content_type, "text/plain");
+        assert_eq!(
+            s.head_object("my-bucket", "a/b/c.txt")
+                .await
+                .unwrap()
+                .content_type,
+            "text/plain"
+        );
 
         s.delete_object("my-bucket", "a/b/c.txt").await.unwrap();
-        assert!(matches!(s.head_object("my-bucket", "a/b/c.txt").await, Err(ObjectError::NoSuchKey(_))));
+        assert!(matches!(
+            s.head_object("my-bucket", "a/b/c.txt").await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
         // Delete is idempotent.
         s.delete_object("my-bucket", "a/b/c.txt").await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -995,10 +1056,20 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("flatbucket").await.unwrap();
         // In a hierarchical FS `a/b` and `a/b/c` would conflict; hex keys avoid it.
-        s.put_object("flatbucket", "a/b", &b"1"[..], "x", None).await.unwrap();
-        s.put_object("flatbucket", "a/b/c", &b"2"[..], "x", None).await.unwrap();
-        assert_eq!(read_all(s.get_object("flatbucket", "a/b").await.unwrap().1).await, b"1");
-        assert_eq!(read_all(s.get_object("flatbucket", "a/b/c").await.unwrap().1).await, b"2");
+        s.put_object("flatbucket", "a/b", &b"1"[..], "x", None)
+            .await
+            .unwrap();
+        s.put_object("flatbucket", "a/b/c", &b"2"[..], "x", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(s.get_object("flatbucket", "a/b").await.unwrap().1).await,
+            b"1"
+        );
+        assert_eq!(
+            read_all(s.get_object("flatbucket", "a/b/c").await.unwrap().1).await,
+            b"2"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1008,16 +1079,34 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bucket-one").await.unwrap();
         s.create_bucket("bucket-two").await.unwrap();
-        s.put_object("bucket-one", "img/a", &b"x"[..], "x", None).await.unwrap();
-        s.put_object("bucket-one", "img/b", &b"x"[..], "x", None).await.unwrap();
-        s.put_object("bucket-one", "doc/c", &b"x"[..], "x", None).await.unwrap();
-        s.put_object("bucket-two", "img/z", &b"x"[..], "x", None).await.unwrap();
+        s.put_object("bucket-one", "img/a", &b"x"[..], "x", None)
+            .await
+            .unwrap();
+        s.put_object("bucket-one", "img/b", &b"x"[..], "x", None)
+            .await
+            .unwrap();
+        s.put_object("bucket-one", "doc/c", &b"x"[..], "x", None)
+            .await
+            .unwrap();
+        s.put_object("bucket-two", "img/z", &b"x"[..], "x", None)
+            .await
+            .unwrap();
 
-        let page = s.list_objects("bucket-one", "img/", None, 1000).await.unwrap();
+        let page = s
+            .list_objects("bucket-one", "img/", None, 1000)
+            .await
+            .unwrap();
         let keys: Vec<_> = page.objects.into_iter().map(|m| m.key).collect();
         assert_eq!(keys, vec!["img/a".to_string(), "img/b".to_string()]);
         // Isolation: b2's object never shows up under b1.
-        assert_eq!(s.list_objects("bucket-two", "", None, 1000).await.unwrap().objects.len(), 1);
+        assert_eq!(
+            s.list_objects("bucket-two", "", None, 1000)
+                .await
+                .unwrap()
+                .objects
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1026,7 +1115,9 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("page-bucket").await.unwrap();
         for i in 0..5u32 {
-            s.put_object("page-bucket", &format!("k{i}"), &b"x"[..], "x", None).await.unwrap();
+            s.put_object("page-bucket", &format!("k{i}"), &b"x"[..], "x", None)
+                .await
+                .unwrap();
         }
         let p1 = s.list_objects("page-bucket", "", None, 3).await.unwrap();
         assert_eq!(p1.objects.len(), 3);
@@ -1034,12 +1125,20 @@ mod tests {
         let token = p1.next_continuation_token.unwrap();
         assert_eq!(token, "k2");
 
-        let p2 = s.list_objects("page-bucket", "", Some(&token), 3).await.unwrap();
+        let p2 = s
+            .list_objects("page-bucket", "", Some(&token), 3)
+            .await
+            .unwrap();
         assert_eq!(p2.objects.len(), 2);
         assert!(!p2.is_truncated);
         assert!(p2.next_continuation_token.is_none());
 
-        let all_keys: Vec<_> = p1.objects.iter().chain(p2.objects.iter()).map(|m| m.key.clone()).collect();
+        let all_keys: Vec<_> = p1
+            .objects
+            .iter()
+            .chain(p2.objects.iter())
+            .map(|m| m.key.clone())
+            .collect();
         assert_eq!(all_keys, vec!["k0", "k1", "k2", "k3", "k4"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1057,17 +1156,25 @@ mod tests {
         // Folders folded; only top-level files listed as objects.
         let objs: Vec<_> = page.objects.iter().map(|m| m.key.clone()).collect();
         assert_eq!(objs, vec!["root.txt".to_string(), "zeta.txt".to_string()]);
-        assert_eq!(page.common_prefixes, vec!["a/".to_string(), "b/".to_string()]);
+        assert_eq!(
+            page.common_prefixes,
+            vec!["a/".to_string(), "b/".to_string()]
+        );
         assert!(!page.is_truncated);
 
         // Descend into folder "a/": its members become the objects, no sub-folders.
         let sub = s.list_v2("buk", "a/", Some("/"), None, 1000).await.unwrap();
         let sub_objs: Vec<_> = sub.objects.iter().map(|m| m.key.clone()).collect();
-        assert_eq!(sub_objs, vec!["a/1".to_string(), "a/2".to_string(), "a/3".to_string()]);
+        assert_eq!(
+            sub_objs,
+            vec!["a/1".to_string(), "a/2".to_string(), "a/3".to_string()]
+        );
         assert!(sub.common_prefixes.is_empty());
 
         // Nested folders one level down are folded, not flattened.
-        s.put_object("buk", "a/deep/z", &b"x"[..], "x", None).await.unwrap();
+        s.put_object("buk", "a/deep/z", &b"x"[..], "x", None)
+            .await
+            .unwrap();
         let sub2 = s.list_v2("buk", "a/", Some("/"), None, 1000).await.unwrap();
         assert_eq!(sub2.common_prefixes, vec!["a/deep/".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1084,7 +1191,10 @@ mod tests {
         // 16 GiB (the default quota) at the 1 MiB/s floor rate = 16384s: above the
         // floor, below the 6h ceiling -> used as-is.
         let dq = 16u64 * 1024 * 1024 * 1024;
-        assert_eq!(upload_deadline(Some(dq)), Duration::from_secs(dq / MIN_UPLOAD_RATE));
+        assert_eq!(
+            upload_deadline(Some(dq)),
+            Duration::from_secs(dq / MIN_UPLOAD_RATE)
+        );
         assert!(upload_deadline(Some(dq)) > MIN_UPLOAD_DEADLINE);
         assert!(upload_deadline(Some(dq)) <= MAX_UPLOAD_DEADLINE);
         // A hostile / large-quota declared length is clamped to the ceiling, NOT years.
@@ -1101,15 +1211,25 @@ mod tests {
         let dir = root("marker");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("buk").await.unwrap();
-        s.put_object("buk", "dir/", &b""[..], "x", None).await.unwrap();
-        s.put_object("buk", "dir/file", &b"x"[..], "x", None).await.unwrap();
+        s.put_object("buk", "dir/", &b""[..], "x", None)
+            .await
+            .unwrap();
+        s.put_object("buk", "dir/file", &b"x"[..], "x", None)
+            .await
+            .unwrap();
 
         let root_page = s.list_v2("buk", "", Some("/"), None, 1000).await.unwrap();
-        assert!(root_page.objects.is_empty(), "marker must not list as a root object");
+        assert!(
+            root_page.objects.is_empty(),
+            "marker must not list as a root object"
+        );
         assert_eq!(root_page.common_prefixes, vec!["dir/".to_string()]);
 
         // Inside the folder, the marker object (remainder "" has no delimiter) appears.
-        let sub = s.list_v2("buk", "dir/", Some("/"), None, 1000).await.unwrap();
+        let sub = s
+            .list_v2("buk", "dir/", Some("/"), None, 1000)
+            .await
+            .unwrap();
         let keys: Vec<_> = sub.objects.iter().map(|m| m.key.clone()).collect();
         assert_eq!(keys, vec!["dir/".to_string(), "dir/file".to_string()]);
         assert!(sub.common_prefixes.is_empty());
@@ -1136,9 +1256,15 @@ mod tests {
         assert_eq!(token, "b/");
 
         // Page 2 must NOT re-list "b/" even though "b/1".."b/3" > "b/" lexically.
-        let p2 = s.list_v2("buk", "", Some("/"), Some(&token), 2).await.unwrap();
+        let p2 = s
+            .list_v2("buk", "", Some("/"), Some(&token), 2)
+            .await
+            .unwrap();
         assert_eq!(p2.common_prefixes, vec!["d/".to_string()]);
-        assert_eq!(p2.objects.iter().map(|m| m.key.clone()).collect::<Vec<_>>(), vec!["c.txt".to_string()]);
+        assert_eq!(
+            p2.objects.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
+            vec!["c.txt".to_string()]
+        );
         assert!(!p2.is_truncated);
         assert!(p2.next_continuation_token.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1148,12 +1274,26 @@ mod tests {
     async fn errors_for_missing_bucket_and_invalid_names() {
         let dir = root("err");
         let s = ObjectStore::open(&dir).unwrap();
-        assert!(matches!(s.put_object("nope", "k", &b""[..], "x", None).await, Err(ObjectError::NoSuchBucket(_))));
-        assert!(matches!(s.create_bucket("AB").await, Err(ObjectError::InvalidBucketName(_)))); // too short + uppercase
+        assert!(matches!(
+            s.put_object("nope", "k", &b""[..], "x", None).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.create_bucket("AB").await,
+            Err(ObjectError::InvalidBucketName(_))
+        )); // too short + uppercase
         s.create_bucket("ok-bucket").await.unwrap();
-        assert!(matches!(s.create_bucket("ok-bucket").await, Err(ObjectError::BucketAlreadyExists(_))));
-        s.put_object("ok-bucket", "k", &b"x"[..], "x", None).await.unwrap();
-        assert!(matches!(s.delete_bucket("ok-bucket").await, Err(ObjectError::BucketNotEmpty(_))));
+        assert!(matches!(
+            s.create_bucket("ok-bucket").await,
+            Err(ObjectError::BucketAlreadyExists(_))
+        ));
+        s.put_object("ok-bucket", "k", &b"x"[..], "x", None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.delete_bucket("ok-bucket").await,
+            Err(ObjectError::BucketNotEmpty(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1162,16 +1302,31 @@ mod tests {
         let dir = root("mpu");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("mp-bucket").await.unwrap();
-        let uid = s.create_multipart("mp-bucket", "big/file", "application/octet-stream").await.unwrap();
-        let e1 = s.upload_part("mp-bucket", &uid, 1, &b"hello "[..], None).await.unwrap();
-        let e2 = s.upload_part("mp-bucket", &uid, 2, &b"world"[..], None).await.unwrap();
+        let uid = s
+            .create_multipart("mp-bucket", "big/file", "application/octet-stream")
+            .await
+            .unwrap();
+        let e1 = s
+            .upload_part("mp-bucket", &uid, 1, &b"hello "[..], None)
+            .await
+            .unwrap();
+        let e2 = s
+            .upload_part("mp-bucket", &uid, 2, &b"world"[..], None)
+            .await
+            .unwrap();
         assert_eq!(e1, format!("{:x}", Md5::digest(b"hello ")));
         assert_eq!(e2, format!("{:x}", Md5::digest(b"world")));
 
-        let meta = s.complete_multipart("mp-bucket", "big/file", &uid, &[1, 2]).await.unwrap();
+        let meta = s
+            .complete_multipart("mp-bucket", "big/file", &uid, &[1, 2])
+            .await
+            .unwrap();
         assert_eq!(meta.size, 11);
         assert!(meta.etag.ends_with("-2")); // S3 multipart etag carries the part count
-        assert_eq!(read_all(s.get_object("mp-bucket", "big/file").await.unwrap().1).await, b"hello world");
+        assert_eq!(
+            read_all(s.get_object("mp-bucket", "big/file").await.unwrap().1).await,
+            b"hello world"
+        );
 
         // The upload id is consumed by complete.
         assert!(matches!(
@@ -1190,13 +1345,18 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("ab-bucket").await.unwrap();
         let uid = s.create_multipart("ab-bucket", "k", "x").await.unwrap();
-        s.upload_part("ab-bucket", &uid, 1, &b"data"[..], None).await.unwrap();
+        s.upload_part("ab-bucket", &uid, 1, &b"data"[..], None)
+            .await
+            .unwrap();
         s.abort_multipart("ab-bucket", &uid).await.unwrap();
         assert!(matches!(
             s.complete_multipart("ab-bucket", "k", &uid, &[1]).await,
             Err(ObjectError::NoSuchUpload(_))
         ));
-        assert!(matches!(s.head_object("ab-bucket", "k").await, Err(ObjectError::NoSuchKey(_))));
+        assert!(matches!(
+            s.head_object("ab-bucket", "k").await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1205,8 +1365,13 @@ mod tests {
         let dir = root("mpu-list");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("sweep-bucket").await.unwrap();
-        let uid = s.create_multipart("sweep-bucket", "pending/obj", "application/octet-stream").await.unwrap();
-        s.upload_part("sweep-bucket", &uid, 1, &b"part"[..], None).await.unwrap();
+        let uid = s
+            .create_multipart("sweep-bucket", "pending/obj", "application/octet-stream")
+            .await
+            .unwrap();
+        s.upload_part("sweep-bucket", &uid, 1, &b"part"[..], None)
+            .await
+            .unwrap();
 
         let uploads = s.list_multipart_uploads("sweep-bucket").await.unwrap();
         assert_eq!(uploads.len(), 1);
@@ -1216,14 +1381,23 @@ mod tests {
         // Zero seconds max_age -> everything is "stale" (initiated <= now - 0 = now).
         // Use 1s so freshly created upload IS stale only when initiated < now.
         // Force stale by using a tiny threshold: max_age = u64::MAX seconds.
-        let removed = s.sweep_stale_uploads(Duration::from_secs(u64::MAX / 2)).await.unwrap();
+        let removed = s
+            .sweep_stale_uploads(Duration::from_secs(u64::MAX / 2))
+            .await
+            .unwrap();
         // Not stale (just created) — no removal.
         assert_eq!(removed, 0);
 
         // With max_age=0 every upload is stale.
         let removed = s.sweep_stale_uploads(Duration::from_secs(0)).await.unwrap();
         assert_eq!(removed, 1);
-        assert_eq!(s.list_multipart_uploads("sweep-bucket").await.unwrap().len(), 0);
+        assert_eq!(
+            s.list_multipart_uploads("sweep-bucket")
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1237,14 +1411,19 @@ mod tests {
         let body = b"content to verify";
         let correct = format!("{:x}", Sha256::digest(body));
         // Correct hash -> succeeds.
-        s.put_object("sha-bucket", "k", &body[..], "x", Some(&correct)).await.unwrap();
+        s.put_object("sha-bucket", "k", &body[..], "x", Some(&correct))
+            .await
+            .unwrap();
         // Wrong hash -> ContentSha256Mismatch.
         assert!(matches!(
-            s.put_object("sha-bucket", "k", &body[..], "x", Some("aaaa")).await,
+            s.put_object("sha-bucket", "k", &body[..], "x", Some("aaaa"))
+                .await,
             Err(ObjectError::ContentSha256Mismatch)
         ));
         // None -> no check.
-        s.put_object("sha-bucket", "k", &body[..], "x", None).await.unwrap();
+        s.put_object("sha-bucket", "k", &body[..], "x", None)
+            .await
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

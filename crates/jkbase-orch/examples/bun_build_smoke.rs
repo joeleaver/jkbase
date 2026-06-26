@@ -68,7 +68,11 @@ async fn main() -> anyhow::Result<()> {
         Ok(k) => PathBuf::from(k),
         Err(_) => {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         }
     };
     if !kernel.exists() {
@@ -151,10 +155,16 @@ async fn main() -> anyhow::Result<()> {
     );
     let run = BuildVm::run("bs", &cfg, &data.join("run")).await?;
     let outcome = run.outcome;
-    println!("    outcome: {outcome:?} (cpu={:?}us wall={:?})", run.cpu_usec, run.wall);
+    println!(
+        "    outcome: {outcome:?} (cpu={:?}us wall={:?})",
+        run.cpu_usec, run.wall
+    );
 
     if let Some(log) = build_output::read_capped(&output_img, "/build.log", 16 * 1024)? {
-        println!("    --- build.log ---\n{}\n    -----------------", String::from_utf8_lossy(&log).trim_end());
+        println!(
+            "    --- build.log ---\n{}\n    -----------------",
+            String::from_utf8_lossy(&log).trim_end()
+        );
     }
     if outcome != BuildOutcome::Completed {
         anyhow::bail!("build VM did not power off cleanly: {outcome:?}");
@@ -177,7 +187,11 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("/rootfs.tar.gz is not gzip-framed (bad magic)");
     }
     let entries = list_tar_gz(&tar_gz)?;
-    println!("    /rootfs.tar.gz: {} bytes, {} entries", tar_gz.len(), entries.len());
+    println!(
+        "    /rootfs.tar.gz: {} bytes, {} entries",
+        tar_gz.len(),
+        entries.len()
+    );
     if !entries.iter().any(|e| e.ends_with("server.ts")) {
         anyhow::bail!("exported rootfs is missing server.ts (entries: {entries:?})");
     }
@@ -201,7 +215,9 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("missing env NODE_ENV=production: {}", mani["env"]);
     }
 
-    println!("\nPASS: Bun source -> bun.ext4 build VM -> flat rootfs + launch manifest, end-to-end.");
+    println!(
+        "\nPASS: Bun source -> bun.ext4 build VM -> flat rootfs + launch manifest, end-to-end."
+    );
     Ok(())
 }
 

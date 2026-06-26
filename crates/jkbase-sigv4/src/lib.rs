@@ -64,7 +64,9 @@ pub fn uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             b'/' if !encode_slash => out.push('/'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -112,7 +114,11 @@ fn civil(now_unix: u64) -> (i64, u32, u32, u32, u32, u32) {
     let secs = now_unix as i64;
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    let (hh, mm, ss) = (
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    );
     // days since 1970-01-01 → civil date
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -179,14 +185,20 @@ pub fn presign(
     let scope = format!("{date}/{region}/{SERVICE}/{AWS_REQUEST}");
     let mut params = vec![
         ("X-Amz-Algorithm".to_string(), ALGORITHM.to_string()),
-        ("X-Amz-Credential".to_string(), format!("{access_key}/{scope}")),
+        (
+            "X-Amz-Credential".to_string(),
+            format!("{access_key}/{scope}"),
+        ),
         ("X-Amz-Date".to_string(), amzd.clone()),
         ("X-Amz-Expires".to_string(), expires_secs.to_string()),
         ("X-Amz-SignedHeaders".to_string(), "host".to_string()),
     ];
     let cquery = canonical_query(&params, "");
     let creq = build_canonical_request(method, path, &cquery, host);
-    let sts = format!("{ALGORITHM}\n{amzd}\n{scope}\n{}", sha256_hex(creq.as_bytes()));
+    let sts = format!(
+        "{ALGORITHM}\n{amzd}\n{scope}\n{}",
+        sha256_hex(creq.as_bytes())
+    );
     let sig = hex(&hmac(&signing_key(secret, &date, region), sts.as_bytes()));
     params.push(("X-Amz-Signature".to_string(), sig));
     let qs = params
@@ -212,7 +224,12 @@ pub fn verify_presigned(
     lookup_secret: impl Fn(&str) -> Option<String>,
     now_unix: u64,
 ) -> Result<String, String> {
-    let get = |k: &str| query.iter().find(|(qk, _)| qk == k).map(|(_, v)| v.as_str());
+    let get = |k: &str| {
+        query
+            .iter()
+            .find(|(qk, _)| qk == k)
+            .map(|(_, v)| v.as_str())
+    };
     let cred = get("X-Amz-Credential").ok_or("missing X-Amz-Credential")?;
     let amzd = get("X-Amz-Date").ok_or("missing X-Amz-Date")?;
     let expires: u64 = get("X-Amz-Expires")
@@ -246,7 +263,10 @@ pub fn verify_presigned(
     let cquery = canonical_query(query, "X-Amz-Signature");
     let creq = build_canonical_request(method, path, &cquery, host);
     let scope = format!("{date}/{region}/{SERVICE}/{AWS_REQUEST}");
-    let sts = format!("{ALGORITHM}\n{amzd}\n{scope}\n{}", sha256_hex(creq.as_bytes()));
+    let sts = format!(
+        "{ALGORITHM}\n{amzd}\n{scope}\n{}",
+        sha256_hex(creq.as_bytes())
+    );
     let sig = hex(&hmac(&signing_key(&secret, date, region), sts.as_bytes()));
 
     if ct_eq(sig.as_bytes(), provided.as_bytes()) {
@@ -276,13 +296,17 @@ pub fn sign_header(
     let date = date_stamp(now_unix);
     let scope = format!("{date}/{region}/{SERVICE}/{AWS_REQUEST}");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    let canonical_headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amzd}\n");
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amzd}\n");
     let cquery = canonical_query(query, "");
     let creq = format!(
         "{method}\n{}\n{cquery}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
         uri_encode(path, false)
     );
-    let sts = format!("{ALGORITHM}\n{amzd}\n{scope}\n{}", sha256_hex(creq.as_bytes()));
+    let sts = format!(
+        "{ALGORITHM}\n{amzd}\n{scope}\n{}",
+        sha256_hex(creq.as_bytes())
+    );
     let sig = hex(&hmac(&signing_key(secret, &date, region), sts.as_bytes()));
     let auth = format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={sig}"
@@ -356,7 +380,10 @@ pub fn verify_header(
         uri_encode(path, false)
     );
     let scope = format!("{date}/{region}/{SERVICE}/{AWS_REQUEST}");
-    let sts = format!("{ALGORITHM}\n{amzd}\n{scope}\n{}", sha256_hex(creq.as_bytes()));
+    let sts = format!(
+        "{ALGORITHM}\n{amzd}\n{scope}\n{}",
+        sha256_hex(creq.as_bytes())
+    );
     let computed = hex(&hmac(&signing_key(&secret, date, region), sts.as_bytes()));
 
     if ct_eq(computed.as_bytes(), provided.as_bytes()) {
@@ -408,7 +435,16 @@ mod tests {
 
     #[test]
     fn presign_then_verify_round_trips() {
-        let url = presign("GET", "s3.jkbase.app", "/bucket/dir/obj.txt", KEY, SECRET, "us-east-1", 900, NOW);
+        let url = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/bucket/dir/obj.txt",
+            KEY,
+            SECRET,
+            "us-east-1",
+            900,
+            NOW,
+        );
         let (path, q) = split(&url);
         assert_eq!(
             verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW + 100),
@@ -423,7 +459,16 @@ mod tests {
         // passes. (Before the fix the URL embedded the raw key, so a space/& key never
         // verified.)
         for key in ["/b/a b", "/b/a&b", "/b/p l/u s"] {
-            let url = presign("GET", "s3.jkbase.app", key, KEY, SECRET, "us-east-1", 900, NOW);
+            let url = presign(
+                "GET",
+                "s3.jkbase.app",
+                key,
+                KEY,
+                SECRET,
+                "us-east-1",
+                900,
+                NOW,
+            );
             let (enc_path, q) = split(&url);
             assert!(!enc_path.contains(' '), "path left unencoded: {enc_path}");
             let decoded = pct_decode(&enc_path); // what the server does before verify_presigned
@@ -437,7 +482,16 @@ mod tests {
 
     #[test]
     fn tampered_signature_is_rejected() {
-        let url = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 900, NOW);
+        let url = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            SECRET,
+            "us-east-1",
+            900,
+            NOW,
+        );
         let (path, mut q) = split(&url);
         for (k, v) in q.iter_mut() {
             if k == "X-Amz-Signature" {
@@ -450,29 +504,74 @@ mod tests {
     #[test]
     fn presign_rejects_unbounded_expiry_and_future_date() {
         // Expiry beyond the 7-day cap is rejected even with a valid signature.
-        let url = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 700_000, NOW);
+        let url = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            SECRET,
+            "us-east-1",
+            700_000,
+            NOW,
+        );
         let (path, q) = split(&url);
         assert!(verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW).is_err());
         // A future-dated signature (signed_at well ahead of now) is rejected.
-        let url2 = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 900, NOW + 100_000);
+        let url2 = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            SECRET,
+            "us-east-1",
+            900,
+            NOW + 100_000,
+        );
         let (path2, q2) = split(&url2);
         assert!(verify_presigned("GET", "s3.jkbase.app", &path2, &q2, lookup, NOW).is_err());
         // A normal one still round-trips.
-        let url3 = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 900, NOW);
+        let url3 = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            SECRET,
+            "us-east-1",
+            900,
+            NOW,
+        );
         let (path3, q3) = split(&url3);
         assert!(verify_presigned("GET", "s3.jkbase.app", &path3, &q3, lookup, NOW + 10).is_ok());
     }
 
     #[test]
     fn expired_url_is_rejected() {
-        let url = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 60, NOW);
+        let url = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            SECRET,
+            "us-east-1",
+            60,
+            NOW,
+        );
         let (path, q) = split(&url);
         assert!(verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW + 61).is_err());
     }
 
     #[test]
     fn wrong_secret_and_unknown_key_are_rejected() {
-        let url = presign("GET", "s3.jkbase.app", "/b/k", KEY, "OTHER-SECRET", "us-east-1", 900, NOW);
+        let url = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            "OTHER-SECRET",
+            "us-east-1",
+            900,
+            NOW,
+        );
         let (path, q) = split(&url);
         // Signed with a different secret than `lookup` returns -> mismatch.
         assert!(verify_presigned("GET", "s3.jkbase.app", &path, &q, lookup, NOW).is_err());
@@ -482,7 +581,16 @@ mod tests {
 
     #[test]
     fn host_and_method_are_bound() {
-        let url = presign("GET", "s3.jkbase.app", "/b/k", KEY, SECRET, "us-east-1", 900, NOW);
+        let url = presign(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            KEY,
+            SECRET,
+            "us-east-1",
+            900,
+            NOW,
+        );
         let (path, q) = split(&url);
         // Different host or method must not validate (they're in the signature).
         assert!(verify_presigned("GET", "evil.example.com", &path, &q, lookup, NOW).is_err());
@@ -501,11 +609,29 @@ mod tests {
     #[test]
     fn header_sign_then_verify_round_trips() {
         let q: Vec<(String, String)> = vec![];
-        let (auth, amzd) =
-            sign_header("PUT", "s3.jkbase.app", "/bucket/key", &q, "UNSIGNED-PAYLOAD", KEY, SECRET, "us-east-1", NOW);
+        let (auth, amzd) = sign_header(
+            "PUT",
+            "s3.jkbase.app",
+            "/bucket/key",
+            &q,
+            "UNSIGNED-PAYLOAD",
+            KEY,
+            SECRET,
+            "us-east-1",
+            NOW,
+        );
         let h = hdrs(&amzd, "UNSIGNED-PAYLOAD");
         assert_eq!(
-            verify_header("PUT", "s3.jkbase.app", "/bucket/key", &q, &h, &auth, lookup, NOW + 10),
+            verify_header(
+                "PUT",
+                "s3.jkbase.app",
+                "/bucket/key",
+                &q,
+                &h,
+                &auth,
+                lookup,
+                NOW + 10
+            ),
             Ok(KEY.to_string())
         );
     }
@@ -513,16 +639,51 @@ mod tests {
     #[test]
     fn header_rejects_skew_unknown_key_and_tamper() {
         let q: Vec<(String, String)> = vec![];
-        let (auth, amzd) =
-            sign_header("GET", "s3.jkbase.app", "/b/k", &q, "UNSIGNED-PAYLOAD", KEY, SECRET, "us-east-1", NOW);
+        let (auth, amzd) = sign_header(
+            "GET",
+            "s3.jkbase.app",
+            "/b/k",
+            &q,
+            "UNSIGNED-PAYLOAD",
+            KEY,
+            SECRET,
+            "us-east-1",
+            NOW,
+        );
         let h = hdrs(&amzd, "UNSIGNED-PAYLOAD");
         // Clock skew beyond 15 minutes.
-        assert!(verify_header("GET", "s3.jkbase.app", "/b/k", &q, &h, &auth, lookup, NOW + 1000).is_err());
+        assert!(
+            verify_header(
+                "GET",
+                "s3.jkbase.app",
+                "/b/k",
+                &q,
+                &h,
+                &auth,
+                lookup,
+                NOW + 1000
+            )
+            .is_err()
+        );
         // Unknown access key.
-        assert!(verify_header("GET", "s3.jkbase.app", "/b/k", &q, &h, &auth, |_| None, NOW).is_err());
+        assert!(
+            verify_header("GET", "s3.jkbase.app", "/b/k", &q, &h, &auth, |_| None, NOW).is_err()
+        );
         // Tamper a signed header value -> signature mismatch.
         let tampered = hdrs(&amzd, "deadbeef");
-        assert!(verify_header("GET", "s3.jkbase.app", "/b/k", &q, &tampered, &auth, lookup, NOW).is_err());
+        assert!(
+            verify_header(
+                "GET",
+                "s3.jkbase.app",
+                "/b/k",
+                &q,
+                &tampered,
+                &auth,
+                lookup,
+                NOW
+            )
+            .is_err()
+        );
     }
 }
 
@@ -536,8 +697,17 @@ mod cross_vector {
 
     #[test]
     fn header_signature_is_stable() {
-        let (auth, amzd) =
-            sign_header("GET", "s3.test", "/b/k", &[], "UNSIGNED-PAYLOAD", "AKID", "SECRET", "us-east-1", NOW);
+        let (auth, amzd) = sign_header(
+            "GET",
+            "s3.test",
+            "/b/k",
+            &[],
+            "UNSIGNED-PAYLOAD",
+            "AKID",
+            "SECRET",
+            "us-east-1",
+            NOW,
+        );
         assert_eq!(amzd, "20231114T221320Z");
         assert!(auth.ends_with(
             "Signature=0f0c7b988b19fb25857e216bac0116a054f0cb91696c0ae00e81bb06520cf115"
@@ -546,7 +716,16 @@ mod cross_vector {
 
     #[test]
     fn presign_signature_is_stable() {
-        let url = presign("GET", "s3.test", "/b/k", "AKID", "SECRET", "us-east-1", 900, NOW);
+        let url = presign(
+            "GET",
+            "s3.test",
+            "/b/k",
+            "AKID",
+            "SECRET",
+            "us-east-1",
+            900,
+            NOW,
+        );
         assert!(url.ends_with(
             "X-Amz-Signature=67dfd03db2009a8216e3779a68cb239b0ba9579b44c4b3fe168cd0b0bab28614"
         ));

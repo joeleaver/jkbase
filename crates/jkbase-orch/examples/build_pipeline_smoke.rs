@@ -36,7 +36,10 @@ async fn main() -> anyhow::Result<()> {
     let source_img = workspace.join("function-app.source.img");
     let output_img = workspace.join("function-app.output.img");
 
-    println!("[1/3] building RO source drive from {} (no mount) ...", source_dir.display());
+    println!(
+        "[1/3] building RO source drive from {} (no mount) ...",
+        source_dir.display()
+    );
     build_ro_ext4_from_dir(&source_dir, &source_img, 16)?;
 
     let cfg = BuildVmConfig {
@@ -82,13 +85,22 @@ async fn main() -> anyhow::Result<()> {
     };
 
     std::fs::create_dir_all(&cfg.chroot_base)?;
-    println!("[2/3] booting jailed build VM (timeout {}s) ...", cfg.timeout.as_secs());
+    println!(
+        "[2/3] booting jailed build VM (timeout {}s) ...",
+        cfg.timeout.as_secs()
+    );
     let run = BuildVm::run("bp-smoke", &cfg, &data.join("run")).await?;
     let outcome = run.outcome;
-    println!("    outcome: {outcome:?} (cpu={:?}us wall={:?})", run.cpu_usec, run.wall);
+    println!(
+        "    outcome: {outcome:?} (cpu={:?}us wall={:?})",
+        run.cpu_usec, run.wall
+    );
 
     if let Some(log) = build_output::read_capped(&output_img, "/build.log", 8 * 1024)? {
-        println!("    --- build.log ---\n{}", String::from_utf8_lossy(&log).trim_end());
+        println!(
+            "    --- build.log ---\n{}",
+            String::from_utf8_lossy(&log).trim_end()
+        );
     }
     if outcome != BuildOutcome::Completed {
         anyhow::bail!("build VM did not complete cleanly: {outcome:?}");

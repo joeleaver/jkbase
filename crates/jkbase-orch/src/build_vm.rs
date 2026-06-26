@@ -29,11 +29,11 @@ use crate::firecracker::{
     BootSource, Drive, FirecrackerClient, MachineConfig, NetworkInterface, VsockConfig,
 };
 use crate::jailer::{self, JailerConfig, JailerLayout};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -262,7 +262,10 @@ impl BuildVm {
 
         // RO: kernel + toolchain + source, hard-linked (must be 0o444 at source).
         jailer::stage_ro(&config.kernel_path, &layout.chroot_root.join("kernel"))?;
-        jailer::stage_ro(&config.toolchain_rootfs, &layout.drives_dir.join("rootfs.img"))?;
+        jailer::stage_ro(
+            &config.toolchain_rootfs,
+            &layout.drives_dir.join("rootfs.img"),
+        )?;
         jailer::stage_ro(&config.source_drive, &layout.drives_dir.join("source.img"))?;
 
         // RW: preallocated (non-sparse) so guest writes can't host-ENOSPC.
@@ -318,14 +321,21 @@ impl BuildVm {
         let seal_notify = Arc::new(Notify::new());
         let mut drains = Vec::new();
         if let Some(out) = process.stdout.take() {
-            drains.push(tokio::spawn(drain_into(out, log.clone(), seal_notify.clone())));
+            drains.push(tokio::spawn(drain_into(
+                out,
+                log.clone(),
+                seal_notify.clone(),
+            )));
         }
         if let Some(err) = process.stderr.take() {
-            drains.push(tokio::spawn(drain_into(err, log.clone(), seal_notify.clone())));
+            drains.push(tokio::spawn(drain_into(
+                err,
+                log.clone(),
+                seal_notify.clone(),
+            )));
         }
 
-        let outcome =
-            Self::configure_and_wait(id, config, layout, &mut process, seal_notify).await;
+        let outcome = Self::configure_and_wait(id, config, layout, &mut process, seal_notify).await;
 
         // Explicit reap of the jailer/firecracker child; the cgroup liveness
         // check in teardown is what actually guarantees no escapee survives.
@@ -341,7 +351,10 @@ impl BuildVm {
     fn jailer_config(id: &str, config: &BuildVmConfig) -> JailerConfig {
         let cgroups = vec![
             ("pids.max".to_string(), config.cgroup_pids_max.to_string()),
-            ("memory.max".to_string(), config.cgroup_mem_max_bytes.to_string()),
+            (
+                "memory.max".to_string(),
+                config.cgroup_mem_max_bytes.to_string(),
+            ),
             // No swap: a hostile build can't push host into swap thrash.
             ("memory.swap.max".to_string(), "0".to_string()),
             ("cpu.max".to_string(), config.cgroup_cpu_max.clone()),
@@ -415,7 +428,9 @@ impl BuildVm {
         }
         if let Some(builder) = &config.builder_hint
             && !builder.is_empty()
-            && builder.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && builder
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
             boot_args.push_str(&format!(" jkbase.builder={builder}"));
         }
@@ -505,7 +520,11 @@ impl BuildVm {
                 .await?;
         }
 
-        info!(id, timeout_secs = config.timeout.as_secs(), "booting build VM");
+        info!(
+            id,
+            timeout_secs = config.timeout.as_secs(),
+            "booting build VM"
+        );
         client.start().await?;
 
         // Fetch-then-seal: when a seal action is configured, the host tears the

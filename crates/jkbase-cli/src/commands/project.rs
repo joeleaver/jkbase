@@ -57,8 +57,9 @@ struct ErrorResponse {
 }
 
 pub async fn run(command: ProjectCommand) -> Result<()> {
-    let token = crate::credentials::load_token()?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated — run `jkbase init` or `jkbase login` first"))?;
+    let token = crate::credentials::load_token()?.ok_or_else(|| {
+        anyhow::anyhow!("not authenticated — run `jkbase init` or `jkbase login` first")
+    })?;
     let client = crate::credentials::authenticated_client(&token);
 
     match command {
@@ -98,7 +99,11 @@ pub async fn run(command: ProjectCommand) -> Result<()> {
                 }
             }
         }
-        ProjectCommand::Delete { name, force: _, api } => {
+        ProjectCommand::Delete {
+            name,
+            force: _,
+            api,
+        } => {
             let id = slug(&name);
             let resp = client
                 .delete(format!("{api}/projects/{id}"))

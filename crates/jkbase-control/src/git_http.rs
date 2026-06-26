@@ -69,7 +69,11 @@ pub async fn ensure_bare_repo(repo: &Path) -> Result<()> {
     .await;
     // Don't run fsck on every object set on the hot path (it's slow); the VM
     // boundary, not object well-formedness, is the security boundary (§9).
-    let _ = run_git(&["--git-dir", &dir, "config", "receive.fsckObjects", "false"], None).await;
+    let _ = run_git(
+        &["--git-dir", &dir, "config", "receive.fsckObjects", "false"],
+        None,
+    )
+    .await;
     Ok(())
 }
 
@@ -129,9 +133,12 @@ pub async fn receive_pack(repo: &Path, input: Vec<u8>) -> Result<Vec<u8>> {
 pub async fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
     let dir = repo.to_string_lossy().to_string();
     let refname = format!("refs/heads/{branch}");
-    let out = run_git(&["--git-dir", &dir, "rev-parse", "--verify", "-q", &refname], None)
-        .await
-        .ok()?;
+    let out = run_git(
+        &["--git-dir", &dir, "rev-parse", "--verify", "-q", &refname],
+        None,
+    )
+    .await
+    .ok()?;
     let oid = String::from_utf8_lossy(&out).trim().to_string();
     (!oid.is_empty()).then_some(oid)
 }
@@ -160,11 +167,17 @@ async fn run_git(args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
 
     let mut cmd = Command::new("git");
     cmd.args(args)
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().context("spawn git (is it installed on the host?)")?;
+    let mut child = cmd
+        .spawn()
+        .context("spawn git (is it installed on the host?)")?;
 
     // Write stdin and read stdout concurrently so a large report doesn't
     // deadlock against a still-writing stdin pipe.
@@ -182,7 +195,11 @@ async fn run_git(args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("git {:?} failed: {}", args.first().unwrap_or(&"?"), stderr.trim());
+        bail!(
+            "git {:?} failed: {}",
+            args.first().unwrap_or(&"?"),
+            stderr.trim()
+        );
     }
     Ok(out.stdout)
 }
@@ -192,9 +209,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

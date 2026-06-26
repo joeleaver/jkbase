@@ -47,8 +47,7 @@ pub fn start_chrony() {
         tracing::error!(error = %e, dir = CHRONY_RUNDIR, "failed to create chrony run dir; clock will drift");
         return;
     }
-    if let Err(e) =
-        std::fs::set_permissions(CHRONY_RUNDIR, std::fs::Permissions::from_mode(0o750))
+    if let Err(e) = std::fs::set_permissions(CHRONY_RUNDIR, std::fs::Permissions::from_mode(0o750))
     {
         tracing::warn!(error = %e, "failed to chmod chrony run dir 0750; command socket may be disabled");
     }

@@ -188,8 +188,9 @@ pub fn module_name(app_dir: &Path) -> Option<String> {
 /// True for a Go semantic-import major-version path element: `v` followed by digits,
 /// e.g. `v2`, `v10` (but not `v0`/`v1`, which never appear as a path suffix).
 fn is_major_version(s: &str) -> bool {
-    s.strip_prefix('v')
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n != "0" && n != "1")
+    s.strip_prefix('v').is_some_and(|n| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && n != "0" && n != "1"
+    })
 }
 
 /// The executables `go build -o <dir>/` produced (name → path), sorted by name for a
@@ -207,7 +208,10 @@ fn collect_binaries(bindir: &Path) -> Result<Vec<(String, PathBuf)>> {
         let md = entry.metadata()?;
         // A regular, executable file.
         if md.is_file() && md.permissions().mode() & 0o111 != 0 {
-            out.push((entry.file_name().to_string_lossy().into_owned(), entry.path()));
+            out.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -236,12 +240,15 @@ fn assemble_app_layer(app_dir: &Path, app_at: &Path, bins: &[(String, PathBuf)])
     std::fs::create_dir_all(app_at)
         .with_context(|| format!("creating app layer dir {}", app_at.display()))?;
     const EXCLUDE: &[&str] = &[".git"];
-    for entry in std::fs::read_dir(app_dir)
-        .with_context(|| format!("read app dir {}", app_dir.display()))?
+    for entry in
+        std::fs::read_dir(app_dir).with_context(|| format!("read app dir {}", app_dir.display()))?
     {
         let entry = entry?;
         let name = entry.file_name();
-        if EXCLUDE.iter().any(|e| name.as_os_str() == std::ffi::OsStr::new(e)) {
+        if EXCLUDE
+            .iter()
+            .any(|e| name.as_os_str() == std::ffi::OsStr::new(e))
+        {
             continue;
         }
         std::fs::rename(entry.path(), app_at.join(&name))
@@ -301,7 +308,11 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         let lines: Vec<&str> = combined.lines().collect();
         let tail = lines[lines.len().saturating_sub(40)..].join("\n");
-        anyhow::bail!("`{what}` failed: {}\n--- output (tail) ---\n{}", out.status, tail);
+        anyhow::bail!(
+            "`{what}` failed: {}\n--- output (tail) ---\n{}",
+            out.status,
+            tail
+        );
     }
     Ok(())
 }
@@ -354,7 +365,11 @@ mod tests {
     #[test]
     fn module_name_takes_last_path_element() {
         let d = tempdir().unwrap();
-        write(d.path(), "go.mod", "module github.com/acme/widget\n\ngo 1.22\n");
+        write(
+            d.path(),
+            "go.mod",
+            "module github.com/acme/widget\n\ngo 1.22\n",
+        );
         assert_eq!(module_name(d.path()).as_deref(), Some("widget"));
         let d2 = tempdir().unwrap();
         write(d2.path(), "go.mod", "module standalone\n");
@@ -365,7 +380,11 @@ mod tests {
     fn module_name_strips_major_version_suffix() {
         // go names the binary after the element BEFORE a /vN major-version marker.
         let d = tempdir().unwrap();
-        write(d.path(), "go.mod", "module github.com/acme/widget/v2\n\ngo 1.22\n");
+        write(
+            d.path(),
+            "go.mod",
+            "module github.com/acme/widget/v2\n\ngo 1.22\n",
+        );
         assert_eq!(module_name(d.path()).as_deref(), Some("widget"));
         let d2 = tempdir().unwrap();
         write(d2.path(), "go.mod", "module example.com/svc/v10\n");
@@ -425,10 +444,20 @@ mod tests {
         let app_at = d.path().join("layer/app");
         assemble_app_layer(&app, &app_at, &bins).unwrap();
 
-        assert_eq!(fs::read_to_string(app_at.join("templates/index.html")).unwrap(), "<h1>hi</h1>");
+        assert_eq!(
+            fs::read_to_string(app_at.join("templates/index.html")).unwrap(),
+            "<h1>hi</h1>"
+        );
         assert!(app_at.join("main.go").exists());
         assert!(app_at.join("svc").exists());
-        assert_eq!(fs::metadata(app_at.join("svc")).unwrap().permissions().mode() & 0o111, 0o111);
+        assert_eq!(
+            fs::metadata(app_at.join("svc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o111
+        );
         assert!(!app_at.join(".git").exists(), ".git must not ship");
     }
 }

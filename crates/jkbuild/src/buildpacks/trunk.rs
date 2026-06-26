@@ -219,10 +219,9 @@ pub fn dist_dir(app_dir: &Path) -> String {
 /// tree has no build/VCS dirs to exclude (trunk writes only the bundle), so this is
 /// an unconditional move. Pure filesystem ops (no trunk) → unit-testable.
 fn move_tree_contents(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)
-        .with_context(|| format!("creating dest {}", dst.display()))?;
-    for entry in std::fs::read_dir(src)
-        .with_context(|| format!("read dist dir {}", src.display()))?
+    std::fs::create_dir_all(dst).with_context(|| format!("creating dest {}", dst.display()))?;
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("read dist dir {}", src.display()))?
     {
         let entry = entry?;
         let name = entry.file_name();
@@ -274,8 +273,9 @@ fn provision_wasm_bindgen(ctx: &BuildContext, trunk_cache: &Path, version: &str)
     let dest = bin_dir.join("wasm-bindgen");
     std::fs::create_dir_all(&bin_dir).with_context(|| format!("creating {}", bin_dir.display()))?;
     let asset = format!("wasm-bindgen-{version}-x86_64-unknown-linux-musl");
-    let url =
-        format!("https://github.com/rustwasm/wasm-bindgen/releases/download/{version}/{asset}.tar.gz");
+    let url = format!(
+        "https://github.com/rustwasm/wasm-bindgen/releases/download/{version}/{asset}.tar.gz"
+    );
     let tgz = cache_dir.join("wasm-bindgen-dl.tar.gz");
 
     // curl through the egress proxy (HTTPS_PROXY set by apply_proxy); -L follows the
@@ -283,7 +283,12 @@ fn provision_wasm_bindgen(ctx: &BuildContext, trunk_cache: &Path, version: &str)
     let mut dl = Command::new("curl");
     dl.env("PATH", BUILD_PATH);
     apply_proxy(&mut dl, ctx);
-    dl.arg("-fSL").arg("--retry").arg("3").arg("-o").arg(&tgz).arg(&url);
+    dl.arg("-fSL")
+        .arg("--retry")
+        .arg("3")
+        .arg("-o")
+        .arg(&tgz)
+        .arg(&url);
     run(dl, "curl wasm-bindgen release")?;
 
     // Extract just the `wasm-bindgen` binary (tar-rs refuses path escapes); the archive
@@ -310,8 +315,8 @@ fn extract_named(tgz: &Path, filename: &str, dest: &Path) -> Result<()> {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
         if path.file_name().and_then(|n| n.to_str()) == Some(filename) {
-            let mut out =
-                std::fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
+            let mut out = std::fs::File::create(dest)
+                .with_context(|| format!("create {}", dest.display()))?;
             std::io::copy(&mut entry, &mut out).context("write extracted binary")?;
             return Ok(());
         }
@@ -365,7 +370,11 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         let lines: Vec<&str> = combined.lines().collect();
         let tail = lines[lines.len().saturating_sub(40)..].join("\n");
-        anyhow::bail!("`{what}` failed: {}\n--- output (tail) ---\n{}", out.status, tail);
+        anyhow::bail!(
+            "`{what}` failed: {}\n--- output (tail) ---\n{}",
+            out.status,
+            tail
+        );
     }
     Ok(())
 }
@@ -471,10 +480,16 @@ mod tests {
         move_tree_contents(&dist, &layer).unwrap();
 
         // The bundle lands at the layer root (index.html at the served site root).
-        assert_eq!(fs::read_to_string(layer.join("index.html")).unwrap(), "<html>");
+        assert_eq!(
+            fs::read_to_string(layer.join("index.html")).unwrap(),
+            "<html>"
+        );
         assert!(layer.join("app-abc123.js").exists());
         assert!(layer.join("app-abc123_bg.wasm").exists());
-        assert_eq!(fs::read_to_string(layer.join("assets/logo.svg")).unwrap(), "<svg>");
+        assert_eq!(
+            fs::read_to_string(layer.join("assets/logo.svg")).unwrap(),
+            "<svg>"
+        );
         // The source dist entries were moved out.
         assert!(!dist.join("index.html").exists());
     }

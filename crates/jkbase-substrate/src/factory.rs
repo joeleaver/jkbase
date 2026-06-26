@@ -10,8 +10,8 @@
 //! call as they are added.
 
 use crate::{
-    BlobStore, Caps, ControlStore, DataDiskProvider, FlockLease, Lease, LocalFsBlobStore, LocalLoop,
-    RedbControlStore, Result, SubstrateError,
+    BlobStore, Caps, ControlStore, DataDiskProvider, FlockLease, Lease, LocalFsBlobStore,
+    LocalLoop, RedbControlStore, Result, SubstrateError,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +32,9 @@ pub struct SubstrateConfig {
 
 /// R1 backend selection.
 pub enum ControlBackend {
-    Redb { path: PathBuf },
+    Redb {
+        path: PathBuf,
+    },
     /// A pre-connected control store (e.g. [`EtcdControlStore`](crate::EtcdControlStore)).
     /// Replicated cluster backends connect asynchronously, while this factory is
     /// sync, so the caller builds them at boot and hands the trait object in here;
@@ -41,25 +43,36 @@ pub enum ControlBackend {
 }
 /// R4 backend selection.
 pub enum BlobBackend {
-    LocalFs { root: PathBuf },
+    LocalFs {
+        root: PathBuf,
+    },
     /// Any S3-compatible endpoint (AWS S3 / MinIO / Ceph RGW). Feature `s3`.
     #[cfg(feature = "s3")]
     S3(crate::S3Config),
 }
 /// R2 backend selection.
 pub enum LeaseBackend {
-    Flock { dir: PathBuf, source_id: String },
+    Flock {
+        dir: PathBuf,
+        source_id: String,
+    },
     /// A pre-connected lease authority (e.g. [`EtcdLease`](crate::EtcdLease)) —
     /// built by the caller because connecting is async while this factory is sync.
     Connected(Arc<dyn Lease>),
 }
 /// R3 backend selection.
 pub enum DataDiskBackend {
-    LocalLoop { dir: PathBuf },
+    LocalLoop {
+        dir: PathBuf,
+    },
     /// Ceph RBD with storage-enforced RWO (feature `ceph`). `conf`/`user` override
     /// the system ceph config + client id when set.
     #[cfg(feature = "ceph")]
-    CephRbd { pool: String, conf: Option<String>, user: Option<String> },
+    CephRbd {
+        pool: String,
+        conf: Option<String>,
+        user: Option<String>,
+    },
 }
 
 /// The assembled set of role backends, ready to hand to the control plane / HA.
@@ -101,7 +114,12 @@ pub fn build_substrate(cfg: SubstrateConfig) -> Result<Substrate> {
         }
     };
 
-    negotiate(cfg.node_count, control.caps(), lease.caps(), data_disk.caps())?;
+    negotiate(
+        cfg.node_count,
+        control.caps(),
+        lease.caps(),
+        data_disk.caps(),
+    )?;
 
     Ok(Substrate {
         control,
@@ -116,7 +134,12 @@ fn negotiate(node_count: u32, control: Caps, lease: Caps, data_disk: Caps) -> Re
     if node_count > 1 {
         needs(control, Caps::REPLICATED_TXN, "control store", node_count)?;
         needs(lease, Caps::CLUSTER_EXCLUSIVE_FENCE, "lease", node_count)?;
-        needs(data_disk, Caps::STORAGE_ENFORCED_RWO, "data-disk provider", node_count)?;
+        needs(
+            data_disk,
+            Caps::STORAGE_ENFORCED_RWO,
+            "data-disk provider",
+            node_count,
+        )?;
     }
     Ok(())
 }
@@ -136,7 +159,10 @@ fn needs(have: Caps, need: Caps, role: &str, node_count: u32) -> Result<()> {
 /// The cluster's own R2/R4 state must never resolve to jkbase's OWN tenant object
 /// store (circularity: the platform can't depend on the product it's serving).
 /// Endpoint-bearing backends call this at build time.
-pub fn assert_not_self_referential(endpoint: &str, tenant_object_store_host: Option<&str>) -> Result<()> {
+pub fn assert_not_self_referential(
+    endpoint: &str,
+    tenant_object_store_host: Option<&str>,
+) -> Result<()> {
     if let Some(forbidden) = tenant_object_store_host
         && endpoint_host(endpoint).eq_ignore_ascii_case(forbidden)
     {
@@ -173,10 +199,19 @@ mod tests {
     fn local_cfg(node_count: u32, base: &Path) -> SubstrateConfig {
         SubstrateConfig {
             node_count,
-            control: ControlBackend::Redb { path: base.join("control.redb") },
-            blob: BlobBackend::LocalFs { root: base.join("blobs") },
-            lease: LeaseBackend::Flock { dir: base.join("leases"), source_id: "node-a".into() },
-            data_disk: DataDiskBackend::LocalLoop { dir: base.join("disks") },
+            control: ControlBackend::Redb {
+                path: base.join("control.redb"),
+            },
+            blob: BlobBackend::LocalFs {
+                root: base.join("blobs"),
+            },
+            lease: LeaseBackend::Flock {
+                dir: base.join("leases"),
+                source_id: "node-a".into(),
+            },
+            data_disk: DataDiskBackend::LocalLoop {
+                dir: base.join("disks"),
+            },
             tenant_object_store_host: None,
         }
     }
@@ -184,13 +219,15 @@ mod tests {
     #[test]
     fn negotiate_single_node_accepts_local_caps() {
         // Local backends' real caps satisfy a single-node topology.
-        assert!(negotiate(
-            1,
-            Caps::SINGLE_NODE_TXN,
-            Caps::MONOTONIC_FENCE | Caps::NODE_LOCAL_EXCLUSIVE,
-            Caps::NODE_LOCAL_RWO,
-        )
-        .is_ok());
+        assert!(
+            negotiate(
+                1,
+                Caps::SINGLE_NODE_TXN,
+                Caps::MONOTONIC_FENCE | Caps::NODE_LOCAL_EXCLUSIVE,
+                Caps::NODE_LOCAL_RWO,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -207,13 +244,15 @@ mod tests {
 
     #[test]
     fn negotiate_multi_node_accepts_cluster_caps() {
-        assert!(negotiate(
-            3,
-            Caps::REPLICATED_TXN,
-            Caps::CLUSTER_EXCLUSIVE_FENCE,
-            Caps::STORAGE_ENFORCED_RWO,
-        )
-        .is_ok());
+        assert!(
+            negotiate(
+                3,
+                Caps::REPLICATED_TXN,
+                Caps::CLUSTER_EXCLUSIVE_FENCE,
+                Caps::STORAGE_ENFORCED_RWO,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -240,13 +279,18 @@ mod tests {
     #[test]
     fn self_referential_endpoint_is_rejected() {
         // R4 endpoint pointing at jkbase's own tenant object store => circular.
-        assert!(assert_not_self_referential(
-            "https://s3.jkbase.app/cluster-state",
-            Some("s3.jkbase.app")
-        )
-        .is_err());
+        assert!(
+            assert_not_self_referential(
+                "https://s3.jkbase.app/cluster-state",
+                Some("s3.jkbase.app")
+            )
+            .is_err()
+        );
         // A different, external object store is fine.
-        assert!(assert_not_self_referential("https://s3.amazonaws.com/x", Some("s3.jkbase.app")).is_ok());
+        assert!(
+            assert_not_self_referential("https://s3.amazonaws.com/x", Some("s3.jkbase.app"))
+                .is_ok()
+        );
         // No forbidden host configured => no check.
         assert!(assert_not_self_referential("https://s3.jkbase.app/x", None).is_ok());
     }

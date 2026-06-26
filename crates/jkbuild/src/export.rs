@@ -66,8 +66,9 @@ pub fn pack_flat_tarball(out: &BuildOutput, dest: &Path) -> Result<()> {
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
     for layer in out.layers.iter().filter(|l| l.types.launch) {
-        tar.append_dir_all(".", &layer.path)
-            .with_context(|| format!("taring layer {} from {}", layer.name, layer.path.display()))?;
+        tar.append_dir_all(".", &layer.path).with_context(|| {
+            format!("taring layer {} from {}", layer.name, layer.path.display())
+        })?;
     }
     let gz = tar.into_inner()?;
     gz.finish()?.flush()?;
@@ -164,7 +165,10 @@ mod tests {
         let m = to_built_manifest(&sample_output(d.path()));
         assert_eq!(m.cmd, vec!["/opt/bun/bin/bun", "run", "start"]);
         assert_eq!(m.working_dir, "/app");
-        assert_eq!(m.env.get("NODE_ENV").map(String::as_str), Some("production"));
+        assert_eq!(
+            m.env.get("NODE_ENV").map(String::as_str),
+            Some("production")
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! mount needs no recovery) and world-readable, so the image can be hard-linked
 //! into a jail and opened by the dropped non-root build uid.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 /// Build a read-only ext4 image at `out_path`, populated from `src_dir` and
@@ -96,7 +96,10 @@ pub fn build_empty_ext4(out_path: &Path, size_bytes: u64, uid: u32, gid: u32) ->
         .arg(out_path)
         .status()
         .with_context(|| {
-            format!("run mkfs.ext4 for {} (is e2fsprogs installed?)", out_path.display())
+            format!(
+                "run mkfs.ext4 for {} (is e2fsprogs installed?)",
+                out_path.display()
+            )
         })?;
     if !status.success() {
         // Don't leave a half-formatted image that a later build would reuse.

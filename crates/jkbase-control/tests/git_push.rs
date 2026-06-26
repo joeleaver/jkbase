@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jkbase_control::api::{AppState, BuildContext, router};
+use jkbase_control::auth;
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{Project, ProjectState, RepoTriggerConfig, Store};
-use jkbase_control::auth;
 
 /// Unique temp dir for one test run (no `Date::now`-free clock needed — pid +
 /// the OS temp dir is enough isolation between concurrent test binaries).
@@ -115,10 +115,13 @@ async fn git_push_authenticates_lands_and_triggers_build() {
     });
 
     // Wait for the server to accept connections before pushing.
-    tokio::time::timeout(Duration::from_secs(5), reqwest::get(format!("http://{addr}/health")))
-        .await
-        .expect("server did not come up")
-        .expect("health request failed");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reqwest::get(format!("http://{addr}/health")),
+    )
+    .await
+    .expect("server did not come up")
+    .expect("health request failed");
 
     // Build a local repo with a jkbase.toml and push it.
     let work = base.join("work");
@@ -151,7 +154,15 @@ async fn git_push_authenticates_lands_and_triggers_build() {
 
     // The objects landed in the per-project bare repo at refs/heads/main.
     let bare = base.join("data").join("git").join("demo.git");
-    let tip = git(&work, &["--git-dir", bare.to_str().unwrap(), "rev-parse", "refs/heads/main"]);
+    let tip = git(
+        &work,
+        &[
+            "--git-dir",
+            bare.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/main",
+        ],
+    );
     assert!(tip.status.success(), "bare repo has no refs/heads/main");
 
     // The push triggered a build whose source tar carries jkbase.toml.
@@ -219,10 +230,13 @@ async fn stale_token_after_delete_recreate_is_rejected() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
     });
-    tokio::time::timeout(Duration::from_secs(5), reqwest::get(format!("http://{addr}/health")))
-        .await
-        .expect("server did not come up")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reqwest::get(format!("http://{addr}/health")),
+    )
+    .await
+    .expect("server did not come up")
+    .unwrap();
 
     let work = base.join("work");
     std::fs::create_dir_all(&work).unwrap();

@@ -34,7 +34,7 @@
 //!     `StoreLimits` caps guest memory, request/response bodies are size-capped, and each
 //!     call gets a fresh `Store`+`ResourceTable` so no state bleeds between invocations.
 
-use crate::function_egress::{gate_send, EgressContext};
+use crate::function_egress::{EgressContext, gate_send};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -99,8 +99,7 @@ fn async_config() -> Config {
 /// The artifact is platform-produced (from the build's `.wasm`) and shipped read-only, so
 /// the agent's `deserialize` (unsafe — trusts the bytes) is sound; a tenant can't inject one.
 pub fn precompile(in_wasm: &Path, out_cwasm: &Path) -> Result<()> {
-    let bytes = std::fs::read(in_wasm)
-        .with_context(|| format!("read {}", in_wasm.display()))?;
+    let bytes = std::fs::read(in_wasm).with_context(|| format!("read {}", in_wasm.display()))?;
     let kind = classify_preamble(&bytes).context("not a wasm module or component")?;
     let serialized = match kind {
         RuntimeKind::WasiHttp => Engine::new(&async_config())?.precompile_component(&bytes)?,
@@ -838,8 +837,7 @@ mod tests {
     /// Path to the committed `wasi:http` component fixture (built from
     /// `templates/function-rust` with `cargo build --target wasm32-wasip2`).
     fn fixture() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/echo-component.wasm")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/echo-component.wasm")
     }
 
     /// A scratch copy of the fixture with an optional sidecar, so per-test classification
@@ -879,7 +877,10 @@ mod tests {
             "got: {text}"
         );
         // The component issued a real outbound request; the host must have refused it.
-        assert!(text.contains("egress=DENIED"), "egress not denied! got: {text}");
+        assert!(
+            text.contains("egress=DENIED"),
+            "egress not denied! got: {text}"
+        );
     }
 
     /// The own-bucket `jkbase:objectstore/store` binding resolves end to end: a real
@@ -891,9 +892,14 @@ mod tests {
     async fn component_calls_store_binding() {
         let probe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/store-probe.wasm");
-        assert!(probe.exists(), "missing store-probe fixture {}", probe.display());
+        assert!(
+            probe.exists(),
+            "missing store-probe fixture {}",
+            probe.display()
+        );
         let mut rt = test_rt();
-        rt.load_module("store", &probe).expect("load store-probe component");
+        rt.load_module("store", &probe)
+            .expect("load store-probe component");
 
         let req = FunctionRequest {
             method: "GET".into(),
@@ -907,8 +913,14 @@ mod tests {
         assert_eq!(resp.status, 200, "body: {text}");
         // The guest called store::put/get; with no credential the host returns access-denied —
         // proving the binding is wired (not a trap / unresolved import).
-        assert!(text.contains("put=access-denied"), "store put did not reach the host impl: {text}");
-        assert!(text.contains("get=access-denied"), "store get did not reach the host impl: {text}");
+        assert!(
+            text.contains("put=access-denied"),
+            "store put did not reach the host impl: {text}"
+        );
+        assert!(
+            text.contains("get=access-denied"),
+            "store get did not reach the host impl: {text}"
+        );
     }
 
     /// Project secrets injected via the sidecar env reach the component (pre-validates the

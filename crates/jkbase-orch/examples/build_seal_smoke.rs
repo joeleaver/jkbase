@@ -137,9 +137,15 @@ esac
     ip(&["link", "delete", TAP]).await;
 
     let run = result?;
-    println!("outcome: {:?} (cpu={:?}us wall={:?})", run.outcome, run.cpu_usec, run.wall);
+    println!(
+        "outcome: {:?} (cpu={:?}us wall={:?})",
+        run.outcome, run.cpu_usec, run.wall
+    );
     if let Some(log) = build_output::read_capped(&output_img, "/build.log", 8 * 1024)? {
-        println!("--- build.log ---\n{}", String::from_utf8_lossy(&log).trim_end());
+        println!(
+            "--- build.log ---\n{}",
+            String::from_utf8_lossy(&log).trim_end()
+        );
     }
     if run.outcome != BuildOutcome::Completed {
         anyhow::bail!("build VM did not complete: {:?}", run.outcome);
@@ -157,7 +163,12 @@ esac
     println!("fetch-net={fetch_net}  compile-net={compile_net}");
 
     assert_eq!(fetch_net, "up", "network must be UP during FETCH");
-    assert_eq!(compile_net, "down", "network must be SEALED (down) during COMPILE");
-    println!("\nPASS: host-enforced fetch-then-seal — network up during fetch, sealed for compile.");
+    assert_eq!(
+        compile_net, "down",
+        "network must be SEALED (down) during COMPILE"
+    );
+    println!(
+        "\nPASS: host-enforced fetch-then-seal — network up during fetch, sealed for compile."
+    );
     Ok(())
 }

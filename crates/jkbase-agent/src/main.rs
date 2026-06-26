@@ -10,7 +10,6 @@ mod static_server;
 use anyhow::{Context, Result};
 use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
-use log_sink::LogSink;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
@@ -18,6 +17,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use jkbase_common::layers::RuntimeLayers;
+use log_sink::LogSink;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -44,13 +44,7 @@ fn mount_filesystems() {
         let tgt = CString::new(*target).unwrap();
         let fst = CString::new(*fstype).unwrap();
         unsafe {
-            libc::mount(
-                src.as_ptr(),
-                tgt.as_ptr(),
-                fst.as_ptr(),
-                0,
-                ptr::null(),
-            );
+            libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, ptr::null());
         }
     }
 }
@@ -168,7 +162,10 @@ fn load_platform_egress(serve_dir: &Path) -> jkbase_common::config::PlatformEgre
     let path = serve_dir.join(jkbase_common::config::PlatformEgress::FILE);
     match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            eprintln!("failed to parse {}: {e}; using fail-closed egress defaults", path.display());
+            eprintln!(
+                "failed to parse {}: {e}; using fail-closed egress defaults",
+                path.display()
+            );
             Default::default()
         }),
         Err(_) => Default::default(),
@@ -197,7 +194,13 @@ fn mount_erofs_ro(source: &Path, target: &Path) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::other("nul byte in target path"))?;
     let fst = CString::new("erofs").unwrap();
     let ret = unsafe {
-        libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), libc::MS_RDONLY, ptr::null())
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fst.as_ptr(),
+            libc::MS_RDONLY,
+            ptr::null(),
+        )
     };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
@@ -406,9 +409,8 @@ async fn main() -> Result<()> {
         clock::start_chrony();
     }
 
-    let serve_dir = PathBuf::from(
-        std::env::var("JKBASE_SERVE_DIR").unwrap_or_else(|_| "/srv/www".to_string()),
-    );
+    let serve_dir =
+        PathBuf::from(std::env::var("JKBASE_SERVE_DIR").unwrap_or_else(|_| "/srv/www".to_string()));
     let functions_dir = PathBuf::from(
         std::env::var("JKBASE_FUNCTIONS_DIR")
             .unwrap_or_else(|_| serve_dir.join("_functions").to_string_lossy().to_string()),
@@ -720,9 +722,10 @@ async fn handle_request(
         .headers()
         .get("x-jkbase-site")
         .and_then(|v| v.to_str().ok())
-        && let Some(site) = state.sites.iter().find(|s| s.name == site_name) {
-            return static_server::handle_static_with_path(&site.root, &path, site.spa).await;
-        }
+        && let Some(site) = state.sites.iter().find(|s| s.name == site_name)
+    {
+        return static_server::handle_static_with_path(&site.root, &path, site.spa).await;
+    }
 
     // Multi-site routing: find the best matching site by prefix
     if !state.sites.is_empty() {
@@ -1009,7 +1012,10 @@ async fn invoke_function(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let body = match Limited::new(req.into_body(), MAX_REQUEST_BODY).collect().await {
+    let body = match Limited::new(req.into_body(), MAX_REQUEST_BODY)
+        .collect()
+        .await
+    {
         Ok(b) => b.to_bytes().to_vec(),
         Err(_) => {
             return Response::builder()
@@ -1090,8 +1096,14 @@ mod tests {
 
     #[test]
     fn function_name_extraction() {
-        assert_eq!(extract_function_name("/functions/hello"), Some("hello".into()));
-        assert_eq!(extract_function_name("/functions/hello/world"), Some("hello".into()));
+        assert_eq!(
+            extract_function_name("/functions/hello"),
+            Some("hello".into())
+        );
+        assert_eq!(
+            extract_function_name("/functions/hello/world"),
+            Some("hello".into())
+        );
         assert_eq!(extract_function_name("/api/foo"), None);
         assert_eq!(extract_function_name("/"), None);
     }

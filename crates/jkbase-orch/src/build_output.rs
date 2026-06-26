@@ -20,7 +20,7 @@
 //! therefore determined by whether the destination file was actually written —
 //! never by the process exit status.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 /// Dump one known file from the untrusted ext4 `image` to `dest` on the host via
@@ -134,7 +134,12 @@ mod tests {
                 .map(|o| o.status.success() || !o.stderr.is_empty() || !o.stdout.is_empty())
                 .unwrap_or(false)
         }
-        if !have("debugfs") || std::process::Command::new("mkfs.ext4").arg("-V").output().is_err() {
+        if !have("debugfs")
+            || std::process::Command::new("mkfs.ext4")
+                .arg("-V")
+                .output()
+                .is_err()
+        {
             eprintln!("skipping: debugfs/mkfs.ext4 unavailable");
             return;
         }
@@ -148,19 +153,23 @@ mod tests {
         std::fs::write(src.join("build.log"), vec![b'x'; 100_000]).unwrap();
 
         let img = dir.join("out.img");
-        assert!(std::process::Command::new("truncate")
-            .args(["-s", "16M"])
-            .arg(&img)
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("mkfs.ext4")
-            .args(["-F", "-q", "-O", "^has_journal", "-d"])
-            .arg(&src)
-            .arg(&img)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("truncate")
+                .args(["-s", "16M"])
+                .arg(&img)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("mkfs.ext4")
+                .args(["-F", "-q", "-O", "^has_journal", "-d"])
+                .arg(&src)
+                .arg(&img)
+                .status()
+                .unwrap()
+                .success()
+        );
 
         // status parses
         assert_eq!(read_status(&img).unwrap(), Some(0));

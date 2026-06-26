@@ -32,13 +32,13 @@
 //!   * P0-DOS-* — aggressive per-outbound timeouts, a SEPARATE in-flight semaphore, a
 //!     per-invocation byte cap, and a per-VM (=per-project) connect-rate limiter.
 
+use crate::log_sink::LogSink;
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::HOST;
 use hyper_util::rt::TokioIo;
-use crate::log_sink::LogSink;
 use jkbase_common::config::{PlatformEgress, ResolvedEgress};
 use jkbase_common::egress::{host_allowed, ip_is_public};
 use jkbase_common::logs::{EgressEvent, Verdict};
@@ -160,7 +160,10 @@ impl EgressContext {
         headers: &[(String, String)],
         body: Vec<u8>,
     ) -> Result<(u16, Vec<u8>), ErrorCode> {
-        let host = self.storage_host.as_deref().ok_or(ErrorCode::InternalError(None))?;
+        let host = self
+            .storage_host
+            .as_deref()
+            .ok_or(ErrorCode::InternalError(None))?;
         // Resolve via the pinned resolver; the dial target MUST be a platform IP.
         let addrs: Vec<IpAddr> = match self.resolver.lookup_ip(host).await {
             Ok(l) => l.iter().filter(|ip| matches!(ip, IpAddr::V4(_))).collect(),
@@ -198,11 +201,13 @@ impl EgressContext {
             .await
             .map_err(|_| ErrorCode::ConnectionTimeout)?
             .map_err(|_| ErrorCode::TlsProtocolError)?;
-        let (mut sender, conn) =
-            timeout(CONNECT_TIMEOUT_CAP, hyper::client::conn::http1::handshake(TokioIo::new(tls)))
-                .await
-                .map_err(|_| ErrorCode::ConnectionTimeout)?
-                .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let (mut sender, conn) = timeout(
+            CONNECT_TIMEOUT_CAP,
+            hyper::client::conn::http1::handshake(TokioIo::new(tls)),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?;
         let worker = wasmtime_wasi::runtime::spawn(async move {
             let _permit = _permit;
             let _ = conn.await;
@@ -388,7 +393,11 @@ fn decide(
 
     // Zone 2 vs Zone 3 — pick the first PUBLIC, non-platform, IPv4 address. If none exists,
     // every resolved address is internal/platform/IPv6 ⇒ Zone-2 DENY, independent of policy.
-    let Some(public_addr) = addrs.iter().copied().find(|ip| vet_public(*ip, platform_ips)) else {
+    let Some(public_addr) = addrs
+        .iter()
+        .copied()
+        .find(|ip| vet_public(*ip, platform_ips))
+    else {
         return Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform);
     };
 
@@ -430,13 +439,22 @@ pub async fn gate_send(
 ) -> Result<IncomingResponse, ErrorCode> {
     let use_tls = config.use_tls;
     let method = request.method().to_string();
-    let (host, port) = authority_parts(request.uri(), use_tls)
-        .ok_or(ErrorCode::HttpRequestUriInvalid)?;
+    let (host, port) =
+        authority_parts(request.uri(), use_tls).ok_or(ErrorCode::HttpRequestUriInvalid)?;
 
     // Refuse IPv6 literals up front (phase 1 is IPv4-only egress — one rule removes a whole
     // class of v6-classifier-edge risk). An IPv6 destination is the hard fence.
     if host.parse::<std::net::Ipv6Addr>().is_ok() || host.contains(':') {
-        emit(&ctx, &function, &host, port, &method, Verdict::DenyPlatform, None).await;
+        emit(
+            &ctx,
+            &function,
+            &host,
+            port,
+            &method,
+            Verdict::DenyPlatform,
+            None,
+        )
+        .await;
         return Err(ErrorCode::DestinationIpProhibited);
     }
 
@@ -480,7 +498,16 @@ pub async fn gate_send(
 
     // Per-VM outbound connect-rate limiter (after the verdict, before any socket).
     if !ctx.rate.lock().expect("rate mutex").try_take() {
-        emit(&ctx, &function, &host, port, &method, Verdict::Error, first_ip).await;
+        emit(
+            &ctx,
+            &function,
+            &host,
+            port,
+            &method,
+            Verdict::Error,
+            first_ip,
+        )
+        .await;
         return Err(ErrorCode::ConnectionLimitReached);
     }
 
@@ -489,7 +516,16 @@ pub async fn gate_send(
     let permit = match ctx.inflight.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            emit(&ctx, &function, &host, port, &method, Verdict::Error, first_ip).await;
+            emit(
+                &ctx,
+                &function,
+                &host,
+                port,
+                &method,
+                Verdict::Error,
+                first_ip,
+            )
+            .await;
             return Err(ErrorCode::ConnectionLimitReached);
         }
     };
@@ -503,14 +539,32 @@ pub async fn gate_send(
         .is_some_and(|s| host.trim_end_matches('.').eq_ignore_ascii_case(s))
         && ctx.platform_ips.contains(&addr.ip());
     if !own_ok && !vet_public(addr.ip(), &ctx.platform_ips) {
-        emit(&ctx, &function, &host, port, &method, Verdict::DenyPlatform, Some(addr.ip().to_string())).await;
+        emit(
+            &ctx,
+            &function,
+            &host,
+            port,
+            &method,
+            Verdict::DenyPlatform,
+            Some(addr.ip().to_string()),
+        )
+        .await;
         return Err(ErrorCode::DestinationIpProhibited);
     }
 
     // ALLOW: record the contact (host:port, pinned IP) BEFORE the connect, so an abort /
     // connect failure can lose the byte refinement but never the existence of the
     // destination (P0-OBS-UNCONDITIONAL).
-    emit(&ctx, &function, &host, port, &method, Verdict::Allow, Some(addr.ip().to_string())).await;
+    emit(
+        &ctx,
+        &function,
+        &host,
+        port,
+        &method,
+        Verdict::Allow,
+        Some(addr.ip().to_string()),
+    )
+    .await;
 
     let connect_to = min_dur(config.connect_timeout, CONNECT_TIMEOUT_CAP);
     let first_byte = min_dur(config.first_byte_timeout, FIRST_BYTE_TIMEOUT_CAP);
@@ -542,11 +596,13 @@ pub async fn gate_send(
             .await
             .map_err(|_| ErrorCode::ConnectionTimeout)?
             .map_err(|_| ErrorCode::TlsProtocolError)?;
-        let (sender, conn) =
-            timeout(connect_to, hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)))
-                .await
-                .map_err(|_| ErrorCode::ConnectionTimeout)?
-                .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let (sender, conn) = timeout(
+            connect_to,
+            hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?;
         // The connection worker OWNS the in-flight permit; abort/drop releases it and tears
         // down the FD (P0-EGRESS-ABORT).
         let worker = wasmtime_wasi::runtime::spawn(async move {
@@ -555,11 +611,13 @@ pub async fn gate_send(
         });
         (sender, worker)
     } else {
-        let (sender, conn) =
-            timeout(connect_to, hyper::client::conn::http1::handshake(TokioIo::new(tcp)))
-                .await
-                .map_err(|_| ErrorCode::ConnectionTimeout)?
-                .map_err(|_| ErrorCode::HttpProtocolError)?;
+        let (sender, conn) = timeout(
+            connect_to,
+            hyper::client::conn::http1::handshake(TokioIo::new(tcp)),
+        )
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?;
         let worker = wasmtime_wasi::runtime::spawn(async move {
             let _permit = permit;
             let _ = conn.await;
@@ -614,11 +672,7 @@ pub async fn gate_send(
 }
 
 fn min_dur(a: Duration, b: Duration) -> Duration {
-    if a < b {
-        a
-    } else {
-        b
-    }
+    if a < b { a } else { b }
 }
 
 /// A body that debits each data frame's length from a shared budget, erroring once the
@@ -698,17 +752,38 @@ mod tests {
         ));
         // Resolves to RFC1918 → Zone-2 deny even under Default.
         assert!(matches!(
-            decide(&[ip("10.0.0.5")], "evil.example.com", 443, None, &plat, &ResolvedEgress::Default),
+            decide(
+                &[ip("10.0.0.5")],
+                "evil.example.com",
+                443,
+                None,
+                &plat,
+                &ResolvedEgress::Default
+            ),
             Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
         // Resolves to the platform's own public IP (domain-front to api.) → Zone-2 deny.
         assert!(matches!(
-            decide(&[ip("203.0.113.10")], "api.attacker.com", 443, None, &plat, &ResolvedEgress::Default),
+            decide(
+                &[ip("203.0.113.10")],
+                "api.attacker.com",
+                443,
+                None,
+                &plat,
+                &ResolvedEgress::Default
+            ),
             Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
         // Metadata IP literal → deny.
         assert!(matches!(
-            decide(&[ip("169.254.169.254")], "169.254.169.254", 80, None, &plat, &ResolvedEgress::Default),
+            decide(
+                &[ip("169.254.169.254")],
+                "169.254.169.254",
+                80,
+                None,
+                &plat,
+                &ResolvedEgress::Default
+            ),
             Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
@@ -735,7 +810,14 @@ mod tests {
         let plat = platform(&[]);
         // An AAAA-only result (we filter v6 before decide, but defense in depth) → deny.
         assert!(matches!(
-            decide(&[ip("2606:4700::1111")], "v6.example.com", 443, None, &plat, &ResolvedEgress::Default),
+            decide(
+                &[ip("2606:4700::1111")],
+                "v6.example.com",
+                443,
+                None,
+                &plat,
+                &ResolvedEgress::Default
+            ),
             Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
@@ -746,7 +828,14 @@ mod tests {
         let storage = Some("storage.jkbase.app");
         // Sandbox → public denied.
         assert!(matches!(
-            decide(&[ip("140.82.112.3")], "api.stripe.com", 443, storage, &plat, &ResolvedEgress::Sandbox),
+            decide(
+                &[ip("140.82.112.3")],
+                "api.stripe.com",
+                443,
+                storage,
+                &plat,
+                &ResolvedEgress::Sandbox
+            ),
             Decision::Deny(ErrorCode::HttpRequestDenied, _)
         ));
         // OWN storage (host==storage, IP∈platform) → allowed EVEN under sandbox.
@@ -757,7 +846,14 @@ mod tests {
         // A look-alike storage host that does NOT resolve to a platform IP → deny (a name
         // match alone never suffices).
         assert!(matches!(
-            decide(&[ip("140.82.112.3")], "storage.jkbase.app", 443, storage, &plat, &ResolvedEgress::Sandbox),
+            decide(
+                &[ip("140.82.112.3")],
+                "storage.jkbase.app",
+                443,
+                storage,
+                &plat,
+                &ResolvedEgress::Sandbox
+            ),
             Decision::Deny(ErrorCode::DestinationIpProhibited, Verdict::DenyPlatform)
         ));
     }
@@ -768,7 +864,14 @@ mod tests {
         let al = ResolvedEgress::Allowlist(vec!["api.stripe.com".to_string()]);
         // Exact allowlisted public host → allowed.
         assert!(matches!(
-            decide(&[ip("140.82.112.3")], "api.stripe.com", 443, None, &plat, &al),
+            decide(
+                &[ip("140.82.112.3")],
+                "api.stripe.com",
+                443,
+                None,
+                &plat,
+                &al
+            ),
             Decision::Dial(_)
         ));
         // Not on the list → denied.

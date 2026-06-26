@@ -32,9 +32,15 @@ const PACKAGE_JSON: &str = r#"{
 "#;
 
 async fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new(cmd).args(args).output().await?;
+    let out = tokio::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .await?;
     if !out.status.success() {
-        anyhow::bail!("{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{cmd} {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -49,10 +55,18 @@ async fn main() -> anyhow::Result<()> {
         Ok(k) => PathBuf::from(k),
         Err(_) => {
             let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() { lts } else { data.join("vmlinux.bin") }
+            if lts.exists() {
+                lts
+            } else {
+                data.join("vmlinux.bin")
+            }
         }
     };
-    anyhow::ensure!(kernel.exists(), "kernel not found at {} (set KERNEL=)", kernel.display());
+    anyhow::ensure!(
+        kernel.exists(),
+        "kernel not found at {} (set KERNEL=)",
+        kernel.display()
+    );
 
     std::fs::create_dir_all(&data)?;
     let workspace = data.join("ws");
@@ -112,12 +126,25 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.chroot_base)?;
     println!("[2/4] booting jailed Bun build VM (jkbase.export=layered) ...");
     let run_res = BuildVm::run("bls", &cfg, &data.join("run")).await?;
-    println!("    outcome: {:?} (wall={:?})", run_res.outcome, run_res.wall);
+    println!(
+        "    outcome: {:?} (wall={:?})",
+        run_res.outcome, run_res.wall
+    );
     if let Some(log) = build_output::read_capped(&output_img, "/build.log", 16 * 1024)? {
-        println!("    --- build.log ---\n{}\n    -----------------", String::from_utf8_lossy(&log).trim_end());
+        println!(
+            "    --- build.log ---\n{}\n    -----------------",
+            String::from_utf8_lossy(&log).trim_end()
+        );
     }
-    anyhow::ensure!(run_res.outcome == BuildOutcome::Completed, "VM did not power off cleanly: {:?}", run_res.outcome);
-    anyhow::ensure!(build_output::read_status(&output_img)? == Some(0), "lifecycle status != 0");
+    anyhow::ensure!(
+        run_res.outcome == BuildOutcome::Completed,
+        "VM did not power off cleanly: {:?}",
+        run_res.outcome
+    );
+    anyhow::ensure!(
+        build_output::read_status(&output_img)? == Some(0),
+        "lifecycle status != 0"
+    );
 
     println!("[3/4] reading /out/layers/index.json via debugfs ...");
     let index_out = workspace.join("index.json");
@@ -129,14 +156,24 @@ async fn main() -> anyhow::Result<()> {
     println!("    index: {}", serde_json::to_string(&index)?);
     let layers = index["layers"].as_array().cloned().unwrap_or_default();
     // jkbuild only emits the per-app layer; the host injects base + runtime by digest.
-    anyhow::ensure!(layers.len() == 1, "expected exactly 1 (app) layer, got {}", layers.len());
+    anyhow::ensure!(
+        layers.len() == 1,
+        "expected exactly 1 (app) layer, got {}",
+        layers.len()
+    );
     let app = &layers[0];
     anyhow::ensure!(app["role"] == "app", "layer role != app: {}", app["role"]);
-    anyhow::ensure!(app["media"] == "erofs", "layer media != erofs: {}", app["media"]);
+    anyhow::ensure!(
+        app["media"] == "erofs",
+        "layer media != erofs: {}",
+        app["media"]
+    );
     let digest = app["digest"].as_str().unwrap_or("");
     let file = app["file"].as_str().unwrap_or("");
-    anyhow::ensure!(digest.starts_with("sha256:") && file.starts_with("sha256-") && file.ends_with(".erofs"),
-        "bad layer digest/file: {digest} / {file}");
+    anyhow::ensure!(
+        digest.starts_with("sha256:") && file.starts_with("sha256-") && file.ends_with(".erofs"),
+        "bad layer digest/file: {digest} / {file}"
+    );
 
     println!("[4/4] extracting + mount-checking the app erofs layer ...");
     let blob = workspace.join("app.erofs");
@@ -147,23 +184,48 @@ async fn main() -> anyhow::Result<()> {
     // Host-side sha256 must match the claimed digest (the integrity guarantee).
     let got = sha256_file(&blob).await?;
     let want = digest.strip_prefix("sha256:").unwrap_or(digest);
-    anyhow::ensure!(got == want, "app layer digest mismatch: claimed {want}, got {got}");
-    println!("    blob {} bytes, sha256 verified", std::fs::metadata(&blob)?.len());
+    anyhow::ensure!(
+        got == want,
+        "app layer digest mismatch: claimed {want}, got {got}"
+    );
+    println!(
+        "    blob {} bytes, sha256 verified",
+        std::fs::metadata(&blob)?.len()
+    );
 
     // Mount-check: confirm the app is rooted at /app (so it composes correctly).
     let mnt = workspace.join("mnt");
     std::fs::create_dir_all(&mnt)?;
-    run("mount", &["-t", "erofs", "-o", "ro,loop", blob.to_str().unwrap(), mnt.to_str().unwrap()]).await?;
+    run(
+        "mount",
+        &[
+            "-t",
+            "erofs",
+            "-o",
+            "ro,loop",
+            blob.to_str().unwrap(),
+            mnt.to_str().unwrap(),
+        ],
+    )
+    .await?;
     let server_at_app = mnt.join("app/server.ts").exists();
     let _ = run("umount", &[mnt.to_str().unwrap()]).await;
-    anyhow::ensure!(server_at_app, "app layer does not root the workspace at /app");
+    anyhow::ensure!(
+        server_at_app,
+        "app layer does not root the workspace at /app"
+    );
 
-    println!("\nPASS: Bun layered export — /out/layers/index.json + content-addressed app erofs (rooted at /app), digest-verified.");
+    println!(
+        "\nPASS: Bun layered export — /out/layers/index.json + content-addressed app erofs (rooted at /app), digest-verified."
+    );
     Ok(())
 }
 
 async fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("sha256sum").arg(path).output().await?;
+    let out = tokio::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .await?;
     anyhow::ensure!(out.status.success(), "sha256sum failed");
     Ok(String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
