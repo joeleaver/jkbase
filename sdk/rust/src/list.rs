@@ -159,7 +159,9 @@ impl ObjectClient {
                 let token = match state {
                     Some(t) => t,
                     None => {
-                        return Ok::<Option<(ListPage, Option<Option<String>>)>, crate::Error>(None);
+                        return Ok::<Option<(ListPage, Option<Option<String>>)>, crate::Error>(
+                            None,
+                        );
                     }
                 };
                 let page = self

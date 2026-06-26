@@ -2348,15 +2348,21 @@ async fn handle_deploy(
         }
     }
 
-    // If hibernated, clear stale snapshot
-    if plat.vm_states.get(project_id) == Some(&VmLifecycle::Hibernated) {
-        info!(project = %project_id, "clearing snapshot for fresh deploy");
+    // A deploy/rollback supersedes any prior snapshot UNCONDITIONALLY — not only when
+    // `Hibernated`. A VM that was restored-then-Running still carries its snapshot (restore
+    // doesn't delete it), and the metadata image / layers it baked are about to be rewritten in
+    // place; leaving that snapshot would let a later restart restore stale guest RAM against the
+    // new bytes if the version happened to re-match (e.g. a rollback). Clearing here closes that
+    // window — the `deployment_version` viability gate is then defence in depth, not the only guard.
+    {
+        info!(project = %project_id, "clearing any stale snapshot for fresh deploy");
         let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
         let _ = std::fs::remove_dir_all(&snapshot_dir);
         let _ = plat.store.remove_snapshot_meta(project_id);
     }
 
     if let Some(mut old_vm) = plat.vms.remove(project_id) {
+        plat.vm_rootfs_hashes.remove(project_id);
         info!(project = %project_id, "syncing and stopping old VM for redeploy");
         if let Ok(Some(alloc)) = plat.store.get_vm_allocation(project_id) {
             let _ = sync_agent(&alloc.ip).await;
@@ -2534,10 +2540,12 @@ async fn handle_deploy(
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
     // Cold boot always runs the CURRENT rootfs; track it so a later hibernate stamps the truthful
-    // hash (and keeps the GC reference set honest).
+    // hash (and keeps the GC reference set honest). Clear any wake-failure throttle: this project
+    // is now freshly booted, so a stale entry mustn't fast-fail a routing-miss request.
     let ran_hash = plat.base_rootfs_hash.clone();
     plat.vm_rootfs_hashes
         .insert(project_id.to_string(), ran_hash);
+    plat.wake_failures.remove(project_id);
     let active_domains = plat
         .store
         .list_active_domains_for_project(project_id)
@@ -3081,7 +3089,11 @@ async fn wake_project_inner(
                         // rather than repeating this ~10s+ cycle every wake), then cold-boot the
                         // current rootfs reusing the held fence.
                         tracing::warn!(project = %project_id, error = %e, "restored VM agent not ready; reaping + poisoning snapshot + cold booting");
-                        let _ = restored.stop().await;
+                        // The whole no-double-writer guarantee rests on FC1 being dead before the
+                        // cold boot reopens the fenced loop — surface (don't swallow) a reap error.
+                        if let Err(re) = restored.stop().await {
+                            tracing::warn!(project = %project_id, error = %re, "reap of restored FC before cold boot reported an error");
+                        }
                         {
                             let p = platform.lock().await;
                             let _ = p.store.remove_snapshot_meta(project_id);
@@ -3170,6 +3182,7 @@ async fn wake_project_inner(
     // release's losetup I/O isn't held under the mutex.
     if plat.store.get_project(project_id).ok().flatten().is_none() {
         plat.vm_states.remove(project_id);
+        plat.vm_rootfs_hashes.remove(project_id);
         drop(plat);
         drop(vm); // SIGKILL the FC before detaching the disk it still maps
         if let Some(g) = disk_guard {

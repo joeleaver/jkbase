@@ -3574,19 +3574,30 @@ esac
         let cas_dir = fx.data.join("base-rootfs");
         let (rootfs_a, hash_a) =
             crate::rootfs_cas::place(&rootfs, &cas_dir).expect("CAS-place rootfs A");
-        eprintln!("[cas-e2e] rootfs A = {} ({}…)", rootfs_a.display(), &hash_a[..12]);
+        eprintln!(
+            "[cas-e2e] rootfs A = {} ({}…)",
+            rootfs_a.display(),
+            &hash_a[..12]
+        );
 
         // Point-to-point tap on its own /24 (clear of the other pipeline tests).
-        let (tag, host_ip, guest_ip, guest_mac) =
-            ("casredeploy", "172.28.0.1", "172.28.0.2", "AA:FC:00:00:28:02");
+        let (tag, host_ip, guest_ip, guest_mac) = (
+            "casredeploy",
+            "172.28.0.1",
+            "172.28.0.2",
+            "AA:FC:00:00:28:02",
+        );
         let tap = format!("jk{tag}");
         let _ = sh("ip", &["link", "del", &tap]).await;
         sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
             .await
             .unwrap();
-        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
-            .await
-            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
         sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
 
         let cfg_a = VmConfig {
@@ -3611,8 +3622,14 @@ esac
             .await
             .expect("VM should boot from the content-addressed rootfs path");
         let cold = poll_http_200(guest_ip, 80, Duration::from_secs(75)).await;
-        eprintln!("[cas-e2e] cold-boot from CAS rootfs → 200 = {}", cold.is_some());
-        assert!(cold.is_some(), "VM booted from the CAS rootfs must serve HTTP 200");
+        eprintln!(
+            "[cas-e2e] cold-boot from CAS rootfs → 200 = {}",
+            cold.is_some()
+        );
+        assert!(
+            cold.is_some(),
+            "VM booted from the CAS rootfs must serve HTTP 200"
+        );
 
         // --- Hibernate: the snapshot bakes rootfs path A.
         let snap_dir = fx.data.join("casredeploy-snap");
@@ -3633,7 +3650,10 @@ esac
         }
         let (_rootfs_b, hash_b) =
             crate::rootfs_cas::place(&tweaked, &cas_dir).expect("CAS-place rootfs B");
-        assert_ne!(hash_a, hash_b, "a changed agent must mint a new rootfs hash");
+        assert_ne!(
+            hash_a, hash_b,
+            "a changed agent must mint a new rootfs hash"
+        );
         assert!(
             rootfs_a.exists(),
             "the OLD rootfs blob MUST be retained so the snapshot can restore"
@@ -3671,7 +3691,11 @@ esac
         );
         let keep_b_only: std::collections::HashSet<String> = [hash_b].into_iter().collect();
         let removed = crate::rootfs_cas::gc(&cas_dir, &keep_b_only).unwrap();
-        assert_eq!(removed, vec![hash_a], "GC must reap the now-unreferenced blob");
+        assert_eq!(
+            removed,
+            vec![hash_a],
+            "GC must reap the now-unreferenced blob"
+        );
         assert!(!rootfs_a.exists(), "the reaped blob must be gone");
 
         let _ = sh("ip", &["link", "del", &tap]).await;
