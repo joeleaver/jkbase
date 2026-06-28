@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         guest_ip: None,
         gateway_ip: None,
         vsock_cid: None,
+        runtime_cgroup_parent: None,
     };
 
     // 2. Loop-bind the image (device A) and cold-boot with the data disk on /dev/vdc.

@@ -883,6 +883,12 @@ struct PlatformState {
 
 /// Data disk size (MiB) created on first use for projects that declare volumes.
 const DATA_DISK_MIB: u64 = 1024;
+/// Parent cgroup-v2 dir for runtime Firecrackers. Every runtime FC is migrated into a
+/// `<this>/<project_id>` leaf right after spawn so it lives OUTSIDE `jkbase.service`'s
+/// cgroup and survives `systemctl restart` (`KillMode=mixed` reaps only the service's own
+/// cgroup) for the next process to re-adopt. Provisioned by `tools/setup-runtime-cgroup.sh`
+/// (an `ExecStartPre`), mirroring `jkbase-build`. See `docs/vm-readoption-design.md` §1.
+const RUNTIME_CGROUP_PARENT: &str = "/sys/fs/cgroup/jkbase-runtime";
 /// Data-disk lease TTL — the failover horizon. With the node-local FlockLease it is moot
 /// (the lock is held for the life of the process); with a distributed lease (HA) it is
 /// the etcd grant TTL: a crashed/partitioned holder's key expires this long after its
@@ -2511,6 +2517,7 @@ async fn handle_deploy(
         guest_ip: Some(alloc.ip.clone()),
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
+        runtime_cgroup_parent: Some(PathBuf::from(RUNTIME_CGROUP_PARENT)),
     };
     // If start fails, release the fenced disk + lease AWAITED (not via the Drop
     // backstop) so an immediate re-deploy/re-wake can't race a fire-and-forget cleanup
@@ -3018,6 +3025,7 @@ async fn wake_project_inner(
         guest_ip: Some(alloc.ip.clone()),
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
+        runtime_cgroup_parent: Some(PathBuf::from(RUNTIME_CGROUP_PARENT)),
     };
     let runtime_dir = plat.data_dir.join("run");
     let active_domains = plat
