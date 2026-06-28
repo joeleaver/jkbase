@@ -1,6 +1,7 @@
 mod build_ca;
 mod build_orchestrator;
 mod egress;
+mod handoff;
 mod layer_plan;
 mod log_shipper;
 mod metering;

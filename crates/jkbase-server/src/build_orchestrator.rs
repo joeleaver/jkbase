@@ -3614,6 +3614,7 @@ esac
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = fx.data.join("casredeploy-run");
 
@@ -4871,6 +4872,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = fx.data.join(format!("{tag}-run"));
         let mut vm = VmInstance::start(tag, &config, &runtime_dir)
@@ -5014,6 +5016,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = data.join(format!("{tag}-run"));
         let mut vm = VmInstance::start(tag, &config, &runtime_dir)
@@ -5323,6 +5326,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = data.join("egr-e2e-run");
         let mut vm = VmInstance::start("egre2e", &config, &runtime_dir)
@@ -5643,6 +5647,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = fx.data.join("dbpipe-run");
 
