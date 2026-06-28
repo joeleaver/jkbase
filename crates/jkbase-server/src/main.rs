@@ -893,6 +893,11 @@ const DATA_DISK_MIB: u64 = 1024;
 /// cgroup) for the next process to re-adopt. Provisioned by `tools/setup-runtime-cgroup.sh`
 /// (an `ExecStartPre`), mirroring `jkbase-build`. See `docs/vm-readoption-design.md` §1.
 const RUNTIME_CGROUP_PARENT: &str = "/sys/fs/cgroup/jkbase-runtime";
+/// How recently the `.upgrading` flag must have been written for `shutdown_signal` to treat a
+/// SIGTERM as an UPGRADE (skip the drain, leave VMs for re-adoption) rather than a real
+/// shutdown. A stale flag (deploy crashed after touching it but before `systemctl restart`)
+/// falls back to draining — so a later operator `stop` never silently leaks running tenants.
+const UPGRADE_FLAG_FRESHNESS_SECS: u64 = 300;
 /// Data-disk lease TTL — the failover horizon. With the node-local FlockLease it is moot
 /// (the lock is held for the life of the process); with a distributed lease (HA) it is
 /// the etcd grant TTL: a crashed/partitioned holder's key expires this long after its
@@ -1536,6 +1541,9 @@ async fn main() -> Result<()> {
     // Replaces the old blunt `pkill -9 firecracker` that would have SIGKILLed every survivor. Must
     // precede the reconcilers below so they see the adopted Running state (they are survivor-aware).
     adopt_or_reap_runtime_vms(&platform, &routing_table, &domain_map).await;
+    // Adoption is complete — clear the upgrade flag so a later operator `stop`/`restart` without a
+    // fresh flag drains/hibernates normally (and a crashed deploy's stale flag never lingers).
+    let _ = std::fs::remove_file(upgrade_flag_path(&data_dir));
 
     // Reconcile state and build the domain map BEFORE the proxy serves traffic,
     // or apex/www/console would 404 in the gap.
@@ -1695,6 +1703,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Path of the upgrade-in-progress flag `deploy-server.sh` writes immediately before
+/// `systemctl restart`. Its first line is the epoch second it was written (a second optional
+/// line carries the deploy pid, for diagnostics only).
+fn upgrade_flag_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(".upgrading")
+}
+
+/// True iff a FRESH upgrade flag is present (written < [`UPGRADE_FLAG_FRESHNESS_SECS`] ago).
+fn upgrade_in_progress(data_dir: &Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(upgrade_flag_path(data_dir)) else {
+        return false;
+    };
+    let Some(ts) = body.lines().next().and_then(|l| l.trim().parse::<u64>().ok()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(ts) < UPGRADE_FLAG_FRESHNESS_SECS
+}
+
 async fn shutdown_signal(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
@@ -1708,6 +1738,25 @@ async fn shutdown_signal(
         _ = ctrl_c => {},
         _ = sigterm.recv() => {},
     }
+
+    // VM re-adoption §8: an UPGRADE restart (a fresh .upgrading flag) leaves tenant VMs RUNNING
+    // for the next process to re-adopt — the zero-bounce goal. We must exit WITHOUT running any
+    // destructor: a spawned VmInstance's Drop (and tokio kill_on_drop) would otherwise SIGKILL
+    // every survivor as `vms` drops. std::process::exit terminates immediately, skipping all
+    // destructors; the survivors live in the jkbase-runtime cgroup, so systemd's KillMode=mixed
+    // (which reaps only jkbase.service's own cgroup) leaves them up. A real shutdown (no fresh
+    // flag) falls through and drains/hibernates as before.
+    let data_dir = { platform.lock().await.data_dir.clone() };
+    if upgrade_in_progress(&data_dir) {
+        let n = platform.lock().await.vms.len();
+        info!(
+            running_vms = n,
+            "upgrade restart (.upgrading present) — leaving tenant VMs running for re-adoption; \
+             exiting without draining"
+        );
+        std::process::exit(0);
+    }
+
     info!("shutdown signal received, hibernating running VMs...");
 
     let running_projects: Vec<String> = {
