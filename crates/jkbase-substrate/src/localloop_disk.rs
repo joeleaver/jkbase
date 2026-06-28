@@ -52,6 +52,27 @@ fn process_starttime(pid: u32) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// Whether process `pid` currently holds `target` (e.g. `/dev/loopN`) open as any of its
+/// file descriptors, by resolving the `/proc/<pid>/fd/*` symlinks. Used by
+/// [`adopt_writer`](LocalLoop::adopt_writer) to PROVE a re-adopted survivor Firecracker is
+/// the actual live writer of the loop device before re-pinning the holder to it — so a
+/// stale/forged `loop_dev` (or a `fc_pid` that no longer maps that device) can never be
+/// re-fenced as the writer. Conservative: any read error (`/proc` unreadable, fd raced
+/// away) reads as "does not hold it" (fail-closed for the adopt path's purposes).
+fn pid_holds_path(pid: u32, target: &str) -> bool {
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        if let Ok(link) = std::fs::read_link(entry.path())
+            && link.to_string_lossy() == target
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Liveness with PID-reuse resistance. With a known `expected_starttime` the process
 /// counts as alive only if its current start time still matches (same incarnation).
 /// `expected_starttime == 0` is a legacy holder with no recorded start time: fall
@@ -260,6 +281,61 @@ impl DataDiskProvider for LocalLoop {
         }
     }
 
+    async fn adopt_writer(
+        &self,
+        id: &str,
+        token: &FenceToken,
+        loop_dev: &str,
+        fc_pid: u32,
+        fc_starttime: u64,
+    ) -> Result<()> {
+        validate_id(id)?;
+        let img = self.img_path(id);
+        if !tokio::fs::try_exists(&img).await.unwrap_or(false) {
+            return Err(SubstrateError::NotFound(id.to_string()));
+        }
+        // (c) The writer must be the SAME live incarnation the caller verified. Reject a
+        // starttime of 0 outright (never inherit read_holder's legacy PID-only fallback —
+        // that is precisely what defeats PID reuse): re-adoption demands a pinned identity.
+        if fc_starttime == 0 || !process_alive_with_identity(fc_pid, fc_starttime) {
+            return Err(SubstrateError::RwoUnsafe {
+                scope: id.to_string(),
+            });
+        }
+        // (a) Fresh kernel read: `loop_dev` must STILL back THIS image. Re-querying the
+        // kernel (not trusting the persisted holder) catches a loop device that was torn
+        // down / rebound under us across the restart.
+        let backing = run("losetup", &["-j", img.to_str().unwrap()]).await?;
+        let still_backs = backing
+            .lines()
+            .filter_map(|l| l.split(':').next())
+            .any(|dev| dev == loop_dev);
+        if !still_backs {
+            return Err(SubstrateError::RwoUnsafe {
+                scope: id.to_string(),
+            });
+        }
+        // (b) `fc_pid` must actually hold `loop_dev` open — proves it is the real writer,
+        // not merely a live process that happens to carry the right pid+starttime.
+        if !pid_holds_path(fc_pid, loop_dev) {
+            return Err(SubstrateError::RwoUnsafe {
+                scope: id.to_string(),
+            });
+        }
+        // Re-pin: overwrite the holder with the fresh epoch/source + the verified writer,
+        // keeping the UNCHANGED, kernel-confirmed loop_dev. No losetup attach/detach.
+        self.write_holder(
+            id,
+            &Holder {
+                pid: fc_pid,
+                pid_starttime: fc_starttime,
+                epoch: token.epoch,
+                source_id: token.source_id.clone(),
+                loop_dev: loop_dev.to_string(),
+            },
+        )
+    }
+
     async fn detach(&self, id: &str) -> Result<()> {
         validate_id(id)?;
         if let Some(h) = self.read_holder(id) {
@@ -398,6 +474,50 @@ mod tests {
             Err(SubstrateError::Fenced { .. })
         ));
         assert_eq!(p.read_holder("d").unwrap().pid, 4242); // unchanged
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    #[test]
+    fn pid_holds_path_detects_open_fd() {
+        // An open file shows up as a /proc/self/fd/* symlink to its absolute path.
+        let dir = dir("fd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("held.bin");
+        let f = std::fs::File::create(&p).unwrap();
+        let me = std::process::id();
+        let target = p.to_string_lossy().to_string();
+        assert!(pid_holds_path(me, &target)); // we hold it open right now
+        assert!(!pid_holds_path(me, "/dev/loop-does-not-exist-99999")); // not held
+        assert!(!pid_holds_path(4_000_000_000, &target)); // dead pid ⇒ false
+        drop(f);
+        // After close, the fd is gone, so we no longer "hold" it.
+        assert!(!pid_holds_path(me, &target));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adopt_writer_fails_closed_on_bad_identity_or_missing_disk() {
+        let p = LocalLoop::open(dir("adopt-fc")).unwrap();
+        // Missing disk ⇒ NotFound (before any identity check).
+        assert!(matches!(
+            p.adopt_writer("nope", &token(2), "/dev/loop9", 1234, 7).await,
+            Err(SubstrateError::NotFound(_))
+        ));
+        // Disk present, but a starttime of 0 (UNKNOWN) is rejected outright — re-adoption
+        // never inherits the PID-only liveness fallback. Reached before any losetup.
+        std::fs::write(p.img_path("d"), b"").unwrap();
+        assert!(matches!(
+            p.adopt_writer("d", &token(2), "/dev/loop9", std::process::id(), 0)
+                .await,
+            Err(SubstrateError::RwoUnsafe { .. })
+        ));
+        // A dead/implausible pid (with a non-zero claimed starttime) ⇒ RwoUnsafe, also
+        // before any losetup (so this needs no root).
+        assert!(matches!(
+            p.adopt_writer("d", &token(2), "/dev/loop9", 4_000_000_000, 42)
+                .await,
+            Err(SubstrateError::RwoUnsafe { .. })
+        ));
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 
