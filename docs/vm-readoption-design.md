@@ -257,3 +257,34 @@ recorded here before implementation:
   before `rootfs_cas::gc` (`main.rs:1133`). All adopt-or-reap (verify + re-fence + reap orphans) happens in
   the §6b pass after `PlatformState` is built. GC reaping an orphan's blob mid-life is non-destructive
   (`unlink`, FC holds the fd) and the orphan is reaped in §6b.
+
+## Implementation review outcome (post-code adversarial review)
+A 6-dimension adversarial review (find → adversarial-verify → merge-gate synthesis) of the
+implemented change returned **FIX-FIRST**; all confirmed findings are now fixed:
+- **HIGH-1 (fixed):** `restore_from_snapshot` did NOT migrate the FC into the `jkbase-runtime`
+  cgroup (only `start` did), so snapshot-woken survivors — the *dominant* cohort on a scale-to-zero
+  platform — would be SIGKILLed on upgrade, silently defeating the feature for most VMs. Mirrored
+  the migrate-after-spawn into `restore_from_snapshot`.
+- **HIGH-2 (fixed):** the teardown `pkill -f "firecracker.*{id}"` was an unanchored substring →
+  a short project id (`a`) SIGKILLed every tenant FC host-wide. Anchored to `/{id}/firecracker.sock`.
+- **MED (fixed):** the runtime-cgroup `ExecStartPre` is `-`-prefixed (non-essential) so an aborted
+  deploy can't brick a later restart.
+- **LOW (fixed):** `reap_runtime_fc` now re-checks `/proc/<pid>/cmdline` against the expected
+  api-sock before SIGKILL (defeats a pid-recycle bystander kill); hibernate's failure paths use
+  `vm.stop()` (synchronous-to-death for BOTH variants) instead of `drop(vm)` (a no-op for the
+  Adopted variant) so the loop is never detached under a live FC; the cgroup leaf is `rmdir`'d on
+  `stop()` (R3).
+- **Self-caught (fixed before review):** the commit-time `set_writer_pid`-fatal path killed the FC
+  via the non-synchronous Owned `Drop` *after* releasing (detaching) the disk → now `vm.stop()`
+  first.
+- **Declined / accepted:** `panic = "abort"` (would make every tenant-induced task panic fatal to
+  the whole host — worse for availability than the narrow main-panic-during-upgrade window the
+  `process::exit(0)` path already structurally avoids); the 300s `.upgrading` freshness window
+  (bounded + self-healing); synchronous before-bind adoption (the correct safety choice — binding
+  first risks a double-boot).
+- **On-box validation targets (carried into the validation plan):** (1) the HIGH-1 regression must
+  boot → hibernate → **wake-via-restore** → assert the FC is in `jkbase-runtime` → upgrade-restart →
+  FC pid unchanged + 200 (a `start`-only test goes green while the dominant path bounces); (2) the
+  HIGH-2 blast radius (id `a` + a bystander VM → delete `a` → bystander survives); (3) the flagless
+  restart still hibernates; (4) negatives (kill-in-gap → reap+cold-boot; paused-mid-hibernate SIGKILL
+  → no resurrection; PID-reuse; double-adopt idempotency; second-live-server → `LeaseHeld` refuse).
