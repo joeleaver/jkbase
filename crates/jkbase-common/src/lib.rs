@@ -9,3 +9,17 @@ pub mod routing;
 /// and there remains exactly ONE implementation (byte-identical, no divergence).
 pub use jkbase_sigv4 as sigv4;
 pub mod storage;
+
+/// In-VM agent ⇄ host control-plane protocol version, echoed by the agent on
+/// `/_jkbase/health` (the [`AGENT_PROTOCOL_HEADER`] header). The host's VM re-adoption path
+/// reads it at adopt time: a survivor whose agent reports a DIFFERENT version is force-
+/// recycled (hibernate → cold-boot) rather than re-adopted, so a deploy that ships a
+/// breaking agent-protocol change can't silently keep talking the old wire format to a
+/// re-adopted old agent. **Bump this only on an incompatible change** to the unversioned
+/// `/_jkbase/*` endpoints (health / sync / resync-clock / logs) the host depends on. A
+/// MISSING header (a pre-versioning agent — every survivor during THIS rollout) is treated
+/// by the host as compatible, so re-adoption still works; the gate is forward-looking. See
+/// `docs/vm-readoption-design.md` §9.
+pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+/// The header the agent stamps its [`AGENT_PROTOCOL_VERSION`] into on health responses.
+pub const AGENT_PROTOCOL_HEADER: &str = "X-Jkbase-Agent-Proto";

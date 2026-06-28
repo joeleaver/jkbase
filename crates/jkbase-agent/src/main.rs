@@ -764,10 +764,17 @@ async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
         "functions_dir_exists": state.functions_dir.exists(),
         "functions_dir": state.functions_dir.display().to_string(),
         "servers": servers,
+        // Echoed so the host's VM re-adoption path can detect agent-protocol skew at adopt
+        // time and force-recycle instead of re-adopting an incompatible old agent (§9).
+        "agent_protocol": jkbase_common::AGENT_PROTOCOL_VERSION,
     });
     Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
+        .header(
+            jkbase_common::AGENT_PROTOCOL_HEADER,
+            jkbase_common::AGENT_PROTOCOL_VERSION.to_string(),
+        )
         .body(Full::new(Bytes::from(
             serde_json::to_vec_pretty(&body).unwrap(),
         )))
