@@ -2606,7 +2606,7 @@ async fn handle_deploy(
     // If start fails, release the fenced disk + lease AWAITED (not via the Drop
     // backstop) so an immediate re-deploy/re-wake can't race a fire-and-forget cleanup
     // and fail transiently with LeaseHeld/RwoUnsafe.
-    let vm = match VmInstance::start(project_id, &config, &runtime_dir).await {
+    let mut vm = match VmInstance::start(project_id, &config, &runtime_dir).await {
         Ok(vm) => vm,
         Err(e) => {
             if let Some(g) = disk_guard {
@@ -2623,13 +2623,16 @@ async fn handle_deploy(
     let fc_pid = vm.pid();
     // Capture the disk fence facts for the handoff, and make the writer-pid commit FATAL: the
     // holder must record the FC pid (so attach_rwo's liveness gate + re-adoption track the real
-    // writer) before the handoff names it. On failure, release the guard AWAITED + drop the VM,
-    // then bail (deploy is retryable) — never commit a VM whose holder still names this server.
+    // writer) before the handoff names it. On failure, KILL the FC synchronously-to-death FIRST
+    // (so the loop it maps is free) THEN release the guard AWAITED, and bail (deploy is
+    // retryable) — never commit a VM whose holder still names this server, never detach a loop a
+    // live FC still writes.
     let (loop_dev, lease_epoch) = if let Some(guard) = disk_guard {
         if let Some(pid) = fc_pid
             && let Err(e) = dd.set_writer_pid(project_id, guard.token(), pid).await
         {
             drop(plat);
+            let _ = vm.stop().await;
             guard.release().await;
             return Err(anyhow::anyhow!("commit set_writer_pid {project_id}: {e}"));
         }
@@ -3379,6 +3382,8 @@ async fn wake_project_inner(
             let dd2 = plat.data_disk.clone();
             if let Err(e) = dd2.set_writer_pid(project_id, guard.token(), pid).await {
                 drop(plat);
+                // Kill the FC synchronously-to-death BEFORE releasing (detaching) the disk it maps.
+                let _ = vm.stop().await;
                 guard.release().await;
                 let mut p = platform.lock().await;
                 p.wake_failures
