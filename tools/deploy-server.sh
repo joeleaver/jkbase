@@ -79,6 +79,11 @@ sudo tee /etc/systemd/system/jkbase.service.d/10-drain.conf > /dev/null << 'DROP
 [Service]
 KillMode=mixed
 TimeoutStopSec=120
+# Runtime-cgroup provisioner (VM re-adoption §1): an additive ExecStartPre so already-provisioned
+# boxes whose main unit predates it still create /sys/fs/cgroup/jkbase-runtime before the server
+# starts. Idempotent if the main unit (fresh provision) also lists it. The cp below installs the
+# script before this restart so the next ExecStartPre finds it.
+ExecStartPre=/usr/local/bin/jkbase-runtime-cgroup.sh
 DROPIN
 sudo systemctl daemon-reload
 
@@ -93,8 +98,9 @@ sudo systemctl daemon-reload
 echo "Re-syncing ExecStartPre helper scripts..."
 sudo cp "$HOME/jkbase/tools/setup-bridge.sh" /usr/local/bin/jkbase-bridge.sh
 sudo cp "$HOME/jkbase/tools/setup-build-cgroup.sh" /usr/local/bin/jkbase-build-cgroup.sh
+sudo cp "$HOME/jkbase/tools/setup-runtime-cgroup.sh" /usr/local/bin/jkbase-runtime-cgroup.sh
 sudo cp "$HOME/jkbase/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
-sudo chmod +x /usr/local/bin/jkbase-bridge.sh /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-build-net.sh
+sudo chmod +x /usr/local/bin/jkbase-bridge.sh /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-runtime-cgroup.sh /usr/local/bin/jkbase-build-net.sh
 
 # Re-scope ufw 80/443 to the public uplink on already-provisioned boxes. provision.sh only
 # runs once, so an existing box keeps the broad `ufw allow 80/443` on EVERY interface (incl.
@@ -118,6 +124,16 @@ if ! command -v ebtables >/dev/null 2>&1; then
     echo "Installing ebtables (build source-guard dependency)..."
     sudo apt-get install -y -qq ebtables
 fi
+
+# VM re-adoption §8: mark this restart as an UPGRADE so the OUTGOING server leaves its tenant
+# VMs running (in the jkbase-runtime cgroup) for the incoming server to re-adopt, instead of
+# draining/hibernating them. The incoming server clears the flag once adoption completes; the
+# trap removes it if THIS deploy dies before/at the restart, so a crashed deploy can't leave a
+# stale flag that makes a later operator `stop` skip the drain. First deploy of this code still
+# bounces once (the OLD server predates the flag check); upgrades after that are zero-bounce.
+# (Older than 300s ⇒ the server ignores it anyway — belt to the trap's suspenders.)
+trap 'sudo rm -f /var/jkbase/.upgrading 2>/dev/null || true' EXIT
+{ date +%s; echo "$$"; } | sudo tee /var/jkbase/.upgrading >/dev/null
 
 echo "Restarting service..."
 sudo systemctl restart jkbase
