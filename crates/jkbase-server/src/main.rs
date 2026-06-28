@@ -534,8 +534,11 @@ async fn self_fence_project(
         }
         tracing::error!(project = %project_id, scope = %lost_token.scope, epoch = lost_token.epoch,
                "DATA-DISK LEASE LOST — self-fencing: killing Firecracker before any survivor attaches");
-        // Drop our claim first so no other path still treats us as the holder.
+        // Drop our claim first so no other path still treats us as the holder. Remove the
+        // re-adoption record too: the FC is about to be killed, so a future start must NOT
+        // re-adopt it (it'll cold-boot once the lease situation clears).
         plat.disk_tokens.remove(project_id);
+        handoff::remove(&plat.data_dir.join("run"), project_id);
         plat.vm_states.remove(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
         (plat.vms.remove(project_id), plat.data_disk.clone())
@@ -1813,6 +1816,10 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             // maps (which another project could then be handed = corruption). The wake,
             // finding its FC dead, fails and its guard releases.
             reap_firecracker(project_id).await;
+            // The project is being deleted: drop its re-adoption record so a surviving FC
+            // can't be re-adopted on a later start (remove_project_artifacts also nukes
+            // run/{id} below; this is the explicit, lock-held removal beside disk_tokens).
+            handoff::remove(&plat.data_dir.join("run"), project_id);
             // Release the data-disk lease + destroy the disk (detach loop device,
             // remove the image + holder record) as part of reaping the project.
             if let Some(token) = plat.disk_tokens.remove(project_id) {
@@ -2401,6 +2408,10 @@ async fn handle_deploy(
         }
         let _ = old_vm.stop().await;
     }
+    // The old VM is gone (or being replaced); drop its re-adoption record so a crash between
+    // here and the new commit can't leave a handoff pointing at the now-dead old FC. The new
+    // VM writes a fresh record at its commit-to-Running below.
+    handoff::remove(&plat.data_dir.join("run"), project_id);
     // Release the old VM's data-disk hold (if any) before re-fencing for the new VM —
     // UNCONDITIONALLY: a stop() error or a missing VM handle must not leak the lease
     // (which would then fail the re-fence below with LeaseHeld and brick the redeploy).
@@ -2560,13 +2571,27 @@ async fn handle_deploy(
     // writer (so a future attach's liveness check tracks the real writer, not this
     // server), then DISARM the guard and hand the token to disk_tokens.
     let mut plat = platform.lock().await;
-    if let Some(guard) = disk_guard {
-        if let Some(pid) = vm.pid() {
-            let _ = dd.set_writer_pid(project_id, guard.token(), pid).await;
+    let fc_pid = vm.pid();
+    // Capture the disk fence facts for the handoff, and make the writer-pid commit FATAL: the
+    // holder must record the FC pid (so attach_rwo's liveness gate + re-adoption track the real
+    // writer) before the handoff names it. On failure, release the guard AWAITED + drop the VM,
+    // then bail (deploy is retryable) — never commit a VM whose holder still names this server.
+    let (loop_dev, lease_epoch) = if let Some(guard) = disk_guard {
+        if let Some(pid) = fc_pid
+            && let Err(e) = dd.set_writer_pid(project_id, guard.token(), pid).await
+        {
+            drop(plat);
+            guard.release().await;
+            return Err(anyhow::anyhow!("commit set_writer_pid {project_id}: {e}"));
         }
+        let dev = guard.device().to_string_lossy().into_owned();
+        let epoch = guard.token().epoch;
         plat.disk_tokens
             .insert(project_id.to_string(), guard.disarm());
-    }
+        (Some(dev), Some(epoch))
+    } else {
+        (None, None)
+    };
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
@@ -2575,13 +2600,33 @@ async fn handle_deploy(
     // is now freshly booted, so a stale entry mustn't fast-fail a routing-miss request.
     let ran_hash = plat.base_rootfs_hash.clone();
     plat.vm_rootfs_hashes
-        .insert(project_id.to_string(), ran_hash);
+        .insert(project_id.to_string(), ran_hash.clone());
     plat.wake_failures.remove(project_id);
+    let deployment_version = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.current_version);
     let active_domains = plat
         .store
         .list_active_domains_for_project(project_id)
         .unwrap_or_default();
     drop(plat);
+
+    // Persist the re-adoption record so a future jkbase-server upgrade re-adopts this VM (no
+    // bounce) instead of draining → cold-restoring it. Removed on every teardown. Best-effort:
+    // a write failure just means this VM cold-boots on the next restart (the prior behavior).
+    write_handoff_record(
+        &runtime_dir,
+        project_id,
+        fc_pid,
+        &alloc,
+        loop_dev,
+        lease_epoch,
+        ran_hash,
+        deployment_version,
+    );
 
     wait_for_agent(&alloc.ip).await?;
 
@@ -2596,6 +2641,49 @@ async fn handle_deploy(
 
     info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");
     Ok(())
+}
+
+/// Write the per-VM re-adoption record at commit-to-Running (deploy + wake). `fc_pid` +
+/// `fc_starttime` are captured from the SAME `/proc` read so the pid is pinned to one
+/// incarnation. Best-effort: if `fc_pid` is unknown (FC already exited) or the write fails, we
+/// skip — the only consequence is that this VM cold-boots on the next restart (the prior
+/// behavior), never a correctness hazard. See [`handoff`].
+#[allow(clippy::too_many_arguments)]
+fn write_handoff_record(
+    runtime_dir: &Path,
+    project_id: &str,
+    fc_pid: Option<u32>,
+    alloc: &VmAllocation,
+    loop_dev: Option<String>,
+    lease_epoch: Option<u64>,
+    base_rootfs_hash: String,
+    deployment_version: Option<u64>,
+) {
+    let Some(pid) = fc_pid else {
+        warn!(project = %project_id, "no FC pid at commit; skipping re-adoption handoff");
+        return;
+    };
+    let Some(st) = proc_starttime(pid) else {
+        warn!(project = %project_id, %pid, "FC pid gone at commit; skipping re-adoption handoff");
+        return;
+    };
+    let rec = handoff::HandoffRecord {
+        schema_version: handoff::SCHEMA_VERSION,
+        project_id: project_id.to_string(),
+        fc_pid: pid,
+        fc_starttime: st,
+        ip: alloc.ip.clone(),
+        tap: alloc.tap_device.clone(),
+        mac: alloc.mac.clone(),
+        loop_dev,
+        lease_epoch,
+        base_rootfs_hash,
+        deployment_version,
+    };
+    if let Err(e) = handoff::write(runtime_dir, project_id, &rec) {
+        warn!(project = %project_id, error = %e,
+            "failed to write re-adoption handoff (VM will cold-boot on next restart)");
+    }
 }
 
 /// Point all of a project's Active hosts at its VM IP (fast-path routes) and
@@ -2664,6 +2752,13 @@ async fn hibernate_project(
             anyhow::bail!("no VM instance for {project_id}");
         }
     };
+
+    // VM re-adoption §6/R4: remove the handoff record FIRST — before the pause below — so even a
+    // SIGKILL of this server mid-snapshot can't leave a PAUSED FC that the next start would
+    // re-adopt as "running" (the paused-FC-resurrection hole). Decoupled from the disk_tokens
+    // clear, which is in the SECOND lock after the pause. The teardown paths that have no pause
+    // (force-stop / self-fence / teardown) remove it beside their disk_tokens clear instead.
+    handoff::remove(&plat.data_dir.join("run"), project_id);
 
     let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
     let agent_ip = plat
@@ -3185,7 +3280,7 @@ async fn wake_project_inner(
         Ok((vm, ran_hash, outcome))
     }
     .await;
-    let (vm, ran_hash, outcome) = match boot {
+    let (mut vm, ran_hash, outcome) = match boot {
         Ok(t) => t,
         Err(e) => {
             // Release the fenced disk AWAITED, THEN record the failure. Ordering matters: the
@@ -3216,30 +3311,48 @@ async fn wake_project_inner(
         plat.vm_states.remove(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
         drop(plat);
-        drop(vm); // SIGKILL the FC before detaching the disk it still maps
+        let _ = vm.stop().await; // synchronous-to-death before detaching the disk it maps
         if let Some(g) = disk_guard {
             g.release().await; // detach + lease release inline; disarms so Drop no-ops
         }
+        // No handoff was written this wake (that happens at commit, below), but a stale one
+        // from a prior incarnation must not survive a delete-during-wake — remove defensively.
+        handoff::remove(&runtime_dir, project_id);
         anyhow::bail!("project {project_id} was deleted during wake; aborting");
     }
 
-    // Record Firecracker's PID as the data-disk writer, then DISARM the guard and hold
-    // the token for the VM's lifetime (released on hibernate/stop/teardown).
-    if let Some(guard) = disk_guard {
-        if let Some(pid) = vm.pid() {
+    // Record Firecracker's PID as the data-disk writer (FATAL — see the deploy commit), capture
+    // the fence facts for the handoff, then DISARM the guard and hold the token for the VM's
+    // lifetime (released on hibernate/stop/teardown).
+    let fc_pid = vm.pid();
+    let (loop_dev, lease_epoch) = if let Some(guard) = disk_guard {
+        if let Some(pid) = fc_pid {
             let dd2 = plat.data_disk.clone();
-            let _ = dd2.set_writer_pid(project_id, guard.token(), pid).await;
+            if let Err(e) = dd2.set_writer_pid(project_id, guard.token(), pid).await {
+                drop(plat);
+                guard.release().await;
+                let mut p = platform.lock().await;
+                p.wake_failures
+                    .insert(project_id.to_string(), std::time::Instant::now());
+                drop(p);
+                return Err(anyhow::anyhow!("commit set_writer_pid {project_id}: {e}"));
+            }
         }
+        let dev = guard.device().to_string_lossy().into_owned();
+        let epoch = guard.token().epoch;
         plat.disk_tokens
             .insert(project_id.to_string(), guard.disarm());
-    }
+        (Some(dev), Some(epoch))
+    } else {
+        (None, None)
+    };
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
     // Track the rootfs this VM actually ran so the NEXT hibernate stamps the truthful hash
     // (a restored VM ran the OLD blob, not `current`). Clear any prior wake-failure throttle.
     plat.vm_rootfs_hashes
-        .insert(project_id.to_string(), ran_hash);
+        .insert(project_id.to_string(), ran_hash.clone());
     plat.wake_failures.remove(project_id);
 
     if let Ok(Some(mut proj)) = plat.store.get_project(project_id) {
@@ -3248,6 +3361,18 @@ async fn wake_project_inner(
     }
     drop(plat);
     waking_guard.commit();
+
+    // Persist the re-adoption record (mirrors the deploy commit; removed on every teardown).
+    write_handoff_record(
+        &runtime_dir,
+        project_id,
+        fc_pid,
+        &alloc,
+        loop_dev,
+        lease_epoch,
+        ran_hash,
+        current_version,
+    );
 
     register_active_routes(
         &routing,
@@ -4237,6 +4362,9 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
         let _ = vm.stop().await;
     }
     plat.vm_rootfs_hashes.remove(project_id);
+    // The FC is being reaped below — drop its re-adoption record so a later start can't adopt it.
+    // (hibernate_project already removed it before its pause; idempotent if so.)
+    handoff::remove(&plat.data_dir.join("run"), project_id);
     // Release the data-disk hold so the next wake re-fences (the FC is reaped below).
     if let Some(token) = plat.disk_tokens.remove(project_id) {
         let dd = plat.data_disk.clone();
