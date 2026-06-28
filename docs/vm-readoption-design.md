@@ -212,3 +212,48 @@ returned **"needs rethink."** v2 folds in every CONFIRMED finding:
   the 3-point cgroup provisioning wiring (§1); the `.upgrading` stale-flag freshness (§8); agent
   protocol skew (§9); `cleanup_orphans` severing a survivor (§7); over-quota adopt (§10); `SO_PEERCRED`
   socket binding (§4).
+
+## Implementation resolutions (v2.1 — seam-map + completeness-critic pass, pre-code)
+A parallel seam-map of every current touchpoint (line numbers re-confirmed against HEAD) plus a
+completeness critic raised nine items; the load-bearing ones change the mechanism, so they are
+recorded here before implementation:
+
+- **R1 (was §1/§2, the critical one): the survival mechanism is `std::process::exit(0)` on upgrade,
+  NOT "drop `kill_on_drop`."** `VmInstance` has an *explicit* `Drop` impl (`vm.rs:409`, `start_kill()`)
+  that kills the FC **independent of `kill_on_drop`** — so a graceful upgrade return would SIGKILL every
+  spawned survivor before it could be adopted, no matter what `kill_on_drop` is set to. Resolution: keep
+  the spawned `VmInstance` (Child + `kill_on_drop` + killing `Drop`) **exactly as-is** — its backstop on
+  `start()`/`restore()` config errors is preserved (closes critic G7) — and on the **upgrade** branch of
+  `shutdown_signal` call `std::process::exit(0)`, which terminates without running ANY destructor (neither
+  `Drop` nor the tokio Child kill-guard fires). Survival vs `systemd KillMode=mixed` is the `jkbase-runtime`
+  cgroup escape (§1). A real-shutdown (no fresh flag) still drains/hibernates as today. Bonus: a SIGKILLed
+  crash (OOM) now also leaves survivors for the next start to adopt-or-reap.
+- **R2 (§5.1 / critic G8): `LeaseHeld` at adopt ⇒ SKIP that one project (loud error) + continue — never
+  abort the whole startup, never kill the peer's VM.** Aborting startup over one held disk would take down
+  every other tenant and systemd would restart-loop. On single-host with systemd this path shouldn't occur
+  (the old flock releases on the prior process's exit before `systemctl restart` starts the new one).
+- **R3 (§1 / critic G3): the SERVER creates the per-`<id>` cgroup leaf.** `setup-runtime-cgroup.sh`
+  provisions only the **parent** `/sys/fs/cgroup/jkbase-runtime` (mirroring `setup-build-cgroup.sh`); since
+  runtime FCs are raw (no jailer), `vm.rs` itself `mkdir`s `jkbase-runtime/<id>/` and writes the FC pid to
+  its `cgroup.procs` immediately after spawn (via a new `VmConfig.runtime_cgroup_parent` field, set only by
+  the server's runtime path — build VMs keep the jailer mechanism). Empty leaves are best-effort `rmdir`'d
+  on stop.
+- **R4 (§3/§6/§8 / critic G2): handoff removal on hibernate is DECOUPLED from the `disk_tokens` clear.**
+  In `hibernate_project` the first lock (≤`main.rs:2644`) and the `disk_tokens.remove` (`main.rs:2696`) sit
+  on opposite sides of the pause (`main.rs:2671`). Anti-resurrection (§8) needs the handoff gone *before*
+  the pause, so it is removed in the **first** lock (right after `vms.remove`); other teardown paths keep
+  it beside their `disk_tokens` clear.
+- **R5 (§9 / critic G4): the agent protocol surface is greenfield** — added as a `JKBASE_AGENT_PROTOCOL`
+  constant (`jkbase-common`) echoed by the agent on `/_jkbase/health` (header). Adopt reads it; **absent ⇒
+  compatible (adopt anyway)** — survivors run the OLD agent which has no header, so this is forward-looking
+  (it gates FUTURE breaking upgrades), with "omit the `.upgrading` flag for a protocol-breaking deploy" as
+  the operational hammer.
+- **R6 (§4 / critic G5): `SO_PEERCRED` is a new raw helper.** `FirecrackerClient` never exposes its fd, so
+  adopt does its own `UnixStream::connect(api_sock)` + `getsockopt(SO_PEERCRED)` (via the existing
+  workspace `libc` dep) to bind the socket probe to `fc_pid`. Defense-in-depth atop the starttime pin.
+- **R7 (§6a / critic): the pre-GC keep-set scan replaces the OLD `reap_orphan_firecrackers` at
+  `main.rs:1111`** — that targeted reaper is DELETED (it would kill survivors before adoption); instead a
+  cheap `handoff::scan` unions every strict-parsed survivor's `base_rootfs_hash` into the GC keep set
+  before `rootfs_cas::gc` (`main.rs:1133`). All adopt-or-reap (verify + re-fence + reap orphans) happens in
+  the §6b pass after `PlatformState` is built. GC reaping an orphan's blob mid-life is non-destructive
+  (`unlink`, FC holds the fd) and the orphan is reaped in §6b.
