@@ -1888,7 +1888,13 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 
     // Kill any leaked Firecracker that outlived the handle, then drop its TAP.
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("firecracker.*{project_id}")])
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
+        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
         .status()
         .await;
     if let Some(a) = alloc {
@@ -2853,13 +2859,16 @@ async fn hibernate_project(
         Ok(Ok(paths)) => paths,
         Ok(Err(e)) => {
             tracing::error!(project = %project_id, error = %e, "hibernate failed, force-stopping");
-            drop(vm); // Drop SIGKILLs the process; force_stop handles the rest.
+            // stop() is synchronous-to-death for BOTH variants; a bare drop() would NOT kill an
+            // Adopted survivor (its Drop is a no-op), leaving force_stop to detach the loop under a
+            // live FC. Kill here so the FC is gone before force_stop releases the disk.
+            let _ = vm.stop().await;
             force_stop_and_cleanup(project_id, &platform).await;
             return Ok(());
         }
         Err(_elapsed) => {
             tracing::error!(project = %project_id, "hibernate timed out (VM wedged), force-stopping");
-            drop(vm);
+            let _ = vm.stop().await;
             force_stop_and_cleanup(project_id, &platform).await;
             return Ok(());
         }
@@ -3851,7 +3860,13 @@ async fn migrate_legacy_data_disks(dir: &Path) -> Result<()> {
 /// Reap any Firecracker process still running for `project_id` (best-effort).
 async fn reap_firecracker(project_id: &str) {
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("firecracker.*{project_id}")])
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
+        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
         .status()
         .await;
 }
@@ -4142,7 +4157,20 @@ async fn agent_protocol_version(ip: &str) -> Option<u32> {
 /// The holder record is deliberately LEFT in place so a later cold-boot's `attach_rwo` runs
 /// its fail-CLOSED preempt; deleting it would make `attach_rwo` fail-OPEN. The caller removes
 /// only `handoff.json`.
-async fn reap_runtime_fc(fc_pid: u32) {
+///
+/// TOCTOU-guarded: only kills if `fc_pid` is STILL the firecracker serving `expected_sock` — the
+/// FC could have exited during the seconds of verification between enumeration and here, and its
+/// pid been recycled to an unrelated process; a bare-pid SIGKILL would then hit a bystander.
+async fn reap_runtime_fc(fc_pid: u32, expected_sock: &Path) {
+    let sock_bytes = expected_sock.to_string_lossy().into_owned().into_bytes();
+    let still_ours = std::fs::read(format!("/proc/{fc_pid}/cmdline"))
+        .map(|raw| raw.split(|b| *b == 0).any(|arg| arg == sock_bytes.as_slice()))
+        .unwrap_or(false);
+    if !still_ours {
+        warn!(%fc_pid, sock = %expected_sock.display(),
+            "VM re-adoption: pid is no longer the FC for this api-sock (exited/recycled); not killing");
+        return;
+    }
     warn!(%fc_pid, "VM re-adoption: reaping non-survivor runtime Firecracker");
     let _ = std::process::Command::new("kill")
         .arg("-KILL")
@@ -4204,7 +4232,7 @@ async fn adopt_or_reap_runtime_vms(
             .map(|s| s.to_string_lossy().into_owned())
         else {
             warn!(%fc_pid, sock = %sock.display(), "re-adoption: cannot derive project id; reaping");
-            reap_runtime_fc(fc_pid).await;
+            reap_runtime_fc(fc_pid, &sock).await;
             reaped += 1;
             continue;
         };
@@ -4252,7 +4280,7 @@ async fn adopt_one_survivor(
     // fail-closed preempt for a later attach_rwo).
     let Some(rec) = handoff::read_strict(runtime_dir, id) else {
         warn!(project = %id, %fc_pid, "re-adoption: no valid handoff (orphan); reaping");
-        reap_runtime_fc(fc_pid).await;
+        reap_runtime_fc(fc_pid, sock).await;
         handoff::remove(runtime_dir, id);
         return AdoptOutcome::Reaped;
     };
@@ -4284,7 +4312,7 @@ async fn adopt_one_survivor(
         .await;
     }
     // Any verification miss fell through to here.
-    reap_runtime_fc(fc_pid).await;
+    reap_runtime_fc(fc_pid, sock).await;
     handoff::remove(runtime_dir, id);
     AdoptOutcome::Reaped
 }
@@ -4303,6 +4331,7 @@ async fn finish_adoption(
     fc_pid: u32,
     rec: handoff::HandoffRecord,
 ) -> AdoptOutcome {
+    let sock = runtime_dir.join(id).join("firecracker.sock");
     // (3) Re-fence the data disk WITHOUT detaching — only for projects that have one. The old
     // process's flock released on its exit, so acquire wins at a fresh (higher) epoch.
     let token = if let Some(loop_dev) = rec.loop_dev.clone() {
@@ -4319,7 +4348,7 @@ async fn finish_adoption(
             }
             Err(e) => {
                 tracing::warn!(project = %id, error = %e, "re-adoption: lease acquire failed; reaping");
-                reap_runtime_fc(fc_pid).await;
+                reap_runtime_fc(fc_pid, &sock).await;
                 handoff::remove(runtime_dir, id);
                 return AdoptOutcome::Reaped;
             }
@@ -4335,7 +4364,7 @@ async fn finish_adoption(
             tracing::warn!(project = %id, error = %e,
                 "re-adoption: adopt_writer failed; releasing lease + reaping for cold boot");
             let _ = lease.release(&token).await;
-            reap_runtime_fc(fc_pid).await;
+            reap_runtime_fc(fc_pid, &sock).await;
             handoff::remove(runtime_dir, id);
             return AdoptOutcome::Reaped;
         }
@@ -4454,7 +4483,13 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
 
     // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("firecracker.*{project_id}")])
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
+        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
         .status()
         .await;
 

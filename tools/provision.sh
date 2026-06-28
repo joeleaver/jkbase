@@ -277,7 +277,10 @@ User=root
 EnvironmentFile=/var/jkbase/.env
 ExecStartPre=/usr/local/bin/jkbase-bridge.sh
 ExecStartPre=/usr/local/bin/jkbase-build-cgroup.sh
-ExecStartPre=/usr/local/bin/jkbase-runtime-cgroup.sh
+# `-` prefix: the runtime cgroup is NON-essential (the server self-creates the per-id leaf via
+# create_dir_all; a missing/failing script just costs upgrade-survival, never blocks startup), so
+# its absence/failure must never brick the service start.
+ExecStartPre=-/usr/local/bin/jkbase-runtime-cgroup.sh
 ExecStartPre=/usr/local/bin/jkbase-build-net.sh
 ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --data-dir /var/jkbase \

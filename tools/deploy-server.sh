@@ -81,9 +81,12 @@ KillMode=mixed
 TimeoutStopSec=120
 # Runtime-cgroup provisioner (VM re-adoption §1): an additive ExecStartPre so already-provisioned
 # boxes whose main unit predates it still create /sys/fs/cgroup/jkbase-runtime before the server
-# starts. Idempotent if the main unit (fresh provision) also lists it. The cp below installs the
-# script before this restart so the next ExecStartPre finds it.
-ExecStartPre=/usr/local/bin/jkbase-runtime-cgroup.sh
+# starts. Idempotent if the main unit (fresh provision) also lists it. The `-` prefix makes it
+# NON-essential: the script is installed by the cp below (before this restart), but if a deploy
+# aborts in the window between this daemon-reload and that cp, a later restart must not brick on a
+# missing ExecStartPre — and the server self-creates the per-id leaf anyway, so a failure here only
+# costs upgrade-survival, never startup.
+ExecStartPre=-/usr/local/bin/jkbase-runtime-cgroup.sh
 DROPIN
 sudo systemctl daemon-reload
 
