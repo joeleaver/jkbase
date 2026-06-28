@@ -4346,7 +4346,13 @@ async fn finish_adoption(
 
     // (4) Commit under the platform lock. Re-validate the project still exists (a delete could
     // have landed via the control API). If gone: kill the FC + release/detach AWAITED, reap.
-    let vm = VmInstance::adopt(id, runtime_dir, fc_pid, rec.fc_starttime);
+    let vm = VmInstance::adopt(
+        id,
+        runtime_dir,
+        fc_pid,
+        rec.fc_starttime,
+        Some(Path::new(RUNTIME_CGROUP_PARENT)),
+    );
     let over_quota;
     let active_domains;
     {

@@ -43,6 +43,9 @@ pub struct VmInstance {
     log_path: PathBuf,
     handle: FcHandle,
     client: FirecrackerClient,
+    /// The runtime cgroup leaf (`<parent>/<id>`) this FC was migrated into, if any. Best-effort
+    /// `rmdir`'d by `stop()` once the FC is dead so empty per-id leaves don't accumulate.
+    cgroup_leaf: Option<PathBuf>,
 }
 
 /// How this process relates to the Firecracker it manages.
@@ -278,6 +281,7 @@ impl VmInstance {
             log_path,
             handle: FcHandle::Owned(process),
             client,
+            cgroup_leaf: config.runtime_cgroup_parent.as_ref().map(|p| p.join(id)),
         })
     }
 
@@ -290,7 +294,13 @@ impl VmInstance {
     /// layer answers, and that the api-sock's `SO_PEERCRED` peer == `fc_pid`. The returned
     /// adopted instance re-implements `pid`/`stop`/`hibernate` off the pid (no `Child`), and
     /// its `Drop` is a no-op so it can never kill a VM meant to survive.
-    pub fn adopt(id: &str, runtime_dir: &Path, fc_pid: u32, fc_starttime: u64) -> Self {
+    pub fn adopt(
+        id: &str,
+        runtime_dir: &Path,
+        fc_pid: u32,
+        fc_starttime: u64,
+        cgroup_parent: Option<&Path>,
+    ) -> Self {
         let vm_dir = runtime_dir.join(id);
         let socket_path = vm_dir.join("firecracker.sock");
         let vsock_path = vm_dir.join("vsock.sock");
@@ -310,6 +320,8 @@ impl VmInstance {
                 fc_starttime,
             },
             client,
+            // The survivor's leaf was created by the prior server; clean it up when we stop it.
+            cgroup_leaf: cgroup_parent.map(|p| p.join(id)),
         }
     }
 
@@ -380,6 +392,11 @@ impl VmInstance {
             && vp.exists()
         {
             let _ = tokio::fs::remove_file(vp).await;
+        }
+        // The FC is dead, so its runtime cgroup leaf is now empty — best-effort rmdir so empty
+        // per-id leaves don't accumulate under jkbase-runtime across a long uptime.
+        if let Some(leaf) = &self.cgroup_leaf {
+            let _ = std::fs::remove_dir(leaf);
         }
 
         info!(self.id, "VM stopped");
@@ -462,6 +479,17 @@ impl VmInstance {
             .spawn()
             .context("failed to spawn Firecracker process")?;
 
+        // Migrate the restored FC into the runtime cgroup IMMEDIATELY (same as `start`) so it
+        // survives a server restart for re-adoption. WITHOUT this, snapshot-woken VMs — the
+        // DOMINANT cohort on a scale-to-zero platform (every project that has hibernated+woken)
+        // — stay in jkbase.service's cgroup and are SIGKILLed by KillMode=mixed on upgrade,
+        // silently defeating the whole re-adoption feature for the majority of running VMs.
+        if let Some(parent) = &config.runtime_cgroup_parent
+            && let Some(fc_pid) = process.id()
+        {
+            migrate_to_runtime_cgroup(parent, id, fc_pid);
+        }
+
         for _ in 0..50 {
             if socket_path.exists() {
                 break;
@@ -527,6 +555,7 @@ impl VmInstance {
             log_path,
             handle: FcHandle::Owned(process),
             client,
+            cgroup_leaf: config.runtime_cgroup_parent.as_ref().map(|p| p.join(id)),
         })
     }
 }
@@ -600,7 +629,7 @@ mod tests {
     fn adopt_exposes_fc_pid_and_paths() {
         let dir = std::env::temp_dir().join(format!("jkb-vm-adopt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let vm = VmInstance::adopt("proj-x", &dir, 4242, 99);
+        let vm = VmInstance::adopt("proj-x", &dir, 4242, 99, None);
         assert_eq!(vm.pid(), Some(4242)); // metering reads the adopted pid
         assert_eq!(vm.id, "proj-x");
         assert!(vm.socket_path().ends_with("proj-x/firecracker.sock"));
@@ -620,7 +649,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // A dead/implausible pid: SIGKILL is a no-op, proc_alive_at is immediately false, so
         // stop() confirms death on the first poll and returns Ok (no real FC needed).
-        let mut vm = VmInstance::adopt("proj-y", &dir, 4_000_000_000, 12345);
+        let mut vm = VmInstance::adopt("proj-y", &dir, 4_000_000_000, 12345, None);
         assert!(vm.stop().await.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
