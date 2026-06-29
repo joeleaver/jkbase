@@ -7,6 +7,7 @@ edition = "2024"
 jkbase-common = { workspace = true }
 jkbase-wsproxy = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1"] }
