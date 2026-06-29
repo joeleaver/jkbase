@@ -3246,8 +3246,15 @@ async fn wake_project_inner(
             current_hash: &str,
             outcome: &'static str,
         ) -> Result<(VmInstance, String, &'static str)> {
-            let vm = VmInstance::start(project_id, config, runtime_dir).await?;
-            wait_for_agent(agent_ip).await?;
+            let mut vm = VmInstance::start(project_id, config, runtime_dir).await?;
+            // Synchronous-to-death on agent-wait failure, mirroring the restore arm's
+            // `restored.stop().await`: a bare `?` here would drop `vm` (SIGKILL via Drop, NOT
+            // awaited), so the caller's `disk_guard.release()` could `losetup -d` the data disk
+            // out from under a still-dying FC. `stop()` reaps the FC before we return Err.
+            if let Err(e) = wait_for_agent(agent_ip).await {
+                let _ = vm.stop().await;
+                return Err(e);
+            }
             Ok((vm, current_hash.to_string(), outcome))
         }
 

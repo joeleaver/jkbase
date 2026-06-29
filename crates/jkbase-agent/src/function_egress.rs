@@ -321,16 +321,26 @@ struct TokenBucket {
 
 impl TokenBucket {
     fn new(capacity: f64, refill_per_sec: f64) -> Self {
+        Self::new_at(capacity, refill_per_sec, Instant::now())
+    }
+
+    fn try_take(&mut self) -> bool {
+        self.try_take_at(Instant::now())
+    }
+
+    /// Clock-injecting variants. Production reads `Instant::now()` (above); tests drive `now`
+    /// explicitly so refill is exact and never races scheduler jitter (the old wall-clock test
+    /// flaked CI: ~1ms between takes refilled a token before the "exhausted" assert).
+    fn new_at(capacity: f64, refill_per_sec: f64, now: Instant) -> Self {
         Self {
             tokens: capacity,
             capacity,
             refill_per_sec,
-            last: Instant::now(),
+            last: now,
         }
     }
 
-    fn try_take(&mut self) -> bool {
-        let now = Instant::now();
+    fn try_take_at(&mut self, now: Instant) -> bool {
         let elapsed = now.duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
@@ -889,11 +899,17 @@ mod tests {
 
     #[test]
     fn token_bucket_limits_then_refills() {
-        let mut tb = TokenBucket::new(2.0, 1000.0);
-        assert!(tb.try_take());
-        assert!(tb.try_take());
-        assert!(!tb.try_take(), "burst exhausted");
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(tb.try_take(), "refilled after a tick");
+        // Deterministic clock: no time advances across the burst, so refill is exactly zero and
+        // the bucket empties at precisely `capacity` takes (no wall-clock dependence / no sleep).
+        let t0 = Instant::now();
+        let mut tb = TokenBucket::new_at(2.0, 1000.0, t0);
+        assert!(tb.try_take_at(t0));
+        assert!(tb.try_take_at(t0));
+        assert!(!tb.try_take_at(t0), "burst exhausted");
+        // +5ms at 1000/s → 5 tokens refilled.
+        assert!(
+            tb.try_take_at(t0 + Duration::from_millis(5)),
+            "refilled after a tick"
+        );
     }
 }
