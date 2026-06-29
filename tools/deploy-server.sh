@@ -105,6 +105,35 @@ sudo cp "$HOME/jkbase/tools/setup-runtime-cgroup.sh" /usr/local/bin/jkbase-runti
 sudo cp "$HOME/jkbase/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
 sudo chmod +x /usr/local/bin/jkbase-bridge.sh /usr/local/bin/jkbase-build-cgroup.sh /usr/local/bin/jkbase-runtime-cgroup.sh /usr/local/bin/jkbase-build-net.sh
 
+# Socket-activation units (zero-bounce Phase 2): refresh the two public-listener socket units +
+# install the wiring drop-in (mirrors 10-drain.conf) so an already-provisioned box gets
+# Requires=/After=/Sockets= without a full provision.sh re-run. NEVER `restart` an active socket —
+# that drops the listen backlog and re-opens the gap; deploys touch only the service.
+echo "Refreshing socket-activation units (Phase 2)..."
+sudo cp "$HOME/jkbase/tools/units/jkbase-proxy-http.socket"  /etc/systemd/system/jkbase-proxy-http.socket
+sudo cp "$HOME/jkbase/tools/units/jkbase-proxy-https.socket" /etc/systemd/system/jkbase-proxy-https.socket
+sudo tee /etc/systemd/system/jkbase.service.d/20-sockets.conf > /dev/null << 'DROPIN'
+[Unit]
+# NO PartOf= — that would cycle the sockets on a service restart and re-open the gap. Requires=
+# propagates stop only socket->service, never service->socket.
+Requires=jkbase-proxy-http.socket jkbase-proxy-https.socket
+After=jkbase-proxy-http.socket jkbase-proxy-https.socket
+[Service]
+Sockets=jkbase-proxy-http.socket
+Sockets=jkbase-proxy-https.socket
+DROPIN
+# Lift the listen-backlog ceiling so the units' Backlog=4096 isn't silently clamped during the
+# successor's cold-start no-acceptor window (adversarial MED-6).
+echo 'net.core.somaxconn = 4096' | sudo tee /etc/sysctl.d/99-jkbase-somaxconn.conf > /dev/null
+sudo sysctl -q -w net.core.somaxconn=4096 || true
+sudo systemctl daemon-reload   # does NOT drop already-bound sockets
+# enable (NOT --now): on the FIRST deploy of this code the old in-process server still holds
+# :80/:443, so `start`ing the socket now would EADDRINUSE and (set -e) abort the deploy mid-flight.
+# The service's Requires= pulls the sockets up during the restart's start job (after the stop frees
+# the ports). FIRST deploy bounces once (old binary predates the sockets); every deploy after is
+# gapless. A future socket port-edit also bounces once (must restart the socket).
+sudo systemctl enable jkbase-proxy-http.socket jkbase-proxy-https.socket
+
 # Re-scope ufw 80/443 to the public uplink on already-provisioned boxes. provision.sh only
 # runs once, so an existing box keeps the broad `ufw allow 80/443` on EVERY interface (incl.
 # jkbr0). JKRUNFW (re-synced above, evaluated before ufw) is the load-bearing control; this

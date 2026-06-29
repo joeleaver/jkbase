@@ -1,0 +1,20 @@
+[Unit]
+Description=jkbase proxy HTTP :80 (socket-activated; survives a jkbase-server restart)
+# Zero-bounce Phase 2: systemd owns this listening socket for the unit's whole life, so a
+# `systemctl restart jkbase` (service-only) never closes it — new connections queue in the kernel
+# backlog and are accepted by the successor instead of getting ECONNREFUSED. NO PartOf= (that would
+# cycle the socket on a service restart and re-open the gap); Requires= on the service side
+# propagates stop only socket->service. See docs/zero-bounce-phase2-design.md.
+
+[Socket]
+# Explicit 0.0.0.0 = AF_INET, exact parity with the historical bind(([0,0,0,0],80)). A bare
+# `ListenStream=80` would open an AF_INET6 dual-stack socket (peer IPs -> ::ffff:..., bypassing the
+# IPv4 ufw/JKRUNFW rules); the server also hard-asserts AF_INET on the inherited fd. Do NOT change
+# to the bare form.
+ListenStream=0.0.0.0:80
+FileDescriptorName=proxy-http
+Service=jkbase.service
+Backlog=4096
+
+[Install]
+WantedBy=sockets.target

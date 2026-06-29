@@ -236,6 +236,21 @@ sudo chmod +x /usr/local/bin/jkbase-runtime-cgroup.sh
 sudo cp "$JKBASE_DIR/tools/setup-build-net.sh" /usr/local/bin/jkbase-build-net.sh
 sudo chmod +x /usr/local/bin/jkbase-build-net.sh
 
+# Socket-activation units (zero-bounce Phase 2). systemd owns the public :80/:443 listening sockets
+# for the unit's life, so a `systemctl restart jkbase` (service-only) never closes them — new
+# connections queue in the kernel backlog for the successor instead of ECONNREFUSED. NO PartOf= (it
+# would cycle the socket on a service restart and re-open the gap). api/storage are deliberately NOT
+# activated: they stay in-process 127.0.0.1 binds so their loopback P0 invariant stays structural.
+# See docs/zero-bounce-phase2-design.md.
+sudo cp "$JKBASE_DIR/tools/units/jkbase-proxy-http.socket"  /etc/systemd/system/jkbase-proxy-http.socket
+sudo cp "$JKBASE_DIR/tools/units/jkbase-proxy-https.socket" /etc/systemd/system/jkbase-proxy-https.socket
+
+# Lift the listen-backlog ceiling: the no-acceptor window during the successor's cold start
+# (ExecStartPre + adopt_or_reap) queues new connections; net.core.somaxconn silently clamps the
+# units' Backlog=4096, so raise it to match (adversarial MED-6).
+echo 'net.core.somaxconn = 4096' | sudo tee /etc/sysctl.d/99-jkbase-somaxconn.conf > /dev/null
+sudo sysctl -q -w net.core.somaxconn=4096 || true
+
 # Create .env file for secrets if it doesn't exist
 if [ ! -f /var/jkbase/.env ]; then
     {
@@ -270,11 +285,20 @@ sudo tee /etc/systemd/system/jkbase.service > /dev/null << SERVICE
 Description=jkbase platform server
 After=network.target
 Wants=network.target
+# Zero-bounce Phase 2: inherit the socket-activated :80/:443 fds. Requires= propagates stop only
+# socket->service (a service restart leaves the sockets — and their backlog — bound). NO PartOf=.
+Requires=jkbase-proxy-http.socket jkbase-proxy-https.socket
+After=jkbase-proxy-http.socket jkbase-proxy-https.socket
 
 [Service]
 Type=simple
 User=root
 EnvironmentFile=/var/jkbase/.env
+# Pass the named fds even when started DIRECTLY (systemctl restart), not only on socket traffic —
+# socket INHERITANCE, not lazy activation (the service stays WantedBy=multi-user.target and runs the
+# metering/scheduler/build loops). take_listener("proxy-http"/"proxy-https") adopts these.
+Sockets=jkbase-proxy-http.socket
+Sockets=jkbase-proxy-https.socket
 ExecStartPre=/usr/local/bin/jkbase-bridge.sh
 ExecStartPre=/usr/local/bin/jkbase-build-cgroup.sh
 # `-` prefix: the runtime cgroup is NON-essential (the server self-creates the per-id leaf via
@@ -310,6 +334,10 @@ WantedBy=multi-user.target
 SERVICE
 
 sudo systemctl daemon-reload
+# enable (NOT --now): on a box where an old in-process server still holds :80/:443, starting the
+# socket now would fail EADDRINUSE. The service's Requires= pulls the sockets in during its OWN
+# start job (after any prior stop frees the ports); thereafter they stay bound across every restart.
+sudo systemctl enable jkbase-proxy-http.socket jkbase-proxy-https.socket
 sudo systemctl enable jkbase
 
 # Bake the default build-VM toolchain image if absent (busybox "passthrough", B1).
