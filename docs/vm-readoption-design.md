@@ -288,3 +288,36 @@ implemented change returned **FIX-FIRST**; all confirmed findings are now fixed:
   HIGH-2 blast radius (id `a` + a bystander VM → delete `a` → bystander survives); (3) the flagless
   restart still hibernates; (4) negatives (kill-in-gap → reap+cold-boot; paused-mid-hibernate SIGKILL
   → no resurrection; PID-reuse; double-adopt idempotency; second-live-server → `LeaseHeld` refuse).
+
+## Validation outcome (systemd end-to-end, dev box, 2026-06-29) — PASS
+
+Run on the KVM-capable dev box under a real `systemd` unit (`KillMode=mixed`, `TimeoutStopSec=120`,
+the runtime-cgroup `ExecStartPre`), mirroring `provision.sh`'s `[Service]`, against real Firecracker
+microVMs. Two real bun apps were deployed through the full deploy→build→boot path: `bunfix`
+(diskless) and `bunvol` (a declared volume → RWO data disk on a loop). Every target in the plan
+above is covered; the gate is **satisfied**.
+
+- **Deploy-path cgroup escape:** both FCs migrated into `jkbase-runtime/<id>` on `start` (deploy).
+- **(1) Upgrade-restart survival (cold-boot cohort):** `.upgrading` → the old process logged
+  *"leaving tenant VMs running for re-adoption; exiting without draining"* and `process::exit(0)`'d;
+  `KillMode=mixed` spared both FCs; the new process re-adopted both (`adopted=2 reaped=0`); **FC pids
+  unchanged**; 200 via the proxy (routes restored); **disk re-fenced** — `bunvol` kept the SAME loop
+  (`/dev/loop34`), epoch bumped, and its `/data` boot-marker was preserved (re-fenced, not re-created)
+  → no reboot.
+- **(3) Flagless restart hibernates:** no flag → drain path (*"hibernating running VMs"* →
+  *"all VMs hibernated"*); FCs killed; woken on demand via restore.
+- **HIGH-1 (snapshot/restore cohort = the dominant path):** a wake logged *"FC migrated into runtime
+  cgroup (restart-survivable)"* from `restore_from_snapshot`; a subsequent upgrade-restart kept the
+  **snapshot-woken FC pids unchanged** + 200. Without the HIGH-1 fix these would have been SIGKILLed.
+- **(4) Negatives:** no-handoff orphan → reaped not adopted (anti-resurrection); poisoned
+  `fc_starttime` → reaped (*"pid not alive at recorded start time"* — PID-reuse pin); kill-in-gap →
+  dead survivor not adopted, orphan-cleaned, cold-boots on request, live peer untouched;
+  double-adopt idempotent (`bunvol` FC re-adopted across 7 consecutive cycles, epoch 1→7, pid stable).
+- **Second-live-server / HIGH-2 blast radius:** a second `jkbase-server` on the same data-dir is
+  refused even earlier than the `LeaseHeld` arm — redb's exclusive open lock (*"Database already open"*)
+  stops a duplicate live server before adopt, and the primary's VM is untouched (the
+  `LeaseHeld→SkippedPeerOwned` arm is the HA distributed-lease net, unit-tested). The HIGH-2 bystander
+  property held throughout: every reap of `bunfix` left `bunvol`'s FC untouched.
+
+**Conclusion: ready for PR/merge/deploy. The first prod deploy still bounces once** (the OUTGOING
+server predates the `.upgrading` check); every upgrade after is zero-bounce.
