@@ -8,6 +8,7 @@ mod metering;
 mod mirror;
 mod objectstore_service;
 mod rootfs_cas;
+mod socket_activation;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -898,6 +899,13 @@ const RUNTIME_CGROUP_PARENT: &str = "/sys/fs/cgroup/jkbase-runtime";
 /// shutdown. A stale flag (deploy crashed after touching it but before `systemctl restart`)
 /// falls back to draining — so a later operator `stop` never silently leaks running tenants.
 const UPGRADE_FLAG_FRESHNESS_SECS: u64 = 300;
+/// Hard ceiling (seconds) on the upgrade-restart HTTP drain (zero-bounce Phase 2). The process is
+/// GUARANTEED to `process::exit(0)` within this window of the SIGTERM — event-driven (it exits the
+/// instant the proxy + storage in-flight work empties), so an idle box pays ~0. Well under
+/// `TimeoutStopSec=120`, and small so a slow/hostile in-flight request can't widen the successor's
+/// start delay. Bulk transfers exceeding it are cut at exit (no worse than today). See
+/// `docs/zero-bounce-phase2-design.md`.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// Data-disk lease TTL — the failover horizon. With the node-local FlockLease it is moot
 /// (the lock is held for the life of the process); with a distributed lease (HA) it is
 /// the etcd grant TTL: a crashed/partitioned holder's key expires this long after its
@@ -978,8 +986,19 @@ fn resolve_guest_kernel(fc_dir: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Single-threaded prologue (zero-bounce Phase 2): parse + scrub the systemd socket-activation
+    // env (LISTEN_*) and arm FD_CLOEXEC on every inherited listener fd BEFORE the tokio runtime —
+    // and thus any worker thread or fork+exec child (jailer/FC/buildpack) — exists. remove_var is
+    // racy under threads (edition 2024) and an un-CLOEXEC'd :443 fd would leak into a tenant FC.
+    socket_activation::init();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
@@ -1071,7 +1090,12 @@ async fn main() -> Result<()> {
     // `storage.{domain}` to it via a reserved-host branch). Separate from the control
     // app: SigV4 auth (not Bearer), no global body cap (uploads stream to disk), and
     // it must never co-mingle with control-plane state.
-    {
+    // Zero-bounce Phase 2: cancellation tokens for the graceful data-plane drain on an upgrade
+    // restart (cancelled in shutdown_signal's upgrade branch; bounded by the DRAIN_GRACE watchdog).
+    let proxy_shutdown = tokio_util::sync::CancellationToken::new();
+    let storage_shutdown = tokio_util::sync::CancellationToken::new();
+    let storage_join = {
+        let storage_tok = storage_shutdown.clone();
         let svc = Arc::new(objectstore_service::ObjectStoreService::new(
             data_dir.clone(),
             store.clone(),
@@ -1095,19 +1119,26 @@ async fn main() -> Result<()> {
                 }
             });
         }
+        // Loopback bind stays IN-PROCESS (NOT socket-activated): the 127.0.0.1 P0 invariant
+        // (function-outbound-io — the object-store front must never be reachable off loopback)
+        // stays a structural guarantee in the binary, not a unit-file line. with_graceful_shutdown
+        // drains in-flight S3 transfers on an upgrade instead of cutting them mid-stream.
         let bind = format!("127.0.0.1:{}", args.storage_port);
         tokio::spawn(async move {
             match tokio::net::TcpListener::bind(&bind).await {
                 Ok(listener) => {
                     info!(storage = %bind, "object-store service listening");
-                    if let Err(e) = axum::serve(listener, svc.into_router()).await {
+                    if let Err(e) = axum::serve(listener, svc.into_router())
+                        .with_graceful_shutdown(async move { storage_tok.cancelled().await })
+                        .await
+                    {
                         tracing::error!(error = %e, "object-store service error");
                     }
                 }
                 Err(e) => tracing::error!(error = %e, addr = %bind, "object-store bind failed"),
             }
-        });
-    }
+        })
+    };
     let routing_table = new_routing_table();
     let domain_map: DomainMap = new_domain_map();
     let activity_tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
@@ -1514,6 +1545,33 @@ async fn main() -> Result<()> {
     });
 
     let api_addr = format!("127.0.0.1:{}", args.api_port);
+
+    // Zero-bounce Phase 2: adopt the systemd-activated public :80/:443 fds if present (so the
+    // listening sockets — and their accept backlog — survive this binary's restart). When activated
+    // but a name is missing, FAIL CLOSED: the port is held by systemd, so serve()'s bind() fallback
+    // would hit EADDRINUSE (adversarial HIGH-3). Not activated (local dev) ⇒ None ⇒ serve() binds.
+    let (proxy_http_listener, proxy_https_listener) = if socket_activation::activated() {
+        let http = match socket_activation::take_listener("proxy-http") {
+            Some(l) => Some(tokio::net::TcpListener::from_std(l)?),
+            None => anyhow::bail!(
+                "socket-activated but no fd named 'proxy-http' — check jkbase-proxy-http.socket FileDescriptorName="
+            ),
+        };
+        let https = if args.tls {
+            match socket_activation::take_listener("proxy-https") {
+                Some(l) => Some(tokio::net::TcpListener::from_std(l)?),
+                None => anyhow::bail!(
+                    "socket-activated but no fd named 'proxy-https' — check jkbase-proxy-https.socket FileDescriptorName="
+                ),
+            }
+        } else {
+            None
+        };
+        (http, https)
+    } else {
+        (None, None)
+    };
+
     let proxy_config = ProxyConfig {
         http_port: args.proxy_port,
         https_port: if args.tls {
@@ -1531,6 +1589,8 @@ async fn main() -> Result<()> {
         backend_port: 80,
         relay_idle_timeout: jkbase_wsproxy::DEFAULT_RELAY_IDLE_TIMEOUT,
         max_concurrent_upgrades: 1024,
+        http_listener: proxy_http_listener,
+        https_listener: proxy_https_listener,
     };
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();
@@ -1552,8 +1612,9 @@ async fn main() -> Result<()> {
     reconcile_baselayers_on_boot(&platform).await;
     backfill_domains(&platform, &domain_map).await;
 
-    tokio::spawn(async move {
-        if let Err(e) = jkbase_proxy::serve(proxy_config, proxy_routes).await {
+    let proxy_tok = proxy_shutdown.clone();
+    let proxy_join = tokio::spawn(async move {
+        if let Err(e) = jkbase_proxy::serve(proxy_config, proxy_routes, proxy_tok).await {
             tracing::error!(error = %e, "proxy error");
         }
     });
@@ -1692,14 +1753,37 @@ async fn main() -> Result<()> {
     let platform_for_shutdown = platform.clone();
     let routing_for_shutdown = routing_table.clone();
     let shipper_for_shutdown = log_shipper.clone();
-    axum::serve(listener, router)
+    // Set by shutdown_signal's upgrade branch so the post-serve code knows to exit(0) (never
+    // unwind) rather than fall through to a normal return.
+    let upgrade_kind = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve_res = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal(
             platform_for_shutdown,
             routing_for_shutdown,
             shipper_for_shutdown,
+            proxy_shutdown.clone(),
+            storage_shutdown.clone(),
+            upgrade_kind.clone(),
         ))
-        .await?;
+        .await;
 
+    // UPGRADE path: NEVER let `main` unwind — a `?` here would drop PlatformState → vms →
+    // VmInstance::Drop (kill_on_drop) SIGKILLing every Owned survivor (adversarial HIGH-2). The
+    // api drained via axum's graceful shutdown (shutdown_signal RETURNED on the upgrade branch);
+    // now finish the proxy + storage in-flight work under DRAIN_GRACE (the shutdown_signal watchdog
+    // is the hard backstop if a join hangs), then exit(0) skipping all destructors.
+    if upgrade_kind.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = tokio::time::timeout(DRAIN_GRACE, async {
+            let _ = proxy_join.await; // serve() returns once its in-flight connections drain
+            let _ = storage_join.await; // axum storage graceful drain returns
+        })
+        .await;
+        // exit(0): survivors live in the jkbase-runtime cgroup, adopted by the successor; the open
+        // socket DUPs close harmlessly (systemd keeps the originals listening for the successor).
+        std::process::exit(0);
+    }
+
+    serve_res?; // normal shutdown: shutdown_signal already hibernated the VMs
     Ok(())
 }
 
@@ -1729,6 +1813,9 @@ async fn shutdown_signal(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
+    proxy_shutdown: tokio_util::sync::CancellationToken,
+    storage_shutdown: tokio_util::sync::CancellationToken,
+    upgrade_kind: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -1739,22 +1826,39 @@ async fn shutdown_signal(
         _ = sigterm.recv() => {},
     }
 
-    // VM re-adoption §8: an UPGRADE restart (a fresh .upgrading flag) leaves tenant VMs RUNNING
-    // for the next process to re-adopt — the zero-bounce goal. We must exit WITHOUT running any
-    // destructor: a spawned VmInstance's Drop (and tokio kill_on_drop) would otherwise SIGKILL
-    // every survivor as `vms` drops. std::process::exit terminates immediately, skipping all
-    // destructors; the survivors live in the jkbase-runtime cgroup, so systemd's KillMode=mixed
-    // (which reaps only jkbase.service's own cgroup) leaves them up. A real shutdown (no fresh
-    // flag) falls through and drains/hibernates as before.
+    // VM re-adoption §8: an UPGRADE restart (a fresh .upgrading flag) leaves tenant VMs RUNNING for
+    // the next process to re-adopt — the zero-bounce goal. Phase 2 ALSO keeps the data plane up:
+    // the systemd-owned :80/:443 sockets stay open (new connections queue for the successor) while
+    // this process GRACEFULLY DRAINS in-flight HTTP. We must still exit WITHOUT running VmInstance
+    // destructors (Drop/kill_on_drop would SIGKILL every survivor); the survivors live in the
+    // jkbase-runtime cgroup, untouched by KillMode=mixed. A real shutdown (no fresh flag) falls
+    // through and drains/hibernates as before.
     let data_dir = { platform.lock().await.data_dir.clone() };
     if upgrade_in_progress(&data_dir) {
         let n = platform.lock().await.vms.len();
         info!(
             running_vms = n,
-            "upgrade restart (.upgrading present) — leaving tenant VMs running for re-adoption; \
-             exiting without draining"
+            "upgrade restart (.upgrading present) — draining HTTP (proxy+storage+api), leaving \
+             tenant VMs running for re-adoption"
         );
-        std::process::exit(0);
+        // Stop accepting + begin draining the proxy + storage. The api drains via axum's own
+        // graceful shutdown once we RETURN (NOT process::exit inline — that would skip the api
+        // drain). Draining touches only connection-level state, never a VmInstance (the proxy's
+        // SharedState is disjoint from PlatformState.vms), so no survivor is dropped.
+        proxy_shutdown.cancel();
+        storage_shutdown.cancel();
+        upgrade_kind.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Watchdog (adversarial BLOCKER-1): GUARANTEE the process exits within DRAIN_GRACE of the
+        // SIGTERM no matter what any drain is doing — axum's graceful shutdown has NO internal
+        // timeout, so a hostile tenant holding an authenticated `api.` request open could otherwise
+        // stall to TimeoutStopSec (a LONGER gap than Phase 1). exit(0) skips destructors, sparing
+        // the jkbase-runtime FCs.
+        tokio::spawn(async {
+            tokio::time::sleep(DRAIN_GRACE).await;
+            tracing::warn!("upgrade drain grace elapsed — exiting (cutting any remaining streams)");
+            std::process::exit(0);
+        });
+        return;
     }
 
     info!("shutdown signal received, hibernating running VMs...");

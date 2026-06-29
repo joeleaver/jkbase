@@ -1,0 +1,12 @@
+[Unit]
+Description=jkbase proxy HTTPS :443 (socket-activated; survives a jkbase-server restart)
+# See jkbase-proxy-http.socket. NO PartOf=.
+
+[Socket]
+ListenStream=0.0.0.0:443
+FileDescriptorName=proxy-https
+Service=jkbase.service
+Backlog=4096
+
+[Install]
+WantedBy=sockets.target

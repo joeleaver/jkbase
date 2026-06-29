@@ -123,6 +123,8 @@ fn base_config(proxy_port: u16) -> ProxyConfig {
         backend_port: 80,
         relay_idle_timeout: Duration::from_secs(600),
         max_concurrent_upgrades: 64,
+        http_listener: None,
+        https_listener: None,
     }
 }
 
@@ -133,7 +135,9 @@ fn base_config(proxy_port: u16) -> ProxyConfig {
 fn spawn_proxy(config: ProxyConfig, routes: RoutingTable) -> oneshot::Receiver<String> {
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        if let Err(e) = serve(config, routes).await {
+        // Never-cancelled token: these tests don't exercise graceful drain, only the serve path.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        if let Err(e) = serve(config, routes, shutdown).await {
             let _ = tx.send(e.to_string());
         }
     });

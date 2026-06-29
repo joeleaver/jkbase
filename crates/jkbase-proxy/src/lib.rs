@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 /// Running backends: host-key → VM IP (fast path; only entries for live VMs).
@@ -93,6 +95,11 @@ pub struct ProxyConfig {
     /// Cap on concurrent in-flight relayed upgrades on this (shared) edge — bounds
     /// the fds + relay tasks a flood of cheap WebSocket holds can pin.
     pub max_concurrent_upgrades: usize,
+    /// Pre-bound `:80` listener from systemd socket activation (zero-bounce Phase 2). `None` ⇒
+    /// [`serve`] binds `0.0.0.0:http_port` itself (local-dev / non-activated path).
+    pub http_listener: Option<TcpListener>,
+    /// Pre-bound `:443` listener from systemd socket activation. `None` ⇒ bind `0.0.0.0:https_port`.
+    pub https_listener: Option<TcpListener>,
 }
 
 struct SharedState {
@@ -109,7 +116,20 @@ struct SharedState {
     relay_permits: Arc<tokio::sync::Semaphore>,
 }
 
-pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
+/// Serve the data-plane proxy until `shutdown` is cancelled, then GRACEFULLY DRAIN in-flight
+/// connections before returning (zero-bounce Phase 2). On cancel each accept loop stops accepting
+/// (the systemd-owned listening socket stays open for the successor) and every live connection is
+/// `graceful_shutdown()`-ed; `serve` returns once the last connection task is gone. The caller
+/// bounds the total wait (see the `DRAIN_GRACE` watchdog in jkbase-server) so a slow tenant can't
+/// stall the successor's start.
+pub async fn serve(
+    config: ProxyConfig,
+    routes: RoutingTable,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let http_listener = config.http_listener;
+    let https_listener = config.https_listener;
+    let http_port = config.http_port;
     let shared = Arc::new(SharedState {
         routes,
         domain: Arc::new(config.platform_domain),
@@ -123,61 +143,118 @@ pub async fn serve(config: ProxyConfig, routes: RoutingTable) -> Result<()> {
         relay_permits: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_upgrades)),
     });
 
+    // Drain barrier: every live connection task holds a clone of `conn_tx`. Once all accept loops
+    // break (on cancel) and every connection finishes, the last sender drops and `conn_rx.recv()`
+    // returns `None` = fully drained. (`serve_http_redirect`'s instant 301/ACME conns are NOT in
+    // the barrier — they only need to stop accepting.)
+    let (conn_tx, mut conn_rx) = mpsc::channel::<()>(1);
+
     if let (Some(https_port), Some(cert_manager)) = (config.https_port, config.cert_manager.clone())
     {
         let acceptor = TlsAcceptor::from(cert_manager.server_config());
         cert_manager.spawn_reconcile();
 
         let shared_tls = shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_https(https_port, acceptor, shared_tls).await {
+        let https_shutdown = shutdown.clone();
+        let https_tx = conn_tx.clone();
+        let https = tokio::spawn(async move {
+            if let Err(e) =
+                serve_https(https_listener, https_port, acceptor, shared_tls, https_shutdown, https_tx)
+                    .await
+            {
                 error!(error = %e, "HTTPS proxy error");
             }
         });
 
-        serve_http_redirect(config.http_port, shared.domain.clone(), cert_manager).await
+        let res =
+            serve_http_redirect(http_listener, http_port, shared.domain.clone(), cert_manager, shutdown.clone())
+                .await;
+        let _ = https.await; // its accept loop has broken on cancel
+        res?;
     } else {
-        serve_http(config.http_port, shared).await
+        serve_http(http_listener, http_port, shared, shutdown.clone(), conn_tx.clone()).await?;
+    }
+
+    // Wait for in-flight connections to finish draining (caller bounds this).
+    drop(conn_tx);
+    let _ = conn_rx.recv().await;
+    Ok(())
+}
+
+/// Resolve the listener: the inherited (socket-activated) one if present, else bind `0.0.0.0:port`
+/// — the exact historical `bind(([0,0,0,0],port))` semantics for the local-dev / non-activated path.
+async fn resolve_listener(inherited: Option<TcpListener>, port: u16) -> Result<TcpListener> {
+    match inherited {
+        Some(l) => Ok(l),
+        None => Ok(TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?),
     }
 }
 
-async fn serve_http(port: u16, shared: Arc<SharedState>) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, domain = %shared.domain, "HTTP proxy listening");
+async fn serve_http(
+    inherited: Option<TcpListener>,
+    port: u16,
+    shared: Arc<SharedState>,
+    shutdown: CancellationToken,
+    conn_tx: mpsc::Sender<()>,
+) -> Result<()> {
+    let listener = resolve_listener(inherited, port).await?;
+    info!(addr = %listener.local_addr()?, domain = %shared.domain, "HTTP proxy listening");
 
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, _peer) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break, // stop accepting → leave the socket for the successor
+            accept = listener.accept() => match accept {
+                Ok(v) => v,
+                Err(e) => { error!(error = %e, "proxy accept error"); continue; }
+            },
+        };
         let shared = shared.clone();
+        let shutdown = shutdown.clone();
+        let permit = conn_tx.clone(); // held for the task's life = drain-barrier membership
         tokio::spawn(async move {
+            let _permit = permit;
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
-            // with_upgrades(): keep driving the connection after a 101 so a
-            // proxied WebSocket (or other Upgrade) can reclaim the raw stream.
-            // header_read_timeout caps slow-header (slowloris) connections.
-            if let Err(e) = http1::Builder::new()
+            // with_upgrades(): keep driving the connection after a 101 so a proxied WebSocket can
+            // reclaim the raw stream. header_read_timeout caps slow-header (slowloris) connections.
+            let conn = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(30))
                 .serve_connection(io, svc)
-                .with_upgrades()
-                .await
-            {
-                error!(error = %e, "proxy connection error");
-            }
+                .with_upgrades();
+            drive_connection(conn, shutdown, "proxy connection error").await;
         });
     }
+    Ok(()) // listener dropped → our DUP closes; systemd's original stays listening
 }
 
-async fn serve_https(port: u16, acceptor: TlsAcceptor, shared: Arc<SharedState>) -> Result<()> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, domain = %shared.domain, "HTTPS proxy listening");
+async fn serve_https(
+    inherited: Option<TcpListener>,
+    port: u16,
+    acceptor: TlsAcceptor,
+    shared: Arc<SharedState>,
+    shutdown: CancellationToken,
+    conn_tx: mpsc::Sender<()>,
+) -> Result<()> {
+    let listener = resolve_listener(inherited, port).await?;
+    info!(addr = %listener.local_addr()?, domain = %shared.domain, "HTTPS proxy listening");
 
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, _peer) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accept = listener.accept() => match accept {
+                Ok(v) => v,
+                Err(e) => { error!(error = %e, "HTTPS accept error"); continue; }
+            },
+        };
         let acceptor = acceptor.clone();
         let shared = shared.clone();
+        let shutdown = shutdown.clone();
+        let permit = conn_tx.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -187,31 +264,66 @@ async fn serve_https(port: u16, acceptor: TlsAcceptor, shared: Arc<SharedState>)
             };
             let io = TokioIo::new(tls_stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
-            if let Err(e) = http1::Builder::new()
+            let conn = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(30))
                 .serve_connection(io, svc)
-                .with_upgrades()
-                .await
-            {
-                error!(error = %e, "HTTPS connection error");
-            }
+                .with_upgrades();
+            drive_connection(conn, shutdown, "HTTPS connection error").await;
         });
+    }
+    Ok(())
+}
+
+/// Drive one upgradeable hyper connection to completion, and on `shutdown` GRACEFULLY shut it down
+/// (finish the in-flight response, send `Connection: close`, stop reading new requests) so the
+/// drain barrier converges — `graceful_shutdown()` is what turns an idle keep-alive (whose later
+/// reads are untimed) from "hangs until the client leaves" into "ends promptly". A WebSocket relay
+/// has already handed off the raw stream at `101`, so this returns promptly and never pins the
+/// drain on a long-lived splice.
+async fn drive_connection<I, S>(
+    conn: hyper::server::conn::http1::UpgradeableConnection<I, S>,
+    shutdown: CancellationToken,
+    err_msg: &'static str,
+) where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::HttpService<hyper::body::Incoming> + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    S::ResBody: Send + 'static,
+    <S::ResBody as hyper::body::Body>::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    <S::ResBody as hyper::body::Body>::Data: Send,
+{
+    tokio::pin!(conn);
+    tokio::select! {
+        res = conn.as_mut() => { if let Err(e) = res { error!(error = %e, "{err_msg}"); } }
+        _ = shutdown.cancelled() => {
+            conn.as_mut().graceful_shutdown();
+            if let Err(e) = conn.await { error!(error = %e, "{err_msg}"); }
+        }
     }
 }
 
 async fn serve_http_redirect(
+    inherited: Option<TcpListener>,
     port: u16,
     domain: Arc<String>,
     cert_manager: Arc<tls::CertManager>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     const ACME_PREFIX: &str = "/.well-known/acme-challenge/";
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    info!(%addr, "HTTP->HTTPS redirect listening (with ACME HTTP-01)");
+    let listener = resolve_listener(inherited, port).await?;
+    info!(addr = %listener.local_addr()?, "HTTP->HTTPS redirect listening (with ACME HTTP-01)");
 
     loop {
-        let (stream, _peer) = listener.accept().await?;
+        let (stream, _peer) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break, // stop accepting; 301/ACME conns are instant, no per-conn drain
+            accept = listener.accept() => match accept {
+                Ok(v) => v,
+                Err(e) => { error!(error = %e, "redirect accept error"); continue; }
+            },
+        };
         let domain = domain.clone();
         let cm = cert_manager.clone();
         tokio::spawn(async move {
@@ -256,11 +368,17 @@ async fn serve_http_redirect(
                     )
                 }
             });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+            if let Err(e) = http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(30))
+                .serve_connection(io, svc)
+                .await
+            {
                 error!(error = %e, "redirect connection error");
             }
         });
     }
+    Ok(())
 }
 
 async fn proxy_request(
