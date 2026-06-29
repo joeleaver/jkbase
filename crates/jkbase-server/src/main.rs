@@ -1,6 +1,7 @@
 mod build_ca;
 mod build_orchestrator;
 mod egress;
+mod handoff;
 mod layer_plan;
 mod log_shipper;
 mod metering;
@@ -533,8 +534,11 @@ async fn self_fence_project(
         }
         tracing::error!(project = %project_id, scope = %lost_token.scope, epoch = lost_token.epoch,
                "DATA-DISK LEASE LOST — self-fencing: killing Firecracker before any survivor attaches");
-        // Drop our claim first so no other path still treats us as the holder.
+        // Drop our claim first so no other path still treats us as the holder. Remove the
+        // re-adoption record too: the FC is about to be killed, so a future start must NOT
+        // re-adopt it (it'll cold-boot once the lease situation clears).
         plat.disk_tokens.remove(project_id);
+        handoff::remove(&plat.data_dir.join("run"), project_id);
         plat.vm_states.remove(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
         (plat.vms.remove(project_id), plat.data_disk.clone())
@@ -883,6 +887,17 @@ struct PlatformState {
 
 /// Data disk size (MiB) created on first use for projects that declare volumes.
 const DATA_DISK_MIB: u64 = 1024;
+/// Parent cgroup-v2 dir for runtime Firecrackers. Every runtime FC is migrated into a
+/// `<this>/<project_id>` leaf right after spawn so it lives OUTSIDE `jkbase.service`'s
+/// cgroup and survives `systemctl restart` (`KillMode=mixed` reaps only the service's own
+/// cgroup) for the next process to re-adopt. Provisioned by `tools/setup-runtime-cgroup.sh`
+/// (an `ExecStartPre`), mirroring `jkbase-build`. See `docs/vm-readoption-design.md` §1.
+const RUNTIME_CGROUP_PARENT: &str = "/sys/fs/cgroup/jkbase-runtime";
+/// How recently the `.upgrading` flag must have been written for `shutdown_signal` to treat a
+/// SIGTERM as an UPGRADE (skip the drain, leave VMs for re-adoption) rather than a real
+/// shutdown. A stale flag (deploy crashed after touching it but before `systemctl restart`)
+/// falls back to draining — so a later operator `stop` never silently leaks running tenants.
+const UPGRADE_FLAG_FRESHNESS_SECS: u64 = 300;
 /// Data-disk lease TTL — the failover horizon. With the node-local FlockLease it is moot
 /// (the lock is held for the life of the process); with a distributed lease (HA) it is
 /// the etcd grant TTL: a crashed/partitioned holder's key expires this long after its
@@ -1101,20 +1116,19 @@ async fn main() -> Result<()> {
     // pre-existing hibernation snapshot (incident: nlnwt, 2026-06-26). The staging artifact at
     // `base-rootfs.ext4` is built by the deploy script in prod (apko may not be on the service's
     // PATH) or the local-dev fallback; we hash it and pin it immutably at `base-rootfs/<hash>.ext4`.
-    // ORDER IS LOAD-BEARING (see docs/rootfs-cas-snapshot-durability.md): reap orphan FCs → CAS-ize
-    // → GC, ALL synchronously here, before any loop that can boot/restore a VM is spawned (the HA
-    // reconciler/disk-fence below) and before the proxy binds — so the GC reference set is computed
-    // while zero VMs are running and no wake can race a blob mid-sweep.
+    // ORDER IS LOAD-BEARING (see docs/rootfs-cas-snapshot-durability.md): CAS-ize → GC, ALL
+    // synchronously here, before any loop that can boot/restore a VM is spawned (the HA
+    // reconciler/disk-fence below) and before the proxy binds. VM re-adoption (§6) changes the
+    // premise that this used to depend on: runtime FCs now SURVIVE a restart (they live in the
+    // jkbase-runtime cgroup), so we do NOT reap them here — the old blunt pre-GC reaper is gone.
+    // Instead the survivors' rootfs blobs are kept out of the sweep (the keep-set scan below), and
+    // the full verify/adopt/reap of survivors happens after PlatformState is built (§6b). GC
+    // unlinking a still-mapped blob is non-destructive anyway (the FC holds the fd; bytes survive
+    // until it closes), and a true orphan is reaped in §6b.
     let staging_rootfs = data_dir.join("base-rootfs.ext4");
     rootfs::build_base_rootfs(&args.agent_bin, &staging_rootfs).await?;
     let cas_dir = data_dir.join("base-rootfs");
-    let reaped = rootfs_cas::reap_orphan_firecrackers(&data_dir.join("run"));
-    if reaped > 0 {
-        warn!(
-            count = reaped,
-            "reaped orphaned Firecrackers from a prior incarnation before rootfs GC"
-        );
-    }
+    let runtime_dir = data_dir.join("run");
     let (base_rootfs_path, base_rootfs_hash) = rootfs_cas::place(&staging_rootfs, &cas_dir)?;
     // FAIL CLOSED: only reap a blob we can PROVE no restorable snapshot references. If we can't
     // enumerate every snapshot's stamped hash, skip all deletes (a partial set would reap a live
@@ -1128,6 +1142,15 @@ async fn main() -> Result<()> {
                     && rootfs_cas::is_sha256_hex(h)
                 {
                     keep.insert(h.clone());
+                }
+            }
+            // §6a: keep every LIVE survivor's mapped rootfs blob — an upgrade mints a new
+            // current_hash, and a survivor that hibernated before this start carries no snapshot
+            // yet, so without this union its (old) blob would be reaped and its next hibernate
+            // would stamp a missing blob → forced cold-boot. Cheap scan of run/*/handoff.json.
+            for rec in handoff::scan(&runtime_dir) {
+                if rootfs_cas::is_sha256_hex(&rec.base_rootfs_hash) {
+                    keep.insert(rec.base_rootfs_hash.clone());
                 }
             }
             match rootfs_cas::gc(&cas_dir, &keep) {
@@ -1512,9 +1535,18 @@ async fn main() -> Result<()> {
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();
 
+    // VM re-adoption §6b: BEFORE the proxy serves and BEFORE any wake-capable loop, verify every
+    // runtime Firecracker that survived the prior process, re-adopt the live ones (re-fence the
+    // disk at a fresh epoch WITHOUT detaching, rebuild vms/vm_states/routing) and reap the rest.
+    // Replaces the old blunt `pkill -9 firecracker` that would have SIGKILLed every survivor. Must
+    // precede the reconcilers below so they see the adopted Running state (they are survivor-aware).
+    adopt_or_reap_runtime_vms(&platform, &routing_table, &domain_map).await;
+    // Adoption is complete — clear the upgrade flag so a later operator `stop`/`restart` without a
+    // fresh flag drains/hibernates normally (and a crashed deploy's stale flag never lingers).
+    let _ = std::fs::remove_file(upgrade_flag_path(&data_dir));
+
     // Reconcile state and build the domain map BEFORE the proxy serves traffic,
     // or apex/www/console would 404 in the gap.
-    reap_orphan_firecrackers_on_boot().await;
     cleanup_orphans(&platform).await;
     reconcile_orphans_on_boot(&platform).await;
     reconcile_baselayers_on_boot(&platform).await;
@@ -1671,6 +1703,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Path of the upgrade-in-progress flag `deploy-server.sh` writes immediately before
+/// `systemctl restart`. Its first line is the epoch second it was written (a second optional
+/// line carries the deploy pid, for diagnostics only).
+fn upgrade_flag_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(".upgrading")
+}
+
+/// True iff a FRESH upgrade flag is present (written < [`UPGRADE_FLAG_FRESHNESS_SECS`] ago).
+fn upgrade_in_progress(data_dir: &Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(upgrade_flag_path(data_dir)) else {
+        return false;
+    };
+    let Some(ts) = body.lines().next().and_then(|l| l.trim().parse::<u64>().ok()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(ts) < UPGRADE_FLAG_FRESHNESS_SECS
+}
+
 async fn shutdown_signal(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
@@ -1684,6 +1738,25 @@ async fn shutdown_signal(
         _ = ctrl_c => {},
         _ = sigterm.recv() => {},
     }
+
+    // VM re-adoption §8: an UPGRADE restart (a fresh .upgrading flag) leaves tenant VMs RUNNING
+    // for the next process to re-adopt — the zero-bounce goal. We must exit WITHOUT running any
+    // destructor: a spawned VmInstance's Drop (and tokio kill_on_drop) would otherwise SIGKILL
+    // every survivor as `vms` drops. std::process::exit terminates immediately, skipping all
+    // destructors; the survivors live in the jkbase-runtime cgroup, so systemd's KillMode=mixed
+    // (which reaps only jkbase.service's own cgroup) leaves them up. A real shutdown (no fresh
+    // flag) falls through and drains/hibernates as before.
+    let data_dir = { platform.lock().await.data_dir.clone() };
+    if upgrade_in_progress(&data_dir) {
+        let n = platform.lock().await.vms.len();
+        info!(
+            running_vms = n,
+            "upgrade restart (.upgrading present) — leaving tenant VMs running for re-adoption; \
+             exiting without draining"
+        );
+        std::process::exit(0);
+    }
+
     info!("shutdown signal received, hibernating running VMs...");
 
     let running_projects: Vec<String> = {
@@ -1724,6 +1797,12 @@ async fn cleanup_orphans(platform: &Arc<Mutex<PlatformState>>) {
     };
 
     for alloc in &allocs {
+        // VM re-adoption §7: never reap a survivor re-adopted Running this start — adoption
+        // already proved its liveness via the agent HTTP probe, and a momentarily-slow guest
+        // could otherwise false-negative this 2s TCP probe and sever a live VM's allocation.
+        if plat.vm_states.get(&alloc.project_id) == Some(&VmLifecycle::Running) {
+            continue;
+        }
         // Only probe our OWN VMs. A peer host's VM IP lives on its own network island,
         // unreachable from here, so a TCP probe would false-negative and wrongly reap a
         // live peer's allocation; peer/host liveness is via heartbeats (HOSTS), not TCP.
@@ -1786,6 +1865,10 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             // maps (which another project could then be handed = corruption). The wake,
             // finding its FC dead, fails and its guard releases.
             reap_firecracker(project_id).await;
+            // The project is being deleted: drop its re-adoption record so a surviving FC
+            // can't be re-adopted on a later start (remove_project_artifacts also nukes
+            // run/{id} below; this is the explicit, lock-held removal beside disk_tokens).
+            handoff::remove(&plat.data_dir.join("run"), project_id);
             // Release the data-disk lease + destroy the disk (detach loop device,
             // remove the image + holder record) as part of reaping the project.
             if let Some(token) = plat.disk_tokens.remove(project_id) {
@@ -1805,7 +1888,13 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 
     // Kill any leaked Firecracker that outlived the handle, then drop its TAP.
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("firecracker.*{project_id}")])
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
+        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
         .status()
         .await;
     if let Some(a) = alloc {
@@ -1845,19 +1934,6 @@ async fn remove_project_artifacts(data_dir: &Path, project_id: &str) {
     let _ = tokio::fs::remove_dir_all(data_dir.join("git").join(format!("{project_id}.git"))).await;
 }
 
-/// Reap every runtime Firecracker left over from a previous (crashed/restarted) server
-/// BEFORE we wake any project. On a fresh start `vms` is empty, so any running runtime
-/// microVM is an orphan we no longer own — and a surviving writer, combined with a wake
-/// that preempts a now-stale holder record, would put two writers on one data disk.
-/// The server re-boots/re-restores the projects it should run. (Build VMs run jailed
-/// and none are in flight at boot.)
-async fn reap_orphan_firecrackers_on_boot() {
-    let _ = tokio::process::Command::new("pkill")
-        .args(["-9", "-f", "firecracker-v1.15.1-x86_64"])
-        .status()
-        .await;
-}
-
 /// Boot-time sweep for projects deleted but left with artifacts behind (a teardown
 /// that failed midway, or a project removed before teardown existed). For every
 /// per-project image/dir whose name is NOT a currently registered project, drop the
@@ -1865,10 +1941,18 @@ async fn reap_orphan_firecrackers_on_boot() {
 /// safe. `builds/` is reaped wholesale by the build reconcile, so it is omitted.
 async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     let plat = platform.lock().await;
-    let registered: HashSet<String> = match plat.store.list_projects() {
+    let mut registered: HashSet<String> = match plat.store.list_projects() {
         Ok(ps) => ps.into_iter().map(|p| p.id).collect(),
         Err(_) => return,
     };
+    // VM re-adoption §7: treat every re-adopted survivor as protected too (belt-and-suspenders
+    // — a survivor is always also `registered`, but this guards the data-disks loop-detach below
+    // against ever `losetup -d`'ing a live survivor's loop even if a store read drifted).
+    for (id, state) in plat.vm_states.iter() {
+        if *state == VmLifecycle::Running {
+            registered.insert(id.clone());
+        }
+    }
     let data_dir = plat.data_dir.clone();
     drop(plat);
 
@@ -2129,13 +2213,21 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
             }
             match project.state {
                 ProjectState::Active | ProjectState::Hibernated => {
+                    // VM re-adoption §7: a project re-adopted Running this start is ALREADY live
+                    // (its survivor VM + routes are up). Do NOT overwrite its state to Hibernated
+                    // or flip redb — that silently breaks metering/log-ship/idle-hibernate/drain,
+                    // which all filter on `== Running`. Just keep its domains grandfathered.
+                    let adopted = plat.vm_states.get(&project.id) == Some(&VmLifecycle::Running)
+                        || plat.vms.contains_key(&project.id);
                     // Reconcile a registered project whose deployable artifacts were
                     // removed out-of-band: it would otherwise be registered for wake and
                     // loop the proxy on "starting up" forever. Mark it NeedsRedeploy so
                     // the proxy serves a clear message; still grandfather its domains so
                     // the user gets that message (not a 404). A redeploy clears it.
                     let data_dir = plat.data_dir.clone();
-                    if !project_can_wake(&data_dir, &plat.store, &project.id) {
+                    if adopted {
+                        // live survivor — leave Running + routes intact; grandfather only.
+                    } else if !project_can_wake(&data_dir, &plat.store, &project.id) {
                         warn!(
                             project = %project.id,
                             "registered project has no deployable artifacts (content + snapshot gone) — marking needs-redeploy"
@@ -2371,6 +2463,10 @@ async fn handle_deploy(
         }
         let _ = old_vm.stop().await;
     }
+    // The old VM is gone (or being replaced); drop its re-adoption record so a crash between
+    // here and the new commit can't leave a handoff pointing at the now-dead old FC. The new
+    // VM writes a fresh record at its commit-to-Running below.
+    handoff::remove(&plat.data_dir.join("run"), project_id);
     // Release the old VM's data-disk hold (if any) before re-fencing for the new VM —
     // UNCONDITIONALLY: a stop() error or a missing VM handle must not leak the lease
     // (which would then fail the re-fence below with LeaseHeld and brick the redeploy).
@@ -2511,11 +2607,12 @@ async fn handle_deploy(
         guest_ip: Some(alloc.ip.clone()),
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
+        runtime_cgroup_parent: Some(PathBuf::from(RUNTIME_CGROUP_PARENT)),
     };
     // If start fails, release the fenced disk + lease AWAITED (not via the Drop
     // backstop) so an immediate re-deploy/re-wake can't race a fire-and-forget cleanup
     // and fail transiently with LeaseHeld/RwoUnsafe.
-    let vm = match VmInstance::start(project_id, &config, &runtime_dir).await {
+    let mut vm = match VmInstance::start(project_id, &config, &runtime_dir).await {
         Ok(vm) => vm,
         Err(e) => {
             if let Some(g) = disk_guard {
@@ -2529,13 +2626,30 @@ async fn handle_deploy(
     // writer (so a future attach's liveness check tracks the real writer, not this
     // server), then DISARM the guard and hand the token to disk_tokens.
     let mut plat = platform.lock().await;
-    if let Some(guard) = disk_guard {
-        if let Some(pid) = vm.pid() {
-            let _ = dd.set_writer_pid(project_id, guard.token(), pid).await;
+    let fc_pid = vm.pid();
+    // Capture the disk fence facts for the handoff, and make the writer-pid commit FATAL: the
+    // holder must record the FC pid (so attach_rwo's liveness gate + re-adoption track the real
+    // writer) before the handoff names it. On failure, KILL the FC synchronously-to-death FIRST
+    // (so the loop it maps is free) THEN release the guard AWAITED, and bail (deploy is
+    // retryable) — never commit a VM whose holder still names this server, never detach a loop a
+    // live FC still writes.
+    let (loop_dev, lease_epoch) = if let Some(guard) = disk_guard {
+        if let Some(pid) = fc_pid
+            && let Err(e) = dd.set_writer_pid(project_id, guard.token(), pid).await
+        {
+            drop(plat);
+            let _ = vm.stop().await;
+            guard.release().await;
+            return Err(anyhow::anyhow!("commit set_writer_pid {project_id}: {e}"));
         }
+        let dev = guard.device().to_string_lossy().into_owned();
+        let epoch = guard.token().epoch;
         plat.disk_tokens
             .insert(project_id.to_string(), guard.disarm());
-    }
+        (Some(dev), Some(epoch))
+    } else {
+        (None, None)
+    };
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
@@ -2544,13 +2658,33 @@ async fn handle_deploy(
     // is now freshly booted, so a stale entry mustn't fast-fail a routing-miss request.
     let ran_hash = plat.base_rootfs_hash.clone();
     plat.vm_rootfs_hashes
-        .insert(project_id.to_string(), ran_hash);
+        .insert(project_id.to_string(), ran_hash.clone());
     plat.wake_failures.remove(project_id);
+    let deployment_version = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.current_version);
     let active_domains = plat
         .store
         .list_active_domains_for_project(project_id)
         .unwrap_or_default();
     drop(plat);
+
+    // Persist the re-adoption record so a future jkbase-server upgrade re-adopts this VM (no
+    // bounce) instead of draining → cold-restoring it. Removed on every teardown. Best-effort:
+    // a write failure just means this VM cold-boots on the next restart (the prior behavior).
+    write_handoff_record(
+        &runtime_dir,
+        project_id,
+        fc_pid,
+        &alloc,
+        loop_dev,
+        lease_epoch,
+        ran_hash,
+        deployment_version,
+    );
 
     wait_for_agent(&alloc.ip).await?;
 
@@ -2565,6 +2699,49 @@ async fn handle_deploy(
 
     info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");
     Ok(())
+}
+
+/// Write the per-VM re-adoption record at commit-to-Running (deploy + wake). `fc_pid` +
+/// `fc_starttime` are captured from the SAME `/proc` read so the pid is pinned to one
+/// incarnation. Best-effort: if `fc_pid` is unknown (FC already exited) or the write fails, we
+/// skip — the only consequence is that this VM cold-boots on the next restart (the prior
+/// behavior), never a correctness hazard. See [`handoff`].
+#[allow(clippy::too_many_arguments)]
+fn write_handoff_record(
+    runtime_dir: &Path,
+    project_id: &str,
+    fc_pid: Option<u32>,
+    alloc: &VmAllocation,
+    loop_dev: Option<String>,
+    lease_epoch: Option<u64>,
+    base_rootfs_hash: String,
+    deployment_version: Option<u64>,
+) {
+    let Some(pid) = fc_pid else {
+        warn!(project = %project_id, "no FC pid at commit; skipping re-adoption handoff");
+        return;
+    };
+    let Some(st) = proc_starttime(pid) else {
+        warn!(project = %project_id, %pid, "FC pid gone at commit; skipping re-adoption handoff");
+        return;
+    };
+    let rec = handoff::HandoffRecord {
+        schema_version: handoff::SCHEMA_VERSION,
+        project_id: project_id.to_string(),
+        fc_pid: pid,
+        fc_starttime: st,
+        ip: alloc.ip.clone(),
+        tap: alloc.tap_device.clone(),
+        mac: alloc.mac.clone(),
+        loop_dev,
+        lease_epoch,
+        base_rootfs_hash,
+        deployment_version,
+    };
+    if let Err(e) = handoff::write(runtime_dir, project_id, &rec) {
+        warn!(project = %project_id, error = %e,
+            "failed to write re-adoption handoff (VM will cold-boot on next restart)");
+    }
 }
 
 /// Point all of a project's Active hosts at its VM IP (fast-path routes) and
@@ -2634,6 +2811,13 @@ async fn hibernate_project(
         }
     };
 
+    // VM re-adoption §6/R4: remove the handoff record FIRST — before the pause below — so even a
+    // SIGKILL of this server mid-snapshot can't leave a PAUSED FC that the next start would
+    // re-adopt as "running" (the paused-FC-resurrection hole). Decoupled from the disk_tokens
+    // clear, which is in the SECOND lock after the pause. The teardown paths that have no pause
+    // (force-stop / self-fence / teardown) remove it beside their disk_tokens clear instead.
+    handoff::remove(&plat.data_dir.join("run"), project_id);
+
     let snapshot_dir = plat.data_dir.join("snapshots").join(project_id);
     let agent_ip = plat
         .store
@@ -2675,13 +2859,16 @@ async fn hibernate_project(
         Ok(Ok(paths)) => paths,
         Ok(Err(e)) => {
             tracing::error!(project = %project_id, error = %e, "hibernate failed, force-stopping");
-            drop(vm); // Drop SIGKILLs the process; force_stop handles the rest.
+            // stop() is synchronous-to-death for BOTH variants; a bare drop() would NOT kill an
+            // Adopted survivor (its Drop is a no-op), leaving force_stop to detach the loop under a
+            // live FC. Kill here so the FC is gone before force_stop releases the disk.
+            let _ = vm.stop().await;
             force_stop_and_cleanup(project_id, &platform).await;
             return Ok(());
         }
         Err(_elapsed) => {
             tracing::error!(project = %project_id, "hibernate timed out (VM wedged), force-stopping");
-            drop(vm);
+            let _ = vm.stop().await;
             force_stop_and_cleanup(project_id, &platform).await;
             return Ok(());
         }
@@ -3018,6 +3205,7 @@ async fn wake_project_inner(
         guest_ip: Some(alloc.ip.clone()),
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
+        runtime_cgroup_parent: Some(PathBuf::from(RUNTIME_CGROUP_PARENT)),
     };
     let runtime_dir = plat.data_dir.join("run");
     let active_domains = plat
@@ -3153,7 +3341,7 @@ async fn wake_project_inner(
         Ok((vm, ran_hash, outcome))
     }
     .await;
-    let (vm, ran_hash, outcome) = match boot {
+    let (mut vm, ran_hash, outcome) = match boot {
         Ok(t) => t,
         Err(e) => {
             // Release the fenced disk AWAITED, THEN record the failure. Ordering matters: the
@@ -3184,30 +3372,50 @@ async fn wake_project_inner(
         plat.vm_states.remove(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
         drop(plat);
-        drop(vm); // SIGKILL the FC before detaching the disk it still maps
+        let _ = vm.stop().await; // synchronous-to-death before detaching the disk it maps
         if let Some(g) = disk_guard {
             g.release().await; // detach + lease release inline; disarms so Drop no-ops
         }
+        // No handoff was written this wake (that happens at commit, below), but a stale one
+        // from a prior incarnation must not survive a delete-during-wake — remove defensively.
+        handoff::remove(&runtime_dir, project_id);
         anyhow::bail!("project {project_id} was deleted during wake; aborting");
     }
 
-    // Record Firecracker's PID as the data-disk writer, then DISARM the guard and hold
-    // the token for the VM's lifetime (released on hibernate/stop/teardown).
-    if let Some(guard) = disk_guard {
-        if let Some(pid) = vm.pid() {
+    // Record Firecracker's PID as the data-disk writer (FATAL — see the deploy commit), capture
+    // the fence facts for the handoff, then DISARM the guard and hold the token for the VM's
+    // lifetime (released on hibernate/stop/teardown).
+    let fc_pid = vm.pid();
+    let (loop_dev, lease_epoch) = if let Some(guard) = disk_guard {
+        if let Some(pid) = fc_pid {
             let dd2 = plat.data_disk.clone();
-            let _ = dd2.set_writer_pid(project_id, guard.token(), pid).await;
+            if let Err(e) = dd2.set_writer_pid(project_id, guard.token(), pid).await {
+                drop(plat);
+                // Kill the FC synchronously-to-death BEFORE releasing (detaching) the disk it maps.
+                let _ = vm.stop().await;
+                guard.release().await;
+                let mut p = platform.lock().await;
+                p.wake_failures
+                    .insert(project_id.to_string(), std::time::Instant::now());
+                drop(p);
+                return Err(anyhow::anyhow!("commit set_writer_pid {project_id}: {e}"));
+            }
         }
+        let dev = guard.device().to_string_lossy().into_owned();
+        let epoch = guard.token().epoch;
         plat.disk_tokens
             .insert(project_id.to_string(), guard.disarm());
-    }
+        (Some(dev), Some(epoch))
+    } else {
+        (None, None)
+    };
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
     // Track the rootfs this VM actually ran so the NEXT hibernate stamps the truthful hash
     // (a restored VM ran the OLD blob, not `current`). Clear any prior wake-failure throttle.
     plat.vm_rootfs_hashes
-        .insert(project_id.to_string(), ran_hash);
+        .insert(project_id.to_string(), ran_hash.clone());
     plat.wake_failures.remove(project_id);
 
     if let Ok(Some(mut proj)) = plat.store.get_project(project_id) {
@@ -3216,6 +3424,18 @@ async fn wake_project_inner(
     }
     drop(plat);
     waking_guard.commit();
+
+    // Persist the re-adoption record (mirrors the deploy commit; removed on every teardown).
+    write_handoff_record(
+        &runtime_dir,
+        project_id,
+        fc_pid,
+        &alloc,
+        loop_dev,
+        lease_epoch,
+        ran_hash,
+        current_version,
+    );
 
     register_active_routes(
         &routing,
@@ -3640,7 +3860,13 @@ async fn migrate_legacy_data_disks(dir: &Path) -> Result<()> {
 /// Reap any Firecracker process still running for `project_id` (best-effort).
 async fn reap_firecracker(project_id: &str) {
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("firecracker.*{project_id}")])
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
+        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
         .status()
         .await;
 }
@@ -3856,6 +4082,361 @@ async fn agent_alive(ip: &str) -> bool {
     )
 }
 
+/// Process start time (jiffies since boot) from field 22 of `/proc/<pid>/stat`, or `None` if
+/// gone/unparseable. (Mirrors the substrate/orch helpers; main can't reach those privates.)
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// True iff `pid` is alive AND still the same incarnation as `starttime` (PID-reuse-proof).
+fn proc_alive_at(pid: u32, starttime: u64) -> bool {
+    matches!(proc_starttime(pid), Some(st) if st == starttime)
+}
+
+/// Peer pid listening on a Firecracker api-sock, via `SO_PEERCRED`. Binds the socket-liveness
+/// probe to a SPECIFIC pid at re-adoption time: the survivor's api-sock must be answered by
+/// exactly `fc_pid` — not an unrelated process that bound the path, nor a recycled pid. `None`
+/// if the socket is absent/unconnectable or the credential read fails (fail-closed).
+fn socket_peer_pid(socket_path: &Path) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let stream = UnixStream::connect(socket_path).ok()?;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: cred/len are sized to ucred; getsockopt writes at most `len` bytes into cred.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 || cred.pid <= 0 {
+        return None;
+    }
+    Some(cred.pid as u32)
+}
+
+/// The agent's reported protocol version from the `X-Jkbase-Agent-Proto` header on
+/// `/_jkbase/health`. `None` if unreachable OR the header is absent/unparseable — a
+/// pre-versioning agent (every survivor during this rollout), which the caller treats as
+/// compatible. See [`jkbase_common::AGENT_PROTOCOL_VERSION`].
+async fn agent_protocol_version(ip: &str) -> Option<u32> {
+    let probe = async {
+        let stream = tokio::net::TcpStream::connect(format!("{ip}:80"))
+            .await
+            .ok()?;
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
+        tokio::spawn(conn);
+        let req = hyper::Request::builder()
+            .uri(format!("http://{ip}:80/_jkbase/health"))
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+            .ok()?;
+        let resp = sender.send_request(req).await.ok()?;
+        resp.headers()
+            .get(jkbase_common::AGENT_PROTOCOL_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u32>().ok())
+    };
+    tokio::time::timeout(Duration::from_secs(2), probe)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// SIGKILL a non-survivor runtime Firecracker by exact pid and confirm its death (bounded).
+/// The holder record is deliberately LEFT in place so a later cold-boot's `attach_rwo` runs
+/// its fail-CLOSED preempt; deleting it would make `attach_rwo` fail-OPEN. The caller removes
+/// only `handoff.json`.
+///
+/// TOCTOU-guarded: only kills if `fc_pid` is STILL the firecracker serving `expected_sock` — the
+/// FC could have exited during the seconds of verification between enumeration and here, and its
+/// pid been recycled to an unrelated process; a bare-pid SIGKILL would then hit a bystander.
+async fn reap_runtime_fc(fc_pid: u32, expected_sock: &Path) {
+    let sock_bytes = expected_sock.to_string_lossy().into_owned().into_bytes();
+    let still_ours = std::fs::read(format!("/proc/{fc_pid}/cmdline"))
+        .map(|raw| raw.split(|b| *b == 0).any(|arg| arg == sock_bytes.as_slice()))
+        .unwrap_or(false);
+    if !still_ours {
+        warn!(%fc_pid, sock = %expected_sock.display(),
+            "VM re-adoption: pid is no longer the FC for this api-sock (exited/recycled); not killing");
+        return;
+    }
+    warn!(%fc_pid, "VM re-adoption: reaping non-survivor runtime Firecracker");
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(fc_pid.to_string())
+        .status();
+    // Confirm death so a slow exit can't still be mapping a data loop when a cold-boot reopens
+    // it. /proc-existence is enough here (a fresh-killed pid won't be recycled in this window).
+    for _ in 0..60 {
+        if !Path::new(&format!("/proc/{fc_pid}")).exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    warn!(%fc_pid, "reaped runtime FC did not exit within 3s");
+}
+
+/// Outcome of evaluating one surviving runtime Firecracker.
+enum AdoptOutcome {
+    Adopted,
+    Reaped,
+    /// A second live `jkbase-server` legitimately holds the disk (`LeaseHeld`) — we refuse this
+    /// project and leave the survivor UNTOUCHED (never kill a live peer's VM). Single-host: a
+    /// misconfiguration for an operator to resolve; we don't abort the whole startup over it.
+    SkippedPeerOwned,
+}
+
+/// VM re-adoption (§4/§5/§6b): verify every runtime Firecracker that SURVIVED the prior
+/// `jkbase-server`, re-adopt the live ones (re-acquire the lease at a fresh epoch, re-fence the
+/// disk WITHOUT detaching, rebuild `vms`/`vm_states`/`routing`) and reap the rest. Runs ONCE at
+/// startup, AFTER `PlatformState` is built and BEFORE the proxy binds or any wake-capable loop
+/// (scheduler/idle/wake) runs. Replaces the old blunt `pkill -9 firecracker` boot reaper.
+async fn adopt_or_reap_runtime_vms(
+    platform: &Arc<Mutex<PlatformState>>,
+    routing: &jkbase_proxy::RoutingTable,
+    domain_map: &DomainMap,
+) {
+    let (runtime_dir, data_disk, lease, host_id) = {
+        let plat = platform.lock().await;
+        (
+            plat.data_dir.join("run"),
+            plat.data_disk.clone(),
+            plat.lease.clone(),
+            plat.host_id.clone(),
+        )
+    };
+    let fcs = rootfs_cas::list_runtime_firecrackers(&runtime_dir);
+    if fcs.is_empty() {
+        return;
+    }
+    info!(
+        count = fcs.len(),
+        "VM re-adoption: examining surviving runtime Firecrackers"
+    );
+    let (mut adopted, mut reaped, mut skipped) = (0usize, 0usize, 0usize);
+    for (fc_pid, sock) in fcs {
+        let Some(id) = sock
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+        else {
+            warn!(%fc_pid, sock = %sock.display(), "re-adoption: cannot derive project id; reaping");
+            reap_runtime_fc(fc_pid, &sock).await;
+            reaped += 1;
+            continue;
+        };
+        match adopt_one_survivor(
+            platform,
+            routing,
+            domain_map,
+            &runtime_dir,
+            &data_disk,
+            &lease,
+            &host_id,
+            &id,
+            fc_pid,
+            &sock,
+        )
+        .await
+        {
+            AdoptOutcome::Adopted => adopted += 1,
+            AdoptOutcome::Reaped => reaped += 1,
+            AdoptOutcome::SkippedPeerOwned => skipped += 1,
+        }
+    }
+    info!(
+        adopted,
+        reaped, skipped, "VM re-adoption complete"
+    );
+}
+
+/// Evaluate + (re-)adopt or reap a single surviving runtime Firecracker `fc_pid` for `id`.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_one_survivor(
+    platform: &Arc<Mutex<PlatformState>>,
+    routing: &jkbase_proxy::RoutingTable,
+    domain_map: &DomainMap,
+    runtime_dir: &Path,
+    data_disk: &Arc<dyn DataDiskProvider>,
+    lease: &Arc<dyn Lease>,
+    host_id: &str,
+    id: &str,
+    fc_pid: u32,
+    sock: &Path,
+) -> AdoptOutcome {
+    // (1) Strict handoff. No valid record ⇒ a true orphan (crash between spawn and
+    // handoff-write) ⇒ reap; delete only handoff.json (NOT the holder — leave the
+    // fail-closed preempt for a later attach_rwo).
+    let Some(rec) = handoff::read_strict(runtime_dir, id) else {
+        warn!(project = %id, %fc_pid, "re-adoption: no valid handoff (orphan); reaping");
+        reap_runtime_fc(fc_pid, sock).await;
+        handoff::remove(runtime_dir, id);
+        return AdoptOutcome::Reaped;
+    };
+
+    // (2) Verify SURVIVOR. Each check is fail-closed → reap on any miss.
+    let reap = |why: &'static str| {
+        warn!(project = %id, %fc_pid, reason = why, "re-adoption: not a survivor; reaping + cold-boot on next request");
+    };
+    if rec.fc_pid != fc_pid {
+        reap("handoff pid mismatch");
+    } else if !proc_alive_at(fc_pid, rec.fc_starttime) {
+        reap("pid not alive at recorded start time");
+    } else if socket_peer_pid(sock) != Some(fc_pid) {
+        reap("api-sock SO_PEERCRED peer != fc_pid");
+    } else if !agent_alive(&rec.ip).await {
+        // The AGENT HTTP layer — NOT the bare FC api-sock, which a *paused* FC still answers
+        // (the paused-FC-resurrection hole). A real survivor has a live, serving guest.
+        reap("agent HTTP layer not answering");
+    } else if matches!(agent_protocol_version(&rec.ip).await, Some(v) if v != jkbase_common::AGENT_PROTOCOL_VERSION)
+    {
+        // Agent-protocol skew: force-recycle (reap → cold-boot on the NEW agent) rather than
+        // keep talking the old wire format. Absent header ⇒ compatible (pre-versioning agent).
+        reap("agent protocol version skew");
+    } else {
+        // All checks passed — proceed to adopt below.
+        return finish_adoption(
+            platform, routing, domain_map, runtime_dir, data_disk, lease, host_id, id, fc_pid, rec,
+        )
+        .await;
+    }
+    // Any verification miss fell through to here.
+    reap_runtime_fc(fc_pid, sock).await;
+    handoff::remove(runtime_dir, id);
+    AdoptOutcome::Reaped
+}
+
+/// Re-fence + commit a VERIFIED survivor. Split out so the verification arm stays readable.
+#[allow(clippy::too_many_arguments)]
+async fn finish_adoption(
+    platform: &Arc<Mutex<PlatformState>>,
+    routing: &jkbase_proxy::RoutingTable,
+    domain_map: &DomainMap,
+    runtime_dir: &Path,
+    data_disk: &Arc<dyn DataDiskProvider>,
+    lease: &Arc<dyn Lease>,
+    host_id: &str,
+    id: &str,
+    fc_pid: u32,
+    rec: handoff::HandoffRecord,
+) -> AdoptOutcome {
+    let sock = runtime_dir.join(id).join("firecracker.sock");
+    // (3) Re-fence the data disk WITHOUT detaching — only for projects that have one. The old
+    // process's flock released on its exit, so acquire wins at a fresh (higher) epoch.
+    let token = if let Some(loop_dev) = rec.loop_dev.clone() {
+        let token = match lease.acquire(id, host_id, DISK_LEASE_TTL).await {
+            Ok(t) => t,
+            Err(SubstrateError::LeaseHeld { .. }) => {
+                // §5.1: a second live server owns the disk. Do NOT adopt and do NOT kill the
+                // survivor — refuse this project loudly and move on (never one instance "fixing"
+                // a misconfig by SIGKILLing the other's tenant VM).
+                tracing::error!(project = %id,
+                    "re-adoption: data-disk lease is HELD by another live jkbase-server — refusing \
+                     this project and leaving its VM untouched (resolve the duplicate server)");
+                return AdoptOutcome::SkippedPeerOwned;
+            }
+            Err(e) => {
+                tracing::warn!(project = %id, error = %e, "re-adoption: lease acquire failed; reaping");
+                reap_runtime_fc(fc_pid, &sock).await;
+                handoff::remove(runtime_dir, id);
+                return AdoptOutcome::Reaped;
+            }
+        };
+        // adopt_writer re-pins the holder at the fresh epoch + verified writer, fail-closed
+        // (fresh kernel loop-backing read + fc_pid fd proof + starttime pin). On ANY doubt,
+        // RELEASE the freshly-acquired lease FIRST (else the cold-boot's own acquire would hit
+        // LeaseHeld against this very process — the §5.3 self-deadlock), then reap → cold-boot.
+        if let Err(e) = data_disk
+            .adopt_writer(id, &token, &loop_dev, fc_pid, rec.fc_starttime)
+            .await
+        {
+            tracing::warn!(project = %id, error = %e,
+                "re-adoption: adopt_writer failed; releasing lease + reaping for cold boot");
+            let _ = lease.release(&token).await;
+            reap_runtime_fc(fc_pid, &sock).await;
+            handoff::remove(runtime_dir, id);
+            return AdoptOutcome::Reaped;
+        }
+        Some(token)
+    } else {
+        None // diskless project: no lease, no disk_tokens entry (mirrors the deploy/wake path)
+    };
+
+    // (4) Commit under the platform lock. Re-validate the project still exists (a delete could
+    // have landed via the control API). If gone: kill the FC + release/detach AWAITED, reap.
+    let vm = VmInstance::adopt(
+        id,
+        runtime_dir,
+        fc_pid,
+        rec.fc_starttime,
+        Some(Path::new(RUNTIME_CGROUP_PARENT)),
+    );
+    let over_quota;
+    let active_domains;
+    {
+        let mut plat = platform.lock().await;
+        if plat.store.get_project(id).ok().flatten().is_none() {
+            drop(plat);
+            let mut vm = vm;
+            let _ = vm.stop().await; // synchronous-to-death before detaching the disk
+            if let Some(token) = token {
+                let _ = data_disk.detach(id).await;
+                let _ = lease.release(&token).await;
+            }
+            handoff::remove(runtime_dir, id);
+            warn!(project = %id, "re-adoption: project was deleted; reaped");
+            return AdoptOutcome::Reaped;
+        }
+        over_quota = plat
+            .store
+            .get_quota_status(id)
+            .ok()
+            .flatten()
+            .map(|s| s.bandwidth_blocked)
+            .unwrap_or(false);
+        if let Some(token) = &token {
+            plat.disk_tokens.insert(id.to_string(), token.clone());
+        }
+        plat.vms.insert(id.to_string(), vm);
+        plat.vm_states
+            .insert(id.to_string(), VmLifecycle::Running);
+        plat.vm_rootfs_hashes
+            .insert(id.to_string(), rec.base_rootfs_hash.clone());
+        plat.wake_failures.remove(id);
+        active_domains = plat
+            .store
+            .list_active_domains_for_project(id)
+            .unwrap_or_default();
+    }
+
+    // Rewrite the handoff with the refreshed lease epoch so run/<id>/handoff.json stays
+    // consistent with disk_tokens (pid/starttime/loop_dev unchanged — same FC, same loop).
+    let mut rec2 = rec;
+    rec2.lease_epoch = token.as_ref().map(|t| t.epoch);
+    let _ = handoff::write(runtime_dir, id, &rec2);
+
+    // (5) Route — UNLESS over quota (§10): then leave it unrouted so it isn't served; the idle
+    // loop hibernates it and a request is refused by wake_project's quota gate.
+    if over_quota {
+        warn!(project = %id, "re-adoption: adopted an OVER-QUOTA survivor; not registering routes");
+    } else {
+        register_active_routes(routing, domain_map, &active_domains, id, &rec2.ip).await;
+    }
+    info!(project = %id, %fc_pid, ip = %rec2.ip, "VM re-adopted (no bounce)");
+    AdoptOutcome::Adopted
+}
+
 /// Centralized force-stop + state reconciliation for a project whose graceful
 /// hibernate could not complete (wedged agent, pause/snapshot timeout, or error).
 /// Idempotent and best-effort: every step is independently fallible-ignored so a
@@ -3870,6 +4451,9 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
         let _ = vm.stop().await;
     }
     plat.vm_rootfs_hashes.remove(project_id);
+    // The FC is being reaped below — drop its re-adoption record so a later start can't adopt it.
+    // (hibernate_project already removed it before its pause; idempotent if so.)
+    handoff::remove(&plat.data_dir.join("run"), project_id);
     // Release the data-disk hold so the next wake re-fences (the FC is reaped below).
     if let Some(token) = plat.disk_tokens.remove(project_id) {
         let dd = plat.data_disk.clone();
@@ -3899,7 +4483,13 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
 
     // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
     let _ = tokio::process::Command::new("pkill")
-        .args(["-f", &format!("firecracker.*{project_id}")])
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
+        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
         .status()
         .await;
 

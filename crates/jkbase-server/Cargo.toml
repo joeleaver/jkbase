@@ -41,6 +41,8 @@ tower = { workspace = true, features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
+# SO_PEERCRED on the Firecracker api-sock at VM re-adoption time (binds the socket probe to fc_pid).
+libc = "0.2"
 
 [dev-dependencies]
 toml = { workspace = true }

@@ -312,6 +312,30 @@ pub trait DataDiskProvider: Backend {
         let _ = (id, token, pid);
         Ok(())
     }
+    /// Re-fence a disk whose loop binding + live writer SURVIVED a server restart,
+    /// WITHOUT detaching it (the survivor's Firecracker still holds the device open).
+    /// This is the re-adoption counterpart to [`attach_rwo`](DataDiskProvider::attach_rwo):
+    /// it spawns no VM and unbinds no loop — it only re-pins the holder record to
+    /// `token`'s fresh (higher) epoch and the verified writer `fc_pid`/`fc_starttime`,
+    /// so a future attach's exclusivity check tracks the right incarnation. Host-local
+    /// backends fail CLOSED here (a fresh kernel re-check that `loop_dev` still backs the
+    /// disk AND `fc_pid` actually holds it AND `fc_pid` is alive at `fc_starttime`); any
+    /// doubt ⇒ `Err`, and the caller MUST release the freshly-acquired lease and
+    /// cold-boot. Storage-enforced backends (no PID/loop model) return an error so the
+    /// caller cold-boots. Default: unsupported.
+    async fn adopt_writer(
+        &self,
+        id: &str,
+        token: &FenceToken,
+        loop_dev: &str,
+        fc_pid: u32,
+        fc_starttime: u64,
+    ) -> Result<()> {
+        let _ = (id, token, loop_dev, fc_pid, fc_starttime);
+        Err(SubstrateError::Backend(
+            "adopt_writer (VM re-adoption) is not supported by this backend".to_string(),
+        ))
+    }
     /// Detach `id` from this host (release the exclusive hold).
     async fn detach(&self, id: &str) -> Result<()>;
     /// Destroy `id` and its data permanently.

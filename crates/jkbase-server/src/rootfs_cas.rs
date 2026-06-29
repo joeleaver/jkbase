@@ -155,24 +155,24 @@ pub fn gc(cas_dir: &Path, keep: &HashSet<String>) -> Result<Vec<String>> {
     Ok(removed)
 }
 
-/// SIGKILL any `firecracker` process whose `--api-sock` lives under `runtime_dir` — orphans
-/// from a PRIOR incarnation that exited non-gracefully (OOM / SIGKILL / panic-abort), where
-/// tokio's `kill_on_drop` never fired so the jailer/FC reparented to init and kept faulting
-/// its rootfs blob. Run at startup BEFORE CAS placement + GC so the "zero VMs running"
-/// premise the GC reference set depends on actually holds. Returns the count killed.
+/// Enumerate every runtime `firecracker` process whose `--api-sock` lives under `runtime_dir`,
+/// returning `(pid, api_sock_path)` for each. These are FCs from a PRIOR incarnation — either
+/// genuine orphans (a non-graceful exit) or **survivors** the VM re-adoption pass will verify
+/// and adopt. The caller (`adopt_or_reap_runtime_vms`) decides per-FC; this only finds them.
 ///
-/// Targeted by the `--api-sock <runtime_dir>/...` argument — NEVER a `pkill -f firecracker`
-/// substring match (which could reap an unrelated process / a project whose id is a substring
-/// of another). At startup none of OUR VMs exist yet, so every match is genuinely an orphan.
-pub fn reap_orphan_firecrackers(runtime_dir: &Path) -> usize {
+/// Matched by the `--api-sock <runtime_dir>/...` argument — NEVER a `pkill -f firecracker`
+/// substring match (which could hit an unrelated process / a project whose id is a substring of
+/// another). Build VMs run jailed with their api-sock under the jailer chroot, NOT under
+/// `runtime_dir`, so they are never matched here.
+pub fn list_runtime_firecrackers(runtime_dir: &Path) -> Vec<(u32, PathBuf)> {
     let run_prefix = runtime_dir.to_string_lossy().to_string();
-    let mut victims: Vec<i32> = Vec::new();
+    let mut found = Vec::new();
     let Ok(rd) = std::fs::read_dir("/proc") else {
-        return 0;
+        return found;
     };
     for entry in rd.flatten() {
         let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
         let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
@@ -192,20 +192,21 @@ pub fn reap_orphan_firecrackers(runtime_dir: &Path) -> usize {
             .next()
             .unwrap_or("")
             .contains("firecracker");
-        let under_run = args.iter().any(|a| a.contains(&run_prefix));
-        if is_fc && under_run {
-            victims.push(pid);
+        if !is_fc {
+            continue;
+        }
+        // The value following `--api-sock`; only accept it if it lives under runtime_dir.
+        let sock = args
+            .iter()
+            .position(|a| *a == "--api-sock")
+            .and_then(|i| args.get(i + 1))
+            .filter(|s| s.starts_with(&run_prefix))
+            .map(PathBuf::from);
+        if let Some(sock) = sock {
+            found.push((pid, sock));
         }
     }
-    for pid in &victims {
-        warn!(pid = %pid, "reaping orphaned Firecracker from a prior incarnation");
-        // SIGKILL by exact PID; dependency-free.
-        let _ = std::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .status();
-    }
-    victims.len()
+    found
 }
 
 #[cfg(test)]

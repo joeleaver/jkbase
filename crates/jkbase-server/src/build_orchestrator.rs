@@ -3614,6 +3614,7 @@ esac
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = fx.data.join("casredeploy-run");
 
@@ -4871,6 +4872,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = fx.data.join(format!("{tag}-run"));
         let mut vm = VmInstance::start(tag, &config, &runtime_dir)
@@ -5014,6 +5016,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = data.join(format!("{tag}-run"));
         let mut vm = VmInstance::start(tag, &config, &runtime_dir)
@@ -5323,6 +5326,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = data.join("egr-e2e-run");
         let mut vm = VmInstance::start("egre2e", &config, &runtime_dir)
@@ -5643,6 +5647,7 @@ console.log("listening on " + port);
             guest_ip: Some(guest_ip.to_string()),
             gateway_ip: Some(host_ip.to_string()),
             vsock_cid: None,
+            runtime_cgroup_parent: None,
         };
         let runtime_dir = fx.data.join("dbpipe-run");
 
@@ -6262,6 +6267,197 @@ console.log("listening on " + port);
         );
         println!(
             "PASS (negative): no `context` -> ../common absent -> build fails as expected\n  error: {err}"
+        );
+    }
+
+    /// On-box validation of the VM re-adoption kernel-touching primitives (zero-bounce continuity
+    /// phase 1, docs/vm-readoption-design.md): the `jkbase-runtime` cgroup ESCAPE, the SO_PEERCRED
+    /// binding, `adopt_writer` re-fencing a LIVE loop at a fresh epoch WITHOUT detaching/disturbing
+    /// the running guest, `adopt()` taking over a survivor, and the no-op adopted `Drop`. Boots a
+    /// real bun server VM with a data disk, simulates the old server releasing its lease, then
+    /// re-fences + re-adopts the still-serving FC.
+    ///
+    /// NOT covered here (need a systemd-managed jkbase-server → staging/prod gate): the actual
+    /// KillMode=mixed survival across `systemctl restart`, and the full deploy→handoff→restart→
+    /// adopt server flow. The adopted `stop()`/`hibernate()` by-pid+/proc logic is unit-tested
+    /// (an Owned handle reaps the child cleanly here to avoid a test-only zombie; in prod the
+    /// survivor reparents to init).
+    ///
+    /// Run: `tools/dev test vm_readoption_primitives_on_box`
+    #[tokio::test]
+    #[ignore = "needs KVM + root + bun.ext4 + agent rootfs; proves the re-adoption kernel primitives"]
+    async fn vm_readoption_primitives_on_box() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use jkbase_substrate::{DataDiskProvider, FlockLease, Lease, LocalLoop};
+
+        let Some(fx) = bun_pipeline_build("readopt", 77, Workload::OfflineNoDep).await else {
+            return;
+        };
+        let Some((store_dir, _agent)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+
+        // Plain-server metadata image (no in-guest data mount — we only need the FC to OPEN the
+        // data loop so adopt_writer's /proc/<pid>/fd proof has something to find).
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, true)
+            .expect("layer plan");
+        let meta_img = fx.data.join("readopt-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            &meta_img,
+        )
+        .expect("metadata image");
+
+        let cas_dir = fx.data.join("base-rootfs");
+        let staging_rootfs = std::env::var("JKB_ROOTFS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| fx.data.join("base-rootfs.ext4"));
+        let (rootfs_path, _hash) =
+            crate::rootfs_cas::place(&staging_rootfs, &cas_dir).expect("CAS place rootfs");
+
+        // A real data disk on a real loop, attached at epoch 1 (the "old server" fence).
+        let id = "readopt";
+        let disks = LocalLoop::open(fx.data.join("readopt-disks")).expect("open localloop");
+        disks
+            .ensure(id, 64 * 1024 * 1024)
+            .await
+            .expect("ensure data disk");
+        let lease =
+            FlockLease::open(fx.data.join("readopt-leases"), "old-server").expect("open lease");
+        let token1 = lease
+            .acquire(id, "old-server", Duration::from_secs(30))
+            .await
+            .expect("acquire epoch 1");
+        let dev = disks.attach_rwo(id, &token1).await.expect("attach_rwo");
+        let loop_dev = dev.path.to_string_lossy().into_owned();
+
+        // Point-to-point tap on its own /24 (clear of the other on-box tests).
+        let (host_ip, guest_ip, guest_mac) = ("172.29.0.1", "172.29.0.2", "AA:FC:00:00:29:02");
+        let tap = "jkreadopt";
+        let _ = sh("ip", &["link", "del", tap]).await;
+        sh("ip", &["tuntap", "add", "dev", tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", tap, "up"]).await.unwrap();
+
+        let parent = PathBuf::from(crate::RUNTIME_CGROUP_PARENT);
+        let cfg = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path,
+            metadata_image_path: Some(meta_img),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: Some(dev.path.clone()),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.to_string()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: Some(parent.clone()),
+        };
+        let runtime_dir = fx.data.join("readopt-run");
+        let mut vm = VmInstance::start(id, &cfg, &runtime_dir)
+            .await
+            .expect("boot runtime VM");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(75))
+                .await
+                .is_some(),
+            "the booted VM must serve HTTP 200"
+        );
+        let fc_pid = vm.pid().expect("fc pid");
+        let starttime = crate::proc_starttime(fc_pid).expect("fc starttime");
+
+        // (1) cgroup ESCAPE: the FC was migrated into jkbase-runtime/<id> (a sibling of
+        //     jkbase.service), the precondition for surviving KillMode=mixed.
+        let procs = std::fs::read_to_string(parent.join(id).join("cgroup.procs")).unwrap_or_default();
+        assert!(
+            procs.lines().any(|l| l.trim() == fc_pid.to_string()),
+            "FC pid {fc_pid} must be in {}/{id}/cgroup.procs (cgroup escape) — got {procs:?}",
+            parent.display()
+        );
+        eprintln!("[readopt] cgroup escape OK: pid {fc_pid} in jkbase-runtime/{id}");
+
+        // (2) SO_PEERCRED binds the api-sock probe to fc_pid.
+        let sock = runtime_dir.join(id).join("firecracker.sock");
+        assert_eq!(
+            crate::socket_peer_pid(&sock),
+            Some(fc_pid),
+            "api-sock SO_PEERCRED peer must equal fc_pid"
+        );
+        eprintln!("[readopt] SO_PEERCRED OK: peer == {fc_pid}");
+
+        // --- Simulate the OLD server exiting: its flock releases; the FC keeps running. ---
+        lease.release(&token1).await.expect("release epoch 1");
+
+        // --- The NEW server re-fences at a fresh (higher) epoch WITHOUT detaching the live loop. ---
+        let token2 = lease
+            .acquire(id, "new-server", Duration::from_secs(30))
+            .await
+            .expect("acquire epoch 2");
+        assert!(token2.epoch > token1.epoch, "re-fence epoch must be higher");
+        disks
+            .adopt_writer(id, &token2, &loop_dev, fc_pid, starttime)
+            .await
+            .expect("adopt_writer must re-pin the live writer without detaching");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(15))
+                .await
+                .is_some(),
+            "the guest must keep serving 200 across adopt_writer (no detach / no disturbance)"
+        );
+        eprintln!(
+            "[readopt] adopt_writer OK: re-pinned at epoch {} — guest still serving 200",
+            token2.epoch
+        );
+
+        // (3) adopt() takes over the survivor; the agent answers through the adopted handle; and
+        //     dropping the adopted handle must NOT kill it (no-op adopted Drop).
+        let adopted = VmInstance::adopt(id, &runtime_dir, fc_pid, starttime, Some(&parent));
+        assert_eq!(adopted.pid(), Some(fc_pid), "adopted pid() must be fc_pid");
+        assert!(
+            crate::agent_alive(guest_ip).await,
+            "the agent must answer through the adopted survivor"
+        );
+        drop(adopted);
+        assert!(
+            crate::proc_alive_at(fc_pid, starttime),
+            "dropping the adopted handle must NOT kill the survivor (no-op Drop)"
+        );
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(10))
+                .await
+                .is_some(),
+            "survivor must still serve 200 after the adopted handle is dropped"
+        );
+        eprintln!("[readopt] adopt() OK + adopted Drop is a no-op (survivor still serving)");
+
+        // Clean teardown via the Owned handle: reaps the child cleanly (no zombie) + rmdir's the leaf.
+        vm.stop().await.expect("stop");
+        assert!(
+            !crate::proc_alive_at(fc_pid, starttime),
+            "stop() must kill the FC"
+        );
+        assert!(
+            !parent.join(id).exists(),
+            "stop() must rmdir the now-empty cgroup leaf"
+        );
+        let _ = disks.destroy(id).await;
+        let _ = lease.release(&token2).await;
+        let _ = sh("ip", &["link", "del", tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!(
+            "PASS: VM re-adoption primitives — cgroup escape + SO_PEERCRED + adopt_writer (live, \
+             no disturbance) + adopt + no-op adopted Drop + leaf rmdir"
         );
     }
 }

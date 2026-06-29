@@ -1871,6 +1871,7 @@ dependencies = [
  "jkbase-substrate",
  "jkbase-wsproxy",
  "jkbuild-types",
+ "libc",
  "rcgen 0.13.2",
  "reqwest",
  "rustls 0.23.40",

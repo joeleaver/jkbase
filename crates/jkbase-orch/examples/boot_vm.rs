@@ -26,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
         guest_ip: Some("172.16.0.2".to_string()),
         gateway_ip: Some("172.16.0.1".to_string()),
         vsock_cid: None,
+        runtime_cgroup_parent: None,
     };
 
     let runtime_dir = base.join("run");

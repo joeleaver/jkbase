@@ -25,6 +25,15 @@ pub struct VmConfig {
     pub guest_ip: Option<String>,
     pub gateway_ip: Option<String>,
     pub vsock_cid: Option<u32>,
+    /// Parent cgroup-v2 dir for runtime FCs (e.g. `/sys/fs/cgroup/jkbase-runtime`). When
+    /// set, `start`/`restore_from_snapshot` `mkdir` a `<parent>/<id>` leaf and migrate the
+    /// Firecracker pid into its `cgroup.procs` immediately after spawn, so the FC lives in a
+    /// sibling cgroup OUTSIDE `jkbase.service` and survives `systemctl restart`
+    /// (`KillMode=mixed` only reaps the service's own cgroup) for the next process to
+    /// re-adopt. `None` keeps the FC in the spawning process's cgroup (build VMs, tests,
+    /// pre-cgroup hosts). Best-effort: a migration failure is logged, not fatal — the VM
+    /// runs, it just won't survive an upgrade (falls back to the cold-restore path).
+    pub runtime_cgroup_parent: Option<PathBuf>,
 }
 
 pub struct VmInstance {
@@ -32,8 +41,37 @@ pub struct VmInstance {
     socket_path: PathBuf,
     vsock_path: Option<PathBuf>,
     log_path: PathBuf,
-    process: Child,
+    handle: FcHandle,
     client: FirecrackerClient,
+    /// The runtime cgroup leaf (`<parent>/<id>`) this FC was migrated into, if any. Best-effort
+    /// `rmdir`'d by `stop()` once the FC is dead so empty per-id leaves don't accumulate.
+    cgroup_leaf: Option<PathBuf>,
+}
+
+/// How this process relates to the Firecracker it manages.
+enum FcHandle {
+    /// Spawned by THIS process: the tokio [`Child`] IS the Firecracker, so `kill_on_drop`
+    /// and the `Drop` backstop apply and `wait()` reaps it.
+    Owned(Child),
+    /// Re-adopted across a server restart: NOT our child (so `process.wait()` would `ECHILD`).
+    /// We carry its verified pid + `/proc/<pid>/stat` field-22 start time and act on it via
+    /// signals + `/proc` polling, pinned to that incarnation so PID reuse can't fool us.
+    Adopted { fc_pid: u32, fc_starttime: u64 },
+}
+
+/// Process start time (jiffies since boot) from field 22 of `/proc/<pid>/stat`, or `None`
+/// if the process is gone / unparseable. `comm` (field 2) is parenthesised and may contain
+/// spaces and `)`, so split the tail AFTER the last `)` — field 22 is then index 19.
+/// (Mirrors the substrate's `process_starttime`; orch can't depend on that crate.)
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// True iff `pid` is alive AND still the same incarnation as `starttime` (PID-reuse-proof).
+fn proc_alive_at(pid: u32, starttime: u64) -> bool {
+    matches!(proc_starttime(pid), Some(st) if st == starttime)
 }
 
 impl VmInstance {
@@ -75,6 +113,14 @@ impl VmInstance {
             .kill_on_drop(true)
             .spawn()
             .context("failed to spawn Firecracker process")?;
+
+        // Migrate the FC into the runtime cgroup IMMEDIATELY (before the slow config calls)
+        // so it survives a server restart for re-adoption. Best-effort.
+        if let Some(parent) = &config.runtime_cgroup_parent
+            && let Some(fc_pid) = process.id()
+        {
+            migrate_to_runtime_cgroup(parent, id, fc_pid);
+        }
 
         // Wait for the socket to appear
         for _ in 0..50 {
@@ -233,9 +279,50 @@ impl VmInstance {
             socket_path,
             vsock_path,
             log_path,
-            process,
+            handle: FcHandle::Owned(process),
             client,
+            cgroup_leaf: config.runtime_cgroup_parent.as_ref().map(|p| p.join(id)),
         })
+    }
+
+    /// Re-adopt a Firecracker that SURVIVED a prior `jkbase-server` exit (it lives in the
+    /// `jkbase-runtime` cgroup, so `systemctl restart` did not reap it). Unlike [`start`],
+    /// this ATTACHES to the existing `run/<id>/firecracker.sock` (it does NOT unlink it —
+    /// that would sever the live FC's API channel) and does NO `setup_tap`/boot — the TAP +
+    /// its source-guard persist across the restart and the guest is already running. The
+    /// caller has already verified `fc_pid` is alive at `fc_starttime`, that the agent HTTP
+    /// layer answers, and that the api-sock's `SO_PEERCRED` peer == `fc_pid`. The returned
+    /// adopted instance re-implements `pid`/`stop`/`hibernate` off the pid (no `Child`), and
+    /// its `Drop` is a no-op so it can never kill a VM meant to survive.
+    pub fn adopt(
+        id: &str,
+        runtime_dir: &Path,
+        fc_pid: u32,
+        fc_starttime: u64,
+        cgroup_parent: Option<&Path>,
+    ) -> Self {
+        let vm_dir = runtime_dir.join(id);
+        let socket_path = vm_dir.join("firecracker.sock");
+        let vsock_path = vm_dir.join("vsock.sock");
+        let vsock_path = if vsock_path.exists() {
+            Some(vsock_path)
+        } else {
+            None
+        };
+        let client = FirecrackerClient::new(&socket_path);
+        VmInstance {
+            id: id.to_string(),
+            socket_path,
+            vsock_path,
+            log_path: vm_dir.join("console.log"),
+            handle: FcHandle::Adopted {
+                fc_pid,
+                fc_starttime,
+            },
+            client,
+            // The survivor's leaf was created by the prior server; clean it up when we stop it.
+            cgroup_leaf: cgroup_parent.map(|p| p.join(id)),
+        }
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -250,19 +337,53 @@ impl VmInstance {
         &self.log_path
     }
 
-    /// OS pid of the Firecracker process, or `None` once it has exited.
+    /// OS pid of the Firecracker process, or `None` once an Owned process has exited.
     /// Used by host-side CPU metering to read `/proc/<pid>/stat`.
     pub fn pid(&self) -> Option<u32> {
-        self.process.id()
+        match &self.handle {
+            FcHandle::Owned(p) => p.id(),
+            FcHandle::Adopted { fc_pid, .. } => Some(*fc_pid),
+        }
     }
 
+    /// Kill the Firecracker and BLOCK until its death is confirmed, then clean up the
+    /// sockets. Synchronous-to-death is load-bearing: callers (`detach`-after-`stop`, the
+    /// restore-fallback cold boot, redeploy/teardown) rely on no live FC still mapping the
+    /// data loop once this returns — the no-two-writers-on-one-RWO-disk guarantee.
     pub async fn stop(&mut self) -> Result<()> {
         info!(self.id, "stopping VM");
-        self.process
-            .kill()
-            .await
-            .context("failed to kill Firecracker process")?;
-        self.process.wait().await?;
+        match &mut self.handle {
+            FcHandle::Owned(process) => {
+                process
+                    .kill()
+                    .await
+                    .context("failed to kill Firecracker process")?;
+                process.wait().await?;
+            }
+            FcHandle::Adopted {
+                fc_pid,
+                fc_starttime,
+            } => {
+                // Not our child (`wait` would ECHILD): SIGKILL by pid, then poll `/proc`
+                // pinned to the start time until the process is gone (or the pid is recycled
+                // to a different incarnation — also "our FC is dead"). Bounded so a stuck
+                // /proc can't hang the caller forever.
+                kill_pid(*fc_pid);
+                let mut confirmed = false;
+                for _ in 0..600 {
+                    if !proc_alive_at(*fc_pid, *fc_starttime) {
+                        confirmed = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                if !confirmed {
+                    anyhow::bail!(
+                        "adopted FC pid {fc_pid} did not die within 30s after SIGKILL"
+                    );
+                }
+            }
+        }
 
         if self.socket_path.exists() {
             let _ = tokio::fs::remove_file(&self.socket_path).await;
@@ -271,6 +392,11 @@ impl VmInstance {
             && vp.exists()
         {
             let _ = tokio::fs::remove_file(vp).await;
+        }
+        // The FC is dead, so its runtime cgroup leaf is now empty — best-effort rmdir so empty
+        // per-id leaves don't accumulate under jkbase-runtime across a long uptime.
+        if let Some(leaf) = &self.cgroup_leaf {
+            let _ = std::fs::remove_dir(leaf);
         }
 
         info!(self.id, "VM stopped");
@@ -294,8 +420,24 @@ impl VmInstance {
             .await?;
 
         info!(self.id, "snapshot created, killing process");
-        self.process.kill().await?;
-        self.process.wait().await?;
+        match &mut self.handle {
+            FcHandle::Owned(process) => {
+                process.kill().await?;
+                process.wait().await?;
+            }
+            FcHandle::Adopted {
+                fc_pid,
+                fc_starttime,
+            } => {
+                kill_pid(*fc_pid);
+                for _ in 0..600 {
+                    if !proc_alive_at(*fc_pid, *fc_starttime) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
 
         if self.socket_path.exists() {
             let _ = tokio::fs::remove_file(&self.socket_path).await;
@@ -336,6 +478,17 @@ impl VmInstance {
             .kill_on_drop(true)
             .spawn()
             .context("failed to spawn Firecracker process")?;
+
+        // Migrate the restored FC into the runtime cgroup IMMEDIATELY (same as `start`) so it
+        // survives a server restart for re-adoption. WITHOUT this, snapshot-woken VMs — the
+        // DOMINANT cohort on a scale-to-zero platform (every project that has hibernated+woken)
+        // — stay in jkbase.service's cgroup and are SIGKILLed by KillMode=mixed on upgrade,
+        // silently defeating the whole re-adoption feature for the majority of running VMs.
+        if let Some(parent) = &config.runtime_cgroup_parent
+            && let Some(fc_pid) = process.id()
+        {
+            migrate_to_runtime_cgroup(parent, id, fc_pid);
+        }
 
         for _ in 0..50 {
             if socket_path.exists() {
@@ -400,18 +553,104 @@ impl VmInstance {
             socket_path,
             vsock_path: None,
             log_path,
-            process,
+            handle: FcHandle::Owned(process),
             client,
+            cgroup_leaf: config.runtime_cgroup_parent.as_ref().map(|p| p.join(id)),
         })
+    }
+}
+
+/// SIGKILL `pid` by number — dependency-free, matches `rootfs_cas::reap_orphan_firecrackers`.
+/// Used for the Adopted variant, whose FC is not a tokio `Child` (no `kill()`).
+fn kill_pid(pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status();
+}
+
+/// Best-effort migrate `fc_pid` into a `<parent>/<id>` cgroup-v2 leaf so it lives OUTSIDE
+/// `jkbase.service`'s cgroup and survives `systemctl restart` (`KillMode=mixed`). The server
+/// runs as root, so it can `mkdir` the leaf and write `cgroup.procs`; the parent is
+/// provisioned by `tools/setup-runtime-cgroup.sh`. A failure is logged, not fatal: the VM
+/// still runs, it just won't survive an upgrade (degrades to the cold-restore path).
+fn migrate_to_runtime_cgroup(parent: &Path, id: &str, fc_pid: u32) {
+    let leaf = parent.join(id);
+    if let Err(e) = std::fs::create_dir_all(&leaf) {
+        tracing::warn!(id, error = %e, leaf = %leaf.display(),
+            "could not create runtime cgroup leaf; FC will not survive a restart");
+        return;
+    }
+    let procs = leaf.join("cgroup.procs");
+    if let Err(e) = std::fs::write(&procs, fc_pid.to_string()) {
+        tracing::warn!(id, %fc_pid, error = %e, procs = %procs.display(),
+            "could not migrate FC into runtime cgroup; FC will not survive a restart");
+    } else {
+        info!(id, %fc_pid, leaf = %leaf.display(), "FC migrated into runtime cgroup (restart-survivable)");
     }
 }
 
 impl Drop for VmInstance {
     fn drop(&mut self) {
-        // Best-effort sync kill if the process is still running
-        if let Ok(Some(_)) = self.process.try_wait() {
-            return;
+        match &mut self.handle {
+            // Backstop for a spawned FC dropped without an explicit stop()/hibernate()
+            // (e.g. a config error between spawn and a successful return). On the upgrade
+            // path this never runs — shutdown exits via std::process::exit, skipping every
+            // destructor, so survivors are left for re-adoption.
+            FcHandle::Owned(process) => {
+                if let Ok(Some(_)) = process.try_wait() {
+                    return;
+                }
+                let _ = process.start_kill();
+            }
+            // NEVER kill an adopted survivor on drop — it is meant to outlive this handle.
+            // Teardown of an adopted VM goes through the synchronous-to-death stop().
+            FcHandle::Adopted { .. } => {}
         }
-        let _ = self.process.start_kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_helpers_track_self_and_reject_dead_or_reused() {
+        let me = std::process::id();
+        let st = proc_starttime(me).expect("self has a start time");
+        assert!(st > 0);
+        assert!(proc_alive_at(me, st)); // same incarnation
+        assert!(!proc_alive_at(me, st.wrapping_add(1))); // pid reuse ⇒ different start time
+        assert_eq!(proc_starttime(0), None); // /proc/0 never exists
+        assert!(!proc_alive_at(4_000_000_000, 1)); // implausible pid
+    }
+
+    #[test]
+    fn adopt_exposes_fc_pid_and_paths() {
+        let dir = std::env::temp_dir().join(format!("jkb-vm-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let vm = VmInstance::adopt("proj-x", &dir, 4242, 99, None);
+        assert_eq!(vm.pid(), Some(4242)); // metering reads the adopted pid
+        assert_eq!(vm.id, "proj-x");
+        assert!(vm.socket_path().ends_with("proj-x/firecracker.sock"));
+        assert!(matches!(
+            vm.handle,
+            FcHandle::Adopted {
+                fc_pid: 4242,
+                fc_starttime: 99
+            }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adopted_stop_is_ok_when_pid_already_gone() {
+        let dir = std::env::temp_dir().join(format!("jkb-vm-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A dead/implausible pid: SIGKILL is a no-op, proc_alive_at is immediately false, so
+        // stop() confirms death on the first poll and returns Ok (no real FC needed).
+        let mut vm = VmInstance::adopt("proj-y", &dir, 4_000_000_000, 12345, None);
+        assert!(vm.stop().await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

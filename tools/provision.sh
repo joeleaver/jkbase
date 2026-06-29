@@ -218,6 +218,12 @@ sudo chmod +x /usr/local/bin/jkbase-bridge.sh
 sudo cp "$JKBASE_DIR/tools/setup-build-cgroup.sh" /usr/local/bin/jkbase-build-cgroup.sh
 sudo chmod +x /usr/local/bin/jkbase-build-cgroup.sh
 
+# Runtime cgroup provisioner (ExecStartPre, per-boot). Tenant VMs are migrated into leaf
+# cgroups beneath /sys/fs/cgroup/jkbase-runtime so they survive `systemctl restart` and the
+# next jkbase-server can re-adopt them (zero-bounce upgrades; docs/vm-readoption-design.md §1).
+sudo cp "$JKBASE_DIR/tools/setup-runtime-cgroup.sh" /usr/local/bin/jkbase-runtime-cgroup.sh
+sudo chmod +x /usr/local/bin/jkbase-runtime-cgroup.sh
+
 # Isolated build network provisioner (ExecStartPre, reboot-surviving). Creates the
 # jkbuild0 bridge + JKBUILD firewall so build VMs can reach ONLY the egress proxy
 # on the build gateway (default-deny; no internet, no other VMs, no NAT). Required
@@ -271,6 +277,10 @@ User=root
 EnvironmentFile=/var/jkbase/.env
 ExecStartPre=/usr/local/bin/jkbase-bridge.sh
 ExecStartPre=/usr/local/bin/jkbase-build-cgroup.sh
+# `-` prefix: the runtime cgroup is NON-essential (the server self-creates the per-id leaf via
+# create_dir_all; a missing/failing script just costs upgrade-survival, never blocks startup), so
+# its absence/failure must never brick the service start.
+ExecStartPre=-/usr/local/bin/jkbase-runtime-cgroup.sh
 ExecStartPre=/usr/local/bin/jkbase-build-net.sh
 ExecStart=$JKBASE_DIR/target/release/jkbase-server \
     --data-dir /var/jkbase \
