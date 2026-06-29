@@ -173,3 +173,33 @@ On the systemd validation box, then prod:
 8. **TLS reload disk-only:** same wildcard cert serial before/after; ACME challenge path 404 (not
    refused) across the restart.
 9. **Deploy doesn't restart the socket:** `:443` inode unchanged across a full `deploy-server.sh`.
+
+## Validation outcome (systemd, dev box, 2026-06-29) — PASS
+
+Validated under real systemd socket activation (a `jkbase-val-http.socket` →
+`jkbase-readopt-val.service`, `:18080`, `Backlog=4096`) with a real tenant bun microVM, mirroring
+the Phase-1 capture→restart→assert. The `:80`/`serve_http` path was exercised on-box; `:443`/
+`serve_https` shares the identical `resolve_listener` + cancellable-accept + `drive_connection`
+machinery (differs only by the per-stream TLS handshake; cert reload is unchanged `CertManager`
+disk-load), and is exercised for real on the prod deploy.
+
+- **Socket ownership:** `ss -ltnpe` shows `:18080` held by BOTH `systemd (pid 1)` and `jkbase-server`,
+  in the **socket unit's** cgroup (`/system.slice/jkbase-val-http.socket`) — outside the service
+  cgroup, so `KillMode=mixed` can't touch it. `Send-Q 4096` (the `Backlog=` + somaxconn bump took).
+- **Sensitivity control:** both units stopped → the probe saw **392/392 connection-refused**
+  (proves the probe detects a real gap, so a clean treatment run is meaningful).
+- **Headline (C1) — zero refused across an upgrade restart:** a fresh-connection curl witness across
+  a `.upgrading` + `systemctl restart` (service only) → **2525 requests, 2525 OK, 0 refused, 0
+  timeout**. Restart returned in ~0.2s (event-driven drain).
+- **Socket continuity:** listen-socket inode **unchanged** (`1703440`) before/after — systemd kept
+  the socket, not a fresh bind.
+- **Phase-1 intact:** tenant FC pid **unchanged** (`107591`), `VM re-adopted (no bounce) ...
+  adopted=1 reaped=0`; journal shows the `upgrade restart — draining HTTP (proxy+storage+api),
+  leaving tenant VMs running` branch.
+- **No fd leak (threat-model gate):** the `:18080` listen-socket inode is **absent** from the tenant
+  FC's `/proc/<pid>/fd` (CLOEXEC arming works).
+- **Loopback P0 intact:** api `:19090` + storage `:19091` bound `127.0.0.1`-only (never `0.0.0.0`).
+
+**Conclusion: ready for PR/merge/deploy.** The FIRST prod deploy bounces once (the OUTGOING binary
+predates the sockets, holds `:80`/`:443` in-process, releases only at exit); every deploy after is
+gapless.
