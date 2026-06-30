@@ -2692,7 +2692,8 @@ async fn handle_deploy(
     // any prior writer. Held by an RAII guard until the VM is up, so a boot failure (or
     // a cancelled future) releases the lease instead of bricking the project.
     let disk_guard = if has_disk {
-        Some(fence_data_disk(&dd, &ls, &hid, project_id).await?)
+        let disk_mib = data_disk_mib_for(&data_dir, project_id);
+        Some(fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?)
     } else {
         None
     };
@@ -3287,6 +3288,7 @@ async fn wake_project_inner(
     let dd = plat.data_disk.clone();
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
+    let data_dir = plat.data_dir.clone();
 
     // The erofs layer attach order for the cold-boot fallback (restore re-derives
     // drives from the snapshot, so this only matters when restore fails/misses). Read
@@ -3326,7 +3328,8 @@ async fn wake_project_inner(
     // restore path patches the data drive to this fenced device; refuse→cold-boot
     // (reap + retry, else error) lives in fence_data_disk. None when no data disk.
     let disk_guard = if has_disk {
-        let g = fence_data_disk(&dd, &ls, &hid, project_id).await?;
+        let disk_mib = data_disk_mib_for(&data_dir, project_id);
+        let g = fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?;
         config.data_disk_path = Some(g.device());
         Some(g)
     } else {
@@ -4074,6 +4077,7 @@ async fn fence_data_disk(
     lease: &Arc<dyn Lease>,
     host_id: &str,
     project_id: &str,
+    disk_mib: u64,
 ) -> Result<DiskLeaseGuard> {
     let token = lease
         .acquire(project_id, host_id, DISK_LEASE_TTL)
@@ -4089,7 +4093,7 @@ async fn fence_data_disk(
         device: PathBuf::new(),
         armed: true,
     };
-    let device = fence_attach(data_disk, project_id, guard.token()).await?;
+    let device = fence_attach(data_disk, project_id, guard.token(), disk_mib).await?;
     guard.device = device;
     Ok(guard)
 }
@@ -4098,9 +4102,12 @@ async fn fence_attach(
     data_disk: &Arc<dyn DataDiskProvider>,
     project_id: &str,
     token: &FenceToken,
+    disk_mib: u64,
 ) -> Result<PathBuf> {
+    // `ensure` is grow-or-create and NEVER shrinks, so a re-sized `[database].size`
+    // grows the disk on the next boot and a smaller value is a safe no-op (no data loss).
     data_disk
-        .ensure(project_id, DATA_DISK_MIB * 1024 * 1024)
+        .ensure(project_id, disk_mib * 1024 * 1024)
         .await
         .map_err(|e| anyhow::anyhow!("ensure data disk {project_id}: {e}"))?;
     let device = match data_disk.attach_rwo(project_id, token).await {
@@ -4166,6 +4173,25 @@ fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
         .join("live")
         .join("_database.json")
         .exists()
+}
+
+/// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
+/// (parsed host-side at deploy into `_database.json`'s `size_mib`) when present, else
+/// the platform default [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized
+/// DB grows on the next boot (`ensure` never shrinks). Floored at the default — the DB
+/// disk is never smaller than the platform minimum, so a too-small `size` is harmless.
+/// A non-DB project (no `_database.json`, or no `size_mib`) gets the default unchanged.
+fn data_disk_mib_for(data_dir: &Path, project_id: &str) -> u64 {
+    let path = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_database.json");
+    let configured = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("size_mib").and_then(serde_json::Value::as_u64));
+    configured.unwrap_or(0).max(DATA_DISK_MIB)
 }
 
 /// Application-level liveness probe. Returns true only if the agent answers HTTP
