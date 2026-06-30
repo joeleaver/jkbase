@@ -76,6 +76,36 @@ pub fn generate_secret_access_key() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Mint a managed-DB access-key id — the PUBLIC identifier the reach-plane preamble
+/// carries (`{akid, secret}`). A distinct `JKBD` prefix (vs the S3 `JKBA`) keeps the DB
+/// keyspace visibly separate; combined with a separate control-db table this is the
+/// [R2] partition — an S3 key can never resolve on the DB path and vice versa. 64 bits
+/// of entropy: it's an identifier, not a secret. `[A-Z0-9]`, 20 chars, AKID-shaped.
+pub fn generate_db_access_key_id() -> String {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(20);
+    s.push_str("JKBD");
+    for b in bytes {
+        s.push_str(&format!("{b:02X}"));
+    }
+    s
+}
+
+/// Mint a managed-DB access-key secret (240 bits). UNLIKE the S3 secret it is NEVER
+/// stored — only its [`token_fingerprint`] is — so the high entropy makes the sha256
+/// preimage-safe (the git-token rationale). Distinct `jkbd_` prefix so a leaked secret
+/// is self-identifying and can't be mistaken for a git (`jkbg_`) or tenant (`jkb_`) token.
+/// Shown once at mint.
+pub fn generate_db_secret() -> String {
+    let mut bytes = [0u8; 30];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "jkbd_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 /// SHA-256 (hex) fingerprint of a high-entropy token, used to store and look up
 /// the per-project git-push token WITHOUT keeping the plaintext. A 256-bit random
 /// token makes SHA-256 preimage-resistant (unlike a low-entropy password, which
@@ -90,6 +120,24 @@ pub fn token_fingerprint(token: &str) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// Const-time check that `presented_secret` hashes to `stored_fingerprint`
+/// (`sha256` hex). Compares the two 64-byte digests with an XOR accumulator so it
+/// can't leak, via early-exit timing, how many leading digest bytes matched — the same
+/// discipline the git-push and webhook paths use. Used to verify a managed-DB
+/// access-key secret against its at-rest fingerprint without storing the secret.
+pub fn fingerprint_eq(presented_secret: &str, stored_fingerprint: &str) -> bool {
+    let computed = token_fingerprint(presented_secret);
+    let (a, b) = (computed.as_bytes(), stored_fingerprint.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub fn hash_token(token: &str) -> Result<String> {

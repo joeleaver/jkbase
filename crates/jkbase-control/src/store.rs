@@ -33,6 +33,16 @@ const ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_k
 /// written in one txn so they never diverge.
 const ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
     TableDefinition::new("access_keys_by_project");
+
+/// Managed-DB reach-plane access keys — a credential keyspace ENTIRELY SEPARATE from the
+/// S3 `ACCESS_KEYS` above ([R2]). A distinct table + a distinct `JKBD` akid prefix means an
+/// object-store key can never resolve on the DB reach path and a DB key can never sign
+/// SigV4 — a partition, not a shared `scope` flag one default-value bug from cross-streaming.
+/// Records store ONLY a sha256 fingerprint of the secret ([R4]), never the secret. Mirrors
+/// the primary + per-project-index split so listing/teardown stay O(keys-for-this-project).
+const DB_ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("db_access_keys");
+const DB_ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("db_access_keys_by_project");
 /// Cluster fleet membership (HA), one row per `jkbase-server` host instance, keyed
 /// by `host_id`. The leader's placement + dead-host detection (P3) read this; at HA
 /// P0 it is schema only — CRUD + tests, no loop touches it yet.
@@ -189,6 +199,44 @@ pub struct AccessKey {
     /// Optional tenant-supplied label (e.g. "ci", "backups"); never authoritative.
     pub label: String,
     pub created_unix: u64,
+}
+
+/// An owner-held credential for the managed-DB reach plane — the native-TCP ingress
+/// sidecar (or a future TLS-capable `@rhypedb/client`) presents it in the connection
+/// preamble. FORKED from the S3 [`AccessKey`] lifecycle but deliberately NOT the same
+/// record:
+/// - it lives in the separate `DB_ACCESS_KEYS` keyspace with a `JKBD` akid prefix
+///   ([R2]) — an S3 `JKBA…` key can't resolve here and a DB key can't sign SigV4;
+/// - it stores ONLY `token_fingerprint = sha256(secret)` ([R4]). The 240-bit secret is
+///   returned once at mint and never persisted, so a control-db read yields no usable DB
+///   credential, and verification is an O(1) lookup + const-time fingerprint compare —
+///   no cleartext-at-rest (the SigV4 `secret_key` trap) and no argon2-per-connect (a
+///   CPU-DoS amplifier on the attacker-reachable, reconnect-heavy reach endpoint).
+///
+/// Owner-bound via `tenant_id`, re-checked against the project's current owner on the
+/// reach path so a key orphaned by a crash-interrupted teardown can't be inherited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAccessKey {
+    pub access_key_id: String,
+    pub project_id: String,
+    /// The tenant that minted the key; re-checked against the project's current owner.
+    /// `#[serde(default)]` so an older record deserializes (empty tenant → fails the
+    /// ownership re-bind → safe).
+    #[serde(default)]
+    pub tenant_id: String,
+    /// SHA-256 (hex) of the secret. The plaintext is shown once at mint and never stored.
+    pub token_fingerprint: String,
+    /// Optional owner-supplied label (e.g. "ci", "prod-app"); never authoritative.
+    pub label: String,
+    pub created_unix: u64,
+}
+
+impl DbAccessKey {
+    /// Const-time check that `presented_secret` matches this key's stored fingerprint.
+    /// The reach-plane edge calls this after an O(1) [`Store::lookup_db_access_key`].
+    pub fn verify_secret(&self, presented_secret: &str) -> bool {
+        auth::fingerprint_eq(presented_secret, &self.token_fingerprint)
+    }
 }
 
 /// Per-project connected-repo build-trigger credentials (build · D). Stored
@@ -502,6 +550,8 @@ impl Store {
         let _ = txn.open_table(QUOTA_STATUS)?;
         let _ = txn.open_table(ACCESS_KEYS)?;
         let _ = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
+        let _ = txn.open_table(DB_ACCESS_KEYS)?;
+        let _ = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(HOSTS)?;
         txn.commit()?;
 
@@ -1617,6 +1667,152 @@ impl Store {
         Ok(removed)
     }
 
+    // -- Managed-DB reach-plane access keys (owner-held; see [`DbAccessKey`]) --
+
+    /// Hard cap on DB access keys per project (mirrors [`Self::MAX_ACCESS_KEYS_PER_PROJECT`]):
+    /// bounds index growth and a compromised owner's blast radius.
+    pub const MAX_DB_ACCESS_KEYS_PER_PROJECT: usize = 25;
+
+    /// Count a project's DB access keys via a bounded range scan over the index.
+    pub fn count_db_access_keys(&self, project_id: &str) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let count = index.range(lo.as_str()..hi.as_str())?.count();
+        Ok(count)
+    }
+
+    /// Mint a DB access key for `project_id`. Returns `(record, secret)` — the 240-bit
+    /// plaintext `secret` is exposed ONLY here (the caller shows it once); the record
+    /// persists just its sha256 fingerprint ([R4]). Primary + per-project index written in
+    /// one txn (cap check shares it, so the count is exact). Errs at the per-project cap or
+    /// on the astronomically unlikely id collision.
+    pub fn create_db_access_key(
+        &self,
+        project_id: &str,
+        tenant_id: &str,
+        label: &str,
+    ) -> Result<(DbAccessKey, String)> {
+        let secret = auth::generate_db_secret();
+        let key = DbAccessKey {
+            access_key_id: auth::generate_db_access_key_id(),
+            project_id: project_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            token_fingerprint: auth::token_fingerprint(&secret),
+            label: label.to_string(),
+            created_unix: auth::timestamp(),
+        };
+        let index_key = format!("{}:{}", project_id, key.access_key_id);
+        let txn = self.db.begin_write()?;
+        {
+            let lo = format!("{project_id}:");
+            let hi = format!("{project_id};");
+            let mut index = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
+            let current = index.range(lo.as_str()..hi.as_str())?.count();
+            if current >= Self::MAX_DB_ACCESS_KEYS_PER_PROJECT {
+                return Err(anyhow::anyhow!(
+                    "db access key limit reached ({} per project)",
+                    Self::MAX_DB_ACCESS_KEYS_PER_PROJECT
+                ));
+            }
+            let mut primary = txn.open_table(DB_ACCESS_KEYS)?;
+            if primary.get(key.access_key_id.as_str())?.is_some() {
+                return Err(anyhow::anyhow!("db access key id collision; retry"));
+            }
+            let data = serde_json::to_vec(&key)?;
+            primary.insert(key.access_key_id.as_str(), data.as_slice())?;
+            index.insert(index_key.as_str(), key.access_key_id.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok((key, secret))
+    }
+
+    /// Resolve a DB access-key id to its record — the O(1) lookup the reach-plane edge
+    /// performs per connection. `None` if unknown/revoked. Consults ONLY the DB keyspace,
+    /// so an S3 `JKBA…` id will not resolve here ([R2]).
+    pub fn lookup_db_access_key(&self, access_key_id: &str) -> Result<Option<DbAccessKey>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DB_ACCESS_KEYS)?;
+        match table.get(access_key_id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List a project's DB access keys (console / CLI). Bounded range scan over the index;
+    /// records carry only fingerprints, so there is no secret to leak.
+    pub fn list_db_access_keys(&self, project_id: &str) -> Result<Vec<DbAccessKey>> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
+        let primary = txn.open_table(DB_ACCESS_KEYS)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let mut out = Vec::new();
+        for entry in index.range(lo.as_str()..hi.as_str())? {
+            let (_k, v) = entry?;
+            let akid = String::from_utf8_lossy(v.value()).into_owned();
+            if let Some(rec) = primary.get(akid.as_str())? {
+                out.push(serde_json::from_slice::<DbAccessKey>(rec.value())?);
+            }
+        }
+        out.sort_by_key(|a| a.created_unix);
+        Ok(out)
+    }
+
+    /// Revoke one DB access key, scoped to `project_id` via the index compound key (a
+    /// tenant can't revoke another project's key by guessing its id). Returns whether it
+    /// existed for this project. NB [R5]: tearing down LIVE relays on revoke is the
+    /// reach-plane edge's job; this removes only the credential record.
+    pub fn delete_db_access_key(&self, project_id: &str, access_key_id: &str) -> Result<bool> {
+        let index_key = format!("{project_id}:{access_key_id}");
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut index = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
+            let owned = index.remove(index_key.as_str())?.is_some();
+            if owned {
+                let mut primary = txn.open_table(DB_ACCESS_KEYS)?;
+                primary.remove(access_key_id)?;
+            }
+            owned
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Revoke ALL of a project's DB access keys (project teardown). Mirrors
+    /// [`Self::delete_all_access_keys`] (collect-then-delete; redb forbids mutating a table
+    /// mid-iteration). Without this, a recreated same-slug project could inherit a prior
+    /// tenant's DB credential.
+    pub fn delete_all_db_access_keys(&self, project_id: &str) -> Result<usize> {
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut index = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
+            let entries: Vec<(String, String)> = index
+                .range(lo.as_str()..hi.as_str())?
+                .filter_map(|e| e.ok())
+                .map(|(k, v)| {
+                    (
+                        k.value().to_string(),
+                        String::from_utf8_lossy(v.value()).into_owned(),
+                    )
+                })
+                .collect();
+            let mut primary = txn.open_table(DB_ACCESS_KEYS)?;
+            for (index_key, akid) in entries {
+                index.remove(index_key.as_str())?;
+                if primary.remove(akid.as_str())?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
     // -- Connected-repo build triggers (build · D) --
 
     /// Load a project's repo-trigger credentials, or `None` if it has none yet.
@@ -1752,6 +1948,155 @@ mod tests {
         assert!(store.delete_access_key("proj-a", &a.access_key_id).unwrap());
         assert!(store.lookup_access_key(&a.access_key_id).unwrap().is_none());
         assert!(store.list_access_keys("proj-a").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_access_keys_mint_lookup_verify_and_scope() {
+        let (store, path) = tmp_db();
+        let (a, a_secret) = store
+            .create_db_access_key("proj-a", "tenant-a", "ci")
+            .unwrap();
+        let (b, b_secret) = store
+            .create_db_access_key("proj-b", "tenant-b", "")
+            .unwrap();
+        // Distinct JKBD-prefixed akids; the 240-bit secrets are unique and jkbd_-tagged.
+        assert_ne!(a.access_key_id, b.access_key_id);
+        assert!(a.access_key_id.starts_with("JKBD"));
+        assert!(a_secret.starts_with("jkbd_") && a_secret != b_secret);
+
+        // The record persists ONLY a fingerprint — never the secret ([R4]).
+        assert_eq!(a.token_fingerprint, auth::token_fingerprint(&a_secret));
+        assert_ne!(a.token_fingerprint, a_secret);
+
+        // O(1) lookup resolves the owner; verify_secret is a const-time fingerprint match.
+        let got = store
+            .lookup_db_access_key(&a.access_key_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.project_id, "proj-a");
+        assert_eq!(got.tenant_id, "tenant-a");
+        assert!(got.verify_secret(&a_secret));
+        assert!(!got.verify_secret(&b_secret));
+        assert!(!got.verify_secret("jkbd_wrong"));
+        assert!(
+            store
+                .lookup_db_access_key("JKBDDEADBEEF00000000")
+                .unwrap()
+                .is_none()
+        );
+
+        // List + revoke are per-project (a tenant can't revoke another project's key).
+        assert_eq!(store.list_db_access_keys("proj-a").unwrap().len(), 1);
+        assert!(
+            !store
+                .delete_db_access_key("proj-b", &a.access_key_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .lookup_db_access_key(&a.access_key_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .delete_db_access_key("proj-a", &a.access_key_id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .lookup_db_access_key(&a.access_key_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_db_access_keys("proj-a").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_and_s3_keyspaces_never_cross_resolve() {
+        let (store, path) = tmp_db();
+        let s3 = store.create_access_key("proj", "t", "s3").unwrap();
+        let (db, _db_secret) = store.create_db_access_key("proj", "t", "db").unwrap();
+
+        // [R2]: an S3 key id must NOT resolve on the DB path, and a DB key id must NOT
+        // resolve on the S3 path — separate tables, not a shared scope flag that's one
+        // default-value bug from cross-streaming.
+        assert!(
+            store
+                .lookup_db_access_key(&s3.access_key_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .lookup_access_key(&db.access_key_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // Each keyspace lists only its own kind.
+        assert_eq!(store.list_access_keys("proj").unwrap().len(), 1);
+        assert_eq!(store.list_db_access_keys("proj").unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_access_key_cap_enforced_per_project() {
+        let (store, path) = tmp_db();
+        for i in 0..Store::MAX_DB_ACCESS_KEYS_PER_PROJECT {
+            store
+                .create_db_access_key("proj-a", "t1", &format!("k{i}"))
+                .unwrap();
+        }
+        assert!(
+            store
+                .create_db_access_key("proj-a", "t1", "overflow")
+                .is_err()
+        );
+        assert_eq!(
+            store.count_db_access_keys("proj-a").unwrap(),
+            Store::MAX_DB_ACCESS_KEYS_PER_PROJECT
+        );
+        // A different project is unaffected by another's full cap.
+        assert!(store.create_db_access_key("proj-b", "t2", "ok").is_ok());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delete_all_db_access_keys_purges_only_the_target_project() {
+        let (store, path) = tmp_db();
+        let (k1, _) = store.create_db_access_key("forumall", "t1", "a").unwrap();
+        let _ = store.create_db_access_key("forumall", "t1", "b").unwrap();
+        // Prefix boundary: a same-prefix slug must NOT be swept (':' separator is exact).
+        let keep = store
+            .create_db_access_key("forumall2", "t2", "c")
+            .unwrap()
+            .0;
+
+        let removed = store.delete_all_db_access_keys("forumall").unwrap();
+        assert_eq!(removed, 2);
+        assert!(
+            store
+                .lookup_db_access_key(&k1.access_key_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_db_access_keys("forumall").unwrap().is_empty());
+        assert!(
+            store
+                .lookup_db_access_key(&keep.access_key_id)
+                .unwrap()
+                .is_some(),
+            "prefix boundary: forumall2 must survive"
+        );
+        // Idempotent.
+        assert_eq!(store.delete_all_db_access_keys("forumall").unwrap(), 0);
 
         let _ = std::fs::remove_file(path);
     }

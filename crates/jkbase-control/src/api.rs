@@ -684,6 +684,7 @@ async fn create_project(
     // NEW owner (cross-tenant inheritance). Purge it before the slug is reused.
     let _ = state.store.delete_all_secrets(&id);
     let _ = state.store.delete_all_access_keys(&id);
+    let _ = state.store.delete_all_db_access_keys(&id);
     let _ = tokio::fs::remove_dir_all(data_dir(&state).join("objectstore").join(&id)).await;
 
     // Claim the project's primary subdomain (host-key == project id). This also
@@ -835,6 +836,9 @@ async fn delete_project(
                     // same-slug project must not inherit a prior tenant's S3
                     // credentials or stored objects (keys gate cross-tenant access).
                     let _ = state.store.delete_all_access_keys(&id);
+                    // Same reasoning for the managed-DB reach-plane keys: a recreated
+                    // same-slug project must not inherit a prior tenant's DB credential.
+                    let _ = state.store.delete_all_db_access_keys(&id);
                     let _ =
                         tokio::fs::remove_dir_all(data_dir(&state).join("objectstore").join(&id))
                             .await;
