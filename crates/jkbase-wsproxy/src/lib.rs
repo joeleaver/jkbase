@@ -14,14 +14,47 @@ use hyper::header::{HeaderMap, HeaderValue, SET_COOKIE};
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 /// Default idle-reap window for a spliced upgrade (WebSocket &c.) — torn down after
 /// this long with no bytes in either direction. Active traffic (incl. WS keepalives)
 /// resets it, so only abandoned/stalled sockets are reaped.
 pub const DEFAULT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often a busy managed-DB relay re-stamps the activity tracker. Throttled so a
+/// chatty connection keeps its VM warm (§5 liveness) without taking the tracker's
+/// write-lock on every 8 KiB read.
+pub const ACTIVITY_STAMP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Optional hooks for [`relay_bidirectional_hooked`]. The managed-DB reach plane uses
+/// them; the (short-lived) WebSocket path passes none via [`relay_bidirectional`].
+#[derive(Default)]
+pub struct RelayHooks {
+    /// Force-close BOTH directions when this fires. A raw DB relay never EOFs on its
+    /// own, so the edge passes its drain token to tear the relay down at the
+    /// `DRAIN_GRACE` deadline ([R-drain]); the same token (per-relay) is how a key
+    /// revocation drops a LIVE relay ([R5]).
+    pub cancel: Option<CancellationToken>,
+    /// Invoked (throttled to [`ACTIVITY_STAMP_INTERVAL`]) on byte flow in either
+    /// direction. The reach plane stamps the `ActivityTracker` through this — a raw
+    /// relay never passes through `proxy_request`, so without this a busy-but-quiet
+    /// connection's VM would be hibernated out from under it (§5).
+    pub on_activity: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Enable TCP keepalive so a dead half-open peer is reaped by the OS even when the
+/// app-level idle watchdog can't tell it's dead (a realtime subscription can be open
+/// but byte-silent for minutes). [R9]: without it a wedged socket would pin the
+/// per-project connection gauge and hold a VM warm forever — a standing cost-DoS.
+pub fn set_relay_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(20));
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}
 
 /// Did the client ask to switch protocols (e.g. a WebSocket handshake)?
 /// `Connection: Upgrade` + an `Upgrade:` token, per RFC 9110 §7.8. Full-token match
@@ -154,14 +187,53 @@ where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    relay_bidirectional_hooked(client, backend, idle_timeout, RelayHooks::default()).await
+}
+
+/// [`relay_bidirectional`] plus the managed-DB reach-plane [`RelayHooks`]: a
+/// force-close `cancel` token ([R-drain]/[R5]) and a throttled `on_activity` stamp (§5).
+/// With [`RelayHooks::default`] it behaves identically to `relay_bidirectional`.
+pub async fn relay_bidirectional_hooked<A, B>(
+    client: A,
+    backend: B,
+    idle_timeout: Duration,
+    hooks: RelayHooks,
+) where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let RelayHooks {
+        cancel,
+        on_activity,
+    } = hooks;
 
     let (mut client_rd, mut client_wr) = tokio::io::split(client);
     let (mut backend_rd, mut backend_wr) = tokio::io::split(backend);
     let activity = Arc::new(tokio::sync::Notify::new());
 
+    // Wrap `on_activity` in a shared throttle so a busy relay stamps at most once per
+    // ACTIVITY_STAMP_INTERVAL (the first byte stamps immediately). Cloned into both pumps.
+    let stamp: Option<Arc<dyn Fn() + Send + Sync>> = on_activity.map(|cb| {
+        let last: Arc<std::sync::Mutex<Option<Instant>>> = Arc::new(std::sync::Mutex::new(None));
+        let f: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let mut g = last.lock().unwrap();
+            let due = g
+                .map(|t| t.elapsed() >= ACTIVITY_STAMP_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                *g = Some(Instant::now());
+                drop(g);
+                cb();
+            }
+        });
+        f
+    });
+
     let to_backend = {
         let activity = activity.clone();
+        let stamp = stamp.clone();
         async move {
             let mut buf = [0u8; 8192];
             loop {
@@ -172,6 +244,9 @@ where
                             break;
                         }
                         activity.notify_one();
+                        if let Some(s) = &stamp {
+                            s();
+                        }
                     }
                 }
             }
@@ -182,6 +257,7 @@ where
 
     let to_client = {
         let activity = activity.clone();
+        let stamp = stamp.clone();
         async move {
             let mut buf = [0u8; 8192];
             loop {
@@ -192,6 +268,9 @@ where
                             break;
                         }
                         activity.notify_one();
+                        if let Some(s) = &stamp {
+                            s();
+                        }
                     }
                 }
             }
@@ -210,9 +289,19 @@ where
         }
     };
 
+    // Force-close: fires on drain/revocation. `pending()` when no token is supplied so
+    // this arm simply never wins (identical to the un-hooked relay).
+    let cancelled = async {
+        match cancel {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+
     tokio::select! {
         _ = async { tokio::join!(to_backend, to_client) } => {}
         _ = idle => info!("upgrade relay idle timeout; closing"),
+        _ = cancelled => info!("relay force-closed (drain or revocation)"),
     }
 }
 
@@ -421,5 +510,52 @@ mod tests {
             .map(|v| v.to_str().unwrap())
             .collect();
         assert_eq!(got, vec!["a=1", "b=2; Domain=a.jkbase.app"]);
+    }
+
+    #[tokio::test]
+    async fn hooked_relay_forwards_stamps_and_force_closes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Two in-memory pipes; the relay owns one end of each, the test drives the other.
+        let (mut c_test, c_relay) = tokio::io::duplex(1024);
+        let (mut b_test, b_relay) = tokio::io::duplex(1024);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let on_hit = {
+            let hits = hits.clone();
+            Arc::new(move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        let cancel = CancellationToken::new();
+
+        let relay = tokio::spawn(relay_bidirectional_hooked(
+            c_relay,
+            b_relay,
+            Duration::from_secs(600),
+            RelayHooks {
+                cancel: Some(cancel.clone()),
+                on_activity: Some(on_hit),
+            },
+        ));
+
+        // Byte-transparent forwarding client -> backend, and the first byte stamps.
+        c_test.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        b_test.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "activity must be stamped on byte flow"
+        );
+
+        // Neither side closed and the idle window is long — only the cancel token can
+        // end it. [R-drain]/[R5]: a live relay must force-close promptly.
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay must force-close on cancel")
+            .unwrap();
     }
 }
