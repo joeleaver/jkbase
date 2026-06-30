@@ -1,3 +1,4 @@
+pub mod db_preamble;
 pub mod tls;
 
 use anyhow::Result;
@@ -158,21 +159,39 @@ pub async fn serve(
         let https_shutdown = shutdown.clone();
         let https_tx = conn_tx.clone();
         let https = tokio::spawn(async move {
-            if let Err(e) =
-                serve_https(https_listener, https_port, acceptor, shared_tls, https_shutdown, https_tx)
-                    .await
+            if let Err(e) = serve_https(
+                https_listener,
+                https_port,
+                acceptor,
+                shared_tls,
+                https_shutdown,
+                https_tx,
+            )
+            .await
             {
                 error!(error = %e, "HTTPS proxy error");
             }
         });
 
-        let res =
-            serve_http_redirect(http_listener, http_port, shared.domain.clone(), cert_manager, shutdown.clone())
-                .await;
+        let res = serve_http_redirect(
+            http_listener,
+            http_port,
+            shared.domain.clone(),
+            cert_manager,
+            shutdown.clone(),
+        )
+        .await;
         let _ = https.await; // its accept loop has broken on cancel
         res?;
     } else {
-        serve_http(http_listener, http_port, shared, shutdown.clone(), conn_tx.clone()).await?;
+        serve_http(
+            http_listener,
+            http_port,
+            shared,
+            shutdown.clone(),
+            conn_tx.clone(),
+        )
+        .await?;
     }
 
     // Wait for in-flight connections to finish draining (caller bounds this).
