@@ -1,4 +1,5 @@
 pub mod db_preamble;
+pub mod db_relay;
 pub mod tls;
 
 use anyhow::Result;
