@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::ptr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
@@ -52,6 +53,13 @@ struct ManagedServer {
     layers: Option<Vec<PathBuf>>,
     process: Option<Child>,
     healthy: bool,
+    /// Consecutive (re)spawn attempts since the server was last healthy. Reset to 0 once
+    /// it passes a health check. Drives the exponential restart backoff so a crash-looping
+    /// server doesn't hot-loop the supervisor (one respawn per health pass).
+    restart_count: u32,
+    /// Earliest instant the next (re)spawn may be attempted (the backoff gate). `None` ⇒
+    /// respawn immediately on the next pass (a fresh server or a recovered one).
+    next_restart_at: Option<Instant>,
 }
 
 pub struct ContainerSupervisor {
@@ -183,6 +191,8 @@ impl ContainerSupervisor {
                 layers,
                 process: Some(process),
                 healthy: false,
+                restart_count: 0,
+                next_restart_at: None,
             });
         }
 
@@ -274,6 +284,8 @@ impl ContainerSupervisor {
             layers: Some(lowerdirs),
             process: Some(process),
             healthy: false,
+            restart_count: 0,
+            next_restart_at: None,
         });
         Ok(())
     }
@@ -299,41 +311,18 @@ impl ContainerSupervisor {
     }
 
     pub async fn run_health_checks(&self) {
+        let now = Instant::now();
         let mut servers = self.servers.write().await;
         for server in servers.iter_mut() {
+            // Reap an exited process so the (re)spawn path below treats it like any other
+            // server with no live process. Drop the handle (process = None) rather than
+            // respawning inline — the backoff gate decides whether/when to respawn.
             if let Some(ref mut process) = server.process {
                 match process.try_wait() {
                     Ok(Some(status)) => {
-                        warn!(
-                            server = %server.name,
-                            exit_code = ?status.code(),
-                            "server process exited, restarting"
-                        );
+                        warn!(server = %server.name, exit_code = ?status.code(), "server process exited");
                         server.healthy = false;
-                        let respawn = match &server.layers {
-                            Some(lowerdirs) => spawn_server_layered(
-                                &server.name,
-                                &server.manifest,
-                                lowerdirs,
-                                &self.logs,
-                            ),
-                            None => spawn_server_chroot(
-                                &server.name,
-                                &server.manifest,
-                                &server.rootfs_dir,
-                                &self.logs,
-                            ),
-                        };
-                        match respawn {
-                            Ok(new_process) => {
-                                server.process = Some(new_process);
-                            }
-                            Err(e) => {
-                                error!(server = %server.name, error = %e, "failed to restart server");
-                                server.process = None;
-                            }
-                        }
-                        continue;
+                        server.process = None;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -341,6 +330,39 @@ impl ContainerSupervisor {
                         continue;
                     }
                 }
+            }
+
+            // (Re)spawn any server with no live process — whether it just exited OR a prior
+            // respawn itself errored (which previously left `process = None` and was NEVER
+            // retried). Gated by an exponential backoff so a crash-looping server respawns
+            // at most once per capped interval instead of once per health pass.
+            if server.process.is_none() {
+                if server.next_restart_at.is_some_and(|at| now < at) {
+                    continue; // still backing off — retry on a later pass
+                }
+                let respawn = match &server.layers {
+                    Some(lowerdirs) => {
+                        spawn_server_layered(&server.name, &server.manifest, lowerdirs, &self.logs)
+                    }
+                    None => spawn_server_chroot(
+                        &server.name,
+                        &server.manifest,
+                        &server.rootfs_dir,
+                        &self.logs,
+                    ),
+                };
+                server.restart_count = server.restart_count.saturating_add(1);
+                server.next_restart_at = Some(now + restart_backoff(server.restart_count));
+                match respawn {
+                    Ok(new_process) => {
+                        info!(server = %server.name, attempt = server.restart_count, "restarted server");
+                        server.process = Some(new_process);
+                    }
+                    Err(e) => {
+                        error!(server = %server.name, attempt = server.restart_count, error = %e, "failed to restart server; retrying after backoff");
+                    }
+                }
+                continue; // give the fresh (or still-absent) process a pass before probing
             }
 
             let check_path = server
@@ -358,6 +380,12 @@ impl ContainerSupervisor {
                 info!(server = %server.name, port = server.manifest.port, path = %check_path, "server is healthy");
             } else if !server.healthy && was_healthy {
                 warn!(server = %server.name, "server health check failed");
+            }
+
+            // A healthy server clears its restart backoff so a later crash restarts promptly.
+            if server.healthy {
+                server.restart_count = 0;
+                server.next_restart_at = None;
             }
         }
     }
@@ -379,6 +407,15 @@ impl ContainerSupervisor {
             .find(|s| s.name != DB_SERVER_NAME && s.name == route_name)
             .map(|s| s.manifest.port)
     }
+}
+
+/// Exponential restart backoff: the wait before the next (re)spawn after `attempt`
+/// consecutive attempts. The first respawn is immediate (the `next_restart_at` gate is
+/// `None`); thereafter 1s, 2s, 4s, … doubling, capped at 60s. Bounds a crash-looping
+/// server to one respawn per capped interval instead of one per health-check pass.
+fn restart_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6); // 2^0..=2^6 → 1..=64s, then capped
+    Duration::from_secs((1u64 << shift).min(60))
 }
 
 fn remount_rw(target: &str) {
@@ -911,6 +948,26 @@ async fn tcp_health_check(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_backoff_escalates_then_caps() {
+        // First respawn is gated by next_restart_at=None (immediate); this is the wait
+        // AFTER attempt N before attempt N+1: 1,2,4,8,16,32,64→capped 60, then steady 60.
+        assert_eq!(restart_backoff(1), Duration::from_secs(1));
+        assert_eq!(restart_backoff(2), Duration::from_secs(2));
+        assert_eq!(restart_backoff(3), Duration::from_secs(4));
+        assert_eq!(restart_backoff(4), Duration::from_secs(8));
+        assert_eq!(restart_backoff(5), Duration::from_secs(16));
+        assert_eq!(restart_backoff(6), Duration::from_secs(32));
+        assert_eq!(restart_backoff(7), Duration::from_secs(60)); // 64 capped to 60
+        assert_eq!(restart_backoff(100), Duration::from_secs(60));
+        // Monotonic non-decreasing, never zero (the gate, not this fn, gives the immediate
+        // first respawn) — so a crash loop can never hot-loop the supervisor.
+        for n in 1..200u32 {
+            assert!(restart_backoff(n) >= Duration::from_secs(1));
+            assert!(restart_backoff(n + 1) >= restart_backoff(n));
+        }
+    }
 
     #[test]
     fn apply_server_env_reserved_vars_win_over_manifest_env() {
