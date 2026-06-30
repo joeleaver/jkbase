@@ -113,6 +113,9 @@ pub enum Command {
     /// Connect a repo for push-to-deploy (git push / GitHub Actions)
     #[command(subcommand)]
     Repo(repo::RepoCommand),
+    /// Manage the project's managed database (RhypeDB)
+    #[command(subcommand)]
+    Db(DbCommand),
 }
 
 #[derive(Subcommand)]
@@ -172,6 +175,46 @@ pub enum AccessKeyCommand {
         api: String,
     },
     /// Revoke an access key
+    Rm {
+        /// Access key id to revoke
+        access_key_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DbCommand {
+    /// Manage managed-DB access keys (the reach-plane credential)
+    #[command(subcommand)]
+    Key(DbKeyCommand),
+}
+
+#[derive(Subcommand)]
+pub enum DbKeyCommand {
+    /// Create a new managed-DB access key (the secret is shown ONCE)
+    Create {
+        /// Optional label (e.g. ci, prod-app)
+        #[arg(long, default_value = "")]
+        label: String,
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// List managed-DB access keys (ids + labels; secrets are never shown)
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Revoke a managed-DB access key
+    #[command(alias = "revoke")]
     Rm {
         /// Access key id to revoke
         access_key_id: String,
@@ -325,6 +368,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::AccessKey(cmd) => run_access_key(cmd).await,
         Command::Domain(cmd) => run_domain(cmd).await,
         Command::Repo(cmd) => repo::run(cmd).await,
+        Command::Db(cmd) => run_db(cmd).await,
     }
 }
 
@@ -882,6 +926,111 @@ async fn run_access_key(cmd: AccessKeyCommand) -> anyhow::Result<()> {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 let err = body["error"].as_str().unwrap_or("unknown error");
                 anyhow::bail!("failed to revoke access key: {err}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_db(cmd: DbCommand) -> anyhow::Result<()> {
+    match cmd {
+        DbCommand::Key(cmd) => run_db_key(cmd).await,
+    }
+}
+
+async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {
+    match cmd {
+        DbKeyCommand::Create {
+            label,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+
+            let resp = client
+                .post(format!("{api}/projects/{project_id}/db-keys"))
+                .json(&serde_json::json!({ "label": label }))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await?;
+                let akid = body["access_key_id"].as_str().unwrap_or("");
+                let secret = body["secret"].as_str().unwrap_or("");
+                println!("Managed-DB access key created for project '{project_id}':");
+                println!("  Access Key ID: {akid}");
+                println!("  Secret:        {secret}");
+                println!("\n  Save the secret now — it is not shown again.");
+                println!("  It authenticates managed-DB connections via the reach-plane.");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to create db key: {err}");
+            }
+            Ok(())
+        }
+        DbKeyCommand::List { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+
+            let resp = client
+                .get(format!("{api}/projects/{project_id}/db-keys"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+
+            if resp.status().is_success() {
+                let keys: Vec<serde_json::Value> = resp.json().await?;
+                if keys.is_empty() {
+                    println!("No managed-DB keys for project '{project_id}'");
+                } else {
+                    for k in &keys {
+                        let akid = k["access_key_id"].as_str().unwrap_or("");
+                        let label = k["label"].as_str().unwrap_or("");
+                        if label.is_empty() {
+                            println!("  {akid}");
+                        } else {
+                            println!("  {akid}  ({label})");
+                        }
+                    }
+                }
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to list db keys: {err}");
+            }
+            Ok(())
+        }
+        DbKeyCommand::Rm {
+            access_key_id,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+
+            let resp = client
+                .delete(format!(
+                    "{api}/projects/{project_id}/db-keys/{access_key_id}"
+                ))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+
+            if resp.status().is_success() {
+                println!("Managed-DB key '{access_key_id}' revoked from project '{project_id}'");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to revoke db key: {err}");
             }
             Ok(())
         }
