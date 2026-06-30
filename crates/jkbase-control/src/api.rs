@@ -266,6 +266,14 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             "/projects/{id}/access-keys/{akid}",
             axum::routing::delete(revoke_access_key),
         )
+        .route(
+            "/projects/{id}/db-keys",
+            get(list_db_keys).post(issue_db_key),
+        )
+        .route(
+            "/projects/{id}/db-keys/{akid}",
+            axum::routing::delete(revoke_db_key),
+        )
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
@@ -2834,6 +2842,168 @@ async fn revoke_access_key(
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
                 error: format!("access key '{akid}' not found"),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Returned ONCE, at creation — the only time a managed-DB key's secret is exposed.
+/// The owner pastes `{access_key_id, secret}` into the reach-plane sidecar / client.
+#[derive(Serialize)]
+pub struct DbKeyCreatedResponse {
+    pub access_key_id: String,
+    pub secret: String,
+    pub label: String,
+    pub created_unix: u64,
+}
+
+/// Listing view of a managed-DB key — only the fingerprint exists at rest, so there is
+/// no secret to surface here even in principle.
+#[derive(Serialize)]
+pub struct DbKeyResponse {
+    pub access_key_id: String,
+    pub label: String,
+    pub created_unix: u64,
+}
+
+/// `POST /projects/{id}/db-keys` — mint an owner-held managed-DB reach-plane key.
+/// Owner-scoped. The 240-bit secret is shown once here and never retrievable after
+/// (the store persists only its sha256 fingerprint).
+async fn issue_db_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateAccessKeyRequest>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let label = req.label.trim();
+    if label.len() > 64 || label.bytes().any(|b| b.is_ascii_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "label must be <= 64 chars and contain no control characters".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match state.store.create_db_access_key(&id, &tenant.id, label) {
+        Ok((key, secret)) => {
+            info!(project = %id, access_key_id = %key.access_key_id, "managed-db access key issued");
+            (
+                StatusCode::CREATED,
+                Json(DbKeyCreatedResponse {
+                    access_key_id: key.access_key_id,
+                    secret,
+                    label: key.label,
+                    created_unix: key.created_unix,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/db-keys` — list the project's managed-DB keys (ids + labels,
+/// never secrets). Owner-scoped.
+async fn list_db_keys(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.list_db_access_keys(&id) {
+        Ok(keys) => {
+            let out: Vec<DbKeyResponse> = keys
+                .into_iter()
+                .map(|k| DbKeyResponse {
+                    access_key_id: k.access_key_id,
+                    label: k.label,
+                    created_unix: k.created_unix,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /projects/{id}/db-keys/{akid}` — revoke one managed-DB key. Owner-scoped and
+/// key-scoped (the store only removes it if it belongs to this project). NB: this
+/// invalidates new connections; tearing down LIVE reach-plane relays on revoke is the
+/// edge's job ([R5]) and lands with the serve-side ingress.
+async fn revoke_db_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path((id, akid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.delete_db_access_key(&id, &akid) {
+        Ok(true) => {
+            info!(project = %id, access_key_id = %akid, "managed-db access key revoked");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("db key '{akid}' not found"),
             }),
         )
             .into_response(),
