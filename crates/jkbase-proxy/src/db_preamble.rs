@@ -27,6 +27,12 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+/// The ALPN protocol a reach client negotiates to select the DB relay branch on the
+/// shared `:443` listener (D3). The edge advertises it alongside `http/1.1`; a
+/// connection that negotiates it is demuxed to the DB path (after the SNI + auth
+/// checks), everything else stays HTTP.
+pub const DB_ALPN: &[u8] = b"jkbase-db";
+
 /// Protocol marker. Distinct from the S3/DB *akid* prefixes — this is the wire magic.
 pub const PREAMBLE_MAGIC: &[u8; 4] = b"JKDB";
 /// Current preamble version. Bump only on a wire-incompatible change.

@@ -63,23 +63,51 @@ pub struct TlsConfig {
 struct Resolver {
     platform_domain: String,
     wildcard: RwLock<Option<Arc<CertifiedKey>>>,
+    /// The `*.db.{domain}` wildcard for the managed-DB reach plane. A SEPARATE slot
+    /// because `*.{domain}` (one label) can't validate a two-label `<proj>.db.{domain}`
+    /// host — the resolver serves this more-specific cert for `.db.{domain}` SNIs
+    /// (longest-zone-first). `None` until provisioned, so DB ingress fails closed.
+    db_wildcard: RwLock<Option<Arc<CertifiedKey>>>,
     hosts: RwLock<HashMap<String, Arc<CertifiedKey>>>,
 }
 
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let wildcard = || self.wildcard.read().unwrap().clone();
         let Some(sni) = hello.server_name() else {
-            return wildcard(); // SNI-less clients get the wildcard
+            // SNI-less clients get the apex wildcard. The DB demux additionally requires
+            // a present `.db.{domain}` SNI + the `jkbase-db` ALPN and drops anything
+            // else before it can wake a VM ([R6]/[R7]), so serving the apex here is safe.
+            return self.wildcard.read().unwrap().clone();
         };
         if let Some(ck) = self.hosts.read().unwrap().get(sni).cloned() {
             return Some(ck);
         }
-        if sni == self.platform_domain || sni.ends_with(&format!(".{}", self.platform_domain)) {
-            return wildcard();
+        match classify_wildcard(sni, &self.platform_domain) {
+            WildcardKind::Db => self.db_wildcard.read().unwrap().clone(),
+            WildcardKind::Apex => self.wildcard.read().unwrap().clone(),
+            // Known-but-not-yet-issued custom domain (or unknown SNI): fail cleanly.
+            WildcardKind::None => None,
         }
-        // Known-but-not-yet-issued custom domain (or unknown SNI): fail cleanly.
-        None
+    }
+}
+
+/// Which platform wildcard (if any) covers `sni`. The `.db.{domain}` zone is checked
+/// FIRST (longest-zone-first): `<proj>.db.{domain}` ends with both `.db.{domain}` and
+/// `.{domain}`, but only the dedicated `*.db.{domain}` cert validates its two labels.
+#[derive(Debug, PartialEq, Eq)]
+enum WildcardKind {
+    Apex,
+    Db,
+    None,
+}
+
+fn classify_wildcard(sni: &str, platform_domain: &str) -> WildcardKind {
+    if sni.ends_with(&format!(".db.{platform_domain}")) {
+        WildcardKind::Db
+    } else if sni == platform_domain || sni.ends_with(&format!(".{platform_domain}")) {
+        WildcardKind::Apex
+    } else {
+        WildcardKind::None
     }
 }
 
@@ -105,6 +133,7 @@ impl CertManager {
         let resolver = Arc::new(Resolver {
             platform_domain: cfg.domain.clone(),
             wildcard: RwLock::new(None),
+            db_wildcard: RwLock::new(None),
             hosts: RwLock::new(HashMap::new()),
         });
 
@@ -118,16 +147,24 @@ impl CertManager {
         });
 
         mgr.ensure_wildcard().await?;
+        // Best-effort: the platform (web hosting) must boot even if the DB-ingress cert
+        // can't issue; reconcile retries. Failure leaves the db_wildcard slot None.
+        mgr.ensure_db_wildcard().await;
         mgr.load_cached_hosts();
         Ok(mgr)
     }
 
     pub fn server_config(&self) -> Arc<ServerConfig> {
-        Arc::new(
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(self.resolver.clone()),
-        )
+        let mut cfg = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(self.resolver.clone());
+        // Advertise the managed-DB reach-plane ALPN alongside `http/1.1` (the edge
+        // speaks http1). The DB ingress demuxes on a negotiated `jkbase-db`; `http/1.1`
+        // MUST be listed too — otherwise a normal client that offers ALPN with no
+        // overlap would get a fatal `no_application_protocol` alert. Clients that send
+        // no ALPN at all negotiate nothing and take the HTTP path exactly as before.
+        cfg.alpn_protocols = vec![crate::db_preamble::DB_ALPN.to_vec(), b"http/1.1".to_vec()];
+        Arc::new(cfg)
     }
 
     /// HTTP-01 challenge body for `token`, if one is currently outstanding.
@@ -149,7 +186,17 @@ impl CertManager {
         let fresh = have_cached && !needs_renewal(&cert_path);
         if !fresh {
             info!("provisioning wildcard certificate via ACME DNS-01");
-            if let Err(e) = self.provision_wildcard().await {
+            // Apex order: `{domain}` + `*.{domain}` both validate at the SAME challenge
+            // name `_acme-challenge.{domain}`, so the order shares one challenge.
+            let identifiers = [
+                Identifier::Dns(self.cfg.domain.clone()),
+                Identifier::Dns(format!("*.{}", self.cfg.domain)),
+            ];
+            let challenge = format!("_acme-challenge.{}", self.cfg.domain);
+            if let Err(e) = self
+                .provision_cert(&identifiers, &challenge, &cert_path, &key_path)
+                .await
+            {
                 // Don't take the whole server down over a transient ACME/DNS error
                 // if we already have a usable (if aging) cert; reconcile will retry.
                 if have_cached {
@@ -163,6 +210,39 @@ impl CertManager {
         let ck = read_certified_key(&cert_path, &key_path)?;
         *self.resolver.wildcard.write().unwrap() = Some(Arc::new(ck));
         Ok(())
+    }
+
+    /// Provision/renew the `*.db.{domain}` wildcard for the managed-DB reach plane and
+    /// load it into the resolver's `db_wildcard` slot. BEST-EFFORT: unlike the apex
+    /// wildcard a failure must NOT down the platform — the slot stays `None` (a
+    /// `.db.{domain}` handshake then fails closed) and reconcile retries.
+    async fn ensure_db_wildcard(&self) {
+        let cert_path = self.cfg.cert_dir.join("db-fullchain.pem");
+        let key_path = self.cfg.cert_dir.join("db-privkey.pem");
+        let have_cached = cert_path.exists() && key_path.exists();
+        let fresh = have_cached && !needs_renewal(&cert_path);
+        if !fresh {
+            info!("provisioning *.db wildcard certificate via ACME DNS-01");
+            // Single-SAN order — its one authorization validates at
+            // `_acme-challenge.db.{domain}` (NOT the apex name).
+            let identifiers = [Identifier::Dns(format!("*.db.{}", self.cfg.domain))];
+            let challenge = format!("_acme-challenge.db.{}", self.cfg.domain);
+            if let Err(e) = self
+                .provision_cert(&identifiers, &challenge, &cert_path, &key_path)
+                .await
+            {
+                if have_cached {
+                    warn!(error = %e, "db wildcard provisioning failed; using existing cert, will retry");
+                } else {
+                    warn!(error = %e, "db wildcard provisioning failed; managed-DB ingress unavailable until it succeeds");
+                    return;
+                }
+            }
+        }
+        match read_certified_key(&cert_path, &key_path) {
+            Ok(ck) => *self.resolver.db_wildcard.write().unwrap() = Some(Arc::new(ck)),
+            Err(e) => warn!(error = %e, "failed to load db wildcard cert"),
+        }
     }
 
     fn load_cached_hosts(&self) {
@@ -322,9 +402,23 @@ impl CertManager {
         certified_key_from_pem(cert_chain.as_bytes(), key_pem.as_bytes())
     }
 
-    async fn provision_wildcard(&self) -> Result<()> {
+    async fn provision_cert(
+        &self,
+        identifiers: &[Identifier],
+        challenge_name: &str,
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Result<()> {
         let mut record_handles: Vec<String> = Vec::new();
-        let outcome = self.issue_wildcard(&mut record_handles).await;
+        let outcome = self
+            .issue_cert_order(
+                identifiers,
+                challenge_name,
+                cert_path,
+                key_path,
+                &mut record_handles,
+            )
+            .await;
         // Always remove the published challenge records — on success AND failure — so a failed
         // attempt doesn't leak `_acme-challenge` TXTs (which the RFC2136 `append` path would
         // otherwise accumulate at the same name across retries). Best-effort.
@@ -334,17 +428,23 @@ impl CertManager {
         outcome
     }
 
-    /// The wildcard ACME order flow. Each published DNS-01 challenge handle is pushed into
-    /// `record_handles` so [`provision_wildcard`](Self::provision_wildcard) can always clean up.
-    async fn issue_wildcard(&self, record_handles: &mut Vec<String>) -> Result<()> {
-        let wildcard = format!("*.{}", self.cfg.domain);
-        let identifiers = vec![
-            Identifier::Dns(self.cfg.domain.clone()),
-            Identifier::Dns(wildcard),
-        ];
+    /// One ACME DNS-01 order flow. ALL of `identifiers` are expected to share the single
+    /// DNS-01 `challenge_name` — true for the apex order (`{domain}` + `*.{domain}` both
+    /// validate at `_acme-challenge.{domain}`) and trivially for the single-SAN db order.
+    /// Keeping apex and db as SEPARATE orders is exactly what lets each hard-code its own
+    /// challenge name instead of deriving it per authorization. Each published challenge
+    /// handle is pushed into `record_handles` so [`Self::provision_cert`] always cleans up.
+    async fn issue_cert_order(
+        &self,
+        identifiers: &[Identifier],
+        challenge_name: &str,
+        cert_path: &Path,
+        key_path: &Path,
+        record_handles: &mut Vec<String>,
+    ) -> Result<()> {
         let mut order = self
             .account
-            .new_order(&NewOrder::new(&identifiers))
+            .new_order(&NewOrder::new(identifiers))
             .await
             .context("failed to create ACME order")?;
 
@@ -359,7 +459,7 @@ impl CertManager {
                 let record_id = self
                     .cfg
                     .dns_provider
-                    .create_txt(&format!("_acme-challenge.{}", self.cfg.domain), &dns_value)
+                    .create_txt(challenge_name, &dns_value)
                     .await?;
                 record_handles.push(record_id);
                 info!("waiting for DNS propagation...");
@@ -395,13 +495,9 @@ impl CertManager {
             .await
             .context("failed to get certificate")?;
 
-        tokio::fs::write(self.cfg.cert_dir.join("fullchain.pem"), &cert_chain).await?;
-        tokio::fs::write(
-            self.cfg.cert_dir.join("privkey.pem"),
-            key_pair.serialize_pem(),
-        )
-        .await?;
-        info!("wildcard certificate provisioned");
+        tokio::fs::write(cert_path, &cert_chain).await?;
+        tokio::fs::write(key_path, key_pair.serialize_pem()).await?;
+        info!(cert = %cert_path.display(), "certificate provisioned");
         Ok(())
     }
 
@@ -419,6 +515,13 @@ impl CertManager {
                     if let Err(e) = mgr.ensure_wildcard().await {
                         warn!(error = %e, "wildcard renewal failed");
                     }
+                }
+
+                // The `*.db` wildcard: renew near expiry OR retry if a prior provision
+                // (e.g. at startup) never produced a cert (best-effort, so it can be absent).
+                let db_cert_path = mgr.cfg.cert_dir.join("db-fullchain.pem");
+                if !db_cert_path.exists() || needs_renewal(&db_cert_path) {
+                    mgr.ensure_db_wildcard().await;
                 }
 
                 let custom_hosts: Vec<String> = {
@@ -757,6 +860,29 @@ impl DnsProvider for Rfc2136Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_wildcard_prefers_the_db_zone() {
+        let d = "jkbase.app";
+        // `<proj>.db.{domain}` → the dedicated db wildcard (longest-zone-first), even
+        // though it also ends with `.{domain}`.
+        assert_eq!(
+            classify_wildcard("myapp.db.jkbase.app", d),
+            WildcardKind::Db
+        );
+        // Ordinary project + infra subdomains → apex wildcard.
+        assert_eq!(classify_wildcard("myapp.jkbase.app", d), WildcardKind::Apex);
+        assert_eq!(
+            classify_wildcard("storage.jkbase.app", d),
+            WildcardKind::Apex
+        );
+        assert_eq!(classify_wildcard("jkbase.app", d), WildcardKind::Apex);
+        // A bare `db.jkbase.app` (no label before `.db`) is NOT a db-zone host — the
+        // apex wildcard covers it; we never serve it anyway.
+        assert_eq!(classify_wildcard("db.jkbase.app", d), WildcardKind::Apex);
+        // Off-platform SNI → no platform cert.
+        assert_eq!(classify_wildcard("evil.com", d), WildcardKind::None);
+    }
 
     #[test]
     fn rfc2136_config_validation() {
