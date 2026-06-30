@@ -43,6 +43,13 @@ const ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
 const DB_ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("db_access_keys");
 const DB_ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
     TableDefinition::new("db_access_keys_by_project");
+/// Per-project managed-DB reach-plane **splice secret** ([R3]): the host→agent shared
+/// secret the edge presents on the `/_jkbase/db` upgrade and the in-VM agent verifies
+/// before splicing to the loopback DB. Generated host-side at deploy and written into
+/// the per-VM metadata image (which the host never reads back — it never mounts the
+/// guest fs), so the edge needs an independent copy here to present it. `project_id` →
+/// secret; overwritten each deploy (like the own-bucket binding), purged on teardown.
+const DB_SPLICE: TableDefinition<&str, &[u8]> = TableDefinition::new("db_splice_secret");
 /// Cluster fleet membership (HA), one row per `jkbase-server` host instance, keyed
 /// by `host_id`. The leader's placement + dead-host detection (P3) read this; at HA
 /// P0 it is schema only — CRUD + tests, no loop touches it yet.
@@ -552,6 +559,7 @@ impl Store {
         let _ = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(DB_ACCESS_KEYS)?;
         let _ = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
+        let _ = txn.open_table(DB_SPLICE)?;
         let _ = txn.open_table(HOSTS)?;
         txn.commit()?;
 
@@ -1813,6 +1821,44 @@ impl Store {
         Ok(removed)
     }
 
+    // -- Managed-DB reach-plane splice secret ([R3]) --
+
+    /// Set (overwrite) a project's host→agent splice secret. Called at deploy with the
+    /// SAME value baked into the per-VM metadata image, so edge and agent agree.
+    pub fn set_db_splice_secret(&self, project_id: &str, secret: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DB_SPLICE)?;
+            table.insert(project_id, secret.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The project's current splice secret, or `None` if it has no managed DB / none set.
+    /// The edge presents this on the `/_jkbase/db` upgrade; a `None` (or a mismatch with
+    /// the agent's baked copy) makes the splice fail closed — never open.
+    pub fn get_db_splice_secret(&self, project_id: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DB_SPLICE)?;
+        match table.get(project_id)? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(v.value()).into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a project's splice secret (teardown), so a recreated same-slug project can't
+    /// inherit it.
+    pub fn delete_db_splice_secret(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DB_SPLICE)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     // -- Connected-repo build triggers (build · D) --
 
     /// Load a project's repo-trigger credentials, or `None` if it has none yet.
@@ -2065,6 +2111,28 @@ mod tests {
         // A different project is unaffected by another's full cap.
         assert!(store.create_db_access_key("proj-b", "t2", "ok").is_ok());
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_splice_secret_set_get_overwrite_delete() {
+        let (store, path) = tmp_db();
+        assert_eq!(store.get_db_splice_secret("p").unwrap(), None);
+        store.set_db_splice_secret("p", "s3cr3t-1").unwrap();
+        assert_eq!(
+            store.get_db_splice_secret("p").unwrap().as_deref(),
+            Some("s3cr3t-1")
+        );
+        // Overwrite (a fresh secret each deploy).
+        store.set_db_splice_secret("p", "s3cr3t-2").unwrap();
+        assert_eq!(
+            store.get_db_splice_secret("p").unwrap().as_deref(),
+            Some("s3cr3t-2")
+        );
+        // Scoped to the project.
+        assert_eq!(store.get_db_splice_secret("q").unwrap(), None);
+        store.delete_db_splice_secret("p").unwrap();
+        assert_eq!(store.get_db_splice_secret("p").unwrap(), None);
         let _ = std::fs::remove_file(path);
     }
 
