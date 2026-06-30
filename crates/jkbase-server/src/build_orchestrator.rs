@@ -3566,6 +3566,7 @@ esac
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -4809,6 +4810,7 @@ console.log("listening on " + port);
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -4965,6 +4967,7 @@ console.log("listening on " + port);
             &plan,
             &Default::default(),
             &Default::default(),
+            None,
             None,
             &meta_img,
         )
@@ -5206,6 +5209,7 @@ console.log("listening on " + port);
             &plan,
             &Default::default(),
             &platform,
+            None,
             None,
             &meta_img,
         )
@@ -5601,6 +5605,7 @@ console.log("listening on " + port);
             &plan,
             &Default::default(),
             &Default::default(),
+            None,
             None,
             &meta_img,
         )
@@ -6308,6 +6313,7 @@ console.log("listening on " + port);
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("metadata image");
@@ -6379,7 +6385,8 @@ console.log("listening on " + port);
 
         // (1) cgroup ESCAPE: the FC was migrated into jkbase-runtime/<id> (a sibling of
         //     jkbase.service), the precondition for surviving KillMode=mixed.
-        let procs = std::fs::read_to_string(parent.join(id).join("cgroup.procs")).unwrap_or_default();
+        let procs =
+            std::fs::read_to_string(parent.join(id).join("cgroup.procs")).unwrap_or_default();
         assert!(
             procs.lines().any(|l| l.trim() == fc_pid.to_string()),
             "FC pid {fc_pid} must be in {}/{id}/cgroup.procs (cgroup escape) — got {procs:?}",

@@ -106,6 +106,19 @@ pub fn generate_db_secret() -> String {
     )
 }
 
+/// Mint a managed-DB reach-plane **splice secret** (256-bit) — the per-deploy host→agent
+/// shared secret the edge presents on `/_jkbase/db` and the in-VM agent verifies before
+/// splicing ([R3]). Distinct `jkbs_` prefix so a leaked value is self-identifying. Stored
+/// host-side (control db + the per-VM metadata image), never tenant-facing.
+pub fn generate_splice_secret() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "jkbs_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 /// SHA-256 (hex) fingerprint of a high-entropy token, used to store and look up
 /// the per-project git-push token WITHOUT keeping the plaintext. A 256-bit random
 /// token makes SHA-256 preimage-resistant (unlike a low-entropy password, which

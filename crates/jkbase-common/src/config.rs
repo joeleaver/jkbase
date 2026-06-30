@@ -171,6 +171,24 @@ impl PlatformEgress {
     pub const FILE: &'static str = "_platform.json";
 }
 
+/// Host-authored managed-DB reach-plane facts, baked into the per-VM metadata image
+/// (`_db_reach.json`) for projects that declare a `[database]`. Written LAST into the
+/// image (like [`PlatformEgress`]) so a tenant `jkbase.toml`/source file of the same
+/// name can't forge it — it is genuinely host-authored and tenant-unforgeable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbReachFacts {
+    /// The per-deploy host→agent splice secret. The edge presents it on the
+    /// `/_jkbase/db` upgrade and the agent verifies it before splicing to the loopback
+    /// DB ([R3]) — defense-in-depth so one isolation slip isn't a full DB compromise.
+    #[serde(default)]
+    pub splice_secret: String,
+}
+
+impl DbReachFacts {
+    /// Metadata-image filename. `_`-prefixed, so the agent's static server never serves it.
+    pub const FILE: &'static str = "_db_reach.json";
+}
+
 fn norm_host(h: &str) -> String {
     h.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -1238,11 +1256,11 @@ mod tests {
             ("4GiB", 4096_u64),
             ("512MiB", 512),
             ("1mib", 1),
-            ("1GB", 954),          // 1e9 bytes → ceil(/MiB) = 954
-            ("2G", 1908),          // bare G = decimal
-            ("1048576", 1),        // bare number = bytes = exactly 1 MiB
-            ("1048577", 2),        // one byte over → rounds up
-            ("  8 GiB  ", 8192),   // surrounding + inner whitespace tolerated
+            ("1GB", 954),        // 1e9 bytes → ceil(/MiB) = 954
+            ("2G", 1908),        // bare G = decimal
+            ("1048576", 1),      // bare number = bytes = exactly 1 MiB
+            ("1048577", 2),      // one byte over → rounds up
+            ("  8 GiB  ", 8192), // surrounding + inner whitespace tolerated
         ] {
             let db = DatabaseConfig {
                 engine: None,
@@ -1265,10 +1283,12 @@ mod tests {
         // Sidecar carries an explicit null so the host reads Option::None.
         let bare_size: ProjectConfig =
             toml::from_str("[database]\nschema = \"s.rhype\"\n").unwrap();
-        assert!(bare_size
-            .database_json()
-            .unwrap()
-            .contains("\"size_mib\": null"));
+        assert!(
+            bare_size
+                .database_json()
+                .unwrap()
+                .contains("\"size_mib\": null")
+        );
 
         // Malformed sizes fail closed (a typo must abort the deploy). An empty/
         // whitespace `size` is treated as unset (Ok(None)), like an omitted field.

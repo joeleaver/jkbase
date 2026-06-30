@@ -15,7 +15,7 @@
 //! mount, no root — `mkfs.ext4 -d`, threat-model P0-3).
 
 use anyhow::{Context, Result, ensure};
-use jkbase_common::config::PlatformEgress;
+use jkbase_common::config::{DbReachFacts, PlatformEgress};
 use jkbase_common::layers::{RuntimeLayers, ServerLayers, VerityParams};
 
 /// The platform-managed own-bucket binding credential written into each function sidecar's
@@ -448,6 +448,7 @@ pub fn build_metadata_image(
     secrets: &BTreeMap<String, String>,
     platform: &PlatformEgress,
     binding: Option<&StorageBinding>,
+    db_reach: Option<&DbReachFacts>,
     out: &Path,
 ) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
@@ -515,6 +516,16 @@ pub fn build_metadata_image(
         stage.join(PlatformEgress::FILE),
         serde_json::to_vec_pretty(platform)?,
     )?;
+
+    // Host-authored reach-plane facts (`_db_reach.json`): the per-deploy splice secret,
+    // present only for a project with a managed DB. Written LAST (same reasoning as
+    // `_platform.json`) so it's tenant-unforgeable, and into the per-VM image only.
+    if let Some(reach) = db_reach {
+        std::fs::write(
+            stage.join(DbReachFacts::FILE),
+            serde_json::to_vec_pretty(reach)?,
+        )?;
+    }
 
     build_ro_ext4_from_dir(&stage, &tmp_img, 8)
         .with_context(|| format!("mkfs metadata image for {}", out.display()))?;

@@ -1799,7 +1799,11 @@ fn upgrade_in_progress(data_dir: &Path) -> bool {
     let Ok(body) = std::fs::read_to_string(upgrade_flag_path(data_dir)) else {
         return false;
     };
-    let Some(ts) = body.lines().next().and_then(|l| l.trim().parse::<u64>().ok()) else {
+    let Some(ts) = body
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+    else {
         return false;
     };
     let now = std::time::SystemTime::now()
@@ -2654,6 +2658,20 @@ async fn handle_deploy(
             access_key_id: k.access_key_id,
             secret_key: k.secret_key,
         });
+    // Mint (rotate) the per-deploy reach-plane splice secret for a project with a managed
+    // DB and persist it — the edge reads it from the control store to present on the
+    // `/_jkbase/db` upgrade, and the SAME value is baked into the per-VM image below so
+    // the in-VM agent can verify it ([R3]). Best-effort: a mint failure just means the
+    // reach plane can't splice until the next deploy (fail-closed), never a failed deploy.
+    let db_reach: Option<jkbase_common::config::DbReachFacts> =
+        if check_project_has_database(&data_dir, project_id) {
+            plat.store
+                .mint_db_splice_secret(project_id)
+                .ok()
+                .map(|splice_secret| jkbase_common::config::DbReachFacts { splice_secret })
+        } else {
+            None
+        };
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -2679,6 +2697,7 @@ async fn handle_deploy(
                 &secrets,
                 &platform_egress,
                 storage_binding.as_ref(),
+                db_reach.as_ref(),
                 &out,
             )?;
             Ok(plan)
@@ -4301,7 +4320,10 @@ async fn agent_protocol_version(ip: &str) -> Option<u32> {
 async fn reap_runtime_fc(fc_pid: u32, expected_sock: &Path) {
     let sock_bytes = expected_sock.to_string_lossy().into_owned().into_bytes();
     let still_ours = std::fs::read(format!("/proc/{fc_pid}/cmdline"))
-        .map(|raw| raw.split(|b| *b == 0).any(|arg| arg == sock_bytes.as_slice()))
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .any(|arg| arg == sock_bytes.as_slice())
+        })
         .unwrap_or(false);
     if !still_ours {
         warn!(%fc_pid, sock = %expected_sock.display(),
@@ -4392,10 +4414,7 @@ async fn adopt_or_reap_runtime_vms(
             AdoptOutcome::SkippedPeerOwned => skipped += 1,
         }
     }
-    info!(
-        adopted,
-        reaped, skipped, "VM re-adoption complete"
-    );
+    info!(adopted, reaped, skipped, "VM re-adoption complete");
 }
 
 /// Evaluate + (re-)adopt or reap a single surviving runtime Firecracker `fc_pid` for `id`.
@@ -4444,7 +4463,16 @@ async fn adopt_one_survivor(
     } else {
         // All checks passed — proceed to adopt below.
         return finish_adoption(
-            platform, routing, domain_map, runtime_dir, data_disk, lease, host_id, id, fc_pid, rec,
+            platform,
+            routing,
+            domain_map,
+            runtime_dir,
+            data_disk,
+            lease,
+            host_id,
+            id,
+            fc_pid,
+            rec,
         )
         .await;
     }
@@ -4546,8 +4574,7 @@ async fn finish_adoption(
             plat.disk_tokens.insert(id.to_string(), token.clone());
         }
         plat.vms.insert(id.to_string(), vm);
-        plat.vm_states
-            .insert(id.to_string(), VmLifecycle::Running);
+        plat.vm_states.insert(id.to_string(), VmLifecycle::Running);
         plat.vm_rootfs_hashes
             .insert(id.to_string(), rec.base_rootfs_hash.clone());
         plat.wake_failures.remove(id);

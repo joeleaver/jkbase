@@ -1823,6 +1823,15 @@ impl Store {
 
     // -- Managed-DB reach-plane splice secret ([R3]) --
 
+    /// Mint (rotate) a project's splice secret: generate a fresh value, persist it, and
+    /// return it so the SAME value can be baked into the per-VM metadata image in the
+    /// same deploy. Mirrors [`Self::mint_binding_key`].
+    pub fn mint_db_splice_secret(&self, project_id: &str) -> Result<String> {
+        let secret = auth::generate_splice_secret();
+        self.set_db_splice_secret(project_id, &secret)?;
+        Ok(secret)
+    }
+
     /// Set (overwrite) a project's host→agent splice secret. Called at deploy with the
     /// SAME value baked into the per-VM metadata image, so edge and agent agree.
     pub fn set_db_splice_secret(&self, project_id: &str, secret: &str) -> Result<()> {
