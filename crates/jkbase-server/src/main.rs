@@ -1946,6 +1946,7 @@ async fn shutdown_signal(
             platform.clone(),
             routing.clone(),
             shipper.clone(),
+            None,
         )
         .await
         {
@@ -2966,11 +2967,27 @@ async fn hibernate_project(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
+    // Idle-path callers pass the DB relay registry so we can re-check for a LIVE managed-DB
+    // relay UNDER the platform lock (§5); shutdown/quota callers pass `None` — those paths
+    // hibernate regardless (relays are force-closed on drain; over-quota must win).
+    db_registry: Option<&Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
 
     match plat.vm_states.get(project_id) {
         Some(VmLifecycle::Running) => {
+            // §5: re-check under the platform lock that no live DB relay appeared since the
+            // idle loop's UNLOCKED conn_count read (db_ingress reserves the relay before its
+            // wake, so a racing connection is already counted here) — otherwise a byte-silent
+            // realtime subscription would be hibernated out from under itself. A relay that
+            // slips in during this function's own critical section instead fails its bounded
+            // connect and the client retries, waking the VM cleanly.
+            if db_registry
+                .map(|r| r.conn_count(project_id) > 0)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
             plat.vm_states
                 .insert(project_id.to_string(), VmLifecycle::Hibernating);
         }
@@ -3740,6 +3757,7 @@ async fn idle_detection_loop(
                     platform.clone(),
                     routing.clone(),
                     shipper.clone(),
+                    db_registry.as_ref(),
                 )
                 .await
                 {
@@ -5031,9 +5049,14 @@ async fn metering_loop(
                 let is_running =
                     { platform.lock().await.vm_states.get(id) == Some(&VmLifecycle::Running) };
                 if is_running
-                    && let Err(e) =
-                        hibernate_project(id, platform.clone(), routing.clone(), shipper.clone())
-                            .await
+                    && let Err(e) = hibernate_project(
+                        id,
+                        platform.clone(),
+                        routing.clone(),
+                        shipper.clone(),
+                        None,
+                    )
+                    .await
                 {
                     tracing::error!(project = %id, error = %e, "failed to hibernate over-quota project");
                 }
