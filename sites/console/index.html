@@ -1772,6 +1772,20 @@ body {
     objError: null,             // inline object-browser error
     uploadBusy: false,
     deleteObjectConfirm: null,  // object key awaiting delete confirm
+    // database / managed-DB reach-plane keys (CONTROL API: /projects/{id}/db-keys)
+    dbKeys: [],
+    dbKeysLoading: false,
+    showCreateDbKey: false,
+    dbKeyBusy: false,
+    revealedDbKey: null,        // { access_key_id, secret, label, created_unix } shown ONCE after create
+    revokeDbKeyConfirm: null,   // access_key_id awaiting revoke confirm
+    // database / backups (CONTROL API: /projects/{id}/db/backups + /db/restore)
+    dbBackups: [],
+    dbBackupsLoading: false,
+    dbBackupBusy: false,        // a create-backup or restore in flight
+    restoreConfirm: null,       // backup_id awaiting restore confirm
+    dbError: null,              // inline database-panel error (mirror of objError)
+    dbNote: null,               // inline database-panel success note (tab-local, like dbError)
   };
 
   // --- API helpers ---
@@ -1972,6 +1986,13 @@ body {
     state.showCreateBucket = false;
     state.deleteBucketConfirm = null;
     state.deleteObjectConfirm = null;
+    // Reset the Database tab sub-state for the newly-opened project.
+    state.showCreateDbKey = false;
+    state.revealedDbKey = null;
+    state.revokeDbKeyConfirm = null;
+    state.restoreConfirm = null;
+    state.dbError = null;
+    state.dbNote = null;
     render();
     // Fetch all data in parallel
     loadStatus(project.id);
@@ -1980,6 +2001,8 @@ body {
     loadDeployments(project.id);
     loadAccessKeys(project.id);
     loadBuckets(project.id);
+    loadDbKeys(project.id);
+    loadDbBackups(project.id);
     loadUsage(project.id);
     loadLogs(project.id);
   }
@@ -1994,6 +2017,13 @@ body {
     state.revealedAccessKey = null;
     state.showCreateAccessKey = false;
     state.revokeKeyConfirm = null;
+    // The Database tab's one-time key reveal + inline confirms are tab-local too.
+    state.revealedDbKey = null;
+    state.showCreateDbKey = false;
+    state.revokeDbKeyConfirm = null;
+    state.restoreConfirm = null;
+    state.dbError = null;
+    state.dbNote = null;
     // Reset the object browser to a fresh bucket list on every tab change so a stale
     // folder view (or a since-deleted bucket) can't linger when returning to Storage.
     state.showCreateBucket = false;
@@ -2009,6 +2039,11 @@ body {
     // Re-fetch the bucket list when entering Storage so it reflects current state.
     if (tab === "storage" && state.currentProject) {
       loadBuckets(state.currentProject.id);
+    }
+    // Re-fetch DB keys + backups when entering the Database tab.
+    if (tab === "database" && state.currentProject) {
+      loadDbKeys(state.currentProject.id);
+      loadDbBackups(state.currentProject.id);
     }
   }
 
@@ -2124,6 +2159,164 @@ body {
       state.error = e.message;
       render();
     });
+  }
+
+  // --- Managed-DB reach-plane keys + backups (Database tab) ---
+  //
+  // All of these hit the CONTROL API (api.<domain>) via api() — NOT the object store.
+  // Feedback is tab-local: errors in `dbError`, success notes in `dbNote` (never the global
+  // banner), so nothing bleeds onto other tabs or lingers past its context. The two are
+  // mutually exclusive — every mutator clears both up front, then sets at most one.
+
+  function loadDbKeys(projectId) {
+    state.dbKeysLoading = true;
+    render();
+    api("GET", "/projects/" + projectId + "/db-keys").then(function(keys) {
+      state.dbKeys = Array.isArray(keys) ? keys : [];
+      state.dbKeysLoading = false;
+      render();
+    }).catch(function(e) {
+      state.dbKeysLoading = false;
+      state.dbError = e.message;
+      state.dbNote = null;
+      render();
+    });
+  }
+
+  function createDbKey(projectId, label) {
+    // Mirror the server rule (issue_db_key): label <= 64 chars, no control characters —
+    // validated here for a fast local error instead of a round-trip 400.
+    if (label && (label.length > 64 || /[\x00-\x1f\x7f]/.test(label))) {
+      state.dbError = "label must be <= 64 chars and contain no control characters";
+      state.dbNote = null;
+      render();
+      return;
+    }
+    state.dbError = null;
+    state.dbNote = null;
+    state.dbKeyBusy = true;
+    render();
+    api("POST", "/projects/" + projectId + "/db-keys", { label: label }).then(function(key) {
+      // The secret is returned exactly once; hold it in state to reveal it.
+      state.revealedDbKey = key;
+      state.showCreateDbKey = false;
+      state.dbKeyBusy = false;
+      render();
+      loadDbKeys(projectId);
+    }).catch(function(e) {
+      state.dbKeyBusy = false;
+      state.dbError = e.message;
+      state.dbNote = null;
+      render();
+    });
+  }
+
+  function revokeDbKey(projectId, accessKeyId) {
+    state.dbError = null;
+    state.dbNote = null;
+    state.revokeDbKeyConfirm = null;
+    state.dbKeyBusy = true;
+    render();
+    api("DELETE", "/projects/" + projectId + "/db-keys/" + encodeURIComponent(accessKeyId)).then(function() {
+      state.dbKeyBusy = false;
+      // If the revealed key was the one just revoked, stop showing its secret.
+      if (state.revealedDbKey && state.revealedDbKey.access_key_id === accessKeyId) {
+        state.revealedDbKey = null;
+      }
+      render();
+      loadDbKeys(projectId);
+    }).catch(function(e) {
+      state.dbKeyBusy = false;
+      state.dbError = e.message;
+      state.dbNote = null;
+      render();
+    });
+  }
+
+  // `silent` skips the leading re-render (used by the poll loop so a background refresh
+  // never rebuilds the DOM out from under a focused input).
+  function loadDbBackups(projectId, silent) {
+    state.dbBackupsLoading = true;
+    if (!silent) render();
+    api("GET", "/projects/" + projectId + "/db/backups").then(function(backups) {
+      state.dbBackups = Array.isArray(backups) ? backups : [];
+      state.dbBackupsLoading = false;
+      render();
+    }).catch(function(e) {
+      state.dbBackupsLoading = false;
+      state.dbError = e.message;
+      state.dbNote = null;
+      render();
+    });
+  }
+
+  function createDbBackup(projectId) {
+    state.dbError = null;
+    state.dbNote = null;
+    state.dbBackupBusy = true;
+    render();
+    // Fire-and-forget: the POST returns a `pending` row immediately and the backup runs
+    // server-side. Reload the list; the poll loop then advances it to complete/failed.
+    api("POST", "/projects/" + projectId + "/db/backups").then(function() {
+      state.dbBackupBusy = false;
+      render();
+      loadDbBackups(projectId);
+    }).catch(function(e) {
+      state.dbBackupBusy = false;
+      state.dbError = e.message;
+      state.dbNote = null;
+      render();
+    });
+  }
+
+  function restoreDbBackup(projectId, backupId) {
+    state.dbError = null;
+    state.dbNote = null;
+    state.restoreConfirm = null;
+    state.dbBackupBusy = true;
+    render();
+    // Destructive + async: the server pushes the snapshot into the guest and the DB
+    // restarts. The 202 only means the restore was dispatched, not that it's back.
+    api("POST", "/projects/" + projectId + "/db/restore", { backup_id: backupId }).then(function() {
+      state.dbBackupBusy = false;
+      state.dbNote = "Restore of " + backupId + " started — the database will briefly restart.";
+      render();
+      loadDbBackups(projectId);
+    }).catch(function(e) {
+      state.dbBackupBusy = false;
+      state.dbError = e.message;
+      state.dbNote = null;
+      render();
+    });
+  }
+
+  // Poll quietly while a backup is still `pending` so its row flips to complete/failed
+  // without a manual refresh (mirrors startDomainPollLoop). Skips the reload while a
+  // create/restore form is open, since render() rebuilds the whole DOM and would wipe the
+  // user's in-progress typing (notably the destructive restore's type-to-confirm field).
+  function startDbBackupPollLoop() {
+    setInterval(function() {
+      if (state.view === "console" &&
+          state.projectTab === "database" &&
+          state.currentProject &&
+          !state.showCreateDbKey &&
+          !state.restoreConfirm &&
+          state.dbBackups.some(function(b) { return b.status === "pending"; })) {
+        loadDbBackups(state.currentProject.id, true);
+      }
+    }, 8000);
+  }
+
+  // The managed-DB reach-plane host for a project: <project>.db.<domain>, derived from the
+  // API host the same way storageEndpoint() derives storage.<domain>. This is what the
+  // `jkbase db proxy` sidecar (and a TLS-capable client) connects to on :443.
+  function dbHost(project) {
+    try {
+      var host = new URL(API).host.replace(/^api\./, "");
+      return project.id + ".db." + host;
+    } catch (e) {
+      return project.id + ".db.jkbase.app";
+    }
   }
 
   // Object-store endpoint, derived from the API host so it tracks the platform
@@ -2363,6 +2556,20 @@ body {
       });
     } catch (e) {
       return String(unix);
+    }
+  }
+
+  // Backup timestamps are unix MILLISECONDS (unlike created_unix seconds); render date +
+  // time so same-day backups are distinguishable.
+  function formatDateTimeMs(ms) {
+    if (ms == null) return "";
+    try {
+      return new Date(ms).toLocaleString(undefined, {
+        year: "numeric", month: "short", day: "numeric",
+        hour: "2-digit", minute: "2-digit",
+      });
+    } catch (e) {
+      return String(ms);
     }
   }
 
@@ -2687,6 +2894,7 @@ body {
     { key: "servers",    label: "Servers",     icon: ">" },
     { key: "deployments",label: "Deployments", icon: "^" },
     { key: "storage",    label: "Storage",     icon: "&" },
+    { key: "database",   label: "Database",    icon: ":" },
     { key: "usage",      label: "Usage",       icon: "$" },
     { key: "secrets",    label: "Secrets",     icon: "*" },
     { key: "settings",   label: "Settings",    icon: "%" },
@@ -3974,6 +4182,304 @@ body {
     );
   }
 
+  // Database (managed RhypeDB) — reach-plane keys + backups. Endpoints are on the CONTROL
+  // API (api(), not objApi()); DB errors render in the tab-local dbError banner.
+  function renderDatabaseView(project) {
+    var host = dbHost(project);
+    var proxyCmd = "jkbase db proxy --project " + project.id;
+
+    // --- DB access-key list ---
+    var keyItems = [];
+    if (state.dbKeysLoading && state.dbKeys.length === 0) {
+      keyItems.push(h("div", { className: "section-desc" }, "Loading keys..."));
+    } else if (state.dbKeys.length > 0) {
+      keyItems.push(
+        h("table", { className: "secret-table" },
+          h("tbody", null,
+            state.dbKeys.map(function(key) {
+              return h("tr", null,
+                h("td", { className: "secret-key", style: "font-family: var(--mono); font-size: 12px" }, key.access_key_id),
+                h("td", { style: "color: var(--text-dim); font-size: 12px" }, key.label || "(no label)"),
+                h("td", { style: "color: var(--text-dim); font-size: 12px; white-space: nowrap" }, formatDate(key.created_unix)),
+                h("td", { className: "secret-actions" },
+                  h("button", {
+                    className: "btn btn-danger btn-sm",
+                    disabled: state.dbKeyBusy ? "disabled" : null,
+                    onClick: function() {
+                      state.dbNote = null;
+                      state.revokeDbKeyConfirm = key.access_key_id;
+                      render();
+                    },
+                  }, "Revoke")
+                )
+              );
+            })
+          )
+        )
+      );
+    } else if (!state.dbKeysLoading) {
+      keyItems.push(h("div", { className: "section-desc" }, "No database keys yet. Create one to connect to your managed database from outside the VM."));
+    }
+
+    if (state.revokeDbKeyConfirm) {
+      keyItems.push(
+        h("div", { className: "secret-delete-confirm" },
+          h("div", { className: "secret-delete-confirm-text" },
+            "Revoke ",
+            h("span", { className: "highlight" }, state.revokeDbKeyConfirm),
+            "? Any client or sidecar using this key will immediately lose access."
+          ),
+          h("div", { className: "secret-delete-confirm-actions" },
+            h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
+              state.revokeDbKeyConfirm = null;
+              render();
+            }}, "Cancel"),
+            h("button", { className: "btn btn-danger btn-sm", onClick: function() {
+              revokeDbKey(project.id, state.revokeDbKeyConfirm);
+            }}, "Revoke")
+          )
+        )
+      );
+    }
+
+    if (state.showCreateDbKey) {
+      keyItems.push(
+        h("form", { className: "secret-add-form", onSubmit: function(e) {
+          e.preventDefault();
+          var input = e.target.querySelector("input");
+          var label = input ? input.value.trim() : "";
+          createDbKey(project.id, label);
+        }},
+          h("input", {
+            className: "input",
+            type: "text",
+            placeholder: "label (optional, e.g. ci)",
+            autocomplete: "off",
+            maxlength: "64",
+          }),
+          h("button", {
+            className: "btn btn-primary btn-sm",
+            type: "submit",
+            disabled: state.dbKeyBusy ? "disabled" : null,
+          }, state.dbKeyBusy ? "Creating..." : "Create"),
+          h("button", {
+            className: "btn btn-secondary btn-sm",
+            type: "button",
+            onClick: function() {
+              state.showCreateDbKey = false;
+              render();
+            },
+          }, "Cancel")
+        )
+      );
+    }
+
+    // --- One-time secret reveal (shown right after creation) ---
+    var revealCard = null;
+    if (state.revealedDbKey) {
+      var rk = state.revealedDbKey;
+      var connectCmd =
+        "export JKBASE_DB_ACCESS_KEY_ID=" + rk.access_key_id + "\n" +
+        "export JKBASE_DB_SECRET=<SECRET>\n" +
+        "jkbase db proxy --project " + project.id + "\n" +
+        "# then point @rhypedb/client at 127.0.0.1:4200";
+      revealCard = h("div", { className: "token-reveal-card", style: "border-color: var(--warning)" },
+        h("div", { className: "token-label", style: "color: var(--warning)" }, "Database secret"),
+        h("code", { className: "token-value" }, rk.secret),
+        h("button", { className: "copy-btn", onClick: function() {
+          navigator.clipboard.writeText(rk.secret);
+          this.textContent = "Copied";
+          var btn = this;
+          setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+        }}, "Copy"),
+        h("div", { className: "token-warning", style: "color: var(--warning); font-weight: 600" },
+          "Copy this now — the secret is not shown again."
+        ),
+        h("div", { style: "margin-top: 14px" },
+          h("div", { className: "token-label" }, "Access key ID"),
+          h("code", { className: "code-block", style: "margin-top: 0" }, rk.access_key_id)
+        ),
+        h("div", { style: "margin-top: 12px" },
+          h("div", { className: "token-label" }, "Connect with the sidecar"),
+          h("div", { className: "code-block-row" },
+            h("code", { className: "code-block", style: "white-space: pre" }, connectCmd),
+            h("button", { className: "copy-btn", onClick: function() {
+              navigator.clipboard.writeText(connectCmd);
+              this.textContent = "Copied";
+              var btn = this;
+              setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+            }}, "Copy")
+          )
+        ),
+        h("button", {
+          className: "btn btn-secondary btn-sm",
+          style: "margin-top: 14px",
+          onClick: function() {
+            state.revealedDbKey = null;
+            render();
+          },
+        }, "Done")
+      );
+    }
+
+    // --- Backups list ---
+    var backupItems = [];
+    if (state.dbBackupsLoading && state.dbBackups.length === 0) {
+      backupItems.push(h("div", { className: "section-desc" }, "Loading backups..."));
+    } else if (state.dbBackups.length > 0) {
+      backupItems.push(
+        h("table", { className: "secret-table" },
+          h("tbody", null,
+            state.dbBackups.map(function(b) {
+              var dot = b.status === "complete" ? "green" : (b.status === "failed" ? "red" : "yellow");
+              return h("tr", null,
+                h("td", { className: "secret-key", style: "font-family: var(--mono); font-size: 12px" }, b.backup_id),
+                h("td", { style: "color: var(--text-dim); font-size: 12px; white-space: nowrap" }, formatDateTimeMs(b.created_at_ms)),
+                h("td", { style: "color: var(--text-dim); font-size: 12px; white-space: nowrap" }, b.status === "complete" ? fmtBytes(b.size_bytes) : "—"),
+                h("td", { style: "font-size: 12px; white-space: nowrap" },
+                  h("span", { className: "status-dot " + dot, style: "margin-right: 6px" }),
+                  b.status
+                ),
+                h("td", { className: "secret-actions" },
+                  b.status === "complete"
+                    ? h("button", {
+                        className: "btn btn-secondary btn-sm",
+                        disabled: state.dbBackupBusy ? "disabled" : null,
+                        onClick: function() {
+                          state.dbNote = null;
+                          state.restoreConfirm = b.backup_id;
+                          render();
+                        },
+                      }, "Restore")
+                    : null
+                )
+              );
+            })
+          )
+        )
+      );
+    } else if (!state.dbBackupsLoading) {
+      backupItems.push(h("div", { className: "section-desc" }, "No backups yet. When a managed database is enabled, create one on demand or wait for the nightly backup."));
+    }
+
+    if (state.restoreConfirm) {
+      backupItems.push(
+        h("form", { className: "secret-delete-confirm", style: "flex-direction: column; align-items: stretch", onSubmit: function(e) {
+          e.preventDefault();
+          var input = e.target.querySelector("input");
+          var typed = input ? input.value.trim() : "";
+          if (typed !== project.id) {
+            state.dbError = "confirmation did not match; restore aborted";
+            state.dbNote = null;
+            render();
+            return;
+          }
+          restoreDbBackup(project.id, state.restoreConfirm);
+        }},
+          h("div", { className: "secret-delete-confirm-text" },
+            "Restore ",
+            h("span", { className: "highlight" }, state.restoreConfirm),
+            "? This OVERWRITES the current database and briefly restarts it — it cannot be undone. Type the project id ",
+            h("span", { className: "highlight" }, project.id),
+            " to confirm."
+          ),
+          h("input", {
+            className: "input input-sm",
+            type: "text",
+            placeholder: project.id,
+            autocomplete: "off",
+            style: "margin: 8px 0",
+          }),
+          h("div", { className: "secret-delete-confirm-actions", style: "justify-content: flex-end" },
+            h("button", { className: "btn btn-secondary btn-sm", type: "button", onClick: function() {
+              state.restoreConfirm = null;
+              render();
+            }}, "Cancel"),
+            h("button", {
+              className: "btn btn-danger btn-sm",
+              type: "submit",
+              disabled: state.dbBackupBusy ? "disabled" : null,
+            }, state.dbBackupBusy ? "Restoring..." : "Restore")
+          )
+        )
+      );
+    }
+
+    return h("div", { className: "feature-content-inner" },
+      h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px" },
+        h("div", { className: "feature-title", style: "margin-bottom: 0" }, "Database"),
+        h("button", {
+          className: "btn btn-secondary btn-sm",
+          disabled: state.showCreateDbKey ? "disabled" : null,
+          onClick: function() {
+            state.dbNote = null;
+            state.showCreateDbKey = true;
+            render();
+          },
+        }, "Create DB key")
+      ),
+      state.dbError ? h("div", { className: "error-banner" }, state.dbError) : null,
+      state.dbNote ? h("div", { className: "success-banner" }, state.dbNote) : null,
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Managed database"),
+          h("div", { className: "section-desc", style: "margin-bottom: 10px" },
+            "This project can run a managed RhypeDB co-located with your app. Your app reaches it over loopback automatically; to connect from your own machine or CI, create a database key below and run the reach-plane sidecar. If you haven't enabled a database yet, add a [database] section to jkbase.toml and redeploy."
+          ),
+          h("div", { className: "token-label" }, "Reach-plane host"),
+          h("div", { className: "code-block-row" },
+            h("code", { className: "code-block", style: "margin-top: 0" }, host),
+            h("button", { className: "copy-btn", onClick: function() {
+              navigator.clipboard.writeText(host);
+              this.textContent = "Copied";
+              var btn = this;
+              setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+            }}, "Copy")
+          ),
+          h("div", { className: "token-label", style: "margin-top: 12px" }, "Connect with the sidecar"),
+          h("div", { className: "code-block-row" },
+            h("code", { className: "code-block", style: "margin-top: 0" }, proxyCmd),
+            h("button", { className: "copy-btn", onClick: function() {
+              navigator.clipboard.writeText(proxyCmd);
+              this.textContent = "Copied";
+              var btn = this;
+              setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+            }}, "Copy")
+          )
+        )
+      ),
+
+      revealCard,
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Database keys"),
+          h("div", null, keyItems)
+        )
+      ),
+
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px" },
+            h("div", { className: "card-title", style: "margin-bottom: 0" }, "Backups"),
+            h("button", {
+              className: "btn btn-secondary btn-sm",
+              disabled: state.dbBackupBusy ? "disabled" : null,
+              onClick: function() {
+                createDbBackup(project.id);
+              },
+            }, state.dbBackupBusy ? "Working..." : "Create backup")
+          ),
+          h("div", { className: "section-desc", style: "margin-bottom: 10px" },
+            "On-demand and nightly snapshots of your managed database, stored off your storage quota. The newest 14 are kept. Restoring overwrites the current database."
+          ),
+          h("div", null, backupItems)
+        )
+      )
+    );
+  }
+
   // Secrets
   function renderSecretsView(project) {
     var items = [];
@@ -4214,6 +4720,7 @@ body {
       case "servers":     return renderServersView(project);
       case "deployments": return renderDeploymentsView(project);
       case "storage":     return renderStorageView(project);
+      case "database":    return renderDatabaseView(project);
       case "secrets":     return renderSecretsView(project);
       case "settings":    return renderSettingsView(project);
       default:            return renderOverviewView(project);
@@ -4432,6 +4939,7 @@ body {
 
   startLogTailLoop();
   startDomainPollLoop();
+  startDbBackupPollLoop();
 
   if (state.token) {
     state.view = "loading";
