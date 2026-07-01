@@ -1,5 +1,6 @@
 mod build_ca;
 mod build_orchestrator;
+mod db_backup_store;
 mod egress;
 mod handoff;
 mod layer_plan;
@@ -1551,6 +1552,30 @@ async fn async_main() -> Result<()> {
         }));
     }
 
+    // Managed-DB backups ([RB*]): the platform-owned blob store + the executor context shared by
+    // the on-demand callbacks and the nightly loop. The control API records intent + owner-scopes;
+    // execution (VM wake, agent relay, blob store) is server-side here.
+    let db_backup_ctx = DbBackupCtx {
+        platform: platform.clone(),
+        routing: routing_table.clone(),
+        domains: domain_map.clone(),
+        shipper: log_shipper.clone(),
+        store: state.store.clone(),
+        backups: Arc::new(db_backup_store::BackupStore::new(&data_dir)),
+    };
+    {
+        let ctx = db_backup_ctx.clone();
+        state.db_backup_callback = Some(Arc::new(move |project_id, backup_id| {
+            tokio::spawn(run_db_backup(ctx.clone(), project_id, backup_id));
+        }));
+    }
+    {
+        let ctx = db_backup_ctx.clone();
+        state.db_restore_callback = Some(Arc::new(move |project_id, backup_id| {
+            tokio::spawn(run_db_restore(ctx.clone(), project_id, backup_id));
+        }));
+    }
+
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
 
@@ -1687,6 +1712,9 @@ async fn async_main() -> Result<()> {
 
     // Spawn log shipper loop (pulls guest logs into the persistent store)
     tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
+
+    // Nightly automatic managed-DB backups ([RB12]).
+    tokio::spawn(db_backup_nightly_loop(db_backup_ctx.clone()));
 
     // Spawn idle detection loop
     if args.idle_timeout_secs > 0 {
@@ -2200,9 +2228,10 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             info!(project = %id, artifact = "data-disks", "reaped orphaned artifact");
         }
     }
-    // `objectstore/{id}`: a deleted project's bucket tree (delete purges it, but a
-    // crash-interrupted teardown can leave it — reap so a recreated slug starts clean).
-    for sub in ["hosting", "run", "snapshots", "objectstore"] {
+    // `objectstore/{id}` + `db-backups/{id}`: a deleted project's bucket tree / managed-DB
+    // backup blobs ([RB11]). Delete purges them, but a crash-interrupted teardown can leave them
+    // — reap so a recreated slug starts clean and a deleted tenant's DB data doesn't linger.
+    for sub in ["hosting", "run", "snapshots", "objectstore", "db-backups"] {
         let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
             continue;
         };
@@ -2726,17 +2755,22 @@ async fn handle_deploy(
             access_key_id: k.access_key_id,
             secret_key: k.secret_key,
         });
-    // Mint (rotate) the per-deploy reach-plane splice secret for a project with a managed
-    // DB and persist it — the edge reads it from the control store to present on the
-    // `/_jkbase/db` upgrade, and the SAME value is baked into the per-VM image below so
-    // the in-VM agent can verify it ([R3]). Best-effort: a mint failure just means the
-    // reach plane can't splice until the next deploy (fail-closed), never a failed deploy.
+    // Mint (rotate) the per-deploy reach-plane secrets for a project with a managed DB and
+    // persist them — the edge reads the splice secret from the control store to present on the
+    // `/_jkbase/db` upgrade, and the SAME values are baked into the per-VM image below so the
+    // in-VM agent can verify the splice ([R3]) and inject the admin token into the DB env
+    // ([RB1]). Best-effort: a mint failure just means the reach plane / backups can't run until
+    // the next deploy (fail-closed), never a failed deploy. The admin token rides the reserved
+    // channel ONLY — never `_database.json`.
     let db_reach: Option<jkbase_common::config::DbReachFacts> =
         if check_project_has_database(&data_dir, project_id) {
-            plat.store
-                .mint_db_splice_secret(project_id)
-                .ok()
-                .map(|splice_secret| jkbase_common::config::DbReachFacts { splice_secret })
+            plat.store.mint_db_splice_secret(project_id).ok().map(|splice_secret| {
+                let admin_token = plat.store.mint_db_admin_token(project_id).unwrap_or_default();
+                jkbase_common::config::DbReachFacts {
+                    splice_secret,
+                    admin_token,
+                }
+            })
         } else {
             None
         };
@@ -3798,6 +3832,268 @@ async fn log_shipper_loop(platform: Arc<Mutex<PlatformState>>, shipper: Arc<LogS
 
         for (project_id, ip) in targets {
             shipper.ship(&project_id, &ip).await;
+        }
+    }
+}
+
+// ===================================================================
+// Managed-DB backups — host-relay pull + host-push restore ([RB*]).
+// ===================================================================
+
+/// Hard cap on a backup tar the agent may relay ([RB3]).
+const MAX_DB_BACKUP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Retained backups per project after each successful backup (retention bound; the store cap
+/// [`Store::MAX_DB_BACKUPS_PER_PROJECT`] is the backstop).
+const DB_BACKUP_KEEP: usize = 14;
+/// Nightly-loop cadence + the age at which a managed DB is due for an automatic backup.
+const DB_BACKUP_TICK: Duration = Duration::from_secs(30 * 60);
+const DB_BACKUP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+const DB_BACKUP_MAX_CONCURRENT: usize = 2;
+
+/// Everything the backup/restore executors need. All handles are cheap Arc clones.
+#[derive(Clone)]
+struct DbBackupCtx {
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domains: DomainMap,
+    shipper: Arc<LogShipper>,
+    store: Store,
+    backups: Arc<db_backup_store::BackupStore>,
+}
+
+/// Client-side HTTP/1.1 `Upgrade` to `<vm_ip>:80{path}` presenting the reach-plane splice
+/// secret (mirrors the proxy edge's `connect_agent`). On `101` returns the raw upgraded stream.
+/// Used by the backup PULL and restore PUSH executors — the DB stays loopback-only, the agent
+/// is the sole mediator.
+async fn connect_agent_db_upgrade(
+    vm_ip: &str,
+    path: &str,
+    splice_secret: &str,
+    proto: &str,
+) -> Result<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>> {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
+        .await
+        .context("connect agent")?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("agent handshake")?;
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", vm_ip)
+        .header("connection", "upgrade")
+        .header("upgrade", proto)
+        .header("x-jkbase-db-secret", splice_secret)
+        .body(Full::<Bytes>::new(Bytes::new()))
+        .context("agent req build")?;
+    let mut resp = sender.send_request(req).await.context("agent send")?;
+    if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+        anyhow::bail!("agent refused {path} upgrade ({})", resp.status());
+    }
+    let upgraded = hyper::upgrade::on(&mut resp).await.context("agent upgrade")?;
+    Ok(hyper_util::rt::TokioIo::new(upgraded))
+}
+
+/// Pull a backup: wake the VM, relay the tar out of the agent, validate + store it, return
+/// (size, manifest summary). The admin token never leaves the guest — the agent authorizes the
+/// loopback `/admin/backup/stream` and relays only opaque tar bytes.
+async fn do_db_backup(
+    ctx: &DbBackupCtx,
+    project_id: &str,
+    backup_id: &str,
+) -> Result<(u64, String)> {
+    let secret = ctx
+        .store
+        .get_db_splice_secret(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("no reach-plane secret (managed DB not deployed?)"))?;
+    let ip = wake_project(
+        project_id,
+        ctx.platform.clone(),
+        ctx.routing.clone(),
+        ctx.domains.clone(),
+        ctx.shipper.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("wake project: {e:?}"))?;
+    let mut upgraded =
+        connect_agent_db_upgrade(&ip, "/_jkbase/db/backup", &secret, "jkbase-db-backup").await?;
+    let staged = ctx
+        .backups
+        .stage(project_id, backup_id, &mut upgraded, MAX_DB_BACKUP_BYTES)
+        .await?;
+    let size = staged.size_bytes;
+    match ctx.backups.validate(&staged).await {
+        Ok(summary) => {
+            ctx.backups.commit(staged).await?;
+            Ok((size, summary))
+        }
+        Err(e) => {
+            ctx.backups.discard(staged).await;
+            Err(e)
+        }
+    }
+}
+
+/// Run one backup end-to-end (spawned by the on-demand callback + the nightly loop): execute,
+/// record the catalog outcome, and prune to the retention bound on success.
+async fn run_db_backup(ctx: DbBackupCtx, project_id: String, backup_id: String) {
+    match do_db_backup(&ctx, &project_id, &backup_id).await {
+        Ok((size, summary)) => {
+            let _ = ctx.store.set_db_backup_status(
+                &project_id,
+                &backup_id,
+                jkbase_control::store::BackupStatus::Complete,
+                size,
+                &summary,
+            );
+            info!(project = %project_id, backup = %backup_id, size, "managed-db backup complete");
+            prune_db_backups(&ctx, &project_id).await;
+        }
+        Err(e) => {
+            warn!(project = %project_id, backup = %backup_id, error = %e, "managed-db backup failed");
+            let _ = ctx.store.set_db_backup_status(
+                &project_id,
+                &backup_id,
+                jkbase_control::store::BackupStatus::Failed,
+                0,
+                "",
+            );
+            let _ = ctx.backups.delete(&project_id, &backup_id).await;
+        }
+    }
+}
+
+/// Push a restore: resolve the (Complete) backup, wake the VM, and stream the tar to the agent,
+/// which untars it in-guest and respawns rhypedb. Reads back the agent's `ok`/`err:` line.
+async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let backup = ctx
+        .store
+        .get_db_backup(project_id, backup_id)?
+        .ok_or_else(|| anyhow::anyhow!("backup not found"))?;
+    if backup.status != jkbase_control::store::BackupStatus::Complete {
+        anyhow::bail!("backup {backup_id} is not restorable (status {:?})", backup.status);
+    }
+    let secret = ctx
+        .store
+        .get_db_splice_secret(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("no reach-plane secret"))?;
+    let ip = wake_project(
+        project_id,
+        ctx.platform.clone(),
+        ctx.routing.clone(),
+        ctx.domains.clone(),
+        ctx.shipper.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("wake project: {e:?}"))?;
+    let mut tar = ctx.backups.open_read(project_id, backup_id).await?;
+    let mut upgraded =
+        connect_agent_db_upgrade(&ip, "/_jkbase/db/restore", &secret, "jkbase-db-restore").await?;
+    tokio::io::copy(&mut tar, &mut upgraded)
+        .await
+        .context("stream backup to agent")?;
+    // Half-close the write half → the agent sees a clean EOF for the tar, processes it, then
+    // writes its status line back on the still-open read half.
+    upgraded.shutdown().await.context("half-close restore push")?;
+    let mut status = String::new();
+    upgraded
+        .read_to_string(&mut status)
+        .await
+        .context("read restore status")?;
+    let status = status.trim();
+    if status == "ok" {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "agent restore: {}",
+            if status.is_empty() { "no response" } else { status }
+        )
+    }
+}
+
+async fn run_db_restore(ctx: DbBackupCtx, project_id: String, backup_id: String) {
+    match do_db_restore(&ctx, &project_id, &backup_id).await {
+        Ok(()) => info!(project = %project_id, backup = %backup_id, "managed-db restore complete"),
+        Err(e) => {
+            warn!(project = %project_id, backup = %backup_id, error = %e, "managed-db restore failed")
+        }
+    }
+}
+
+/// Keep the newest [`DB_BACKUP_KEEP`] backups for a project; delete older rows + their blobs.
+async fn prune_db_backups(ctx: &DbBackupCtx, project_id: &str) {
+    let backups = match ctx.store.list_db_backups(project_id) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    for old in backups.into_iter().skip(DB_BACKUP_KEEP) {
+        let _ = ctx.backups.delete(project_id, &old.backup_id).await;
+        let _ = ctx.store.delete_db_backup(project_id, &old.backup_id);
+    }
+}
+
+/// Nightly automatic backups ([RB12]): each tick, back up every managed-DB project whose newest
+/// Complete backup is older than [`DB_BACKUP_INTERVAL_MS`] (or has none), bounded by a
+/// concurrency semaphore so waking DBs to snapshot them can't stampede. Single-host owns all
+/// projects today (mirrors `scheduler_loop`); a future HA layer gates on ownership.
+async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
+    let sem = Arc::new(tokio::sync::Semaphore::new(DB_BACKUP_MAX_CONCURRENT));
+    loop {
+        tokio::time::sleep(DB_BACKUP_TICK).await;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let projects = match ctx.store.list_projects() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "nightly db-backup: could not list projects");
+                continue;
+            }
+        };
+        for proj in projects {
+            let pid = proj.id.clone();
+            // A managed DB that has been deployed has a minted admin token.
+            if !matches!(ctx.store.get_db_admin_token(&pid), Ok(Some(_))) {
+                continue;
+            }
+            let due = match ctx.store.list_db_backups(&pid) {
+                Ok(list) => match list
+                    .iter()
+                    .find(|b| b.status == jkbase_control::store::BackupStatus::Complete)
+                {
+                    Some(b) => now_ms.saturating_sub(b.created_at_ms) >= DB_BACKUP_INTERVAL_MS,
+                    None => true,
+                },
+                Err(_) => false,
+            };
+            if !due {
+                continue;
+            }
+            let tenant_id = proj.tenant_id.clone().unwrap_or_default();
+            let row = match ctx.store.create_db_backup_auto(&pid, &tenant_id) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(project = %pid, error = %e, "nightly db-backup: could not record row");
+                    continue;
+                }
+            };
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                break;
+            };
+            let ctx2 = ctx.clone();
+            let backup_id = row.backup_id.clone();
+            tokio::spawn(async move {
+                let _permit = permit; // held for the backup's duration (bounds concurrency)
+                run_db_backup(ctx2, pid, backup_id).await;
+            });
         }
     }
 }
