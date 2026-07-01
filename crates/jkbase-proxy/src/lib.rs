@@ -129,6 +129,10 @@ pub struct ProxyConfig {
     pub db_max_concurrent: usize,
     /// Concurrent unauthenticated DB handshake→preamble reads ([R6]).
     pub db_preauth_max: usize,
+    /// Concurrent unauthenticated preamble reads allowed from a SINGLE source IP ([R6]) —
+    /// the per-IP dimension the global `db_preauth_max` lacks, so one host can't hold every
+    /// preauth slot for the full preamble deadline and starve the DB reach plane platform-wide.
+    pub db_preauth_per_ip_max: usize,
     /// Per-project live DB-relay cap.
     pub db_max_per_project: usize,
 }
@@ -181,6 +185,7 @@ pub async fn serve(
             backend_port: config.backend_port,
             global: Arc::new(tokio::sync::Semaphore::new(config.db_max_concurrent)),
             preauth: Arc::new(tokio::sync::Semaphore::new(config.db_preauth_max)),
+            per_ip: db_ingress::PerIpLimiter::new(config.db_preauth_per_ip_max),
             per_project_max: config.db_max_per_project,
         })),
         _ => None,
@@ -330,7 +335,7 @@ async fn serve_https(
     info!(addr = %listener.local_addr()?, domain = %shared.domain, "HTTPS proxy listening");
 
     loop {
-        let (stream, _peer) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
             accept = listener.accept() => match accept {
@@ -359,7 +364,7 @@ async fn serve_https(
             // deadline force-closes it via the registry (see `serve`).
             if tls_stream.get_ref().1.alpn_protocol() == Some(db_preamble::DB_ALPN) {
                 if let Some(ingress) = shared.db_ingress.clone() {
-                    ingress.handle(tls_stream).await;
+                    ingress.handle(tls_stream, peer.ip()).await;
                 }
                 return;
             }

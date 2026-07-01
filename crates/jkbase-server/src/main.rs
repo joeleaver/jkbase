@@ -1652,6 +1652,10 @@ async fn async_main() -> Result<()> {
         db_relay_registry: Some(db_relay_registry.clone()),
         db_max_concurrent: 1024,
         db_preauth_max: 256,
+        // One source IP may hold at most 1/8 of the global preauth pool, so a single host
+        // can't slow-loris every slot for the preamble deadline and deny the DB reach plane
+        // platform-wide ([R6]); still ample headroom for a legit sidecar's connection bursts.
+        db_preauth_per_ip_max: 32,
         db_max_per_project: 64,
     };
     let proxy_port = proxy_config.http_port;

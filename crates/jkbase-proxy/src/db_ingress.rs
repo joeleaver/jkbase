@@ -16,13 +16,68 @@ use hyper::StatusCode;
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use jkbase_wsproxy::{RelayHooks, relay_bidirectional_hooked, set_relay_keepalive};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, warn};
+
+/// A per-source-IP concurrency limiter for the UNAUTHENTICATED preamble window ([R6]). The
+/// global `preauth` semaphore bounds total in-flight handshakes but has no per-IP dimension,
+/// so a single host could open `db_preauth_max` connections that each hold a slot for the
+/// full `PREAMBLE_DEADLINE` and deny the DB reach plane to every other tenant. This caps how
+/// many concurrent pre-auth reads one IP may hold; a permit is released (RAII) the instant
+/// the connection authenticates or drops.
+pub struct PerIpLimiter {
+    counts: Mutex<HashMap<IpAddr, u32>>,
+    max: u32,
+}
+
+impl PerIpLimiter {
+    pub fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            counts: Mutex::new(HashMap::new()),
+            max: max.max(1) as u32,
+        })
+    }
+
+    /// Reserve a pre-auth slot for `ip`, or `None` if the IP is already at its cap.
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<IpPermit> {
+        let mut counts = self.counts.lock().unwrap();
+        let n = counts.entry(ip).or_insert(0);
+        if *n >= self.max {
+            return None;
+        }
+        *n += 1;
+        Some(IpPermit {
+            limiter: self.clone(),
+            ip,
+        })
+    }
+}
+
+/// RAII pre-auth slot: decrements its IP's count on drop (pruning the entry at zero so the
+/// map can't grow unbounded across distinct source IPs).
+struct IpPermit {
+    limiter: Arc<PerIpLimiter>,
+    ip: IpAddr,
+}
+
+impl Drop for IpPermit {
+    fn drop(&mut self) {
+        let mut counts = self.limiter.counts.lock().unwrap();
+        if let Some(n) = counts.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// App-level idle watchdog for a DB relay — effectively "never", so a legitimately
 /// silent realtime subscription stays open. A DEAD peer is reaped by TCP keepalive ([R9])
@@ -52,27 +107,37 @@ pub struct DbIngress {
     /// Concurrent UNAUTHENTICATED handshake→preamble reads — bounds the flood the public
     /// `:443` takes from the whole internet, which the post-auth per-project cap can't ([R6]).
     pub preauth: Arc<Semaphore>,
+    /// Per-source-IP dimension of the preauth bound, so one host can't hold every global
+    /// slot for the preamble deadline ([R6]).
+    pub per_ip: Arc<PerIpLimiter>,
     /// Per-project live-relay cap (bounds owner over-subscription).
     pub per_project_max: usize,
 }
 
 impl DbIngress {
-    /// Drive one DB reach connection to completion (or drop it). `_drain` is the graceful
-    /// drain barrier token held for the connection's life (like the HTTP path); the drain
-    /// deadline force-closes registered relays via [`DbRelayRegistry::cancel_all`].
-    pub async fn handle(self: Arc<Self>, tls: TlsStream<TcpStream>) {
-        if let Err(reason) = self.serve(tls).await {
+    /// Drive one DB reach connection to completion (or drop it). `peer_ip` is the accepted
+    /// socket's source address, used for the per-IP pre-auth cap ([R6]). The connection's
+    /// task holds the graceful-drain barrier permit for its life (like the HTTP path); the
+    /// drain deadline force-closes registered relays via [`DbRelayRegistry::cancel_all`].
+    pub async fn handle(self: Arc<Self>, tls: TlsStream<TcpStream>, peer_ip: IpAddr) {
+        if let Err(reason) = self.serve(tls, peer_ip).await {
             debug!(reason, "db reach connection dropped");
         }
     }
 
-    async fn serve(&self, mut tls: TlsStream<TcpStream>) -> Result<(), &'static str> {
-        // [R6] Bound unauthenticated work up front.
+    async fn serve(&self, mut tls: TlsStream<TcpStream>, peer_ip: IpAddr) -> Result<(), &'static str> {
+        // [R6] Bound unauthenticated work up front — globally AND per source IP, so one host
+        // can't hold every global slot for the full preamble deadline. Both permits are held
+        // only across the unauthenticated preamble read and released the instant we auth.
         let preauth = self
             .preauth
             .clone()
             .try_acquire_owned()
             .map_err(|_| "preauth cap reached")?;
+        let ip_permit = self
+            .per_ip
+            .try_acquire(peer_ip)
+            .ok_or("per-ip preauth cap reached")?;
 
         // Pull the negotiated ALPN + SNI + our exporter off the completed handshake.
         let (sni, edge_exporter) = {
@@ -118,8 +183,9 @@ impl DbIngress {
         let project_id = ok.project_id.clone();
         let akid = preamble.akid.clone();
 
-        // Authenticated → free the unauth slot; take the post-auth ceilings.
+        // Authenticated → free the unauth slots (global + per-IP); take the post-auth ceilings.
         drop(preauth);
+        drop(ip_permit);
         let _global = self
             .global
             .clone()
@@ -273,5 +339,42 @@ impl DbIngress {
                 act.write().await.insert(pid, Instant::now());
             });
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_ip_limiter_caps_one_ip_and_releases_on_drop() {
+        let lim = PerIpLimiter::new(2);
+        let a: IpAddr = "203.0.113.7".parse().unwrap();
+        let b: IpAddr = "203.0.113.8".parse().unwrap();
+
+        let p1 = lim.try_acquire(a).unwrap();
+        let p2 = lim.try_acquire(a).unwrap();
+        // Third concurrent pre-auth from the SAME ip is refused...
+        assert!(lim.try_acquire(a).is_none());
+        // ...but a different source ip has its own budget.
+        let _pb = lim.try_acquire(b).unwrap();
+
+        // Releasing a slot (RAII) re-opens capacity for that ip.
+        drop(p1);
+        let p3 = lim.try_acquire(a).unwrap();
+        assert!(lim.try_acquire(a).is_none());
+
+        // Draining an ip to zero prunes its map entry (no unbounded growth across IPs).
+        drop(p2);
+        drop(p3);
+        assert!(lim.counts.lock().unwrap().get(&a).is_none());
+    }
+
+    #[test]
+    fn per_ip_limiter_min_one() {
+        // A zero/absurd config still admits at least one connection.
+        let lim = PerIpLimiter::new(0);
+        let a: IpAddr = "198.51.100.1".parse().unwrap();
+        assert!(lim.try_acquire(a).is_some());
     }
 }
