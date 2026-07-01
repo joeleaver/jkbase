@@ -172,6 +172,16 @@ fn load_platform_egress(serve_dir: &Path) -> jkbase_common::config::PlatformEgre
     }
 }
 
+/// Read the host-written `_db_reach.json` splice secret ([R3]) from the metadata image.
+/// Absent/malformed/empty ⇒ `None` (no managed DB, or fail-closed) → `/_jkbase/db` is
+/// then unreachable, never open.
+fn load_db_splice_secret(serve_dir: &Path) -> Option<String> {
+    let path = serve_dir.join(jkbase_common::config::DbReachFacts::FILE);
+    let bytes = std::fs::read(&path).ok()?;
+    let facts: jkbase_common::config::DbReachFacts = serde_json::from_slice(&bytes).ok()?;
+    (!facts.splice_secret.is_empty()).then_some(facts.splice_secret)
+}
+
 /// dm-verity mapper name for a layer block device (e.g. `/dev/vdc` → `jkverity-vdc`):
 /// stable, unique per device, and within `dmverity::activate`'s accepted name charset.
 fn verity_name(device: &str) -> String {
@@ -350,6 +360,10 @@ struct AgentState {
     log_sink: Arc<LogSink>,
     route_config: Vec<RouteEntry>,
     sites: Vec<SiteEntry>,
+    /// Host→agent managed-DB reach-plane splice secret ([R3]), read from the host-authored
+    /// `_db_reach.json`. `Some` only for a project with a managed DB; the `/_jkbase/db`
+    /// handler verifies it before splicing (a `None`/mismatch fails closed).
+    db_splice_secret: Option<String>,
 }
 
 /// A backend kind a tenant route can target. Resolved at the agent's deserialization
@@ -543,6 +557,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "80".to_string())
         .parse()?;
 
+    let db_splice_secret = load_db_splice_secret(&serve_dir);
     let state = Arc::new(AgentState {
         serve_dir,
         functions_dir,
@@ -551,6 +566,7 @@ async fn main() -> Result<()> {
         log_sink,
         route_config,
         sites,
+        db_splice_secret,
     });
 
     info!("jkbase-agent starting (pid {})", std::process::id());
@@ -561,10 +577,19 @@ async fn main() -> Result<()> {
 
     loop {
         let (stream, _peer) = listener.accept().await?;
+        // Which interface accepted this connection: the host reaches the agent over the
+        // VM's eth0 (dest = guest_ip), the in-VM tenant app over loopback. Used to fence
+        // `/_jkbase/*` control endpoints off guest loopback ([R3]). Unknown ⇒ not-loopback
+        // (allow) so a local_addr glitch can't break host health checks — the /_jkbase/db
+        // splice secret is the real gate regardless.
+        let on_loopback = stream
+            .local_addr()
+            .map(|a| a.ip().is_loopback())
+            .unwrap_or(false);
         let state = state.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| handle_request(state.clone(), req));
+            let svc = service_fn(move |req| handle_request(state.clone(), req, on_loopback));
             // with_upgrades(): required to proxy WebSockets through to the container.
             if let Err(e) = http1::Builder::new()
                 .serve_connection(io, svc)
@@ -648,11 +673,24 @@ fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
 async fn handle_request(
     state: Arc<AgentState>,
     req: Request<hyper::body::Incoming>,
+    on_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let path = req.uri().path().to_string();
 
+    // [R3] Control endpoints are for the HOST (reached over the VM's eth0), never the
+    // in-VM tenant app. Drop any `/_jkbase/*` that arrived on guest loopback — defense in
+    // depth atop each endpoint's own auth (the `/_jkbase/db` splice secret). 404 (not 403)
+    // so a probing tenant can't even confirm the endpoint exists.
+    if on_loopback && path.starts_with("/_jkbase/") {
+        return Ok(not_found_response());
+    }
+
     if path == "/_jkbase/health" {
         return Ok(health_response(&state).await);
+    }
+
+    if path == "/_jkbase/db" {
+        return Ok(handle_db_splice(state, req).await);
     }
 
     if path == "/_jkbase/sync" {
@@ -980,6 +1018,103 @@ async fn proxy_to_server(
                 .unwrap()
         }
     }
+}
+
+/// rhypedb's loopback native-TCP wire port inside the guest (see `start_database`).
+const RHYPEDB_TCP_PORT: u16 = 4201;
+
+/// Constant-time byte compare for the splice-secret check (the agent has no other
+/// const-time primitive; mirrors the edge/control-plane discipline).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// [R3] The managed-DB reach-plane backend leg. The edge does an HTTP/1.1 `Upgrade` to
+/// `/_jkbase/db` presenting the per-deploy splice secret; on `101` the agent splices the
+/// raw byte stream to rhypedb's loopback TCP wire (`127.0.0.1:4201`). The DB stays
+/// loopback-only — this is the sole in-VM path to it, gated on the secret so one isolation
+/// slip (a sibling reaching this eth0 port) isn't a direct splice into the unauthenticated
+/// engine. Not an HTTP backend, so there is NO hyper handshake on the backend leg.
+async fn handle_db_splice(
+    state: Arc<AgentState>,
+    mut req: Request<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    // Verify the host→agent secret. No secret configured (no managed DB / not baked) OR a
+    // mismatch ⇒ 404, fail-closed (never confirm the endpoint or the DB's existence).
+    let Some(expected) = state.db_splice_secret.as_deref() else {
+        return not_found_response();
+    };
+    let presented = req
+        .headers()
+        .get("x-jkbase-db-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        return not_found_response();
+    }
+
+    // Require a real upgrade so a valid-secret non-upgrade request can't leak a permit on
+    // an `on()` future that never resolves.
+    if !jkbase_wsproxy::is_upgrade_request(req.headers()) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Full::new(Bytes::from("expected upgrade")))
+            .unwrap();
+    }
+
+    // Bound concurrent splices with the same intra-VM permit pool as WS upgrades.
+    let Ok(permit) = upgrade_permits().clone().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "5")
+            .body(Full::new(Bytes::from("too many concurrent db connections")))
+            .unwrap();
+    };
+
+    // Connect the raw loopback wire BEFORE returning 101 (a connect failure must not leave
+    // the edge spliced to nothing).
+    let backend = match tokio::net::TcpStream::connect(("127.0.0.1", RHYPEDB_TCP_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "db splice: rhypedb loopback wire not available");
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Full::new(Bytes::from("db not available")))
+                .unwrap();
+        }
+    };
+    let _ = jkbase_wsproxy::set_relay_keepalive(&backend);
+
+    let client_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        let _permit = permit; // released when the relay ends
+        match client_upgrade.await {
+            Ok(upgraded) => {
+                jkbase_wsproxy::relay_bidirectional(
+                    TokioIo::new(upgraded),
+                    backend,
+                    jkbase_wsproxy::DEFAULT_RELAY_IDLE_TIMEOUT,
+                )
+                .await;
+            }
+            Err(e) => error!(error = %e, "db splice: client upgrade failed"),
+        }
+    });
+
+    // 101 → the edge splices its (TLS) side to this upgraded stream.
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("connection", "upgrade")
+        .header("upgrade", "jkbase-db")
+        .body(Full::new(Bytes::new()))
+        .unwrap()
 }
 
 /// Bound on concurrent in-flight relayed upgrades inside this agent (one tenant VM).
