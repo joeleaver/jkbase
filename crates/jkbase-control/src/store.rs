@@ -2014,6 +2014,31 @@ impl Store {
         Ok(rec)
     }
 
+    /// A backup is considered "in progress" while a `Pending` row younger than this exists —
+    /// used for single-flight (one backup per project at a time). A `Pending` row older than
+    /// this is treated as stale (the server crashed mid-backup) and no longer blocks a new one.
+    pub const BACKUP_STALE_MS: u64 = 30 * 60 * 1000;
+
+    /// True if the project has a non-stale `Pending` backup (single-flight guard). Prevents a
+    /// tenant from accumulating 30 concurrent Pending rows and a project from re-firing a backup
+    /// while one is running.
+    pub fn has_active_backup(&self, project_id: &str) -> Result<bool> {
+        let now = auth::timestamp_ms();
+        Ok(self.list_db_backups(project_id)?.iter().any(|b| {
+            b.status == BackupStatus::Pending
+                && now.saturating_sub(b.created_at_ms) < Self::BACKUP_STALE_MS
+        }))
+    }
+
+    /// Create a `Pending` backup row with a server-authored id + object key ([RB6]). The single
+    /// place both the on-demand endpoint and the nightly loop mint a backup, so the object key
+    /// is never caller-influenced.
+    pub fn create_db_backup_auto(&self, project_id: &str, tenant_id: &str) -> Result<DbBackup> {
+        let backup_id = auth::generate_backup_id();
+        let object_key = format!("{project_id}/{backup_id}.tar");
+        self.create_db_backup(project_id, tenant_id, &backup_id, &object_key)
+    }
+
     /// Resolve a backup by (`project_id`, `backup_id`) via the per-project index key, so a
     /// tenant can't resolve another project's backup by guessing the id ([RB6]). `None` if
     /// unknown for this project.
@@ -2046,7 +2071,7 @@ impl Store {
                 out.push(serde_json::from_slice::<DbBackup>(rec.value())?);
             }
         }
-        out.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        out.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
         Ok(out)
     }
 
@@ -2135,10 +2160,10 @@ impl Store {
             let mut primary = txn.open_table(DB_BACKUPS)?;
             for (index_key, id) in entries {
                 index.remove(index_key.as_str())?;
-                if let Some(v) = primary.get(id.as_str())? {
-                    if let Ok(rec) = serde_json::from_slice::<DbBackup>(v.value()) {
-                        removed.push(rec);
-                    }
+                if let Some(v) = primary.get(id.as_str())?
+                    && let Ok(rec) = serde_json::from_slice::<DbBackup>(v.value())
+                {
+                    removed.push(rec);
                 }
                 primary.remove(id.as_str())?;
             }

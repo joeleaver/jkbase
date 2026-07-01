@@ -1562,6 +1562,8 @@ async fn async_main() -> Result<()> {
         shipper: log_shipper.clone(),
         store: state.store.clone(),
         backups: Arc::new(db_backup_store::BackupStore::new(&data_dir)),
+        backup_sem: Arc::new(tokio::sync::Semaphore::new(DB_BACKUP_MAX_CONCURRENT)),
+        restoring: Arc::new(std::sync::Mutex::new(HashSet::new())),
     };
     {
         let ctx = db_backup_ctx.clone();
@@ -3840,14 +3842,19 @@ async fn log_shipper_loop(platform: Arc<Mutex<PlatformState>>, shipper: Arc<LogS
 // Managed-DB backups — host-relay pull + host-push restore ([RB*]).
 // ===================================================================
 
-/// Hard cap on a backup tar the agent may relay ([RB3]).
-const MAX_DB_BACKUP_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// Retained backups per project after each successful backup (retention bound; the store cap
+/// Hard cap on a backup tar the agent may relay + the host stages ([RB3]). The tar is roughly
+/// the DB's on-disk size (bounded by the RWO data disk); this ceiling fails a runaway/garbage
+/// stream fast, well before it could exhaust host disk under the concurrency bound below.
+const MAX_DB_BACKUP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Retained COMPLETE backups per project (retention bound; the store cap
 /// [`Store::MAX_DB_BACKUPS_PER_PROJECT`] is the backstop).
 const DB_BACKUP_KEEP: usize = 14;
 /// Nightly-loop cadence + the age at which a managed DB is due for an automatic backup.
 const DB_BACKUP_TICK: Duration = Duration::from_secs(30 * 60);
 const DB_BACKUP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Max concurrent backup PULLS across the WHOLE host (on-demand AND nightly share this), so a
+/// tenant spamming on-demand backups — or the nightly fan-out — can't stage many full-DB tars
+/// into off-quota host disk at once (adversarial-review finding).
 const DB_BACKUP_MAX_CONCURRENT: usize = 2;
 
 /// Everything the backup/restore executors need. All handles are cheap Arc clones.
@@ -3859,6 +3866,11 @@ struct DbBackupCtx {
     shipper: Arc<LogShipper>,
     store: Store,
     backups: Arc<db_backup_store::BackupStore>,
+    /// Host-wide concurrency bound shared by on-demand + nightly backups.
+    backup_sem: Arc<tokio::sync::Semaphore>,
+    /// Per-project in-flight restore guard so two overlapping restores can't corrupt the shared
+    /// staging dir (adversarial-review finding).
+    restoring: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 /// Client-side HTTP/1.1 `Upgrade` to `<vm_ip>:80{path}` presenting the reach-plane splice
@@ -3940,9 +3952,27 @@ async fn do_db_backup(
     }
 }
 
-/// Run one backup end-to-end (spawned by the on-demand callback + the nightly loop): execute,
-/// record the catalog outcome, and prune to the retention bound on success.
+/// Run one backup end-to-end (spawned by the on-demand callback + the nightly loop): acquire the
+/// host-wide concurrency permit, execute, record the catalog outcome, and prune the catalog —
+/// on EITHER outcome, so failed backups can never wedge the per-project row cap
+/// (adversarial-review finding).
 async fn run_db_backup(ctx: DbBackupCtx, project_id: String, backup_id: String) {
+    // Bound host-wide concurrent pulls (shared by on-demand + nightly). A closed semaphore never
+    // happens (we never close it); on the impossible error, fail the backup rather than run
+    // unbounded.
+    let _permit = match ctx.backup_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = ctx.store.set_db_backup_status(
+                &project_id,
+                &backup_id,
+                jkbase_control::store::BackupStatus::Failed,
+                0,
+                "",
+            );
+            return;
+        }
+    };
     match do_db_backup(&ctx, &project_id, &backup_id).await {
         Ok((size, summary)) => {
             let _ = ctx.store.set_db_backup_status(
@@ -3953,7 +3983,6 @@ async fn run_db_backup(ctx: DbBackupCtx, project_id: String, backup_id: String) 
                 &summary,
             );
             info!(project = %project_id, backup = %backup_id, size, "managed-db backup complete");
-            prune_db_backups(&ctx, &project_id).await;
         }
         Err(e) => {
             warn!(project = %project_id, backup = %backup_id, error = %e, "managed-db backup failed");
@@ -3967,12 +3996,31 @@ async fn run_db_backup(ctx: DbBackupCtx, project_id: String, backup_id: String) 
             let _ = ctx.backups.delete(&project_id, &backup_id).await;
         }
     }
+    // Prune on EVERY outcome so a run of failures can't fill the per-project row cap and
+    // permanently disable backups for the project.
+    prune_db_backups(&ctx, &project_id).await;
 }
 
 /// Push a restore: resolve the (Complete) backup, wake the VM, and stream the tar to the agent,
 /// which untars it in-guest and respawns rhypedb. Reads back the agent's `ok`/`err:` line.
 async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Serialize restores per project: two overlapping restores share the same in-guest staging
+    // paths and would corrupt each other (adversarial-review finding). RAII-remove on return.
+    struct RestoreGuard(Arc<std::sync::Mutex<HashSet<String>>>, String);
+    impl Drop for RestoreGuard {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().remove(&self.1);
+        }
+    }
+    {
+        let mut set = ctx.restoring.lock().unwrap();
+        if !set.insert(project_id.to_string()) {
+            anyhow::bail!("a restore is already in progress for this project");
+        }
+    }
+    let _guard = RestoreGuard(ctx.restoring.clone(), project_id.to_string());
+
     let backup = ctx
         .store
         .get_db_backup(project_id, backup_id)?
@@ -4027,24 +4075,50 @@ async fn run_db_restore(ctx: DbBackupCtx, project_id: String, backup_id: String)
     }
 }
 
-/// Keep the newest [`DB_BACKUP_KEEP`] backups for a project; delete older rows + their blobs.
+/// Bound the per-project catalog: keep the newest [`DB_BACKUP_KEEP`] COMPLETE backups + any fresh
+/// (in-flight) Pending row, and delete everything else — all Failed rows, stale Pending rows
+/// (a crashed backup), and Complete rows beyond the retention bound — along with their blobs. Run
+/// after every attempt, so a run of failures can't wedge the row cap and disable backups.
 async fn prune_db_backups(ctx: &DbBackupCtx, project_id: &str) {
     let backups = match ctx.store.list_db_backups(project_id) {
-        Ok(b) => b,
+        Ok(b) => b, // newest-first
         Err(_) => return,
     };
-    for old in backups.into_iter().skip(DB_BACKUP_KEEP) {
-        let _ = ctx.backups.delete(project_id, &old.backup_id).await;
-        let _ = ctx.store.delete_db_backup(project_id, &old.backup_id);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut kept_complete = 0usize;
+    for b in backups {
+        use jkbase_control::store::BackupStatus;
+        let keep = match b.status {
+            BackupStatus::Complete => {
+                kept_complete += 1;
+                kept_complete <= DB_BACKUP_KEEP
+            }
+            // A fresh Pending is an in-flight backup — never delete it out from under a running
+            // pull; a stale one (crashed) is swept.
+            BackupStatus::Pending => {
+                now_ms.saturating_sub(b.created_at_ms)
+                    < jkbase_control::store::Store::BACKUP_STALE_MS
+            }
+            BackupStatus::Failed => false,
+        };
+        if !keep {
+            let _ = ctx.backups.delete(project_id, &b.backup_id).await;
+            let _ = ctx.store.delete_db_backup(project_id, &b.backup_id);
+        }
     }
 }
 
 /// Nightly automatic backups ([RB12]): each tick, back up every managed-DB project whose newest
-/// Complete backup is older than [`DB_BACKUP_INTERVAL_MS`] (or has none), bounded by a
-/// concurrency semaphore so waking DBs to snapshot them can't stampede. Single-host owns all
-/// projects today (mirrors `scheduler_loop`); a future HA layer gates on ownership.
+/// TERMINAL (Complete or Failed) backup is older than [`DB_BACKUP_INTERVAL_MS`] (or has none),
+/// skipping any project with a backup already in flight. Concurrency is bounded inside
+/// `run_db_backup` by the host-wide `backup_sem` (shared with on-demand). Considering Failed too
+/// gives a failing project a full interval of backoff instead of re-firing every 30-min tick.
+/// Single-host owns all projects today (mirrors `scheduler_loop`); a future HA layer gates on
+/// ownership.
 async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
-    let sem = Arc::new(tokio::sync::Semaphore::new(DB_BACKUP_MAX_CONCURRENT));
     loop {
         tokio::time::sleep(DB_BACKUP_TICK).await;
         let now_ms = std::time::SystemTime::now()
@@ -4064,11 +4138,18 @@ async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
             if !matches!(ctx.store.get_db_admin_token(&pid), Ok(Some(_))) {
                 continue;
             }
+            // Skip if a backup is already in flight (single-flight, shared with on-demand).
+            if matches!(ctx.store.has_active_backup(&pid), Ok(true)) {
+                continue;
+            }
             let due = match ctx.store.list_db_backups(&pid) {
-                Ok(list) => match list
-                    .iter()
-                    .find(|b| b.status == jkbase_control::store::BackupStatus::Complete)
-                {
+                Ok(list) => match list.iter().find(|b| {
+                    matches!(
+                        b.status,
+                        jkbase_control::store::BackupStatus::Complete
+                            | jkbase_control::store::BackupStatus::Failed
+                    )
+                }) {
                     Some(b) => now_ms.saturating_sub(b.created_at_ms) >= DB_BACKUP_INTERVAL_MS,
                     None => true,
                 },
@@ -4085,15 +4166,8 @@ async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
                     continue;
                 }
             };
-            let Ok(permit) = sem.clone().acquire_owned().await else {
-                break;
-            };
-            let ctx2 = ctx.clone();
-            let backup_id = row.backup_id.clone();
-            tokio::spawn(async move {
-                let _permit = permit; // held for the backup's duration (bounds concurrency)
-                run_db_backup(ctx2, pid, backup_id).await;
-            });
+            // run_db_backup acquires the shared concurrency permit itself; spawn and move on.
+            tokio::spawn(run_db_backup(ctx.clone(), pid, row.backup_id.clone()));
         }
     }
 }

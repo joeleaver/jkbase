@@ -25,6 +25,32 @@ const DB_SERVER_NAME: &str = "rhypedb";
 /// untar renames into place atomically, so a partial/interrupted restore is never visible.
 const RHYPEDB_RESTORE_STAGING: &str = "/mnt/data/volumes/rhypedb-restore/snapshot";
 
+/// True if `dir` holds a COMPLETE rhypedb snapshot: a parseable `MANIFEST.json` plus every
+/// load-bearing file it vouches for (each listed SST under `sst/`, `wal.log`, `schema.rhype`).
+/// Used to gate restore-on-boot ([RB5]/[RB8]): a truncated/incomplete staged snapshot (missing
+/// SSTs) would make rhypedb fail-closed on open and, left armed, crash-loop the DB across
+/// reboots — so we only arm `RHYPEDB_RESTORE_FROM` when the snapshot is provably complete.
+pub(crate) fn snapshot_is_complete(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join("MANIFEST.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if !dir.join("wal.log").is_file() || !dir.join("schema.rhype").is_file() {
+        return false;
+    }
+    if let Some(ssts) = v.get("ssts").and_then(|s| s.as_array()) {
+        for s in ssts.iter().filter_map(|x| x.as_str()) {
+            let base = Path::new(s).file_name().and_then(|n| n.to_str()).unwrap_or(s);
+            if !dir.join("sst").join(base).is_file() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Build the managed-DB server manifest. Injects the per-deploy `RHYPEDB_ADMIN_TOKEN` (host-
 /// only, from the reserved channel — [RB1]) and, when a complete restore snapshot is staged,
 /// the `/restore` volume + `RHYPEDB_RESTORE_FROM(_FORCE)` so rhypedb restore-on-boots. rhypedb's
@@ -51,7 +77,7 @@ fn db_manifest(admin_token: Option<&str>) -> ServerManifest {
             mount: "/etc/rhypedb".into(),
         },
     ];
-    if Path::new(RHYPEDB_RESTORE_STAGING).join("MANIFEST.json").is_file() {
+    if snapshot_is_complete(Path::new(RHYPEDB_RESTORE_STAGING)) {
         volumes.push(VolumeMount {
             name: "rhypedb-restore".into(),
             mount: "/restore".into(),

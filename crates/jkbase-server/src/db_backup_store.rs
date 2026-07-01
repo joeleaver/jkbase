@@ -86,29 +86,39 @@ impl BackupStore {
             .context("create backup project dir")?;
         let final_path = self.object_path(project_id, backup_id)?;
         let tmp = dir.join(format!(".{backup_id}.tar.tmp"));
-        let mut f = tokio::fs::File::create(&tmp)
-            .await
-            .context("create backup tmp")?;
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut size: u64 = 0;
-        loop {
-            let n = reader.read(&mut buf).await.context("read backup stream")?;
-            if n == 0 {
-                break;
+        // Stream to the tmp file; on ANY error remove the tmp so a failed/aborted pull can't leak
+        // a partial multi-GiB file on the off-quota host disk (finding: .tmp leak).
+        let stream = async {
+            let mut f = tokio::fs::File::create(&tmp)
+                .await
+                .context("create backup tmp")?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut size: u64 = 0;
+            loop {
+                let n = reader.read(&mut buf).await.context("read backup stream")?;
+                if n == 0 {
+                    break;
+                }
+                size += n as u64;
+                if size > max_bytes {
+                    anyhow::bail!("backup exceeds {max_bytes} bytes");
+                }
+                f.write_all(&buf[..n]).await.context("write backup tmp")?;
             }
-            size += n as u64;
-            if size > max_bytes {
+            f.flush().await.context("flush backup tmp")?;
+            Ok::<u64, anyhow::Error>(size)
+        };
+        match stream.await {
+            Ok(size) => Ok(StagedBackup {
+                tmp,
+                final_path,
+                size_bytes: size,
+            }),
+            Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp).await;
-                anyhow::bail!("backup exceeds {max_bytes} bytes");
+                Err(e)
             }
-            f.write_all(&buf[..n]).await.context("write backup tmp")?;
         }
-        f.flush().await.context("flush backup tmp")?;
-        Ok(StagedBackup {
-            tmp,
-            final_path,
-            size_bytes: size,
-        })
     }
 
     /// Validate a staged tar ([RB8]) off the async thread and return its manifest summary.
@@ -152,29 +162,87 @@ impl BackupStore {
 
 }
 
+/// A real rhypedb backup MANIFEST.json is a few KB of metadata. Cap the read hard so a hostile
+/// guest can't declare a multi-GiB MANIFEST entry and OOM the shared host process — the tar bytes
+/// are wholly guest-controlled (the pull relays loopback:4200 opaquely), so this is on the
+/// adversarial path ([RB3]).
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Validate a completed backup tar and extract a one-line summary from its `MANIFEST.json`
-/// ([RB8]). rhypedb writes `MANIFEST.json` LAST, so its presence proves the stream wasn't
-/// truncated. Sync (tar is a blocking reader) — run under `spawn_blocking`. Errs if the tar is
-/// unreadable or has no `MANIFEST.json` (⇒ the backup is truncated/corrupt → not restorable).
+/// ([RB8]). Sync (tar is a blocking reader) — run under `spawn_blocking`.
+///
+/// Truncation-safe: `MANIFEST.json` is NOT reliably the last entry in the tar STREAM (rhypedb
+/// builds it with `append_dir_all`, i.e. unsorted `readdir` order — it is only written last to
+/// the on-disk temp dir for fsync durability), so its mere presence proves nothing. We therefore
+/// (1) iterate EVERY entry to the tar's end-of-archive marker, draining each entry's body so a
+/// mid-stream truncation surfaces as a hard error rather than a silent early stop, (2) cap the
+/// MANIFEST read so a giant manifest can't OOM the host, and (3) cross-check that every
+/// manifest-listed load-bearing file (SSTs + `wal.log` + `schema.rhype`) is actually present.
+/// A truncated/incomplete tar therefore fails validation and is never committed/restored.
 pub fn validate_and_summarize(tar_path: &Path) -> Result<String> {
+    use std::io::Read;
     let f = std::fs::File::open(tar_path).context("open backup for validation")?;
     let mut ar = tar::Archive::new(f);
-    let mut manifest_bytes: Option<Vec<u8>> = None;
+    let mut manifest: Option<serde_json::Value> = None;
+    // Basenames of every fully-read entry (rhypedb entries: `sst/<n>.sst`, `wal.log`,
+    // `schema.rhype`, `hnsw_*.bin`, `MANIFEST.json` — all with unique basenames).
+    let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in ar.entries().context("read backup entries")? {
+        // A truncation mid-entry / mid-header surfaces here or in the drain below as an Err —
+        // exactly the end-of-archive validation [RB8] requires.
         let mut entry = entry.context("read backup entry (truncated?)")?;
         let path = entry.path().context("backup entry path")?;
-        if path.file_name().and_then(|n| n.to_str()) == Some("MANIFEST.json") {
-            use std::io::Read;
+        let base = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        if base.as_deref() == Some("MANIFEST.json") && manifest.is_none() {
+            if entry.header().size().unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
+                anyhow::bail!("backup MANIFEST.json is implausibly large (rejecting)");
+            }
             let mut b = Vec::new();
-            entry.read_to_end(&mut b).context("read MANIFEST.json")?;
-            manifest_bytes = Some(b);
-            break;
+            entry
+                .by_ref()
+                .take(MAX_MANIFEST_BYTES)
+                .read_to_end(&mut b)
+                .context("read MANIFEST.json")?;
+            manifest = Some(serde_json::from_slice(&b).context("parse backup MANIFEST.json")?);
+        } else {
+            // Drain the body to advance to the next header AND force the tar reader to detect a
+            // truncated final entry. Discarded (never buffered).
+            std::io::copy(&mut entry, &mut std::io::sink()).context("read backup entry body")?;
+        }
+        if let Some(b) = base {
+            present.insert(b);
         }
     }
-    let bytes = manifest_bytes
-        .ok_or_else(|| anyhow::anyhow!("backup is incomplete: no MANIFEST.json (truncated stream)"))?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parse backup MANIFEST.json")?;
+    let v =
+        manifest.ok_or_else(|| anyhow::anyhow!("backup is incomplete: no MANIFEST.json"))?;
+    // Cross-check completeness: every load-bearing file the manifest vouches for must be present
+    // (a clean end-of-archive that dropped trailing entries would still be caught here).
+    let mut missing: Vec<String> = Vec::new();
+    if let Some(ssts) = v.get("ssts").and_then(|s| s.as_array()) {
+        for s in ssts.iter().filter_map(|x| x.as_str()) {
+            let base = std::path::Path::new(s)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(s);
+            if !present.contains(base) {
+                missing.push(format!("sst/{base}"));
+            }
+        }
+    }
+    for req in ["wal.log", "schema.rhype"] {
+        if !present.contains(req) {
+            missing.push(req.to_string());
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "backup is incomplete (truncated?) — missing: {}",
+            missing.join(", ")
+        );
+    }
     let ssts = v.get("ssts").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0);
     let max_version = v.get("max_version").and_then(|x| x.as_u64()).unwrap_or(0);
     let migrating = v
@@ -257,24 +325,92 @@ mod tests {
         assert!(store.stage("p", "bkp_1_a", &mut src, 1024).await.is_err());
     }
 
-    #[tokio::test]
-    async fn validate_rejects_non_tar_and_missing_manifest() {
-        let dir = TmpDir::new();
-        let store = BackupStore::new(dir.path());
-        // A tar with files but NO MANIFEST.json ⇒ treated as truncated/incomplete ([RB8]).
-        let mut tar_bytes = Vec::new();
+    /// Build a rhypedb-shaped backup tar containing exactly `entries` (name → bytes) plus a
+    /// MANIFEST.json listing `manifest_ssts` (unless `omit_manifest`).
+    fn make_tar(entries: &[(&str, &[u8])], manifest_ssts: &[&str], omit_manifest: bool) -> Vec<u8> {
+        let mut out = Vec::new();
         {
-            let mut b = tar::Builder::new(&mut tar_bytes);
-            let data = b"sst-bytes";
-            let mut h = tar::Header::new_gnu();
-            h.set_size(data.len() as u64);
-            h.set_cksum();
-            b.append_data(&mut h, "sst/1.sst", &data[..]).unwrap();
+            let mut b = tar::Builder::new(&mut out);
+            let append = |b: &mut tar::Builder<&mut Vec<u8>>, name: &str, data: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_cksum();
+                b.append_data(&mut h, name, data).unwrap();
+            };
+            for (name, data) in entries {
+                append(&mut b, name, data);
+            }
+            if !omit_manifest {
+                let m = serde_json::json!({
+                    "ssts": manifest_ssts, "max_version": 5, "in_flight_migrations": [],
+                });
+                let mb = serde_json::to_vec(&m).unwrap();
+                append(&mut b, "MANIFEST.json", &mb);
+            }
             b.finish().unwrap();
         }
-        let mut src = std::io::Cursor::new(tar_bytes);
-        let staged = store.stage("p", "bkp_1_a", &mut src, 1 << 20).await.unwrap();
+        out
+    }
+
+    async fn stage_tar(store: &BackupStore, id: &str, bytes: Vec<u8>) -> StagedBackup {
+        let mut src = std::io::Cursor::new(bytes);
+        store.stage("p", id, &mut src, 1 << 20).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_a_complete_backup() {
+        let dir = TmpDir::new();
+        let store = BackupStore::new(dir.path());
+        let tar = make_tar(
+            &[
+                ("sst/1.sst", b"a"),
+                ("sst/2.sst", b"bb"),
+                ("wal.log", b"w"),
+                ("schema.rhype", b"type X {}"),
+            ],
+            &["1.sst", "2.sst"],
+            false,
+        );
+        let staged = stage_tar(&store, "bkp_ok", tar).await;
+        let summary = store.validate(&staged).await.unwrap();
+        assert!(summary.contains("ssts=2"), "{summary}");
+        store.discard(staged).await;
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_missing_manifest() {
+        let dir = TmpDir::new();
+        let store = BackupStore::new(dir.path());
+        let tar = make_tar(&[("sst/1.sst", b"a"), ("wal.log", b"w")], &["1.sst"], true);
+        let staged = stage_tar(&store, "bkp_nomani", tar).await;
         assert!(store.validate(&staged).await.is_err(), "no MANIFEST.json ⇒ incomplete");
+        store.discard(staged).await;
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_manifest_present_but_sst_missing() {
+        // [RB8] the core truncation case: MANIFEST.json made it (it is NOT last in the stream)
+        // but a manifest-listed SST did not. Must be rejected, not committed Complete.
+        let dir = TmpDir::new();
+        let store = BackupStore::new(dir.path());
+        let tar = make_tar(
+            &[("wal.log", b"w"), ("schema.rhype", b"type X {}")],
+            &["1.sst", "2.sst"], // manifest promises 2 ssts, tar has none
+            false,
+        );
+        let staged = stage_tar(&store, "bkp_trunc", tar).await;
+        let err = store.validate(&staged).await.unwrap_err().to_string();
+        assert!(err.contains("incomplete") && err.contains("sst/1.sst"), "{err}");
+        store.discard(staged).await;
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_missing_wal_or_schema() {
+        let dir = TmpDir::new();
+        let store = BackupStore::new(dir.path());
+        let tar = make_tar(&[("sst/1.sst", b"a")], &["1.sst"], false); // no wal.log/schema.rhype
+        let staged = stage_tar(&store, "bkp_nowal", tar).await;
+        assert!(store.validate(&staged).await.is_err());
         store.discard(staged).await;
     }
 }

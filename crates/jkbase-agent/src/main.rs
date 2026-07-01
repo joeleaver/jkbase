@@ -1397,9 +1397,14 @@ where
     .await
     .context("untar task join")??;
     let _ = std::fs::remove_file(&tar_path);
-    if !incoming.join("MANIFEST.json").is_file() {
+    // Require a COMPLETE snapshot (MANIFEST.json + every listed SST + wal.log + schema.rhype),
+    // not just a MANIFEST.json — a stream truncated at a tar-entry boundary after MANIFEST but
+    // before an SST unpacks cleanly yet is unrestorable. Publishing it would brick the DB boot
+    // (rhypedb fail-closes, and db_manifest would re-arm the restore every boot). Refuse instead,
+    // so the DB simply boots its pre-restore data.
+    if !container_supervisor::snapshot_is_complete(&incoming) {
         let _ = std::fs::remove_dir_all(&incoming);
-        anyhow::bail!("pushed archive is not a complete backup (no MANIFEST.json)");
+        anyhow::bail!("pushed archive is not a complete backup (truncated / missing files)");
     }
 
     // Atomically publish: only a complete snapshot ever becomes `snapshot/`, so a partial

@@ -3160,16 +3160,24 @@ async fn trigger_db_backup(
             .into_response();
     };
 
-    let backup_id = crate::auth::generate_backup_id();
-    // Server-authored object key ([RB6]) — the caller never supplies a storage path.
-    let object_key = format!("{id}/{backup_id}.tar");
-    match state
-        .store
-        .create_db_backup(&id, &tenant.id, &backup_id, &object_key)
-    {
+    // Single-flight: refuse a new backup while one is already in progress, so a tenant can't
+    // accumulate concurrent full-DB pulls into off-quota host disk (adversarial-review finding).
+    if matches!(state.store.has_active_backup(&id), Ok(true)) {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "a backup is already in progress for this project".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Server-authored id + object key ([RB6]) — the caller never supplies a storage path.
+    match state.store.create_db_backup_auto(&id, &tenant.id) {
         Ok(row) => {
+            let backup_id = row.backup_id.clone();
             info!(project = %id, backup_id = %backup_id, "managed-db backup requested");
-            cb(id.clone(), backup_id.clone());
+            cb(id.clone(), backup_id);
             (StatusCode::ACCEPTED, Json(DbBackupResponse::from(row))).into_response()
         }
         Err(e) => (
