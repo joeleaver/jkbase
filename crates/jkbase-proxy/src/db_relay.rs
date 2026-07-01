@@ -26,6 +26,11 @@ pub struct DbRelayRegistry {
 struct Inner {
     next_id: u64,
     by_project: HashMap<String, Vec<Entry>>,
+    /// Set once the graceful-drain sweep ([`Self::cancel_all`]) has run. A relay that
+    /// registers AFTER that one-shot sweep would otherwise never be signalled and would
+    /// pin the drain barrier until the hard `DRAIN_GRACE` exit; so once draining, every
+    /// new registration is cancelled at birth.
+    draining: bool,
 }
 
 struct Entry {
@@ -41,23 +46,43 @@ impl DbRelayRegistry {
             inner: Mutex::new(Inner {
                 next_id: 0,
                 by_project: HashMap::new(),
+                draining: false,
             }),
         })
     }
 
-    /// Register a live relay for `project_id` authorized by `akid`. Returns the RAII
-    /// [`RelayGuard`] (hold it for the relay's lifetime) and the [`CancellationToken`]
-    /// the relay must force-close on.
-    pub fn register(
+    /// Atomically reserve a live-relay slot for `project_id` authorized by `akid`, enforcing
+    /// `per_project_max` UNDER THE SAME LOCK as the insert. Returns `None` if the project is
+    /// already at its cap. On success, returns the RAII [`RelayGuard`] (hold it for the
+    /// relay's lifetime — drop decrements the gauge) and the [`CancellationToken`] the relay
+    /// must force-close on.
+    ///
+    /// Folding the cap check into the insert is load-bearing: a check-then-register split
+    /// (read `conn_count`, `.await` a wake, then register) is a TOCTOU that lets many
+    /// concurrent connections for one project all observe `< max` and blow past the cap,
+    /// monopolizing the shared global pool. Callers MUST register through this BEFORE any
+    /// wake `.await`, so the relay is visible to `cancel_key`/`cancel_project` for the whole
+    /// setup window (else revocation during setup misses it — [R5]).
+    pub fn try_register(
         self: &Arc<Self>,
         project_id: &str,
         akid: &str,
-    ) -> (RelayGuard, CancellationToken) {
+        per_project_max: usize,
+    ) -> Option<(RelayGuard, CancellationToken)> {
         let cancel = CancellationToken::new();
         let id = {
             let mut inner = self.inner.lock().unwrap();
+            let count = inner
+                .by_project
+                .get(project_id)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= per_project_max {
+                return None;
+            }
             let id = inner.next_id;
             inner.next_id += 1;
+            let draining = inner.draining;
             inner
                 .by_project
                 .entry(project_id.to_string())
@@ -67,16 +92,22 @@ impl DbRelayRegistry {
                     akid: akid.to_string(),
                     cancel: cancel.clone(),
                 });
+            // [R-drain] Registered into an already-draining registry ⇒ the one-shot
+            // `cancel_all` sweep has passed; cancel at birth so this relay can't pin the
+            // drain barrier past the hard exit.
+            if draining {
+                cancel.cancel();
+            }
             id
         };
-        (
+        Some((
             RelayGuard {
                 registry: self.clone(),
                 project_id: project_id.to_string(),
                 id,
             },
             cancel,
-        )
+        ))
     }
 
     /// Live relay count for `project_id`. The idle loop excludes a project with `> 0`
@@ -132,9 +163,12 @@ impl DbRelayRegistry {
         }
     }
 
-    /// [R-drain] Cancel ALL live relays (graceful-drain deadline). Returns the count.
+    /// [R-drain] Cancel ALL live relays (graceful-drain deadline) and mark the registry
+    /// draining so any relay that registers after this sweep is cancelled at birth (closing
+    /// the shutdown-window race). Returns the count signalled in this sweep.
     pub fn cancel_all(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.draining = true;
         let mut n = 0;
         for entries in inner.by_project.values() {
             for e in entries {
@@ -170,12 +204,15 @@ impl Drop for RelayGuard {
 mod tests {
     use super::*;
 
+    // A generous cap for tests that don't exercise the per-project limit.
+    const MAX: usize = 64;
+
     #[test]
     fn register_counts_and_raii_deregisters() {
         let reg = DbRelayRegistry::new();
         assert_eq!(reg.conn_count("p"), 0);
-        let (g1, _t1) = reg.register("p", "JKBDaaa");
-        let (g2, _t2) = reg.register("p", "JKBDbbb");
+        let (g1, _t1) = reg.try_register("p", "JKBDaaa", MAX).unwrap();
+        let (g2, _t2) = reg.try_register("p", "JKBDbbb", MAX).unwrap();
         assert_eq!(reg.conn_count("p"), 2);
         assert_eq!(reg.total(), 2);
         drop(g1);
@@ -187,11 +224,28 @@ mod tests {
     }
 
     #[test]
+    fn per_project_cap_is_enforced_atomically_in_register() {
+        let reg = DbRelayRegistry::new();
+        // Fill a project to its cap of 2.
+        let (_g1, _t1) = reg.try_register("p", "k", 2).unwrap();
+        let (g2, _t2) = reg.try_register("p", "k", 2).unwrap();
+        // The 3rd is refused — the cap is checked under the same lock as the insert, so
+        // concurrent registrations can't all slip past a stale count.
+        assert!(reg.try_register("p", "k", 2).is_none());
+        assert_eq!(reg.conn_count("p"), 2);
+        // A different project has its own budget.
+        assert!(reg.try_register("q", "k", 2).is_some());
+        // Freeing a slot re-opens the project.
+        drop(g2);
+        assert!(reg.try_register("p", "k", 2).is_some());
+    }
+
+    #[test]
     fn cancel_key_signals_only_that_keys_relays() {
         let reg = DbRelayRegistry::new();
-        let (_g1, t1) = reg.register("p", "JKBDaaa");
-        let (_g2, t2) = reg.register("p", "JKBDbbb");
-        let (_g3, t3) = reg.register("q", "JKBDaaa");
+        let (_g1, t1) = reg.try_register("p", "JKBDaaa", MAX).unwrap();
+        let (_g2, t2) = reg.try_register("p", "JKBDbbb", MAX).unwrap();
+        let (_g3, t3) = reg.try_register("q", "JKBDaaa", MAX).unwrap();
         assert!(!t1.is_cancelled() && !t2.is_cancelled() && !t3.is_cancelled());
         // Revoking key aaa cancels its relays across ALL projects, not key bbb's.
         assert_eq!(reg.cancel_key("JKBDaaa"), 2);
@@ -203,13 +257,24 @@ mod tests {
     #[test]
     fn cancel_project_and_all_are_scoped() {
         let reg = DbRelayRegistry::new();
-        let (_gp, tp) = reg.register("p", "k");
-        let (_gq, tq) = reg.register("q", "k");
+        let (_gp, tp) = reg.try_register("p", "k", MAX).unwrap();
+        let (_gq, tq) = reg.try_register("q", "k", MAX).unwrap();
         assert_eq!(reg.cancel_project("p"), 1);
         assert!(tp.is_cancelled());
         assert!(!tq.is_cancelled());
         // cancel_all gets the remainder.
         assert_eq!(reg.cancel_all(), 2); // both entries still registered (tasks not yet unwound)
         assert!(tq.is_cancelled());
+    }
+
+    #[test]
+    fn registering_after_drain_is_cancelled_at_birth() {
+        let reg = DbRelayRegistry::new();
+        // Drain sweep runs (0 live relays), marking the registry draining.
+        assert_eq!(reg.cancel_all(), 0);
+        // A relay that registers in the shutdown window is cancelled immediately, so it
+        // can't pin the drain barrier past the hard deadline.
+        let (_g, t) = reg.try_register("p", "k", MAX).unwrap();
+        assert!(t.is_cancelled());
     }
 }

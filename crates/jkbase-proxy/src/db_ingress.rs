@@ -31,6 +31,11 @@ use tracing::{debug, warn};
 const DB_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Hard deadline on the handshake→preamble read of an UNAUTHENTICATED connection ([R6]).
 const PREAMBLE_DEADLINE: Duration = Duration::from_secs(10);
+/// Hard deadline on the post-auth backend leg (agent TCP connect + HTTP/1.1 upgrade). A
+/// woken agent that accepts the TCP but stalls its `101` must not pin the shared global
+/// permit + the gauge entry forever on an unbreakable await. Sized well above a healthy
+/// wake+upgrade but far below "indefinite".
+const CONNECT_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The edge half of the reach plane. Built once (in `serve`) from the proxy config and
 /// shared across all DB connections.
@@ -110,8 +115,8 @@ impl DbIngress {
         // Authenticate: lookup akid → verify secret fingerprint → SNI==key-project ([R1])
         // → owner re-bind. The AUTHORITATIVE project is the KEY's, returned here.
         let ok = (self.auth)(&preamble.akid, &preamble.secret, &claimed).ok_or("auth rejected")?;
-        let project_id = ok.project_id;
-        let akid = preamble.akid;
+        let project_id = ok.project_id.clone();
+        let akid = preamble.akid.clone();
 
         // Authenticated → free the unauth slot; take the post-auth ceilings.
         drop(preauth);
@@ -120,36 +125,68 @@ impl DbIngress {
             .clone()
             .try_acquire_owned()
             .map_err(|_| "global db cap reached")?;
-        if self.registry.conn_count(&project_id) >= self.per_project_max {
-            return Err("per-project db cap reached");
+
+        // Reserve the live-relay slot NOW — BEFORE any wake `.await` — with the per-project
+        // cap enforced atomically inside `try_register`. Two invariants ride on this order:
+        //  • the per-project cap can't be TOCTOU'd by concurrent connects that all read a
+        //    stale `conn_count < max` before any of them registers, and
+        //  • the relay is visible to `cancel_key`/`cancel_project` for the ENTIRE setup
+        //    window (wake + connect), so a revocation during setup tears it down ([R5]).
+        let (guard, cancel) = self
+            .registry
+            .try_register(&project_id, &akid, self.per_project_max)
+            .ok_or("per-project db cap reached")?;
+
+        // Close the auth→register cross-thread race ([R5]): a revoke on another runtime
+        // thread that ran between the auth read above and the register just now would have
+        // (a) missed this connection (nothing registered to cancel) AND (b) deleted the key.
+        // Re-validate now that we ARE registered: any `cancel_key` that runs after our
+        // register will find us; any `delete` that ran before this re-check is seen here. So
+        // no interleaving lets a revoked key keep a live relay. `guard` drops (deregisters)
+        // on the early return.
+        if (self.auth)(&preamble.akid, &preamble.secret, &claimed).is_none() {
+            return Err("key revoked during setup");
         }
 
         // [R7] AUTH BEFORE WAKE — a woken VM is a real cost; never on an unauth connection.
-        let vm_ip = match (self.wake)(project_id.clone()).await {
-            Ok(ip) => ip,
-            Err(WakeError::OverQuota(m)) => {
-                debug!(project = %project_id, %m, "db wake over quota");
-                return Err("over quota");
-            }
-            Err(WakeError::Unavailable(m)) => {
-                debug!(project = %project_id, %m, "db wake unavailable");
-                return Err("unavailable");
-            }
-            Err(WakeError::Gone(m)) => {
-                debug!(project = %project_id, %m, "db wake gone");
-                return Err("gone");
-            }
+        // Selectable on `cancel` so a revocation mid-wake aborts instead of waiting out a
+        // full VM restore.
+        let vm_ip = tokio::select! {
+            _ = cancel.cancelled() => return Err("cancelled during wake"),
+            woke = (self.wake)(project_id.clone()) => match woke {
+                Ok(ip) => ip,
+                Err(WakeError::OverQuota(m)) => {
+                    debug!(project = %project_id, %m, "db wake over quota");
+                    return Err("over quota");
+                }
+                Err(WakeError::Unavailable(m)) => {
+                    debug!(project = %project_id, %m, "db wake unavailable");
+                    return Err("unavailable");
+                }
+                Err(WakeError::Gone(m)) => {
+                    debug!(project = %project_id, %m, "db wake gone");
+                    return Err("gone");
+                }
+            },
         };
 
         // Stamp post-wake so the idle loop doesn't hibernate the VM out from under us.
         self.stamp(&project_id).await;
 
-        // Register the live relay: gauge++ (excludes from hibernation, §5) + a cancel
-        // token the drain ([R-drain]) and key/project revocation ([R5]) close it through.
-        let (guard, cancel) = self.registry.register(&project_id, &akid);
-
-        // Connect the agent backend leg, presenting the splice secret ([R3]).
-        let mut backend = self.connect_agent(&vm_ip, &ok.splice_secret).await?;
+        // Connect the agent backend leg, presenting the splice secret ([R3]). Bounded by a
+        // deadline AND selectable on `cancel`, so a stalled agent (or a revocation) can't
+        // pin the shared global permit + gauge on an unbreakable await.
+        let mut backend = tokio::select! {
+            _ = cancel.cancelled() => return Err("cancelled during agent connect"),
+            res = tokio::time::timeout(
+                CONNECT_DEADLINE,
+                self.connect_agent(&vm_ip, &ok.splice_secret),
+            ) => match res {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err("agent connect timeout"),
+            },
+        };
 
         // [R-relay] Flush any bytes the client pipelined after the preamble first.
         if !leftover.is_empty() && backend.write_all(&leftover).await.is_err() {
