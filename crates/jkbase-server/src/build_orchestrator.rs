@@ -5966,6 +5966,7 @@ console.log("listening on " + port);
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
+        let sidecar_log = fx.data.join("dbreach-sidecar.log");
         let mut sidecar = tokio::process::Command::new(&cli)
             .args([
                 "db",
@@ -5983,6 +5984,8 @@ console.log("listening on " + port);
                 "--ca-file",
                 ca_path.to_str().unwrap(),
             ])
+            .stdout(std::fs::File::create(&sidecar_log).unwrap())
+            .stderr(std::fs::File::create(fx.data.join("dbreach-sidecar.err")).unwrap())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn jkbase db proxy");
@@ -6022,6 +6025,12 @@ console.log("listening on " + port);
         let _ = vm.stop().await;
         let _ = sh("ip", &["link", "del", &tap]).await;
         std::fs::write("/etc/hosts", hosts_before).ok(); // restore exactly
+        // Surface the sidecar's own output on failure (it's the most opaque hop).
+        if probe_out.is_empty() {
+            if let Ok(err) = std::fs::read_to_string(fx.data.join("dbreach-sidecar.err")) {
+                eprintln!("[reach-e2e] sidecar stderr:\n{}", err.trim());
+            }
+        }
         let _ = std::fs::remove_dir_all(&fx.staged);
 
         assert_eq!(
