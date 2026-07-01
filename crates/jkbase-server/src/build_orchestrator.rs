@@ -5735,6 +5735,14 @@ console.log("listening on " + port);
     /// loopback test above (which proves the DB boots + persists), this proves the reach
     /// plane is *usable* from outside the VM with the real client wire.
     ///
+    /// It THEN proves managed-DB BACKUP + RESTORE end-to-end: standing in for the server-side
+    /// executor, it pulls a snapshot off the agent's `/_jkbase/db/backup` (which authorizes the
+    /// loopback `/admin/backup/stream` with the injected admin token) into the platform
+    /// `BackupStore` + validates it, MUTATES the DB (adds `beta`), then pushes the snapshot to
+    /// `/_jkbase/db/restore` (agent untars in-guest + respawns rhypedb via `RHYPEDB_RESTORE_FROM`)
+    /// and observes the DB REVERT to the backup state (`alpha` only) — proving admin-token
+    /// injection, the pull, tar validation, and a real in-guest restore respawn.
+    ///
     /// It orchestrates the REAL binaries as subprocesses (like the other on-box tests locate
     /// JKB_AGENT/JKB_ROOTFS): the built `jkbase` CLI (`JKB_CLI`) and a tiny helper that links
     /// the real `rhypedb-client` (`RHYPEDB_PROBE`, from `tools/rhypedb-probe`). The host side
@@ -5806,6 +5814,9 @@ console.log("listening on " + port);
         let akid = "JKBDreach0e2e000000f";
         let owner_secret = "jkbd_reach-e2e-owner-secret-value";
         let splice_secret = "reach-e2e-splice-secret-0123456789abcdef";
+        // The per-deploy rhypedb admin token — baked into _db_reach.json so the agent injects it
+        // as RHYPEDB_ADMIN_TOKEN AND uses it to authorize the loopback /admin/backup/stream pull.
+        let admin_token = "jkba_reach-e2e-admin-token-0123456789abcdef";
 
         let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, true, true)
             .expect("compute layer plan with a managed DB + data disk");
@@ -5823,7 +5834,7 @@ console.log("listening on " + port);
             // `/_jkbase/db` handler will require on the backend upgrade.
             Some(&jkbase_common::config::DbReachFacts {
                 splice_secret: splice_secret.to_string(),
-                admin_token: String::new(),
+                admin_token: admin_token.to_string(),
             }),
             &meta_img,
         )
@@ -6018,6 +6029,93 @@ console.log("listening on " + port);
             tokio::time::sleep(Duration::from_millis(1500)).await;
         }
 
+        // ---- Managed-DB BACKUP + RESTORE over the direct host<->agent channels ----
+        // Only meaningful once the alpha round-trip proved the DB is up + reachable. The test
+        // stands in for the server-side executor: connect the agent's eth0 `/_jkbase/db/backup`
+        // + `/_jkbase/db/restore` with the baked splice secret and drive the real
+        // BackupStore/validate path. A full round-trip proves: admin-token injection into
+        // rhypedb, the pull of `/admin/backup/stream`, tar validation, and a real restore
+        // (mutate the DB, restore the earlier snapshot, observe it revert).
+        let mut backup_summary = String::new();
+        let mut after_beta = String::new();
+        let mut after_restore = String::new();
+        if probe_out == "users=alpha count=1" {
+            let backups =
+                crate::db_backup_store::BackupStore::new(&fx.data.join("dbreach-backups"));
+            let backup_id = "bkp_0000000000001_e2eaaaaa";
+            let local = format!("127.0.0.1:{local_port}");
+
+            // BACKUP: pull the tar off the agent, then validate + commit it.
+            match async {
+                let mut up = crate::connect_agent_db_upgrade(
+                    guest_ip,
+                    "/_jkbase/db/backup",
+                    splice_secret,
+                    "jkbase-db-backup",
+                )
+                .await?;
+                let staged = backups.stage("testproj", backup_id, &mut up, 1 << 30).await?;
+                let summary = backups.validate(&staged).await?;
+                backups.commit(staged).await?;
+                Ok::<String, anyhow::Error>(summary)
+            }
+            .await
+            {
+                Ok(s) => backup_summary = s,
+                Err(e) => eprintln!("[backup-e2e] backup failed: {e:#}"),
+            }
+
+            // Mutate: add `beta`, so the DB (alpha+beta) now differs from the backup (alpha).
+            if let Ok(out) = tokio::process::Command::new(&probe)
+                .args([local.as_str(), "create", "beta"])
+                .output()
+                .await
+            {
+                after_beta = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+
+            // RESTORE the earlier snapshot; the agent untars it in-guest + respawns rhypedb.
+            let restore_status = async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut tar = backups.open_read("testproj", backup_id).await?;
+                let mut up = crate::connect_agent_db_upgrade(
+                    guest_ip,
+                    "/_jkbase/db/restore",
+                    splice_secret,
+                    "jkbase-db-restore",
+                )
+                .await?;
+                tokio::io::copy(&mut tar, &mut up).await?;
+                up.shutdown().await?;
+                let mut status = String::new();
+                up.read_to_string(&mut status).await?;
+                Ok::<String, anyhow::Error>(status.trim().to_string())
+            }
+            .await;
+
+            match restore_status {
+                Ok(status) => {
+                    // After restore, list the DB (retry across the DB respawn/warmup window).
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(out) = tokio::process::Command::new(&probe)
+                            .args([local.as_str(), "list"])
+                            .output()
+                            .await
+                        {
+                            let o = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if out.status.success() && o.starts_with("users=") {
+                                after_restore = format!("restore={status} {o}");
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                }
+                Err(e) => eprintln!("[backup-e2e] restore failed: {e:#}"),
+            }
+        }
+
         // ---- Cleanup BEFORE asserting (mirror the loopback test) so a failed assert can't
         //      leak the tap / /etc/hosts line / child processes.
         let _ = sidecar.start_kill();
@@ -6040,6 +6138,26 @@ console.log("listening on " + port);
              (sidecar -> TLS edge -> agent /_jkbase/db splice -> loopback rhypedb :4201)"
         );
         println!("PASS: reach-plane e2e — real @rhypedb/client round-trip through {probe_out:?}");
+
+        // ---- Backup + restore assertions (the DB was alive for the whole phase above) ----
+        assert!(
+            backup_summary.contains("ssts="),
+            "backup must pull a VALID tar off the agent (admin-token inject + /admin/backup/stream \
+             + host validation); got {backup_summary:?}"
+        );
+        assert_eq!(
+            after_beta, "users=alpha,beta count=2",
+            "mutation before restore must add `beta` (DB now differs from the backup)"
+        );
+        assert_eq!(
+            after_restore, "restore=ok users=alpha count=1",
+            "restore must push the snapshot to the agent, respawn rhypedb from it, and REVERT the \
+             DB to the backup state (alpha only, beta gone)"
+        );
+        println!(
+            "PASS: backup+restore e2e — {backup_summary:?}; post-mutation {after_beta:?}; \
+             post-restore {after_restore:?}"
+        );
     }
 
     /// Networked — the real-dependency proof. A Bun server importing `ms` is built
