@@ -1591,6 +1591,14 @@ async fn async_main() -> Result<()> {
         max_concurrent_upgrades: 1024,
         http_listener: proxy_http_listener,
         https_listener: proxy_https_listener,
+        // Managed-DB reach plane wired live in a follow-up (registry + auth callback +
+        // idle-loop gauge + revocation). Until then the ingress is dormant: a
+        // `jkbase-db`-ALPN connection is dropped at the demux.
+        db_auth_callback: None,
+        db_relay_registry: None,
+        db_max_concurrent: 1024,
+        db_preauth_max: 256,
+        db_max_per_project: 64,
     };
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();

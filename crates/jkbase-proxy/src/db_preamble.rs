@@ -335,7 +335,7 @@ mod tests {
     fn encode_rejects_oversized_fields() {
         assert!(encode_preamble(&"a".repeat(MAX_AKID_LEN + 1), "s", &[1]).is_none());
         assert!(encode_preamble("a", &"s".repeat(MAX_SECRET_LEN + 1), &[1]).is_none());
-        assert!(encode_preamble("a", "s", &vec![1u8; MAX_EXPORTER_LEN + 1]).is_none());
+        assert!(encode_preamble("a", "s", &[1u8; MAX_EXPORTER_LEN + 1]).is_none());
         assert!(encode_preamble("", "s", &[1]).is_none());
     }
 
