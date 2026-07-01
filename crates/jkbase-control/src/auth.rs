@@ -119,6 +119,20 @@ pub fn generate_splice_secret() -> String {
     )
 }
 
+/// Mint a per-deploy rhypedb admin bearer (256-bit) — the `RHYPEDB_ADMIN_TOKEN` the agent
+/// injects into the DB's process env to authorize `/admin/*` (backup stream) over loopback.
+/// Distinct `jkba_` prefix so a leaked value is self-identifying (vs the `jkbs_` splice
+/// secret). Stored host-side (control db + the per-VM metadata image), never tenant-facing,
+/// rotated every deploy so a leak dies at the next deploy ([RB1]).
+pub fn generate_rhypedb_admin_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "jkba_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 /// SHA-256 (hex) fingerprint of a high-entropy token, used to store and look up
 /// the per-project git-push token WITHOUT keeping the plaintext. A 256-bit random
 /// token makes SHA-256 preimage-resistant (unlike a low-entropy password, which
@@ -183,4 +197,26 @@ pub fn timestamp() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+/// Unix time in milliseconds — used where sub-second ordering matters (e.g. the managed-DB
+/// backup catalog's `created_at_ms`).
+pub fn timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Mint a managed-DB backup id: `bkp_<unix_ms>_<8 hex>`. Time-prefixed so ids sort by age,
+/// with random entropy so two backups in the same millisecond don't collide. Only
+/// `[a-z0-9_]`, so it is a safe object-store key component (`{project_id}/{backup_id}.tar`).
+pub fn generate_backup_id() -> String {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(16);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    format!("bkp_{}_{}", timestamp_ms(), hex)
 }

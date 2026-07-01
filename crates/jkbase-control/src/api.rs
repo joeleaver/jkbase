@@ -44,6 +44,18 @@ pub enum DbRevokeScope {
 /// control owns no proxy dependency (mirrors `CertRequest`).
 pub type DbRevokeCallback = Arc<dyn Fn(DbRevokeScope) + Send + Sync>;
 
+/// Kick off a managed-DB backup for `(project_id, backup_id)`: resolve the running VM, pull
+/// the tar from the in-VM DB's `/admin/backup/stream`, stream it into the platform backup
+/// store, and flip the catalog row to Complete/Failed. Fire-and-forget (the server impl
+/// spawns the executor; the CLI polls the catalog). Control owns no orch/object-store
+/// dependency — the server binary provides the impl (mirrors [`DbRevokeCallback`]).
+pub type DbBackupCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+
+/// Kick off a managed-DB restore of `backup_id` into `project_id`: read the tar from the
+/// platform store and push it to the agent, which untars it and respawns rhypedb with
+/// `RHYPEDB_RESTORE_FROM`. Fire-and-forget (the server impl spawns the executor).
+pub type DbRestoreCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+
 /// Inputs handed to the server-provided build orchestrator for one build job.
 pub struct BuildContext {
     pub project_id: String,
@@ -92,6 +104,11 @@ pub struct AppState {
     pub cert_status: Option<CertStatusFn>,
     /// Tears down live managed-DB relays on key revocation / project delete ([R5]).
     pub db_revoke_callback: Option<DbRevokeCallback>,
+    /// Runs a managed-DB backup (host-relay pull → platform store). `None` ⇒ backups disabled
+    /// on this server (`POST /db/backups` → 503).
+    pub db_backup_callback: Option<DbBackupCallback>,
+    /// Runs a managed-DB restore (host-push → in-guest untar). `None` ⇒ restore disabled.
+    pub db_restore_callback: Option<DbRestoreCallback>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     /// Optional platform-operator admin token (jkbase-server `--admin-token`).
@@ -172,6 +189,8 @@ impl AppState {
             cert_request: None,
             cert_status: None,
             db_revoke_callback: None,
+            db_backup_callback: None,
+            db_restore_callback: None,
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -290,6 +309,11 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             "/projects/{id}/db-keys/{akid}",
             axum::routing::delete(revoke_db_key),
         )
+        .route(
+            "/projects/{id}/db/backups",
+            get(list_db_backups).post(trigger_db_backup),
+        )
+        .route("/projects/{id}/db/restore", post(restore_db_backup))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
@@ -710,6 +734,11 @@ async fn create_project(
     let _ = state.store.delete_all_access_keys(&id);
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
+    // Managed-DB backups ([RB11]): drop the admin token + catalog rows, and reap the backup
+    // blobs, so a recreated same-slug project can't inherit a prior tenant's snapshots.
+    let _ = state.store.delete_db_admin_token(&id);
+    let _ = state.store.delete_all_db_backups(&id);
+    let _ = std::fs::remove_dir_all(data_dir(&state).join("db-backups").join(&id));
     // [R5] Drop any LIVE managed-DB relay for this project now that its credentials are gone.
     if let Some(cb) = &state.db_revoke_callback {
         cb(DbRevokeScope::Project(id.clone()));
@@ -869,6 +898,12 @@ async fn delete_project(
                     // same-slug project must not inherit a prior tenant's DB credential.
                     let _ = state.store.delete_all_db_access_keys(&id);
                     let _ = state.store.delete_db_splice_secret(&id);
+                    // Managed-DB backups ([RB11]): admin token + catalog rows + backup blobs.
+                    let _ = state.store.delete_db_admin_token(&id);
+                    let _ = state.store.delete_all_db_backups(&id);
+                    let _ =
+                        tokio::fs::remove_dir_all(data_dir(&state).join("db-backups").join(&id))
+                            .await;
                     // [R5] Drop any LIVE managed-DB relay now that credentials are gone.
                     if let Some(cb) = &state.db_revoke_callback {
                         cb(DbRevokeScope::Project(id.clone()));
@@ -3045,6 +3080,197 @@ async fn revoke_db_key(
         )
             .into_response(),
     }
+}
+
+// -- Managed-DB backups ([RB6]/[RB8]) --
+
+/// One catalog row, as surfaced to the owner. Never carries the object-store key or the
+/// tenant id — the caller identifies a backup only by its opaque `backup_id`.
+#[derive(Serialize)]
+struct DbBackupResponse {
+    backup_id: String,
+    created_at_ms: u64,
+    size_bytes: u64,
+    status: crate::store::BackupStatus,
+    manifest_summary: String,
+}
+
+impl From<crate::store::DbBackup> for DbBackupResponse {
+    fn from(b: crate::store::DbBackup) -> Self {
+        Self {
+            backup_id: b.backup_id,
+            created_at_ms: b.created_at_ms,
+            size_bytes: b.size_bytes,
+            status: b.status,
+            manifest_summary: b.manifest_summary,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RestoreRequest {
+    backup_id: String,
+}
+
+/// `POST /projects/{id}/db/backups` — trigger an on-demand backup of the project's managed
+/// DB. Owner-scoped. Records a `Pending` catalog row and fires the server-side executor
+/// (host-relay pull → platform store), returning immediately with the new `backup_id`; the
+/// caller polls `GET /db/backups` for completion. 400 if the project has no deployed managed
+/// DB (no admin token minted yet).
+async fn trigger_db_backup(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    // A managed DB that has been deployed since backups shipped has a minted admin token;
+    // without one there is nothing to back up (or the token needs a redeploy to rotate in).
+    match state.store.get_db_admin_token(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "project has no managed database, or it has not been redeployed since \
+                            backups were enabled (redeploy to enable backups)"
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+    let Some(cb) = state.db_backup_callback.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "backups are not available on this server".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let backup_id = crate::auth::generate_backup_id();
+    // Server-authored object key ([RB6]) — the caller never supplies a storage path.
+    let object_key = format!("{id}/{backup_id}.tar");
+    match state
+        .store
+        .create_db_backup(&id, &tenant.id, &backup_id, &object_key)
+    {
+        Ok(row) => {
+            info!(project = %id, backup_id = %backup_id, "managed-db backup requested");
+            cb(id.clone(), backup_id.clone());
+            (StatusCode::ACCEPTED, Json(DbBackupResponse::from(row))).into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/db/backups` — list the project's managed-DB backups (newest first).
+/// Owner-scoped. Metadata only; the tar blobs are never exposed here.
+async fn list_db_backups(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    match state.store.list_db_backups(&id) {
+        Ok(rows) => {
+            let out: Vec<DbBackupResponse> =
+                rows.into_iter().map(DbBackupResponse::from).collect();
+            Json(out).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /projects/{id}/db/restore` — restore the managed DB from a backup. Owner-scoped.
+/// The body carries only an opaque `backup_id`, resolved through the per-project catalog to
+/// the server-authored object key ([RB6]) — a caller can never point restore at an arbitrary
+/// blob. Refuses a backup that isn't `Complete` ([RB8]). Fires the server-side restore
+/// executor (host-push → in-guest untar → rhypedb restore-on-boot).
+async fn restore_db_backup(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<RestoreRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    let backup = match state.store.get_db_backup(&id, &req.backup_id) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("backup '{}' not found", req.backup_id),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if backup.status != crate::store::BackupStatus::Complete {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: format!(
+                    "backup '{}' is not restorable (status: {:?})",
+                    req.backup_id, backup.status
+                ),
+            }),
+        )
+            .into_response();
+    }
+    let Some(cb) = state.db_restore_callback.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "restore is not available on this server".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    info!(project = %id, backup_id = %req.backup_id, "managed-db restore requested");
+    cb(id.clone(), req.backup_id.clone());
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "started", "backup_id": req.backup_id })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]

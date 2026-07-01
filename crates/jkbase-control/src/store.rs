@@ -50,6 +50,20 @@ const DB_ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
 /// guest fs), so the edge needs an independent copy here to present it. `project_id` →
 /// secret; overwritten each deploy (like the own-bucket binding), purged on teardown.
 const DB_SPLICE: TableDefinition<&str, &[u8]> = TableDefinition::new("db_splice_secret");
+/// Per-project rhypedb **admin token** ([RB1]): the per-deploy `RHYPEDB_ADMIN_TOKEN` the
+/// agent injects into the DB env to authorize `/admin/backup/stream`. Like [`DB_SPLICE`],
+/// it is generated host-side at deploy, baked into the per-VM image (which the host never
+/// reads back), so the backup executor needs an independent copy here. `project_id` →
+/// token; overwritten each deploy, purged on teardown.
+const DB_ADMIN_TOKEN: TableDefinition<&str, &[u8]> = TableDefinition::new("db_admin_token");
+/// Per-project managed-DB **backup catalog** (primary, key = `backup_id`) + its
+/// per-project index (`"{project_id}:{backup_id}"` → `backup_id`), mirroring the
+/// [`DB_ACCESS_KEYS`] primary+index split so list/teardown stay O(backups-for-this-project)
+/// and a tenant can't resolve another project's backup by guessing an id. Rows hold only
+/// metadata (the tar lives in the platform object store); purged on teardown.
+const DB_BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("db_backups");
+const DB_BACKUPS_BY_PROJECT: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("db_backups_by_project");
 /// Cluster fleet membership (HA), one row per `jkbase-server` host instance, keyed
 /// by `host_id`. The leader's placement + dead-host detection (P3) read this; at HA
 /// P0 it is schema only — CRUD + tests, no loop touches it yet.
@@ -244,6 +258,45 @@ impl DbAccessKey {
     pub fn verify_secret(&self, presented_secret: &str) -> bool {
         auth::fingerprint_eq(presented_secret, &self.token_fingerprint)
     }
+}
+
+/// Lifecycle of a managed-DB backup ([RB8]). A backup is a two-phase operation: the row is
+/// written `Pending`, the tar is pulled + stored + its end-of-archive marker validated, and
+/// only then is the row flipped to `Complete`. A truncated/failed stream lands `Failed`
+/// (its partial object deleted). Restore refuses any non-`Complete` backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupStatus {
+    Pending,
+    Complete,
+    Failed,
+}
+
+/// One catalog entry for a managed-DB backup. Metadata only — the tar itself lives in the
+/// platform object store at [`Self::object_key`], NEVER in redb. The `object_key` is
+/// server-authored (derived from `project_id` + `backup_id`); restore resolves an opaque
+/// `backup_id` through the per-project index to this key, so a caller can never point restore
+/// at an arbitrary storage path ([RB6]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbBackup {
+    pub backup_id: String,
+    pub project_id: String,
+    /// The tenant that owned the project when the backup was taken; re-checked against the
+    /// project's current owner on restore (an orphaned backup can't be inherited). Empty on
+    /// an older record → fails the re-bind → safe.
+    #[serde(default)]
+    pub tenant_id: String,
+    pub created_at_ms: u64,
+    /// Size of the stored tar, filled in when the backup completes (0 while `Pending`).
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Key in the platform `db-backups` object store (server-authored, not caller-supplied).
+    pub object_key: String,
+    /// Short human summary from the tar `MANIFEST.json` (e.g. sst count / max_version); best
+    /// effort, empty until complete.
+    #[serde(default)]
+    pub manifest_summary: String,
+    pub status: BackupStatus,
 }
 
 /// Per-project connected-repo build-trigger credentials (build · D). Stored
@@ -560,6 +613,9 @@ impl Store {
         let _ = txn.open_table(DB_ACCESS_KEYS)?;
         let _ = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(DB_SPLICE)?;
+        let _ = txn.open_table(DB_ADMIN_TOKEN)?;
+        let _ = txn.open_table(DB_BACKUPS)?;
+        let _ = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
         let _ = txn.open_table(HOSTS)?;
         txn.commit()?;
 
@@ -1868,6 +1924,229 @@ impl Store {
         Ok(())
     }
 
+    // -- Managed-DB rhypedb admin token ([RB1]) --
+
+    /// Mint (rotate) a project's rhypedb admin token: fresh value, persisted, and returned so
+    /// the SAME value can be baked into the per-VM metadata image in the same deploy. Mirrors
+    /// [`Self::mint_db_splice_secret`].
+    pub fn mint_db_admin_token(&self, project_id: &str) -> Result<String> {
+        let token = auth::generate_rhypedb_admin_token();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DB_ADMIN_TOKEN)?;
+            table.insert(project_id, token.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(token)
+    }
+
+    /// The project's current rhypedb admin token, or `None` if it has no managed DB / none
+    /// set. The backup executor presents this as `Authorization: Bearer` when it drives the
+    /// agent's backup pull; `None` ⇒ backups fail closed (never a plaintext admin call).
+    pub fn get_db_admin_token(&self, project_id: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DB_ADMIN_TOKEN)?;
+        match table.get(project_id)? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(v.value()).into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a project's admin token (teardown), so a recreated same-slug project can't inherit
+    /// it (and a leaked token is dead once the project is gone).
+    pub fn delete_db_admin_token(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DB_ADMIN_TOKEN)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // -- Managed-DB backup catalog ([RB6]/[RB8]) --
+
+    /// Hard cap on retained backups per project (retention bound). The nightly loop prunes to
+    /// this; on-demand backups past it are refused (mirrors [`Self::MAX_DB_ACCESS_KEYS_PER_PROJECT`]).
+    pub const MAX_DB_BACKUPS_PER_PROJECT: usize = 30;
+
+    /// Record a new `Pending` backup row (primary + per-project index in one txn). The caller
+    /// (backup executor) then streams the tar and flips status via [`Self::set_db_backup_status`].
+    /// Errs at the per-project cap or on an id collision.
+    pub fn create_db_backup(
+        &self,
+        project_id: &str,
+        tenant_id: &str,
+        backup_id: &str,
+        object_key: &str,
+    ) -> Result<DbBackup> {
+        let rec = DbBackup {
+            backup_id: backup_id.to_string(),
+            project_id: project_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            created_at_ms: auth::timestamp_ms(),
+            size_bytes: 0,
+            object_key: object_key.to_string(),
+            manifest_summary: String::new(),
+            status: BackupStatus::Pending,
+        };
+        let index_key = format!("{project_id}:{backup_id}");
+        let txn = self.db.begin_write()?;
+        {
+            let lo = format!("{project_id}:");
+            let hi = format!("{project_id};");
+            let mut index = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+            if index.range(lo.as_str()..hi.as_str())?.count() >= Self::MAX_DB_BACKUPS_PER_PROJECT {
+                return Err(anyhow::anyhow!(
+                    "backup limit reached ({} per project); prune older backups first",
+                    Self::MAX_DB_BACKUPS_PER_PROJECT
+                ));
+            }
+            let mut primary = txn.open_table(DB_BACKUPS)?;
+            if primary.get(backup_id)?.is_some() {
+                return Err(anyhow::anyhow!("backup id collision; retry"));
+            }
+            let data = serde_json::to_vec(&rec)?;
+            primary.insert(backup_id, data.as_slice())?;
+            index.insert(index_key.as_str(), backup_id.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(rec)
+    }
+
+    /// Resolve a backup by (`project_id`, `backup_id`) via the per-project index key, so a
+    /// tenant can't resolve another project's backup by guessing the id ([RB6]). `None` if
+    /// unknown for this project.
+    pub fn get_db_backup(&self, project_id: &str, backup_id: &str) -> Result<Option<DbBackup>> {
+        let index_key = format!("{project_id}:{backup_id}");
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+        if index.get(index_key.as_str())?.is_none() {
+            return Ok(None);
+        }
+        let primary = txn.open_table(DB_BACKUPS)?;
+        match primary.get(backup_id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List a project's backups (newest first). Bounded range scan over the index.
+    pub fn list_db_backups(&self, project_id: &str) -> Result<Vec<DbBackup>> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+        let primary = txn.open_table(DB_BACKUPS)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let mut out = Vec::new();
+        for entry in index.range(lo.as_str()..hi.as_str())? {
+            let (_k, v) = entry?;
+            let id = String::from_utf8_lossy(v.value()).into_owned();
+            if let Some(rec) = primary.get(id.as_str())? {
+                out.push(serde_json::from_slice::<DbBackup>(rec.value())?);
+            }
+        }
+        out.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms));
+        Ok(out)
+    }
+
+    /// Update a backup's status (+ size/summary on completion). Scoped to `project_id` via the
+    /// index so a stray call can't mutate another project's row. No-op if the row is gone.
+    pub fn set_db_backup_status(
+        &self,
+        project_id: &str,
+        backup_id: &str,
+        status: BackupStatus,
+        size_bytes: u64,
+        manifest_summary: &str,
+    ) -> Result<()> {
+        let index_key = format!("{project_id}:{backup_id}");
+        let txn = self.db.begin_write()?;
+        {
+            let owned = {
+                let index = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+                index.get(index_key.as_str())?.is_some()
+            };
+            if owned {
+                let mut primary = txn.open_table(DB_BACKUPS)?;
+                let existing = primary
+                    .get(backup_id)?
+                    .map(|v| serde_json::from_slice::<DbBackup>(v.value()))
+                    .transpose()?;
+                if let Some(mut rec) = existing {
+                    rec.status = status;
+                    if size_bytes > 0 {
+                        rec.size_bytes = size_bytes;
+                    }
+                    if !manifest_summary.is_empty() {
+                        rec.manifest_summary = manifest_summary.to_string();
+                    }
+                    let data = serde_json::to_vec(&rec)?;
+                    primary.insert(backup_id, data.as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Delete one backup row (both tables), scoped to `project_id`. Returns the deleted row so
+    /// the caller can GC the blob. NB: the blob deletion is the caller's job ([RB11]).
+    pub fn delete_db_backup(&self, project_id: &str, backup_id: &str) -> Result<Option<DbBackup>> {
+        let index_key = format!("{project_id}:{backup_id}");
+        let txn = self.db.begin_write()?;
+        let removed = {
+            let mut index = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+            if index.remove(index_key.as_str())?.is_none() {
+                None
+            } else {
+                let mut primary = txn.open_table(DB_BACKUPS)?;
+                let rec = primary
+                    .get(backup_id)?
+                    .map(|v| serde_json::from_slice::<DbBackup>(v.value()))
+                    .transpose()?;
+                primary.remove(backup_id)?;
+                rec
+            }
+        };
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Delete ALL of a project's backup rows (teardown), returning them so the caller GCs the
+    /// blobs. Collect-then-delete (redb forbids mutating a table mid-iteration).
+    pub fn delete_all_db_backups(&self, project_id: &str) -> Result<Vec<DbBackup>> {
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let txn = self.db.begin_write()?;
+        let mut removed = Vec::new();
+        {
+            let mut index = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+            let entries: Vec<(String, String)> = index
+                .range(lo.as_str()..hi.as_str())?
+                .filter_map(|e| e.ok())
+                .map(|(k, v)| {
+                    (
+                        k.value().to_string(),
+                        String::from_utf8_lossy(v.value()).into_owned(),
+                    )
+                })
+                .collect();
+            let mut primary = txn.open_table(DB_BACKUPS)?;
+            for (index_key, id) in entries {
+                index.remove(index_key.as_str())?;
+                if let Some(v) = primary.get(id.as_str())? {
+                    if let Ok(rec) = serde_json::from_slice::<DbBackup>(v.value()) {
+                        removed.push(rec);
+                    }
+                }
+                primary.remove(id.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
     // -- Connected-repo build triggers (build · D) --
 
     /// Load a project's repo-trigger credentials, or `None` if it has none yet.
@@ -2142,6 +2421,89 @@ mod tests {
         assert_eq!(store.get_db_splice_secret("q").unwrap(), None);
         store.delete_db_splice_secret("p").unwrap();
         assert_eq!(store.get_db_splice_secret("p").unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_admin_token_mint_get_overwrite_delete_and_scope() {
+        let (store, path) = tmp_db();
+        assert_eq!(store.get_db_admin_token("p").unwrap(), None);
+        let t1 = store.mint_db_admin_token("p").unwrap();
+        assert!(t1.starts_with("jkba_"));
+        assert_eq!(store.get_db_admin_token("p").unwrap().as_deref(), Some(t1.as_str()));
+        // Rotates on each deploy (fresh value).
+        let t2 = store.mint_db_admin_token("p").unwrap();
+        assert_ne!(t1, t2);
+        assert_eq!(store.get_db_admin_token("p").unwrap().as_deref(), Some(t2.as_str()));
+        // Scoped to the project; purged on teardown.
+        assert_eq!(store.get_db_admin_token("q").unwrap(), None);
+        store.delete_db_admin_token("p").unwrap();
+        assert_eq!(store.get_db_admin_token("p").unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_backup_catalog_two_phase_scope_and_teardown() {
+        let (store, path) = tmp_db();
+        // A pending backup for proj-a, and one for a same-prefix slug proj-a2.
+        let a = store
+            .create_db_backup("proj-a", "t-a", "bkp_1_aa", "proj-a/bkp_1_aa.tar")
+            .unwrap();
+        assert_eq!(a.status, BackupStatus::Pending);
+        assert_eq!(a.size_bytes, 0);
+        let keep = store
+            .create_db_backup("proj-a2", "t-a2", "bkp_9_zz", "proj-a2/bkp_9_zz.tar")
+            .unwrap();
+
+        // Cross-project resolution is refused ([RB6]): the id only resolves under its project.
+        assert!(store.get_db_backup("proj-a", "bkp_9_zz").unwrap().is_none());
+        assert!(store.get_db_backup("proj-a2", "bkp_9_zz").unwrap().is_some());
+
+        // Two-phase: flip to Complete with size + summary.
+        store
+            .set_db_backup_status("proj-a", "bkp_1_aa", BackupStatus::Complete, 4096, "2 ssts")
+            .unwrap();
+        let done = store.get_db_backup("proj-a", "bkp_1_aa").unwrap().unwrap();
+        assert_eq!(done.status, BackupStatus::Complete);
+        assert_eq!(done.size_bytes, 4096);
+        assert_eq!(done.manifest_summary, "2 ssts");
+
+        // A status update scoped to the wrong project is a no-op (doesn't touch the row).
+        store
+            .set_db_backup_status("proj-a2", "bkp_1_aa", BackupStatus::Failed, 0, "")
+            .unwrap();
+        assert_eq!(
+            store.get_db_backup("proj-a", "bkp_1_aa").unwrap().unwrap().status,
+            BackupStatus::Complete
+        );
+
+        // Teardown purges only the target project (':' boundary is exact) and returns the rows.
+        let removed = store.delete_all_db_backups("proj-a").unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].object_key, "proj-a/bkp_1_aa.tar");
+        assert!(store.list_db_backups("proj-a").unwrap().is_empty());
+        assert!(
+            store.get_db_backup("proj-a2", &keep.backup_id).unwrap().is_some(),
+            "prefix boundary: proj-a2 must survive"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn db_backup_cap_enforced_per_project() {
+        let (store, path) = tmp_db();
+        for i in 0..Store::MAX_DB_BACKUPS_PER_PROJECT {
+            store
+                .create_db_backup("capproj", "t", &format!("bkp_{i}_x"), &format!("capproj/{i}.tar"))
+                .unwrap();
+        }
+        assert!(
+            store
+                .create_db_backup("capproj", "t", "bkp_over_x", "capproj/over.tar")
+                .is_err()
+        );
+        // A different project is unaffected.
+        assert!(store.create_db_backup("other", "t", "bkp_ok_x", "other/ok.tar").is_ok());
         let _ = std::fs::remove_file(path);
     }
 
