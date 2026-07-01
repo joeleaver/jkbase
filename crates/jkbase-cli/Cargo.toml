@@ -23,6 +23,7 @@ dirs = "6"
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 # The reach-plane sidecar's integration test stands up a real local rustls server

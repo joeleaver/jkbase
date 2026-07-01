@@ -58,6 +58,12 @@ pub struct ProxyArgs {
     /// Platform API URL — used only to derive the default DB host's domain.
     #[arg(long, default_value = "https://api.jkbase.app")]
     pub api: String,
+    /// Additional PEM CA/leaf certificate(s) to trust, on TOP of the public webpki roots
+    /// (for a private/on-prem edge issued by a non-public CA). This is ADDITIVE — the server
+    /// cert is still fully verified against the combined set and the SNI is still pinned; it
+    /// is NOT an insecure/skip-verify mode. Prefer the env var for CI.
+    #[arg(long, env = "JKBASE_DB_CA_FILE")]
+    pub ca_file: Option<std::path::PathBuf>,
 }
 
 /// Everything one accepted local connection needs to open its own upstream tunnel.
@@ -92,7 +98,7 @@ pub async fn run(args: ProxyArgs) -> Result<()> {
         .with_context(|| format!("invalid DB host '{db_host}' for TLS SNI"))?;
 
     let tunnel = Arc::new(Tunnel {
-        connector: TlsConnector::from(build_client_config()),
+        connector: TlsConnector::from(build_client_config(args.ca_file.as_deref())?),
         connect_host: db_host.clone(),
         connect_port: args.port,
         server_name,
@@ -108,14 +114,34 @@ pub async fn run(args: ProxyArgs) -> Result<()> {
     serve(listen, tunnel).await
 }
 
-/// The reusable client TLS config: public webpki roots + the `jkbase-db` ALPN. Pins the
-/// `ring` provider EXPLICITLY (the workspace also pulls `aws-lc-rs`, so `builder()`'s
-/// auto-detect is ambiguous and panics — `builder_with_provider` is deterministic).
-fn build_client_config() -> Arc<tokio_rustls::rustls::ClientConfig> {
-    let roots = tokio_rustls::rustls::RootCertStore {
+/// The reusable client TLS config: public webpki roots (+ any additional PEM roots from
+/// `extra_ca`, for a private/on-prem edge) + the `jkbase-db` ALPN. Pins the `ring` provider
+/// EXPLICITLY (the workspace also pulls `aws-lc-rs`, so `builder()`'s auto-detect is
+/// ambiguous and panics — `builder_with_provider` is deterministic).
+fn build_client_config(
+    extra_ca: Option<&std::path::Path>,
+) -> Result<Arc<tokio_rustls::rustls::ClientConfig>> {
+    let mut roots = tokio_rustls::rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.into(),
     };
-    build_client_config_with_roots(roots)
+    if let Some(path) = extra_ca {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("failed to read --ca-file {}", path.display()))?;
+        let mut added = 0usize;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+            let cert = cert.with_context(|| format!("invalid PEM in --ca-file {}", path.display()))?;
+            // ADDITIVE: still a real trust anchor; the server cert is fully verified against
+            // the combined set and the SNI is still pinned — never a skip-verify mode.
+            roots
+                .add(cert)
+                .with_context(|| format!("bad CA certificate in {}", path.display()))?;
+            added += 1;
+        }
+        if added == 0 {
+            anyhow::bail!("--ca-file {} contained no certificates", path.display());
+        }
+    }
+    Ok(build_client_config_with_roots(roots))
 }
 
 fn build_client_config_with_roots(
@@ -241,6 +267,29 @@ mod tests {
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio_rustls::TlsAcceptor;
     use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+
+    #[test]
+    fn build_client_config_accepts_extra_ca_and_rejects_empty() {
+        // No extra CA → just the webpki roots.
+        assert!(build_client_config(None).is_ok());
+
+        // A real self-signed cert written as PEM is accepted as an additional root.
+        let ck = rcgen::generate_simple_self_signed(vec!["edge.db.test".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("jkbase-db-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem_path = dir.join("ca.pem");
+        std::fs::write(&pem_path, ck.cert.pem()).unwrap();
+        assert!(build_client_config(Some(&pem_path)).is_ok());
+
+        // A file with no certificates is rejected (fail-closed, not silently ignored).
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, b"not a certificate\n").unwrap();
+        assert!(build_client_config(Some(&empty)).is_err());
+
+        // A missing file is an error.
+        assert!(build_client_config(Some(&dir.join("nope.pem"))).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn platform_domain_strips_scheme_api_prefix_and_port() {

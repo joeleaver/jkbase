@@ -1726,6 +1726,7 @@ dependencies = [
  "rcgen 0.13.2",
  "reqwest",
  "rustls 0.23.40",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tar",
