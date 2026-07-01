@@ -1,3 +1,4 @@
+mod db_proxy;
 mod deploy;
 mod project;
 mod repo;
@@ -190,6 +191,9 @@ pub enum DbCommand {
     /// Manage managed-DB access keys (the reach-plane credential)
     #[command(subcommand)]
     Key(DbKeyCommand),
+    /// Run a local proxy that tunnels plaintext `@rhypedb/client` connections to the
+    /// project's managed DB over the authenticated TLS reach plane.
+    Proxy(db_proxy::ProxyArgs),
 }
 
 #[derive(Subcommand)]
@@ -935,6 +939,7 @@ async fn run_access_key(cmd: AccessKeyCommand) -> anyhow::Result<()> {
 async fn run_db(cmd: DbCommand) -> anyhow::Result<()> {
     match cmd {
         DbCommand::Key(cmd) => run_db_key(cmd).await,
+        DbCommand::Proxy(args) => db_proxy::run(args).await,
     }
 }
 
