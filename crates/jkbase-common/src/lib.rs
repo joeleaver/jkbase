@@ -1,4 +1,8 @@
 pub mod config;
+/// Shared wire contract for the managed-DB reach-plane connection preamble — the ONE
+/// definition used by both the `jkbase db proxy` sidecar (encode) and the edge (parse),
+/// so client and server can never drift on a security seam.
+pub mod db_preamble;
 pub mod egress;
 pub mod layers;
 pub mod logs;
