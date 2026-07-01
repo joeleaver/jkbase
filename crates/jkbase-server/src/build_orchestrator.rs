@@ -5918,6 +5918,8 @@ console.log("listening on " + port);
                     Some(jkbase_proxy::DbAuthOk {
                         project_id: "testproj".to_string(),
                         splice_secret: splice_c.clone(),
+                        tenant_id: Some("testtenant".to_string()),
+                        warm_vm_max: 16,
                     })
                 } else {
                     None

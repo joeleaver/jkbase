@@ -18,6 +18,10 @@ const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules"
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
 const QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("quotas");
 const QUOTA_STATUS: TableDefinition<&str, &[u8]> = TableDefinition::new("quota_status");
+/// Per-TENANT resource limits, keyed by `tenant_id`. The platform's first
+/// tenant-scoped quota (all others are per-project); today it holds only the
+/// warm-VM cap. Absent override -> [`DEFAULT_TENANT_QUOTA`].
+const TENANT_QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_quotas");
 /// Per-project connected-repo trigger credentials (build · D): the git-push
 /// token fingerprint, bound to the owning tenant. Kept out of the app-`SECRETS`
 /// table (those are tenant env vars) so the two never leak into each other.
@@ -459,6 +463,12 @@ pub struct UsageBucket {
     /// sampler tick). Distinct from `cpu_jiffies` (runtime-VM CPU).
     #[serde(default)]
     pub build_seconds: u64,
+    /// Seconds this hour the runtime VM was held warm by a managed-DB reach-plane
+    /// relay (`Running` while `conn_count > 0`) — DB-attributable warm-time, so an
+    /// idle external DB connection that pins a VM warm is billed, not free.
+    /// `#[serde(default)]` for back-compat with pre-warm-metering buckets.
+    #[serde(default)]
+    pub warm_seconds: u64,
 }
 
 /// Per-project resource limits. Absent override -> [`DEFAULT_QUOTA`].
@@ -524,7 +534,32 @@ pub struct MonthToDate {
     pub tx_bytes: u64,
     pub storage_bytes: u64,
     pub build_seconds: u64,
+    #[serde(default)]
+    pub warm_seconds: u64,
 }
+
+/// Per-tenant resource limits. Absent override -> [`DEFAULT_TENANT_QUOTA`]. The
+/// platform's first tenant-scoped quota (every other quota is per-project).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TenantQuotaLimits {
+    /// Max number of the tenant's projects that may be held warm SIMULTANEOUSLY by
+    /// managed-DB reach-plane relays (external DB connections). Bounds a tenant's
+    /// host footprint so one idle DB connection per project can't pin every VM
+    /// warm. The in-VM app->DB loopback path is unaffected (it never registers a
+    /// relay). `#[serde(default)]` so overrides stored before this field existed
+    /// still deserialize with the platform default.
+    #[serde(default = "default_warm_vm_max")]
+    pub warm_vm_max: u32,
+}
+
+const DEFAULT_WARM_VM_MAX: u32 = 16;
+fn default_warm_vm_max() -> u32 {
+    DEFAULT_WARM_VM_MAX
+}
+
+pub const DEFAULT_TENANT_QUOTA: TenantQuotaLimits = TenantQuotaLimits {
+    warm_vm_max: DEFAULT_WARM_VM_MAX,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -608,6 +643,7 @@ impl Store {
         let _ = txn.open_table(USAGE)?;
         let _ = txn.open_table(QUOTAS)?;
         let _ = txn.open_table(QUOTA_STATUS)?;
+        let _ = txn.open_table(TENANT_QUOTAS)?;
         let _ = txn.open_table(ACCESS_KEYS)?;
         let _ = txn.open_table(ACCESS_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(DB_ACCESS_KEYS)?;
@@ -1112,6 +1148,36 @@ impl Store {
         Ok(())
     }
 
+    /// Add `warm_seconds` (DB-attributable warm-time) to a project's hourly bucket.
+    /// Accrued by the metering loop for a `Running` VM held warm by a managed-DB
+    /// relay (`conn_count > 0`), so an idle external DB connection is billed.
+    pub fn add_warm_usage(
+        &self,
+        project_id: &str,
+        hour_epoch: u64,
+        warm_seconds: u64,
+    ) -> Result<()> {
+        let key = Self::usage_key(project_id, hour_epoch);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(USAGE)?;
+            let existing = table.get(key.as_str())?.map(|d| d.value().to_vec());
+            let mut bucket: UsageBucket = match existing {
+                Some(bytes) => serde_json::from_slice(&bytes)?,
+                None => UsageBucket {
+                    project_id: project_id.to_string(),
+                    hour_epoch,
+                    ..Default::default()
+                },
+            };
+            bucket.warm_seconds = bucket.warm_seconds.saturating_add(warm_seconds);
+            let out = serde_json::to_vec(&bucket)?;
+            table.insert(key.as_str(), out.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// All buckets for a project with `hour_epoch` in `[from_hour, to_hour]`, oldest first.
     pub fn list_usage_for_project(
         &self,
@@ -1157,6 +1223,7 @@ impl Store {
                     mtd.rx_bytes = mtd.rx_bytes.saturating_add(b.rx_bytes);
                     mtd.tx_bytes = mtd.tx_bytes.saturating_add(b.tx_bytes);
                     mtd.build_seconds = mtd.build_seconds.saturating_add(b.build_seconds);
+                    mtd.warm_seconds = mtd.warm_seconds.saturating_add(b.warm_seconds);
                 }
                 if b.hour_epoch >= newest_hour {
                     newest_hour = b.hour_epoch;
@@ -1259,6 +1326,45 @@ impl Store {
         let existed = {
             let mut table = txn.open_table(QUOTAS)?;
             table.remove(project_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    // -- Per-tenant quotas (warm-VM cap) --
+
+    pub fn set_tenant_quota(&self, tenant_id: &str, limits: &TenantQuotaLimits) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(TENANT_QUOTAS)?;
+            let data = serde_json::to_vec(limits)?;
+            table.insert(tenant_id, data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_tenant_quota_override(&self, tenant_id: &str) -> Result<Option<TenantQuotaLimits>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TENANT_QUOTAS)?;
+        match table.get(tenant_id)? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The tenant's effective limits: its override, else [`DEFAULT_TENANT_QUOTA`].
+    pub fn get_tenant_quota(&self, tenant_id: &str) -> Result<TenantQuotaLimits> {
+        Ok(self
+            .get_tenant_quota_override(tenant_id)?
+            .unwrap_or(DEFAULT_TENANT_QUOTA))
+    }
+
+    pub fn remove_tenant_quota(&self, tenant_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(TENANT_QUOTAS)?;
+            table.remove(tenant_id)?.is_some()
         };
         txn.commit()?;
         Ok(existed)
@@ -2247,6 +2353,40 @@ mod tests {
             created_at: version, // arbitrary but ordered
             layer_digests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tenant_quota_and_warm_usage_roundtrip() {
+        let (store, path) = tmp_db();
+        // Default when no override; no override recorded yet.
+        assert_eq!(
+            store.get_tenant_quota("t1").unwrap().warm_vm_max,
+            DEFAULT_TENANT_QUOTA.warm_vm_max
+        );
+        assert!(store.get_tenant_quota_override("t1").unwrap().is_none());
+        // An override persists and is isolated to that tenant.
+        store
+            .set_tenant_quota("t1", &TenantQuotaLimits { warm_vm_max: 40 })
+            .unwrap();
+        assert_eq!(store.get_tenant_quota("t1").unwrap().warm_vm_max, 40);
+        assert!(store.get_tenant_quota_override("t1").unwrap().is_some());
+        assert_eq!(
+            store.get_tenant_quota("t2").unwrap().warm_vm_max,
+            DEFAULT_TENANT_QUOTA.warm_vm_max
+        );
+        // Removing the override reverts to the default.
+        assert!(store.remove_tenant_quota("t1").unwrap());
+        assert_eq!(
+            store.get_tenant_quota("t1").unwrap().warm_vm_max,
+            DEFAULT_TENANT_QUOTA.warm_vm_max
+        );
+
+        // Warm-seconds accrue additively into the hour bucket and month-to-date.
+        let hour = 1_000_000u64 / 3600 * 3600;
+        store.add_warm_usage("p", hour, 60).unwrap();
+        store.add_warm_usage("p", hour, 30).unwrap();
+        assert_eq!(store.sum_month_to_date("p", hour).unwrap().warm_seconds, 90);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

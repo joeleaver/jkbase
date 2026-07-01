@@ -184,6 +184,8 @@ impl DbIngress {
         // → owner re-bind. The AUTHORITATIVE project is the KEY's, returned here.
         let ok = (self.auth)(&preamble.akid, &preamble.secret, &claimed).ok_or("auth rejected")?;
         let project_id = ok.project_id.clone();
+        let tenant_id = ok.tenant_id.clone();
+        let warm_vm_max = ok.warm_vm_max as usize;
         let akid = preamble.akid.clone();
 
         // Authenticated → free the unauth slots (global + per-IP); take the post-auth ceilings.
@@ -201,10 +203,24 @@ impl DbIngress {
         //    stale `conn_count < max` before any of them registers, and
         //  • the relay is visible to `cancel_key`/`cancel_project` for the ENTIRE setup
         //    window (wake + connect), so a revocation during setup tears it down ([R5]).
+        // Enforces BOTH the per-project cap AND the per-tenant warm-VM quota atomically
+        // under the registry lock, refusing BEFORE the wake `.await` — an over-quota
+        // connection never costs a VM boot. The per-tenant refusal is the warm-VM quota:
+        // an owner can't pin more than `warm_vm_max` of their VMs warm via idle DB
+        // connections.
         let (guard, cancel) = self
             .registry
-            .try_register(&project_id, &akid, self.per_project_max)
-            .ok_or("per-project db cap reached")?;
+            .try_register(
+                &project_id,
+                tenant_id.as_deref(),
+                &akid,
+                self.per_project_max,
+                warm_vm_max,
+            )
+            .map_err(|r| match r {
+                crate::db_relay::RelayRejected::PerProject => "per-project db cap reached",
+                crate::db_relay::RelayRejected::PerTenant => "tenant warm-VM quota reached",
+            })?;
 
         // Close the auth→register cross-thread race ([R5]): a revoke on another runtime
         // thread that ran between the auth read above and the register just now would have

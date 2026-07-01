@@ -50,6 +50,13 @@ pub type WakeCallback = Arc<
 pub struct DbAuthOk {
     pub project_id: String,
     pub splice_secret: String,
+    /// The project's owning tenant (`None` for an ownerless project) — the dimension
+    /// the per-tenant warm-VM quota is enforced on. Resolved server-side.
+    pub tenant_id: Option<String>,
+    /// The owner's effective per-tenant warm-VM cap (from the tenant-quota override
+    /// or the platform default), resolved server-side at auth so the edge enforces it
+    /// without a control-store dependency. Ignored when `tenant_id` is `None`.
+    pub warm_vm_max: u32,
 }
 
 /// Authenticate a DB reach preamble: `(akid, secret, claimed_project_from_sni)` →

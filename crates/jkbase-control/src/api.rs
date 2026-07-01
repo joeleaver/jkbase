@@ -328,6 +328,10 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             "/projects/{id}/quota",
             get(get_project_quota).post(set_project_quota),
         )
+        .route(
+            "/tenants/{tenant_id}/quota",
+            get(get_tenant_quota).post(set_tenant_quota),
+        )
         .route("/projects/{id}/domains", get(list_domains).post(add_domain))
         .route(
             "/projects/{id}/domains/{domain}/verify",
@@ -2062,6 +2066,10 @@ pub struct UsageResponse {
     pub storage_bytes: u64,
     /// Month-to-date server-side build-VM seconds.
     pub build_seconds: u64,
+    /// Month-to-date DB-attributable warm-VM seconds (time a VM was held warm by a
+    /// managed-DB reach-plane relay). `#[serde(default)]` on the wire for older clients.
+    #[serde(default)]
+    pub warm_seconds: u64,
     pub month_start: u64,
 }
 
@@ -2100,6 +2108,19 @@ pub struct SetQuotaRequest {
     pub max_buckets: u64,
 }
 
+#[derive(Serialize)]
+pub struct TenantQuotaResponse {
+    /// Max projects the tenant may hold warm simultaneously via managed-DB relays.
+    pub warm_vm_max: u32,
+    /// True if this tenant has an override (vs the platform default).
+    pub overridden: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SetTenantQuotaRequest {
+    pub warm_vm_max: u32,
+}
+
 /// Month-to-date metered usage for a project. Works while hibernated (store-only).
 async fn get_project_usage(
     State(state): State<Arc<AppState>>,
@@ -2126,6 +2147,7 @@ async fn get_project_usage(
             tx_bytes: mtd.tx_bytes,
             storage_bytes: mtd.storage_bytes,
             build_seconds: mtd.build_seconds,
+            warm_seconds: mtd.warm_seconds,
             month_start,
         })
         .into_response(),
@@ -2241,6 +2263,86 @@ async fn set_project_quota(
             overridden: true,
             bandwidth_blocked: false,
             blocked_reason: None,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_tenant_quota(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(tenant_id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // A tenant may read only its OWN quota; a platform admin may read any tenant's.
+    if !state.is_admin_request(&headers) && tenant_id != tenant.id {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("tenant '{tenant_id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    let limits = state
+        .store
+        .get_tenant_quota(&tenant_id)
+        .unwrap_or(crate::store::DEFAULT_TENANT_QUOTA);
+    let overridden = state
+        .store
+        .get_tenant_quota_override(&tenant_id)
+        .ok()
+        .flatten()
+        .is_some();
+    Json(TenantQuotaResponse {
+        warm_vm_max: limits.warm_vm_max,
+        overridden,
+    })
+    .into_response()
+}
+
+/// Set a per-tenant quota override. Owner-scoped and CLAMPED to the platform default
+/// for tenants: a tenant can only *lower* its own warm-VM cap, never raise it above
+/// [`DEFAULT_TENANT_QUOTA`] (untrusted-tenant threat model). A platform operator
+/// presenting a valid `X-Admin-Token` bypasses both the scoping and the clamp, so ops
+/// can grant a paying tenant a higher cap. No admin token configured ⇒ every set is
+/// clamped. Mirrors [`set_project_quota`].
+async fn set_tenant_quota(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(tenant_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SetTenantQuotaRequest>,
+) -> impl IntoResponse {
+    let is_admin = state.is_admin_request(&headers);
+    if !is_admin && tenant_id != tenant.id {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("tenant '{tenant_id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    // Tenants may only self-restrict (clamp to the default); an admin may raise it.
+    let warm_vm_max = if is_admin {
+        req.warm_vm_max
+    } else {
+        req.warm_vm_max
+            .min(crate::store::DEFAULT_TENANT_QUOTA.warm_vm_max)
+    };
+    let limits = crate::store::TenantQuotaLimits { warm_vm_max };
+    match state.store.set_tenant_quota(&tenant_id, &limits) {
+        Ok(()) => Json(TenantQuotaResponse {
+            warm_vm_max: limits.warm_vm_max,
+            overridden: true,
         })
         .into_response(),
         Err(e) => (

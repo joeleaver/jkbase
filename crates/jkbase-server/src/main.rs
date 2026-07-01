@@ -1650,9 +1650,20 @@ async fn async_main() -> Result<()> {
                 .get_db_splice_secret(&key.project_id)
                 .ok()
                 .flatten()?;
+            // The owner re-bind above proved `project.tenant_id == Some(key.tenant_id)`,
+            // so a successful auth always has an owner. Resolve the owner's effective
+            // per-tenant warm-VM cap here (server-side, over the store) so the edge can
+            // enforce it without a control-store dependency. On a store error, fall back
+            // to a conservative default rather than an unbounded cap.
+            let warm_vm_max = db_auth_store
+                .get_tenant_quota(&key.tenant_id)
+                .map(|q| q.warm_vm_max)
+                .unwrap_or(16);
             Some(jkbase_proxy::DbAuthOk {
                 project_id: key.project_id,
                 splice_secret,
+                tenant_id: Some(key.tenant_id),
+                warm_vm_max,
             })
         });
 
@@ -1752,6 +1763,7 @@ async fn async_main() -> Result<()> {
         platform.clone(),
         routing_table.clone(),
         log_shipper.clone(),
+        Some(db_relay_registry.clone()),
     ));
 
     // Spawn the build egress proxy (default-deny forward proxy + SSRF defense).
@@ -5342,6 +5354,7 @@ async fn metering_loop(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
+    db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
 ) {
     let mut state = metering::SamplerState::default();
     let mut last_sample = Instant::now();
@@ -5419,6 +5432,22 @@ async fn metering_loop(
             }
             if let Err(e) = store.add_usage(id, hour_epoch, cpu_j, rx, tx, storage, elapsed) {
                 tracing::warn!(project = %id, error = %e, "metering: add_usage failed");
+            }
+        }
+
+        // DB-attributable warm-seconds: accrue for every RUNNING VM that a managed-DB
+        // reach-plane relay is holding warm (`conn_count > 0`). This is the resource an
+        // idle external DB connection consumes — the VM would otherwise hibernate — so
+        // it's metered (billable), complementing the per-tenant warm-VM cap enforced at
+        // relay registration. The in-VM app->DB loopback path never registers a relay,
+        // so it's not double-counted here.
+        if let Some(reg) = &db_registry {
+            for (id, _pid) in &running_pids {
+                if reg.conn_count(id) > 0
+                    && let Err(e) = store.add_warm_usage(id, hour_epoch, elapsed)
+                {
+                    tracing::warn!(project = %id, error = %e, "metering: add_warm_usage failed");
+                }
             }
         }
 
