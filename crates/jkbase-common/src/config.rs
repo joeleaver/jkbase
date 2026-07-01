@@ -182,6 +182,13 @@ pub struct DbReachFacts {
     /// DB ([R3]) — defense-in-depth so one isolation slip isn't a full DB compromise.
     #[serde(default)]
     pub splice_secret: String,
+    /// The per-deploy rhypedb admin bearer (`RHYPEDB_ADMIN_TOKEN`). Host-minted, injected
+    /// ONLY into the DB's own process env by the agent — it gates `/admin/*` (backup stream
+    /// = full data exfil) on loopback:4200. It rides THIS reserved channel, never the
+    /// tenant-influenced `_database.json` ([RB1]). Empty (old images / no managed DB) ⇒
+    /// backups disabled, fail-closed, never a crash.
+    #[serde(default)]
+    pub admin_token: String,
 }
 
 impl DbReachFacts {

@@ -172,14 +172,15 @@ fn load_platform_egress(serve_dir: &Path) -> jkbase_common::config::PlatformEgre
     }
 }
 
-/// Read the host-written `_db_reach.json` splice secret ([R3]) from the metadata image.
-/// Absent/malformed/empty ⇒ `None` (no managed DB, or fail-closed) → `/_jkbase/db` is
-/// then unreachable, never open.
-fn load_db_splice_secret(serve_dir: &Path) -> Option<String> {
+/// Read the host-written `_db_reach.json` reach-plane facts ([R3]/[RB1]) from the metadata
+/// image. Absent/malformed ⇒ default (all-empty), so the splice/backup endpoints stay
+/// unreachable and the admin token stays unset — fail-closed, never open.
+fn load_db_reach_facts(serve_dir: &Path) -> jkbase_common::config::DbReachFacts {
     let path = serve_dir.join(jkbase_common::config::DbReachFacts::FILE);
-    let bytes = std::fs::read(&path).ok()?;
-    let facts: jkbase_common::config::DbReachFacts = serde_json::from_slice(&bytes).ok()?;
-    (!facts.splice_secret.is_empty()).then_some(facts.splice_secret)
+    std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 /// dm-verity mapper name for a layer block device (e.g. `/dev/vdc` → `jkverity-vdc`):
@@ -364,6 +365,10 @@ struct AgentState {
     /// `_db_reach.json`. `Some` only for a project with a managed DB; the `/_jkbase/db`
     /// handler verifies it before splicing (a `None`/mismatch fails closed).
     db_splice_secret: Option<String>,
+    /// The per-deploy rhypedb admin bearer ([RB1]), read from the same host-only
+    /// `_db_reach.json`. Used ONLY by the `/_jkbase/db-backup` pull handler to authorize the
+    /// loopback `/admin/backup/stream` call — never served, never handed to a tenant process.
+    db_admin_token: Option<String>,
 }
 
 /// A backend kind a tenant route can target. Resolved at the agent's deserialization
@@ -508,13 +513,19 @@ async fn main() -> Result<()> {
     // entry and never routed, reachable only at 127.0.0.1:4200 by the project's own app.
     // Schema (+ optional rules) are host-baked into `_database/` in the metadata image;
     // the agent seeds them into the DB's meta volume before the server starts.
+    // Host-only reach-plane facts (splice secret + rhypedb admin token), loaded once from the
+    // metadata image before the DB starts so the token can be injected into the DB's env.
+    let db_reach = load_db_reach_facts(&serve_dir);
+    let db_splice_secret = (!db_reach.splice_secret.is_empty()).then(|| db_reach.splice_secret.clone());
+    let db_admin_token = (!db_reach.admin_token.is_empty()).then(|| db_reach.admin_token.clone());
+
     if let Some(lowerdirs) = db_lowerdirs {
         let schema_path = serve_dir.join("_database/schema.rhype");
         match std::fs::read(&schema_path) {
             Ok(schema) => {
                 let rules = std::fs::read(serve_dir.join("_database/rules.rhype")).ok();
                 if let Err(e) = containers
-                    .start_database(&schema, rules.as_deref(), lowerdirs)
+                    .start_database(db_admin_token.as_deref(), &schema, rules.as_deref(), lowerdirs)
                     .await
                 {
                     error!(error = %e, "failed to start managed database");
@@ -557,7 +568,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "80".to_string())
         .parse()?;
 
-    let db_splice_secret = load_db_splice_secret(&serve_dir);
     let state = Arc::new(AgentState {
         serve_dir,
         functions_dir,
@@ -567,6 +577,7 @@ async fn main() -> Result<()> {
         route_config,
         sites,
         db_splice_secret,
+        db_admin_token,
     });
 
     info!("jkbase-agent starting (pid {})", std::process::id());
@@ -691,6 +702,14 @@ async fn handle_request(
 
     if path == "/_jkbase/db" {
         return Ok(handle_db_splice(state, req).await);
+    }
+
+    if path == "/_jkbase/db/backup" {
+        return Ok(handle_db_backup(state, req).await);
+    }
+
+    if path == "/_jkbase/db/restore" {
+        return Ok(handle_db_restore(state, req).await);
     }
 
     if path == "/_jkbase/sync" {
@@ -1042,21 +1061,27 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// loopback-only — this is the sole in-VM path to it, gated on the secret so one isolation
 /// slip (a sibling reaching this eth0 port) isn't a direct splice into the unauthenticated
 /// engine. Not an HTTP backend, so there is NO hyper handshake on the backend leg.
-async fn handle_db_splice(
-    state: Arc<AgentState>,
-    mut req: Request<hyper::body::Incoming>,
-) -> Response<Full<Bytes>> {
-    // Verify the host→agent secret. No secret configured (no managed DB / not baked) OR a
-    // mismatch ⇒ 404, fail-closed (never confirm the endpoint or the DB's existence).
+/// Verify the host→agent reach-plane secret ([R3]/[RB2]). No secret configured (no managed DB
+/// / not baked) OR a mismatch ⇒ false, so every gated endpoint fails closed to 404 (never
+/// confirming the endpoint or the DB's existence). Constant-time compare.
+fn db_secret_ok(state: &AgentState, req: &Request<hyper::body::Incoming>) -> bool {
     let Some(expected) = state.db_splice_secret.as_deref() else {
-        return not_found_response();
+        return false;
     };
     let presented = req
         .headers()
         .get("x-jkbase-db-secret")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !ct_eq(presented.as_bytes(), expected.as_bytes()) {
+    ct_eq(presented.as_bytes(), expected.as_bytes())
+}
+
+async fn handle_db_splice(
+    state: Arc<AgentState>,
+    mut req: Request<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    // Verify the host→agent secret. No secret / mismatch ⇒ 404, fail-closed.
+    if !db_secret_ok(&state, &req) {
         return not_found_response();
     }
 
@@ -1114,6 +1139,321 @@ async fn handle_db_splice(
         .header("connection", "upgrade")
         .header("upgrade", "jkbase-db")
         .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+/// rhypedb's loopback HTTP admin port inside the guest (see `db_manifest`).
+const RHYPEDB_HTTP_PORT: u16 = 4200;
+
+/// Hard cap on a restore tar the host may push ([RB3]) — defense-in-depth so even a
+/// host-authenticated push can't fill the data disk unbounded. The disk itself is the real
+/// bound; this fails fast well before an accidental runaway.
+const MAX_RESTORE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// [RB2]/[RB3] Managed-DB backup PULL. The host does an HTTP/1.1 `Upgrade` to
+/// `/_jkbase/db/backup` presenting the splice secret; the agent authorizes the loopback
+/// `GET /admin/backup/stream` with the reserved admin token ([RB1]) and streams the tar back
+/// over the upgraded socket, DE-CHUNKED and never buffered ([RB3]). The host validates the tar
+/// end-of-archive marker before committing the object ([RB8]); a truncated relay = a failed
+/// backup. The admin token never leaves the guest — only the opaque tar bytes do.
+async fn handle_db_backup(
+    state: Arc<AgentState>,
+    mut req: Request<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    use tokio::io::AsyncWriteExt;
+    if !db_secret_ok(&state, &req) {
+        return not_found_response();
+    }
+    // Need the reserved admin token to authorize the loopback admin call; absent ⇒ 404
+    // (no managed DB / not baked), fail-closed.
+    let Some(admin_token) = state.db_admin_token.clone() else {
+        return not_found_response();
+    };
+    if !jkbase_wsproxy::is_upgrade_request(req.headers()) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Full::new(Bytes::from("expected upgrade")))
+            .unwrap();
+    }
+    let Ok(permit) = upgrade_permits().clone().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "5")
+            .body(Full::new(Bytes::from("too many concurrent db connections")))
+            .unwrap();
+    };
+
+    // Connect + send the admin request BEFORE returning 101, so a DB-down / auth failure is a
+    // clean non-101 error to the host rather than an empty upgraded stream.
+    let backend = match tokio::net::TcpStream::connect(("127.0.0.1", RHYPEDB_HTTP_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "db backup: rhypedb loopback http not available");
+            return bad_gateway("db not available");
+        }
+    };
+    let (mut sender, conn) =
+        match hyper::client::conn::http1::handshake(TokioIo::new(backend)).await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "db backup: loopback handshake failed");
+                return bad_gateway("db handshake failed");
+            }
+        };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let admin_req = Request::builder()
+        .method("GET")
+        .uri("/admin/backup/stream")
+        .header("host", "127.0.0.1")
+        .header("authorization", format!("Bearer {admin_token}"))
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    let resp = match sender.send_request(admin_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "db backup: admin request failed");
+            return bad_gateway("db backup request failed");
+        }
+    };
+    if resp.status() != StatusCode::OK {
+        error!(status = %resp.status(), "db backup: admin returned non-200");
+        return bad_gateway("db backup unavailable");
+    }
+
+    let client_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        let _permit = permit; // released when the relay ends
+        // Keep the loopback connection driver alive by moving `sender` in (dropping it early
+        // could cancel the in-flight response body).
+        let _sender = sender;
+        match client_upgrade.await {
+            Ok(upgraded) => {
+                let mut out = TokioIo::new(upgraded);
+                let mut body = resp.into_body();
+                let mut clean = true;
+                loop {
+                    match body.frame().await {
+                        Some(Ok(frame)) => {
+                            if let Some(chunk) = frame.data_ref()
+                                && out.write_all(chunk).await.is_err()
+                            {
+                                clean = false;
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!(error = %e, "db backup: body stream error");
+                            clean = false;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                // Half-close so the host sees a clean EOF = end of the tar. A mid-stream error
+                // truncates the body → the host's tar-EOF validation rejects it ([RB8]).
+                let _ = out.shutdown().await;
+                if !clean {
+                    tracing::warn!("db backup: tar stream ended early (host will reject as truncated)");
+                }
+            }
+            Err(e) => error!(error = %e, "db backup: client upgrade failed"),
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("connection", "upgrade")
+        .header("upgrade", "jkbase-db-backup")
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+/// [RB2]/[RB3]/[RB5] Managed-DB restore PUSH. The host Upgrades to `/_jkbase/db/restore`
+/// (splice-secret gated) and streams a backup tar; the agent untars it IN-GUEST (the host
+/// never writes the data-disk FS — [RB5]), atomically stages a complete snapshot, respawns
+/// rhypedb with `RHYPEDB_RESTORE_FROM`, waits for it to serve again, then reports `ok` /
+/// `err: …` back over the socket so the host records the outcome.
+async fn handle_db_restore(
+    state: Arc<AgentState>,
+    mut req: Request<hyper::body::Incoming>,
+) -> Response<Full<Bytes>> {
+    if !db_secret_ok(&state, &req) {
+        return not_found_response();
+    }
+    if !Path::new("/mnt/data").exists() {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Full::new(Bytes::from("no data disk")))
+            .unwrap();
+    }
+    if !jkbase_wsproxy::is_upgrade_request(req.headers()) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Full::new(Bytes::from("expected upgrade")))
+            .unwrap();
+    }
+    let Ok(permit) = upgrade_permits().clone().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "5")
+            .body(Full::new(Bytes::from("too many concurrent db connections")))
+            .unwrap();
+    };
+    let admin_token = state.db_admin_token.clone();
+    let client_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let _permit = permit;
+        let upgraded = match client_upgrade.await {
+            Ok(u) => u,
+            Err(e) => {
+                error!(error = %e, "db restore: client upgrade failed");
+                return;
+            }
+        };
+        let mut io = TokioIo::new(upgraded);
+        let result = perform_restore(&state.containers, admin_token.as_deref(), &mut io).await;
+        let line = match &result {
+            Ok(()) => "ok\n".to_string(),
+            Err(e) => {
+                error!(error = %e, "db restore failed");
+                format!("err: {e}\n")
+            }
+        };
+        let _ = io.write_all(line.as_bytes()).await;
+        let _ = io.shutdown().await;
+    });
+
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("connection", "upgrade")
+        .header("upgrade", "jkbase-db-restore")
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
+/// Drive one restore: stream the tar off `io` to a temp file (bounded, never in RAM), untar
+/// it traversal-safe into a fresh staging dir, require a complete snapshot (its
+/// `MANIFEST.json`), atomically publish it, then respawn rhypedb to restore-on-boot and wait
+/// for it to serve. On success clears the staging + resets the DB manifest ([RB9]).
+async fn perform_restore<S>(
+    containers: &Arc<ContainerSupervisor>,
+    admin_token: Option<&str>,
+    io: &mut S,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let base = PathBuf::from("/mnt/data/volumes/rhypedb-restore");
+    let incoming = base.join(".incoming");
+    let snapshot = base.join("snapshot");
+    let tar_path = base.join(".incoming.tar");
+    std::fs::create_dir_all(&base).context("create restore volume dir")?;
+    let _ = std::fs::remove_dir_all(&incoming);
+    let _ = std::fs::remove_file(&tar_path);
+
+    // Stream the pushed tar → temp file on the data disk (bounded by MAX_RESTORE_BYTES; the
+    // host half-closes after the archive, so read-to-EOF yields the whole tar).
+    {
+        let mut f = tokio::fs::File::create(&tar_path)
+            .await
+            .context("create restore tar")?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = io.read(&mut buf).await.context("read restore stream")?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > MAX_RESTORE_BYTES {
+                let _ = tokio::fs::remove_file(&tar_path).await;
+                anyhow::bail!("restore stream exceeds {MAX_RESTORE_BYTES} bytes");
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut f, &buf[..n])
+                .await
+                .context("write restore tar")?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut f)
+            .await
+            .context("flush restore tar")?;
+    }
+
+    // Untar traversal-safe (the `tar` crate refuses `..`/absolute escapes) on the blocking
+    // pool. Then require a complete snapshot before publishing it.
+    let incoming_c = incoming.clone();
+    let tar_c = tar_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        std::fs::create_dir_all(&incoming_c)?;
+        let f = std::fs::File::open(&tar_c)?;
+        let mut ar = tar::Archive::new(f);
+        ar.set_preserve_permissions(false);
+        ar.unpack(&incoming_c).context("untar restore snapshot")?;
+        Ok(())
+    })
+    .await
+    .context("untar task join")??;
+    let _ = std::fs::remove_file(&tar_path);
+    if !incoming.join("MANIFEST.json").is_file() {
+        let _ = std::fs::remove_dir_all(&incoming);
+        anyhow::bail!("pushed archive is not a complete backup (no MANIFEST.json)");
+    }
+
+    // Atomically publish: only a complete snapshot ever becomes `snapshot/`, so a partial
+    // untar can never trigger a restore that would brick the DB boot.
+    let _ = std::fs::remove_dir_all(&snapshot);
+    std::fs::rename(&incoming, &snapshot).context("publish restore snapshot")?;
+
+    // Respawn the DB to restore-on-boot, then wait for it to serve again.
+    containers.restore_database(admin_token).await?;
+    if !wait_db_healthy(std::time::Duration::from_secs(300)).await {
+        anyhow::bail!("managed DB did not become healthy after restore");
+    }
+    containers.finalize_restore(admin_token).await;
+    Ok(())
+}
+
+/// Poll the loopback DB `/health` until it serves 200 (⟹ rhypedb finished restore-on-boot and
+/// opened the database) or the deadline passes.
+async fn wait_db_healthy(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if db_health_probe().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
+async fn db_health_probe() -> bool {
+    let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", RHYPEDB_HTTP_PORT)).await else {
+        return false;
+    };
+    let Ok((mut sender, conn)) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+    else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header("host", "127.0.0.1")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
+    matches!(sender.send_request(req).await, Ok(r) if r.status() == StatusCode::OK)
+}
+
+fn bad_gateway(msg: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Full::new(Bytes::from(msg)))
         .unwrap()
 }
 

@@ -19,6 +19,69 @@ use tracing::{error, info, warn};
 /// fences the name from `[routes.*]`/server/site names at deploy (validate_manifest).
 const DB_SERVER_NAME: &str = "rhypedb";
 
+/// Host-side path where a restore snapshot is staged (guest-written; the host never touches
+/// it — [RB5]). Bound into the DB's namespace as `/restore` and pointed at by
+/// `RHYPEDB_RESTORE_FROM=/restore/snapshot` when its `MANIFEST.json` is present. A complete
+/// untar renames into place atomically, so a partial/interrupted restore is never visible.
+const RHYPEDB_RESTORE_STAGING: &str = "/mnt/data/volumes/rhypedb-restore/snapshot";
+
+/// Build the managed-DB server manifest. Injects the per-deploy `RHYPEDB_ADMIN_TOKEN` (host-
+/// only, from the reserved channel — [RB1]) and, when a complete restore snapshot is staged,
+/// the `/restore` volume + `RHYPEDB_RESTORE_FROM(_FORCE)` so rhypedb restore-on-boots. rhypedb's
+/// restore is idempotent + sentinel-guarded, so re-applying across a crash-respawn is safe;
+/// [`ContainerSupervisor::finalize_restore`] clears the staging + resets this once healthy.
+///
+/// NB: rhypedb-server has no `--rules` flag yet (the security-rules engine is the upstream RBAC
+/// epic). v1 is backend-only — the DB is reachable only by the tenant's own app over loopback +
+/// the authenticated reach plane — so no rules are enforced; rules are staged for when the
+/// engine gains them. The data plane (`/query`) is open on loopback by design; `/admin/*` is
+/// gated by the admin token.
+fn db_manifest(admin_token: Option<&str>) -> ServerManifest {
+    let mut env = HashMap::new();
+    if let Some(token) = admin_token {
+        env.insert("RHYPEDB_ADMIN_TOKEN".to_string(), token.to_string());
+    }
+    let mut volumes = vec![
+        VolumeMount {
+            name: "rhypedb-data".into(),
+            mount: "/data".into(),
+        },
+        VolumeMount {
+            name: "rhypedb-meta".into(),
+            mount: "/etc/rhypedb".into(),
+        },
+    ];
+    if Path::new(RHYPEDB_RESTORE_STAGING).join("MANIFEST.json").is_file() {
+        volumes.push(VolumeMount {
+            name: "rhypedb-restore".into(),
+            mount: "/restore".into(),
+        });
+        env.insert(
+            "RHYPEDB_RESTORE_FROM".to_string(),
+            "/restore/snapshot".to_string(),
+        );
+        env.insert("RHYPEDB_RESTORE_FROM_FORCE".to_string(), "1".to_string());
+    }
+    ServerManifest {
+        port: 4200,
+        cmd: vec![
+            "/opt/rhypedb/bin/rhypedb-server".to_string(),
+            "--data-dir".into(),
+            "/data".into(),
+            "--schema".into(),
+            "/etc/rhypedb/schema.rhype".into(),
+            "--listen".into(),
+            "127.0.0.1:4200".into(),
+            "--tcp-listen".into(),
+            "127.0.0.1:4201".into(),
+        ],
+        env,
+        working_dir: None,
+        health_check: None,
+        volumes,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMount {
     pub name: String,
@@ -208,6 +271,7 @@ impl ContainerSupervisor {
     /// restart, health, and log machinery as every other layered server.
     pub async fn start_database(
         &self,
+        admin_token: Option<&str>,
         schema: &[u8],
         rules: Option<&[u8]>,
         lowerdirs: Vec<PathBuf>,
@@ -237,42 +301,11 @@ impl ContainerSupervisor {
         }
         let _ = std::fs::create_dir_all("/mnt/data/volumes/rhypedb-data");
 
-        // NB: rhypedb-server has no `--rules` flag yet (the security-rules engine is the
-        // upstream RBAC epic). v1 is backend-only — the DB is reachable only by the
-        // tenant's own app over loopback — so no rules are enforced; rules are staged for
-        // when the engine gains them. The data plane (/query) is open on loopback by design.
-        let cmd = vec![
-            "/opt/rhypedb/bin/rhypedb-server".to_string(),
-            "--data-dir".into(),
-            "/data".into(),
-            "--schema".into(),
-            "/etc/rhypedb/schema.rhype".into(),
-            "--listen".into(),
-            "127.0.0.1:4200".into(),
-            "--tcp-listen".into(),
-            "127.0.0.1:4201".into(),
-        ];
-        let manifest = ServerManifest {
-            port: 4200,
-            cmd,
-            env: HashMap::new(),
-            working_dir: None,
-            health_check: None,
-            volumes: vec![
-                VolumeMount {
-                    name: "rhypedb-data".into(),
-                    mount: "/data".into(),
-                },
-                VolumeMount {
-                    name: "rhypedb-meta".into(),
-                    mount: "/etc/rhypedb".into(),
-                },
-            ],
-        };
-
+        let manifest = db_manifest(admin_token);
         info!(
             port = manifest.port,
             layers = lowerdirs.len(),
+            restore = manifest.env.contains_key("RHYPEDB_RESTORE_FROM"),
             "starting managed database (rhypedb, loopback-only)"
         );
         let process = spawn_server_layered(NAME, &manifest, &lowerdirs, &self.logs)?;
@@ -288,6 +321,51 @@ impl ContainerSupervisor {
             next_restart_at: None,
         });
         Ok(())
+    }
+
+    /// Respawn the managed DB so it restore-on-boots from the freshly-staged snapshot
+    /// ([RB9]). The caller has already untarred a complete snapshot to [`RHYPEDB_RESTORE_STAGING`]
+    /// (its `MANIFEST.json` present), so [`db_manifest`] now adds the `/restore` volume +
+    /// `RHYPEDB_RESTORE_FROM`. Held under the servers write lock across kill→reap→respawn so
+    /// the health loop can't race-respawn a plain (non-restoring) DB onto the same data dir,
+    /// and rhypedb (single-writer) has released its data-dir lock before the restoring process
+    /// starts.
+    pub async fn restore_database(&self, admin_token: Option<&str>) -> Result<()> {
+        let mut servers = self.servers.write().await;
+        let srv = servers
+            .iter_mut()
+            .find(|s| s.name == DB_SERVER_NAME)
+            .ok_or_else(|| anyhow::anyhow!("managed DB is not supervised"))?;
+        let lowerdirs = srv
+            .layers
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("managed DB has no layers"))?;
+        if let Some(mut child) = srv.process.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await; // reap → release the single-writer data-dir lock
+        }
+        let manifest = db_manifest(admin_token); // sees the staged snapshot → restore env
+        let process = spawn_server_layered(&srv.name, &manifest, &lowerdirs, &self.logs)?;
+        srv.manifest = manifest;
+        srv.process = Some(process);
+        srv.healthy = false;
+        srv.restart_count = 0;
+        srv.next_restart_at = None;
+        Ok(())
+    }
+
+    /// Called once a restore has completed (the DB is serving again): remove the staged
+    /// snapshot and reset the DB's manifest to a normal (non-restoring) one, so a later
+    /// health-loop respawn or cold boot doesn't re-point `RHYPEDB_RESTORE_FROM` at a
+    /// now-deleted path. The running process is untouched (it already restored). Safe because
+    /// "healthy" ⟹ rhypedb's own `RESTORE_DONE` sentinel is durable in the data dir, so the
+    /// staging is no longer needed. Idempotent.
+    pub async fn finalize_restore(&self, admin_token: Option<&str>) {
+        let _ = std::fs::remove_dir_all(RHYPEDB_RESTORE_STAGING);
+        let mut servers = self.servers.write().await;
+        if let Some(srv) = servers.iter_mut().find(|s| s.name == DB_SERVER_NAME) {
+            srv.manifest = db_manifest(admin_token);
+        }
     }
 
     pub async fn status(&self) -> Vec<ServerStatus> {
