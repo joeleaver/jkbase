@@ -67,56 +67,79 @@ fn parse_env() -> Activation {
         std::env::remove_var("LISTEN_FDS");
         std::env::remove_var("LISTEN_FDNAMES");
     }
-    let mut map = HashMap::new();
-    let count: RawFd = match count.as_deref().and_then(|c| c.parse().ok()) {
-        Some(n) if n > 0 => n,
-        _ => {
-            return Activation {
-                activated: false,
-                fds: std::sync::Mutex::new(map),
-            };
-        }
-    };
     // Arm CLOEXEC on the whole inherited range UNCONDITIONALLY — even if LISTEN_PID mismatches,
     // any fds present at 3.. are ours to NOT leak into a tenant fork+exec (LOW-9).
-    for i in 0..count {
-        arm_cloexec(SD_LISTEN_FDS_START + i);
+    if let Some(n) = count.as_deref().and_then(|c| c.parse::<RawFd>().ok()) {
+        for i in 0..n {
+            arm_cloexec(SD_LISTEN_FDS_START + i);
+        }
     }
-    let ours = matches!(pid.and_then(|p| p.parse::<u32>().ok()), Some(p) if p == std::process::id());
-    if !ours {
-        // Vars leaked into us (not the pid systemd targeted) → not activated; callers bind().
+    // Pure name→fd resolution (PID gate + duplicate fail-closed) — unit-tested below.
+    let Some(named) = resolve_fd_names(
+        pid.as_deref(),
+        count.as_deref(),
+        names.as_deref(),
+        std::process::id(),
+    ) else {
+        // Not socket-activated (or LISTEN_* leaked into us) → callers bind().
         return Activation {
             activated: false,
-            fds: std::sync::Mutex::new(map),
+            fds: std::sync::Mutex::new(HashMap::new()),
         };
-    }
-    let mut names: Vec<String> = names
-        .map(|s| s.split(':').map(str::to_owned).collect())
-        .unwrap_or_default();
-    names.resize(count as usize, String::new());
-    for i in 0..count {
-        let fd = SD_LISTEN_FDS_START + i;
-        let name = std::mem::take(&mut names[i as usize]);
-        if name.is_empty() {
-            tracing::error!(fd, "socket-activation: fd has no FileDescriptorName=; ignoring");
-            continue;
-        }
-        if !is_listening_stream(fd) {
+    };
+    // Validate each resolved fd is a real listening SOCK_STREAM before trusting it (syscall —
+    // kept out of the pure resolver). AF_INET is asserted later, in take_listener.
+    let mut map = HashMap::new();
+    for (name, fd) in named {
+        if is_listening_stream(fd) {
+            map.insert(name, fd);
+        } else {
             tracing::error!(fd, %name, "socket-activation: fd is not a listening SOCK_STREAM; ignoring");
-            continue;
         }
-        // Duplicate FileDescriptorName= would silently overwrite one role's fd → fail closed by
-        // dropping BOTH so the affected role hits the activated-but-missing fatal path.
-        if map.remove(&name).is_some() {
-            tracing::error!(%name, "socket-activation: duplicate FileDescriptorName=; refusing both");
-            continue;
-        }
-        map.insert(name, fd);
     }
     Activation {
         activated: true,
         fds: std::sync::Mutex::new(map),
     }
+}
+
+/// Pure `sd_listen_fds` name→fd resolution: the PID gate + `LISTEN_FDNAMES` mapping + duplicate
+/// fail-closed, with NO syscalls/env/global state so it is unit-testable. `None` ⇒ not
+/// socket-activated (caller binds); `Some(map)` ⇒ activated (caller fails closed on a missing
+/// name). A `FileDescriptorName=` repeated across units drops ALL its entries (fail closed); a
+/// name absent from `LISTEN_FDNAMES` (fewer names than fds) is skipped.
+fn resolve_fd_names(
+    pid: Option<&str>,
+    count: Option<&str>,
+    names: Option<&str>,
+    my_pid: u32,
+) -> Option<HashMap<String, RawFd>> {
+    let count: RawFd = count.and_then(|c| c.parse().ok()).filter(|&n| n > 0)?;
+    match pid.and_then(|p| p.parse::<u32>().ok()) {
+        Some(p) if p == my_pid => {}
+        _ => return None, // not the pid systemd targeted (or unset) → leaked into us
+    }
+    let mut names: Vec<String> = names
+        .map(|s| s.split(':').map(str::to_owned).collect())
+        .unwrap_or_default();
+    names.resize(count as usize, String::new());
+    let mut map = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..count {
+        let fd = SD_LISTEN_FDS_START + i;
+        let name = std::mem::take(&mut names[i as usize]);
+        if name.is_empty() {
+            continue; // fd with no FileDescriptorName= — unaddressable, skip
+        }
+        if !seen.insert(name.clone()) {
+            // Duplicate FileDescriptorName= across units → fail closed: ban the name entirely so
+            // the affected role hits the activated-but-missing fatal path rather than a wrong fd.
+            map.remove(&name);
+            continue;
+        }
+        map.insert(name, fd);
+    }
+    Some(map)
 }
 
 /// Re-arm close-on-exec (systemd clears it; we restart via systemd, not self-exec, so the
@@ -189,4 +212,50 @@ pub fn take_listener(name: &str) -> Option<TcpListener> {
         return None; // listener drops here → fd closed
     }
     Some(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ME: u32 = 4242;
+
+    #[test]
+    fn two_named_fds_map_by_name_in_order() {
+        // The prod shape: jkbase-proxy-http.socket + jkbase-proxy-https.socket → two named fds.
+        // Each role looks up BY NAME, so :443 resolves to its OWN fd regardless of pass order.
+        let m = resolve_fd_names(Some("4242"), Some("2"), Some("proxy-http:proxy-https"), ME).unwrap();
+        assert_eq!(m.get("proxy-http"), Some(&3));
+        assert_eq!(m.get("proxy-https"), Some(&4));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn pid_mismatch_is_not_activated() {
+        // LISTEN_* leaked into a fork+exec child (jailer/FC) — must read as "not ours" → bind().
+        assert!(resolve_fd_names(Some("9999"), Some("2"), Some("proxy-http:proxy-https"), ME).is_none());
+        assert!(resolve_fd_names(None, Some("2"), Some("proxy-http"), ME).is_none());
+    }
+
+    #[test]
+    fn zero_or_missing_count_is_not_activated() {
+        assert!(resolve_fd_names(Some("4242"), Some("0"), None, ME).is_none());
+        assert!(resolve_fd_names(Some("4242"), None, None, ME).is_none());
+    }
+
+    #[test]
+    fn duplicate_fdname_fails_closed_for_that_name_only() {
+        // Two units sharing a name → that name is banned (caller bails), the distinct one survives.
+        let m = resolve_fd_names(Some("4242"), Some("3"), Some("dup:dup:api"), ME).unwrap();
+        assert_eq!(m.get("dup"), None, "duplicated name must be dropped (fail closed)");
+        assert_eq!(m.get("api"), Some(&5));
+    }
+
+    #[test]
+    fn fewer_names_than_fds_skips_unnamed() {
+        // An fd absent from LISTEN_FDNAMES is unaddressable, not mis-assigned.
+        let m = resolve_fd_names(Some("4242"), Some("2"), Some("proxy-http"), ME).unwrap();
+        assert_eq!(m.get("proxy-http"), Some(&3));
+        assert_eq!(m.len(), 1);
+    }
 }
