@@ -1373,7 +1373,9 @@ async fn async_main() -> Result<()> {
     };
 
     let store_for_builds = store.clone();
-    let mut state = AppState::new(store, log_store.clone(), deploy_dir);
+    // Keep a `store` handle after this move: the managed-DB reach-plane auth callback
+    // (built below) closes over a clone.
+    let mut state = AppState::new(store.clone(), log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
     state.domain_map = Some(domain_map.clone());
     state.platform_domain = args.domain.clone();
@@ -1526,6 +1528,29 @@ async fn async_main() -> Result<()> {
     );
     state.build_callback = Some(build_orchestrator::build_callback(build_deps));
 
+    // Managed-DB reach-plane live-relay registry — shared with the proxy edge, the idle
+    // loop, and the drain. [R5]: the control API force-closes live relays through it when a
+    // DB key is revoked or a project is deleted/transferred. Built here (before `state` is
+    // sealed into the router) so the revoke callback can reach it.
+    let db_relay_registry = jkbase_proxy::db_relay::DbRelayRegistry::new();
+    {
+        let reg = db_relay_registry.clone();
+        state.db_revoke_callback = Some(Arc::new(move |scope| match scope {
+            jkbase_control::api::DbRevokeScope::Key(k) => {
+                let n = reg.cancel_key(&k);
+                if n > 0 {
+                    info!(key = %k, count = n, "db key revoked: closed live relays");
+                }
+            }
+            jkbase_control::api::DbRevokeScope::Project(p) => {
+                let n = reg.cancel_project(&p);
+                if n > 0 {
+                    info!(project = %p, count = n, "project teardown: closed live db relays");
+                }
+            }
+        }));
+    }
+
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
 
@@ -1572,6 +1597,38 @@ async fn async_main() -> Result<()> {
         (None, None)
     };
 
+    // Managed-DB reach plane: the live-relay registry (shared with the idle loop, the
+    // drain, and revocation) + the auth callback that resolves a preamble against the
+    // control store. The closure closes over a `Store` clone, so `jkbase-proxy` needs no
+    // `jkbase-control` dependency (mirrors `wake_callback`). The tls-exporter channel-bind
+    // ([R-replay]) is checked edge-side BEFORE this runs.
+    let db_auth_store = store.clone();
+    let db_auth_callback: jkbase_proxy::DbAuthCallback =
+        Arc::new(move |akid: &str, secret: &str, claimed_project: &str| {
+            let key = db_auth_store.lookup_db_access_key(akid).ok().flatten()?;
+            if !key.verify_secret(secret) {
+                return None;
+            }
+            // [R1] The SNI's claimed project must equal the KEY's project.
+            if key.project_id != claimed_project {
+                return None;
+            }
+            // Owner re-bind: the key's tenant must still own the project (fail-closed if
+            // the project was deleted or transferred — an orphaned key can't be inherited).
+            let project = db_auth_store.get_project(&key.project_id).ok().flatten()?;
+            if project.tenant_id.as_deref() != Some(key.tenant_id.as_str()) {
+                return None;
+            }
+            let splice_secret = db_auth_store
+                .get_db_splice_secret(&key.project_id)
+                .ok()
+                .flatten()?;
+            Some(jkbase_proxy::DbAuthOk {
+                project_id: key.project_id,
+                splice_secret,
+            })
+        });
+
     let proxy_config = ProxyConfig {
         http_port: args.proxy_port,
         https_port: if args.tls {
@@ -1591,11 +1648,8 @@ async fn async_main() -> Result<()> {
         max_concurrent_upgrades: 1024,
         http_listener: proxy_http_listener,
         https_listener: proxy_https_listener,
-        // Managed-DB reach plane wired live in a follow-up (registry + auth callback +
-        // idle-loop gauge + revocation). Until then the ingress is dormant: a
-        // `jkbase-db`-ALPN connection is dropped at the demux.
-        db_auth_callback: None,
-        db_relay_registry: None,
+        db_auth_callback: Some(db_auth_callback),
+        db_relay_registry: Some(db_relay_registry.clone()),
         db_max_concurrent: 1024,
         db_preauth_max: 256,
         db_max_per_project: 64,
@@ -1643,6 +1697,7 @@ async fn async_main() -> Result<()> {
             activity_tracker.clone(),
             idle_timeout,
             log_shipper.clone(),
+            Some(db_relay_registry.clone()),
         ));
     }
 
@@ -3627,6 +3682,7 @@ async fn idle_detection_loop(
     activity: ActivityTracker,
     idle_timeout: Duration,
     shipper: Arc<LogShipper>,
+    db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
 ) {
     let check_interval = Duration::from_secs(60);
 
@@ -3668,7 +3724,14 @@ async fn idle_detection_loop(
             let should_hibernate = {
                 let plat = platform.lock().await;
                 plat.vm_states.get(&project_id) == Some(&VmLifecycle::Running)
-            };
+            }
+            // §5: never hibernate a project with a LIVE managed-DB relay — a realtime
+            // subscription can be open but byte-silent, so last-byte activity alone would
+            // scale it to zero out from under the connection.
+            && db_registry
+                .as_ref()
+                .map(|r| r.conn_count(&project_id) == 0)
+                .unwrap_or(true);
 
             if should_hibernate {
                 info!(project = %project_id, "idle timeout, hibernating");

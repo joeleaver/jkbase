@@ -31,6 +31,19 @@ pub type DeployCallback = Box<
 pub type TeardownCallback =
     Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync>;
 
+/// What to tear down when a managed-DB credential is revoked ([R5]): a single revoked
+/// key, or every relay for a deleted/transferred project.
+pub enum DbRevokeScope {
+    Key(String),
+    Project(String),
+}
+
+/// Fire-and-forget: force-close LIVE managed-DB reach-plane relays on key revocation or
+/// project delete/transfer ([R5]) — blocking new connects isn't enough, the attacker must
+/// be out NOW. The server wires this to the relay registry's `cancel_key`/`cancel_project`;
+/// control owns no proxy dependency (mirrors `CertRequest`).
+pub type DbRevokeCallback = Arc<dyn Fn(DbRevokeScope) + Send + Sync>;
+
 /// Inputs handed to the server-provided build orchestrator for one build job.
 pub struct BuildContext {
     pub project_id: String,
@@ -77,6 +90,8 @@ pub struct AppState {
     pub domain_map: Option<DomainMap>,
     pub cert_request: Option<CertRequest>,
     pub cert_status: Option<CertStatusFn>,
+    /// Tears down live managed-DB relays on key revocation / project delete ([R5]).
+    pub db_revoke_callback: Option<DbRevokeCallback>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     /// Optional platform-operator admin token (jkbase-server `--admin-token`).
@@ -156,6 +171,7 @@ impl AppState {
             domain_map: None,
             cert_request: None,
             cert_status: None,
+            db_revoke_callback: None,
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -694,6 +710,10 @@ async fn create_project(
     let _ = state.store.delete_all_access_keys(&id);
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
+    // [R5] Drop any LIVE managed-DB relay for this project now that its credentials are gone.
+    if let Some(cb) = &state.db_revoke_callback {
+        cb(DbRevokeScope::Project(id.clone()));
+    }
     let _ = tokio::fs::remove_dir_all(data_dir(&state).join("objectstore").join(&id)).await;
 
     // Claim the project's primary subdomain (host-key == project id). This also
@@ -849,6 +869,10 @@ async fn delete_project(
                     // same-slug project must not inherit a prior tenant's DB credential.
                     let _ = state.store.delete_all_db_access_keys(&id);
                     let _ = state.store.delete_db_splice_secret(&id);
+                    // [R5] Drop any LIVE managed-DB relay now that credentials are gone.
+                    if let Some(cb) = &state.db_revoke_callback {
+                        cb(DbRevokeScope::Project(id.clone()));
+                    }
                     let _ =
                         tokio::fs::remove_dir_all(data_dir(&state).join("objectstore").join(&id))
                             .await;
@@ -3000,6 +3024,10 @@ async fn revoke_db_key(
     match state.store.delete_db_access_key(&id, &akid) {
         Ok(true) => {
             info!(project = %id, access_key_id = %akid, "managed-db access key revoked");
+            // [R5] Drop any LIVE relay this key authorized — revocation must mean "out now".
+            if let Some(cb) = &state.db_revoke_callback {
+                cb(DbRevokeScope::Key(akid.clone()));
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => (
