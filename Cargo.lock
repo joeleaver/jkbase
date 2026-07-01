@@ -1923,7 +1923,9 @@ version = "0.1.0"
 dependencies = [
  "hyper",
  "hyper-util",
+ "socket2",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
