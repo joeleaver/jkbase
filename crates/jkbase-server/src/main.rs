@@ -3849,6 +3849,10 @@ const MAX_DB_BACKUP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// Retained COMPLETE backups per project (retention bound; the store cap
 /// [`Store::MAX_DB_BACKUPS_PER_PROJECT`] is the backstop).
 const DB_BACKUP_KEEP: usize = 14;
+/// Retained Failed rows per project — enough for the nightly loop's failure backoff to see the
+/// last failure time (so a persistently-failing project retries once per interval, not per tick),
+/// and for the owner to see recent failures, without letting Failed rows wedge the cap.
+const DB_BACKUP_FAILED_KEEP: usize = 3;
 /// Nightly-loop cadence + the age at which a managed DB is due for an automatic backup.
 const DB_BACKUP_TICK: Duration = Duration::from_secs(30 * 60);
 const DB_BACKUP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -4089,6 +4093,7 @@ async fn prune_db_backups(ctx: &DbBackupCtx, project_id: &str) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut kept_complete = 0usize;
+    let mut kept_failed = 0usize;
     for b in backups {
         use jkbase_control::store::BackupStatus;
         let keep = match b.status {
@@ -4102,7 +4107,12 @@ async fn prune_db_backups(ctx: &DbBackupCtx, project_id: &str) {
                 now_ms.saturating_sub(b.created_at_ms)
                     < jkbase_control::store::Store::BACKUP_STALE_MS
             }
-            BackupStatus::Failed => false,
+            // Keep the newest few Failed rows so the nightly backoff can see the last failure;
+            // drop the rest so they can't wedge the cap.
+            BackupStatus::Failed => {
+                kept_failed += 1;
+                kept_failed <= DB_BACKUP_FAILED_KEEP
+            }
         };
         if !keep {
             let _ = ctx.backups.delete(project_id, &b.backup_id).await;

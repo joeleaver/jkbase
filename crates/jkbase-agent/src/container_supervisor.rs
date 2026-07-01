@@ -42,8 +42,12 @@ pub(crate) fn snapshot_is_complete(dir: &Path) -> bool {
     }
     if let Some(ssts) = v.get("ssts").and_then(|s| s.as_array()) {
         for s in ssts.iter().filter_map(|x| x.as_str()) {
-            let base = Path::new(s).file_name().and_then(|n| n.to_str()).unwrap_or(s);
-            if !dir.join("sst").join(base).is_file() {
+            // Reject a traversal / non-plain name (rhypedb's restore refuses it, so arming a
+            // restore for it would just brick the boot). A legit sst name is a plain filename.
+            if s.is_empty() || s.contains('/') || s.contains('\\') || s == "." || s == ".." {
+                return false;
+            }
+            if !dir.join("sst").join(s).is_file() {
                 return false;
             }
         }

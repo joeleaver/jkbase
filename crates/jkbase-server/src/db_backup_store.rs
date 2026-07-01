@@ -88,6 +88,11 @@ impl BackupStore {
         let tmp = dir.join(format!(".{backup_id}.tar.tmp"));
         // Stream to the tmp file; on ANY error remove the tmp so a failed/aborted pull can't leak
         // a partial multi-GiB file on the off-quota host disk (finding: .tmp leak).
+        // Bound the whole pull's duration so a hostile guest can't slow-drip a stream past the
+        // single-flight/stale window and leave an orphaned off-quota blob (adversarial-review
+        // residual). Comfortably above a legit multi-GiB backup over the fast VM→host link, well
+        // below Store::BACKUP_STALE_MS.
+        let deadline = tokio::time::Instant::now() + STAGE_MAX_DURATION;
         let stream = async {
             let mut f = tokio::fs::File::create(&tmp)
                 .await
@@ -95,7 +100,10 @@ impl BackupStore {
             let mut buf = vec![0u8; 64 * 1024];
             let mut size: u64 = 0;
             loop {
-                let n = reader.read(&mut buf).await.context("read backup stream")?;
+                let n = tokio::time::timeout_at(deadline, reader.read(&mut buf))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("backup stream stalled / exceeded time budget"))?
+                    .context("read backup stream")?;
                 if n == 0 {
                     break;
                 }
@@ -168,6 +176,111 @@ impl BackupStore {
 /// adversarial path ([RB3]).
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Total wall-clock budget for streaming one backup tar off the agent. Bounds a slow-drip /
+/// stalled pull so it can't outlive the single-flight window (< `Store::BACKUP_STALE_MS` = 30m)
+/// and orphan a committed off-quota blob.
+const STAGE_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// A plain, in-directory filename: non-empty, no path separators, not `.`/`..`, not absolute.
+/// Mirrors rhypedb's `is_safe_filename` (restore.rs) so the host rejects a manifest that lists a
+/// traversal name (`../x.sst`) — otherwise the host's basename-normalized presence check would
+/// pass a snapshot that rhypedb's own restore then refuses, bricking the DB on restore.
+fn is_safe_manifest_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !std::path::Path::new(name).is_absolute()
+}
+
+/// Read exactly `buf.len()` bytes, or fewer at EOF. Returns the count read.
+fn read_full(f: &mut impl std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match f.read(&mut buf[got..])? {
+            0 => break,
+            k => got += k,
+        }
+    }
+    Ok(got)
+}
+
+/// Parse a 12-byte tar size field: octal ASCII, or GNU base-256 (high bit of byte 0 set).
+fn parse_tar_size(field: &[u8]) -> Result<u64> {
+    if field.first().is_some_and(|b| b & 0x80 != 0) {
+        let mut v: u128 = (field[0] & 0x7f) as u128;
+        for &b in &field[1..] {
+            v = (v << 8) | b as u128;
+        }
+        u64::try_from(v).map_err(|_| anyhow::anyhow!("tar size overflow"))
+    } else {
+        let s = std::str::from_utf8(field)
+            .unwrap_or("")
+            .trim_matches(|c| c == '\0' || c == ' ');
+        if s.is_empty() {
+            return Ok(0);
+        }
+        u64::from_str_radix(s, 8).map_err(|_| anyhow::anyhow!("bad tar size field"))
+    }
+}
+
+/// Bounded-memory guard against a host-OOM in the tar PARSER itself ([RB3]). The `tar` crate reads
+/// GNU long-name (`L`), long-link (`K`), and PAX extension (`x`/`g`) entry bodies FULLY into RAM
+/// before yielding an entry — before any per-entry cap in [`validate_and_summarize`] runs — so a
+/// hostile guest could declare a multi-GiB such header and OOM the shared host process. A
+/// legitimate rhypedb backup contains ONLY regular files + directories with short ustar names, so
+/// we pre-walk the 512-byte headers (seeking over data, O(1) memory) and reject any tar carrying
+/// an unsupported entry type before it ever reaches `tar::Archive`.
+fn reject_unsafe_tar_headers(tar_path: &Path) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    // A legit rhypedb backup has at most a few thousand entries; cap the scan far above that so a
+    // pathological all-headers tar (millions of zero-size entries) can't burn CPU here.
+    const MAX_TAR_ENTRIES: u64 = 1_000_000;
+    let mut f = std::io::BufReader::new(
+        std::fs::File::open(tar_path).context("open backup for header scan")?,
+    );
+    let mut hdr = [0u8; 512];
+    let mut zero_blocks = 0;
+    let mut entries = 0u64;
+    loop {
+        entries += 1;
+        if entries > MAX_TAR_ENTRIES {
+            anyhow::bail!("backup tar has too many entries (rejecting)");
+        }
+        let n = read_full(&mut f, &mut hdr).context("read tar header")?;
+        if n == 0 {
+            break; // EOF (no end-of-archive marker — validate_and_summarize's drain catches it)
+        }
+        if n < 512 {
+            anyhow::bail!("truncated tar header");
+        }
+        if hdr.iter().all(|&b| b == 0) {
+            zero_blocks += 1;
+            if zero_blocks == 2 {
+                break; // end-of-archive
+            }
+            continue;
+        }
+        zero_blocks = 0;
+        // typeflag @156. Allow regular file ('0'/NUL) + directory ('5'); reject L/K/x/g and any
+        // other extension whose body the tar crate would buffer unbounded.
+        match hdr[156] {
+            b'0' | 0u8 | b'5' => {}
+            other => anyhow::bail!(
+                "backup tar has an unsupported entry type {other:#x} (rejecting to bound host memory)"
+            ),
+        }
+        let size = parse_tar_size(&hdr[124..136])?;
+        // Clamp to i64::MAX so a malicious declared size can't wrap `as i64` negative and seek
+        // backwards into a loop; a seek past EOF just makes the next read return 0 → break.
+        let data = i64::try_from(size.div_ceil(512).saturating_mul(512)).unwrap_or(i64::MAX);
+        f.seek(SeekFrom::Current(data))
+            .context("seek past tar entry data")?;
+    }
+    Ok(())
+}
+
 /// Validate a completed backup tar and extract a one-line summary from its `MANIFEST.json`
 /// ([RB8]). Sync (tar is a blocking reader) — run under `spawn_blocking`.
 ///
@@ -181,6 +294,8 @@ const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 /// A truncated/incomplete tar therefore fails validation and is never committed/restored.
 pub fn validate_and_summarize(tar_path: &Path) -> Result<String> {
     use std::io::Read;
+    // Bound the tar PARSER's memory before handing the guest-controlled tar to `tar::Archive`.
+    reject_unsafe_tar_headers(tar_path)?;
     let f = std::fs::File::open(tar_path).context("open backup for validation")?;
     let mut ar = tar::Archive::new(f);
     let mut manifest: Option<serde_json::Value> = None;
@@ -223,12 +338,13 @@ pub fn validate_and_summarize(tar_path: &Path) -> Result<String> {
     let mut missing: Vec<String> = Vec::new();
     if let Some(ssts) = v.get("ssts").and_then(|s| s.as_array()) {
         for s in ssts.iter().filter_map(|x| x.as_str()) {
-            let base = std::path::Path::new(s)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(s);
-            if !present.contains(base) {
-                missing.push(format!("sst/{base}"));
+            // Reject a traversal name outright — rhypedb's restore refuses it, so a snapshot our
+            // basename check would "pass" here would brick the DB on restore.
+            if !is_safe_manifest_name(s) {
+                anyhow::bail!("backup MANIFEST.json lists an unsafe sst filename: {s:?}");
+            }
+            if !present.contains(s) {
+                missing.push(format!("sst/{s}"));
             }
         }
     }
@@ -411,6 +527,41 @@ mod tests {
         let tar = make_tar(&[("sst/1.sst", b"a")], &["1.sst"], false); // no wal.log/schema.rhype
         let staged = stage_tar(&store, "bkp_nowal", tar).await;
         assert!(store.validate(&staged).await.is_err());
+        store.discard(staged).await;
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_gnu_longname_entry_before_parsing() {
+        // The tar PARSER would buffer a GNU long-name ('L') entry body into RAM before yielding
+        // an entry — the host-OOM vector. Craft a tar whose first header is typeflag 'L' with a
+        // large declared size; the header pre-scan must reject it without allocating the body.
+        let dir = TmpDir::new();
+        let store = BackupStore::new(dir.path());
+        let mut hdr = [0u8; 512];
+        hdr[156] = b'L'; // GNU long-name typeflag
+        // size field @124..136 = octal for a big value (e.g. 100 MiB) — we only write a little.
+        let octal = b"00650000000\0"; // 0o6500000000 = 100 MiB-ish, fits 11 octal digits
+        hdr[124..124 + octal.len()].copy_from_slice(octal);
+        let mut tar = hdr.to_vec();
+        tar.extend_from_slice(&[b'x'; 512]); // one data block (far less than declared)
+        let staged = stage_tar(&store, "bkp_evil", tar).await;
+        let err = store.validate(&staged).await.unwrap_err().to_string();
+        assert!(err.contains("unsupported entry type"), "{err}");
+        store.discard(staged).await;
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_manifest_with_traversal_sst_name() {
+        let dir = TmpDir::new();
+        let store = BackupStore::new(dir.path());
+        let tar = make_tar(
+            &[("wal.log", b"w"), ("schema.rhype", b"type X {}")],
+            &["../evil.sst"],
+            false,
+        );
+        let staged = stage_tar(&store, "bkp_trav", tar).await;
+        let err = store.validate(&staged).await.unwrap_err().to_string();
+        assert!(err.contains("unsafe sst filename"), "{err}");
         store.discard(staged).await;
     }
 }
