@@ -81,10 +81,13 @@ struct Tunnel {
 }
 
 pub async fn run(args: ProxyArgs) -> Result<()> {
-    let project_id = super::resolve_project_id(args.project.clone())?;
-    let db_host = match args.db_host {
+    // Resolve the DB host. Only the DEFAULT (`<project>.db.<domain>`) needs a project
+    // context — an explicit `--db-host` (BYO custom domain, or a non-project invocation)
+    // must NOT require a jkbase.toml / `--project`.
+    let db_host = match args.db_host.clone() {
         Some(h) => h,
         None => {
+            let project_id = super::resolve_project_id(args.project.clone())?;
             let domain = platform_domain(&args.api)
                 .with_context(|| format!("could not derive DB host domain from --api {}", args.api))?;
             format!("{project_id}.db.{domain}")
@@ -106,10 +109,7 @@ pub async fn run(args: ProxyArgs) -> Result<()> {
         secret: args.secret,
     });
 
-    eprintln!(
-        "jkbase db proxy: {listen}  ->  {db_host}:{}  (project {project_id})",
-        args.port
-    );
+    eprintln!("jkbase db proxy: {listen}  ->  {db_host}:{}", args.port);
     eprintln!("  Point @rhypedb/client at {listen}. Ctrl-C to stop.");
     serve(listen, tunnel).await
 }
