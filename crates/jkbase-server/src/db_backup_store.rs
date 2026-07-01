@@ -63,7 +63,9 @@ impl BackupStore {
         if !is_valid_backup_id(backup_id) {
             anyhow::bail!("invalid backup id");
         }
-        Ok(self.project_dir(project_id)?.join(format!("{backup_id}.tar")))
+        Ok(self
+            .project_dir(project_id)?
+            .join(format!("{backup_id}.tar")))
     }
 
     /// Stream a backup tar off `reader` into a temp file next to its final path (same dir → the
@@ -167,7 +169,6 @@ impl BackupStore {
             Err(e) => Err(e).context("delete backup"),
         }
     }
-
 }
 
 /// A real rhypedb backup MANIFEST.json is a few KB of metadata. Cap the read hard so a hostile
@@ -331,8 +332,7 @@ pub fn validate_and_summarize(tar_path: &Path) -> Result<String> {
             present.insert(b);
         }
     }
-    let v =
-        manifest.ok_or_else(|| anyhow::anyhow!("backup is incomplete: no MANIFEST.json"))?;
+    let v = manifest.ok_or_else(|| anyhow::anyhow!("backup is incomplete: no MANIFEST.json"))?;
     // Cross-check completeness: every load-bearing file the manifest vouches for must be present
     // (a clean end-of-archive that dropped trailing entries would still be caught here).
     let mut missing: Vec<String> = Vec::new();
@@ -359,7 +359,11 @@ pub fn validate_and_summarize(tar_path: &Path) -> Result<String> {
             missing.join(", ")
         );
     }
-    let ssts = v.get("ssts").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0);
+    let ssts = v
+        .get("ssts")
+        .and_then(|s| s.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
     let max_version = v.get("max_version").and_then(|x| x.as_u64()).unwrap_or(0);
     let migrating = v
         .get("in_flight_migrations")
@@ -419,7 +423,10 @@ mod tests {
         let dir = TmpDir::new();
         let store = BackupStore::new(dir.path());
         let mut src = std::io::Cursor::new(b"hello-tar-bytes".to_vec());
-        let staged = store.stage("proj-a", "bkp_1_aa", &mut src, 1024).await.unwrap();
+        let staged = store
+            .stage("proj-a", "bkp_1_aa", &mut src, 1024)
+            .await
+            .unwrap();
         assert_eq!(staged.size_bytes, 15);
         store.commit(staged).await.unwrap();
         let mut f = store.open_read("proj-a", "bkp_1_aa").await.unwrap();
@@ -499,7 +506,10 @@ mod tests {
         let store = BackupStore::new(dir.path());
         let tar = make_tar(&[("sst/1.sst", b"a"), ("wal.log", b"w")], &["1.sst"], true);
         let staged = stage_tar(&store, "bkp_nomani", tar).await;
-        assert!(store.validate(&staged).await.is_err(), "no MANIFEST.json ⇒ incomplete");
+        assert!(
+            store.validate(&staged).await.is_err(),
+            "no MANIFEST.json ⇒ incomplete"
+        );
         store.discard(staged).await;
     }
 
@@ -516,7 +526,10 @@ mod tests {
         );
         let staged = stage_tar(&store, "bkp_trunc", tar).await;
         let err = store.validate(&staged).await.unwrap_err().to_string();
-        assert!(err.contains("incomplete") && err.contains("sst/1.sst"), "{err}");
+        assert!(
+            err.contains("incomplete") && err.contains("sst/1.sst"),
+            "{err}"
+        );
         store.discard(staged).await;
     }
 

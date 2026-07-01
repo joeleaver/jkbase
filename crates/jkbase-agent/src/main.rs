@@ -516,7 +516,8 @@ async fn main() -> Result<()> {
     // Host-only reach-plane facts (splice secret + rhypedb admin token), loaded once from the
     // metadata image before the DB starts so the token can be injected into the DB's env.
     let db_reach = load_db_reach_facts(&serve_dir);
-    let db_splice_secret = (!db_reach.splice_secret.is_empty()).then(|| db_reach.splice_secret.clone());
+    let db_splice_secret =
+        (!db_reach.splice_secret.is_empty()).then(|| db_reach.splice_secret.clone());
     let db_admin_token = (!db_reach.admin_token.is_empty()).then(|| db_reach.admin_token.clone());
 
     if let Some(lowerdirs) = db_lowerdirs {
@@ -525,7 +526,12 @@ async fn main() -> Result<()> {
             Ok(schema) => {
                 let rules = std::fs::read(serve_dir.join("_database/rules.rhype")).ok();
                 if let Err(e) = containers
-                    .start_database(db_admin_token.as_deref(), &schema, rules.as_deref(), lowerdirs)
+                    .start_database(
+                        db_admin_token.as_deref(),
+                        &schema,
+                        rules.as_deref(),
+                        lowerdirs,
+                    )
                     .await
                 {
                     error!(error = %e, "failed to start managed database");
@@ -1255,7 +1261,9 @@ async fn handle_db_backup(
                 // truncates the body → the host's tar-EOF validation rejects it ([RB8]).
                 let _ = out.shutdown().await;
                 if !clean {
-                    tracing::warn!("db backup: tar stream ended early (host will reject as truncated)");
+                    tracing::warn!(
+                        "db backup: tar stream ended early (host will reject as truncated)"
+                    );
                 }
             }
             Err(e) => error!(error = %e, "db backup: client upgrade failed"),
@@ -1438,8 +1446,7 @@ async fn db_health_probe() -> bool {
     let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", RHYPEDB_HTTP_PORT)).await else {
         return false;
     };
-    let Ok((mut sender, conn)) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+    let Ok((mut sender, conn)) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
     else {
         return false;
     };

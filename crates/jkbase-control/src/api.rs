@@ -3202,8 +3202,7 @@ async fn list_db_backups(
     }
     match state.store.list_db_backups(&id) {
         Ok(rows) => {
-            let out: Vec<DbBackupResponse> =
-                rows.into_iter().map(DbBackupResponse::from).collect();
+            let out: Vec<DbBackupResponse> = rows.into_iter().map(DbBackupResponse::from).collect();
             Json(out).into_response()
         }
         Err(e) => (

@@ -2455,11 +2455,17 @@ mod tests {
         assert_eq!(store.get_db_admin_token("p").unwrap(), None);
         let t1 = store.mint_db_admin_token("p").unwrap();
         assert!(t1.starts_with("jkba_"));
-        assert_eq!(store.get_db_admin_token("p").unwrap().as_deref(), Some(t1.as_str()));
+        assert_eq!(
+            store.get_db_admin_token("p").unwrap().as_deref(),
+            Some(t1.as_str())
+        );
         // Rotates on each deploy (fresh value).
         let t2 = store.mint_db_admin_token("p").unwrap();
         assert_ne!(t1, t2);
-        assert_eq!(store.get_db_admin_token("p").unwrap().as_deref(), Some(t2.as_str()));
+        assert_eq!(
+            store.get_db_admin_token("p").unwrap().as_deref(),
+            Some(t2.as_str())
+        );
         // Scoped to the project; purged on teardown.
         assert_eq!(store.get_db_admin_token("q").unwrap(), None);
         store.delete_db_admin_token("p").unwrap();
@@ -2482,7 +2488,12 @@ mod tests {
 
         // Cross-project resolution is refused ([RB6]): the id only resolves under its project.
         assert!(store.get_db_backup("proj-a", "bkp_9_zz").unwrap().is_none());
-        assert!(store.get_db_backup("proj-a2", "bkp_9_zz").unwrap().is_some());
+        assert!(
+            store
+                .get_db_backup("proj-a2", "bkp_9_zz")
+                .unwrap()
+                .is_some()
+        );
 
         // Two-phase: flip to Complete with size + summary.
         store
@@ -2498,7 +2509,11 @@ mod tests {
             .set_db_backup_status("proj-a2", "bkp_1_aa", BackupStatus::Failed, 0, "")
             .unwrap();
         assert_eq!(
-            store.get_db_backup("proj-a", "bkp_1_aa").unwrap().unwrap().status,
+            store
+                .get_db_backup("proj-a", "bkp_1_aa")
+                .unwrap()
+                .unwrap()
+                .status,
             BackupStatus::Complete
         );
 
@@ -2508,7 +2523,10 @@ mod tests {
         assert_eq!(removed[0].object_key, "proj-a/bkp_1_aa.tar");
         assert!(store.list_db_backups("proj-a").unwrap().is_empty());
         assert!(
-            store.get_db_backup("proj-a2", &keep.backup_id).unwrap().is_some(),
+            store
+                .get_db_backup("proj-a2", &keep.backup_id)
+                .unwrap()
+                .is_some(),
             "prefix boundary: proj-a2 must survive"
         );
         let _ = std::fs::remove_file(path);
@@ -2519,7 +2537,12 @@ mod tests {
         let (store, path) = tmp_db();
         for i in 0..Store::MAX_DB_BACKUPS_PER_PROJECT {
             store
-                .create_db_backup("capproj", "t", &format!("bkp_{i}_x"), &format!("capproj/{i}.tar"))
+                .create_db_backup(
+                    "capproj",
+                    "t",
+                    &format!("bkp_{i}_x"),
+                    &format!("capproj/{i}.tar"),
+                )
                 .unwrap();
         }
         assert!(
@@ -2528,7 +2551,11 @@ mod tests {
                 .is_err()
         );
         // A different project is unaffected.
-        assert!(store.create_db_backup("other", "t", "bkp_ok_x", "other/ok.tar").is_ok());
+        assert!(
+            store
+                .create_db_backup("other", "t", "bkp_ok_x", "other/ok.tar")
+                .is_ok()
+        );
         let _ = std::fs::remove_file(path);
     }
 

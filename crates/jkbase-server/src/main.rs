@@ -2766,13 +2766,19 @@ async fn handle_deploy(
     // channel ONLY — never `_database.json`.
     let db_reach: Option<jkbase_common::config::DbReachFacts> =
         if check_project_has_database(&data_dir, project_id) {
-            plat.store.mint_db_splice_secret(project_id).ok().map(|splice_secret| {
-                let admin_token = plat.store.mint_db_admin_token(project_id).unwrap_or_default();
-                jkbase_common::config::DbReachFacts {
-                    splice_secret,
-                    admin_token,
-                }
-            })
+            plat.store
+                .mint_db_splice_secret(project_id)
+                .ok()
+                .map(|splice_secret| {
+                    let admin_token = plat
+                        .store
+                        .mint_db_admin_token(project_id)
+                        .unwrap_or_default();
+                    jkbase_common::config::DbReachFacts {
+                        splice_secret,
+                        admin_token,
+                    }
+                })
         } else {
             None
         };
@@ -3912,7 +3918,9 @@ async fn connect_agent_db_upgrade(
     if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
         anyhow::bail!("agent refused {path} upgrade ({})", resp.status());
     }
-    let upgraded = hyper::upgrade::on(&mut resp).await.context("agent upgrade")?;
+    let upgraded = hyper::upgrade::on(&mut resp)
+        .await
+        .context("agent upgrade")?;
     Ok(hyper_util::rt::TokioIo::new(upgraded))
 }
 
@@ -4030,7 +4038,10 @@ async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> 
         .get_db_backup(project_id, backup_id)?
         .ok_or_else(|| anyhow::anyhow!("backup not found"))?;
     if backup.status != jkbase_control::store::BackupStatus::Complete {
-        anyhow::bail!("backup {backup_id} is not restorable (status {:?})", backup.status);
+        anyhow::bail!(
+            "backup {backup_id} is not restorable (status {:?})",
+            backup.status
+        );
     }
     let secret = ctx
         .store
@@ -4053,7 +4064,10 @@ async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> 
         .context("stream backup to agent")?;
     // Half-close the write half → the agent sees a clean EOF for the tar, processes it, then
     // writes its status line back on the still-open read half.
-    upgraded.shutdown().await.context("half-close restore push")?;
+    upgraded
+        .shutdown()
+        .await
+        .context("half-close restore push")?;
     let mut status = String::new();
     upgraded
         .read_to_string(&mut status)
@@ -4065,7 +4079,11 @@ async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> 
     } else {
         anyhow::bail!(
             "agent restore: {}",
-            if status.is_empty() { "no response" } else { status }
+            if status.is_empty() {
+                "no response"
+            } else {
+                status
+            }
         )
     }
 }

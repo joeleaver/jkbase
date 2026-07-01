@@ -5857,9 +5857,12 @@ console.log("listening on " + port);
         sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
             .await
             .unwrap();
-        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
-            .await
-            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
         sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
 
         let config = VmConfig {
@@ -6054,7 +6057,9 @@ console.log("listening on " + port);
                     "jkbase-db-backup",
                 )
                 .await?;
-                let staged = backups.stage("testproj", backup_id, &mut up, 1 << 30).await?;
+                let staged = backups
+                    .stage("testproj", backup_id, &mut up, 1 << 30)
+                    .await?;
                 let summary = backups.validate(&staged).await?;
                 backups.commit(staged).await?;
                 Ok::<String, anyhow::Error>(summary)
