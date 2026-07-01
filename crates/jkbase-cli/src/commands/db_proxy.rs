@@ -142,7 +142,11 @@ async fn serve(listen: SocketAddr, tunnel: Arc<Tunnel>) -> Result<()> {
         let (local, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
+                // Back off briefly so a persistent errno (e.g. EMFILE/ENFILE from fd
+                // exhaustion under many open subscription tunnels) doesn't turn the loop
+                // into a 100%-CPU busy-spin + stderr flood; it self-clears as fds free.
                 eprintln!("jkbase db proxy: accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
         };

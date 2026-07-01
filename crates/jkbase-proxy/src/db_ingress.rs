@@ -81,8 +81,11 @@ impl Drop for IpPermit {
 
 /// App-level idle watchdog for a DB relay — effectively "never", so a legitimately
 /// silent realtime subscription stays open. A DEAD peer is reaped by TCP keepalive ([R9])
-/// in ~minutes; drain + revocation are the other teardown paths. (This is NOT the tenant
-/// keeping a VM warm for free — that is metered/gauged elsewhere.)
+/// in ~minutes; drain + revocation are the other teardown paths. NOTE: an idle relay keeps
+/// its own VM warm (conn_count>0 excludes it from hibernation) at ~zero metered cost — the
+/// same pre-existing property as any idle HTTP/WS connection to one's own project, and bounded
+/// to the owner's OWN projects by the [R1] owner re-bind, NOT a cross-tenant lever. A
+/// per-tenant warm-VM quota is the platform-wide fix (tracked on Overboard, not seam-specific).
 const DB_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Hard deadline on the handshake→preamble read of an UNAUTHENTICATED connection ([R6]).
 const PREAMBLE_DEADLINE: Duration = Duration::from_secs(10);
