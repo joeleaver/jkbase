@@ -2331,12 +2331,20 @@ async fn set_tenant_quota(
         )
             .into_response();
     }
-    // Tenants may only self-restrict (clamp to the default); an admin may raise it.
+    // Tenants may only self-restrict; an admin may set any value (incl. 0 to disable).
+    // For a non-admin we clamp to the tenant's CURRENT effective cap (default or an
+    // admin-granted override) rather than the platform default, so re-saving the
+    // current value doesn't silently claw back an admin grant; and we floor at 1 so a
+    // tenant can't accidentally set 0 and lock itself out of the DB reach plane.
     let warm_vm_max = if is_admin {
         req.warm_vm_max
     } else {
-        req.warm_vm_max
-            .min(crate::store::DEFAULT_TENANT_QUOTA.warm_vm_max)
+        let current = state
+            .store
+            .get_tenant_quota(&tenant_id)
+            .map(|q| q.warm_vm_max)
+            .unwrap_or(crate::store::DEFAULT_TENANT_QUOTA.warm_vm_max);
+        req.warm_vm_max.min(current).max(1)
     };
     let limits = crate::store::TenantQuotaLimits { warm_vm_max };
     match state.store.set_tenant_quota(&tenant_id, &limits) {

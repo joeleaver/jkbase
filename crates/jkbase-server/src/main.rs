@@ -1658,7 +1658,7 @@ async fn async_main() -> Result<()> {
             let warm_vm_max = db_auth_store
                 .get_tenant_quota(&key.tenant_id)
                 .map(|q| q.warm_vm_max)
-                .unwrap_or(16);
+                .unwrap_or(jkbase_control::store::DEFAULT_TENANT_QUOTA.warm_vm_max);
             Some(jkbase_proxy::DbAuthOk {
                 project_id: key.project_id,
                 splice_secret,
