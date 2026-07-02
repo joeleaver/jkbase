@@ -2112,6 +2112,8 @@ pub struct SetQuotaRequest {
 pub struct TenantQuotaResponse {
     /// Max projects the tenant may hold warm simultaneously via managed-DB relays.
     pub warm_vm_max: u32,
+    /// Max TOTAL live managed-DB relays the tenant may hold across all its projects.
+    pub warm_relay_max: u32,
     /// True if this tenant has an override (vs the platform default).
     pub overridden: bool,
 }
@@ -2119,6 +2121,7 @@ pub struct TenantQuotaResponse {
 #[derive(Deserialize)]
 pub struct SetTenantQuotaRequest {
     pub warm_vm_max: u32,
+    pub warm_relay_max: u32,
 }
 
 /// Month-to-date metered usage for a project. Works while hibernated (store-only).
@@ -2303,6 +2306,7 @@ async fn get_tenant_quota(
         .is_some();
     Json(TenantQuotaResponse {
         warm_vm_max: limits.warm_vm_max,
+        warm_relay_max: limits.warm_relay_max,
         overridden,
     })
     .into_response()
@@ -2332,24 +2336,34 @@ async fn set_tenant_quota(
             .into_response();
     }
     // Tenants may only self-restrict; an admin may set any value (incl. 0 to disable).
-    // For a non-admin we clamp to the tenant's CURRENT effective cap (default or an
-    // admin-granted override) rather than the platform default, so re-saving the
+    // For a non-admin we clamp EACH cap to the tenant's CURRENT effective value (default
+    // or an admin-granted override) rather than the platform default, so re-saving the
     // current value doesn't silently claw back an admin grant; and we floor at 1 so a
-    // tenant can't accidentally set 0 and lock itself out of the DB reach plane.
+    // tenant can't accidentally set 0 and lock itself out of the DB reach plane. Both
+    // caps are required in the request (symmetric); one shared read of the current quota
+    // drives both clamps.
+    let current = state
+        .store
+        .get_tenant_quota(&tenant_id)
+        .unwrap_or(crate::store::DEFAULT_TENANT_QUOTA);
     let warm_vm_max = if is_admin {
         req.warm_vm_max
     } else {
-        let current = state
-            .store
-            .get_tenant_quota(&tenant_id)
-            .map(|q| q.warm_vm_max)
-            .unwrap_or(crate::store::DEFAULT_TENANT_QUOTA.warm_vm_max);
-        req.warm_vm_max.min(current).max(1)
+        req.warm_vm_max.min(current.warm_vm_max).max(1)
     };
-    let limits = crate::store::TenantQuotaLimits { warm_vm_max };
+    let warm_relay_max = if is_admin {
+        req.warm_relay_max
+    } else {
+        req.warm_relay_max.min(current.warm_relay_max).max(1)
+    };
+    let limits = crate::store::TenantQuotaLimits {
+        warm_vm_max,
+        warm_relay_max,
+    };
     match state.store.set_tenant_quota(&tenant_id, &limits) {
         Ok(()) => Json(TenantQuotaResponse {
             warm_vm_max: limits.warm_vm_max,
+            warm_relay_max: limits.warm_relay_max,
             overridden: true,
         })
         .into_response(),

@@ -186,6 +186,7 @@ impl DbIngress {
         let project_id = ok.project_id.clone();
         let tenant_id = ok.tenant_id.clone();
         let warm_vm_max = ok.warm_vm_max as usize;
+        let warm_relay_max = ok.warm_relay_max as usize;
         let akid = preamble.akid.clone();
 
         // Authenticated → free the unauth slots (global + per-IP); take the post-auth ceilings.
@@ -216,10 +217,12 @@ impl DbIngress {
                 &akid,
                 self.per_project_max,
                 warm_vm_max,
+                warm_relay_max,
             )
             .map_err(|r| match r {
                 crate::db_relay::RelayRejected::PerProject => "per-project db cap reached",
                 crate::db_relay::RelayRejected::PerTenant => "tenant warm-VM quota reached",
+                crate::db_relay::RelayRejected::PerTenantRelays => "tenant relay quota reached",
             })?;
 
         // Close the auth→register cross-thread race ([R5]): a revoke on another runtime
