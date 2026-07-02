@@ -1695,6 +1695,7 @@ dependencies = [
  "flate2",
  "hickory-resolver",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "jkbase-common",
