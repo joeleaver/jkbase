@@ -1687,6 +1687,193 @@ body {
 .deploy-spacer {
   flex: 1;
 }
+
+/* --- Managed-DB studio (Database tab) --- */
+.db-subnav {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.db-subnav-btn {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 14px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color var(--transition), border-color var(--transition);
+}
+.db-subnav-btn:hover { color: var(--text); }
+.db-subnav-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.db-type-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+.db-type-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  overflow: hidden;
+}
+.db-type-name {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.db-type-name:hover { background: var(--accent-dim); }
+.db-field-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.db-field-row:last-child { border-bottom: none; }
+.db-field-name { font-family: var(--mono); color: var(--text); }
+.db-field-type { font-family: var(--mono); color: var(--text-dim); margin-left: auto; }
+.db-field-type.rel { color: var(--accent); }
+.db-field-type.vec { color: var(--warning); }
+.db-field-badges { display: inline-flex; gap: 4px; }
+.db-kind-badge {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--border);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.db-kind-badge.idx { background: var(--accent-dim); color: var(--accent); }
+.db-kind-badge.uniq { background: var(--success-dim); color: var(--success); }
+.db-kind-badge.rel { background: var(--accent-dim); color: var(--accent); }
+
+.db-rel-list { display: flex; flex-direction: column; gap: 8px; }
+.db-rel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+}
+.db-rel-node { font-family: var(--mono); font-weight: 600; color: var(--text); }
+.db-rel-node.to { color: var(--accent); }
+.db-rel-edge { font-family: var(--mono); color: var(--text-dim); }
+
+.db-sdl, .db-json {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin: 0;
+  overflow-x: auto;
+  white-space: pre;
+}
+.db-json { max-height: 480px; overflow-y: auto; }
+
+.db-query-editor {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  resize: vertical;
+}
+.db-query-editor:focus { outline: none; border-color: var(--accent); }
+
+.db-inline {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--bg-code);
+  color: var(--accent);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.db-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+.db-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.db-table th {
+  text-align: left;
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--text-dim);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  background: var(--bg-input);
+}
+.db-table td {
+  font-family: var(--mono);
+  color: var(--text);
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.db-table tr:last-child td { border-bottom: none; }
+.db-table td.db-id { color: var(--text-dim); }
+
+.db-tables-layout { display: flex; gap: 16px; align-items: flex-start; }
+.db-tables-sidebar { width: 200px; flex-shrink: 0; }
+.db-sidebar-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  font-weight: 600;
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+.db-type-list { display: flex; flex-direction: column; gap: 2px; }
+.db-type-list-btn {
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 10px;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.db-type-list-btn:hover { background: var(--bg-input); color: var(--text); }
+.db-type-list-btn.active { background: var(--accent-dim); color: var(--accent); }
+.db-tables-main { flex: 1; min-width: 0; }
+
+@media (max-width: 720px) {
+  .db-tables-layout { flex-direction: column; }
+  .db-tables-sidebar { width: 100%; }
+  .db-type-list { flex-direction: row; flex-wrap: wrap; }
+}
 </style>
 </head>
 <body>
@@ -1786,6 +1973,25 @@ body {
     restoreConfirm: null,       // backup_id awaiting restore confirm
     dbError: null,              // inline database-panel error (mirror of objError)
     dbNote: null,               // inline database-panel success note (tab-local, like dbError)
+    // database / studio (query + schema + data browser + schema editor).
+    // All read/write via the CONTROL API DB proxy: POST /db/query, GET /db/schema,
+    // POST /db/schema (edit -> redeploy). See renderDatabaseView.
+    dbSubTab: "tables",         // tables | query | schema | connect | backups
+    dbSchema: null,             // introspection {format, types:[{name,fields:[...]}], sdl}
+    dbSchemaLoading: false,
+    dbSchemaError: null,        // "no managed database..." vs a real error (drives empty state)
+    dbQueryText: "",            // query editor buffer
+    dbQueryResult: null,        // { objects:[...] } | { object:{...} } | { ok:true } from the engine
+    dbQueryError: null,         // engine parse/governor error text (tab-local to the Query panel)
+    dbQueryRunning: false,
+    dbQueryRaw: false,          // results view: table vs raw JSON
+    dbBrowseType: null,         // selected type name in the data browser
+    dbBrowseRows: null,         // rows for the current type/page
+    dbBrowseOffset: 0,
+    dbBrowseLoading: false,
+    dbBrowseError: null,
+    dbSchemaEdit: null,         // SDL editor buffer (null = not editing)
+    dbSchemaSaving: false,      // an edit->redeploy in flight
   };
 
   // --- API helpers ---
@@ -2040,10 +2246,11 @@ body {
     if (tab === "storage" && state.currentProject) {
       loadBuckets(state.currentProject.id);
     }
-    // Re-fetch DB keys + backups when entering the Database tab.
+    // Re-fetch DB keys + backups + schema when entering the Database tab.
     if (tab === "database" && state.currentProject) {
       loadDbKeys(state.currentProject.id);
       loadDbBackups(state.currentProject.id);
+      loadDbSchema(state.currentProject.id);
     }
   }
 
@@ -2317,6 +2524,99 @@ body {
     } catch (e) {
       return project.id + ".db.jkbase.app";
     }
+  }
+
+  // --- Studio: query / schema / data browser / schema editor (CONTROL API DB proxy) ---
+
+  // GET /db/schema -> introspection {types, sdl}. A "no managed database" error is EXPECTED for
+  // a project without [database]; we keep it in dbSchemaError (drives the empty state) rather
+  // than the global banner.
+  function loadDbSchema(projectId) {
+    state.dbSchemaLoading = true;
+    state.dbSchemaError = null;
+    render();
+    api("GET", "/projects/" + projectId + "/db/schema").then(function(schema) {
+      state.dbSchema = schema;
+      state.dbSchemaLoading = false;
+      render();
+    }).catch(function(e) {
+      state.dbSchema = null;
+      state.dbSchemaError = e.message;
+      state.dbSchemaLoading = false;
+      render();
+    });
+  }
+
+  // POST /db/query {query} -> engine result. A 4xx (parse / governor) rides back as e.message.
+  function runDbQuery(projectId, query) {
+    if (!query || !query.trim()) return;
+    state.dbQueryRunning = true;
+    state.dbQueryError = null;
+    render();
+    api("POST", "/projects/" + projectId + "/db/query", { query: query }).then(function(result) {
+      state.dbQueryResult = result;
+      state.dbQueryError = null;
+      state.dbQueryRunning = false;
+      render();
+    }).catch(function(e) {
+      state.dbQueryResult = null;
+      state.dbQueryError = e.message;
+      state.dbQueryRunning = false;
+      render();
+    });
+  }
+
+  var DB_BROWSE_PAGE = 50;
+  // Data browser: page a type via `Type.offset(N).limit(P)`. A large UNINDEXED type is refused
+  // fail-closed by the engine governor — surfaced in dbBrowseError with guidance (filter on an
+  // @indexed field in the Query tab).
+  function loadDbBrowse(projectId, typeName, offset) {
+    state.dbBrowseType = typeName;
+    state.dbBrowseOffset = offset;
+    state.dbBrowseLoading = true;
+    state.dbBrowseError = null;
+    render();
+    var q = typeName + ".offset(" + offset + ").limit(" + DB_BROWSE_PAGE + ")";
+    api("POST", "/projects/" + projectId + "/db/query", { query: q }).then(function(result) {
+      state.dbBrowseRows = (result && result.objects) || [];
+      state.dbBrowseLoading = false;
+      render();
+    }).catch(function(e) {
+      state.dbBrowseRows = null;
+      state.dbBrowseError = e.message;
+      state.dbBrowseLoading = false;
+      render();
+    });
+  }
+
+  // POST /db/schema {sdl} -> schema-only redeploy. The DB briefly restarts; on success we
+  // re-introspect after a short delay so the view reflects the new schema.
+  function saveDbSchema(projectId, sdl) {
+    state.dbSchemaSaving = true;
+    state.dbError = null;
+    state.dbNote = null;
+    render();
+    api("POST", "/projects/" + projectId + "/db/schema", { sdl: sdl }).then(function() {
+      state.dbSchemaSaving = false;
+      state.dbSchemaEdit = null;
+      state.dbNote = "Schema update deploying — the database will briefly restart.";
+      render();
+      setTimeout(function() {
+        if (state.currentProject && state.currentProject.id === projectId) loadDbSchema(projectId);
+      }, 4000);
+    }).catch(function(e) {
+      state.dbSchemaSaving = false;
+      state.dbError = e.message;
+      render();
+    });
+  }
+
+  // Render a JSON field value compactly for a table cell.
+  function dbCellText(v) {
+    if (v == null) return "";
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+    try { return JSON.stringify(v); } catch (e) { return String(v); }
   }
 
   // Object-store endpoint, derived from the API host so it tracks the platform
@@ -4405,70 +4705,45 @@ body {
       );
     }
 
-    return h("div", { className: "feature-content-inner" },
-      h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px" },
-        h("div", { className: "feature-title", style: "margin-bottom: 0" }, "Database"),
-        h("button", {
-          className: "btn btn-secondary btn-sm",
-          disabled: state.showCreateDbKey ? "disabled" : null,
+    // --- Studio sub-nav + panel dispatch ---
+    var subtabs = [
+      { key: "tables",  label: "Tables" },
+      { key: "query",   label: "Query" },
+      { key: "schema",  label: "Schema" },
+      { key: "connect", label: "Connect" },
+      { key: "backups", label: "Backups" },
+    ];
+    var nav = h("div", { className: "db-subnav" },
+      subtabs.map(function(t) {
+        return h("button", {
+          className: "db-subnav-btn" + (state.dbSubTab === t.key ? " active" : ""),
           onClick: function() {
-            state.dbNote = null;
-            state.showCreateDbKey = true;
+            if (state.dbSubTab === t.key) return;
+            state.dbSubTab = t.key;
+            state.dbError = null; state.dbNote = null;
+            state.dbQueryError = null; state.dbBrowseError = null;
             render();
           },
-        }, "Create DB key")
-      ),
-      state.dbError ? h("div", { className: "error-banner" }, state.dbError) : null,
-      state.dbNote ? h("div", { className: "success-banner" }, state.dbNote) : null,
+        }, t.label);
+      })
+    );
 
-      h("div", { className: "card" },
-        h("div", { className: "card-static" },
-          h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Managed database"),
-          h("div", { className: "section-desc", style: "margin-bottom: 10px" },
-            "This project can run a managed RhypeDB co-located with your app. Your app reaches it over loopback automatically; to connect from your own machine or CI, create a database key below and run the reach-plane sidecar. If you haven't enabled a database yet, add a [database] section to jkbase.toml and redeploy."
-          ),
-          h("div", { className: "token-label" }, "Reach-plane host"),
-          h("div", { className: "code-block-row" },
-            h("code", { className: "code-block", style: "margin-top: 0" }, host),
-            h("button", { className: "copy-btn", onClick: function() {
-              navigator.clipboard.writeText(host);
-              this.textContent = "Copied";
-              var btn = this;
-              setTimeout(function() { btn.textContent = "Copy"; }, 2000);
-            }}, "Copy")
-          ),
-          h("div", { className: "token-label", style: "margin-top: 12px" }, "Connect with the sidecar"),
-          h("div", { className: "code-block-row" },
-            h("code", { className: "code-block", style: "margin-top: 0" }, proxyCmd),
-            h("button", { className: "copy-btn", onClick: function() {
-              navigator.clipboard.writeText(proxyCmd);
-              this.textContent = "Copied";
-              var btn = this;
-              setTimeout(function() { btn.textContent = "Copy"; }, 2000);
-            }}, "Copy")
-          )
-        )
-      ),
-
-      revealCard,
-
-      h("div", { className: "card" },
-        h("div", { className: "card-static" },
-          h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Database keys"),
-          h("div", null, keyItems)
-        )
-      ),
-
-      h("div", { className: "card" },
+    var body;
+    if (state.dbSubTab === "query") {
+      body = renderDbQueryPanel(project);
+    } else if (state.dbSubTab === "schema") {
+      body = renderDbSchemaPanel(project);
+    } else if (state.dbSubTab === "tables") {
+      body = renderDbTablesPanel(project);
+    } else if (state.dbSubTab === "backups") {
+      body = h("div", { className: "card" },
         h("div", { className: "card-static" },
           h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px" },
             h("div", { className: "card-title", style: "margin-bottom: 0" }, "Backups"),
             h("button", {
               className: "btn btn-secondary btn-sm",
               disabled: state.dbBackupBusy ? "disabled" : null,
-              onClick: function() {
-                createDbBackup(project.id);
-              },
+              onClick: function() { createDbBackup(project.id); },
             }, state.dbBackupBusy ? "Working..." : "Create backup")
           ),
           h("div", { className: "section-desc", style: "margin-bottom: 10px" },
@@ -4476,7 +4751,331 @@ body {
           ),
           h("div", null, backupItems)
         )
+      );
+    } else {
+      // connect: reach-plane host + sidecar + keys (the original DB tab content)
+      body = h("div", null,
+        h("div", { className: "card" },
+          h("div", { className: "card-static" },
+            h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Managed database"),
+            h("div", { className: "section-desc", style: "margin-bottom: 10px" },
+              "This project can run a managed RhypeDB co-located with your app. Your app reaches it over loopback automatically; to connect from your own machine or CI, create a database key below and run the reach-plane sidecar. If you haven't enabled a database yet, add a [database] section to jkbase.toml and redeploy."
+            ),
+            h("div", { className: "token-label" }, "Reach-plane host"),
+            h("div", { className: "code-block-row" },
+              h("code", { className: "code-block", style: "margin-top: 0" }, host),
+              h("button", { className: "copy-btn", onClick: function() {
+                navigator.clipboard.writeText(host);
+                this.textContent = "Copied";
+                var btn = this;
+                setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+              }}, "Copy")
+            ),
+            h("div", { className: "token-label", style: "margin-top: 12px" }, "Connect with the sidecar"),
+            h("div", { className: "code-block-row" },
+              h("code", { className: "code-block", style: "margin-top: 0" }, proxyCmd),
+              h("button", { className: "copy-btn", onClick: function() {
+                navigator.clipboard.writeText(proxyCmd);
+                this.textContent = "Copied";
+                var btn = this;
+                setTimeout(function() { btn.textContent = "Copy"; }, 2000);
+              }}, "Copy")
+            )
+          )
+        ),
+        revealCard,
+        h("div", { className: "card" },
+          h("div", { className: "card-static" },
+            h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px" },
+              h("div", { className: "card-title", style: "margin-bottom: 0" }, "Database keys"),
+              h("button", {
+                className: "btn btn-secondary btn-sm",
+                disabled: state.showCreateDbKey ? "disabled" : null,
+                onClick: function() {
+                  state.dbNote = null;
+                  state.showCreateDbKey = true;
+                  render();
+                },
+              }, "Create DB key")
+            ),
+            h("div", null, keyItems)
+          )
+        )
+      );
+    }
+
+    return h("div", { className: "feature-content-inner" },
+      h("div", { className: "feature-title", style: "margin-bottom: 14px" }, "Database"),
+      nav,
+      state.dbError ? h("div", { className: "error-banner" }, state.dbError) : null,
+      state.dbNote ? h("div", { className: "success-banner" }, state.dbNote) : null,
+      body
+    );
+  }
+
+  // Empty state when no managed database is deployed (the schema fetch failed with "no managed
+  // database…"), distinguished from a real transport error.
+  function renderDbNoSchema() {
+    var msg = state.dbSchemaError || "";
+    var noDb = /no managed database/i.test(msg);
+    return h("div", { className: "card" },
+      h("div", { className: "card-static" },
+        h("div", { className: "card-title", style: "margin-bottom: 8px" }, noDb ? "No managed database" : "Database unavailable"),
+        h("div", { className: "section-desc" },
+          noDb
+            ? "This project has no managed database yet. Add a [database] section to your jkbase.toml (pointing at a schema .rhype file) and redeploy — then the query tools, schema editor, and data browser light up here."
+            : ("Couldn't reach the database: " + msg)
+        )
       )
+    );
+  }
+
+  // Query panel: a query editor + results (table or raw JSON) + engine error surfacing.
+  function renderDbQueryPanel(project) {
+    var result = state.dbQueryResult;
+    var resultView = null;
+    if (state.dbQueryError) {
+      resultView = h("div", { className: "error-banner", style: "white-space: pre-wrap" }, state.dbQueryError);
+    } else if (result) {
+      resultView = state.dbQueryRaw
+        ? h("pre", { className: "db-json" }, JSON.stringify(result, null, 2))
+        : renderDbResultTable(result);
+    }
+    return h("div", null,
+      h("div", { className: "card" },
+        h("div", { className: "card-static" },
+          h("div", { className: "section-desc", style: "margin-bottom: 8px" },
+            "Run a RhypeDB query — reads, relationship traversals, vector search, and writes. Examples: ",
+            h("code", { className: "db-inline" }, "User.filter(.age >= 18).limit(20)"), " · ",
+            h("code", { className: "db-inline" }, 'User.create({ name: "Ada" })'), " · ",
+            h("code", { className: "db-inline" }, "User.get(1).posts")
+          ),
+          h("textarea", {
+            className: "db-query-editor",
+            spellcheck: "false",
+            rows: "5",
+            placeholder: 'Type.filter(.field == "value").offset(0).limit(50)',
+            onInput: function(e) { state.dbQueryText = e.target.value; },
+            onKeydown: function(e) {
+              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                e.preventDefault();
+                runDbQuery(project.id, state.dbQueryText);
+              }
+            },
+          }, state.dbQueryText),
+          h("div", { style: "display: flex; align-items: center; gap: 10px; margin-top: 10px" },
+            h("button", {
+              className: "btn btn-primary btn-sm",
+              disabled: state.dbQueryRunning ? "disabled" : null,
+              onClick: function() { runDbQuery(project.id, state.dbQueryText); },
+            }, state.dbQueryRunning ? "Running..." : "Run"),
+            (result || state.dbQueryError) ? h("button", {
+              className: "btn btn-secondary btn-sm",
+              onClick: function() { state.dbQueryRaw = !state.dbQueryRaw; render(); },
+            }, state.dbQueryRaw ? "Table view" : "Raw JSON") : null,
+            h("div", { className: "section-desc", style: "margin-left: auto; font-size: 12px" }, "Ctrl/⌘+Enter to run")
+          )
+        )
+      ),
+      resultView ? h("div", { className: "card" }, h("div", { className: "card-static" }, resultView)) : null
+    );
+  }
+
+  // Render an engine query result ({objects}|{object}|{ok}) as a table.
+  function renderDbResultTable(result) {
+    if (result && result.ok !== undefined && result.objects === undefined && result.object === undefined) {
+      return h("div", { className: "section-desc" }, "OK — the write succeeded.");
+    }
+    var rows = result && result.objects ? result.objects : (result && result.object ? [result.object] : []);
+    if (rows.length === 0) return h("div", { className: "section-desc" }, "No rows.");
+    var fieldSet = {};
+    rows.forEach(function(r) { if (r.fields) Object.keys(r.fields).forEach(function(k) { fieldSet[k] = 1; }); });
+    var cols = Object.keys(fieldSet);
+    var header = h("tr", null, [h("th", null, "id")].concat(cols.map(function(c) { return h("th", null, c); })));
+    var trs = rows.map(function(r) {
+      return h("tr", null, [h("td", { className: "db-id" }, dbCellText(r.id))].concat(
+        cols.map(function(c) { return h("td", null, dbCellText(r.fields ? r.fields[c] : undefined)); })
+      ));
+    });
+    return h("div", null,
+      h("div", { className: "section-desc", style: "margin-bottom: 6px" },
+        rows.length + " row" + (rows.length === 1 ? "" : "s") + (rows[0].type ? " · " + rows[0].type : "")),
+      h("div", { className: "db-table-wrap" },
+        h("table", { className: "db-table" }, h("thead", null, header), h("tbody", null, trs)))
+    );
+  }
+
+  // Schema panel: per-type field cards + a relationship summary + the SDL, or the SDL editor.
+  function renderDbSchemaPanel(project) {
+    if (state.dbSchemaEdit !== null) return renderDbSchemaEditor(project);
+    if (state.dbSchemaLoading && !state.dbSchema) {
+      return h("div", { className: "card" }, h("div", { className: "card-static" }, h("div", { className: "section-desc" }, "Loading schema...")));
+    }
+    if (!state.dbSchema) return renderDbNoSchema();
+    var types = state.dbSchema.types || [];
+    var rels = [];
+    types.forEach(function(t) {
+      (t.fields || []).forEach(function(f) {
+        if (f.kind === "relation") rels.push({ from: t.name, field: f.name, to: f.target, many: f.many, onDelete: f.onDelete });
+      });
+    });
+    var relList = rels.length
+      ? h("div", { className: "db-rel-list" }, rels.map(function(r) {
+          return h("div", { className: "db-rel" },
+            h("span", { className: "db-rel-node" }, r.from),
+            h("span", { className: "db-rel-edge" }, "." + r.field + " →"),
+            h("span", { className: "db-rel-node to" }, r.to),
+            h("span", { className: "db-kind-badge rel" }, r.many ? "many" : "one"),
+            r.onDelete ? h("span", { className: "db-kind-badge" }, "on delete: " + r.onDelete) : null
+          );
+        }))
+      : h("div", { className: "section-desc" }, "No relationships defined.");
+    return h("div", null,
+      h("div", { className: "card" }, h("div", { className: "card-static" },
+        h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px" },
+          h("div", { className: "card-title", style: "margin-bottom: 0" }, "Schema"),
+          h("button", { className: "btn btn-secondary btn-sm", onClick: function() {
+            state.dbSchemaEdit = state.dbSchema.sdl || "";
+            state.dbError = null; state.dbNote = null;
+            render();
+          } }, "Edit schema")
+        ),
+        h("div", { className: "section-desc", style: "margin-bottom: 12px" }, types.length + " type" + (types.length === 1 ? "" : "s")),
+        h("div", { className: "db-type-grid" }, types.map(function(t) { return renderDbTypeCard(project, t); }))
+      )),
+      h("div", { className: "card" }, h("div", { className: "card-static" },
+        h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Relationships"),
+        relList
+      )),
+      h("div", { className: "card" }, h("div", { className: "card-static" },
+        h("div", { className: "card-title", style: "margin-bottom: 8px" }, "SDL"),
+        h("pre", { className: "db-sdl" }, state.dbSchema.sdl || "")
+      ))
+    );
+  }
+
+  // One type's fields, with kind (scalar/relation/vector) + unique/indexed badges. Clicking the
+  // type name jumps to the data browser for it.
+  function renderDbTypeCard(project, t) {
+    var fields = (t.fields || []).map(function(f) {
+      var meta;
+      if (f.kind === "relation") meta = h("span", { className: "db-field-type rel" }, f.many ? "[" + f.target + "]" : f.target);
+      else if (f.kind === "vector") meta = h("span", { className: "db-field-type vec" }, "vector(" + (f.dimensions || "?") + ")");
+      else meta = h("span", { className: "db-field-type" }, f.scalar || "?");
+      var badges = [];
+      if (f.unique) badges.push(h("span", { className: "db-kind-badge uniq" }, "unique"));
+      if (f.indexed) badges.push(h("span", { className: "db-kind-badge idx" }, "indexed"));
+      return h("div", { className: "db-field-row" },
+        h("span", { className: "db-field-name" }, f.name),
+        meta,
+        h("span", { className: "db-field-badges" }, badges)
+      );
+    });
+    return h("div", { className: "db-type-card" },
+      h("div", { className: "db-type-name", title: "Browse " + t.name, onClick: function() {
+        state.dbSubTab = "tables";
+        loadDbBrowse(project.id, t.name, 0);
+      } }, t.name),
+      h("div", null, fields.length ? fields : h("div", { className: "section-desc" }, "no fields"))
+    );
+  }
+
+  // SDL editor → save triggers a schema-only redeploy (durable). Cancel discards.
+  function renderDbSchemaEditor(project) {
+    return h("div", { className: "card" }, h("div", { className: "card-static" },
+      h("div", { className: "card-title", style: "margin-bottom: 8px" }, "Edit schema"),
+      h("div", { className: "section-desc", style: "margin-bottom: 10px" },
+        "Saving triggers a redeploy so the change is durable — the database briefly restarts. Additive changes (a new type, a new nullable field) apply cleanly; a field TYPE change needs a migration and a field/type DROP needs care. An incompatible change fails the redeploy and the previous schema stays live."
+      ),
+      h("textarea", {
+        className: "db-query-editor",
+        spellcheck: "false",
+        rows: "18",
+        onInput: function(e) { state.dbSchemaEdit = e.target.value; },
+      }, state.dbSchemaEdit),
+      h("div", { style: "display: flex; gap: 10px; margin-top: 10px" },
+        h("button", {
+          className: "btn btn-primary btn-sm",
+          disabled: state.dbSchemaSaving ? "disabled" : null,
+          onClick: function() { saveDbSchema(project.id, state.dbSchemaEdit); },
+        }, state.dbSchemaSaving ? "Deploying..." : "Save & redeploy"),
+        h("button", {
+          className: "btn btn-secondary btn-sm",
+          disabled: state.dbSchemaSaving ? "disabled" : null,
+          onClick: function() { state.dbSchemaEdit = null; render(); },
+        }, "Cancel")
+      )
+    ));
+  }
+
+  // Data browser: a type list on the left, the selected type's rows (paged) on the right.
+  function renderDbTablesPanel(project) {
+    if (state.dbSchemaLoading && !state.dbSchema) {
+      return h("div", { className: "card" }, h("div", { className: "card-static" }, h("div", { className: "section-desc" }, "Loading...")));
+    }
+    if (!state.dbSchema) return renderDbNoSchema();
+    var types = state.dbSchema.types || [];
+    if (types.length === 0) {
+      return h("div", { className: "card" }, h("div", { className: "card-static" }, h("div", { className: "section-desc" }, "No types in the schema.")));
+    }
+    var typeList = types.map(function(t) {
+      return h("button", {
+        className: "db-type-list-btn" + (state.dbBrowseType === t.name ? " active" : ""),
+        onClick: function() { loadDbBrowse(project.id, t.name, 0); },
+      }, t.name);
+    });
+    var main;
+    if (!state.dbBrowseType) {
+      main = h("div", { className: "section-desc" }, "Select a type to browse its rows.");
+    } else if (state.dbBrowseLoading) {
+      main = h("div", { className: "section-desc" }, "Loading " + state.dbBrowseType + "...");
+    } else if (state.dbBrowseError) {
+      var unindexed = /governor|scan|index|limit|resource/i.test(state.dbBrowseError);
+      main = h("div", null,
+        h("div", { className: "error-banner", style: "white-space: pre-wrap" }, state.dbBrowseError),
+        unindexed ? h("div", { className: "section-desc", style: "margin-top: 8px" },
+          "This type is large or unindexed, so a full scan is refused. Use the Query tab with a filter on an @indexed / @unique field, e.g. ",
+          h("code", { className: "db-inline" }, state.dbBrowseType + '.filter(.someIndexedField == "…").limit(50)')) : null
+      );
+    } else {
+      var rows = state.dbBrowseRows || [];
+      var tdef = null;
+      types.forEach(function(x) { if (x.name === state.dbBrowseType) tdef = x; });
+      var cols = tdef ? (tdef.fields || []).filter(function(f) { return f.kind !== "relation"; }).map(function(f) { return f.name; }) : [];
+      if (cols.length === 0) {
+        var seen = {};
+        rows.forEach(function(r) { if (r.fields) Object.keys(r.fields).forEach(function(k) { seen[k] = 1; }); });
+        cols = Object.keys(seen);
+      }
+      var header = h("tr", null, [h("th", null, "id")].concat(cols.map(function(c) { return h("th", null, c); })));
+      var trs = rows.length
+        ? rows.map(function(r) {
+            return h("tr", null, [h("td", { className: "db-id" }, dbCellText(r.id))].concat(
+              cols.map(function(c) { return h("td", null, dbCellText(r.fields ? r.fields[c] : undefined)); })));
+          })
+        : [h("tr", null, h("td", { colspan: String(cols.length + 1), className: "section-desc", style: "padding: 12px" }, "No rows on this page."))];
+      var page = Math.floor(state.dbBrowseOffset / DB_BROWSE_PAGE) + 1;
+      main = h("div", null,
+        h("div", { style: "display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px" },
+          h("div", { className: "card-title", style: "margin-bottom: 0" }, state.dbBrowseType),
+          h("div", { style: "display: flex; gap: 6px; align-items: center" },
+            h("button", { className: "btn btn-secondary btn-sm", disabled: state.dbBrowseOffset === 0 ? "disabled" : null,
+              onClick: function() { loadDbBrowse(project.id, state.dbBrowseType, Math.max(0, state.dbBrowseOffset - DB_BROWSE_PAGE)); } }, "Prev"),
+            h("span", { className: "section-desc" }, "page " + page),
+            h("button", { className: "btn btn-secondary btn-sm", disabled: rows.length < DB_BROWSE_PAGE ? "disabled" : null,
+              onClick: function() { loadDbBrowse(project.id, state.dbBrowseType, state.dbBrowseOffset + DB_BROWSE_PAGE); } }, "Next")
+          )
+        ),
+        h("div", { className: "db-table-wrap" },
+          h("table", { className: "db-table" }, h("thead", null, header), h("tbody", null, trs)))
+      );
+    }
+    return h("div", { className: "db-tables-layout" },
+      h("div", { className: "db-tables-sidebar" },
+        h("div", { className: "db-sidebar-title" }, "Types"),
+        h("div", { className: "db-type-list" }, typeList)
+      ),
+      h("div", { className: "card db-tables-main" }, h("div", { className: "card-static" }, main))
     );
   }
 

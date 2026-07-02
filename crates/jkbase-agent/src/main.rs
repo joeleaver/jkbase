@@ -718,6 +718,18 @@ async fn handle_request(
         return Ok(handle_db_restore(state, req).await);
     }
 
+    if path == "/_jkbase/db/query" {
+        return Ok(handle_db_query(state, req, DbHttpOp::Query).await);
+    }
+
+    if path == "/_jkbase/db/schema" {
+        return Ok(handle_db_query(state, req, DbHttpOp::Schema).await);
+    }
+
+    if path == "/_jkbase/db/status" {
+        return Ok(handle_db_query(state, req, DbHttpOp::Status).await);
+    }
+
     if path == "/_jkbase/sync" {
         unsafe { libc::sync() };
         return Ok(Response::builder()
@@ -1150,6 +1162,127 @@ async fn handle_db_splice(
 
 /// rhypedb's loopback HTTP admin port inside the guest (see `db_manifest`).
 const RHYPEDB_HTTP_PORT: u16 = 4200;
+
+/// A console DB tools op → the target route on rhypedb's OPEN loopback HTTP plane. The rhypedb
+/// path is HARD-CODED per variant (never derived from the host request), so `/admin/*` — which
+/// would need the admin token anyway — is unreachable through this seam.
+#[derive(Clone, Copy)]
+enum DbHttpOp {
+    Query,
+    Schema,
+    Status,
+}
+
+impl DbHttpOp {
+    fn method(self) -> &'static str {
+        match self {
+            DbHttpOp::Query => "POST",
+            DbHttpOp::Schema | DbHttpOp::Status => "GET",
+        }
+    }
+    fn rhypedb_path(self) -> &'static str {
+        match self {
+            DbHttpOp::Query => "/query",
+            DbHttpOp::Schema => "/schema",
+            DbHttpOp::Status => "/status",
+        }
+    }
+    fn forwards_body(self) -> bool {
+        matches!(self, DbHttpOp::Query)
+    }
+}
+
+/// Max inbound query body the agent accepts before forwarding to the engine.
+const MAX_DB_QUERY_IN_BYTES: usize = 256 * 1024;
+/// Max engine response the agent buffers before relaying to the host (result rows are
+/// governor-bounded engine-side; this caps a pathological payload).
+const MAX_DB_QUERY_OUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Console DB proxy ([managed-rhypedb studio]). Forward a secret-gated host request to rhypedb's
+/// OPEN loopback HTTP plane (`/query` | `/schema` | `/status`; NEVER `/admin/*`) and relay the
+/// engine's status + JSON body back. Bounded in + out; concurrency-capped by the shared upgrade
+/// permit pool. Lets the console query/introspect the DB without ever exposing it off-loopback.
+async fn handle_db_query(
+    state: Arc<AgentState>,
+    req: Request<hyper::body::Incoming>,
+    op: DbHttpOp,
+) -> Response<Full<Bytes>> {
+    use http_body_util::{BodyExt, Limited};
+    if !db_secret_ok(&state, &req) {
+        return not_found_response();
+    }
+    let Ok(_permit) = upgrade_permits().clone().try_acquire_owned() else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "5")
+            .body(Full::new(Bytes::from("too many concurrent db connections")))
+            .unwrap();
+    };
+
+    // Read the (bounded) inbound body only for the write/query op; schema/status are GET.
+    let body = if op.forwards_body() {
+        match Limited::new(req.into_body(), MAX_DB_QUERY_IN_BYTES)
+            .collect()
+            .await
+        {
+            Ok(c) => c.to_bytes(),
+            Err(_) => {
+                return Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(Full::new(Bytes::from("query too large")))
+                    .unwrap();
+            }
+        }
+    } else {
+        Bytes::new()
+    };
+
+    let backend = match tokio::net::TcpStream::connect(("127.0.0.1", RHYPEDB_HTTP_PORT)).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "db query: rhypedb loopback http not available");
+            return bad_gateway("db not available");
+        }
+    };
+    let (mut sender, conn) =
+        match hyper::client::conn::http1::handshake(TokioIo::new(backend)).await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "db query: loopback handshake failed");
+                return bad_gateway("db handshake failed");
+            }
+        };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let rreq = Request::builder()
+        .method(op.method())
+        .uri(op.rhypedb_path())
+        .header("host", "127.0.0.1")
+        .header("content-type", "application/json")
+        .body(Full::new(body))
+        .unwrap();
+    let resp = match sender.send_request(rreq).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "db query: engine request failed");
+            return bad_gateway("db request failed");
+        }
+    };
+    let status = resp.status();
+    let out = match Limited::new(resp.into_body(), MAX_DB_QUERY_OUT_BYTES)
+        .collect()
+        .await
+    {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return bad_gateway("db response too large"),
+    };
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(out))
+        .unwrap()
+}
 
 /// Hard cap on a restore tar the host may push ([RB3]) — defense-in-depth so even a
 /// host-authenticated push can't fill the data disk unbounded. The disk itself is the real

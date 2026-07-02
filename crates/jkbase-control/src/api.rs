@@ -56,6 +56,37 @@ pub type DbBackupCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 /// `RHYPEDB_RESTORE_FROM`. Fire-and-forget (the server impl spawns the executor).
 pub type DbRestoreCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 
+/// A read/write op the console DB tools forward to the project's managed DB. Each maps to
+/// exactly ONE route on rhypedb's OPEN loopback HTTP plane (`/query`, `/schema`, `/status`);
+/// `/admin/*` is never reachable through this seam (the agent hard-codes the target path per
+/// variant — no host- or console-controlled path passthrough). See `docs/managed-rhypedb-*`.
+pub enum DbQueryOp {
+    /// `POST /query` — the path query language (filter/traverse/limit/create/update/…).
+    Query(String),
+    /// `GET /schema` — schema introspection (types, fields, the relationship graph, SDL).
+    Schema,
+    /// `GET /status` — metering counts (objects/edges/vectors/queries).
+    Status,
+}
+
+/// The verbatim engine result of a [`DbQueryOp`]: rhypedb's own HTTP status + JSON body,
+/// passed back to the console UNCHANGED so query/parse/governor errors (400) surface as-is.
+pub struct DbQueryResult {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// Proxy a console DB read/write to the project's managed DB: wake the VM, reach the agent
+/// over its eth0 splice seam (secret-gated), and forward to the in-VM DB's open loopback HTTP
+/// plane. Owner-scoped at the router. `Err(String)` is a transport/wake failure; the engine's
+/// own errors ride back inside `Ok(DbQueryResult { status: 4xx, .. })`. The server binary
+/// provides the impl (control owns no orch dependency; mirrors [`DbBackupCallback`]).
+pub type DbQueryCallback = Arc<
+    dyn Fn(String, DbQueryOp) -> Pin<Box<dyn Future<Output = Result<DbQueryResult, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Inputs handed to the server-provided build orchestrator for one build job.
 pub struct BuildContext {
     pub project_id: String,
@@ -109,6 +140,9 @@ pub struct AppState {
     pub db_backup_callback: Option<DbBackupCallback>,
     /// Runs a managed-DB restore (host-push → in-guest untar). `None` ⇒ restore disabled.
     pub db_restore_callback: Option<DbRestoreCallback>,
+    /// Proxies a console DB read/write to the in-VM DB's open loopback HTTP plane (query /
+    /// schema / status). `None` ⇒ the console DB tools are disabled (`… /db/query` → 503).
+    pub db_query_callback: Option<DbQueryCallback>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     /// Optional platform-operator admin token (jkbase-server `--admin-token`).
@@ -191,6 +225,7 @@ impl AppState {
             db_revoke_callback: None,
             db_backup_callback: None,
             db_restore_callback: None,
+            db_query_callback: None,
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -314,6 +349,9 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(list_db_backups).post(trigger_db_backup),
         )
         .route("/projects/{id}/db/restore", post(restore_db_backup))
+        .route("/projects/{id}/db/query", post(db_query))
+        .route("/projects/{id}/db/schema", get(db_schema).post(db_schema_apply))
+        .route("/projects/{id}/db/status", get(db_status))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
@@ -3404,6 +3442,319 @@ async fn restore_db_backup(
         .into_response()
 }
 
+/// Max query-string length the console DB tools accept (defense-in-depth alongside the router
+/// body limit and the agent's own inbound bound). Queries are small; results can be large.
+const MAX_DB_QUERY_LEN: usize = 128 * 1024;
+
+#[derive(Deserialize)]
+pub struct DbQueryRequest {
+    pub query: String,
+}
+
+/// Shared tail for the three console DB proxy endpoints: require the query callback, invoke it,
+/// and pass the engine's HTTP status + JSON body back VERBATIM (so 400 parse/governor errors
+/// reach the UI unchanged). A transport/wake failure becomes a 502 with a JSON error.
+async fn db_query_dispatch(
+    state: &Arc<AppState>,
+    id: String,
+    op: DbQueryOp,
+) -> axum::response::Response {
+    let Some(cb) = state.db_query_callback.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "the database console tools are not available on this server".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    match cb(id, op).await {
+        Ok(res) => {
+            let status = StatusCode::from_u16(res.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                res.body,
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: e })).into_response(),
+    }
+}
+
+/// `POST /projects/{id}/db/query` — run a query against the project's managed DB. Owner-scoped.
+/// The query string is forwarded verbatim to the in-VM DB's open loopback `POST /query`; the
+/// engine's response (including 400 parse/governor errors) is returned unchanged. Enables the
+/// console query tool + data browser.
+async fn db_query(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<DbQueryRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    if req.query.len() > MAX_DB_QUERY_LEN {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: format!("query exceeds {MAX_DB_QUERY_LEN} bytes"),
+            }),
+        )
+            .into_response();
+    }
+    db_query_dispatch(&state, id, DbQueryOp::Query(req.query)).await
+}
+
+/// `GET /projects/{id}/db/schema` — schema introspection for the managed DB (types + fields +
+/// the relationship graph + canonical SDL). Owner-scoped. Powers the schema/relationship view.
+async fn db_schema(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    db_query_dispatch(&state, id, DbQueryOp::Schema).await
+}
+
+/// `GET /projects/{id}/db/status` — metering counts (objects/edges/vectors/queries). Owner-scoped.
+async fn db_status(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    db_query_dispatch(&state, id, DbQueryOp::Status).await
+}
+
+/// Max SDL the schema editor accepts.
+const MAX_SDL_BYTES: usize = 512 * 1024;
+
+#[derive(Deserialize)]
+pub struct DbSchemaRequest {
+    pub sdl: String,
+}
+
+/// Recursively clone `src` → `dst`, HARD-LINKING regular files (immutable deployment artifacts —
+/// mostly large erofs layer blobs) so a schema-only new version doesn't duplicate them on disk;
+/// symlinks are recreated, dirs recursed. A caller that wants to CHANGE a file must
+/// remove-then-write it (writing through a hard-link would mutate the cloned-from version).
+fn hardlink_clone_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            hardlink_clone_dir(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(target, &to)?;
+        } else if std::fs::hard_link(&from, &to).is_err() {
+            // cross-filesystem or EMLINK → fall back to a byte copy.
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Poll the managed DB's `/status` (via the console DB transport) until it returns 200 or the
+/// window elapses. Used as the post-redeploy reconcile gate: rhypedb refuses to open on an
+/// incompatible schema change and crash-loops, so `/status` never reaches 200 → the caller rolls
+/// back. `Ok` if no transport is wired (degraded: no gate) so this never wedges a redeploy.
+async fn wait_db_healthy(state: &Arc<AppState>, id: &str) -> Result<(), String> {
+    let Some(cb) = state.db_query_callback.clone() else {
+        return Ok(());
+    };
+    let mut last = "database did not respond".to_string();
+    for _ in 0..20 {
+        match cb(id.to_string(), DbQueryOp::Status).await {
+            Ok(res) if res.status == 200 => return Ok(()),
+            Ok(res) => last = format!("database returned HTTP {}", res.status),
+            Err(e) => last = e,
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    Err(last)
+}
+
+/// `POST /projects/{id}/db/schema` — apply a new managed-DB schema via a SCHEMA-ONLY REDEPLOY.
+/// Owner-scoped. Clones the current deployment (hard-linking the built app layers — no rebuild),
+/// swaps in the new `_database/schema.rhype`, activates it (atomic `live` swap + VM reboot), then
+/// GATES on DB health: rhypedb reconciles the schema on boot (additive changes apply; a field-type
+/// change needs a migration; a drop needs a shrink) and crash-loops on an incompatible change — so
+/// if `/status` doesn't come back healthy we ROLL BACK to the prior version and report it. The DB's
+/// data disk is untouched by the redeploy.
+async fn db_schema_apply(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<DbSchemaRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    if req.sdl.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "schema (sdl) must not be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if req.sdl.len() > MAX_SDL_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: format!("schema exceeds {MAX_SDL_BYTES} bytes"),
+            }),
+        )
+            .into_response();
+    }
+    let proj_dir = state.deploy_dir.join(&id);
+    // Must already have a live managed DB — this edits an existing schema, it doesn't provision one.
+    if !proj_dir.join("live").join("_database.json").exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "project has no managed database; add a [database] section to jkbase.toml \
+                        and deploy it first"
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+    // Serialize with deploy/build/rollback (409 on contention) — held for the whole redeploy.
+    // Acquire the lock BEFORE reading `current_version`, then re-read the project FRESH under it,
+    // so a concurrent deploy that advanced the version can't be clobbered by a stale snapshot
+    // (activate_deployment derives v{N} from current_version). Mirrors run_build_job's re-read.
+    // [adversarial-review: schema-redeploy TOCTOU]
+    let _guard = match DeployLockGuard::try_acquire(&state, &id) {
+        Some(g) => g,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "a deploy or rollback is already in progress for this project".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let mut project = match state.store.get_project(&id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Some(prev_version) = project.current_version else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "project has no active deployment".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let prev_deploy_path = proj_dir.join("deployments").join(format!("v{prev_version}"));
+    let staged = proj_dir.join(format!(".staging-schema-{}", auth::timestamp()));
+    let _ = std::fs::remove_dir_all(&staged);
+    if let Err(e) = hardlink_clone_dir(&prev_deploy_path, &staged) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("clone current deployment: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    // Remove-then-write so the new SDL doesn't mutate the prior version through the hard-link.
+    let schema_dest = staged.join("_database").join("schema.rhype");
+    if let Some(p) = schema_dest.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::remove_file(&schema_dest);
+    if let Err(e) = std::fs::write(&schema_dest, req.sdl.as_bytes()) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("write schema: {e}"),
+            }),
+        )
+            .into_response();
+    }
+
+    // Activate (move → atomic live swap → VM reboot). On failure, clean the stage and map quota.
+    let new_version = match activate_deployment(&state, &mut project, &staged).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            let status = if e.downcast_ref::<QuotaExceeded>().is_some() {
+                StatusCode::PAYMENT_REQUIRED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (status, Json(ErrorResponse { error: e.to_string() })).into_response();
+        }
+    };
+
+    // Reconcile gate: rhypedb crash-loops on an incompatible schema → roll back to the prior version.
+    if let Err(reason) = wait_db_healthy(&state, &id).await {
+        // do_rollback repoints `live` + persists current_version=prev BEFORE its fallible VM-restart
+        // callback, so on Err the deployment pointer is still on the prior version — but say so
+        // rather than claiming a clean rollback. [adversarial-review: swallowed rollback error]
+        let tail = match do_rollback(&state, &mut project, &prev_deploy_path, prev_version).await {
+            Ok(()) => format!("rolled back to v{prev_version}."),
+            Err(e) => format!(
+                "the deployment pointer is back on v{prev_version}, but restarting it reported an \
+                 error ({e}) — it will restart on next access, or redeploy to force it."
+            ),
+        };
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: format!(
+                    "the database rejected the new schema ({reason}); {tail} \
+                     Additive changes (a new type / a new nullable field) apply cleanly; a field TYPE \
+                     change needs a migration and a field/type DROP needs a shrink."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "version": new_version, "status": "deployed" })),
+    )
+        .into_response()
+}
+
 #[derive(Serialize)]
 struct DomainResponse {
     host: String,
@@ -3949,7 +4300,7 @@ fn to_response(p: &Project) -> ProjectResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::ct_eq;
+    use super::{ct_eq, hardlink_clone_dir};
 
     #[test]
     fn ct_eq_matches_only_identical_bytes() {
@@ -3959,5 +4310,48 @@ mod tests {
         assert!(!ct_eq(b"short", b"longer-token")); // length mismatch
         assert!(!ct_eq(b"", b"x"));
         assert!(ct_eq(b"", b"")); // both empty
+    }
+
+    // The load-bearing safety property of the schema-only redeploy: cloning a version
+    // hard-links its (large, immutable) artifacts, but the schema-apply's remove-then-write
+    // MUST NOT mutate the prior version through the shared inode.
+    #[test]
+    fn hardlink_clone_shares_inodes_but_remove_then_write_isolates() {
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("jkb-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (src, dst) = (base.join("v1"), base.join("v2"));
+        std::fs::create_dir_all(src.join("_database")).unwrap();
+        std::fs::create_dir_all(src.join("_layers")).unwrap();
+        std::fs::write(src.join("_database/schema.rhype"), b"type User { name: String }").unwrap();
+        std::fs::write(src.join("_layers/blob.erofs"), b"BLOBDATA").unwrap();
+        std::fs::write(src.join("_database.json"), br#"{"engine":"rhypedb"}"#).unwrap();
+
+        hardlink_clone_dir(&src, &dst).unwrap();
+
+        // The erofs blob is hard-linked — same inode, no bytes duplicated on disk.
+        let (a, b) = (
+            std::fs::metadata(src.join("_layers/blob.erofs")).unwrap(),
+            std::fs::metadata(dst.join("_layers/blob.erofs")).unwrap(),
+        );
+        assert_eq!(a.ino(), b.ino(), "blob should be hard-linked");
+
+        // Remove-then-write the schema in the CLONE, exactly as db_schema_apply does.
+        let schema_dst = dst.join("_database/schema.rhype");
+        std::fs::remove_file(&schema_dst).unwrap();
+        std::fs::write(&schema_dst, b"type User { name: String age: Int }").unwrap();
+
+        // The SOURCE version's schema is UNTOUCHED (remove broke the hard-link first).
+        assert_eq!(
+            std::fs::read(src.join("_database/schema.rhype")).unwrap(),
+            b"type User { name: String }",
+            "source schema must not be mutated by the clone's schema swap"
+        );
+        // The shared blob is still shared + intact.
+        assert_eq!(
+            std::fs::metadata(src.join("_layers/blob.erofs")).unwrap().ino(),
+            std::fs::metadata(dst.join("_layers/blob.erofs")).unwrap().ino(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
