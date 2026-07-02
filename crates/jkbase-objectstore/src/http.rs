@@ -10,13 +10,14 @@ use axum::{
     Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::{ReaderStream, StreamReader};
 
 /// Build the S3 router backed by `store`.
@@ -77,6 +78,7 @@ async fn put_dispatch(
     }
     // Plain object put — stream the body straight to disk, never buffered.
     let content_type = content_type_of(&headers);
+    let cache_control = cache_control_of(&headers);
     let reader = StreamReader::new(body.into_data_stream().map_err(std::io::Error::other));
     match store
         .put_object_capped(
@@ -84,6 +86,7 @@ async fn put_dispatch(
             &key,
             reader,
             &content_type,
+            cache_control.as_deref(),
             sha256.as_deref(),
             declared,
         )
@@ -97,13 +100,10 @@ async fn put_dispatch(
 async fn get_object(
     State(store): State<Arc<ObjectStore>>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     match store.get_object(&bucket, &key).await {
-        Ok((meta, file)) => (
-            object_headers(&meta),
-            Body::from_stream(ReaderStream::new(file)),
-        )
-            .into_response(),
+        Ok((meta, file)) => respond_object(meta, Some(file), &headers).await,
         Err(e) => s3_error(e),
     }
 }
@@ -111,10 +111,51 @@ async fn get_object(
 async fn head_object(
     State(store): State<Arc<ObjectStore>>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
     match store.head_object(&bucket, &key).await {
-        Ok(meta) => object_headers(&meta).into_response(),
+        Ok(meta) => respond_object(meta, None, &headers).await,
         Err(e) => s3_error(e),
+    }
+}
+
+/// Build a GET/HEAD response, honoring conditional GET (`If-None-Match` /
+/// `If-Modified-Since` → 304) and a single `Range` (→ 206 / 416). `file` is `Some`
+/// for GET (streamed body), `None` for HEAD. `Accept-Ranges: bytes` is always
+/// advertised so clients know ranged reads are available.
+async fn respond_object(
+    meta: ObjectMeta,
+    file: Option<tokio::fs::File>,
+    headers: &HeaderMap,
+) -> Response {
+    // Conditional GET wins over Range: an unchanged resource is 304 regardless.
+    if not_modified(&meta, headers) {
+        return build_object_response(StatusCode::NOT_MODIFIED, &meta, None, None);
+    }
+    let total = meta.size;
+    let Some(mut file) = file else {
+        // HEAD: validators + Content-Length, no body.
+        return build_object_response(StatusCode::OK, &meta, None, None);
+    };
+    match parse_range(headers.get(header::RANGE), total) {
+        RangeOutcome::Full => {
+            let body = Body::from_stream(ReaderStream::new(file));
+            build_object_response(StatusCode::OK, &meta, Some(body), None)
+        }
+        RangeOutcome::Unsatisfiable => range_not_satisfiable(total),
+        RangeOutcome::Partial { start, end } => {
+            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                return s3_error(ObjectError::Io(std::io::Error::other("range seek failed")));
+            }
+            let len = end - start + 1;
+            let body = Body::from_stream(ReaderStream::new(file.take(len)));
+            build_object_response(
+                StatusCode::PARTIAL_CONTENT,
+                &meta,
+                Some(body),
+                Some((start, end, total)),
+            )
+        }
     }
 }
 
@@ -148,7 +189,11 @@ async fn post_dispatch(
 ) -> Response {
     if q.contains_key("uploads") {
         let content_type = content_type_of(&headers);
-        return match store.create_multipart(&bucket, &key, &content_type).await {
+        let cache_control = cache_control_of(&headers);
+        return match store
+            .create_multipart(&bucket, &key, &content_type, cache_control.as_deref())
+            .await
+        {
             Ok(uid) => xml_ok(format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                  <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -393,14 +438,6 @@ fn quoted(etag: &str) -> String {
     format!("\"{etag}\"")
 }
 
-fn content_type_of(headers: &HeaderMap) -> String {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string()
-}
-
 /// The declared body length, used only to size the upload deadline. Prefers
 /// `x-amz-decoded-content-length` (the true payload size for aws-chunked, where
 /// Content-Length is the larger framed size), falling back to Content-Length.
@@ -447,13 +484,151 @@ fn parse_part_numbers(xml: &str) -> Vec<u32> {
     out
 }
 
-fn object_headers(meta: &ObjectMeta) -> [(header::HeaderName, String); 4] {
-    [
-        (header::CONTENT_TYPE, meta.content_type.clone()),
-        (header::CONTENT_LENGTH, meta.size.to_string()),
-        (header::ETAG, quoted(&meta.etag)),
-        (header::LAST_MODIFIED, http_date(meta.last_modified)),
-    ]
+fn content_type_of(headers: &HeaderMap) -> String {
+    header_str(headers, header::CONTENT_TYPE).unwrap_or_else(|| "application/octet-stream".into())
+}
+
+/// Client `Cache-Control` to persist + echo (bounded so one absurd value can't bloat
+/// the sidecar). `None` when absent/empty.
+fn cache_control_of(headers: &HeaderMap) -> Option<String> {
+    header_str(headers, header::CACHE_CONTROL).filter(|s| !s.is_empty() && s.len() <= 512)
+}
+
+fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// Assemble the object response. All representations carry the validators (ETag,
+/// Last-Modified), `Cache-Control` (if set), and `Accept-Ranges: bytes`; a 206 adds
+/// `Content-Range` + the partial `Content-Length`; a 200/HEAD adds the full
+/// `Content-Length`; a 304 carries validators only (no body, no length).
+fn build_object_response(
+    status: StatusCode,
+    meta: &ObjectMeta,
+    body: Option<Body>,
+    content_range: Option<(u64, u64, u64)>,
+) -> Response {
+    let mut b = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, meta.content_type.as_str())
+        .header(header::ETAG, quoted(&meta.etag))
+        .header(header::LAST_MODIFIED, http_date(meta.last_modified))
+        .header(header::ACCEPT_RANGES, "bytes");
+    if let Some(cc) = &meta.cache_control {
+        b = b.header(header::CACHE_CONTROL, cc.as_str());
+    }
+    match content_range {
+        Some((start, end, total)) => {
+            b = b
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+                .header(header::CONTENT_LENGTH, (end - start + 1).to_string());
+        }
+        // 200 (GET or HEAD) carries the full length; 304 carries none.
+        None if status != StatusCode::NOT_MODIFIED => {
+            b = b.header(header::CONTENT_LENGTH, meta.size.to_string());
+        }
+        None => {}
+    }
+    b.body(body.unwrap_or_else(Body::empty))
+        .unwrap_or_else(|_| s3_error(ObjectError::Io(std::io::Error::other("response build"))))
+}
+
+fn range_not_satisfiable(total: u64) -> Response {
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+        .header(header::ACCEPT_RANGES, "bytes")
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::RANGE_NOT_SATISFIABLE.into_response())
+}
+
+enum RangeOutcome {
+    Full,
+    Partial { start: u64, end: u64 },
+    Unsatisfiable,
+}
+
+/// Parse a single `Range: bytes=…`. Per RFC 9110 a malformed / unknown-unit / multi-
+/// range spec is IGNORED (serve the full 200), while a well-formed but out-of-bounds
+/// range is `Unsatisfiable` (→ 416). Byte offsets are inclusive.
+fn parse_range(h: Option<&HeaderValue>, total: u64) -> RangeOutcome {
+    let Some(spec) = h.and_then(|v| v.to_str().ok()) else {
+        return RangeOutcome::Full;
+    };
+    let Some(rest) = spec.trim().strip_prefix("bytes=") else {
+        return RangeOutcome::Full;
+    };
+    // Single range only — a comma (multi-range) falls back to the full object (S3 does).
+    if rest.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((a, b)) = rest.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+    let (a, b) = (a.trim(), b.trim());
+    let (start, end) = match (a.is_empty(), b.is_empty()) {
+        // "-N": the final N bytes.
+        (true, false) => match b.parse::<u64>() {
+            Ok(0) => return RangeOutcome::Unsatisfiable,
+            Ok(_) if total == 0 => return RangeOutcome::Unsatisfiable,
+            Ok(n) => (total - n.min(total), total - 1),
+            Err(_) => return RangeOutcome::Full,
+        },
+        // "start-": from `start` to EOF.
+        (false, true) => match a.parse::<u64>() {
+            Ok(start) if start < total => (start, total - 1),
+            Ok(_) => return RangeOutcome::Unsatisfiable,
+            Err(_) => return RangeOutcome::Full,
+        },
+        // "start-end".
+        (false, false) => match (a.parse::<u64>(), b.parse::<u64>()) {
+            (Ok(start), Ok(end)) => {
+                if start > end || start >= total {
+                    return RangeOutcome::Unsatisfiable;
+                }
+                (start, end.min(total - 1))
+            }
+            _ => return RangeOutcome::Full,
+        },
+        // "-" alone: malformed.
+        (true, true) => return RangeOutcome::Full,
+    };
+    RangeOutcome::Partial { start, end }
+}
+
+/// RFC 9110 conditional GET: `If-None-Match` (weak compare) takes precedence over
+/// `If-Modified-Since`. `true` ⇒ respond 304 Not Modified.
+fn not_modified(meta: &ObjectMeta, headers: &HeaderMap) -> bool {
+    if let Some(inm) = header_str(headers, header::IF_NONE_MATCH) {
+        return if_none_match(&inm, &meta.etag);
+    }
+    if let Some(ims) = header_str(headers, header::IF_MODIFIED_SINCE)
+        && let Some(since) = parse_http_date(&ims)
+    {
+        return meta.last_modified <= since;
+    }
+    false
+}
+
+/// `If-None-Match`: `*` matches any existing object; otherwise a listed etag equal to
+/// ours (weak comparison — a `W/` prefix is ignored) is a match.
+fn if_none_match(header_val: &str, etag: &str) -> bool {
+    let ours = etag.trim_matches('"');
+    header_val.split(',').any(|t| {
+        let t = t.trim();
+        t == "*" || t.strip_prefix("W/").unwrap_or(t).trim_matches('"') == ours
+    })
+}
+
+/// Parse an RFC 1123 HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`) — the form we emit
+/// as Last-Modified and clients echo back. Unparseable ⇒ `None` (⇒ not a 304).
+fn parse_http_date(s: &str) -> Option<u64> {
+    chrono::NaiveDateTime::parse_from_str(s.trim(), "%a, %d %b %Y %H:%M:%S GMT")
+        .ok()
+        .map(|dt| dt.and_utc().timestamp().max(0) as u64)
 }
 
 fn iso8601(secs: u64) -> String {
@@ -608,6 +783,166 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NO_CONTENT);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_range_cases() {
+        let m = |o: RangeOutcome| match o {
+            RangeOutcome::Full => "full".to_string(),
+            RangeOutcome::Unsatisfiable => "416".to_string(),
+            RangeOutcome::Partial { start, end } => format!("{start}-{end}"),
+        };
+        let r = |s: &str, total: u64| m(parse_range(Some(&HeaderValue::from_str(s).unwrap()), total));
+        assert_eq!(r("bytes=0-1023", 10000), "0-1023");
+        assert_eq!(r("bytes=1024-", 10000), "1024-9999");
+        assert_eq!(r("bytes=-500", 10000), "9500-9999");
+        assert_eq!(r("bytes=0-0", 10000), "0-0");
+        assert_eq!(r("bytes=9999-100000", 10000), "9999-9999"); // end clamped to EOF
+        assert_eq!(r("bytes=-100000", 10000), "0-9999"); // suffix larger than object
+        assert_eq!(r("bytes=10000-", 10000), "416"); // start == size
+        assert_eq!(r("bytes=10-5", 10000), "416"); // start > end
+        assert_eq!(r("bytes=-0", 10000), "416"); // last 0 bytes
+        assert_eq!(r("bytes=0-1023", 0), "416"); // empty object
+        assert_eq!(r("bytes=0-1,2-3", 10000), "full"); // multi-range → whole object
+        assert_eq!(r("items=0-1", 10000), "full"); // unknown unit → ignore
+        assert_eq!(r("bytes=abc", 10000), "full"); // malformed → ignore
+        assert_eq!(m(parse_range(None, 10000)), "full");
+    }
+
+    #[test]
+    fn if_none_match_and_http_date_helpers() {
+        assert!(if_none_match("*", "abc"));
+        assert!(if_none_match("\"abc\"", "abc"));
+        assert!(if_none_match("W/\"abc\"", "abc"));
+        assert!(if_none_match("\"x\", \"abc\"", "abc"));
+        assert!(!if_none_match("\"other\"", "abc"));
+        assert_eq!(parse_http_date(&http_date(1_000_000_000)), Some(1_000_000_000));
+        assert_eq!(parse_http_date("garbage"), None);
+    }
+
+    #[tokio::test]
+    async fn range_conditional_and_cache_control_over_http() {
+        let (s, dir) = store();
+        let app = router(s);
+        app.clone()
+            .oneshot(Request::put("/rng").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = "0123456789";
+        let put = app
+            .clone()
+            .oneshot(
+                Request::put("/rng/obj")
+                    .header("content-type", "text/plain")
+                    .header("cache-control", "public, max-age=3600")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let etag = put.headers().get("etag").unwrap().to_str().unwrap().to_string();
+
+        // Full GET: 200 + Accept-Ranges + Cache-Control echoed.
+        let (st, h, text) = body_str(
+            app.clone()
+                .oneshot(Request::get("/rng/obj").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h.get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(h.get("cache-control").unwrap(), "public, max-age=3600");
+        assert_eq!(text, body);
+
+        // Ranged GET: 206 + Content-Range + partial body.
+        let (st, h, text) = body_str(
+            app.clone()
+                .oneshot(
+                    Request::get("/rng/obj")
+                        .header("range", "bytes=2-5")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(h.get("content-range").unwrap(), "bytes 2-5/10");
+        assert_eq!(h.get("content-length").unwrap(), "4");
+        assert_eq!(text, "2345");
+
+        // Suffix range.
+        let (st, _, text) = body_str(
+            app.clone()
+                .oneshot(
+                    Request::get("/rng/obj")
+                        .header("range", "bytes=-3")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(text, "789");
+
+        // Unsatisfiable range: 416 + Content-Range bytes */10.
+        let (st, h, _) = body_str(
+            app.clone()
+                .oneshot(
+                    Request::get("/rng/obj")
+                        .header("range", "bytes=100-200")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(h.get("content-range").unwrap(), "bytes */10");
+
+        // Conditional: If-None-Match with the etag → 304, no body/length, keeps validator.
+        let (st, h, text) = body_str(
+            app.clone()
+                .oneshot(
+                    Request::get("/rng/obj")
+                        .header("if-none-match", &etag)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_MODIFIED);
+        assert!(text.is_empty());
+        assert_eq!(h.get("etag").unwrap().to_str().unwrap(), etag);
+        // A 304 must not advertise the object's full length (an empty-body CL:0 that
+        // the framework adds is fine — it's the no-body length, not the resource size).
+        assert_ne!(
+            h.get("content-length").map(|v| v.to_str().unwrap()),
+            Some("10")
+        );
+
+        // HEAD: 200 + Accept-Ranges + full Content-Length, no body.
+        let (st, h, text) = body_str(
+            app.clone()
+                .oneshot(Request::head("/rng/obj").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h.get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(h.get("content-length").unwrap(), "10");
+        assert!(text.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

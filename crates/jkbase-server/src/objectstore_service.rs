@@ -1134,7 +1134,7 @@ async fn console_put_object(
     );
     match entry
         .store
-        .put_object_capped(&bucket, &key, reader, &content_type, None, Some(len))
+        .put_object_capped(&bucket, &key, reader, &content_type, None, None, Some(len))
         .await
     {
         Ok(meta) => (
@@ -2007,6 +2007,64 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn range_and_conditional_get_over_sigv4() {
+        let dir = tmp("range");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let k = store.create_access_key("proj", "tenant-x", "t").unwrap();
+        let (akid, secret) = (k.access_key_id.clone(), k.secret_key.clone());
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+
+        app.clone()
+            .oneshot(signed("PUT", "/bkt", &akid, &secret, ""))
+            .await
+            .unwrap();
+        // PUT with Cache-Control (not a signed header — added after signing).
+        let mut put = signed("PUT", "/bkt/obj", &akid, &secret, "0123456789");
+        put.headers_mut().insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::OK);
+
+        // Ranged SigV4 GET -> 206 + Content-Range, and Cache-Control echoed.
+        let mut get = signed("GET", "/bkt/obj", &akid, &secret, "");
+        get.headers_mut()
+            .insert("range", HeaderValue::from_static("bytes=2-5"));
+        let r = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(hdr(&r, "content-range").as_deref(), Some("bytes 2-5/10"));
+        assert_eq!(hdr(&r, "accept-ranges").as_deref(), Some("bytes"));
+        assert_eq!(
+            hdr(&r, "cache-control").as_deref(),
+            Some("public, max-age=60")
+        );
+        let (st, body) = status_body(r).await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "2345");
+
+        // Conditional SigV4 GET: If-None-Match with the etag -> 304.
+        let head = app
+            .clone()
+            .oneshot(signed("HEAD", "/bkt/obj", &akid, &secret, ""))
+            .await
+            .unwrap();
+        let etag = hdr(&head, "etag").unwrap();
+        let mut cond = signed("GET", "/bkt/obj", &akid, &secret, "");
+        cond.headers_mut()
+            .insert("if-none-match", HeaderValue::from_str(&etag).unwrap());
+        assert_eq!(
+            app.clone().oneshot(cond).await.unwrap().status(),
+            StatusCode::NOT_MODIFIED
         );
     }
 
