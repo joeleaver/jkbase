@@ -1,0 +1,27 @@
+# On-box e2e helper for the managed-DB reach plane. Links the REAL `rhypedb-client`
+# (binary TCP wire) so the reach-plane e2e test can drive a genuine round-trip through
+# `jkbase db proxy` -> edge -> agent splice -> rhypedb, rather than hand-rolling the wire.
+#
+# This is a STANDALONE workspace (note the empty `[workspace]` table) so it is NOT part of
+# the jkbase workspace and never resolves for `cargo build --workspace` / CI — its path
+# dependency on the sibling rhypedb checkout only needs to exist on the dev box where the
+# `#[ignore]`d reach-plane e2e is actually run. Build it with:
+#   cargo build --manifest-path tools/rhypedb-probe/Cargo.toml --release
+# then point RHYPEDB_PROBE at the resulting binary for the e2e test. Adjust the rhypedb
+# path below if your checkout lives elsewhere.
+[package]
+name = "rhypedb-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "rhypedb-probe"
+path = "main.rs"
+
+[dependencies]
+rhypedb-client = { path = "/home/joe/dev/rhypedb/crates/rhypedb-client" }
+serde = { version = "1", features = ["derive"] }
+
+# Own workspace root → excluded from the jkbase workspace resolution.
+[workspace]

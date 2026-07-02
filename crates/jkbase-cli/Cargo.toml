@@ -19,3 +19,14 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 toml = { workspace = true }
 dirs = "6"
+# `jkbase db proxy` sidecar: client TLS to the managed-DB reach-plane edge.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+# The reach-plane sidecar's integration test stands up a real local rustls server
+# (self-signed) to prove the client-side tls-exporter matches the server's and the
+# ALPN/SNI/preamble wire contract round-trips.
+rcgen = { workspace = true }

@@ -125,6 +125,12 @@ fn base_config(proxy_port: u16) -> ProxyConfig {
         max_concurrent_upgrades: 64,
         http_listener: None,
         https_listener: None,
+        db_auth_callback: None,
+        db_relay_registry: None,
+        db_max_concurrent: 1024,
+        db_preauth_max: 256,
+        db_preauth_per_ip_max: 32,
+        db_max_per_project: 64,
     }
 }
 

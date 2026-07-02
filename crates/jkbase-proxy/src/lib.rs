@@ -1,3 +1,6 @@
+pub mod db_ingress;
+pub mod db_preamble;
+pub mod db_relay;
 pub mod tls;
 
 use anyhow::Result;
@@ -40,6 +43,29 @@ pub enum WakeError {
 pub type WakeCallback = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, WakeError>> + Send>> + Send + Sync,
 >;
+
+/// A successful managed-DB reach-plane authentication: the AUTHORITATIVE project (from
+/// the key, not SNI — [R1]) and the host→agent splice secret to present on the backend
+/// upgrade ([R3]).
+pub struct DbAuthOk {
+    pub project_id: String,
+    pub splice_secret: String,
+    /// The project's owning tenant (`None` for an ownerless project) — the dimension
+    /// the per-tenant warm-VM quota is enforced on. Resolved server-side.
+    pub tenant_id: Option<String>,
+    /// The owner's effective per-tenant warm-VM cap (from the tenant-quota override
+    /// or the platform default), resolved server-side at auth so the edge enforces it
+    /// without a control-store dependency. Ignored when `tenant_id` is `None`.
+    pub warm_vm_max: u32,
+}
+
+/// Authenticate a DB reach preamble: `(akid, secret, claimed_project_from_sni)` →
+/// `Some` iff the key resolves, its fingerprint matches, its project equals the SNI's
+/// claimed project ([R1]), and the owner re-bind holds. Sync — the O(1) control-store
+/// lookup and const-time fingerprint compare. Built by the server over the `Store`, so
+/// `jkbase-proxy` needs no `jkbase-control` dependency (mirrors [`WakeCallback`]). The
+/// TLS-exporter channel-binding ([R-replay]) is checked edge-side before this runs.
+pub type DbAuthCallback = Arc<dyn Fn(&str, &str, &str) -> Option<DbAuthOk> + Send + Sync>;
 
 pub use jkbase_common::routing::DomainTarget;
 
@@ -100,6 +126,22 @@ pub struct ProxyConfig {
     pub http_listener: Option<TcpListener>,
     /// Pre-bound `:443` listener from systemd socket activation. `None` ⇒ bind `0.0.0.0:https_port`.
     pub https_listener: Option<TcpListener>,
+    /// Managed-DB reach-plane auth callback (server-built over the control store). `None`
+    /// disables the DB ingress — a `jkbase-db`-ALPN connection is then dropped.
+    pub db_auth_callback: Option<DbAuthCallback>,
+    /// The live-relay registry, shared with the server's idle loop + revocation. `None`
+    /// (with `db_auth_callback`) also disables the ingress.
+    pub db_relay_registry: Option<Arc<db_relay::DbRelayRegistry>>,
+    /// Total concurrent live DB relays (post-auth ceiling).
+    pub db_max_concurrent: usize,
+    /// Concurrent unauthenticated DB handshake→preamble reads ([R6]).
+    pub db_preauth_max: usize,
+    /// Concurrent unauthenticated preamble reads allowed from a SINGLE source IP ([R6]) —
+    /// the per-IP dimension the global `db_preauth_max` lacks, so one host can't hold every
+    /// preauth slot for the full preamble deadline and starve the DB reach plane platform-wide.
+    pub db_preauth_per_ip_max: usize,
+    /// Per-project live DB-relay cap.
+    pub db_max_per_project: usize,
 }
 
 struct SharedState {
@@ -114,6 +156,8 @@ struct SharedState {
     relay_idle_timeout: Duration,
     /// Permits for in-flight relayed upgrades; a relay holds one for its lifetime.
     relay_permits: Arc<tokio::sync::Semaphore>,
+    /// The managed-DB reach-plane edge, or `None` when the ingress is not configured.
+    db_ingress: Option<Arc<db_ingress::DbIngress>>,
 }
 
 /// Serve the data-plane proxy until `shutdown` is cancelled, then GRACEFULLY DRAIN in-flight
@@ -130,18 +174,57 @@ pub async fn serve(
     let http_listener = config.http_listener;
     let https_listener = config.https_listener;
     let http_port = config.http_port;
+    let domain = Arc::new(config.platform_domain);
+    let activity = config.activity_tracker;
+    // Assemble the managed-DB reach-plane edge iff its auth + registry + wake are all
+    // configured; otherwise a `jkbase-db`-ALPN connection is dropped at the demux.
+    let db_ingress = match (
+        config.db_auth_callback,
+        config.db_relay_registry,
+        config.wake_callback.clone(),
+    ) {
+        (Some(auth), Some(registry), Some(wake)) => Some(Arc::new(db_ingress::DbIngress {
+            domain: domain.clone(),
+            auth,
+            wake,
+            registry,
+            activity: activity.clone(),
+            backend_port: config.backend_port,
+            global: Arc::new(tokio::sync::Semaphore::new(config.db_max_concurrent)),
+            preauth: Arc::new(tokio::sync::Semaphore::new(config.db_preauth_max)),
+            per_ip: db_ingress::PerIpLimiter::new(config.db_preauth_per_ip_max),
+            per_project_max: config.db_max_per_project,
+        })),
+        _ => None,
+    };
     let shared = Arc::new(SharedState {
         routes,
-        domain: Arc::new(config.platform_domain),
+        domain,
         api_addr: Arc::new(config.api_addr),
         storage_addr: Arc::new(config.storage_addr),
         domains: config.domains,
-        activity: config.activity_tracker,
+        activity,
         wake_cb: config.wake_callback,
         backend_port: config.backend_port,
         relay_idle_timeout: config.relay_idle_timeout,
         relay_permits: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_upgrades)),
+        db_ingress,
     });
+
+    // [R-drain] A raw DB relay never EOFs on its own, so on shutdown force-close every live
+    // one — otherwise each would pin the drain barrier below until the hard DRAIN_GRACE
+    // process-exit. Their `RelayHooks.cancel` (the registry token) ends them promptly.
+    if let Some(ingress) = &shared.db_ingress {
+        let registry = ingress.registry.clone();
+        let sd = shutdown.clone();
+        tokio::spawn(async move {
+            sd.cancelled().await;
+            let n = registry.cancel_all();
+            if n > 0 {
+                info!(count = n, "force-closing db relays for drain");
+            }
+        });
+    }
 
     // Drain barrier: every live connection task holds a clone of `conn_tx`. Once all accept loops
     // break (on cancel) and every connection finishes, the last sender drops and `conn_rx.recv()`
@@ -158,21 +241,39 @@ pub async fn serve(
         let https_shutdown = shutdown.clone();
         let https_tx = conn_tx.clone();
         let https = tokio::spawn(async move {
-            if let Err(e) =
-                serve_https(https_listener, https_port, acceptor, shared_tls, https_shutdown, https_tx)
-                    .await
+            if let Err(e) = serve_https(
+                https_listener,
+                https_port,
+                acceptor,
+                shared_tls,
+                https_shutdown,
+                https_tx,
+            )
+            .await
             {
                 error!(error = %e, "HTTPS proxy error");
             }
         });
 
-        let res =
-            serve_http_redirect(http_listener, http_port, shared.domain.clone(), cert_manager, shutdown.clone())
-                .await;
+        let res = serve_http_redirect(
+            http_listener,
+            http_port,
+            shared.domain.clone(),
+            cert_manager,
+            shutdown.clone(),
+        )
+        .await;
         let _ = https.await; // its accept loop has broken on cancel
         res?;
     } else {
-        serve_http(http_listener, http_port, shared, shutdown.clone(), conn_tx.clone()).await?;
+        serve_http(
+            http_listener,
+            http_port,
+            shared,
+            shutdown.clone(),
+            conn_tx.clone(),
+        )
+        .await?;
     }
 
     // Wait for in-flight connections to finish draining (caller bounds this).
@@ -241,7 +342,7 @@ async fn serve_https(
     info!(addr = %listener.local_addr()?, domain = %shared.domain, "HTTPS proxy listening");
 
     loop {
-        let (stream, _peer) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break,
             accept = listener.accept() => match accept {
@@ -262,6 +363,18 @@ async fn serve_https(
                     return;
                 }
             };
+            // ALPN demux (D3): a connection that negotiated `jkbase-db` is the managed-DB
+            // reach plane — route it to the DB ingress and NEVER into the HTTP host-router,
+            // so a `.db.*` host can't be woken by an unauthenticated HTTP request ([R6]/[R7]).
+            // A db-ALPN connection with the ingress unconfigured is dropped. This task holds
+            // `_permit` (drain-barrier membership) for the relay's whole life; the drain
+            // deadline force-closes it via the registry (see `serve`).
+            if tls_stream.get_ref().1.alpn_protocol() == Some(db_preamble::DB_ALPN) {
+                if let Some(ingress) = shared.db_ingress.clone() {
+                    ingress.handle(tls_stream, peer.ip()).await;
+                }
+                return;
+            }
             let io = TokioIo::new(tls_stream);
             let svc = service_fn(move |req| proxy_request(shared.clone(), req));
             let conn = http1::Builder::new()

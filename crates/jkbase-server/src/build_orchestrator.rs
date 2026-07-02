@@ -3566,6 +3566,7 @@ esac
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -4809,6 +4810,7 @@ console.log("listening on " + port);
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -4965,6 +4967,7 @@ console.log("listening on " + port);
             &plan,
             &Default::default(),
             &Default::default(),
+            None,
             None,
             &meta_img,
         )
@@ -5206,6 +5209,7 @@ console.log("listening on " + port);
             &plan,
             &Default::default(),
             &platform,
+            None,
             None,
             &meta_img,
         )
@@ -5602,6 +5606,7 @@ console.log("listening on " + port);
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5720,6 +5725,445 @@ console.log("listening on " + port);
         );
         println!(
             "PASS: managed DB boots in-VM -> loopback round-trip -> HTTP 200 -> survives hibernate→wake AND hard-kill + cold reboot ({cold:?})"
+        );
+    }
+
+    /// The managed-DB REACH-PLANE end-to-end proof: a genuine `@rhypedb/client` round-trip
+    /// travels the WHOLE external path — real `jkbase db proxy` sidecar → TLS `:443`-style
+    /// edge (ALPN demux + preamble auth + tls-exporter channel-bind + wake) → agent
+    /// `/_jkbase/db` splice → loopback rhypedb TCP wire (`:4201`) — and back. Unlike the
+    /// loopback test above (which proves the DB boots + persists), this proves the reach
+    /// plane is *usable* from outside the VM with the real client wire.
+    ///
+    /// It THEN proves managed-DB BACKUP + RESTORE end-to-end: standing in for the server-side
+    /// executor, it pulls a snapshot off the agent's `/_jkbase/db/backup` (which authorizes the
+    /// loopback `/admin/backup/stream` with the injected admin token) into the platform
+    /// `BackupStore` + validates it, MUTATES the DB (adds `beta`), then pushes the snapshot to
+    /// `/_jkbase/db/restore` (agent untars in-guest + respawns rhypedb via `RHYPEDB_RESTORE_FROM`)
+    /// and observes the DB REVERT to the backup state (`alpha` only) — proving admin-token
+    /// injection, the pull, tar validation, and a real in-guest restore respawn.
+    ///
+    /// It orchestrates the REAL binaries as subprocesses (like the other on-box tests locate
+    /// JKB_AGENT/JKB_ROOTFS): the built `jkbase` CLI (`JKB_CLI`) and a tiny helper that links
+    /// the real `rhypedb-client` (`RHYPEDB_PROBE`, from `tools/rhypedb-probe`). The host side
+    /// stands up a `DbIngress` with a self-signed `*.db.local` cert; the sidecar trusts it via
+    /// `--ca-file`, and `testproj.db.local` is pointed at 127.0.0.1 in `/etc/hosts` (the test
+    /// runs as root) so the real CLI dials + SNI-pins exactly as in production.
+    ///
+    ///   cargo build -p jkbase-cli
+    ///   cargo build --manifest-path tools/rhypedb-probe/Cargo.toml --release
+    ///   cargo build -p jkbase-agent --release --target x86_64-unknown-linux-musl
+    ///   OUT=.firecracker/base-rootfs-verity.ext4 AGENT_BIN=…/jkbase-agent tools/build-runtime-rootfs.sh
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/.firecracker JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_BASELAYERS=/abs/.firecracker/baselayers JKB_AGENT=/abs/…/jkbase-agent \
+    ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity.ext4 \
+    ///       JKB_CLI=/abs/target/debug/jkbase \
+    ///       RHYPEDB_PROBE=/abs/tools/rhypedb-probe/target/release/rhypedb-probe \
+    ///       <test-bin> --ignored --nocapture managed_db_reach_plane_e2e
+    #[tokio::test]
+    #[ignore = "reach-plane e2e: KVM+root + baselayers + JKB_ROOTFS + JKB_CLI + RHYPEDB_PROBE"]
+    async fn managed_db_reach_plane_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        // Real binaries this e2e drives as subprocesses.
+        let Ok(cli) = std::env::var("JKB_CLI").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_CLI to the built `jkbase` binary");
+            return;
+        };
+        let Ok(probe) = std::env::var("RHYPEDB_PROBE").map(PathBuf::from) else {
+            eprintln!("skip: set RHYPEDB_PROBE to tools/rhypedb-probe's built binary");
+            return;
+        };
+        if !cli.exists() || !probe.exists() {
+            eprintln!("skip: JKB_CLI/RHYPEDB_PROBE binary missing");
+            return;
+        }
+
+        let Some(fx) = bun_pipeline_build("dbreach", 1, Workload::OfflineDatabase).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Stage the managed DB, mirroring the deploy path (see the loopback test) …
+        std::fs::write(
+            fx.staged.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":null}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.staged.join("_database")).unwrap();
+        std::fs::write(
+            fx.staged.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+
+        // The reach-plane credentials this e2e uses. In production the akid/secret are an
+        // owner-held DB key (minted via the control API) and the splice secret is host-minted
+        // per deploy; here the host edge harness's auth callback stands in for the control
+        // store, and we bake the SAME splice secret the agent will verify.
+        let akid = "JKBDreach0e2e000000f";
+        let owner_secret = "jkbd_reach-e2e-owner-secret-value";
+        let splice_secret = "reach-e2e-splice-secret-0123456789abcdef";
+        // The per-deploy rhypedb admin token — baked into _db_reach.json so the agent injects it
+        // as RHYPEDB_ADMIN_TOKEN AND uses it to authorize the loopback /admin/backup/stream pull.
+        let admin_token = "jkba_reach-e2e-admin-token-0123456789abcdef";
+
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, true, true)
+            .expect("compute layer plan with a managed DB + data disk");
+        assert!(plan.runtime_layers.database.is_some());
+        assert!(plan.runtime_layers.data_device.is_some());
+
+        let meta_img = fx.data.join("dbreach-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            // [R3] Host-authored reach facts: the per-deploy splice secret the agent's
+            // `/_jkbase/db` handler will require on the backend upgrade.
+            Some(&jkbase_common::config::DbReachFacts {
+                splice_secret: splice_secret.to_string(),
+                admin_token: admin_token.to_string(),
+            }),
+            &meta_img,
+        )
+        .expect("build the metadata image");
+
+        let data_disk = fx.data.join("dbreach-data.ext4");
+        let _ = std::fs::remove_file(&data_disk);
+        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+
+        // Point-to-point tap on a subnet clear of the other pipeline tests.
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("dbreach", "172.29.0.1", "172.29.0.2", "AA:FC:00:00:29:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: Some(data_disk.clone()),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("dbreach-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("runtime VM with a managed DB should start");
+
+        // ---- Host-side reach-plane EDGE: a self-signed `*.db.local` cert + a DbIngress ----
+        let sni_host = "testproj.db.local";
+        let ck = rcgen::generate_simple_self_signed(vec![sni_host.to_string()]).unwrap();
+        let ca_path = fx.data.join("dbreach-edge-ca.pem");
+        std::fs::write(&ca_path, ck.cert.pem()).unwrap();
+        let cert_der =
+            tokio_rustls::rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec());
+        let key_der =
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
+        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let mut scfg = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der.into())
+            .unwrap();
+        scfg.alpn_protocols = vec![b"jkbase-db".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(scfg));
+
+        // Auth callback: stands in for the control store's DB-key lookup + [R1] SNI==project
+        // + owner re-bind, returning the baked splice secret on success.
+        let (akid_c, secret_c, splice_c) = (
+            akid.to_string(),
+            owner_secret.to_string(),
+            splice_secret.to_string(),
+        );
+        let auth: jkbase_proxy::DbAuthCallback =
+            std::sync::Arc::new(move |a: &str, s: &str, claimed: &str| {
+                if a == akid_c && s == secret_c && claimed == "testproj" {
+                    Some(jkbase_proxy::DbAuthOk {
+                        project_id: "testproj".to_string(),
+                        splice_secret: splice_c.clone(),
+                        tenant_id: Some("testtenant".to_string()),
+                        warm_vm_max: jkbase_control::store::DEFAULT_TENANT_QUOTA.warm_vm_max,
+                    })
+                } else {
+                    None
+                }
+            });
+        // Wake: the VM is already up, so return its IP immediately.
+        let guest_ip_owned = guest_ip.to_string();
+        let wake: jkbase_proxy::WakeCallback = std::sync::Arc::new(
+            move |_pid: String| -> Pin<
+                Box<dyn Future<Output = Result<String, jkbase_proxy::WakeError>> + Send>,
+            > {
+                let ip = guest_ip_owned.clone();
+                Box::pin(async move { Ok(ip) })
+            },
+        );
+        let ingress = std::sync::Arc::new(jkbase_proxy::db_ingress::DbIngress {
+            domain: std::sync::Arc::new("local".to_string()),
+            auth,
+            wake,
+            registry: jkbase_proxy::db_relay::DbRelayRegistry::new(),
+            activity: None,
+            backend_port: 80,
+            global: std::sync::Arc::new(tokio::sync::Semaphore::new(1024)),
+            preauth: std::sync::Arc::new(tokio::sync::Semaphore::new(256)),
+            per_ip: jkbase_proxy::db_ingress::PerIpLimiter::new(32),
+            per_project_max: 64,
+        });
+        let edge_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let edge_port = edge_listener.local_addr().unwrap().port();
+        let edge_task = tokio::spawn(async move {
+            loop {
+                let Ok((sock, peer)) = edge_listener.accept().await else {
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                let ingress = ingress.clone();
+                tokio::spawn(async move {
+                    if let Ok(tls) = acceptor.accept(sock).await
+                        && tls.get_ref().1.alpn_protocol() == Some(b"jkbase-db".as_ref())
+                    {
+                        ingress.handle(tls, peer.ip()).await;
+                    }
+                });
+            }
+        });
+
+        // ---- Point `testproj.db.local` at the loopback edge so the REAL CLI dials + pins it.
+        let hosts_line = format!("127.0.0.1 {sni_host} # jkbase-dbreach-e2e\n");
+        let hosts_before = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open("/etc/hosts")
+                .expect("append /etc/hosts (test must run as root)");
+            use std::io::Write as _;
+            f.write_all(hosts_line.as_bytes()).unwrap();
+        }
+
+        // ---- The REAL sidecar in front of the edge, trusting the self-signed cert.
+        let local_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let sidecar_log = fx.data.join("dbreach-sidecar.log");
+        let mut sidecar = tokio::process::Command::new(&cli)
+            .args([
+                "db",
+                "proxy",
+                "--db-host",
+                sni_host,
+                "--port",
+                &edge_port.to_string(),
+                "--listen",
+                &format!("127.0.0.1:{local_port}"),
+                "--access-key-id",
+                akid,
+                "--secret",
+                owner_secret,
+                "--ca-file",
+                ca_path.to_str().unwrap(),
+            ])
+            .stdout(std::fs::File::create(&sidecar_log).unwrap())
+            .stderr(std::fs::File::create(fx.data.join("dbreach-sidecar.err")).unwrap())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn jkbase db proxy");
+
+        // ---- Drive the REAL rhypedb-client through the whole path. On a fresh DB the probe
+        //      creates `alpha` then reads it back — proving create AND read travel the reach
+        //      plane. Retry to cover cold-boot / sidecar-warmup; each attempt is sequential so
+        //      the create-if-empty can't double-insert.
+        let mut probe_out = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            if let Ok(out) = tokio::process::Command::new(&probe)
+                .arg(format!("127.0.0.1:{local_port}"))
+                .output()
+                .await
+            {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if out.status.success() && stdout.contains("count=1") {
+                    probe_out = stdout;
+                    break;
+                }
+                eprintln!(
+                    "[reach-e2e] probe not ready: status={} out={:?} err={:?}",
+                    out.status,
+                    stdout,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+
+        // ---- Managed-DB BACKUP + RESTORE over the direct host<->agent channels ----
+        // Only meaningful once the alpha round-trip proved the DB is up + reachable. The test
+        // stands in for the server-side executor: connect the agent's eth0 `/_jkbase/db/backup`
+        // + `/_jkbase/db/restore` with the baked splice secret and drive the real
+        // BackupStore/validate path. A full round-trip proves: admin-token injection into
+        // rhypedb, the pull of `/admin/backup/stream`, tar validation, and a real restore
+        // (mutate the DB, restore the earlier snapshot, observe it revert).
+        let mut backup_summary = String::new();
+        let mut after_beta = String::new();
+        let mut after_restore = String::new();
+        if probe_out == "users=alpha count=1" {
+            let backups =
+                crate::db_backup_store::BackupStore::new(&fx.data.join("dbreach-backups"));
+            let backup_id = "bkp_0000000000001_e2eaaaaa";
+            let local = format!("127.0.0.1:{local_port}");
+
+            // BACKUP: pull the tar off the agent, then validate + commit it.
+            match async {
+                let mut up = crate::connect_agent_db_upgrade(
+                    guest_ip,
+                    "/_jkbase/db/backup",
+                    splice_secret,
+                    "jkbase-db-backup",
+                )
+                .await?;
+                let staged = backups
+                    .stage("testproj", backup_id, &mut up, 1 << 30)
+                    .await?;
+                let summary = backups.validate(&staged).await?;
+                backups.commit(staged).await?;
+                Ok::<String, anyhow::Error>(summary)
+            }
+            .await
+            {
+                Ok(s) => backup_summary = s,
+                Err(e) => eprintln!("[backup-e2e] backup failed: {e:#}"),
+            }
+
+            // Mutate: add `beta`, so the DB (alpha+beta) now differs from the backup (alpha).
+            if let Ok(out) = tokio::process::Command::new(&probe)
+                .args([local.as_str(), "create", "beta"])
+                .output()
+                .await
+            {
+                after_beta = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+
+            // RESTORE the earlier snapshot; the agent untars it in-guest + respawns rhypedb.
+            let restore_status = async {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut tar = backups.open_read("testproj", backup_id).await?;
+                let mut up = crate::connect_agent_db_upgrade(
+                    guest_ip,
+                    "/_jkbase/db/restore",
+                    splice_secret,
+                    "jkbase-db-restore",
+                )
+                .await?;
+                tokio::io::copy(&mut tar, &mut up).await?;
+                up.shutdown().await?;
+                let mut status = String::new();
+                up.read_to_string(&mut status).await?;
+                Ok::<String, anyhow::Error>(status.trim().to_string())
+            }
+            .await;
+
+            match restore_status {
+                Ok(status) => {
+                    // After restore, list the DB (retry across the DB respawn/warmup window).
+                    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(out) = tokio::process::Command::new(&probe)
+                            .args([local.as_str(), "list"])
+                            .output()
+                            .await
+                        {
+                            let o = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if out.status.success() && o.starts_with("users=") {
+                                after_restore = format!("restore={status} {o}");
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                    }
+                }
+                Err(e) => eprintln!("[backup-e2e] restore failed: {e:#}"),
+            }
+        }
+
+        // ---- Cleanup BEFORE asserting (mirror the loopback test) so a failed assert can't
+        //      leak the tap / /etc/hosts line / child processes.
+        let _ = sidecar.start_kill();
+        let _ = sidecar.wait().await;
+        edge_task.abort();
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        std::fs::write("/etc/hosts", hosts_before).ok(); // restore exactly
+        // Surface the sidecar's own output on failure (it's the most opaque hop).
+        if probe_out.is_empty()
+            && let Ok(err) = std::fs::read_to_string(fx.data.join("dbreach-sidecar.err"))
+        {
+            eprintln!("[reach-e2e] sidecar stderr:\n{}", err.trim());
+        }
+        let _ = std::fs::remove_dir_all(&fx.staged);
+
+        assert_eq!(
+            probe_out, "users=alpha count=1",
+            "the real rhypedb-client must create+read a row through the FULL reach plane \
+             (sidecar -> TLS edge -> agent /_jkbase/db splice -> loopback rhypedb :4201)"
+        );
+        println!("PASS: reach-plane e2e — real @rhypedb/client round-trip through {probe_out:?}");
+
+        // ---- Backup + restore assertions (the DB was alive for the whole phase above) ----
+        assert!(
+            backup_summary.contains("ssts="),
+            "backup must pull a VALID tar off the agent (admin-token inject + /admin/backup/stream \
+             + host validation); got {backup_summary:?}"
+        );
+        assert_eq!(
+            after_beta, "users=alpha,beta count=2",
+            "mutation before restore must add `beta` (DB now differs from the backup)"
+        );
+        assert_eq!(
+            after_restore, "restore=ok users=alpha count=1",
+            "restore must push the snapshot to the agent, respawn rhypedb from it, and REVERT the \
+             DB to the backup state (alpha only, beta gone)"
+        );
+        println!(
+            "PASS: backup+restore e2e — {backup_summary:?}; post-mutation {after_beta:?}; \
+             post-restore {after_restore:?}"
         );
     }
 
@@ -6308,6 +6752,7 @@ console.log("listening on " + port);
             &Default::default(),
             &Default::default(),
             None,
+            None,
             &meta_img,
         )
         .expect("metadata image");
@@ -6379,7 +6824,8 @@ console.log("listening on " + port);
 
         // (1) cgroup ESCAPE: the FC was migrated into jkbase-runtime/<id> (a sibling of
         //     jkbase.service), the precondition for surviving KillMode=mixed.
-        let procs = std::fs::read_to_string(parent.join(id).join("cgroup.procs")).unwrap_or_default();
+        let procs =
+            std::fs::read_to_string(parent.join(id).join("cgroup.procs")).unwrap_or_default();
         assert!(
             procs.lines().any(|l| l.trim() == fc_pid.to_string()),
             "FC pid {fc_pid} must be in {}/{id}/cgroup.procs (cgroup escape) — got {procs:?}",

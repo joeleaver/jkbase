@@ -1,5 +1,6 @@
 mod build_ca;
 mod build_orchestrator;
+mod db_backup_store;
 mod egress;
 mod handoff;
 mod layer_plan;
@@ -1373,7 +1374,9 @@ async fn async_main() -> Result<()> {
     };
 
     let store_for_builds = store.clone();
-    let mut state = AppState::new(store, log_store.clone(), deploy_dir);
+    // Keep a `store` handle after this move: the managed-DB reach-plane auth callback
+    // (built below) closes over a clone.
+    let mut state = AppState::new(store.clone(), log_store.clone(), deploy_dir);
     state.routing_table = Some(routing_table.clone());
     state.domain_map = Some(domain_map.clone());
     state.platform_domain = args.domain.clone();
@@ -1526,6 +1529,55 @@ async fn async_main() -> Result<()> {
     );
     state.build_callback = Some(build_orchestrator::build_callback(build_deps));
 
+    // Managed-DB reach-plane live-relay registry — shared with the proxy edge, the idle
+    // loop, and the drain. [R5]: the control API force-closes live relays through it when a
+    // DB key is revoked or a project is deleted/transferred. Built here (before `state` is
+    // sealed into the router) so the revoke callback can reach it.
+    let db_relay_registry = jkbase_proxy::db_relay::DbRelayRegistry::new();
+    {
+        let reg = db_relay_registry.clone();
+        state.db_revoke_callback = Some(Arc::new(move |scope| match scope {
+            jkbase_control::api::DbRevokeScope::Key(k) => {
+                let n = reg.cancel_key(&k);
+                if n > 0 {
+                    info!(key = %k, count = n, "db key revoked: closed live relays");
+                }
+            }
+            jkbase_control::api::DbRevokeScope::Project(p) => {
+                let n = reg.cancel_project(&p);
+                if n > 0 {
+                    info!(project = %p, count = n, "project teardown: closed live db relays");
+                }
+            }
+        }));
+    }
+
+    // Managed-DB backups ([RB*]): the platform-owned blob store + the executor context shared by
+    // the on-demand callbacks and the nightly loop. The control API records intent + owner-scopes;
+    // execution (VM wake, agent relay, blob store) is server-side here.
+    let db_backup_ctx = DbBackupCtx {
+        platform: platform.clone(),
+        routing: routing_table.clone(),
+        domains: domain_map.clone(),
+        shipper: log_shipper.clone(),
+        store: state.store.clone(),
+        backups: Arc::new(db_backup_store::BackupStore::new(&data_dir)),
+        backup_sem: Arc::new(tokio::sync::Semaphore::new(DB_BACKUP_MAX_CONCURRENT)),
+        restoring: Arc::new(std::sync::Mutex::new(HashSet::new())),
+    };
+    {
+        let ctx = db_backup_ctx.clone();
+        state.db_backup_callback = Some(Arc::new(move |project_id, backup_id| {
+            tokio::spawn(run_db_backup(ctx.clone(), project_id, backup_id));
+        }));
+    }
+    {
+        let ctx = db_backup_ctx.clone();
+        state.db_restore_callback = Some(Arc::new(move |project_id, backup_id| {
+            tokio::spawn(run_db_restore(ctx.clone(), project_id, backup_id));
+        }));
+    }
+
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
 
@@ -1572,6 +1624,49 @@ async fn async_main() -> Result<()> {
         (None, None)
     };
 
+    // Managed-DB reach plane: the live-relay registry (shared with the idle loop, the
+    // drain, and revocation) + the auth callback that resolves a preamble against the
+    // control store. The closure closes over a `Store` clone, so `jkbase-proxy` needs no
+    // `jkbase-control` dependency (mirrors `wake_callback`). The tls-exporter channel-bind
+    // ([R-replay]) is checked edge-side BEFORE this runs.
+    let db_auth_store = store.clone();
+    let db_auth_callback: jkbase_proxy::DbAuthCallback =
+        Arc::new(move |akid: &str, secret: &str, claimed_project: &str| {
+            let key = db_auth_store.lookup_db_access_key(akid).ok().flatten()?;
+            if !key.verify_secret(secret) {
+                return None;
+            }
+            // [R1] The SNI's claimed project must equal the KEY's project.
+            if key.project_id != claimed_project {
+                return None;
+            }
+            // Owner re-bind: the key's tenant must still own the project (fail-closed if
+            // the project was deleted or transferred — an orphaned key can't be inherited).
+            let project = db_auth_store.get_project(&key.project_id).ok().flatten()?;
+            if project.tenant_id.as_deref() != Some(key.tenant_id.as_str()) {
+                return None;
+            }
+            let splice_secret = db_auth_store
+                .get_db_splice_secret(&key.project_id)
+                .ok()
+                .flatten()?;
+            // The owner re-bind above proved `project.tenant_id == Some(key.tenant_id)`,
+            // so a successful auth always has an owner. Resolve the owner's effective
+            // per-tenant warm-VM cap here (server-side, over the store) so the edge can
+            // enforce it without a control-store dependency. On a store error, fall back
+            // to a conservative default rather than an unbounded cap.
+            let warm_vm_max = db_auth_store
+                .get_tenant_quota(&key.tenant_id)
+                .map(|q| q.warm_vm_max)
+                .unwrap_or(jkbase_control::store::DEFAULT_TENANT_QUOTA.warm_vm_max);
+            Some(jkbase_proxy::DbAuthOk {
+                project_id: key.project_id,
+                splice_secret,
+                tenant_id: Some(key.tenant_id),
+                warm_vm_max,
+            })
+        });
+
     let proxy_config = ProxyConfig {
         http_port: args.proxy_port,
         https_port: if args.tls {
@@ -1591,6 +1686,15 @@ async fn async_main() -> Result<()> {
         max_concurrent_upgrades: 1024,
         http_listener: proxy_http_listener,
         https_listener: proxy_https_listener,
+        db_auth_callback: Some(db_auth_callback),
+        db_relay_registry: Some(db_relay_registry.clone()),
+        db_max_concurrent: 1024,
+        db_preauth_max: 256,
+        // One source IP may hold at most 1/8 of the global preauth pool, so a single host
+        // can't slow-loris every slot for the preamble deadline and deny the DB reach plane
+        // platform-wide ([R6]); still ample headroom for a legit sidecar's connection bursts.
+        db_preauth_per_ip_max: 32,
+        db_max_per_project: 64,
     };
     let proxy_port = proxy_config.http_port;
     let proxy_routes = routing_table.clone();
@@ -1622,6 +1726,9 @@ async fn async_main() -> Result<()> {
     // Spawn log shipper loop (pulls guest logs into the persistent store)
     tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
 
+    // Nightly automatic managed-DB backups ([RB12]).
+    tokio::spawn(db_backup_nightly_loop(db_backup_ctx.clone()));
+
     // Spawn idle detection loop
     if args.idle_timeout_secs > 0 {
         let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
@@ -1635,6 +1742,7 @@ async fn async_main() -> Result<()> {
             activity_tracker.clone(),
             idle_timeout,
             log_shipper.clone(),
+            Some(db_relay_registry.clone()),
         ));
     }
 
@@ -1655,6 +1763,7 @@ async fn async_main() -> Result<()> {
         platform.clone(),
         routing_table.clone(),
         log_shipper.clone(),
+        Some(db_relay_registry.clone()),
     ));
 
     // Spawn the build egress proxy (default-deny forward proxy + SSRF defense).
@@ -1799,7 +1908,11 @@ fn upgrade_in_progress(data_dir: &Path) -> bool {
     let Ok(body) = std::fs::read_to_string(upgrade_flag_path(data_dir)) else {
         return false;
     };
-    let Some(ts) = body.lines().next().and_then(|l| l.trim().parse::<u64>().ok()) else {
+    let Some(ts) = body
+        .lines()
+        .next()
+        .and_then(|l| l.trim().parse::<u64>().ok())
+    else {
         return false;
     };
     let now = std::time::SystemTime::now()
@@ -1879,6 +1992,7 @@ async fn shutdown_signal(
             platform.clone(),
             routing.clone(),
             shipper.clone(),
+            None,
         )
         .await
         {
@@ -2128,9 +2242,10 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             info!(project = %id, artifact = "data-disks", "reaped orphaned artifact");
         }
     }
-    // `objectstore/{id}`: a deleted project's bucket tree (delete purges it, but a
-    // crash-interrupted teardown can leave it — reap so a recreated slug starts clean).
-    for sub in ["hosting", "run", "snapshots", "objectstore"] {
+    // `objectstore/{id}` + `db-backups/{id}`: a deleted project's bucket tree / managed-DB
+    // backup blobs ([RB11]). Delete purges them, but a crash-interrupted teardown can leave them
+    // — reap so a recreated slug starts clean and a deleted tenant's DB data doesn't linger.
+    for sub in ["hosting", "run", "snapshots", "objectstore", "db-backups"] {
         let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
             continue;
         };
@@ -2654,6 +2769,31 @@ async fn handle_deploy(
             access_key_id: k.access_key_id,
             secret_key: k.secret_key,
         });
+    // Mint (rotate) the per-deploy reach-plane secrets for a project with a managed DB and
+    // persist them — the edge reads the splice secret from the control store to present on the
+    // `/_jkbase/db` upgrade, and the SAME values are baked into the per-VM image below so the
+    // in-VM agent can verify the splice ([R3]) and inject the admin token into the DB env
+    // ([RB1]). Best-effort: a mint failure just means the reach plane / backups can't run until
+    // the next deploy (fail-closed), never a failed deploy. The admin token rides the reserved
+    // channel ONLY — never `_database.json`.
+    let db_reach: Option<jkbase_common::config::DbReachFacts> =
+        if check_project_has_database(&data_dir, project_id) {
+            plat.store
+                .mint_db_splice_secret(project_id)
+                .ok()
+                .map(|splice_secret| {
+                    let admin_token = plat
+                        .store
+                        .mint_db_admin_token(project_id)
+                        .unwrap_or_default();
+                    jkbase_common::config::DbReachFacts {
+                        splice_secret,
+                        admin_token,
+                    }
+                })
+        } else {
+            None
+        };
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -2679,6 +2819,7 @@ async fn handle_deploy(
                 &secrets,
                 &platform_egress,
                 storage_binding.as_ref(),
+                db_reach.as_ref(),
                 &out,
             )?;
             Ok(plan)
@@ -2692,7 +2833,8 @@ async fn handle_deploy(
     // any prior writer. Held by an RAII guard until the VM is up, so a boot failure (or
     // a cancelled future) releases the lease instead of bricking the project.
     let disk_guard = if has_disk {
-        Some(fence_data_disk(&dd, &ls, &hid, project_id).await?)
+        let disk_mib = data_disk_mib_for(&data_dir, project_id);
+        Some(fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?)
     } else {
         None
     };
@@ -2883,11 +3025,27 @@ async fn hibernate_project(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
+    // Idle-path callers pass the DB relay registry so we can re-check for a LIVE managed-DB
+    // relay UNDER the platform lock (§5); shutdown/quota callers pass `None` — those paths
+    // hibernate regardless (relays are force-closed on drain; over-quota must win).
+    db_registry: Option<&Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
 
     match plat.vm_states.get(project_id) {
         Some(VmLifecycle::Running) => {
+            // §5: re-check under the platform lock that no live DB relay appeared since the
+            // idle loop's UNLOCKED conn_count read (db_ingress reserves the relay before its
+            // wake, so a racing connection is already counted here) — otherwise a byte-silent
+            // realtime subscription would be hibernated out from under itself. A relay that
+            // slips in during this function's own critical section instead fails its bounded
+            // connect and the client retries, waking the VM cleanly.
+            if db_registry
+                .map(|r| r.conn_count(project_id) > 0)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
             plat.vm_states
                 .insert(project_id.to_string(), VmLifecycle::Hibernating);
         }
@@ -3287,6 +3445,7 @@ async fn wake_project_inner(
     let dd = plat.data_disk.clone();
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
+    let data_dir = plat.data_dir.clone();
 
     // The erofs layer attach order for the cold-boot fallback (restore re-derives
     // drives from the snapshot, so this only matters when restore fails/misses). Read
@@ -3326,7 +3485,8 @@ async fn wake_project_inner(
     // restore path patches the data drive to this fenced device; refuse→cold-boot
     // (reap + retry, else error) lives in fence_data_disk. None when no data disk.
     let disk_guard = if has_disk {
-        let g = fence_data_disk(&dd, &ls, &hid, project_id).await?;
+        let disk_mib = data_disk_mib_for(&data_dir, project_id);
+        let g = fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?;
         config.data_disk_path = Some(g.device());
         Some(g)
     } else {
@@ -3597,6 +3757,7 @@ async fn idle_detection_loop(
     activity: ActivityTracker,
     idle_timeout: Duration,
     shipper: Arc<LogShipper>,
+    db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
 ) {
     let check_interval = Duration::from_secs(60);
 
@@ -3638,7 +3799,14 @@ async fn idle_detection_loop(
             let should_hibernate = {
                 let plat = platform.lock().await;
                 plat.vm_states.get(&project_id) == Some(&VmLifecycle::Running)
-            };
+            }
+            // §5: never hibernate a project with a LIVE managed-DB relay — a realtime
+            // subscription can be open but byte-silent, so last-byte activity alone would
+            // scale it to zero out from under the connection.
+            && db_registry
+                .as_ref()
+                .map(|r| r.conn_count(&project_id) == 0)
+                .unwrap_or(true);
 
             if should_hibernate {
                 info!(project = %project_id, "idle timeout, hibernating");
@@ -3647,6 +3815,7 @@ async fn idle_detection_loop(
                     platform.clone(),
                     routing.clone(),
                     shipper.clone(),
+                    db_registry.as_ref(),
                 )
                 .await
                 {
@@ -3683,6 +3852,362 @@ async fn log_shipper_loop(platform: Arc<Mutex<PlatformState>>, shipper: Arc<LogS
 
         for (project_id, ip) in targets {
             shipper.ship(&project_id, &ip).await;
+        }
+    }
+}
+
+// ===================================================================
+// Managed-DB backups — host-relay pull + host-push restore ([RB*]).
+// ===================================================================
+
+/// Hard cap on a backup tar the agent may relay + the host stages ([RB3]). The tar is roughly
+/// the DB's on-disk size (bounded by the RWO data disk); this ceiling fails a runaway/garbage
+/// stream fast, well before it could exhaust host disk under the concurrency bound below.
+const MAX_DB_BACKUP_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Retained COMPLETE backups per project (retention bound; the store cap
+/// [`Store::MAX_DB_BACKUPS_PER_PROJECT`] is the backstop).
+const DB_BACKUP_KEEP: usize = 14;
+/// Retained Failed rows per project — enough for the nightly loop's failure backoff to see the
+/// last failure time (so a persistently-failing project retries once per interval, not per tick),
+/// and for the owner to see recent failures, without letting Failed rows wedge the cap.
+const DB_BACKUP_FAILED_KEEP: usize = 3;
+/// Nightly-loop cadence + the age at which a managed DB is due for an automatic backup.
+const DB_BACKUP_TICK: Duration = Duration::from_secs(30 * 60);
+const DB_BACKUP_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Max concurrent backup PULLS across the WHOLE host (on-demand AND nightly share this), so a
+/// tenant spamming on-demand backups — or the nightly fan-out — can't stage many full-DB tars
+/// into off-quota host disk at once (adversarial-review finding).
+const DB_BACKUP_MAX_CONCURRENT: usize = 2;
+
+/// Everything the backup/restore executors need. All handles are cheap Arc clones.
+#[derive(Clone)]
+struct DbBackupCtx {
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domains: DomainMap,
+    shipper: Arc<LogShipper>,
+    store: Store,
+    backups: Arc<db_backup_store::BackupStore>,
+    /// Host-wide concurrency bound shared by on-demand + nightly backups.
+    backup_sem: Arc<tokio::sync::Semaphore>,
+    /// Per-project in-flight restore guard so two overlapping restores can't corrupt the shared
+    /// staging dir (adversarial-review finding).
+    restoring: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// Client-side HTTP/1.1 `Upgrade` to `<vm_ip>:80{path}` presenting the reach-plane splice
+/// secret (mirrors the proxy edge's `connect_agent`). On `101` returns the raw upgraded stream.
+/// Used by the backup PULL and restore PUSH executors — the DB stays loopback-only, the agent
+/// is the sole mediator.
+async fn connect_agent_db_upgrade(
+    vm_ip: &str,
+    path: &str,
+    splice_secret: &str,
+    proto: &str,
+) -> Result<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>> {
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
+        .await
+        .context("connect agent")?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("agent handshake")?;
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("host", vm_ip)
+        .header("connection", "upgrade")
+        .header("upgrade", proto)
+        .header("x-jkbase-db-secret", splice_secret)
+        .body(Full::<Bytes>::new(Bytes::new()))
+        .context("agent req build")?;
+    let mut resp = sender.send_request(req).await.context("agent send")?;
+    if resp.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+        anyhow::bail!("agent refused {path} upgrade ({})", resp.status());
+    }
+    let upgraded = hyper::upgrade::on(&mut resp)
+        .await
+        .context("agent upgrade")?;
+    Ok(hyper_util::rt::TokioIo::new(upgraded))
+}
+
+/// Pull a backup: wake the VM, relay the tar out of the agent, validate + store it, return
+/// (size, manifest summary). The admin token never leaves the guest — the agent authorizes the
+/// loopback `/admin/backup/stream` and relays only opaque tar bytes.
+async fn do_db_backup(
+    ctx: &DbBackupCtx,
+    project_id: &str,
+    backup_id: &str,
+) -> Result<(u64, String)> {
+    let secret = ctx
+        .store
+        .get_db_splice_secret(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("no reach-plane secret (managed DB not deployed?)"))?;
+    let ip = wake_project(
+        project_id,
+        ctx.platform.clone(),
+        ctx.routing.clone(),
+        ctx.domains.clone(),
+        ctx.shipper.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("wake project: {e:?}"))?;
+    let mut upgraded =
+        connect_agent_db_upgrade(&ip, "/_jkbase/db/backup", &secret, "jkbase-db-backup").await?;
+    let staged = ctx
+        .backups
+        .stage(project_id, backup_id, &mut upgraded, MAX_DB_BACKUP_BYTES)
+        .await?;
+    let size = staged.size_bytes;
+    match ctx.backups.validate(&staged).await {
+        Ok(summary) => {
+            ctx.backups.commit(staged).await?;
+            Ok((size, summary))
+        }
+        Err(e) => {
+            ctx.backups.discard(staged).await;
+            Err(e)
+        }
+    }
+}
+
+/// Run one backup end-to-end (spawned by the on-demand callback + the nightly loop): acquire the
+/// host-wide concurrency permit, execute, record the catalog outcome, and prune the catalog —
+/// on EITHER outcome, so failed backups can never wedge the per-project row cap
+/// (adversarial-review finding).
+async fn run_db_backup(ctx: DbBackupCtx, project_id: String, backup_id: String) {
+    // Bound host-wide concurrent pulls (shared by on-demand + nightly). A closed semaphore never
+    // happens (we never close it); on the impossible error, fail the backup rather than run
+    // unbounded.
+    let _permit = match ctx.backup_sem.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = ctx.store.set_db_backup_status(
+                &project_id,
+                &backup_id,
+                jkbase_control::store::BackupStatus::Failed,
+                0,
+                "",
+            );
+            return;
+        }
+    };
+    match do_db_backup(&ctx, &project_id, &backup_id).await {
+        Ok((size, summary)) => {
+            let _ = ctx.store.set_db_backup_status(
+                &project_id,
+                &backup_id,
+                jkbase_control::store::BackupStatus::Complete,
+                size,
+                &summary,
+            );
+            info!(project = %project_id, backup = %backup_id, size, "managed-db backup complete");
+        }
+        Err(e) => {
+            warn!(project = %project_id, backup = %backup_id, error = %e, "managed-db backup failed");
+            let _ = ctx.store.set_db_backup_status(
+                &project_id,
+                &backup_id,
+                jkbase_control::store::BackupStatus::Failed,
+                0,
+                "",
+            );
+            let _ = ctx.backups.delete(&project_id, &backup_id).await;
+        }
+    }
+    // Prune on EVERY outcome so a run of failures can't fill the per-project row cap and
+    // permanently disable backups for the project.
+    prune_db_backups(&ctx, &project_id).await;
+}
+
+/// Push a restore: resolve the (Complete) backup, wake the VM, and stream the tar to the agent,
+/// which untars it in-guest and respawns rhypedb. Reads back the agent's `ok`/`err:` line.
+async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Serialize restores per project: two overlapping restores share the same in-guest staging
+    // paths and would corrupt each other (adversarial-review finding). RAII-remove on return.
+    struct RestoreGuard(Arc<std::sync::Mutex<HashSet<String>>>, String);
+    impl Drop for RestoreGuard {
+        fn drop(&mut self) {
+            self.0.lock().unwrap().remove(&self.1);
+        }
+    }
+    {
+        let mut set = ctx.restoring.lock().unwrap();
+        if !set.insert(project_id.to_string()) {
+            anyhow::bail!("a restore is already in progress for this project");
+        }
+    }
+    let _guard = RestoreGuard(ctx.restoring.clone(), project_id.to_string());
+
+    let backup = ctx
+        .store
+        .get_db_backup(project_id, backup_id)?
+        .ok_or_else(|| anyhow::anyhow!("backup not found"))?;
+    if backup.status != jkbase_control::store::BackupStatus::Complete {
+        anyhow::bail!(
+            "backup {backup_id} is not restorable (status {:?})",
+            backup.status
+        );
+    }
+    let secret = ctx
+        .store
+        .get_db_splice_secret(project_id)?
+        .ok_or_else(|| anyhow::anyhow!("no reach-plane secret"))?;
+    let ip = wake_project(
+        project_id,
+        ctx.platform.clone(),
+        ctx.routing.clone(),
+        ctx.domains.clone(),
+        ctx.shipper.clone(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("wake project: {e:?}"))?;
+    let mut tar = ctx.backups.open_read(project_id, backup_id).await?;
+    let mut upgraded =
+        connect_agent_db_upgrade(&ip, "/_jkbase/db/restore", &secret, "jkbase-db-restore").await?;
+    tokio::io::copy(&mut tar, &mut upgraded)
+        .await
+        .context("stream backup to agent")?;
+    // Half-close the write half → the agent sees a clean EOF for the tar, processes it, then
+    // writes its status line back on the still-open read half.
+    upgraded
+        .shutdown()
+        .await
+        .context("half-close restore push")?;
+    let mut status = String::new();
+    upgraded
+        .read_to_string(&mut status)
+        .await
+        .context("read restore status")?;
+    let status = status.trim();
+    if status == "ok" {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "agent restore: {}",
+            if status.is_empty() {
+                "no response"
+            } else {
+                status
+            }
+        )
+    }
+}
+
+async fn run_db_restore(ctx: DbBackupCtx, project_id: String, backup_id: String) {
+    match do_db_restore(&ctx, &project_id, &backup_id).await {
+        Ok(()) => info!(project = %project_id, backup = %backup_id, "managed-db restore complete"),
+        Err(e) => {
+            warn!(project = %project_id, backup = %backup_id, error = %e, "managed-db restore failed")
+        }
+    }
+}
+
+/// Bound the per-project catalog: keep the newest [`DB_BACKUP_KEEP`] COMPLETE backups + any fresh
+/// (in-flight) Pending row, and delete everything else — all Failed rows, stale Pending rows
+/// (a crashed backup), and Complete rows beyond the retention bound — along with their blobs. Run
+/// after every attempt, so a run of failures can't wedge the row cap and disable backups.
+async fn prune_db_backups(ctx: &DbBackupCtx, project_id: &str) {
+    let backups = match ctx.store.list_db_backups(project_id) {
+        Ok(b) => b, // newest-first
+        Err(_) => return,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut kept_complete = 0usize;
+    let mut kept_failed = 0usize;
+    for b in backups {
+        use jkbase_control::store::BackupStatus;
+        let keep = match b.status {
+            BackupStatus::Complete => {
+                kept_complete += 1;
+                kept_complete <= DB_BACKUP_KEEP
+            }
+            // A fresh Pending is an in-flight backup — never delete it out from under a running
+            // pull; a stale one (crashed) is swept.
+            BackupStatus::Pending => {
+                now_ms.saturating_sub(b.created_at_ms)
+                    < jkbase_control::store::Store::BACKUP_STALE_MS
+            }
+            // Keep the newest few Failed rows so the nightly backoff can see the last failure;
+            // drop the rest so they can't wedge the cap.
+            BackupStatus::Failed => {
+                kept_failed += 1;
+                kept_failed <= DB_BACKUP_FAILED_KEEP
+            }
+        };
+        if !keep {
+            let _ = ctx.backups.delete(project_id, &b.backup_id).await;
+            let _ = ctx.store.delete_db_backup(project_id, &b.backup_id);
+        }
+    }
+}
+
+/// Nightly automatic backups ([RB12]): each tick, back up every managed-DB project whose newest
+/// TERMINAL (Complete or Failed) backup is older than [`DB_BACKUP_INTERVAL_MS`] (or has none),
+/// skipping any project with a backup already in flight. Concurrency is bounded inside
+/// `run_db_backup` by the host-wide `backup_sem` (shared with on-demand). Considering Failed too
+/// gives a failing project a full interval of backoff instead of re-firing every 30-min tick.
+/// Single-host owns all projects today (mirrors `scheduler_loop`); a future HA layer gates on
+/// ownership.
+async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
+    loop {
+        tokio::time::sleep(DB_BACKUP_TICK).await;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let projects = match ctx.store.list_projects() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "nightly db-backup: could not list projects");
+                continue;
+            }
+        };
+        for proj in projects {
+            let pid = proj.id.clone();
+            // A managed DB that has been deployed has a minted admin token.
+            if !matches!(ctx.store.get_db_admin_token(&pid), Ok(Some(_))) {
+                continue;
+            }
+            // Skip if a backup is already in flight (single-flight, shared with on-demand).
+            if matches!(ctx.store.has_active_backup(&pid), Ok(true)) {
+                continue;
+            }
+            let due = match ctx.store.list_db_backups(&pid) {
+                Ok(list) => match list.iter().find(|b| {
+                    matches!(
+                        b.status,
+                        jkbase_control::store::BackupStatus::Complete
+                            | jkbase_control::store::BackupStatus::Failed
+                    )
+                }) {
+                    Some(b) => now_ms.saturating_sub(b.created_at_ms) >= DB_BACKUP_INTERVAL_MS,
+                    None => true,
+                },
+                Err(_) => false,
+            };
+            if !due {
+                continue;
+            }
+            let tenant_id = proj.tenant_id.clone().unwrap_or_default();
+            let row = match ctx.store.create_db_backup_auto(&pid, &tenant_id) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(project = %pid, error = %e, "nightly db-backup: could not record row");
+                    continue;
+                }
+            };
+            // run_db_backup acquires the shared concurrency permit itself; spawn and move on.
+            tokio::spawn(run_db_backup(ctx.clone(), pid, row.backup_id.clone()));
         }
     }
 }
@@ -4074,6 +4599,7 @@ async fn fence_data_disk(
     lease: &Arc<dyn Lease>,
     host_id: &str,
     project_id: &str,
+    disk_mib: u64,
 ) -> Result<DiskLeaseGuard> {
     let token = lease
         .acquire(project_id, host_id, DISK_LEASE_TTL)
@@ -4089,7 +4615,7 @@ async fn fence_data_disk(
         device: PathBuf::new(),
         armed: true,
     };
-    let device = fence_attach(data_disk, project_id, guard.token()).await?;
+    let device = fence_attach(data_disk, project_id, guard.token(), disk_mib).await?;
     guard.device = device;
     Ok(guard)
 }
@@ -4098,9 +4624,12 @@ async fn fence_attach(
     data_disk: &Arc<dyn DataDiskProvider>,
     project_id: &str,
     token: &FenceToken,
+    disk_mib: u64,
 ) -> Result<PathBuf> {
+    // `ensure` is grow-or-create and NEVER shrinks, so a re-sized `[database].size`
+    // grows the disk on the next boot and a smaller value is a safe no-op (no data loss).
     data_disk
-        .ensure(project_id, DATA_DISK_MIB * 1024 * 1024)
+        .ensure(project_id, disk_mib * 1024 * 1024)
         .await
         .map_err(|e| anyhow::anyhow!("ensure data disk {project_id}: {e}"))?;
     let device = match data_disk.attach_rwo(project_id, token).await {
@@ -4166,6 +4695,25 @@ fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
         .join("live")
         .join("_database.json")
         .exists()
+}
+
+/// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
+/// (parsed host-side at deploy into `_database.json`'s `size_mib`) when present, else
+/// the platform default [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized
+/// DB grows on the next boot (`ensure` never shrinks). Floored at the default — the DB
+/// disk is never smaller than the platform minimum, so a too-small `size` is harmless.
+/// A non-DB project (no `_database.json`, or no `size_mib`) gets the default unchanged.
+fn data_disk_mib_for(data_dir: &Path, project_id: &str) -> u64 {
+    let path = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_database.json");
+    let configured = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("size_mib").and_then(serde_json::Value::as_u64));
+    configured.unwrap_or(0).max(DATA_DISK_MIB)
 }
 
 /// Application-level liveness probe. Returns true only if the agent answers HTTP
@@ -4275,7 +4823,10 @@ async fn agent_protocol_version(ip: &str) -> Option<u32> {
 async fn reap_runtime_fc(fc_pid: u32, expected_sock: &Path) {
     let sock_bytes = expected_sock.to_string_lossy().into_owned().into_bytes();
     let still_ours = std::fs::read(format!("/proc/{fc_pid}/cmdline"))
-        .map(|raw| raw.split(|b| *b == 0).any(|arg| arg == sock_bytes.as_slice()))
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .any(|arg| arg == sock_bytes.as_slice())
+        })
         .unwrap_or(false);
     if !still_ours {
         warn!(%fc_pid, sock = %expected_sock.display(),
@@ -4366,10 +4917,7 @@ async fn adopt_or_reap_runtime_vms(
             AdoptOutcome::SkippedPeerOwned => skipped += 1,
         }
     }
-    info!(
-        adopted,
-        reaped, skipped, "VM re-adoption complete"
-    );
+    info!(adopted, reaped, skipped, "VM re-adoption complete");
 }
 
 /// Evaluate + (re-)adopt or reap a single surviving runtime Firecracker `fc_pid` for `id`.
@@ -4418,7 +4966,16 @@ async fn adopt_one_survivor(
     } else {
         // All checks passed — proceed to adopt below.
         return finish_adoption(
-            platform, routing, domain_map, runtime_dir, data_disk, lease, host_id, id, fc_pid, rec,
+            platform,
+            routing,
+            domain_map,
+            runtime_dir,
+            data_disk,
+            lease,
+            host_id,
+            id,
+            fc_pid,
+            rec,
         )
         .await;
     }
@@ -4520,8 +5077,7 @@ async fn finish_adoption(
             plat.disk_tokens.insert(id.to_string(), token.clone());
         }
         plat.vms.insert(id.to_string(), vm);
-        plat.vm_states
-            .insert(id.to_string(), VmLifecycle::Running);
+        plat.vm_states.insert(id.to_string(), VmLifecycle::Running);
         plat.vm_rootfs_hashes
             .insert(id.to_string(), rec.base_rootfs_hash.clone());
         plat.wake_failures.remove(id);
@@ -4798,6 +5354,7 @@ async fn metering_loop(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
+    db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
 ) {
     let mut state = metering::SamplerState::default();
     let mut last_sample = Instant::now();
@@ -4878,6 +5435,22 @@ async fn metering_loop(
             }
         }
 
+        // DB-attributable warm-seconds: accrue for every RUNNING VM that a managed-DB
+        // reach-plane relay is holding warm (`conn_count > 0`). This is the resource an
+        // idle external DB connection consumes — the VM would otherwise hibernate — so
+        // it's metered (billable), complementing the per-tenant warm-VM cap enforced at
+        // relay registration. The in-VM app->DB loopback path never registers a relay,
+        // so it's not double-counted here.
+        if let Some(reg) = &db_registry {
+            for (id, _pid) in &running_pids {
+                if reg.conn_count(id) > 0
+                    && let Err(e) = store.add_warm_usage(id, hour_epoch, elapsed)
+                {
+                    tracing::warn!(project = %id, error = %e, "metering: add_warm_usage failed");
+                }
+            }
+        }
+
         // --- Quota enforcement (monthly bandwidth cap) ---
         let month_start = month_start_epoch(now);
         for id in &projects {
@@ -4907,9 +5480,14 @@ async fn metering_loop(
                 let is_running =
                     { platform.lock().await.vm_states.get(id) == Some(&VmLifecycle::Running) };
                 if is_running
-                    && let Err(e) =
-                        hibernate_project(id, platform.clone(), routing.clone(), shipper.clone())
-                            .await
+                    && let Err(e) = hibernate_project(
+                        id,
+                        platform.clone(),
+                        routing.clone(),
+                        shipper.clone(),
+                        None,
+                    )
+                    .await
                 {
                     tracing::error!(project = %id, error = %e, "failed to hibernate over-quota project");
                 }

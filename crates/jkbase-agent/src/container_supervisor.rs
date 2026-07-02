@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::ptr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::RwLock;
@@ -17,6 +18,99 @@ use tracing::{error, info, warn};
 /// NEVER be reachable via a tenant route: `get_server_for_route` excludes it, and the host
 /// fences the name from `[routes.*]`/server/site names at deploy (validate_manifest).
 const DB_SERVER_NAME: &str = "rhypedb";
+
+/// Host-side path where a restore snapshot is staged (guest-written; the host never touches
+/// it — [RB5]). Bound into the DB's namespace as `/restore` and pointed at by
+/// `RHYPEDB_RESTORE_FROM=/restore/snapshot` when its `MANIFEST.json` is present. A complete
+/// untar renames into place atomically, so a partial/interrupted restore is never visible.
+const RHYPEDB_RESTORE_STAGING: &str = "/mnt/data/volumes/rhypedb-restore/snapshot";
+
+/// True if `dir` holds a COMPLETE rhypedb snapshot: a parseable `MANIFEST.json` plus every
+/// load-bearing file it vouches for (each listed SST under `sst/`, `wal.log`, `schema.rhype`).
+/// Used to gate restore-on-boot ([RB5]/[RB8]): a truncated/incomplete staged snapshot (missing
+/// SSTs) would make rhypedb fail-closed on open and, left armed, crash-loop the DB across
+/// reboots — so we only arm `RHYPEDB_RESTORE_FROM` when the snapshot is provably complete.
+pub(crate) fn snapshot_is_complete(dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join("MANIFEST.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if !dir.join("wal.log").is_file() || !dir.join("schema.rhype").is_file() {
+        return false;
+    }
+    if let Some(ssts) = v.get("ssts").and_then(|s| s.as_array()) {
+        for s in ssts.iter().filter_map(|x| x.as_str()) {
+            // Reject a traversal / non-plain name (rhypedb's restore refuses it, so arming a
+            // restore for it would just brick the boot). A legit sst name is a plain filename.
+            if s.is_empty() || s.contains('/') || s.contains('\\') || s == "." || s == ".." {
+                return false;
+            }
+            if !dir.join("sst").join(s).is_file() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Build the managed-DB server manifest. Injects the per-deploy `RHYPEDB_ADMIN_TOKEN` (host-
+/// only, from the reserved channel — [RB1]) and, when a complete restore snapshot is staged,
+/// the `/restore` volume + `RHYPEDB_RESTORE_FROM(_FORCE)` so rhypedb restore-on-boots. rhypedb's
+/// restore is idempotent + sentinel-guarded, so re-applying across a crash-respawn is safe;
+/// [`ContainerSupervisor::finalize_restore`] clears the staging + resets this once healthy.
+///
+/// NB: rhypedb-server has no `--rules` flag yet (the security-rules engine is the upstream RBAC
+/// epic). v1 is backend-only — the DB is reachable only by the tenant's own app over loopback +
+/// the authenticated reach plane — so no rules are enforced; rules are staged for when the
+/// engine gains them. The data plane (`/query`) is open on loopback by design; `/admin/*` is
+/// gated by the admin token.
+fn db_manifest(admin_token: Option<&str>) -> ServerManifest {
+    let mut env = HashMap::new();
+    if let Some(token) = admin_token {
+        env.insert("RHYPEDB_ADMIN_TOKEN".to_string(), token.to_string());
+    }
+    let mut volumes = vec![
+        VolumeMount {
+            name: "rhypedb-data".into(),
+            mount: "/data".into(),
+        },
+        VolumeMount {
+            name: "rhypedb-meta".into(),
+            mount: "/etc/rhypedb".into(),
+        },
+    ];
+    if snapshot_is_complete(Path::new(RHYPEDB_RESTORE_STAGING)) {
+        volumes.push(VolumeMount {
+            name: "rhypedb-restore".into(),
+            mount: "/restore".into(),
+        });
+        env.insert(
+            "RHYPEDB_RESTORE_FROM".to_string(),
+            "/restore/snapshot".to_string(),
+        );
+        env.insert("RHYPEDB_RESTORE_FROM_FORCE".to_string(), "1".to_string());
+    }
+    ServerManifest {
+        port: 4200,
+        cmd: vec![
+            "/opt/rhypedb/bin/rhypedb-server".to_string(),
+            "--data-dir".into(),
+            "/data".into(),
+            "--schema".into(),
+            "/etc/rhypedb/schema.rhype".into(),
+            "--listen".into(),
+            "127.0.0.1:4200".into(),
+            "--tcp-listen".into(),
+            "127.0.0.1:4201".into(),
+        ],
+        env,
+        working_dir: None,
+        health_check: None,
+        volumes,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMount {
@@ -52,6 +146,13 @@ struct ManagedServer {
     layers: Option<Vec<PathBuf>>,
     process: Option<Child>,
     healthy: bool,
+    /// Consecutive (re)spawn attempts since the server was last healthy. Reset to 0 once
+    /// it passes a health check. Drives the exponential restart backoff so a crash-looping
+    /// server doesn't hot-loop the supervisor (one respawn per health pass).
+    restart_count: u32,
+    /// Earliest instant the next (re)spawn may be attempted (the backoff gate). `None` ⇒
+    /// respawn immediately on the next pass (a fresh server or a recovered one).
+    next_restart_at: Option<Instant>,
 }
 
 pub struct ContainerSupervisor {
@@ -183,6 +284,8 @@ impl ContainerSupervisor {
                 layers,
                 process: Some(process),
                 healthy: false,
+                restart_count: 0,
+                next_restart_at: None,
             });
         }
 
@@ -198,6 +301,7 @@ impl ContainerSupervisor {
     /// restart, health, and log machinery as every other layered server.
     pub async fn start_database(
         &self,
+        admin_token: Option<&str>,
         schema: &[u8],
         rules: Option<&[u8]>,
         lowerdirs: Vec<PathBuf>,
@@ -227,42 +331,11 @@ impl ContainerSupervisor {
         }
         let _ = std::fs::create_dir_all("/mnt/data/volumes/rhypedb-data");
 
-        // NB: rhypedb-server has no `--rules` flag yet (the security-rules engine is the
-        // upstream RBAC epic). v1 is backend-only — the DB is reachable only by the
-        // tenant's own app over loopback — so no rules are enforced; rules are staged for
-        // when the engine gains them. The data plane (/query) is open on loopback by design.
-        let cmd = vec![
-            "/opt/rhypedb/bin/rhypedb-server".to_string(),
-            "--data-dir".into(),
-            "/data".into(),
-            "--schema".into(),
-            "/etc/rhypedb/schema.rhype".into(),
-            "--listen".into(),
-            "127.0.0.1:4200".into(),
-            "--tcp-listen".into(),
-            "127.0.0.1:4201".into(),
-        ];
-        let manifest = ServerManifest {
-            port: 4200,
-            cmd,
-            env: HashMap::new(),
-            working_dir: None,
-            health_check: None,
-            volumes: vec![
-                VolumeMount {
-                    name: "rhypedb-data".into(),
-                    mount: "/data".into(),
-                },
-                VolumeMount {
-                    name: "rhypedb-meta".into(),
-                    mount: "/etc/rhypedb".into(),
-                },
-            ],
-        };
-
+        let manifest = db_manifest(admin_token);
         info!(
             port = manifest.port,
             layers = lowerdirs.len(),
+            restore = manifest.env.contains_key("RHYPEDB_RESTORE_FROM"),
             "starting managed database (rhypedb, loopback-only)"
         );
         let process = spawn_server_layered(NAME, &manifest, &lowerdirs, &self.logs)?;
@@ -274,8 +347,55 @@ impl ContainerSupervisor {
             layers: Some(lowerdirs),
             process: Some(process),
             healthy: false,
+            restart_count: 0,
+            next_restart_at: None,
         });
         Ok(())
+    }
+
+    /// Respawn the managed DB so it restore-on-boots from the freshly-staged snapshot
+    /// ([RB9]). The caller has already untarred a complete snapshot to [`RHYPEDB_RESTORE_STAGING`]
+    /// (its `MANIFEST.json` present), so [`db_manifest`] now adds the `/restore` volume +
+    /// `RHYPEDB_RESTORE_FROM`. Held under the servers write lock across kill→reap→respawn so
+    /// the health loop can't race-respawn a plain (non-restoring) DB onto the same data dir,
+    /// and rhypedb (single-writer) has released its data-dir lock before the restoring process
+    /// starts.
+    pub async fn restore_database(&self, admin_token: Option<&str>) -> Result<()> {
+        let mut servers = self.servers.write().await;
+        let srv = servers
+            .iter_mut()
+            .find(|s| s.name == DB_SERVER_NAME)
+            .ok_or_else(|| anyhow::anyhow!("managed DB is not supervised"))?;
+        let lowerdirs = srv
+            .layers
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("managed DB has no layers"))?;
+        if let Some(mut child) = srv.process.take() {
+            let _ = child.start_kill();
+            let _ = child.wait().await; // reap → release the single-writer data-dir lock
+        }
+        let manifest = db_manifest(admin_token); // sees the staged snapshot → restore env
+        let process = spawn_server_layered(&srv.name, &manifest, &lowerdirs, &self.logs)?;
+        srv.manifest = manifest;
+        srv.process = Some(process);
+        srv.healthy = false;
+        srv.restart_count = 0;
+        srv.next_restart_at = None;
+        Ok(())
+    }
+
+    /// Called once a restore has completed (the DB is serving again): remove the staged
+    /// snapshot and reset the DB's manifest to a normal (non-restoring) one, so a later
+    /// health-loop respawn or cold boot doesn't re-point `RHYPEDB_RESTORE_FROM` at a
+    /// now-deleted path. The running process is untouched (it already restored). Safe because
+    /// "healthy" ⟹ rhypedb's own `RESTORE_DONE` sentinel is durable in the data dir, so the
+    /// staging is no longer needed. Idempotent.
+    pub async fn finalize_restore(&self, admin_token: Option<&str>) {
+        let _ = std::fs::remove_dir_all(RHYPEDB_RESTORE_STAGING);
+        let mut servers = self.servers.write().await;
+        if let Some(srv) = servers.iter_mut().find(|s| s.name == DB_SERVER_NAME) {
+            srv.manifest = db_manifest(admin_token);
+        }
     }
 
     pub async fn status(&self) -> Vec<ServerStatus> {
@@ -299,41 +419,18 @@ impl ContainerSupervisor {
     }
 
     pub async fn run_health_checks(&self) {
+        let now = Instant::now();
         let mut servers = self.servers.write().await;
         for server in servers.iter_mut() {
+            // Reap an exited process so the (re)spawn path below treats it like any other
+            // server with no live process. Drop the handle (process = None) rather than
+            // respawning inline — the backoff gate decides whether/when to respawn.
             if let Some(ref mut process) = server.process {
                 match process.try_wait() {
                     Ok(Some(status)) => {
-                        warn!(
-                            server = %server.name,
-                            exit_code = ?status.code(),
-                            "server process exited, restarting"
-                        );
+                        warn!(server = %server.name, exit_code = ?status.code(), "server process exited");
                         server.healthy = false;
-                        let respawn = match &server.layers {
-                            Some(lowerdirs) => spawn_server_layered(
-                                &server.name,
-                                &server.manifest,
-                                lowerdirs,
-                                &self.logs,
-                            ),
-                            None => spawn_server_chroot(
-                                &server.name,
-                                &server.manifest,
-                                &server.rootfs_dir,
-                                &self.logs,
-                            ),
-                        };
-                        match respawn {
-                            Ok(new_process) => {
-                                server.process = Some(new_process);
-                            }
-                            Err(e) => {
-                                error!(server = %server.name, error = %e, "failed to restart server");
-                                server.process = None;
-                            }
-                        }
-                        continue;
+                        server.process = None;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -341,6 +438,39 @@ impl ContainerSupervisor {
                         continue;
                     }
                 }
+            }
+
+            // (Re)spawn any server with no live process — whether it just exited OR a prior
+            // respawn itself errored (which previously left `process = None` and was NEVER
+            // retried). Gated by an exponential backoff so a crash-looping server respawns
+            // at most once per capped interval instead of once per health pass.
+            if server.process.is_none() {
+                if server.next_restart_at.is_some_and(|at| now < at) {
+                    continue; // still backing off — retry on a later pass
+                }
+                let respawn = match &server.layers {
+                    Some(lowerdirs) => {
+                        spawn_server_layered(&server.name, &server.manifest, lowerdirs, &self.logs)
+                    }
+                    None => spawn_server_chroot(
+                        &server.name,
+                        &server.manifest,
+                        &server.rootfs_dir,
+                        &self.logs,
+                    ),
+                };
+                server.restart_count = server.restart_count.saturating_add(1);
+                server.next_restart_at = Some(now + restart_backoff(server.restart_count));
+                match respawn {
+                    Ok(new_process) => {
+                        info!(server = %server.name, attempt = server.restart_count, "restarted server");
+                        server.process = Some(new_process);
+                    }
+                    Err(e) => {
+                        error!(server = %server.name, attempt = server.restart_count, error = %e, "failed to restart server; retrying after backoff");
+                    }
+                }
+                continue; // give the fresh (or still-absent) process a pass before probing
             }
 
             let check_path = server
@@ -358,6 +488,12 @@ impl ContainerSupervisor {
                 info!(server = %server.name, port = server.manifest.port, path = %check_path, "server is healthy");
             } else if !server.healthy && was_healthy {
                 warn!(server = %server.name, "server health check failed");
+            }
+
+            // A healthy server clears its restart backoff so a later crash restarts promptly.
+            if server.healthy {
+                server.restart_count = 0;
+                server.next_restart_at = None;
             }
         }
     }
@@ -379,6 +515,15 @@ impl ContainerSupervisor {
             .find(|s| s.name != DB_SERVER_NAME && s.name == route_name)
             .map(|s| s.manifest.port)
     }
+}
+
+/// Exponential restart backoff: the wait before the next (re)spawn after `attempt`
+/// consecutive attempts. The first respawn is immediate (the `next_restart_at` gate is
+/// `None`); thereafter 1s, 2s, 4s, … doubling, capped at 60s. Bounds a crash-looping
+/// server to one respawn per capped interval instead of one per health-check pass.
+fn restart_backoff(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(6); // 2^0..=2^6 → 1..=64s, then capped
+    Duration::from_secs((1u64 << shift).min(60))
 }
 
 fn remount_rw(target: &str) {
@@ -911,6 +1056,26 @@ async fn tcp_health_check(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_backoff_escalates_then_caps() {
+        // First respawn is gated by next_restart_at=None (immediate); this is the wait
+        // AFTER attempt N before attempt N+1: 1,2,4,8,16,32,64→capped 60, then steady 60.
+        assert_eq!(restart_backoff(1), Duration::from_secs(1));
+        assert_eq!(restart_backoff(2), Duration::from_secs(2));
+        assert_eq!(restart_backoff(3), Duration::from_secs(4));
+        assert_eq!(restart_backoff(4), Duration::from_secs(8));
+        assert_eq!(restart_backoff(5), Duration::from_secs(16));
+        assert_eq!(restart_backoff(6), Duration::from_secs(32));
+        assert_eq!(restart_backoff(7), Duration::from_secs(60)); // 64 capped to 60
+        assert_eq!(restart_backoff(100), Duration::from_secs(60));
+        // Monotonic non-decreasing, never zero (the gate, not this fn, gives the immediate
+        // first respawn) — so a crash loop can never hot-loop the supervisor.
+        for n in 1..200u32 {
+            assert!(restart_backoff(n) >= Duration::from_secs(1));
+            assert!(restart_backoff(n + 1) >= restart_backoff(n));
+        }
+    }
 
     #[test]
     fn apply_server_env_reserved_vars_win_over_manifest_env() {

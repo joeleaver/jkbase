@@ -171,6 +171,31 @@ impl PlatformEgress {
     pub const FILE: &'static str = "_platform.json";
 }
 
+/// Host-authored managed-DB reach-plane facts, baked into the per-VM metadata image
+/// (`_db_reach.json`) for projects that declare a `[database]`. Written LAST into the
+/// image (like [`PlatformEgress`]) so a tenant `jkbase.toml`/source file of the same
+/// name can't forge it — it is genuinely host-authored and tenant-unforgeable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbReachFacts {
+    /// The per-deploy host→agent splice secret. The edge presents it on the
+    /// `/_jkbase/db` upgrade and the agent verifies it before splicing to the loopback
+    /// DB ([R3]) — defense-in-depth so one isolation slip isn't a full DB compromise.
+    #[serde(default)]
+    pub splice_secret: String,
+    /// The per-deploy rhypedb admin bearer (`RHYPEDB_ADMIN_TOKEN`). Host-minted, injected
+    /// ONLY into the DB's own process env by the agent — it gates `/admin/*` (backup stream
+    /// = full data exfil) on loopback:4200. It rides THIS reserved channel, never the
+    /// tenant-influenced `_database.json` ([RB1]). Empty (old images / no managed DB) ⇒
+    /// backups disabled, fail-closed, never a crash.
+    #[serde(default)]
+    pub admin_token: String,
+}
+
+impl DbReachFacts {
+    /// Metadata-image filename. `_`-prefixed, so the agent's static server never serves it.
+    pub const FILE: &'static str = "_db_reach.json";
+}
+
 fn norm_host(h: &str) -> String {
     h.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -563,6 +588,42 @@ pub enum DatabaseEngine {
     Rhypedb,
 }
 
+/// Parse a human data-disk size (`"4GiB"`, `"512MiB"`, `"1GB"`, `"2G"`, `"1048576"`)
+/// into bytes. Binary (`KiB`/`MiB`/`GiB`/`TiB`) and decimal (`KB`/`MB`/`GB`/`TB`, or a
+/// bare `K`/`M`/`G`/`T` = decimal) suffixes, case-insensitive; a bare number is bytes.
+/// Fails closed on a malformed value so a typo aborts the deploy.
+fn parse_size_bytes(s: &str) -> Result<u64> {
+    let t = s.trim();
+    if t.is_empty() {
+        anyhow::bail!("empty size");
+    }
+    let split = t
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let num: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid size number in {s:?}"))?;
+    if !num.is_finite() || num < 0.0 {
+        anyhow::bail!("invalid size {s:?}");
+    }
+    let kib = 1024.0_f64;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1e3,
+        "ki" | "kib" => kib,
+        "m" | "mb" => 1e6,
+        "mi" | "mib" => kib.powi(2),
+        "g" | "gb" => 1e9,
+        "gi" | "gib" => kib.powi(3),
+        "t" | "tb" => 1e12,
+        "ti" | "tib" => kib.powi(4),
+        other => anyhow::bail!("unknown size unit {other:?} in {s:?}"),
+    };
+    Ok((num * mult).ceil() as u64)
+}
+
 impl DatabaseConfig {
     /// Resolve the `engine` field. Omitted/empty → RhypeDB (the only engine);
     /// errors on an unrecognised value so `engine = "rhypdb"` fails the deploy
@@ -577,15 +638,34 @@ impl DatabaseConfig {
     }
 
     /// Validate the `[database]` section at deploy preflight: resolve the engine
-    /// (reject unknown) and reject an empty `schema` path. File existence (the
-    /// schema/rules files actually being present) is checked where the source tree
-    /// is available — the CLI and the build VM.
+    /// (reject unknown), reject an empty `schema` path, and reject a malformed `size`.
+    /// File existence (the schema/rules files actually being present) is checked where
+    /// the source tree is available — the CLI and the build VM.
     pub fn validate(&self) -> Result<()> {
         self.engine()?;
         if self.schema.trim().is_empty() {
             anyhow::bail!("[database]: `schema` must not be empty (path to the RhypeDB SDL file)");
         }
+        self.size_mib()
+            .context("[database]: `size` is not a valid data-disk size (e.g. \"4GiB\")")?;
         Ok(())
+    }
+
+    /// Resolve `size` to whole MiB (rounded up), or `None` when unset. The data disk
+    /// is sized in MiB host-side (`DATA_DISK_MIB`), so this is the unit the host wants.
+    /// Errors on a malformed value (surfaced at preflight by [`Self::validate`]).
+    pub fn size_mib(&self) -> Result<Option<u64>> {
+        match self.size.as_deref().map(str::trim) {
+            None | Some("") => Ok(None),
+            Some(s) => {
+                const MIB: u64 = 1024 * 1024;
+                let mib = parse_size_bytes(s)?.div_ceil(MIB);
+                if mib == 0 {
+                    anyhow::bail!("[database]: `size` {s:?} rounds to 0 MiB (too small)");
+                }
+                Ok(Some(mib))
+            }
+        }
     }
 }
 
@@ -718,14 +798,17 @@ impl ProjectConfig {
     }
 
     /// `_database.json` sidecar: the resolved managed-DB facts the host/agent need
-    /// to provision + boot the DB — engine, schema path, rules path. `None` when no
-    /// `[database]` is declared. The admin credential is NEVER in this sidecar: it
-    /// is host-minted per deploy and delivered over the reserved metadata channel,
-    /// never tenant-authored and never derived from `jkbase.toml`.
+    /// to provision + boot the DB — engine, schema path, rules path, and the parsed
+    /// data-disk `size_mib` (the host sizes the RWO disk from it; `null`/absent → the
+    /// platform default). `None` when no `[database]` is declared. The admin credential
+    /// is NEVER in this sidecar: it is host-minted per deploy and delivered over the
+    /// reserved metadata channel, never tenant-authored and never derived from
+    /// `jkbase.toml`.
     pub fn database_json(&self) -> Option<String> {
         let db = self.database.as_ref()?;
-        // Preflight `validate()` already rejects an unknown engine; if it somehow
-        // doesn't resolve here, emit nothing rather than a half-formed sidecar.
+        // Preflight `validate()` already rejects an unknown engine + a malformed size;
+        // if either somehow doesn't resolve here, emit nothing (engine) or drop the
+        // field (size) rather than a half-formed sidecar.
         let engine = match db.engine() {
             Ok(DatabaseEngine::Rhypedb) => "rhypedb",
             Err(_) => return None,
@@ -734,6 +817,7 @@ impl ProjectConfig {
             "engine": engine,
             "schema": db.schema,
             "rules": db.rules,
+            "size_mib": db.size_mib().ok().flatten(),
         }))
         .ok()
     }
@@ -1137,13 +1221,15 @@ mod tests {
         assert_eq!(db.schema, "schema.rhype");
         assert_eq!(db.rules.as_deref(), Some("rules.rhype"));
         assert_eq!(db.size.as_deref(), Some("4GiB"));
+        assert_eq!(db.size_mib().unwrap(), Some(4096));
         db.validate().unwrap();
 
-        // Sidecar emits engine/schema/rules and NEVER a credential.
+        // Sidecar emits engine/schema/rules/size_mib and NEVER a credential.
         let sidecar = cfg.database_json().unwrap();
         assert!(sidecar.contains("rhypedb"));
         assert!(sidecar.contains("schema.rhype"));
         assert!(sidecar.contains("rules.rhype"));
+        assert!(sidecar.contains("\"size_mib\": 4096"));
         assert!(!sidecar.to_lowercase().contains("token"));
 
         // Explicit engine = "rhypedb" is accepted.
@@ -1168,5 +1254,60 @@ mod tests {
         let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
         assert!(bare.database.is_none());
         assert!(bare.database_json().is_none());
+    }
+
+    #[test]
+    fn database_size_parses_units_rounds_and_fails_closed() {
+        // Binary + decimal units, case-insensitive; rounds UP to whole MiB.
+        for (s, want) in [
+            ("4GiB", 4096_u64),
+            ("512MiB", 512),
+            ("1mib", 1),
+            ("1GB", 954),        // 1e9 bytes → ceil(/MiB) = 954
+            ("2G", 1908),        // bare G = decimal
+            ("1048576", 1),      // bare number = bytes = exactly 1 MiB
+            ("1048577", 2),      // one byte over → rounds up
+            ("  8 GiB  ", 8192), // surrounding + inner whitespace tolerated
+        ] {
+            let db = DatabaseConfig {
+                engine: None,
+                schema: "s.rhype".into(),
+                rules: None,
+                size: Some(s.into()),
+            };
+            assert_eq!(db.size_mib().unwrap(), Some(want), "size {s:?}");
+            db.validate().unwrap();
+        }
+
+        // Unset → None (the host falls back to the platform default).
+        let db = DatabaseConfig {
+            engine: None,
+            schema: "s.rhype".into(),
+            rules: None,
+            size: None,
+        };
+        assert_eq!(db.size_mib().unwrap(), None);
+        // Sidecar carries an explicit null so the host reads Option::None.
+        let bare_size: ProjectConfig =
+            toml::from_str("[database]\nschema = \"s.rhype\"\n").unwrap();
+        assert!(
+            bare_size
+                .database_json()
+                .unwrap()
+                .contains("\"size_mib\": null")
+        );
+
+        // Malformed sizes fail closed (a typo must abort the deploy). An empty/
+        // whitespace `size` is treated as unset (Ok(None)), like an omitted field.
+        for bad in ["banana", "4 quux", "GiB", "-1MiB", "1 2 3"] {
+            let db = DatabaseConfig {
+                engine: None,
+                schema: "s.rhype".into(),
+                rules: None,
+                size: Some(bad.into()),
+            };
+            assert!(db.size_mib().is_err(), "size {bad:?} should be rejected");
+            assert!(db.validate().is_err(), "validate should reject {bad:?}");
+        }
     }
 }
