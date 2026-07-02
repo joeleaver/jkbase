@@ -1,3 +1,4 @@
+use crate::cors::CorsConfig;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -176,6 +177,9 @@ impl ObjectStore {
             return Err(ObjectError::BucketNotEmpty(bucket.to_string()));
         }
         tokio::fs::remove_dir(&dir).await?;
+        // Drop any CORS sidecar (it lives outside the bucket dir, so it didn't count
+        // toward the emptiness check above) so a re-created same-name bucket starts clean.
+        let _ = self.delete_bucket_cors(bucket).await;
         Ok(())
     }
 
@@ -209,6 +213,48 @@ impl ObjectStore {
             return Err(ObjectError::NoSuchBucket(bucket.to_string()));
         }
         Ok(dir)
+    }
+
+    // ---- per-bucket CORS config -------------------------------------------
+    //
+    // Stored OUTSIDE the bucket dir at `{root}/.cors/{bucket}.json` on purpose: an
+    // in-bucket sidecar would make an otherwise-empty bucket fail `delete_bucket`'s
+    // emptiness check (same latent trap as `.uploads`), and `.cors` is dot-prefixed
+    // so `list_buckets` already skips it. `validate_bucket` keeps the `{bucket}.json`
+    // filename to `[a-z0-9-]` — no traversal.
+
+    fn cors_path(&self, bucket: &str) -> PathBuf {
+        self.root.join(".cors").join(format!("{bucket}.json"))
+    }
+
+    /// Store the bucket's CORS config (bucket must exist).
+    pub async fn put_bucket_cors(&self, bucket: &str, cfg: &CorsConfig) -> Result<()> {
+        self.require_bucket(bucket).await?;
+        let path = self.cors_path(bucket);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&path, serde_json::to_vec(cfg).unwrap()).await?;
+        Ok(())
+    }
+
+    /// The bucket's CORS config, or `None` if unset. A corrupt sidecar reads as
+    /// `None` (fail-open to "no CORS"): it governs only the tenant's own bucket, so
+    /// the worst case is their browser client loses access, never a cross-tenant leak.
+    pub async fn get_bucket_cors(&self, bucket: &str) -> Result<Option<CorsConfig>> {
+        validate_bucket(bucket)?;
+        match tokio::fs::read(self.cors_path(bucket)).await {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove the bucket's CORS config (idempotent).
+    pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<()> {
+        validate_bucket(bucket)?;
+        let _ = tokio::fs::remove_file(self.cors_path(bucket)).await;
+        Ok(())
     }
 
     // ---- objects ----------------------------------------------------------
