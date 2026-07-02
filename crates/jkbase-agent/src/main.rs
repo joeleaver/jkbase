@@ -799,7 +799,13 @@ async fn handle_request(
         .and_then(|v| v.to_str().ok())
         && let Some(site) = state.sites.iter().find(|s| s.name == site_name)
     {
-        return static_server::handle_static_with_path(&site.root, &path, site.spa).await;
+        return static_server::handle_static_with_path(
+            &site.root,
+            &path,
+            site.spa,
+            &static_server::ReqConds::from_headers(req.headers()),
+        )
+        .await;
     }
 
     // Multi-site routing: find the best matching site by prefix
@@ -812,8 +818,13 @@ async fn handle_request(
                 } else {
                     path.strip_prefix(prefix).unwrap_or(&path).to_string()
                 };
-                return static_server::handle_static_with_path(&site.root, &sub_path, site.spa)
-                    .await;
+                return static_server::handle_static_with_path(
+                    &site.root,
+                    &sub_path,
+                    site.spa,
+                    &static_server::ReqConds::from_headers(req.headers()),
+                )
+                .await;
             }
         }
     }

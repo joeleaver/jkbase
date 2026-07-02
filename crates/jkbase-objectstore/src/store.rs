@@ -1,3 +1,4 @@
+use crate::cors::CorsConfig;
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -87,6 +88,9 @@ struct UploadInfo {
     /// uploads created before this field existed (pre-hardening).
     #[serde(default)]
     initiated: u64,
+    /// `Cache-Control` captured at initiate, applied to the completed object.
+    #[serde(default)]
+    cache_control: Option<String>,
 }
 
 type Result<T> = std::result::Result<T, ObjectError>;
@@ -101,6 +105,10 @@ pub struct ObjectMeta {
     pub content_type: String,
     /// Last-modified, unix seconds.
     pub last_modified: u64,
+    /// Client-supplied `Cache-Control` to echo on GET/HEAD. `#[serde(default)]` so
+    /// sidecars written before this field existed still deserialize (as `None`).
+    #[serde(default)]
+    pub cache_control: Option<String>,
 }
 
 /// Result page from `list_objects`. Holds the current page plus pagination
@@ -176,6 +184,9 @@ impl ObjectStore {
             return Err(ObjectError::BucketNotEmpty(bucket.to_string()));
         }
         tokio::fs::remove_dir(&dir).await?;
+        // Drop any CORS sidecar (it lives outside the bucket dir, so it didn't count
+        // toward the emptiness check above) so a re-created same-name bucket starts clean.
+        let _ = self.delete_bucket_cors(bucket).await;
         Ok(())
     }
 
@@ -211,6 +222,48 @@ impl ObjectStore {
         Ok(dir)
     }
 
+    // ---- per-bucket CORS config -------------------------------------------
+    //
+    // Stored OUTSIDE the bucket dir at `{root}/.cors/{bucket}.json` on purpose: an
+    // in-bucket sidecar would make an otherwise-empty bucket fail `delete_bucket`'s
+    // emptiness check (same latent trap as `.uploads`), and `.cors` is dot-prefixed
+    // so `list_buckets` already skips it. `validate_bucket` keeps the `{bucket}.json`
+    // filename to `[a-z0-9-]` — no traversal.
+
+    fn cors_path(&self, bucket: &str) -> PathBuf {
+        self.root.join(".cors").join(format!("{bucket}.json"))
+    }
+
+    /// Store the bucket's CORS config (bucket must exist).
+    pub async fn put_bucket_cors(&self, bucket: &str, cfg: &CorsConfig) -> Result<()> {
+        self.require_bucket(bucket).await?;
+        let path = self.cors_path(bucket);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&path, serde_json::to_vec(cfg).unwrap()).await?;
+        Ok(())
+    }
+
+    /// The bucket's CORS config, or `None` if unset. A corrupt sidecar reads as
+    /// `None` (fail-open to "no CORS"): it governs only the tenant's own bucket, so
+    /// the worst case is their browser client loses access, never a cross-tenant leak.
+    pub async fn get_bucket_cors(&self, bucket: &str) -> Result<Option<CorsConfig>> {
+        validate_bucket(bucket)?;
+        match tokio::fs::read(self.cors_path(bucket)).await {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove the bucket's CORS config (idempotent).
+    pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<()> {
+        validate_bucket(bucket)?;
+        let _ = tokio::fs::remove_file(self.cors_path(bucket)).await;
+        Ok(())
+    }
+
     // ---- objects ----------------------------------------------------------
 
     /// Stream `reader` into `bucket/key`, computing the MD5 etag as it goes (the
@@ -230,7 +283,7 @@ impl ObjectStore {
         content_type: &str,
         expected_sha256: Option<&str>,
     ) -> Result<ObjectMeta> {
-        self.put_object_capped(bucket, key, reader, content_type, expected_sha256, None)
+        self.put_object_capped(bucket, key, reader, content_type, None, expected_sha256, None)
             .await
     }
 
@@ -238,12 +291,14 @@ impl ObjectStore {
     /// total upload deadline — see [`upload_deadline`]. Authenticated front-ends pass
     /// the declared length so a large single PUT over a slow link isn't capped at the
     /// small-upload floor; plain `put_object` (unknown length) uses the floor.
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_object_capped<R: AsyncRead + Unpin>(
         &self,
         bucket: &str,
         key: &str,
         mut reader: R,
         content_type: &str,
+        cache_control: Option<&str>,
         expected_sha256: Option<&str>,
         declared_len: Option<u64>,
     ) -> Result<ObjectMeta> {
@@ -274,6 +329,7 @@ impl ObjectStore {
                     etag,
                     content_type: content_type.to_string(),
                     last_modified: now_secs(),
+                    cache_control: cache_control.map(str::to_string),
                 };
                 let meta_path = dir.join(format!("{hk}.meta"));
                 if let Err(e) =
@@ -510,6 +566,7 @@ impl ObjectStore {
         bucket: &str,
         key: &str,
         content_type: &str,
+        cache_control: Option<&str>,
     ) -> Result<String> {
         validate_key(key)?;
         let dir = self.require_bucket(bucket).await?;
@@ -520,6 +577,7 @@ impl ObjectStore {
             key: key.to_string(),
             content_type: content_type.to_string(),
             initiated: now_secs(),
+            cache_control: cache_control.map(str::to_string),
         };
         tokio::fs::write(sdir.join("info.json"), serde_json::to_vec(&info).unwrap()).await?;
         Ok(upload_id)
@@ -644,6 +702,7 @@ impl ObjectStore {
             etag: format!("{}-{}", hex(&concat.finalize()), part_numbers.len()),
             content_type: info.content_type,
             last_modified: now_secs(),
+            cache_control: info.cache_control,
         };
         let meta_path = dir.join(format!("{hk}.meta"));
         if let Err(e) = tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await {
@@ -1303,7 +1362,7 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("mp-bucket").await.unwrap();
         let uid = s
-            .create_multipart("mp-bucket", "big/file", "application/octet-stream")
+            .create_multipart("mp-bucket", "big/file", "application/octet-stream", None)
             .await
             .unwrap();
         let e1 = s
@@ -1344,7 +1403,7 @@ mod tests {
         let dir = root("mpu-abort");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("ab-bucket").await.unwrap();
-        let uid = s.create_multipart("ab-bucket", "k", "x").await.unwrap();
+        let uid = s.create_multipart("ab-bucket", "k", "x", None).await.unwrap();
         s.upload_part("ab-bucket", &uid, 1, &b"data"[..], None)
             .await
             .unwrap();
@@ -1366,7 +1425,7 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("sweep-bucket").await.unwrap();
         let uid = s
-            .create_multipart("sweep-bucket", "pending/obj", "application/octet-stream")
+            .create_multipart("sweep-bucket", "pending/obj", "application/octet-stream", None)
             .await
             .unwrap();
         s.upload_part("sweep-bucket", &uid, 1, &b"part"[..], None)

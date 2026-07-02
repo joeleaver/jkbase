@@ -13,6 +13,7 @@
 //! sidecar; listing reads the sidecars. Hex encoding also makes traversal (`..`,
 //! absolute paths) structurally impossible.
 
+pub mod cors;
 mod http;
 /// SigV4 lives in the `jkbase-sigv4` leaf crate (re-exported via `jkbase-common`) so the
 /// object-store verify path, the agent's own-bucket sign path, AND the tenant-facing
@@ -24,4 +25,5 @@ pub use jkbase_common::sigv4;
 mod store;
 pub use http::router;
 pub use sigv4::{presign, sign_header, verify_header, verify_presigned};
+pub use cors::{CorsConfig, cors_config_to_xml, parse_cors_config_xml};
 pub use store::{ListPage, ListV2Page, MultipartUpload, ObjectError, ObjectMeta, ObjectStore};

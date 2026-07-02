@@ -27,7 +27,9 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use jkbase_control::store::{DEFAULT_QUOTA, QuotaLimits, Store};
-use jkbase_objectstore::{ObjectError, ObjectStore, sigv4};
+use jkbase_objectstore::{
+    ObjectError, ObjectStore, cors, cors_config_to_xml, parse_cors_config_xml, sigv4,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -472,6 +474,22 @@ impl ObjectStoreService {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let headers = lower_headers(&req);
+        // The bucket is the first path segment (empty for the bucket-list root); the
+        // `Origin` (if any) drives CORS stamping on the way out.
+        let bucket = path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let origin = headers.get("origin").cloned();
+
+        // --- 0. CORS preflight is ANONYMOUS (browsers never sign the OPTIONS): answer
+        // it before the auth loop, resolving the target bucket's project from the
+        // presigned credential (never verifying a signature). ---
+        if method == "OPTIONS" {
+            return self.handle_preflight(&bucket, &query, &headers).await;
+        }
 
         let mut auth = Err("anonymous requests are not allowed".to_string());
         for host in self.host_candidates() {
@@ -525,6 +543,13 @@ impl ObjectStoreService {
                 );
             }
         };
+
+        // --- 2b. Per-bucket CORS config CRUD (`?cors` subresource on `/{bucket}`).
+        // Intercept BEFORE the quota logic below so a `PUT /{bucket}?cors` isn't mistaken
+        // for a bucket create. Authenticated (owner-only) like any other S3 op. ---
+        if !path_has_key(&path) && query.iter().any(|(k, _)| k == "cors") {
+            return self.handle_bucket_cors(&method, &bucket, &entry, req).await;
+        }
 
         let quota = self.control.get_quota(&project_id).unwrap_or(DEFAULT_QUOTA);
 
@@ -659,7 +684,157 @@ impl ObjectStoreService {
             // bucket count stale until the next ≤TTL re-walk — residual #2.)
             self.invalidate_usage_sample(&entry);
         }
+
+        // --- 6. Stamp CORS onto the ACTUAL response when the request carried an Origin
+        // the bucket's policy allows. Both auth paths (SigV4 header + presigned) converge
+        // here, so this covers simple GETs (no preflight) and the real request after a
+        // preflight, incl. error responses (so the browser can read a 404). ---
+        let mut resp = resp;
+        if let Some(origin) = &origin
+            && let Ok(Some(cfg)) = entry.store.get_bucket_cors(&bucket).await
+            && let Some(grant) = cfg.match_actual(origin, &method)
+        {
+            apply_actual_cors(resp.headers_mut(), &grant);
+        }
         resp
+    }
+
+    /// Answer a browser CORS preflight. Anonymous by design: we resolve WHICH bucket's
+    /// (browser-facing, non-secret) policy applies from the presigned credential's
+    /// access-key id — never verifying a signature (browsers can't sign the OPTIONS) and
+    /// never touching object bytes. Fails closed (403, no `Access-Control-*`) on any
+    /// miss, so the browser blocks the real request.
+    async fn handle_preflight(
+        &self,
+        bucket: &str,
+        query: &[(String, String)],
+        headers: &HashMap<String, String>,
+    ) -> Response {
+        // A real preflight carries Origin + Access-Control-Request-Method; a bare OPTIONS
+        // is just an unauthenticated request → 403 like the fallback would give.
+        let (Some(origin), Some(req_method)) = (
+            headers.get("origin"),
+            headers.get("access-control-request-method"),
+        ) else {
+            return s3_access_denied("anonymous requests are not allowed");
+        };
+        let Some(store) = self.resolve_store_for_preflight(query) else {
+            return preflight_denied();
+        };
+        let cfg = match store.get_bucket_cors(bucket).await {
+            Ok(Some(c)) => c,
+            _ => return preflight_denied(),
+        };
+        let req_headers: Vec<String> = headers
+            .get("access-control-request-headers")
+            .map(|s| {
+                s.split(',')
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        match cfg.match_preflight(origin, req_method, &req_headers) {
+            Some(grant) => preflight_response(&grant),
+            None => preflight_denied(),
+        }
+    }
+
+    /// Resolve the project store a preflight targets from the presigned
+    /// `X-Amz-Credential` (`<AKID>/<date>/<region>/<service>/aws4_request`). Applies the
+    /// SAME owner re-bind as the authed path so an orphaned key can't resolve to a
+    /// project a different tenant now owns. `None` (⇒ deny) when unresolvable.
+    fn resolve_store_for_preflight(&self, query: &[(String, String)]) -> Option<Arc<ObjectStore>> {
+        let cred = query.iter().find(|(k, _)| k == "X-Amz-Credential")?;
+        let akid = cred.1.split('/').next()?;
+        let key = self.control.lookup_access_key(akid).ok().flatten()?;
+        match self.control.get_project(&key.project_id) {
+            Ok(Some(p)) if p.tenant_id.as_deref() == Some(key.tenant_id.as_str()) => {}
+            _ => return None,
+        }
+        self.project_entry(&key.project_id)
+            .ok()
+            .map(|e| e.store.clone())
+    }
+
+    /// CRUD the bucket's CORS config via the S3 `?cors` subresource. Owner-authenticated
+    /// upstream; here we just parse/serialize the S3 XML and hit the engine.
+    async fn handle_bucket_cors(
+        &self,
+        method: &str,
+        bucket: &str,
+        entry: &ProjectEntry,
+        req: Request,
+    ) -> Response {
+        // Reject a malformed bucket name up front with a proper 400 (using the engine's
+        // own validator, so the rule can't drift) instead of a 500 buried in the
+        // read/delete error arms below.
+        if let Err(ObjectError::InvalidBucketName(_)) = entry.store.bucket_exists(bucket).await {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidBucketName",
+                "the specified bucket is not valid",
+            );
+        }
+        match method {
+            "GET" => match entry.store.get_bucket_cors(bucket).await {
+                Ok(Some(cfg)) => xml_ok(cors_config_to_xml(&cfg)),
+                Ok(None) => s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchCORSConfiguration",
+                    "the CORS configuration does not exist",
+                ),
+                Err(_) => s3_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "could not read CORS configuration",
+                ),
+            },
+            "PUT" => {
+                if !entry.store.bucket_exists(bucket).await.unwrap_or(false) {
+                    return s3_error(
+                        StatusCode::NOT_FOUND,
+                        "NoSuchBucket",
+                        "the specified bucket does not exist",
+                    );
+                }
+                let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return s3_error(
+                            StatusCode::BAD_REQUEST,
+                            "MalformedXML",
+                            "CORS configuration body too large or unreadable",
+                        );
+                    }
+                };
+                let cfg = match parse_cors_config_xml(&String::from_utf8_lossy(&bytes)) {
+                    Ok(c) => c,
+                    Err(e) => return s3_error(StatusCode::BAD_REQUEST, "MalformedXML", &e),
+                };
+                match entry.store.put_bucket_cors(bucket, &cfg).await {
+                    Ok(()) => StatusCode::OK.into_response(),
+                    Err(_) => s3_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalError",
+                        "could not store CORS configuration",
+                    ),
+                }
+            }
+            "DELETE" => match entry.store.delete_bucket_cors(bucket).await {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => s3_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "could not delete CORS configuration",
+                ),
+            },
+            _ => s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "method not allowed on the ?cors subresource",
+            ),
+        }
     }
 
     /// Host values to try when verifying the signed `host`: the configured public
@@ -969,7 +1144,7 @@ async fn console_put_object(
     );
     match entry
         .store
-        .put_object_capped(&bucket, &key, reader, &content_type, None, Some(len))
+        .put_object_capped(&bucket, &key, reader, &content_type, None, None, Some(len))
         .await
     {
         Ok(meta) => (
@@ -1214,6 +1389,71 @@ fn xml_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn xml_ok(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        body,
+    )
+        .into_response()
+}
+
+/// A denied preflight: 403 with NO `Access-Control-Allow-Origin`, so the browser
+/// blocks the real request (the spec key is the header's absence, not the status).
+fn preflight_denied() -> Response {
+    (StatusCode::FORBIDDEN, Body::empty()).into_response()
+}
+
+fn preflight_response(grant: &cors::PreflightGrant) -> Response {
+    let mut b = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, &grant.allow_origin)
+        .header(header::ACCESS_CONTROL_ALLOW_METHODS, &grant.allow_methods);
+    if let Some(h) = &grant.allow_headers {
+        b = b.header(header::ACCESS_CONTROL_ALLOW_HEADERS, h);
+    }
+    if let Some(age) = grant.max_age {
+        b = b.header(header::ACCESS_CONTROL_MAX_AGE, age.to_string());
+    }
+    if grant.vary_origin {
+        b = b.header(header::VARY, "Origin");
+    }
+    b.body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::NO_CONTENT.into_response())
+}
+
+/// Stamp `Access-Control-Allow-Origin` / `-Expose-Headers` (+ `Vary: Origin`) onto an
+/// actual response for a matched origin.
+fn apply_actual_cors(h: &mut HeaderMap, grant: &cors::ActualGrant) {
+    if let Ok(v) = HeaderValue::from_str(&grant.allow_origin) {
+        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    }
+    if let Some(exp) = &grant.expose_headers
+        && let Ok(v) = HeaderValue::from_str(exp)
+    {
+        h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
+    }
+    if grant.vary_origin {
+        append_vary_origin(h);
+    }
+}
+
+/// Add `Origin` to `Vary` without clobbering an existing value (so caches key the
+/// origin-specific `Access-Control-Allow-Origin` correctly).
+fn append_vary_origin(h: &mut HeaderMap) {
+    match h.get(header::VARY).and_then(|v| v.to_str().ok()) {
+        Some(cur) if cur.to_ascii_lowercase().split(',').any(|p| p.trim() == "origin") => {}
+        Some(cur) => {
+            if let Ok(v) = HeaderValue::from_str(&format!("{cur}, Origin")) {
+                h.insert(header::VARY, v);
+            }
+        }
+        None => {
+            h.insert(header::VARY, HeaderValue::from_static("Origin"));
+        }
+    }
 }
 
 fn s3_error(status: StatusCode, code: &str, msg: &str) -> Response {
@@ -1568,6 +1808,330 @@ mod tests {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// SigV4 header-signed request carrying query params (e.g. the `?cors` subresource).
+    fn signed_q(
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        akid: &str,
+        secret: &str,
+        body: &str,
+    ) -> Request {
+        let q: Vec<(String, String)> = query
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (auth, amzd) = sigv4::sign_header(
+            method,
+            "storage.test",
+            path,
+            &q,
+            "UNSIGNED-PAYLOAD",
+            akid,
+            secret,
+            "us-east-1",
+            now_secs(),
+        );
+        let qs = query
+            .iter()
+            .map(|(k, v)| {
+                if v.is_empty() {
+                    (*k).to_string()
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let uri = if qs.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{qs}")
+        };
+        HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "storage.test")
+            .header("authorization", auth)
+            .header("x-amz-date", amzd)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    const CORS_XML: &str = "<CORSConfiguration><CORSRule>\
+        <AllowedOrigin>https://app.example.com</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod>\
+        <AllowedHeader>*</AllowedHeader>\
+        <ExposeHeader>ETag</ExposeHeader><ExposeHeader>Content-Range</ExposeHeader>\
+        <MaxAgeSeconds>3600</MaxAgeSeconds></CORSRule></CORSConfiguration>";
+
+    fn hdr(resp: &Response, name: &str) -> Option<String> {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    }
+
+    #[tokio::test]
+    async fn cors_crud_preflight_and_actual_stamping() {
+        let dir = tmp("cors");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let k = store.create_access_key("proj", "tenant-x", "t").unwrap();
+        let (akid, secret) = (k.access_key_id.clone(), k.secret_key.clone());
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+
+        // Bucket + an object to fetch.
+        assert_eq!(
+            app.clone()
+                .oneshot(signed("PUT", "/bkt", &akid, &secret, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(signed("PUT", "/bkt/asset.bin", &akid, &secret, "hello"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // PutBucketCors on a bucket that doesn't exist -> 404 (not a bucket-create).
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_q("PUT", "/nope", &[("cors", "")], &akid, &secret, CORS_XML))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // PutBucketCors -> GetBucketCors round-trips.
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_q("PUT", "/bkt", &[("cors", "")], &akid, &secret, CORS_XML))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let (st, body) = status_body(
+            app.clone()
+                .oneshot(signed_q("GET", "/bkt", &[("cors", "")], &akid, &secret, ""))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(body.contains("https://app.example.com"), "got: {body}");
+
+        // Preflight from an ALLOWED origin (anonymous OPTIONS to the presigned URL) -> 204 + ACAO.
+        let presigned = sigv4::presign(
+            "GET",
+            "storage.test",
+            "/bkt/asset.bin",
+            &akid,
+            &secret,
+            "us-east-1",
+            3600,
+            now_secs(),
+        );
+        let preflight = |origin: &str| {
+            HttpRequest::builder()
+                .method("OPTIONS")
+                .uri(presigned.clone())
+                .header("host", "storage.test")
+                .header("origin", origin)
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ok = app
+            .clone()
+            .oneshot(preflight("https://app.example.com"))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            hdr(&ok, "access-control-allow-origin").as_deref(),
+            Some("https://app.example.com")
+        );
+        assert!(hdr(&ok, "access-control-allow-methods").is_some());
+
+        // Preflight from a DISALLOWED origin -> denied, no ACAO (browser blocks it).
+        let bad = app
+            .clone()
+            .oneshot(preflight("https://evil.example"))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::FORBIDDEN);
+        assert!(hdr(&bad, "access-control-allow-origin").is_none());
+
+        // Actual (SigV4) GET carrying an allowed Origin -> ACAO + exposed headers.
+        let mut req = signed("GET", "/bkt/asset.bin", &akid, &secret, "");
+        req.headers_mut()
+            .insert("origin", HeaderValue::from_static("https://app.example.com"));
+        let got = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(
+            hdr(&got, "access-control-allow-origin").as_deref(),
+            Some("https://app.example.com")
+        );
+        let expose = hdr(&got, "access-control-expose-headers").unwrap_or_default();
+        assert!(expose.contains("ETag"), "expose was: {expose}");
+        assert_eq!(hdr(&got, "vary").as_deref(), Some("Origin"));
+
+        // DeleteBucketCors -> subsequent GET is 404, and preflight now denies.
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_q("DELETE", "/bkt", &[("cors", "")], &akid, &secret, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_q("GET", "/bkt", &[("cors", "")], &akid, &secret, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(preflight("https://app.example.com"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn range_and_conditional_get_over_sigv4() {
+        let dir = tmp("range");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let k = store.create_access_key("proj", "tenant-x", "t").unwrap();
+        let (akid, secret) = (k.access_key_id.clone(), k.secret_key.clone());
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+
+        app.clone()
+            .oneshot(signed("PUT", "/bkt", &akid, &secret, ""))
+            .await
+            .unwrap();
+        // PUT with Cache-Control (not a signed header — added after signing).
+        let mut put = signed("PUT", "/bkt/obj", &akid, &secret, "0123456789");
+        put.headers_mut().insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::OK);
+
+        // Ranged SigV4 GET -> 206 + Content-Range, and Cache-Control echoed.
+        let mut get = signed("GET", "/bkt/obj", &akid, &secret, "");
+        get.headers_mut()
+            .insert("range", HeaderValue::from_static("bytes=2-5"));
+        let r = app.clone().oneshot(get).await.unwrap();
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(hdr(&r, "content-range").as_deref(), Some("bytes 2-5/10"));
+        assert_eq!(hdr(&r, "accept-ranges").as_deref(), Some("bytes"));
+        assert_eq!(
+            hdr(&r, "cache-control").as_deref(),
+            Some("public, max-age=60")
+        );
+        let (st, body) = status_body(r).await;
+        assert_eq!(st, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body, "2345");
+
+        // Conditional SigV4 GET: If-None-Match with the etag -> 304.
+        let head = app
+            .clone()
+            .oneshot(signed("HEAD", "/bkt/obj", &akid, &secret, ""))
+            .await
+            .unwrap();
+        let etag = hdr(&head, "etag").unwrap();
+        let mut cond = signed("GET", "/bkt/obj", &akid, &secret, "");
+        cond.headers_mut()
+            .insert("if-none-match", HeaderValue::from_str(&etag).unwrap());
+        assert_eq!(
+            app.clone().oneshot(cond).await.unwrap().status(),
+            StatusCode::NOT_MODIFIED
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_config_is_tenant_isolated() {
+        // tenant-b hitting the same bucket NAME via ?cors resolves to ITS OWN project
+        // store, never tenant-a's config.
+        let dir = tmp("cors-iso");
+        let store = store_at(&dir);
+        mk_project(&store, "proj-a", "tenant-a");
+        mk_project(&store, "proj-b", "tenant-b");
+        let a = store.create_access_key("proj-a", "tenant-a", "t").unwrap();
+        let b = store.create_access_key("proj-b", "tenant-b", "t").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+
+        // tenant-a: bucket + CORS config.
+        app.clone()
+            .oneshot(signed("PUT", "/shared", &a.access_key_id, &a.secret_key, ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_q(
+                    "PUT",
+                    "/shared",
+                    &[("cors", "")],
+                    &a.access_key_id,
+                    &a.secret_key,
+                    CORS_XML
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // tenant-b GET ?cors on the same name -> 404 (its own store has no such config).
+        assert_eq!(
+            app.clone()
+                .oneshot(signed_q(
+                    "GET",
+                    "/shared",
+                    &[("cors", "")],
+                    &b.access_key_id,
+                    &b.secret_key,
+                    ""
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]
