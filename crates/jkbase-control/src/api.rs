@@ -4268,7 +4268,7 @@ fn to_response(p: &Project) -> ProjectResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::ct_eq;
+    use super::{ct_eq, hardlink_clone_dir};
 
     #[test]
     fn ct_eq_matches_only_identical_bytes() {
@@ -4278,5 +4278,48 @@ mod tests {
         assert!(!ct_eq(b"short", b"longer-token")); // length mismatch
         assert!(!ct_eq(b"", b"x"));
         assert!(ct_eq(b"", b"")); // both empty
+    }
+
+    // The load-bearing safety property of the schema-only redeploy: cloning a version
+    // hard-links its (large, immutable) artifacts, but the schema-apply's remove-then-write
+    // MUST NOT mutate the prior version through the shared inode.
+    #[test]
+    fn hardlink_clone_shares_inodes_but_remove_then_write_isolates() {
+        use std::os::unix::fs::MetadataExt;
+        let base = std::env::temp_dir().join(format!("jkb-clone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (src, dst) = (base.join("v1"), base.join("v2"));
+        std::fs::create_dir_all(src.join("_database")).unwrap();
+        std::fs::create_dir_all(src.join("_layers")).unwrap();
+        std::fs::write(src.join("_database/schema.rhype"), b"type User { name: String }").unwrap();
+        std::fs::write(src.join("_layers/blob.erofs"), b"BLOBDATA").unwrap();
+        std::fs::write(src.join("_database.json"), br#"{"engine":"rhypedb"}"#).unwrap();
+
+        hardlink_clone_dir(&src, &dst).unwrap();
+
+        // The erofs blob is hard-linked — same inode, no bytes duplicated on disk.
+        let (a, b) = (
+            std::fs::metadata(src.join("_layers/blob.erofs")).unwrap(),
+            std::fs::metadata(dst.join("_layers/blob.erofs")).unwrap(),
+        );
+        assert_eq!(a.ino(), b.ino(), "blob should be hard-linked");
+
+        // Remove-then-write the schema in the CLONE, exactly as db_schema_apply does.
+        let schema_dst = dst.join("_database/schema.rhype");
+        std::fs::remove_file(&schema_dst).unwrap();
+        std::fs::write(&schema_dst, b"type User { name: String age: Int }").unwrap();
+
+        // The SOURCE version's schema is UNTOUCHED (remove broke the hard-link first).
+        assert_eq!(
+            std::fs::read(src.join("_database/schema.rhype")).unwrap(),
+            b"type User { name: String }",
+            "source schema must not be mutated by the clone's schema swap"
+        );
+        // The shared blob is still shared + intact.
+        assert_eq!(
+            std::fs::metadata(src.join("_layers/blob.erofs")).unwrap().ino(),
+            std::fs::metadata(dst.join("_layers/blob.erofs")).unwrap().ino(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
