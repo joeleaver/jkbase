@@ -350,7 +350,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route("/projects/{id}/db/restore", post(restore_db_backup))
         .route("/projects/{id}/db/query", post(db_query))
-        .route("/projects/{id}/db/schema", get(db_schema))
+        .route("/projects/{id}/db/schema", get(db_schema).post(db_schema_apply))
         .route("/projects/{id}/db/status", get(db_status))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
@@ -3530,6 +3530,197 @@ async fn db_status(
         return e.into_response();
     }
     db_query_dispatch(&state, id, DbQueryOp::Status).await
+}
+
+/// Max SDL the schema editor accepts.
+const MAX_SDL_BYTES: usize = 512 * 1024;
+
+#[derive(Deserialize)]
+pub struct DbSchemaRequest {
+    pub sdl: String,
+}
+
+/// Recursively clone `src` → `dst`, HARD-LINKING regular files (immutable deployment artifacts —
+/// mostly large erofs layer blobs) so a schema-only new version doesn't duplicate them on disk;
+/// symlinks are recreated, dirs recursed. A caller that wants to CHANGE a file must
+/// remove-then-write it (writing through a hard-link would mutate the cloned-from version).
+fn hardlink_clone_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            hardlink_clone_dir(&from, &to)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            std::os::unix::fs::symlink(target, &to)?;
+        } else if std::fs::hard_link(&from, &to).is_err() {
+            // cross-filesystem or EMLINK → fall back to a byte copy.
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Poll the managed DB's `/status` (via the console DB transport) until it returns 200 or the
+/// window elapses. Used as the post-redeploy reconcile gate: rhypedb refuses to open on an
+/// incompatible schema change and crash-loops, so `/status` never reaches 200 → the caller rolls
+/// back. `Ok` if no transport is wired (degraded: no gate) so this never wedges a redeploy.
+async fn wait_db_healthy(state: &Arc<AppState>, id: &str) -> Result<(), String> {
+    let Some(cb) = state.db_query_callback.clone() else {
+        return Ok(());
+    };
+    let mut last = "database did not respond".to_string();
+    for _ in 0..20 {
+        match cb(id.to_string(), DbQueryOp::Status).await {
+            Ok(res) if res.status == 200 => return Ok(()),
+            Ok(res) => last = format!("database returned HTTP {}", res.status),
+            Err(e) => last = e,
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    Err(last)
+}
+
+/// `POST /projects/{id}/db/schema` — apply a new managed-DB schema via a SCHEMA-ONLY REDEPLOY.
+/// Owner-scoped. Clones the current deployment (hard-linking the built app layers — no rebuild),
+/// swaps in the new `_database/schema.rhype`, activates it (atomic `live` swap + VM reboot), then
+/// GATES on DB health: rhypedb reconciles the schema on boot (additive changes apply; a field-type
+/// change needs a migration; a drop needs a shrink) and crash-loops on an incompatible change — so
+/// if `/status` doesn't come back healthy we ROLL BACK to the prior version and report it. The DB's
+/// data disk is untouched by the redeploy.
+async fn db_schema_apply(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<DbSchemaRequest>,
+) -> impl IntoResponse {
+    let mut project = match require_project_owner(&state, &tenant, &id) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    if req.sdl.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "schema (sdl) must not be empty".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if req.sdl.len() > MAX_SDL_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: format!("schema exceeds {MAX_SDL_BYTES} bytes"),
+            }),
+        )
+            .into_response();
+    }
+    let proj_dir = state.deploy_dir.join(&id);
+    // Must already have a live managed DB — this edits an existing schema, it doesn't provision one.
+    if !proj_dir.join("live").join("_database.json").exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "project has no managed database; add a [database] section to jkbase.toml \
+                        and deploy it first"
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+    let Some(prev_version) = project.current_version else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "project has no active deployment".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    // Serialize with deploy/build/rollback (409 on contention) — held for the whole redeploy.
+    let _guard = match DeployLockGuard::try_acquire(&state, &id) {
+        Some(g) => g,
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "a deploy or rollback is already in progress for this project".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let prev_deploy_path = proj_dir.join("deployments").join(format!("v{prev_version}"));
+    let staged = proj_dir.join(format!(".staging-schema-{}", auth::timestamp()));
+    let _ = std::fs::remove_dir_all(&staged);
+    if let Err(e) = hardlink_clone_dir(&prev_deploy_path, &staged) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("clone current deployment: {e}"),
+            }),
+        )
+            .into_response();
+    }
+    // Remove-then-write so the new SDL doesn't mutate the prior version through the hard-link.
+    let schema_dest = staged.join("_database").join("schema.rhype");
+    if let Some(p) = schema_dest.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::remove_file(&schema_dest);
+    if let Err(e) = std::fs::write(&schema_dest, req.sdl.as_bytes()) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("write schema: {e}"),
+            }),
+        )
+            .into_response();
+    }
+
+    // Activate (move → atomic live swap → VM reboot). On failure, clean the stage and map quota.
+    let new_version = match activate_deployment(&state, &mut project, &staged).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staged);
+            let status = if e.downcast_ref::<QuotaExceeded>().is_some() {
+                StatusCode::PAYMENT_REQUIRED
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return (status, Json(ErrorResponse { error: e.to_string() })).into_response();
+        }
+    };
+
+    // Reconcile gate: rhypedb crash-loops on an incompatible schema → roll back to the prior version.
+    if let Err(reason) = wait_db_healthy(&state, &id).await {
+        let _ = do_rollback(&state, &mut project, &prev_deploy_path, prev_version).await;
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResponse {
+                error: format!(
+                    "the database rejected the new schema ({reason}); rolled back to v{prev_version}. \
+                     Additive changes (a new type / a new nullable field) apply cleanly; a field TYPE \
+                     change needs a migration and a field/type DROP needs a shrink."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "version": new_version, "status": "deployed" })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
