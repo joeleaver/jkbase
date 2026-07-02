@@ -57,6 +57,10 @@ pub struct DbAuthOk {
     /// or the platform default), resolved server-side at auth so the edge enforces it
     /// without a control-store dependency. Ignored when `tenant_id` is `None`.
     pub warm_vm_max: u32,
+    /// The owner's effective per-tenant relay-COUNT cap (total live relays across all
+    /// its projects), resolved server-side alongside `warm_vm_max`. Bounds the tenant's
+    /// slice of the global relay pool. Ignored when `tenant_id` is `None`.
+    pub warm_relay_max: u32,
 }
 
 /// Authenticate a DB reach preamble: `(akid, secret, claimed_project_from_sni)` →

@@ -550,6 +550,14 @@ pub struct TenantQuotaLimits {
     /// still deserialize with the platform default.
     #[serde(default = "default_warm_vm_max")]
     pub warm_vm_max: u32,
+    /// Max TOTAL live managed-DB relays the tenant may hold across ALL its projects.
+    /// `warm_vm_max` bounds distinct warm *projects*, but each may hold up to the
+    /// per-project relay cap, so `warm_vm_max * per_project` relays could fill the
+    /// global pool and starve other tenants; this bounds the tenant's total slice of
+    /// it directly. `#[serde(default)]` for pre-existing overrides. Raise this together
+    /// with `warm_vm_max` when granting a bigger tenant more warm projects.
+    #[serde(default = "default_warm_relay_max")]
+    pub warm_relay_max: u32,
 }
 
 const DEFAULT_WARM_VM_MAX: u32 = 16;
@@ -557,8 +565,18 @@ fn default_warm_vm_max() -> u32 {
     DEFAULT_WARM_VM_MAX
 }
 
+/// Default per-tenant relay cap: a quarter of the edge's 1024-relay global pool, so at
+/// least four tenants can be maxed at once, with ample headroom over `warm_vm_max` (16)
+/// warm projects (~16 relays/project). Conceptually paired with the edge caps in
+/// `jkbase-server`'s `ProxyConfig` (`db_max_concurrent` / `db_max_per_project`).
+const DEFAULT_WARM_RELAY_MAX: u32 = 256;
+fn default_warm_relay_max() -> u32 {
+    DEFAULT_WARM_RELAY_MAX
+}
+
 pub const DEFAULT_TENANT_QUOTA: TenantQuotaLimits = TenantQuotaLimits {
     warm_vm_max: DEFAULT_WARM_VM_MAX,
+    warm_relay_max: DEFAULT_WARM_RELAY_MAX,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2366,9 +2384,16 @@ mod tests {
         assert!(store.get_tenant_quota_override("t1").unwrap().is_none());
         // An override persists and is isolated to that tenant.
         store
-            .set_tenant_quota("t1", &TenantQuotaLimits { warm_vm_max: 40 })
+            .set_tenant_quota(
+                "t1",
+                &TenantQuotaLimits {
+                    warm_vm_max: 40,
+                    warm_relay_max: 500,
+                },
+            )
             .unwrap();
         assert_eq!(store.get_tenant_quota("t1").unwrap().warm_vm_max, 40);
+        assert_eq!(store.get_tenant_quota("t1").unwrap().warm_relay_max, 500);
         assert!(store.get_tenant_quota_override("t1").unwrap().is_some());
         assert_eq!(
             store.get_tenant_quota("t2").unwrap().warm_vm_max,

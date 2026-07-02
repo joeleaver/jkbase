@@ -1652,18 +1652,18 @@ async fn async_main() -> Result<()> {
                 .flatten()?;
             // The owner re-bind above proved `project.tenant_id == Some(key.tenant_id)`,
             // so a successful auth always has an owner. Resolve the owner's effective
-            // per-tenant warm-VM cap here (server-side, over the store) so the edge can
-            // enforce it without a control-store dependency. On a store error, fall back
-            // to a conservative default rather than an unbounded cap.
-            let warm_vm_max = db_auth_store
+            // per-tenant caps here (server-side, over the store) so the edge can enforce
+            // them without a control-store dependency. On a store error, fall back to
+            // the conservative platform default rather than an unbounded cap.
+            let quota = db_auth_store
                 .get_tenant_quota(&key.tenant_id)
-                .map(|q| q.warm_vm_max)
-                .unwrap_or(jkbase_control::store::DEFAULT_TENANT_QUOTA.warm_vm_max);
+                .unwrap_or(jkbase_control::store::DEFAULT_TENANT_QUOTA);
             Some(jkbase_proxy::DbAuthOk {
                 project_id: key.project_id,
                 splice_secret,
                 tenant_id: Some(key.tenant_id),
-                warm_vm_max,
+                warm_vm_max: quota.warm_vm_max,
+                warm_relay_max: quota.warm_relay_max,
             })
         });
 

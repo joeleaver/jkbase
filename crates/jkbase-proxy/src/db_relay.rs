@@ -33,6 +33,14 @@ struct Inner {
     /// caps bound them). Used to enforce a per-tenant ceiling so one idle DB
     /// connection per project can't pin every VM warm.
     by_tenant: HashMap<String, HashSet<String>>,
+    /// Total LIVE relays across all of a tenant's projects, grouped by owning tenant —
+    /// the per-tenant relay-COUNT gauge. Distinct from `by_tenant`, which counts warm
+    /// *projects* (VMs): a tenant with `warm_vm_max` projects each holding
+    /// `per_project_max` relays would occupy `warm_vm_max * per_project_max` of the
+    /// global pool, so the project cap alone lets one tenant monopolize it. This bounds
+    /// a tenant's total relay footprint directly. Ownerless projects
+    /// (`tenant_id == None`) are not tracked here.
+    relays_by_tenant: HashMap<String, usize>,
     /// Set once the graceful-drain sweep ([`Self::cancel_all`]) has run. A relay that
     /// registers AFTER that one-shot sweep would otherwise never be signalled and would
     /// pin the drain barrier until the hard `DRAIN_GRACE` exit; so once draining, every
@@ -56,6 +64,10 @@ pub enum RelayRejected {
     /// This tenant already holds `per_tenant_max` distinct projects warm via DB
     /// relays — a per-tenant warm-VM quota refusal.
     PerTenant,
+    /// This tenant already holds `per_tenant_relay_max` total live relays across all
+    /// its projects — a per-tenant relay-count fairness refusal, so one tenant can't
+    /// fill the global pool via `warm_vm_max * per_project_max` relays.
+    PerTenantRelays,
 }
 
 impl DbRelayRegistry {
@@ -65,23 +77,29 @@ impl DbRelayRegistry {
                 next_id: 0,
                 by_project: HashMap::new(),
                 by_tenant: HashMap::new(),
+                relays_by_tenant: HashMap::new(),
                 draining: false,
             }),
         })
     }
 
     /// Atomically reserve a live-relay slot for `project_id` (owned by `tenant_id`)
-    /// authorized by `akid`, enforcing BOTH the `per_project_max` (relays per project)
-    /// and the `per_tenant_max` (distinct projects a tenant may hold warm) UNDER THE
-    /// SAME LOCK as the insert. Returns `Err(RelayRejected::_)` at either cap. On
+    /// authorized by `akid`, enforcing THREE caps UNDER THE SAME LOCK as the insert:
+    /// `per_project_max` (relays per project), `per_tenant_max` (distinct projects a
+    /// tenant may hold warm), and `per_tenant_relay_max` (total relays a tenant may
+    /// hold across all its projects). Returns `Err(RelayRejected::_)` at any cap. On
     /// success, returns the RAII [`RelayGuard`] (hold it for the relay's lifetime —
-    /// drop decrements both gauges) and the [`CancellationToken`] the relay must
+    /// drop decrements every gauge) and the [`CancellationToken`] the relay must
     /// force-close on.
     ///
-    /// The per-tenant cap only trips when this relay would make a NEW project warm
-    /// (its first live relay); a second relay to an already-warm project doesn't add
-    /// a VM, so it never counts against `per_tenant_max`. `tenant_id == None`
-    /// (ownerless project) skips the per-tenant dimension entirely.
+    /// The per-tenant WARM-VM cap (`per_tenant_max`) only trips when this relay would
+    /// make a NEW project warm (its first live relay); a second relay to an
+    /// already-warm project doesn't add a VM, so it never counts against it. The
+    /// per-tenant RELAY-COUNT cap (`per_tenant_relay_max`) trips on EVERY relay,
+    /// warm-making or not — it bounds the tenant's slice of the global pool so
+    /// `per_tenant_max * per_project_max` relays can't fill it and starve other
+    /// tenants. `tenant_id == None` (ownerless project) skips both per-tenant
+    /// dimensions entirely (only the per-project + global caps bound it).
     ///
     /// Folding the cap checks into the insert is load-bearing: a check-then-register
     /// split (read a count, `.await` a wake, then register) is a TOCTOU that lets many
@@ -96,6 +114,7 @@ impl DbRelayRegistry {
         akid: &str,
         per_project_max: usize,
         per_tenant_max: usize,
+        per_tenant_relay_max: usize,
     ) -> Result<(RelayGuard, CancellationToken), RelayRejected> {
         let cancel = CancellationToken::new();
         let id = {
@@ -120,6 +139,16 @@ impl DbRelayRegistry {
                     return Err(RelayRejected::PerTenant);
                 }
             }
+            // Per-tenant relay-COUNT cap — bounds the tenant's total slice of the global
+            // pool. Unlike the warm-VM cap this counts EVERY relay (warm-making or a 2nd
+            // relay to an already-warm project), so `per_tenant_max * per_project_max`
+            // relays can't fill the pool and starve other tenants.
+            if let Some(tid) = tenant_id {
+                let relays = inner.relays_by_tenant.get(tid).copied().unwrap_or(0);
+                if relays >= per_tenant_relay_max {
+                    return Err(RelayRejected::PerTenantRelays);
+                }
+            }
             let id = inner.next_id;
             inner.next_id += 1;
             let draining = inner.draining;
@@ -132,14 +161,16 @@ impl DbRelayRegistry {
                     akid: akid.to_string(),
                     cancel: cancel.clone(),
                 });
-            // Track the newly-warm project against its tenant (idempotent for a
-            // second relay, but we only reach the insert when under both caps).
+            // Track the newly-warm project against its tenant (idempotent for a second
+            // relay), and bump the tenant's total-relay gauge (every relay counts). We
+            // only reach the insert when under all three caps.
             if let Some(tid) = tenant_id {
                 inner
                     .by_tenant
                     .entry(tid.to_string())
                     .or_default()
                     .insert(project_id.to_string());
+                *inner.relays_by_tenant.entry(tid.to_string()).or_insert(0) += 1;
             }
             // [R-drain] Registered into an already-draining registry ⇒ the one-shot
             // `cancel_all` sweep has passed; cancel at birth so this relay can't pin the
@@ -169,6 +200,18 @@ impl DbRelayRegistry {
             .by_tenant
             .get(tenant_id)
             .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Total live relays the tenant is CURRENTLY holding across all its projects (the
+    /// per-tenant relay-count gauge). For metrics / inspection.
+    pub fn relays_for_tenant(&self, tenant_id: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .relays_by_tenant
+            .get(tenant_id)
+            .copied()
             .unwrap_or(0)
     }
 
@@ -273,6 +316,16 @@ impl Drop for RelayGuard {
                 inner.by_tenant.remove(tid);
             }
         }
+        // Every relay counts toward the tenant's total-relay gauge (independent of
+        // whether the project went cold), so decrement on every drop, pruning at zero.
+        if let Some(tid) = self.tenant_id.as_deref()
+            && let Some(n) = inner.relays_by_tenant.get_mut(tid)
+        {
+            *n -= 1;
+            if *n == 0 {
+                inner.relays_by_tenant.remove(tid);
+            }
+        }
     }
 }
 
@@ -283,13 +336,14 @@ mod tests {
     // Generous caps for tests that don't exercise a specific limit.
     const MAX: usize = 64;
     const TMAX: usize = 64;
+    const RMAX: usize = 64;
 
     #[test]
     fn register_counts_and_raii_deregisters() {
         let reg = DbRelayRegistry::new();
         assert_eq!(reg.conn_count("p"), 0);
-        let (g1, _t1) = reg.try_register("p", Some("t"), "JKBDaaa", MAX, TMAX).unwrap();
-        let (g2, _t2) = reg.try_register("p", Some("t"), "JKBDbbb", MAX, TMAX).unwrap();
+        let (g1, _t1) = reg.try_register("p", Some("t"), "JKBDaaa", MAX, TMAX, RMAX).unwrap();
+        let (g2, _t2) = reg.try_register("p", Some("t"), "JKBDbbb", MAX, TMAX, RMAX).unwrap();
         assert_eq!(reg.conn_count("p"), 2);
         assert_eq!(reg.total(), 2);
         // One warm project for the tenant despite two relays.
@@ -308,55 +362,92 @@ mod tests {
     fn per_project_cap_is_enforced_atomically_in_register() {
         let reg = DbRelayRegistry::new();
         // Fill a project to its cap of 2.
-        let (_g1, _t1) = reg.try_register("p", Some("t"), "k", 2, TMAX).unwrap();
-        let (g2, _t2) = reg.try_register("p", Some("t"), "k", 2, TMAX).unwrap();
+        let (_g1, _t1) = reg.try_register("p", Some("t"), "k", 2, TMAX, RMAX).unwrap();
+        let (g2, _t2) = reg.try_register("p", Some("t"), "k", 2, TMAX, RMAX).unwrap();
         // The 3rd is refused — the cap is checked under the same lock as the insert, so
         // concurrent registrations can't all slip past a stale count.
         assert!(matches!(
-            reg.try_register("p", Some("t"), "k", 2, TMAX),
+            reg.try_register("p", Some("t"), "k", 2, TMAX, RMAX),
             Err(RelayRejected::PerProject)
         ));
         assert_eq!(reg.conn_count("p"), 2);
         // A different project has its own budget.
-        assert!(reg.try_register("q", Some("t"), "k", 2, TMAX).is_ok());
+        assert!(reg.try_register("q", Some("t"), "k", 2, TMAX, RMAX).is_ok());
         // Freeing a slot re-opens the project.
         drop(g2);
-        assert!(reg.try_register("p", Some("t"), "k", 2, TMAX).is_ok());
+        assert!(reg.try_register("p", Some("t"), "k", 2, TMAX, RMAX).is_ok());
     }
 
     #[test]
     fn per_tenant_warm_vm_cap_is_enforced() {
         let reg = DbRelayRegistry::new();
         // Tenant `t` may hold at most 2 projects warm.
-        let (_g1, _) = reg.try_register("p1", Some("t"), "k", MAX, 2).unwrap();
-        let (g2, _) = reg.try_register("p2", Some("t"), "k", MAX, 2).unwrap();
+        let (_g1, _) = reg.try_register("p1", Some("t"), "k", MAX, 2, RMAX).unwrap();
+        let (g2, _) = reg.try_register("p2", Some("t"), "k", MAX, 2, RMAX).unwrap();
         assert_eq!(reg.warm_projects_for_tenant("t"), 2);
         // A 3rd DISTINCT project for the same tenant is refused (PerTenant).
         assert!(matches!(
-            reg.try_register("p3", Some("t"), "k", MAX, 2),
+            reg.try_register("p3", Some("t"), "k", MAX, 2, RMAX),
             Err(RelayRejected::PerTenant)
         ));
         // A SECOND relay to an ALREADY-warm project adds no VM -> allowed (only the
         // per-project cap applies), and doesn't grow the tenant's warm set.
-        assert!(reg.try_register("p1", Some("t"), "k", MAX, 2).is_ok());
+        assert!(reg.try_register("p1", Some("t"), "k", MAX, 2, RMAX).is_ok());
         assert_eq!(reg.warm_projects_for_tenant("t"), 2);
         // A different tenant has its own budget.
-        assert!(reg.try_register("p3", Some("u"), "k", MAX, 2).is_ok());
+        assert!(reg.try_register("p3", Some("u"), "k", MAX, 2, RMAX).is_ok());
         // Ownerless projects skip the per-tenant cap entirely.
-        assert!(reg.try_register("o1", None, "k", MAX, 2).is_ok());
-        assert!(reg.try_register("o2", None, "k", MAX, 2).is_ok());
+        assert!(reg.try_register("o1", None, "k", MAX, 2, RMAX).is_ok());
+        assert!(reg.try_register("o2", None, "k", MAX, 2, RMAX).is_ok());
         // When p2 loses its last relay, the tenant frees a warm slot -> the 3rd fits.
         drop(g2);
         assert_eq!(reg.warm_projects_for_tenant("t"), 1);
-        assert!(reg.try_register("p3", Some("t"), "k", MAX, 2).is_ok());
+        assert!(reg.try_register("p3", Some("t"), "k", MAX, 2, RMAX).is_ok());
+    }
+
+    #[test]
+    fn per_tenant_relay_count_cap_is_enforced() {
+        let reg = DbRelayRegistry::new();
+        // Tenant `t` may hold at most 3 TOTAL relays across any mix of projects. Use
+        // generous per-project + warm-VM caps so only the relay-count cap can trip.
+        let (g1, _) = reg.try_register("p1", Some("t"), "k", MAX, MAX, 3).unwrap();
+        // A 2nd relay to the SAME (already-warm) project still counts — unlike the
+        // warm-VM cap, every relay is charged against the tenant's relay budget.
+        let (_g2, _) = reg.try_register("p1", Some("t"), "k", MAX, MAX, 3).unwrap();
+        let (_g3, _) = reg.try_register("p2", Some("t"), "k", MAX, MAX, 3).unwrap();
+        assert_eq!(reg.relays_for_tenant("t"), 3);
+        assert_eq!(reg.warm_projects_for_tenant("t"), 2);
+        // The 4th relay is refused regardless of which project it targets.
+        assert!(matches!(
+            reg.try_register("p1", Some("t"), "k", MAX, MAX, 3),
+            Err(RelayRejected::PerTenantRelays)
+        ));
+        assert!(matches!(
+            reg.try_register("p3", Some("t"), "k", MAX, MAX, 3),
+            Err(RelayRejected::PerTenantRelays)
+        ));
+        // A different tenant has its own relay budget.
+        assert!(reg.try_register("q", Some("u"), "k", MAX, MAX, 3).is_ok());
+        // Ownerless projects skip the per-tenant relay cap entirely.
+        for _ in 0..5 {
+            assert!(reg.try_register("o", None, "k", MAX, MAX, 3).is_ok());
+        }
+        // Dropping a relay frees exactly one slot for the tenant, even though its
+        // project stays warm via the sibling relay.
+        drop(g1);
+        assert_eq!(reg.relays_for_tenant("t"), 2);
+        assert_eq!(reg.warm_projects_for_tenant("t"), 2);
+        // A fresh relay now fits under the freed budget — bind it so it stays live.
+        let (_g4, _) = reg.try_register("p3", Some("t"), "k", MAX, MAX, 3).unwrap();
+        assert_eq!(reg.relays_for_tenant("t"), 3);
     }
 
     #[test]
     fn cancel_key_signals_only_that_keys_relays() {
         let reg = DbRelayRegistry::new();
-        let (_g1, t1) = reg.try_register("p", Some("t"), "JKBDaaa", MAX, TMAX).unwrap();
-        let (_g2, t2) = reg.try_register("p", Some("t"), "JKBDbbb", MAX, TMAX).unwrap();
-        let (_g3, t3) = reg.try_register("q", Some("t"), "JKBDaaa", MAX, TMAX).unwrap();
+        let (_g1, t1) = reg.try_register("p", Some("t"), "JKBDaaa", MAX, TMAX, RMAX).unwrap();
+        let (_g2, t2) = reg.try_register("p", Some("t"), "JKBDbbb", MAX, TMAX, RMAX).unwrap();
+        let (_g3, t3) = reg.try_register("q", Some("t"), "JKBDaaa", MAX, TMAX, RMAX).unwrap();
         assert!(!t1.is_cancelled() && !t2.is_cancelled() && !t3.is_cancelled());
         // Revoking key aaa cancels its relays across ALL projects, not key bbb's.
         assert_eq!(reg.cancel_key("JKBDaaa"), 2);
@@ -368,8 +459,8 @@ mod tests {
     #[test]
     fn cancel_project_and_all_are_scoped() {
         let reg = DbRelayRegistry::new();
-        let (_gp, tp) = reg.try_register("p", Some("t"), "k", MAX, TMAX).unwrap();
-        let (_gq, tq) = reg.try_register("q", Some("t"), "k", MAX, TMAX).unwrap();
+        let (_gp, tp) = reg.try_register("p", Some("t"), "k", MAX, TMAX, RMAX).unwrap();
+        let (_gq, tq) = reg.try_register("q", Some("t"), "k", MAX, TMAX, RMAX).unwrap();
         assert_eq!(reg.cancel_project("p"), 1);
         assert!(tp.is_cancelled());
         assert!(!tq.is_cancelled());
@@ -385,7 +476,7 @@ mod tests {
         assert_eq!(reg.cancel_all(), 0);
         // A relay that registers in the shutdown window is cancelled immediately, so it
         // can't pin the drain barrier past the hard deadline.
-        let (_g, t) = reg.try_register("p", Some("t"), "k", MAX, TMAX).unwrap();
+        let (_g, t) = reg.try_register("p", Some("t"), "k", MAX, TMAX, RMAX).unwrap();
         assert!(t.is_cancelled());
     }
 }

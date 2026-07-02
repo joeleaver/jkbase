@@ -5920,6 +5920,7 @@ console.log("listening on " + port);
                         splice_secret: splice_c.clone(),
                         tenant_id: Some("testtenant".to_string()),
                         warm_vm_max: jkbase_control::store::DEFAULT_TENANT_QUOTA.warm_vm_max,
+                        warm_relay_max: jkbase_control::store::DEFAULT_TENANT_QUOTA.warm_relay_max,
                     })
                 } else {
                     None
