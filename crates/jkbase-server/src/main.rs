@@ -1577,6 +1577,29 @@ async fn async_main() -> Result<()> {
             tokio::spawn(run_db_restore(ctx.clone(), project_id, backup_id));
         }));
     }
+    {
+        // Console DB tools (query / schema / status) — a SYNCHRONOUS proxy (the console blocks
+        // on the result), unlike the fire-and-forget backup/restore callbacks. Captures the wake
+        // inputs + store directly (no need for the backup ctx's store/sem/restoring).
+        let platform = platform.clone();
+        let routing = routing_table.clone();
+        let domains = domain_map.clone();
+        let shipper = log_shipper.clone();
+        let store = state.store.clone();
+        let cb: jkbase_control::api::DbQueryCallback = Arc::new(
+            move |project_id: String, op: jkbase_control::api::DbQueryOp| {
+                let platform = platform.clone();
+                let routing = routing.clone();
+                let domains = domains.clone();
+                let shipper = shipper.clone();
+                let store = store.clone();
+                Box::pin(async move {
+                    do_db_query(platform, routing, domains, shipper, store, project_id, op).await
+                })
+            },
+        );
+        state.db_query_callback = Some(cb);
+    }
 
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
@@ -3974,6 +3997,96 @@ async fn do_db_backup(
             Err(e)
         }
     }
+}
+
+/// Max bytes the host buffers from the in-VM DB's HTTP response before relaying to the console.
+/// The engine's query governor caps result ROWS; this bounds the host relay against a
+/// pathological payload. Schema/status responses are tiny.
+const MAX_DB_QUERY_RESP_BYTES: usize = 16 * 1024 * 1024;
+/// Outer deadline on one console DB request (agent connect + engine round-trip). The engine
+/// governor caps per-query wall-clock; this is the network-level backstop.
+const DB_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Send one PLAIN (non-upgrade) request to the agent's eth0 DB-proxy seam and read the bounded
+/// JSON response. The DB stays loopback-only; the agent forwards only to rhypedb's OPEN plane
+/// (`/query|/schema|/status`, never `/admin/*`). Returns the engine's verbatim status + body.
+async fn agent_db_request(
+    vm_ip: &str,
+    path: &str,
+    method: &str,
+    splice_secret: &str,
+    body: Vec<u8>,
+) -> Result<jkbase_control::api::DbQueryResult> {
+    use http_body_util::{BodyExt, Full, Limited};
+    use hyper::body::Bytes;
+    let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
+        .await
+        .context("connect agent")?;
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .context("agent handshake")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = hyper::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", vm_ip)
+        .header("content-type", "application/json")
+        .header("x-jkbase-db-secret", splice_secret)
+        .body(Full::<Bytes>::new(Bytes::from(body)))
+        .context("agent req build")?;
+    let resp = sender.send_request(req).await.context("agent send")?;
+    let status = resp.status().as_u16();
+    let collected = Limited::new(resp.into_body(), MAX_DB_QUERY_RESP_BYTES)
+        .collect()
+        .await
+        .map_err(|_| anyhow::anyhow!("db response too large (> {MAX_DB_QUERY_RESP_BYTES} bytes)"))?;
+    Ok(jkbase_control::api::DbQueryResult {
+        status,
+        body: collected.to_bytes().to_vec(),
+    })
+}
+
+/// Proxy one console DB op to the project's managed DB (wired to `state.db_query_callback`):
+/// resolve the reach-plane splice secret, wake the VM, and forward to the agent's eth0 seam.
+/// `Err(String)` is a transport/wake failure; the engine's own errors ride back in the `Ok`
+/// result's status (e.g. 400 for a parse/governor error).
+#[allow(clippy::too_many_arguments)]
+async fn do_db_query(
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domains: DomainMap,
+    shipper: Arc<LogShipper>,
+    store: Store,
+    project_id: String,
+    op: jkbase_control::api::DbQueryOp,
+) -> Result<jkbase_control::api::DbQueryResult, String> {
+    use jkbase_control::api::DbQueryOp;
+    let secret = store
+        .get_db_splice_secret(&project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no managed database deployed for this project".to_string())?;
+    let ip = wake_project(&project_id, platform, routing, domains, shipper)
+        .await
+        .map_err(|e| format!("wake project: {e:?}"))?;
+    let (path, method, body): (&str, &str, Vec<u8>) = match &op {
+        DbQueryOp::Query(q) => (
+            "/_jkbase/db/query",
+            "POST",
+            serde_json::to_vec(&serde_json::json!({ "query": q })).unwrap_or_default(),
+        ),
+        DbQueryOp::Schema => ("/_jkbase/db/schema", "GET", Vec::new()),
+        DbQueryOp::Status => ("/_jkbase/db/status", "GET", Vec::new()),
+    };
+    tokio::time::timeout(
+        DB_QUERY_DEADLINE,
+        agent_db_request(&ip, path, method, &secret, body),
+    )
+    .await
+    .map_err(|_| "database request timed out".to_string())?
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Run one backup end-to-end (spawned by the on-demand callback + the nightly loop): acquire the

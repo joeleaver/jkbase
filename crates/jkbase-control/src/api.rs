@@ -56,6 +56,37 @@ pub type DbBackupCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 /// `RHYPEDB_RESTORE_FROM`. Fire-and-forget (the server impl spawns the executor).
 pub type DbRestoreCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 
+/// A read/write op the console DB tools forward to the project's managed DB. Each maps to
+/// exactly ONE route on rhypedb's OPEN loopback HTTP plane (`/query`, `/schema`, `/status`);
+/// `/admin/*` is never reachable through this seam (the agent hard-codes the target path per
+/// variant — no host- or console-controlled path passthrough). See `docs/managed-rhypedb-*`.
+pub enum DbQueryOp {
+    /// `POST /query` — the path query language (filter/traverse/limit/create/update/…).
+    Query(String),
+    /// `GET /schema` — schema introspection (types, fields, the relationship graph, SDL).
+    Schema,
+    /// `GET /status` — metering counts (objects/edges/vectors/queries).
+    Status,
+}
+
+/// The verbatim engine result of a [`DbQueryOp`]: rhypedb's own HTTP status + JSON body,
+/// passed back to the console UNCHANGED so query/parse/governor errors (400) surface as-is.
+pub struct DbQueryResult {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+/// Proxy a console DB read/write to the project's managed DB: wake the VM, reach the agent
+/// over its eth0 splice seam (secret-gated), and forward to the in-VM DB's open loopback HTTP
+/// plane. Owner-scoped at the router. `Err(String)` is a transport/wake failure; the engine's
+/// own errors ride back inside `Ok(DbQueryResult { status: 4xx, .. })`. The server binary
+/// provides the impl (control owns no orch dependency; mirrors [`DbBackupCallback`]).
+pub type DbQueryCallback = Arc<
+    dyn Fn(String, DbQueryOp) -> Pin<Box<dyn Future<Output = Result<DbQueryResult, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Inputs handed to the server-provided build orchestrator for one build job.
 pub struct BuildContext {
     pub project_id: String,
@@ -109,6 +140,9 @@ pub struct AppState {
     pub db_backup_callback: Option<DbBackupCallback>,
     /// Runs a managed-DB restore (host-push → in-guest untar). `None` ⇒ restore disabled.
     pub db_restore_callback: Option<DbRestoreCallback>,
+    /// Proxies a console DB read/write to the in-VM DB's open loopback HTTP plane (query /
+    /// schema / status). `None` ⇒ the console DB tools are disabled (`… /db/query` → 503).
+    pub db_query_callback: Option<DbQueryCallback>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     /// Optional platform-operator admin token (jkbase-server `--admin-token`).
@@ -191,6 +225,7 @@ impl AppState {
             db_revoke_callback: None,
             db_backup_callback: None,
             db_restore_callback: None,
+            db_query_callback: None,
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -314,6 +349,9 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(list_db_backups).post(trigger_db_backup),
         )
         .route("/projects/{id}/db/restore", post(restore_db_backup))
+        .route("/projects/{id}/db/query", post(db_query))
+        .route("/projects/{id}/db/schema", get(db_schema))
+        .route("/projects/{id}/db/status", get(db_status))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
@@ -3402,6 +3440,96 @@ async fn restore_db_backup(
         Json(serde_json::json!({ "status": "started", "backup_id": req.backup_id })),
     )
         .into_response()
+}
+
+/// Max query-string length the console DB tools accept (defense-in-depth alongside the router
+/// body limit and the agent's own inbound bound). Queries are small; results can be large.
+const MAX_DB_QUERY_LEN: usize = 128 * 1024;
+
+#[derive(Deserialize)]
+pub struct DbQueryRequest {
+    pub query: String,
+}
+
+/// Shared tail for the three console DB proxy endpoints: require the query callback, invoke it,
+/// and pass the engine's HTTP status + JSON body back VERBATIM (so 400 parse/governor errors
+/// reach the UI unchanged). A transport/wake failure becomes a 502 with a JSON error.
+async fn db_query_dispatch(
+    state: &Arc<AppState>,
+    id: String,
+    op: DbQueryOp,
+) -> axum::response::Response {
+    let Some(cb) = state.db_query_callback.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "the database console tools are not available on this server".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    match cb(id, op).await {
+        Ok(res) => {
+            let status = StatusCode::from_u16(res.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                res.body,
+            )
+                .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: e })).into_response(),
+    }
+}
+
+/// `POST /projects/{id}/db/query` — run a query against the project's managed DB. Owner-scoped.
+/// The query string is forwarded verbatim to the in-VM DB's open loopback `POST /query`; the
+/// engine's response (including 400 parse/governor errors) is returned unchanged. Enables the
+/// console query tool + data browser.
+async fn db_query(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<DbQueryRequest>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    if req.query.len() > MAX_DB_QUERY_LEN {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse {
+                error: format!("query exceeds {MAX_DB_QUERY_LEN} bytes"),
+            }),
+        )
+            .into_response();
+    }
+    db_query_dispatch(&state, id, DbQueryOp::Query(req.query)).await
+}
+
+/// `GET /projects/{id}/db/schema` — schema introspection for the managed DB (types + fields +
+/// the relationship graph + canonical SDL). Owner-scoped. Powers the schema/relationship view.
+async fn db_schema(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    db_query_dispatch(&state, id, DbQueryOp::Schema).await
+}
+
+/// `GET /projects/{id}/db/status` — metering counts (objects/edges/vectors/queries). Owner-scoped.
+async fn db_status(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    db_query_dispatch(&state, id, DbQueryOp::Status).await
 }
 
 #[derive(Serialize)]
