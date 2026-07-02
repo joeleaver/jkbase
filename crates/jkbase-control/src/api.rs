@@ -3597,10 +3597,9 @@ async fn db_schema_apply(
     Path(id): Path<String>,
     Json(req): Json<DbSchemaRequest>,
 ) -> impl IntoResponse {
-    let mut project = match require_project_owner(&state, &tenant, &id) {
-        Ok(p) => p,
-        Err(e) => return e.into_response(),
-    };
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
     if req.sdl.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -3632,17 +3631,11 @@ async fn db_schema_apply(
         )
             .into_response();
     }
-    let Some(prev_version) = project.current_version else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "project has no active deployment".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
     // Serialize with deploy/build/rollback (409 on contention) — held for the whole redeploy.
+    // Acquire the lock BEFORE reading `current_version`, then re-read the project FRESH under it,
+    // so a concurrent deploy that advanced the version can't be clobbered by a stale snapshot
+    // (activate_deployment derives v{N} from current_version). Mirrors run_build_job's re-read.
+    // [adversarial-review: schema-redeploy TOCTOU]
     let _guard = match DeployLockGuard::try_acquire(&state, &id) {
         Some(g) => g,
         None => {
@@ -3654,6 +3647,36 @@ async fn db_schema_apply(
             )
                 .into_response();
         }
+    };
+    let mut project = match state.store.get_project(&id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let Some(prev_version) = project.current_version else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "project has no active deployment".to_string(),
+            }),
+        )
+            .into_response();
     };
 
     let prev_deploy_path = proj_dir.join("deployments").join(format!("v{prev_version}"));
@@ -3702,12 +3725,21 @@ async fn db_schema_apply(
 
     // Reconcile gate: rhypedb crash-loops on an incompatible schema → roll back to the prior version.
     if let Err(reason) = wait_db_healthy(&state, &id).await {
-        let _ = do_rollback(&state, &mut project, &prev_deploy_path, prev_version).await;
+        // do_rollback repoints `live` + persists current_version=prev BEFORE its fallible VM-restart
+        // callback, so on Err the deployment pointer is still on the prior version — but say so
+        // rather than claiming a clean rollback. [adversarial-review: swallowed rollback error]
+        let tail = match do_rollback(&state, &mut project, &prev_deploy_path, prev_version).await {
+            Ok(()) => format!("rolled back to v{prev_version}."),
+            Err(e) => format!(
+                "the deployment pointer is back on v{prev_version}, but restarting it reported an \
+                 error ({e}) — it will restart on next access, or redeploy to force it."
+            ),
+        };
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(ErrorResponse {
                 error: format!(
-                    "the database rejected the new schema ({reason}); rolled back to v{prev_version}. \
+                    "the database rejected the new schema ({reason}); {tail} \
                      Additive changes (a new type / a new nullable field) apply cleanly; a field TYPE \
                      change needs a migration and a field/type DROP needs a shrink."
                 ),
