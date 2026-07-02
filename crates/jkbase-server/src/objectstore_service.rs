@@ -766,6 +766,16 @@ impl ObjectStoreService {
         entry: &ProjectEntry,
         req: Request,
     ) -> Response {
+        // Reject a malformed bucket name up front with a proper 400 (using the engine's
+        // own validator, so the rule can't drift) instead of a 500 buried in the
+        // read/delete error arms below.
+        if let Err(ObjectError::InvalidBucketName(_)) = entry.store.bucket_exists(bucket).await {
+            return s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidBucketName",
+                "the specified bucket is not valid",
+            );
+        }
         match method {
             "GET" => match entry.store.get_bucket_cors(bucket).await {
                 Ok(Some(cfg)) => xml_ok(cors_config_to_xml(&cfg)),
