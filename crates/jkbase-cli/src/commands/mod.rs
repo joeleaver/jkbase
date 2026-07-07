@@ -628,7 +628,13 @@ async fn run_quota(
     if let Some(tok) = &admin_token {
         get = get.header("X-Admin-Token", tok);
     }
-    let v: serde_json::Value = get.send().await?.json().await?;
+    let resp = get.send().await?;
+    if !resp.status().is_success() {
+        // Don't parse an error body as a quota — its missing fields would print as an
+        // all-zero "platform default" quota, hiding the not-found/authorization failure.
+        anyhow::bail!("failed to read quota ({})", resp.status());
+    }
+    let v: serde_json::Value = resp.json().await?;
     println!("Quota for '{project_id}':");
     println!(
         "  Storage cap:   {}",
