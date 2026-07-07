@@ -341,3 +341,36 @@ from a co-hosted app on loopback.
 **Not required for a functional dedicated DB v1** — the external reach plane (`jkbase db proxy`
 sidecar) + console already reach the DB VM. This leg is the "full-stack-on-jkbase + dedicated DB"
 convenience and the on-ramp toward P5's untrusted-client posture.
+
+### 7.6.1 AS BUILT (2026-07-07, commit `3f7c63d`) — refinements vs the design-lock
+
+The implementation kept the mechanism above but tightened three points; the security spine
+(unforgeable source IP) is unchanged.
+
+- **Two host-gateway ports, not one + a selector byte.** `172.16.0.1:4230` host-mediates the
+  rhypedb HTTP plane (→ DB VM `127.0.0.1:4200`), `:4231` the native TCP wire (→ `:4201`). Each app
+  VM loopback port dials its matching gateway port. The gateway reads **ZERO guest bytes** before it
+  authenticates + splices — the destination port structurally selects the DB plane, so there is no
+  guest-controlled parse pre-splice. (`DB_GATEWAY_{HTTP,WIRE}_PORT` in `jkbase-common::config`.)
+- **ONE DB-agent splice endpoint, port via a HOST-set header.** `/_jkbase/db` now honors
+  `x-jkbase-db-port` (absent ⇒ 4201, so the external edge is byte-identical; `4200`/`4201` only,
+  else 400). The header is set by the host (edge/gateway), never reachable by an external client
+  (which only owns bytes *after* the 101), and clamped to the two rhypedb ports — so it can never be
+  aimed at an arbitrary in-guest port.
+- **Source-IP-ONLY auth (deviation — flag for reviewers).** The gateway does **not** require the app
+  to present the splice secret. It is redundant with the unforgeable source IP (any process in the
+  untrusted guest can read `_db_reach.json`, and a guest only ever reaches its OWN DB either way),
+  and it would add a rotation-drift failure mode (the secret rotates every deploy) + a
+  guest-controlled parse before the splice. The gateway looks up the **current** splice secret
+  host-side (`get_db_splice_secret`, the same value the console/edge path already dials with) and
+  presents it to the DB agent — so the loopback DB stays gated exactly as before. Joe was asked and
+  was away; proceeded on the safer/cleaner default (documented in `db_gateway.rs`), reversible if he
+  wants the belt-and-suspenders secret.
+- **Warm-keeping.** Each leg relay registers in the shared `DbRelayRegistry` keyed on the BASE
+  project with `tenant_id=None` (internal — must not be refused by the external-reach warm-VM quota)
+  and a synthetic akid. `conn_count(base) > 0` then excludes BOTH the app VM and `{base}.db` from
+  idle hibernation while a (possibly byte-silent subscription) relay is live — closing landmine #7
+  for this seam. `cancel_project`/`cancel_all` still tear these down (project delete / drain).
+- **Firewall.** `setup-bridge.sh` `JKRUNFW` opens ONLY `${GW_IP}:4230,4231` to the bridge. This is
+  INPUT (guest→local gateway IP), so the FORWARD-chain SSRF/metadata DROP never touches it (§7.6
+  confirmation); bind is to `172.16.0.1` specifically, off the public interface.
