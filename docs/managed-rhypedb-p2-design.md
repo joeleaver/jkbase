@@ -302,3 +302,42 @@ reaches it via own-agent→host→DB-VM (host-mediated, F2), splice-gated on the
 one reviewed branch; the first compilable unit is foundation + DB-VM boot + the §7.4 teardown/reconcile
 safety (a boot that reaps its own disk is worse than no boot). Sub-commits are fine if each compiles
 clean (every newly-introduced item used in non-test code by the same commit).
+
+### 7.6 The app→DB in-guest leg (design-lock — the novel seam; NOT yet built)
+**Problem.** A jkbase-*hosted* app in a **dedicated** project's app VM must reach its DB (in the
+sibling DB VM) on the same `127.0.0.1:4200/4201` its tenant code already uses for the co-located
+case, unchanged. The app VM (AppNoDb) has no local rhypedb, and direct app↔DB L2 is closed (F2).
+
+**Mechanism (host-mediated, mirrors the external edge in reverse).** Three parts:
+1. **App-agent loopback proxy.** When the app VM is dedicated (a flag in its `_db_reach.json`),
+   the agent binds `127.0.0.1:4200` + `:4201` inside the app VM and, per accepted connection, dials
+   the host DB-gateway and splices. The tenant's rhypedb-client is byte-for-byte unchanged.
+2. **Host DB-gateway.** A NEW host listener on the bridge gateway `172.16.0.1:<DB_GW_PORT>`
+   (internal-only; add one iptables ACCEPT for `-i jkbr0 -d 172.16.0.1 --dport <port>`, and confirm
+   the SSRF DROP set doesn't cover it). Per connection: read the **peer source IP** → map to project
+   via `VM_ALLOCATIONS` (the app VM's alloc row). The L2 source-guard (`install_tap_source_guard`)
+   pins {ip,mac}↔TAP↔slot, so **the source IP is an unforgeable project identity** — a guest can only
+   ever present its own IP, so it can only ever reach its own DB VM. Then verify the app-presented
+   splice secret == that project's secret (defense-in-depth on top of the IP identity), `wake` the
+   `{proj}.db` VmKey (reusing `wake_db_reach`/`wake_project`), and splice to the DB VM agent's
+   `/_jkbase/db` (the same path the external edge uses).
+3. **Wiring/flag.** Add `dedicated: bool` (or a `db_endpoint`) to `DbReachFacts` (serde-default), set
+   on the APP VM's image when dedicated so its agent knows to start the loopback proxy. The DB port
+   (`<DB_GW_PORT>`) is a constant; the gateway IP is the well-known `172.16.0.1`.
+
+**Isolation argument (for review).** The only new externally-reachable surface is
+`172.16.0.1:<port>` on the internal bridge. Its authorization is the *source IP*, which the existing
+L2 source-guard makes unspoofable — so cross-tenant reach is structurally impossible (project A's VM
+cannot emit project B's source IP). The splice secret is redundant defense. No new L2 path, no
+routing-table entry, no internet exposure. Threat-model delta vs §5: same host-mediated splice
+seam, authenticated by an already-enforced invariant.
+
+**Why deferred from the P2c-reach commit.** It needs a new host listener + new agent listener +
+firewall rule that can only be validated on the FC-capable box (cross-VM splice is not unit-testable)
+— so it lands with the on-box e2e (task #20) as one focused, adversarially-reviewed unit. Until then
+a dedicated project's DB is reachable via the external reach plane + console (P2c-reach), just not
+from a co-hosted app on loopback.
+
+**Not required for a functional dedicated DB v1** — the external reach plane (`jkbase db proxy`
+sidecar) + console already reach the DB VM. This leg is the "full-stack-on-jkbase + dedicated DB"
+convenience and the on-ramp toward P5's untrusted-client posture.
