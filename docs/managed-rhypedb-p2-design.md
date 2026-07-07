@@ -32,8 +32,9 @@ Because `.` is validator-legal and the **App role renders to the unchanged bare 
 existing redb row (`VM_ALLOCATIONS`, `SNAPSHOTS`), on-disk path (`snapshots/<id>`, `run/<id>`,
 `hosting/<id>`), cgroup leaf, disk `{id}.img`, and lease scope stays **byte-identical** — **zero
 migration** for the entire existing fleet. The DB VM is purely additive: a new `…​.db` keyspace that
-never existed before. (Guard: reject a tenant `project_id` that ends in `.db` at creation, so a
-project can't collide with another's DB identity — one-line validation in project-create.)
+never existed before. **Collision-proof by construction:** `is_valid_project_id` restricts ids to
+`[a-z0-9-]` (no `.` — `api.rs:1242`), so a `.db`-suffixed id can NEVER equal a real project id — the
+`.` is a namespace escape tenant ids can't reach. No project-name guard needed.
 
 ### F2 — Direct intra-project L2 is a rewrite and NOT needed → **host-mediated reach**
 Cross-tenant isolation on `jkbr0` is enforced by **L2 bridge port-isolation** (`isolated on`,
@@ -179,8 +180,8 @@ Introduce `VmKey{project_id, role}` and thread it through, **additively** (App r
 - **#2 egress** — the DB VM is a runtime VM → inherits the SSRF/metadata DROP + IPv6-off
   (`setup-bridge.sh:66-94`, `main.rs:4371`) automatically; a managed DB needs no outbound except the
   object-store host for backup staging (already default-deny except that).
-- **NEW: `…​.db` identity collision** — a tenant project named `x` and another named `x.db` must not
-  share a DB identity → reject tenant project names ending in `.db` (F1 guard).
+- **`…​.db` identity collision — CLOSED by construction** — `is_valid_project_id` forbids `.`
+  (`api.rs:1242`), so no real project id can equal a `.db`-suffixed one. No guard needed.
 - **NEW: DB survivor re-adopts as the wrong role** — `handoff.json` must carry the role so a boot
   re-adoption can't restore a DB VM as an app VM (or vice-versa).
 
