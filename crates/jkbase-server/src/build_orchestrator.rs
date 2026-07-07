@@ -5835,6 +5835,7 @@ console.log("listening on " + port);
             Some(&jkbase_common::config::DbReachFacts {
                 splice_secret: splice_secret.to_string(),
                 admin_token: admin_token.to_string(),
+                dedicated: false,
             }),
             &meta_img,
         )

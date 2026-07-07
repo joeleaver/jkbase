@@ -520,6 +520,16 @@ async fn main() -> Result<()> {
         (!db_reach.splice_secret.is_empty()).then(|| db_reach.splice_secret.clone());
     let db_admin_token = (!db_reach.admin_token.is_empty()).then(|| db_reach.admin_token.clone());
 
+    // P2 §7.6 — the app→DB in-guest leg. A dedicated project's app VM has NO co-located rhypedb
+    // (`db_lowerdirs.is_none()`); its DB runs in a sibling DB VM. Start the in-guest loopback proxy
+    // so tenant code reaches its DB on the SAME `127.0.0.1:4200/4201` as co-located — byte-for-byte
+    // unchanged. Each accepted loopback connection is spliced to the host DB gateway on the bridge
+    // gateway IP (`172.16.0.1`), which source-IP-authenticates and forwards to the DB VM's agent.
+    // The `dedicated` flag is set ONLY on a dedicated APP image; a co-located app (which co-hosts
+    // rhypedb on those ports) never sets it, so the two can't collide. Capture BEFORE the DB-start
+    // block below moves `db_lowerdirs`.
+    let start_db_leg = db_reach.dedicated && db_lowerdirs.is_none();
+
     if let Some(lowerdirs) = db_lowerdirs {
         let schema_path = serve_dir.join("_database/schema.rhype");
         match std::fs::read(&schema_path) {
@@ -543,6 +553,25 @@ async fn main() -> Result<()> {
                 "managed DB declared but schema missing from metadata image"
             ),
         }
+    }
+
+    // P2 §7.6 — start the app→DB loopback proxy on a dedicated app VM (see `start_db_leg` above).
+    if start_db_leg {
+        info!(
+            "dedicated tier: starting in-guest app→DB loopback proxy \
+             (127.0.0.1:{RHYPEDB_HTTP_PORT}/{RHYPEDB_TCP_PORT} → host DB gateway {})",
+            jkbase_common::config::DB_GATEWAY_IP
+        );
+        // HTTP plane (`POST /query`, …) and the native TCP wire (`@rhypedb/client`, subscriptions)
+        // each get their own loopback listener → its matching host-gateway port.
+        tokio::spawn(db_leg_loopback_proxy(
+            RHYPEDB_HTTP_PORT,
+            jkbase_common::config::DB_GATEWAY_HTTP_PORT,
+        ));
+        tokio::spawn(db_leg_loopback_proxy(
+            RHYPEDB_TCP_PORT,
+            jkbase_common::config::DB_GATEWAY_WIRE_PORT,
+        ));
     }
 
     let route_config = load_route_config(&serve_dir);
@@ -1071,6 +1100,69 @@ async fn proxy_to_server(
 /// rhypedb's loopback native-TCP wire port inside the guest (see `start_database`).
 const RHYPEDB_TCP_PORT: u16 = 4201;
 
+/// P2 §7.6 — one in-guest loopback proxy listener for the app→DB leg. Binds
+/// `127.0.0.1:local_port` (a rhypedb port the tenant's client already targets on a co-located
+/// project) and, per accepted connection, dials the host DB gateway (`172.16.0.1:gateway_port`)
+/// and byte-transparently splices. The gateway authenticates by our UNFORGEABLE source IP (the L2
+/// source-guard pins {ip,mac}↔TAP) and forwards to the sibling DB VM. Best-effort: a bind failure
+/// logs and disables that plane rather than crashing the agent; a per-connection dial failure
+/// drops only that connection. Runs ONLY on a dedicated app VM, where these ports are free (no
+/// co-located rhypedb).
+async fn db_leg_loopback_proxy(local_port: u16, gateway_port: u16) {
+    use tokio::io::copy_bidirectional;
+    let listener = match TcpListener::bind(("127.0.0.1", local_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, port = local_port, "app→DB leg: failed to bind loopback proxy");
+            return;
+        }
+    };
+    loop {
+        let (mut local, _) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                // Back off briefly so a transient accept errno can't busy-spin the loop.
+                error!(error = %e, port = local_port, "app→DB leg: accept error");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            let _ = local.set_nodelay(true);
+            let mut up = match tokio::net::TcpStream::connect((
+                jkbase_common::config::DB_GATEWAY_IP,
+                gateway_port,
+            ))
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, gateway_port, "app→DB leg: dial host DB gateway failed");
+                    return;
+                }
+            };
+            let _ = up.set_nodelay(true);
+            // Byte-transparent full-duplex splice. Propagates half-close; the DB wire has
+            // server-initiated pushes (subscriptions), so this must NOT assume request/response.
+            let _ = copy_bidirectional(&mut local, &mut up).await;
+        });
+    }
+}
+
+/// Resolve the HOST-set `x-jkbase-db-port` header to the rhypedb loopback port to splice to.
+/// Absent ⇒ `RHYPEDB_TCP_PORT` (the native wire — the external edge omits it, so its behavior is
+/// unchanged); exactly `"4200"`/`"4201"` ⇒ that port; anything else ⇒ `Err` so the splice fails
+/// closed rather than being aimed at an arbitrary in-guest port. The header is never
+/// guest-controlled (see the caller).
+fn db_splice_target_port(hdr: Option<&str>) -> Result<u16, ()> {
+    match hdr {
+        None => Ok(RHYPEDB_TCP_PORT),
+        Some(p) if p == RHYPEDB_TCP_PORT.to_string() => Ok(RHYPEDB_TCP_PORT),
+        Some(p) if p == RHYPEDB_HTTP_PORT.to_string() => Ok(RHYPEDB_HTTP_PORT),
+        Some(_) => Err(()),
+    }
+}
+
 /// Constant-time byte compare for the splice-secret check (the agent has no other
 /// const-time primitive; mirrors the edge/control-plane discipline).
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1114,6 +1206,25 @@ async fn handle_db_splice(
         return not_found_response();
     }
 
+    // Which loopback DB port to splice to. The header is HOST-set (the external edge omits it →
+    // the native wire; the app→DB host gateway sets it per leg), NEVER guest-controlled: an
+    // external client only owns the raw bytes AFTER the 101, not this upgrade request's headers.
+    // Fail closed on any value other than the two known rhypedb ports so this can never be aimed
+    // at an arbitrary in-guest port. Absent ⇒ 4201 (the native wire), preserving the edge path.
+    let target_port = match db_splice_target_port(
+        req.headers()
+            .get("x-jkbase-db-port")
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        Ok(p) => p,
+        Err(()) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from("bad db port")))
+                .unwrap();
+        }
+    };
+
     // Require a real upgrade so a valid-secret non-upgrade request can't leak a permit on
     // an `on()` future that never resolves.
     if !jkbase_wsproxy::is_upgrade_request(req.headers()) {
@@ -1134,10 +1245,10 @@ async fn handle_db_splice(
 
     // Connect the raw loopback wire BEFORE returning 101 (a connect failure must not leave
     // the edge spliced to nothing).
-    let backend = match tokio::net::TcpStream::connect(("127.0.0.1", RHYPEDB_TCP_PORT)).await {
+    let backend = match tokio::net::TcpStream::connect(("127.0.0.1", target_port)).await {
         Ok(s) => s,
         Err(e) => {
-            error!(error = %e, "db splice: rhypedb loopback wire not available");
+            error!(error = %e, port = target_port, "db splice: rhypedb loopback wire not available");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Full::new(Bytes::from("db not available")))
@@ -1704,6 +1815,21 @@ async fn invoke_function(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_splice_target_port_is_host_set_and_fail_closed() {
+        // Absent header ⇒ the native wire (the external edge omits it → unchanged behavior).
+        assert_eq!(db_splice_target_port(None), Ok(RHYPEDB_TCP_PORT));
+        // The two known rhypedb loopback ports the app→DB gateway may target.
+        assert_eq!(db_splice_target_port(Some("4201")), Ok(RHYPEDB_TCP_PORT));
+        assert_eq!(db_splice_target_port(Some("4200")), Ok(RHYPEDB_HTTP_PORT));
+        // Anything else fails closed — never aimable at an arbitrary in-guest port.
+        assert_eq!(db_splice_target_port(Some("22")), Err(()));
+        assert_eq!(db_splice_target_port(Some("9090")), Err(()));
+        assert_eq!(db_splice_target_port(Some("")), Err(()));
+        assert_eq!(db_splice_target_port(Some("4201 ")), Err(()));
+        assert_eq!(db_splice_target_port(Some("04201")), Err(()));
+    }
 
     #[test]
     fn route_config_maps_kinds_and_drops_unknown() {

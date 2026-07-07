@@ -189,12 +189,33 @@ pub struct DbReachFacts {
     /// backups disabled, fail-closed, never a crash.
     #[serde(default)]
     pub admin_token: String,
+    /// P2 dedicated tier: `true` ONLY on the APP VM's `_db_reach.json` when the project's DB runs
+    /// in a sibling DB VM (`tier="dedicated"`). It tells the app agent to start the in-guest
+    /// loopback proxy (`127.0.0.1:4200/4201`) that host-mediates to the DB VM, so tenant code
+    /// reaches its DB on the SAME loopback ports as co-located — byte-for-byte unchanged. Never set
+    /// on a co-located app image, and never on the DB VM's OWN image (it *is* the DB). Default
+    /// `false` = co-located (or old images), so this is additive with zero migration.
+    #[serde(default)]
+    pub dedicated: bool,
 }
 
 impl DbReachFacts {
     /// Metadata-image filename. `_`-prefixed, so the agent's static server never serves it.
     pub const FILE: &'static str = "_db_reach.json";
 }
+
+/// Well-known runtime-bridge gateway IP (host side of `jkbr0`). The app→DB leg's host gateway
+/// (P2 §7.6) binds here; a dedicated app VM's agent dials it over eth0. Must match
+/// `tools/setup-bridge.sh`'s `GW_IP` and the boot-time `gateway_ip`.
+pub const DB_GATEWAY_IP: &str = "172.16.0.1";
+/// Host DB-gateway port that host-mediates the native rhypedb TCP wire: a dedicated app VM's
+/// `127.0.0.1:4201` loopback proxy dials `172.16.0.1:DB_GATEWAY_WIRE_PORT`, the gateway
+/// source-IP-authenticates + splices to the DB VM agent's `/_jkbase/db` → its `127.0.0.1:4201`.
+/// Opened bridge-wide in `JKRUNFW` (setup-bridge.sh) — the gateway does the per-project auth.
+pub const DB_GATEWAY_WIRE_PORT: u16 = 4231;
+/// Host DB-gateway port that host-mediates the rhypedb HTTP plane (guest `127.0.0.1:4200` →
+/// DB VM `127.0.0.1:4200`). Sibling of [`DB_GATEWAY_WIRE_PORT`]; see setup-bridge.sh `JKRUNFW`.
+pub const DB_GATEWAY_HTTP_PORT: u16 = 4230;
 
 fn norm_host(h: &str) -> String {
     h.trim_end_matches('.').to_ascii_lowercase()

@@ -120,6 +120,13 @@ iptables -w -N JKRUNFW 2>/dev/null || iptables -w -F JKRUNFW
 iptables -w -A JKRUNFW -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 iptables -w -A JKRUNFW -d "$GW_IP" -p udp --dport 53 -j ACCEPT
 iptables -w -A JKRUNFW -d "$GW_IP" -p tcp --dport 53 -j ACCEPT
+# Managed-DB P2 §7.6 — the app→DB in-guest leg's HOST gateway. A dedicated project's app VM reaches
+# its sibling DB VM host-mediated: its agent dials the gateway on ${GW_IP}:4230 (rhypedb HTTP plane)
+# / :4231 (native TCP wire), which authenticates by the source-guard-pinned (unforgeable) source IP
+# and splices to the DB VM's agent. Open ONLY those two gateway ports on ${GW_IP}; the gateway does
+# the per-project authorization. (Ports must match jkbase-common config DB_GATEWAY_{HTTP,WIRE}_PORT.)
+# This is INPUT (guest→local gateway IP), so the FORWARD-chain SSRF/metadata DROP does not touch it.
+iptables -w -A JKRUNFW -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j ACCEPT
 if [ -n "${PUB_IPS// /}" ]; then
     for pub in $PUB_IPS; do
         iptables -w -A JKRUNFW -d "$pub" -p tcp -m multiport --dports 80,443 -j ACCEPT

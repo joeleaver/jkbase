@@ -1,6 +1,7 @@
 mod build_ca;
 mod build_orchestrator;
 mod db_backup_store;
+mod db_gateway;
 mod egress;
 mod handoff;
 mod layer_plan;
@@ -1747,6 +1748,28 @@ async fn async_main() -> Result<()> {
         }
     });
 
+    // P2 §7.6 — the app→DB in-guest leg's host gateway. Lets a dedicated project's app VM reach
+    // its sibling DB VM on the same `127.0.0.1:4200/4201` as co-located, host-mediated over the
+    // bridge gateway IP and authenticated by the guest's unforgeable source IP. Best-effort bind
+    // (see `db_gateway::serve`); its own wake closure mirrors the proxy's (both call `wake_db_reach`,
+    // which resolves the dedicated `.db` target).
+    {
+        let store = store.clone();
+        let platform_for_gw = platform.clone();
+        let routing_for_gw = routing_table.clone();
+        let domain_for_gw = domain_map.clone();
+        let shipper_for_gw = log_shipper.clone();
+        let gw_wake: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
+            let platform = platform_for_gw.clone();
+            let routing = routing_for_gw.clone();
+            let domains = domain_for_gw.clone();
+            let shipper = shipper_for_gw.clone();
+            Box::pin(async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await })
+        });
+        let registry = db_relay_registry.clone();
+        tokio::spawn(async move { db_gateway::serve(store, gw_wake, registry).await });
+    }
+
     // Spawn log shipper loop (pulls guest logs into the persistent store)
     tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
 
@@ -2876,6 +2899,9 @@ async fn handle_deploy(
                     jkbase_common::config::DbReachFacts {
                         splice_secret,
                         admin_token,
+                        // Base value (the DB VM's own image keeps this); the app VM's copy is
+                        // flipped to `dedicated` below so its agent starts the app→DB loopback proxy.
+                        dedicated: false,
                     }
                 })
         } else {
@@ -2902,8 +2928,14 @@ async fn handle_deploy(
         layer_plan::ImageContent::All
     };
     // The DB VM boot below reuses the SAME per-deploy reach facts (the splice secret both VMs must
-    // present); clone them out before the app build MOVES `db_reach` into its blocking closure.
+    // present); clone them out before the app build MOVES `db_reach` into its blocking closure. The
+    // DB VM's copy keeps `dedicated=false` (it IS the DB — no loopback proxy); flip the APP VM's
+    // copy so its agent starts the app→DB in-guest leg (P2 §7.6).
     let db_reach_for_db_vm = db_reach.clone();
+    let mut db_reach = db_reach;
+    if let Some(r) = db_reach.as_mut() {
+        r.dedicated = dedicated;
+    }
     let plan = {
         let content_dir = content_dir.clone();
         let store_dir = data_dir.join("baselayers");
