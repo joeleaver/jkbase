@@ -67,6 +67,39 @@ pub fn base_project_id(id: &str) -> &str {
     split_vm_id(id).0
 }
 
+/// A VM's Firecracker machine sizing (vCPUs + RAM MiB). Threaded through deploy / wake / hibernate
+/// so a project's App and DB VMs boot — and snapshot/restore — at their own size. The **hibernate
+/// snapshot size MUST equal the restore size** or the mem file won't map; both are sourced from
+/// [`vm_size_for`] keyed by the same [`VmRole`], so they can't drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmSize {
+    pub vcpu_count: u32,
+    pub mem_size_mib: u32,
+}
+
+/// The App VM's historical fixed sizing (3072 MiB / 4 vCPU) — UNCHANGED, so every pre-existing
+/// snapshot restores byte-identical and no running app VM is resized.
+pub const APP_VM_SIZE: VmSize = VmSize {
+    vcpu_count: 4,
+    mem_size_mib: 3072,
+};
+
+/// The dedicated DB VM's lean floor (1024 MiB / 1 vCPU). RhypeDB runs lean (ONNX dropped);
+/// `@vectorize` schemas may want more later. Proven bootable at the orch layer (512/1) and in the
+/// managed-DB smokes (1024/2). Joe's decision #5.
+pub const DB_VM_SIZE: VmSize = VmSize {
+    vcpu_count: 1,
+    mem_size_mib: 1024,
+};
+
+/// The [`VmSize`] for `role`: App keeps its historical fixed size; Db gets the lean floor.
+pub fn vm_size_for(role: VmRole) -> VmSize {
+    match role {
+        VmRole::App => APP_VM_SIZE,
+        VmRole::Db => DB_VM_SIZE,
+    }
+}
+
 /// The ERE `pkill -f` pattern anchoring the Firecracker api-sock path segment for a rendered
 /// `vm_id` (`/{id}/firecracker\.sock`). The rendered id can contain a literal `.` (the DB `.db`
 /// suffix), which is an ERE metacharacter: left unescaped, `foo.db` would match

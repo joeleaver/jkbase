@@ -2922,6 +2922,10 @@ async fn handle_deploy(
         None
     };
 
+    // `handle_deploy` only ever boots the APP VM (the dedicated DB VM boots via its own helper),
+    // so it keeps the historical App sizing. Sourced from VmSize so the DB VM reuses the same
+    // plumbing and hibernate/restore can't drift the mem-file size.
+    let app_size = vm_identity::vm_size_for(vm_identity::VmRole::App);
     let config = VmConfig {
         firecracker_bin,
         kernel_path,
@@ -2929,8 +2933,8 @@ async fn handle_deploy(
         metadata_image_path: Some(metadata_image_path),
         layer_paths: plan.layer_paths.clone(),
         data_disk_path: disk_guard.as_ref().map(|g| g.device()),
-        vcpu_count: 4,
-        mem_size_mib: 3072,
+        vcpu_count: app_size.vcpu_count,
+        mem_size_mib: app_size.mem_size_mib,
         tap_device: Some(alloc.tap_device.clone()),
         guest_mac: Some(alloc.mac.clone()),
         guest_ip: Some(alloc.ip.clone()),
@@ -3248,6 +3252,10 @@ async fn hibernate_project(
         .flatten()
         .and_then(|p| p.current_version);
 
+    // Stamp the snapshot with THIS VM's role-derived size so the restore (which reads these
+    // fields back) maps the mem file at the identical geometry — an app VM at App sizing, a
+    // dedicated DB VM at DB sizing.
+    let snap_size = vm_identity::vm_size_for(vm_identity::split_vm_id(project_id).1);
     let meta = SnapshotMeta {
         project_id: project_id.to_string(),
         snapshot_path: snapshot_path.to_string_lossy().to_string(),
@@ -3256,8 +3264,8 @@ async fn hibernate_project(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
-        vcpu_count: 4,
-        mem_size_mib: 3072,
+        vcpu_count: snap_size.vcpu_count,
+        mem_size_mib: snap_size.mem_size_mib,
         base_rootfs_hash,
         deployment_version,
     };
@@ -3540,6 +3548,10 @@ async fn wake_project_inner(
     // mis-assign device letters. Absent ⇒ legacy/static image with no layers.
     let layer_paths = layer_plan::read_layer_paths(&metadata_image_path);
 
+    // Size by ROLE: an app VM wakes at App sizing (unchanged), a dedicated DB VM (`{id}.db`) at
+    // the lean DB sizing. A restore reads the size back from `SnapshotMeta`, which was stamped at
+    // hibernate from this SAME `vm_size_for`, so the snapshot and restore sizes can't drift.
+    let vm_size = vm_identity::vm_size_for(vm_identity::split_vm_id(project_id).1);
     let mut config = VmConfig {
         firecracker_bin: plat.firecracker_bin.clone(),
         kernel_path: plat.kernel_path.clone(),
@@ -3547,8 +3559,8 @@ async fn wake_project_inner(
         metadata_image_path: Some(metadata_image_path),
         layer_paths,
         data_disk_path: None,
-        vcpu_count: 4,
-        mem_size_mib: 3072,
+        vcpu_count: vm_size.vcpu_count,
+        mem_size_mib: vm_size.mem_size_mib,
         tap_device: Some(alloc.tap_device.clone()),
         guest_mac: Some(alloc.mac.clone()),
         guest_ip: Some(alloc.ip.clone()),
