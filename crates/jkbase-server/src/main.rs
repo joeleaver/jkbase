@@ -2811,8 +2811,12 @@ async fn handle_deploy(
     // metadata-image build (mkfs + sha256 layer verify), the RWO attach (first-deploy
     // mkfs / reap+300ms / losetup), and the VM boot must NOT head-of-line block every
     // other project on the single platform lock. Re-acquire only to commit.
+    // Dedicated projects run their managed DB in a SIBLING VM, so the app VM must NOT be forced a
+    // data disk on account of the DB (`check_project_has_database`) — it only fences a disk for its
+    // OWN volumes. A co-located project (the default) keeps forcing the disk for the loopback DB.
+    let dedicated = project_is_dedicated(&plat.data_dir, project_id);
     let has_disk = check_project_has_volumes(&plat.data_dir, project_id)
-        || check_project_has_database(&plat.data_dir, project_id)
+        || (!dedicated && check_project_has_database(&plat.data_dir, project_id))
         || plat.data_disk.exists(project_id).await.unwrap_or(false);
     let data_dir = plat.data_dir.clone();
     let dd = plat.data_disk.clone();
@@ -2888,6 +2892,18 @@ async fn handle_deploy(
     let content_images_dir = data_dir.join("content-images");
     tokio::fs::create_dir_all(&content_images_dir).await?;
     let metadata_image_path = content_images_dir.join(format!("{project_id}.ext4"));
+    // A dedicated project's app VM image excludes the managed DB (it runs in a sibling VM); a
+    // co-located project's app VM carries the rhypedb overlay as before. `db_reach` rides the app
+    // image EITHER way — the app reaches its DB on loopback (co-located) or host-mediated via the
+    // sibling VM (dedicated), so it needs the splice secret regardless.
+    let app_content = if dedicated {
+        layer_plan::ImageContent::AppNoDb
+    } else {
+        layer_plan::ImageContent::All
+    };
+    // The DB VM boot below reuses the SAME per-deploy reach facts (the splice secret both VMs must
+    // present); clone them out before the app build MOVES `db_reach` into its blocking closure.
+    let db_reach_for_db_vm = db_reach.clone();
     let plan = {
         let content_dir = content_dir.clone();
         let store_dir = data_dir.join("baselayers");
@@ -2895,8 +2911,9 @@ async fn handle_deploy(
         tokio::task::spawn_blocking(move || -> anyhow::Result<layer_plan::LayerPlan> {
             // verify=true: cold-boot deploy re-checks every tenant + platform blob's
             // sha256 before it can be attached to a VM.
-            let plan = layer_plan::compute_layer_plan(&content_dir, &store_dir, has_disk, true)?;
-            layer_plan::build_metadata_image(
+            let plan =
+                layer_plan::compute_layer_plan_with(&content_dir, &store_dir, has_disk, true, app_content)?;
+            layer_plan::build_metadata_image_with(
                 &content_dir,
                 &plan,
                 &secrets,
@@ -2904,6 +2921,7 @@ async fn handle_deploy(
                 storage_binding.as_ref(),
                 db_reach.as_ref(),
                 &out,
+                app_content,
             )?;
             Ok(plan)
         })
@@ -3031,6 +3049,202 @@ async fn handle_deploy(
     .await;
 
     info!(project = %project_id, ip = %alloc.ip, "VM ready, routing active");
+
+    // A dedicated project runs its managed DB in a SIBLING VM (`{project_id}.db`); boot it now that
+    // the app VM is up. A DB-VM boot failure fails the whole deploy (retryable) rather than leaving
+    // a half-provisioned dedicated project whose app can't reach a DB. Co-located projects skip
+    // this entirely (their DB is the loopback process inside the app VM booted above).
+    if dedicated {
+        boot_db_vm(project_id, &platform, db_reach_for_db_vm.as_ref()).await?;
+    }
+    Ok(())
+}
+
+/// Boot (or, on redeploy, replace) a project's dedicated DB VM (`{project_id}.db`). Mirrors the
+/// app-VM cold boot but for a lean, rhypedb-only sibling: its OWN IP/TAP + data disk
+/// (`{id}.db.img`) + metadata image (`content-images/{id}.db.ext4`, built `DbOnly`), booted at
+/// [`vm_identity::DB_VM_SIZE`] and committed into the platform maps under the rendered id. All
+/// deployment/store reads use the BASE `project_id` (the DB VM has no `hosting/<id>.db/` — it
+/// reuses the app's live tree); all per-VM-instance state uses the rendered `db_id`. A boot error
+/// propagates so the caller fails the deploy (retryable) rather than half-provisioning.
+async fn boot_db_vm(
+    project_id: &str,
+    platform: &Arc<Mutex<PlatformState>>,
+    db_reach: Option<&jkbase_common::config::DbReachFacts>,
+) -> Result<()> {
+    let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
+
+    // Snapshot the substrate handles + supersede any prior DB VM (redeploy), then release the lock
+    // for the slow build + fence + boot.
+    let (data_dir, dd, ls, hid, firecracker_bin, kernel_path, rootfs_path, platform_egress, alloc) = {
+        let mut plat = platform.lock().await;
+
+        // Supersede a prior DB VM incarnation (redeploy): drop its stale snapshot, stop it, and
+        // release its data-disk hold before re-fencing — mirrors the app redeploy path.
+        let snapshot_dir = plat.data_dir.join("snapshots").join(&db_id);
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+        let _ = plat.store.remove_snapshot_meta(&db_id);
+        if let Some(mut old) = plat.vms.remove(&db_id) {
+            let _ = old.stop().await;
+        }
+        plat.vm_rootfs_hashes.remove(&db_id);
+        handoff::remove(&plat.data_dir.join("run"), &db_id);
+        if let Some(token) = plat.disk_tokens.remove(&db_id) {
+            let dd = plat.data_disk.clone();
+            let ls = plat.lease.clone();
+            release_data_disk(&dd, &ls, &db_id, token).await;
+        }
+
+        // Allocate (or reuse) the DB VM's own IP under the `{id}.db` allocation row — a 2nd octet.
+        let alloc = match plat.store.get_vm_allocation(&db_id)? {
+            Some(existing) => existing,
+            None => {
+                let (ip, tap, mac) = plat.allocate_ip()?;
+                let a = VmAllocation {
+                    project_id: db_id.clone(),
+                    ip,
+                    tap_device: tap,
+                    mac,
+                    host_id: plat.host_id.clone(),
+                    placement_epoch: 1,
+                };
+                plat.store.save_vm_allocation(&a)?;
+                info!(project = %project_id, db_vm = %db_id, ip = %a.ip, "allocated DB VM IP");
+                a
+            }
+        };
+        (
+            plat.data_dir.clone(),
+            plat.data_disk.clone(),
+            plat.lease.clone(),
+            plat.host_id.clone(),
+            plat.firecracker_bin.clone(),
+            plat.kernel_path.clone(),
+            plat.base_rootfs_path.clone(),
+            plat.platform_egress.clone(),
+            alloc,
+        )
+    };
+
+    let content_dir = data_dir.join("hosting").join(project_id).join("live");
+    let runtime_dir = data_dir.join("run");
+    setup_tap(&alloc.tap_device).await?;
+
+    // Build the DB VM's OWN metadata image (DbOnly: rhypedb overlay + `_database.json`/`_database/`
+    // only — no app servers/routes/sites) + resolve its layer blobs from the same live tree.
+    let metadata_image_path = data_dir
+        .join("content-images")
+        .join(format!("{db_id}.ext4"));
+    let plan = {
+        let content_dir = content_dir.clone();
+        let store_dir = data_dir.join("baselayers");
+        let out = metadata_image_path.clone();
+        let db_reach = db_reach.cloned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<layer_plan::LayerPlan> {
+            let plan = layer_plan::compute_layer_plan_with(
+                &content_dir,
+                &store_dir,
+                true,
+                true,
+                layer_plan::ImageContent::DbOnly,
+            )?;
+            layer_plan::build_metadata_image_with(
+                &content_dir,
+                &plan,
+                &std::collections::BTreeMap::new(),
+                &platform_egress,
+                None,
+                db_reach.as_ref(),
+                &out,
+                layer_plan::ImageContent::DbOnly,
+            )?;
+            Ok(plan)
+        })
+        .await
+        .context("DB VM metadata image build task")??
+    };
+
+    // Fence the DB VM's OWN data disk (`{id}.db.img`), sized from the BASE project's
+    // `_database.json` (`[database].size`). The `.db` scope is validator-legal (F1).
+    let disk_mib = data_disk_mib_for(&data_dir, project_id);
+    let disk_guard = fence_data_disk(&dd, &ls, &hid, &db_id, disk_mib).await?;
+
+    let db_size = vm_identity::vm_size_for(vm_identity::VmRole::Db);
+    let config = VmConfig {
+        firecracker_bin,
+        kernel_path,
+        rootfs_path,
+        metadata_image_path: Some(metadata_image_path),
+        layer_paths: plan.layer_paths.clone(),
+        data_disk_path: Some(disk_guard.device()),
+        vcpu_count: db_size.vcpu_count,
+        mem_size_mib: db_size.mem_size_mib,
+        tap_device: Some(alloc.tap_device.clone()),
+        guest_mac: Some(alloc.mac.clone()),
+        guest_ip: Some(alloc.ip.clone()),
+        gateway_ip: Some("172.16.0.1".to_string()),
+        vsock_cid: None,
+        runtime_cgroup_parent: Some(PathBuf::from(RUNTIME_CGROUP_PARENT)),
+    };
+    // On start failure, release the fenced disk AWAITED (not via the Drop backstop) so an immediate
+    // redeploy/re-wake can't race a fire-and-forget cleanup into a transient LeaseHeld/RwoUnsafe.
+    let mut vm = match VmInstance::start(&db_id, &config, &runtime_dir).await {
+        Ok(vm) => vm,
+        Err(e) => {
+            disk_guard.release().await;
+            return Err(e);
+        }
+    };
+
+    // Commit-to-Running: record the FC pid as the disk writer (FATAL — mirrors the app commit),
+    // disarm the guard, and insert into the platform maps under the rendered id.
+    let mut plat = platform.lock().await;
+    let fc_pid = vm.pid();
+    let (loop_dev, lease_epoch) = {
+        if let Some(pid) = fc_pid
+            && let Err(e) = dd.set_writer_pid(&db_id, disk_guard.token(), pid).await
+        {
+            drop(plat);
+            let _ = vm.stop().await;
+            disk_guard.release().await;
+            return Err(anyhow::anyhow!("commit set_writer_pid {db_id}: {e}"));
+        }
+        let dev = disk_guard.device().to_string_lossy().into_owned();
+        let epoch = disk_guard.token().epoch;
+        plat.disk_tokens.insert(db_id.clone(), disk_guard.disarm());
+        (Some(dev), Some(epoch))
+    };
+    plat.vms.insert(db_id.clone(), vm);
+    plat.vm_states.insert(db_id.clone(), VmLifecycle::Running);
+    let ran_hash = plat.base_rootfs_hash.clone();
+    plat.vm_rootfs_hashes.insert(db_id.clone(), ran_hash.clone());
+    plat.wake_failures.remove(&db_id);
+    // The DB VM's snapshot version token is the BASE project's deploy version: its metadata image is
+    // rewritten every deploy (like the app's), so its snapshot is valid within a deploy version and
+    // invalidated on redeploy (fail-open to a cold boot from the persistent data disk).
+    let deployment_version = plat
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.current_version);
+    drop(plat);
+
+    // Re-adoption record for the DB VM (role Db, derived from the rendered id); removed on teardown.
+    write_handoff_record(
+        &runtime_dir,
+        &db_id,
+        fc_pid,
+        &alloc,
+        loop_dev,
+        lease_epoch,
+        ran_hash,
+        deployment_version,
+    );
+
+    // The DB VM is NOT proxy-routed (it's reached host-mediated); just wait for its agent to serve.
+    wait_for_agent(&alloc.ip).await?;
+    info!(project = %project_id, db_vm = %db_id, ip = %alloc.ip, "DB VM ready");
     Ok(())
 }
 
@@ -3245,9 +3459,12 @@ async fn hibernate_project(
     // the next wake ⇒ non-viable ⇒ fail open to a clean cold boot. Drop the per-VM hash now: the
     // VM is down.
     let base_rootfs_hash = plat.vm_rootfs_hashes.remove(project_id);
+    // Version-gate token from the BASE project (a DB VM has no project row of its own), so a DB
+    // VM's snapshot is stamped with — and on wake compared against — the same deploy version its
+    // metadata image was built at, keeping fast-restore viable within a deploy version.
     let deployment_version = plat
         .store
-        .get_project(project_id)
+        .get_project(vm_identity::base_project_id(project_id))
         .ok()
         .flatten()
         .and_then(|p| p.current_version);
@@ -3517,9 +3734,14 @@ async fn wake_project_inner(
     // current, coherent set). Anything else fails OPEN to a clean cold boot from the current
     // rootfs — never a brick. The reason becomes the `wake_outcome` so a post-deploy spike in
     // cold-boot fallbacks (e.g. a bad staged rootfs) is visible instead of silent.
+    // Per-role/-tier identity: a dedicated DB VM (`{id}.db`) reuses its BASE project's deployment
+    // for every store/content read (it has no `hosting/<id>.db/`), so the snapshot version gate
+    // (and thus fast-restore) works. A co-located app VM is unchanged (base == project_id).
+    let (base_pid, vm_role) = vm_identity::split_vm_id(project_id);
+    let dedicated = project_is_dedicated(&plat.data_dir, base_pid);
     let current_version = plat
         .store
-        .get_project(project_id)
+        .get_project(base_pid)
         .ok()
         .flatten()
         .and_then(|p| p.current_version);
@@ -3529,13 +3751,18 @@ async fn wake_project_inner(
     let (restore_hash, nonviable_outcome) =
         snapshot_restore_decision(snap_meta.as_ref(), current_version, &cas_dir);
 
-    // Whether this project has a data disk, plus clones of the RWO substrate so the
-    // fence (below) can run AFTER dropping the platform lock. data_disk_path is set
-    // by the fence; start with None.
-    let has_volumes = check_project_has_volumes(&plat.data_dir, project_id);
-    let has_disk = has_volumes
-        || check_project_has_database(&plat.data_dir, project_id)
-        || plat.data_disk.exists(project_id).await.unwrap_or(false);
+    // Whether this VM has a data disk, plus clones of the RWO substrate so the fence (below) can
+    // run AFTER dropping the platform lock. The DB VM ALWAYS has one; a dedicated project's app VM
+    // must NOT fence a disk on account of the DB (it runs in the sibling VM) — only for its own
+    // volumes or a disk it already owns (e.g. a colocated→dedicated migration keeps `{id}.img`).
+    let has_disk = match vm_role {
+        vm_identity::VmRole::Db => true,
+        vm_identity::VmRole::App => {
+            check_project_has_volumes(&plat.data_dir, base_pid)
+                || (!dedicated && check_project_has_database(&plat.data_dir, base_pid))
+                || plat.data_disk.exists(project_id).await.unwrap_or(false)
+        }
+    };
     let dd = plat.data_disk.clone();
     let ls = plat.lease.clone();
     let hid = plat.host_id.clone();
@@ -3583,7 +3810,9 @@ async fn wake_project_inner(
     // restore path patches the data drive to this fenced device; refuse→cold-boot
     // (reap + retry, else error) lives in fence_data_disk. None when no data disk.
     let disk_guard = if has_disk {
-        let disk_mib = data_disk_mib_for(&data_dir, project_id);
+        // Size from the BASE project's `_database.json` ([database].size) — the DB VM has no
+        // `hosting/<id>.db/` — but fence the disk under the RENDERED id (`{id}.db.img`), its own.
+        let disk_mib = data_disk_mib_for(&data_dir, base_pid);
         let g = fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?;
         config.data_disk_path = Some(g.device());
         Some(g)
@@ -4887,6 +5116,28 @@ fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
         .exists()
 }
 
+/// True when the project's live deployment declares `[database] tier = "dedicated"` (P2) — its
+/// managed DB runs in a sibling DB VM rather than co-located in the app VM. Reads the host-baked
+/// `hosting/<project>/live/_database.json` `tier` field (always the BASE project id — the DB VM
+/// has no `hosting/<id>.db/`). A missing file / absent-or-other tier ⇒ co-located (the default),
+/// so this is fail-safe: only an explicit `"dedicated"` opts a project into the second VM.
+fn project_is_dedicated(data_dir: &Path, project_id: &str) -> bool {
+    let path = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_database.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| {
+            v.get("tier")
+                .and_then(serde_json::Value::as_str)
+                .map(|t| t.eq_ignore_ascii_case("dedicated"))
+        })
+        .unwrap_or(false)
+}
+
 /// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
 /// (parsed host-side at deploy into `_database.json`'s `size_mib`) when present, else
 /// the platform default [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized
@@ -5244,7 +5495,11 @@ async fn finish_adoption(
     let active_domains;
     {
         let mut plat = platform.lock().await;
-        if plat.store.get_project(id).ok().flatten().is_none() {
+        // A survivor's rendered id may be a DB VM (`{base}.db`): resolve its BASE project for every
+        // store/quota/domain read (the DB VM has no project row of its own). Per-VM state (maps,
+        // lease, disk) stays keyed by the rendered `id`.
+        let (base_pid, vm_role) = vm_identity::split_vm_id(id);
+        if plat.store.get_project(base_pid).ok().flatten().is_none() {
             drop(plat);
             let mut vm = vm;
             let _ = vm.stop().await; // synchronous-to-death before detaching the disk
@@ -5258,7 +5513,7 @@ async fn finish_adoption(
         }
         over_quota = plat
             .store
-            .get_quota_status(id)
+            .get_quota_status(base_pid)
             .ok()
             .flatten()
             .map(|s| s.bandwidth_blocked)
@@ -5271,10 +5526,14 @@ async fn finish_adoption(
         plat.vm_rootfs_hashes
             .insert(id.to_string(), rec.base_rootfs_hash.clone());
         plat.wake_failures.remove(id);
-        active_domains = plat
-            .store
-            .list_active_domains_for_project(id)
-            .unwrap_or_default();
+        // A DB VM is reached host-mediated and never proxy-routed → no domains to register.
+        active_domains = if vm_role == vm_identity::VmRole::Db {
+            Vec::new()
+        } else {
+            plat.store
+                .list_active_domains_for_project(base_pid)
+                .unwrap_or_default()
+        };
     }
 
     // Rewrite the handoff with the refreshed lease epoch so run/<id>/handoff.json stays
@@ -5283,9 +5542,12 @@ async fn finish_adoption(
     rec2.lease_epoch = token.as_ref().map(|t| t.epoch);
     let _ = handoff::write(runtime_dir, id, &rec2);
 
-    // (5) Route — UNLESS over quota (§10): then leave it unrouted so it isn't served; the idle
-    // loop hibernates it and a request is refused by wake_project's quota gate.
-    if over_quota {
+    // (5) Route — UNLESS this is the DB VM (never proxy-routed; reached host-mediated) or the
+    // project is over quota (§10): then leave it unrouted so it isn't served; the idle loop
+    // hibernates it and a request is refused by wake_project's quota gate.
+    if vm_identity::split_vm_id(id).1 == vm_identity::VmRole::Db {
+        info!(project = %id, "re-adoption: DB VM survivor (host-mediated; not registering routes)");
+    } else if over_quota {
         warn!(project = %id, "re-adoption: adopted an OVER-QUOTA survivor; not registering routes");
     } else {
         register_active_routes(routing, domain_map, &active_domains, id, &rec2.ip).await;
