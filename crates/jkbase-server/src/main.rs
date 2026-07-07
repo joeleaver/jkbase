@@ -5960,29 +5960,48 @@ async fn metering_loop(
             }
         }
 
-        // Roll each project's sample into its current hour bucket. Skip projects
-        // with nothing to record (no storage, no deltas) to avoid empty rows.
-        for id in &projects {
+        // A dedicated project's DB VM has its OWN alloc row (`{id}.db`) but no project row, so the
+        // per-project roll below skips it — accrue its usage under the rendered id (decision #3:
+        // separate rows, rolled up in display by `get_project_usage`). cpu/bw are already keyed by
+        // the rendered id; storage is its own `{id}.db.img` disk.
+        let db_vm_ids: Vec<String> = allocs
+            .iter()
+            .map(|(id, _)| id.clone())
+            .filter(|id| vm_identity::split_vm_id(id).1 == vm_identity::VmRole::Db)
+            .collect();
+
+        // Roll each VM's sample into its current hour bucket. Skip VMs with nothing to record (no
+        // storage, no deltas) to avoid empty rows.
+        let roll = |id: &str| {
             let cpu_j = cpu.get(id).copied().unwrap_or(0);
             let (rx, tx) = bw.get(id).copied().unwrap_or((0, 0));
             let storage = jkbase_common::storage::project_storage_bytes(&data_dir, id);
             if cpu_j == 0 && rx == 0 && tx == 0 && storage == 0 {
-                continue;
+                return;
             }
             if let Err(e) = store.add_usage(id, hour_epoch, cpu_j, rx, tx, storage, elapsed) {
                 tracing::warn!(project = %id, error = %e, "metering: add_usage failed");
             }
+        };
+        for id in &projects {
+            roll(id);
+        }
+        for id in &db_vm_ids {
+            roll(id);
         }
 
-        // DB-attributable warm-seconds: accrue for every RUNNING VM that a managed-DB
-        // reach-plane relay is holding warm (`conn_count > 0`). This is the resource an
-        // idle external DB connection consumes — the VM would otherwise hibernate — so
-        // it's metered (billable), complementing the per-tenant warm-VM cap enforced at
-        // relay registration. The in-VM app->DB loopback path never registers a relay,
-        // so it's not double-counted here.
+        // DB-attributable warm-seconds: accrue for the VM a managed-DB reach-plane relay is holding
+        // warm (`conn_count > 0`). This is the resource an idle external DB connection consumes — the
+        // VM would otherwise hibernate — so it's metered (billable), complementing the per-tenant
+        // warm-VM cap enforced at relay registration. Relays are keyed by the BASE project, and the
+        // warm VM is the reach TARGET (the DB VM when dedicated, else the app VM) — attribute only to
+        // it, never both, so a dedicated project isn't double-billed. The in-VM app->DB path never
+        // registers a relay, so it's not double-counted here.
         if let Some(reg) = &db_registry {
             for (id, _pid) in &running_pids {
-                if reg.conn_count(id) > 0
+                let base = vm_identity::base_project_id(id);
+                if reg.conn_count(base) > 0
+                    && id == &db_reach_target_vm(&data_dir, base)
                     && let Err(e) = store.add_warm_usage(id, hour_epoch, elapsed)
                 {
                     tracing::warn!(project = %id, error = %e, "metering: add_warm_usage failed");

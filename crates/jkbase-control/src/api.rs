@@ -2232,25 +2232,37 @@ async fn get_project_usage(
         }
     }
     let month_start = crate::store::month_start_epoch(auth::timestamp());
-    match state.store.sum_month_to_date(&id, month_start) {
-        Ok(mtd) => Json(UsageResponse {
-            cpu_seconds: mtd.cpu_jiffies as f64 / 100.0,
-            rx_bytes: mtd.rx_bytes,
-            tx_bytes: mtd.tx_bytes,
-            storage_bytes: mtd.storage_bytes,
-            build_seconds: mtd.build_seconds,
-            warm_seconds: mtd.warm_seconds,
-            month_start,
-        })
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
+    let base = match state.store.sum_month_to_date(&id, month_start) {
+        Ok(mtd) => mtd,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    // Roll up the project's dedicated DB VM usage, if any (P2, decision #3). A dedicated project's
+    // DB runs in a sibling VM metered under `{id}.db`; a co-located or DB-less project has no such
+    // rows so this adds zero. The `.db` suffix mirrors jkbase-server's `vm_identity::vm_id` and can
+    // never collide with a real project id (`is_valid_project_id` forbids `.`); the `sum_month_to_date`
+    // `"{id}:"` prefix excludes `"{id}.db:"`, so the two never double-count.
+    let db = state
+        .store
+        .sum_month_to_date(&format!("{id}.db"), month_start)
+        .unwrap_or_default();
+    Json(UsageResponse {
+        cpu_seconds: base.cpu_jiffies.saturating_add(db.cpu_jiffies) as f64 / 100.0,
+        rx_bytes: base.rx_bytes.saturating_add(db.rx_bytes),
+        tx_bytes: base.tx_bytes.saturating_add(db.tx_bytes),
+        storage_bytes: base.storage_bytes.saturating_add(db.storage_bytes),
+        build_seconds: base.build_seconds.saturating_add(db.build_seconds),
+        warm_seconds: base.warm_seconds.saturating_add(db.warm_seconds),
+        month_start,
+    })
+    .into_response()
 }
 
 async fn get_project_quota(
