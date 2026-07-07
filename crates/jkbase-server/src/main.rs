@@ -1616,7 +1616,7 @@ async fn async_main() -> Result<()> {
         let domains = domain_for_wake.clone();
         let shipper = shipper_for_wake.clone();
         Box::pin(
-            async move { wake_project(&project_id, platform, routing, domains, shipper).await },
+            async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await },
         )
     });
 
@@ -3345,7 +3345,7 @@ async fn hibernate_project(
             // slips in during this function's own critical section instead fails its bounded
             // connect and the client retries, waking the VM cleanly.
             if db_registry
-                .map(|r| r.conn_count(project_id) > 0)
+                .map(|r| r.conn_count(vm_identity::base_project_id(project_id)) > 0)
                 .unwrap_or(false)
             {
                 return Ok(());
@@ -3565,9 +3565,13 @@ async fn wake_project(
     domain_map: DomainMap,
     shipper: Arc<LogShipper>,
 ) -> std::result::Result<String, jkbase_proxy::WakeError> {
+    // Quota + deployability gate on the BASE project: waking a DB VM (`{id}.db`, driven by the DB
+    // reach seams) is gated on its owning project's quota + content (the DB VM has no project row
+    // of its own), while `wake_project_inner` boots the rendered id. For an app VM base == id.
+    let base = vm_identity::base_project_id(project_id);
     {
         let plat = platform.lock().await;
-        if let Ok(Some(status)) = plat.store.get_quota_status(project_id)
+        if let Ok(Some(status)) = plat.store.get_quota_status(base)
             && status.bandwidth_blocked
         {
             return Err(jkbase_proxy::WakeError::OverQuota(
@@ -3581,13 +3585,13 @@ async fn wake_project(
         // and surface a clear "redeploy" rather than looping the proxy on the
         // transient "starting up" path. The boot reconcile marks these too; this also
         // catches a project whose artifacts go missing while the server is up.
-        if !project_can_wake(&plat.data_dir, &plat.store, project_id) {
-            if let Ok(Some(mut proj)) = plat.store.get_project(project_id)
+        if !project_can_wake(&plat.data_dir, &plat.store, base) {
+            if let Ok(Some(mut proj)) = plat.store.get_project(base)
                 && proj.state != ProjectState::NeedsRedeploy
             {
                 proj.state = ProjectState::NeedsRedeploy;
                 let _ = plat.store.update_project(&proj);
-                let _ = plat.store.remove_snapshot_meta(project_id);
+                let _ = plat.store.remove_snapshot_meta(base);
             }
             return Err(jkbase_proxy::WakeError::Gone(
                 "no deployable content — redeploy to bring it back".to_string(),
@@ -3597,6 +3601,26 @@ async fn wake_project(
     wake_project_inner(project_id, platform, routing, domain_map, shipper)
         .await
         .map_err(|e| jkbase_proxy::WakeError::Unavailable(e.to_string()))
+}
+
+/// Wake the VM that serves a project's managed DB for the reach plane, and return its IP. Resolves
+/// the target via [`db_reach_target_vm`] — the sibling DB VM (`{id}.db`) when `tier="dedicated"`,
+/// else the app VM — then delegates to [`wake_project`] (whose gates run on the base project). All
+/// four DB reach seams (external `:443` edge, console query/schema/status, backup, restore) route
+/// through this so a dedicated project is uniformly followed to its DB VM; the splice secret + dial
+/// on `:80` are unchanged (the DB VM's agent holds the same secret).
+async fn wake_db_reach(
+    project_id: &str,
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domain_map: DomainMap,
+    shipper: Arc<LogShipper>,
+) -> std::result::Result<String, jkbase_proxy::WakeError> {
+    let target = {
+        let plat = platform.lock().await;
+        db_reach_target_vm(&plat.data_dir, project_id)
+    };
+    wake_project(&target, platform, routing, domain_map, shipper).await
 }
 
 /// Decide whether a hibernation snapshot can be restored **byte-correct**, or whether the wake
@@ -3656,9 +3680,22 @@ async fn wake_project_inner(
         }
         Some(VmLifecycle::Waking) => {
             drop(plat);
+            // A DB VM is never proxy-routed (§ security: a routing-table entry would expose it via a
+            // `foo.db.jkbase.app` Host), so a concurrent waiter waits on its lifecycle and resolves
+            // its IP from the allocation, not the routing table. An app VM waits for its route.
+            if vm_identity::split_vm_id(project_id).1 == vm_identity::VmRole::Db {
+                return wait_for_db_vm_running(project_id, &platform).await;
+            }
             return wait_for_route(project_id, &platform, &routing).await;
         }
         Some(VmLifecycle::Running) => {
+            if vm_identity::split_vm_id(project_id).1 == vm_identity::VmRole::Db {
+                // Not in the routing table by design; the allocation is the DB VM's stable address.
+                if let Ok(Some(a)) = plat.store.get_vm_allocation(project_id) {
+                    return Ok(a.ip);
+                }
+                anyhow::bail!("DB VM {project_id} running but has no allocation");
+            }
             let table = routing.read().await;
             if let Some(ip) = table.get(project_id) {
                 return Ok(ip.clone());
@@ -4035,16 +4072,21 @@ async fn wake_project_inner(
         current_version,
     );
 
-    register_active_routes(
-        &routing,
-        &domain_map,
-        &active_domains,
-        project_id,
-        &alloc.ip,
-    )
-    .await;
+    // A DB VM is reached host-mediated only; it must NOT enter the routing table (a `foo.db` entry
+    // would be reachable via a `foo.db.jkbase.app` Host). Its address is the allocation IP, returned
+    // below. App VMs register their fast-path route + domains as before.
+    if vm_identity::split_vm_id(project_id).1 != vm_identity::VmRole::Db {
+        register_active_routes(
+            &routing,
+            &domain_map,
+            &active_domains,
+            project_id,
+            &alloc.ip,
+        )
+        .await;
+    }
 
-    info!(project = %project_id, ip = %alloc.ip, wake_outcome = outcome, "VM awake, routing active");
+    info!(project = %project_id, ip = %alloc.ip, wake_outcome = outcome, "VM awake");
     Ok(alloc.ip)
 }
 
@@ -4076,6 +4118,35 @@ async fn wait_for_route(
         }
     }
     anyhow::bail!("timed out waiting for {project_id} to wake");
+}
+
+/// The DB-VM analogue of [`wait_for_route`]: a non-driver DB-reach request waits for the elected
+/// wake driver to bring the DB VM to `Running`, then resolves its IP from the allocation (the DB VM
+/// is never in the routing table — see the `wake_project_inner` commit). Fast-fails the moment the
+/// driver leaves `Waking`/`Running` without success, so the reach caller retries promptly.
+async fn wait_for_db_vm_running(
+    project_id: &str,
+    platform: &Arc<Mutex<PlatformState>>,
+) -> Result<String> {
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let p = platform.lock().await;
+        match p.vm_states.get(project_id) {
+            Some(VmLifecycle::Running) => {
+                if let Ok(Some(a)) = p.store.get_vm_allocation(project_id) {
+                    return Ok(a.ip);
+                }
+                drop(p);
+                anyhow::bail!("DB VM {project_id} running but has no allocation");
+            }
+            Some(VmLifecycle::Waking) => {}
+            _ => {
+                drop(p);
+                anyhow::bail!("wake of DB VM {project_id} did not complete; retry");
+            }
+        }
+    }
+    anyhow::bail!("timed out waiting for DB VM {project_id} to wake");
 }
 
 async fn idle_detection_loop(
@@ -4129,10 +4200,11 @@ async fn idle_detection_loop(
             }
             // §5: never hibernate a project with a LIVE managed-DB relay — a realtime
             // subscription can be open but byte-silent, so last-byte activity alone would
-            // scale it to zero out from under the connection.
+            // scale it to zero out from under the connection. Relays are keyed by the BASE
+            // project, so a dedicated DB VM (`{id}.db`) candidate is kept warm by the same count.
             && db_registry
                 .as_ref()
-                .map(|r| r.conn_count(&project_id) == 0)
+                .map(|r| r.conn_count(vm_identity::base_project_id(&project_id)) == 0)
                 .unwrap_or(true);
 
             if should_hibernate {
@@ -4275,7 +4347,7 @@ async fn do_db_backup(
         .store
         .get_db_splice_secret(project_id)?
         .ok_or_else(|| anyhow::anyhow!("no reach-plane secret (managed DB not deployed?)"))?;
-    let ip = wake_project(
+    let ip = wake_db_reach(
         project_id,
         ctx.platform.clone(),
         ctx.routing.clone(),
@@ -4372,7 +4444,7 @@ async fn do_db_query(
         .get_db_splice_secret(&project_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no managed database deployed for this project".to_string())?;
-    let ip = wake_project(&project_id, platform, routing, domains, shipper)
+    let ip = wake_db_reach(&project_id, platform, routing, domains, shipper)
         .await
         .map_err(|e| format!("wake project: {e:?}"))?;
     let (path, method, body): (&str, &str, Vec<u8>) = match &op {
@@ -4476,7 +4548,7 @@ async fn do_db_restore(ctx: &DbBackupCtx, project_id: &str, backup_id: &str) -> 
         .store
         .get_db_splice_secret(project_id)?
         .ok_or_else(|| anyhow::anyhow!("no reach-plane secret"))?;
-    let ip = wake_project(
+    let ip = wake_db_reach(
         project_id,
         ctx.platform.clone(),
         ctx.routing.clone(),
@@ -5114,6 +5186,19 @@ fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
         .join("live")
         .join("_database.json")
         .exists()
+}
+
+/// The VM id the DB reach plane (external `:443` edge, console query/schema/status, backup relay)
+/// must wake + dial for a project's managed DB: the sibling **DB VM** (`{id}.db`) when
+/// `tier="dedicated"`, else the **app VM** (`id`) where the DB is co-located on loopback. Keyed by
+/// the BASE project id; the DB VM's agent holds the same splice secret, so only the target IP
+/// changes (the agent side is loopback-only and unchanged).
+fn db_reach_target_vm(data_dir: &Path, project_id: &str) -> String {
+    if project_is_dedicated(data_dir, project_id) {
+        vm_identity::vm_id(project_id, vm_identity::VmRole::Db)
+    } else {
+        project_id.to_string()
+    }
 }
 
 /// True when the project's live deployment declares `[database] tier = "dedicated"` (P2) — its
@@ -6699,5 +6784,40 @@ mod tests {
         assert!(!project_can_wake(&data, &store, "r"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dedicated_tier_parsing_is_fail_safe_and_drives_reach_target() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!("jkbase-tier-{nanos}"));
+        let live = |id: &str| data.join("hosting").join(id).join("live");
+        let write_db = |id: &str, json: &str| {
+            std::fs::create_dir_all(live(id)).unwrap();
+            std::fs::write(live(id).join("_database.json"), json).unwrap();
+        };
+
+        // No _database.json → co-located (a project with no managed DB).
+        assert!(!project_is_dedicated(&data, "none"));
+        assert_eq!(db_reach_target_vm(&data, "none"), "none");
+
+        // Explicit dedicated → the reach target is the DB VM.
+        write_db("ded", r#"{"engine":"rhypedb","schema":"s.rhype","tier":"dedicated"}"#);
+        assert!(project_is_dedicated(&data, "ded"));
+        assert_eq!(db_reach_target_vm(&data, "ded"), "ded.db");
+
+        // Explicit colocated, absent tier, and a garbage value all fail SAFE to co-located
+        // (the app VM), so a malformed tier never silently routes reach at a nonexistent VM.
+        write_db("colo", r#"{"engine":"rhypedb","schema":"s.rhype","tier":"colocated"}"#);
+        write_db("notier", r#"{"engine":"rhypedb","schema":"s.rhype"}"#);
+        write_db("junk", r#"not even json"#);
+        for id in ["colo", "notier", "junk"] {
+            assert!(!project_is_dedicated(&data, id), "{id} must be co-located");
+            assert_eq!(db_reach_target_vm(&data, id), id);
+        }
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
