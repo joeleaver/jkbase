@@ -19,6 +19,7 @@
 //! a guest that crashes its own FC only fails its own liveness check → its own project
 //! cold-boots.
 
+use crate::vm_identity::{split_vm_id, VmRole};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -31,7 +32,16 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoffRecord {
     pub schema_version: u32,
+    /// The **rendered** VM id (`project_id` for an App VM, `"{project_id}.db"` for a dedicated
+    /// DB VM) — equal to the `run/<id>` path segment this record lives under, so `read_strict`
+    /// rejects a misplaced/forged file.
     pub project_id: String,
+    /// Which of the project's Firecrackers this record describes. `#[serde(default)]` = App, so an
+    /// old (pre-P2) record with no `role` field re-adopts as an App VM unchanged — this is why
+    /// [`SCHEMA_VERSION`] does NOT bump for the DB-VM work (a bump would reject every in-flight
+    /// app survivor and bounce the whole fleet on the P2 rollout).
+    #[serde(default)]
+    pub role: VmRole,
     /// Firecracker OS pid + its `/proc/<pid>/stat` field-22 start time, captured from the
     /// SAME read so the pid is pinned to one incarnation (PID-reuse-proof).
     pub fc_pid: u32,
@@ -85,7 +95,13 @@ pub fn write(runtime_dir: &Path, id: &str, rec: &HandoffRecord) -> std::io::Resu
 pub fn read_strict(runtime_dir: &Path, id: &str) -> Option<HandoffRecord> {
     let body = std::fs::read(path(runtime_dir, id)).ok()?;
     let rec: HandoffRecord = serde_json::from_slice(&body).ok()?;
-    if rec.schema_version != SCHEMA_VERSION || rec.fc_starttime == 0 || rec.project_id != id {
+    // `role` must match what the id's `.db` suffix implies, so a record can't restore a DB VM as
+    // an app VM (or vice-versa) even if the file were moved between run dirs.
+    if rec.schema_version != SCHEMA_VERSION
+        || rec.fc_starttime == 0
+        || rec.project_id != id
+        || split_vm_id(id).1 != rec.role
+    {
         return None;
     }
     Some(rec)
@@ -130,6 +146,7 @@ mod tests {
         HandoffRecord {
             schema_version: SCHEMA_VERSION,
             project_id: id.to_string(),
+            role: split_vm_id(id).1,
             fc_pid: 4242,
             fc_starttime: 99,
             ip: "172.16.0.2".into(),
@@ -175,6 +192,23 @@ mod tests {
         // id mismatch (a record dropped into the wrong dir) ⇒ rejected
         write(&rt, "right", &rec("wrong")).unwrap();
         assert!(read_strict(&rt, "right").is_none());
+        // role/id-suffix mismatch: a DB-role record under an App-id dir ⇒ rejected (defends
+        // against a survivor being re-adopted as the wrong role).
+        let mut wrong_role = rec("appvm");
+        wrong_role.role = VmRole::Db;
+        write(&rt, "appvm", &wrong_role).unwrap();
+        assert!(read_strict(&rt, "appvm").is_none());
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+
+    #[test]
+    fn db_vm_record_round_trips_with_role() {
+        let rt = tmp("dbrole");
+        // A rendered DB VM id (`{project}.db`) parses to role Db and round-trips.
+        write(&rt, "proj.db", &rec("proj.db")).unwrap();
+        let got = read_strict(&rt, "proj.db").unwrap();
+        assert_eq!(got.role, VmRole::Db);
+        assert_eq!(got.project_id, "proj.db");
         let _ = std::fs::remove_dir_all(&rt);
     }
 

@@ -172,17 +172,70 @@ fn read_platform(store_dir: &Path) -> Result<PlatformManifest> {
 /// deploy; skip it on wake, where the blobs were already verified and are immutable).
 ///
 /// A deployment with no layered servers (static/function-only) yields an empty plan.
+/// Which parts of a project's deployment a per-VM image/plan includes (P2 dedicated DB VM).
+/// A co-located project's app VM is [`ImageContent::All`]; a dedicated project splits into an
+/// [`ImageContent::AppNoDb`] app VM (no rhypedb overlay / `_database.json`) and an
+/// [`ImageContent::DbOnly`] DB VM (rhypedb overlay + the DB inputs, no tenant servers). See
+/// `docs/managed-rhypedb-p2-design.md` §7.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageContent {
+    /// App + co-located DB — the v1/GA shape (the unchanged default).
+    All,
+    /// The app VM of a dedicated project: app layers/files, but the DB lives in a sibling VM — no
+    /// rhypedb overlay and no `_database.json` in the image, so the app agent can't start a
+    /// SECOND rhypedb over the same data disk (split-brain).
+    AppNoDb,
+    /// The dedicated DB VM: the rhypedb overlay + the DB inputs (`_database.json`, `_database/`)
+    /// ONLY — no tenant servers/routes/sites/functions (so the agent runs rhypedb and nothing
+    /// else, and big site content never lands in the DB image).
+    DbOnly,
+}
+
+impl ImageContent {
+    /// Whether app layers + app files (servers/routes/sites/functions/secrets) are included.
+    fn includes_app(self) -> bool {
+        matches!(self, ImageContent::All | ImageContent::AppNoDb)
+    }
+    /// Whether the managed-DB overlay + `_database.json`/`_database/` are included.
+    fn includes_db(self) -> bool {
+        matches!(self, ImageContent::All | ImageContent::DbOnly)
+    }
+}
+
+/// [`compute_layer_plan_with`] with the default [`ImageContent::All`] (app + co-located DB). The
+/// ergonomic default call shape, exercised by the build-path tests; the production deploy path
+/// always names an explicit [`ImageContent`], so the bin target sees no non-test caller.
+#[allow(dead_code)]
 pub fn compute_layer_plan(
     deployment_dir: &Path,
     store_dir: &Path,
     has_data_disk: bool,
     verify: bool,
 ) -> Result<LayerPlan> {
-    // Gather layered servers, sorted by name for a deterministic device assignment
-    // (so cold-boot deploy and wake agree on the same `_layers.json`).
+    compute_layer_plan_with(
+        deployment_dir,
+        store_dir,
+        has_data_disk,
+        verify,
+        ImageContent::All,
+    )
+}
+
+/// Resolve the erofs layer plan for one per-VM image, restricted to `content`. For a dedicated
+/// project this is called twice per deploy: once `AppNoDb` (the app VM) and once `DbOnly` (the DB
+/// VM), both from the same canonical `hosting/<id>/live` tree.
+pub fn compute_layer_plan_with(
+    deployment_dir: &Path,
+    store_dir: &Path,
+    has_data_disk: bool,
+    verify: bool,
+    content: ImageContent,
+) -> Result<LayerPlan> {
+    // Gather layered servers (skipped for a DB-only image), sorted by name for a deterministic
+    // device assignment (so cold-boot deploy and wake agree on the same `_layers.json`).
     let servers_dir = deployment_dir.join("_servers");
     let mut servers: Vec<(String, ServerLayerInfo)> = Vec::new();
-    if servers_dir.is_dir() {
+    if content.includes_app() && servers_dir.is_dir() {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&servers_dir)
             .with_context(|| format!("read {}", servers_dir.display()))?
             .filter_map(|e| e.ok())
@@ -208,7 +261,7 @@ pub fn compute_layer_plan(
     // (NOT a `_servers/*.json` entry — the DB is not a tenant server). It attaches the
     // shared rhypedb runtime layer over the platform base even for a DB-only project
     // (no tenant servers at all).
-    let has_db = deployment_dir.join("_database.json").exists();
+    let has_db = content.includes_db() && deployment_dir.join("_database.json").exists();
 
     if servers.is_empty() && !has_db {
         return Ok(LayerPlan::empty(has_data_disk));
@@ -442,6 +495,11 @@ impl Drop for TempCleanup {
 /// UNIQUE temp paths and published by a SINGLE atomic rename, so a concurrent or
 /// orphaned build can never leave a half-written or stage-colliding image, and the
 /// device map + attach order are always published together (no desync window).
+///
+/// The ergonomic default ([`ImageContent::All`]) call shape, exercised by the build-path tests;
+/// the production deploy path always names an explicit [`ImageContent`], so the bin target sees no
+/// non-test caller.
+#[allow(dead_code)]
 pub fn build_metadata_image(
     deployment_dir: &Path,
     plan: &LayerPlan,
@@ -450,6 +508,34 @@ pub fn build_metadata_image(
     binding: Option<&StorageBinding>,
     db_reach: Option<&DbReachFacts>,
     out: &Path,
+) -> Result<()> {
+    build_metadata_image_with(
+        deployment_dir,
+        plan,
+        secrets,
+        platform,
+        binding,
+        db_reach,
+        out,
+        ImageContent::All,
+    )
+}
+
+/// [`build_metadata_image`] restricted to `content` (P2). For a dedicated project this is called
+/// twice per deploy — `AppNoDb` for the app VM's image and `DbOnly` for the DB VM's — both from
+/// the one canonical live tree. `db_reach` is orthogonal to `content`: the app VM of a dedicated
+/// project is `AppNoDb` (no `_database.json`) yet still receives `_db_reach.json` so it can reach
+/// its sibling DB VM.
+#[allow(clippy::too_many_arguments)]
+pub fn build_metadata_image_with(
+    deployment_dir: &Path,
+    plan: &LayerPlan,
+    secrets: &BTreeMap<String, String>,
+    platform: &PlatformEgress,
+    binding: Option<&StorageBinding>,
+    db_reach: Option<&DbReachFacts>,
+    out: &Path,
+    content: ImageContent,
 ) -> Result<()> {
     let parent = out.parent().unwrap_or_else(|| Path::new("."));
     let base = out
@@ -467,10 +553,9 @@ pub fn build_metadata_image(
     let _cleanup = TempCleanup(vec![stage.clone(), tmp_img.clone()]);
 
     std::fs::create_dir_all(&stage)?;
-    // Copy the deployment tree except `_layers/` (the erofs blobs are attached as
-    // drives, not carried in the metadata filesystem).
-    copy_dir_except(deployment_dir, &stage, "_layers")
-        .with_context(|| format!("stage metadata from {}", deployment_dir.display()))?;
+    // Stage the deployment tree (minus the erofs blobs under `_layers/`, which attach as drives),
+    // restricted to `content`: the whole tree for an app VM, or only the DB inputs for a DB VM.
+    stage_deployment_tree(deployment_dir, &stage, content)?;
 
     // Inject the project's runtime secrets into each layered server's env — in the
     // PER-VM metadata image ONLY (the on-disk deployment artifact stays secret-free).
@@ -534,6 +619,38 @@ pub fn build_metadata_image(
     // already inside it).
     std::fs::rename(&tmp_img, out)
         .with_context(|| format!("publish metadata image {}", out.display()))?;
+    Ok(())
+}
+
+/// Stage the deployment tree into the metadata-image build dir, restricted to `content`. The
+/// erofs blobs under `_layers/` are always excluded (they attach as drives). For a DB-only image
+/// we copy ONLY the DB inputs — no tenant servers/routes/sites/functions, and none of a large
+/// site's static content — so the DB image stays lean and the agent has no app server to start.
+/// For an app-VM image we copy the whole tree, then (when the DB lives elsewhere) drop the DB
+/// inputs so the app agent can't act on a `_database.json` and co-locate a second rhypedb.
+fn stage_deployment_tree(deployment_dir: &Path, stage: &Path, content: ImageContent) -> Result<()> {
+    match content {
+        ImageContent::DbOnly => {
+            let db_json = deployment_dir.join("_database.json");
+            if db_json.exists() {
+                std::fs::copy(&db_json, stage.join("_database.json"))
+                    .context("stage _database.json for DB VM")?;
+            }
+            let db_dir = deployment_dir.join("_database");
+            if db_dir.is_dir() {
+                copy_dir_except(&db_dir, &stage.join("_database"), "")
+                    .context("stage _database/ for DB VM")?;
+            }
+        }
+        ImageContent::All | ImageContent::AppNoDb => {
+            copy_dir_except(deployment_dir, stage, "_layers")
+                .with_context(|| format!("stage metadata from {}", deployment_dir.display()))?;
+            if !content.includes_db() {
+                let _ = std::fs::remove_file(stage.join("_database.json"));
+                let _ = std::fs::remove_dir_all(stage.join("_database"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1241,6 +1358,105 @@ mod tests {
             vec!["/dev/vde", "/dev/vdc"]
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build a bun-server + managed-DB deployment fixture, returning (root, store, deploy).
+    #[cfg(test)]
+    fn bun_plus_db_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("lp-content-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_database")).unwrap();
+
+        let base_f = format!("sha256-{}.erofs", "a".repeat(64));
+        let bun_f = format!("sha256-{}.erofs", "b".repeat(64));
+        let rh_f = format!("sha256-{}.erofs", "e".repeat(64));
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        std::fs::write(store.join(&base_f), b"base").unwrap();
+        std::fs::write(store.join(&bun_f), b"bun").unwrap();
+        std::fs::write(store.join(&rh_f), b"rhypedb").unwrap();
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+        std::fs::write(
+            store.join("platform.json"),
+            format!(
+                r#"{{"base":{{"digest":"sha256:{a}","file":"{base_f}"}},"runtimes":{{"bun":{{"digest":"sha256:{b}","file":"{bun_f}"}},"rhypedb":{{"digest":"sha256:{e}","file":"{rh_f}"}}}}}}"#,
+                a = "a".repeat(64),
+                b = "b".repeat(64),
+                e = "e".repeat(64),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_servers/api.json"),
+            format!(r#"{{"app_layer":"{app_f}","runtime":"bun","port":3000}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            deploy.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"_database/schema.rhype","tier":"dedicated"}"#,
+        )
+        .unwrap();
+        std::fs::write(deploy.join("_database/schema.rhype"), b"type T { n: String }").unwrap();
+        (root, store, deploy)
+    }
+
+    #[test]
+    fn app_no_db_content_drops_the_managed_db_overlay() {
+        // A dedicated project's APP VM: bun server present, but NO rhypedb overlay / runtime — so
+        // the app agent can never co-locate a second rhypedb over the DB VM's data disk.
+        let (root, store, deploy) = bun_plus_db_fixture("appnodb");
+        let plan =
+            compute_layer_plan_with(&deploy, &store, false, false, ImageContent::AppNoDb).unwrap();
+
+        assert!(
+            plan.runtime_layers.database.is_none(),
+            "AppNoDb must NOT attach the managed-DB overlay"
+        );
+        assert!(
+            plan.runtime_layers.servers.contains_key("api"),
+            "the app server is still present"
+        );
+        // base(vdc) + bun(vdd) + app(vde) only — the rhypedb runtime blob is absent.
+        assert_eq!(plan.layer_paths.len(), 3, "no rhypedb runtime layer");
+        let rh_f = format!("sha256-{}.erofs", "e".repeat(64));
+        assert!(
+            !plan.layer_paths.iter().any(|p| p.ends_with(&rh_f)),
+            "rhypedb runtime must not be attached to the app VM"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn db_only_content_drops_the_app_servers() {
+        // The dedicated DB VM: rhypedb overlay present, and NO tenant server (even though a bun
+        // server exists in the tree) — the agent runs only rhypedb.
+        let (root, store, deploy) = bun_plus_db_fixture("dbonly");
+        let plan =
+            compute_layer_plan_with(&deploy, &store, true, false, ImageContent::DbOnly).unwrap();
+
+        assert!(
+            plan.runtime_layers.servers.is_empty(),
+            "DbOnly must NOT attach any tenant server"
+        );
+        let db = plan
+            .runtime_layers
+            .database
+            .as_ref()
+            .expect("DbOnly attaches the managed-DB overlay");
+        // Only base + rhypedb attach (no bun runtime, no app layer): base(vdc), rhypedb(vdd).
+        assert_eq!(plan.layer_paths.len(), 2, "only base + rhypedb");
+        assert_eq!(db.layers, vec!["/dev/vdd", "/dev/vdc"]);
+        let bun_f = format!("sha256-{}.erofs", "b".repeat(64));
+        let app_f = format!("sha256-{}.erofs", "c".repeat(64));
+        assert!(
+            !plan.layer_paths.iter().any(|p| p.ends_with(&bun_f) || p.ends_with(&app_f)),
+            "no app runtime/app layer in the DB image"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

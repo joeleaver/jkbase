@@ -60,6 +60,13 @@ const DB_SPLICE: TableDefinition<&str, &[u8]> = TableDefinition::new("db_splice_
 /// reads back), so the backup executor needs an independent copy here. `project_id` →
 /// token; overwritten each deploy, purged on teardown.
 const DB_ADMIN_TOKEN: TableDefinition<&str, &[u8]> = TableDefinition::new("db_admin_token");
+/// Per-project managed-DB **deployed tier** (`"colocated"` | `"dedicated"`), stamped on each
+/// successful deploy. The deploy path reads it BEFORE tearing down the old VM to refuse an
+/// in-place tier FLIP (which would strand the old-tier DB data on its disk — colocated data on
+/// `{id}.img`, dedicated data on `{id}.db.img` — and silently start an empty DB or orphan the
+/// sibling VM). Absent ⇒ first deploy / pre-P2 project ⇒ no flip to detect. Purged on teardown so
+/// a recreated same-slug project starts fresh.
+const DB_DEPLOYED_TIER: TableDefinition<&str, &[u8]> = TableDefinition::new("db_deployed_tier");
 /// Per-project managed-DB **backup catalog** (primary, key = `backup_id`) + its
 /// per-project index (`"{project_id}:{backup_id}"` → `backup_id`), mirroring the
 /// [`DB_ACCESS_KEYS`] primary+index split so list/teardown stay O(backups-for-this-project)
@@ -2042,6 +2049,39 @@ impl Store {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(DB_SPLICE)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Record the managed-DB tier (`"colocated"` | `"dedicated"`) a deploy just committed, so the
+    /// NEXT deploy can detect an in-place tier flip. See [`DB_DEPLOYED_TIER`].
+    pub fn set_deployed_tier(&self, project_id: &str, tier: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DB_DEPLOYED_TIER)?;
+            table.insert(project_id, tier.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The tier the project's last successful deploy committed, or `None` (first deploy / pre-P2).
+    pub fn get_deployed_tier(&self, project_id: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(DB_DEPLOYED_TIER)?;
+        match table.get(project_id)? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(v.value()).into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a project's recorded tier (teardown), so a recreated same-slug project starts fresh.
+    pub fn delete_deployed_tier(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DB_DEPLOYED_TIER)?;
             table.remove(project_id)?;
         }
         txn.commit()?;
