@@ -578,6 +578,14 @@ pub struct DatabaseConfig {
     /// parsed host-side at deploy. Omitted → the platform default.
     #[serde(default)]
     pub size: Option<String>,
+    /// Placement tier (P2). `colocated` (default) runs the DB as a second supervised
+    /// process inside the project's app VM (the v1/GA shape). `dedicated` runs it in a
+    /// **sibling DB VM** — noisy-neighbor isolation + per-role sizing, and the required
+    /// posture before any untrusted client reaches the engine. Opt-in: co-located stays
+    /// the default so the existing fleet is untouched. Unknown value → rejected at
+    /// preflight (fail-closed, mirrors [`Self::engine`]).
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 /// Resolved database engine. Only RhypeDB exists today; the enum is the fail-closed
@@ -586,6 +594,15 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseEngine {
     Rhypedb,
+}
+
+/// Resolved DB placement tier (P2). The fail-closed boundary for `[database].tier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseTier {
+    /// DB co-located in the app VM on loopback (v1/GA default).
+    Colocated,
+    /// DB in a dedicated sibling VM, reached host-mediated (P2).
+    Dedicated,
 }
 
 /// Parse a human data-disk size (`"4GiB"`, `"512MiB"`, `"1GB"`, `"2G"`, `"1048576"`)
@@ -637,10 +654,31 @@ impl DatabaseConfig {
         }
     }
 
+    /// Resolve the `tier` field. Omitted/empty → `Colocated` (the v1/GA default);
+    /// errors on an unrecognised value so `tier = "dedcated"` fails the deploy instead
+    /// of silently co-locating a DB the tenant asked to isolate.
+    pub fn tier(&self) -> Result<DatabaseTier> {
+        match self.tier.as_deref().map(str::trim) {
+            None | Some("") | Some("colocated") => Ok(DatabaseTier::Colocated),
+            Some("dedicated") => Ok(DatabaseTier::Dedicated),
+            Some(other) => {
+                anyhow::bail!("unknown database tier {other:?} (expected \"colocated\" or \"dedicated\")")
+            }
+        }
+    }
+
+    /// True when the DB should run in its own sibling VM (P2). Convenience over
+    /// [`Self::tier`]; treats an unresolved tier as not-dedicated (preflight
+    /// [`Self::validate`] rejects a bad value before this is consulted).
+    pub fn is_dedicated(&self) -> bool {
+        matches!(self.tier(), Ok(DatabaseTier::Dedicated))
+    }
+
     /// Validate the `[database]` section at deploy preflight: resolve the engine
-    /// (reject unknown), reject an empty `schema` path, and reject a malformed `size`.
-    /// File existence (the schema/rules files actually being present) is checked where
-    /// the source tree is available — the CLI and the build VM.
+    /// (reject unknown), reject an empty `schema` path, reject a malformed `size`, and
+    /// resolve the tier (reject unknown). File existence (the schema/rules files actually
+    /// being present) is checked where the source tree is available — the CLI and the
+    /// build VM.
     pub fn validate(&self) -> Result<()> {
         self.engine()?;
         if self.schema.trim().is_empty() {
@@ -648,6 +686,7 @@ impl DatabaseConfig {
         }
         self.size_mib()
             .context("[database]: `size` is not a valid data-disk size (e.g. \"4GiB\")")?;
+        self.tier()?;
         Ok(())
     }
 
@@ -813,11 +852,17 @@ impl ProjectConfig {
             Ok(DatabaseEngine::Rhypedb) => "rhypedb",
             Err(_) => return None,
         };
+        let tier = match db.tier() {
+            Ok(DatabaseTier::Colocated) => "colocated",
+            Ok(DatabaseTier::Dedicated) => "dedicated",
+            Err(_) => return None,
+        };
         serde_json::to_string_pretty(&serde_json::json!({
             "engine": engine,
             "schema": db.schema,
             "rules": db.rules,
             "size_mib": db.size_mib().ok().flatten(),
+            "tier": tier,
         }))
         .ok()
     }
@@ -1257,6 +1302,34 @@ mod tests {
     }
 
     #[test]
+    fn database_tier_resolves_defaults_colocated_and_fails_closed() {
+        // Omitted tier → colocated (the GA default); sidecar carries it explicitly.
+        let cfg: ProjectConfig =
+            toml::from_str("[database]\nschema = \"s.rhype\"\n").unwrap();
+        let db = cfg.database.as_ref().unwrap();
+        assert_eq!(db.tier().unwrap(), DatabaseTier::Colocated);
+        assert!(!db.is_dedicated());
+        assert!(cfg.database_json().unwrap().contains("\"tier\": \"colocated\""));
+
+        // Explicit dedicated opts into the sibling VM.
+        let cfg: ProjectConfig =
+            toml::from_str("[database]\nschema = \"s.rhype\"\ntier = \"dedicated\"\n").unwrap();
+        let db = cfg.database.as_ref().unwrap();
+        assert_eq!(db.tier().unwrap(), DatabaseTier::Dedicated);
+        assert!(db.is_dedicated());
+        db.validate().unwrap();
+        assert!(cfg.database_json().unwrap().contains("\"tier\": \"dedicated\""));
+
+        // Unknown tier is rejected at preflight (typo must fail, not silently co-locate).
+        let cfg: ProjectConfig =
+            toml::from_str("[database]\nschema = \"s.rhype\"\ntier = \"dedcated\"\n").unwrap();
+        let db = cfg.database.as_ref().unwrap();
+        assert!(db.tier().is_err());
+        assert!(db.validate().is_err());
+        assert!(!db.is_dedicated()); // fail-closed: a bad tier is not treated as dedicated
+    }
+
+    #[test]
     fn database_size_parses_units_rounds_and_fails_closed() {
         // Binary + decimal units, case-insensitive; rounds UP to whole MiB.
         for (s, want) in [
@@ -1274,6 +1347,7 @@ mod tests {
                 schema: "s.rhype".into(),
                 rules: None,
                 size: Some(s.into()),
+                tier: None,
             };
             assert_eq!(db.size_mib().unwrap(), Some(want), "size {s:?}");
             db.validate().unwrap();
@@ -1285,6 +1359,7 @@ mod tests {
             schema: "s.rhype".into(),
             rules: None,
             size: None,
+            tier: None,
         };
         assert_eq!(db.size_mib().unwrap(), None);
         // Sidecar carries an explicit null so the host reads Option::None.
@@ -1305,6 +1380,7 @@ mod tests {
                 schema: "s.rhype".into(),
                 rules: None,
                 size: Some(bad.into()),
+                tier: None,
             };
             assert!(db.size_mib().is_err(), "size {bad:?} should be rejected");
             assert!(db.validate().is_err(), "validate should reject {bad:?}");
