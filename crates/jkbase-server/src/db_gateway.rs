@@ -41,9 +41,10 @@ use crate::Store;
 use jkbase_control::store::VmAllocation;
 use jkbase_proxy::db_relay::DbRelayRegistry;
 use jkbase_proxy::{WakeCallback, WakeError};
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
@@ -53,8 +54,57 @@ use tracing::{debug, error, info, warn};
 const GLOBAL_MAX: usize = 2048;
 /// Per-project live-leg cap. A dedicated app can open many DB connections (an HTTP pool + N
 /// subscriptions), but not unbounded — this bounds the fd/relay footprint of one project. The
-/// source IP is the project, so this is also the per-source-IP bound.
-const PER_PROJECT_MAX: usize = 256;
+/// source IP is the project, so this is also the per-source-IP concurrency bound. Kept well below
+/// `GLOBAL_MAX` so no single project (source IP) can occupy the whole pool — an attacker needs
+/// `GLOBAL_MAX/PER_PROJECT_MAX` distinct provisioned dedicated projects to exhaust the leg for
+/// others (a per-TENANT leg budget is the tighter fix, tracked as a follow-up — the abuse is
+/// bounded to the attacker's own paid projects and never touches external reach/console, which use
+/// a separate pool).
+const PER_PROJECT_MAX: usize = 64;
+/// Per-source-IP accepted-connection rate (token bucket): steady tokens/sec + burst. The bridge
+/// opens the gateway port to EVERY guest, and each accepted connection does a control-store read
+/// (the alloc lookup) BEFORE it can be dropped as no-DB — so without a rate bound one guest could
+/// flood the shared control store with lookups (a CPU/store DoS) using zero payload bytes. A legit
+/// dedicated app opens few gateway connections (HTTP keep-alive reuses them; the native wire is
+/// long-lived), so this is generous headroom that still throttles a flood to nothing.
+const PER_IP_RATE_PER_SEC: f64 = 25.0;
+const PER_IP_BURST: f64 = 50.0;
+
+/// Per-source-IP token-bucket rate limiter for accepted gateway connections ([R2], see
+/// `PER_IP_RATE_PER_SEC`). The bucket map is bounded by the number of distinct source IPs on the
+/// host's `/24` island (≤253) — a guest can only ever present its own source-guard-pinned IP — so
+/// it needs no pruning.
+struct IpRateLimiter {
+    buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    rate_per_sec: f64,
+    burst: f64,
+}
+
+impl IpRateLimiter {
+    fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            rate_per_sec,
+            burst,
+        }
+    }
+
+    /// Consume one token for `ip`; `false` ⇒ over the rate → drop the connection cheaply, BEFORE
+    /// any control-store read. `now` is injected so the bucket math is unit-testable.
+    fn allow(&self, ip: IpAddr, now: Instant) -> bool {
+        let mut m = self.buckets.lock().unwrap();
+        let (tokens, last) = m.entry(ip).or_insert((self.burst, now));
+        let refill = now.saturating_duration_since(*last).as_secs_f64() * self.rate_per_sec;
+        *tokens = (*tokens + refill).min(self.burst);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 /// App→DB relays are long-lived (a subscription is byte-silent yet must stay open); a DEAD peer is
 /// reaped by TCP keepalive. `30d` ≈ "never" for the app-level idle watchdog, matching the edge.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 24 * 3600);
@@ -70,8 +120,17 @@ struct Gateway {
     store: Store,
     wake: WakeCallback,
     registry: Arc<DbRelayRegistry>,
+    /// This host's `host_id` — the gateway resolves `peer_ip → project` only among THIS host's
+    /// allocations. IP allocation is per-host-island (`next_free_octet` filters by host), so under
+    /// HA (a shared control store) two hosts legitimately reuse the same `172.16.0.x`; without this
+    /// filter the gateway could map a guest's IP to a DIFFERENT host's project → cross-tenant DB
+    /// reach ([R3]). Single-host: the store is local so this is a no-op, but it makes the 1:1
+    /// `peer_ip → project` map that the source-IP-only auth relies on correct by construction.
+    host_id: String,
     /// Post-auth global relay ceiling.
     global: Arc<Semaphore>,
+    /// Per-source-IP accepted-connection rate limiter ([R2]).
+    rate: IpRateLimiter,
     /// TCP port the in-VM agent listens on (`:80`).
     backend_port: u16,
 }
@@ -81,12 +140,13 @@ struct Gateway {
 /// console still work — and is logged, never fatal. Bound to `172.16.0.1` specifically (NOT
 /// `0.0.0.0`), so the gateway is off the public interface; `JKRUNFW` opens the two ports to the
 /// bridge, and the per-connection source-IP auth does the rest.
-pub async fn serve(store: Store, wake: WakeCallback, registry: Arc<DbRelayRegistry>) {
+pub async fn serve(store: Store, wake: WakeCallback, registry: Arc<DbRelayRegistry>, host_id: String) {
     use jkbase_common::config::{DB_GATEWAY_HTTP_PORT, DB_GATEWAY_IP, DB_GATEWAY_WIRE_PORT};
     serve_on(
         store,
         wake,
         registry,
+        host_id,
         DB_GATEWAY_IP,
         DB_GATEWAY_HTTP_PORT,
         DB_GATEWAY_WIRE_PORT,
@@ -98,11 +158,19 @@ pub async fn serve(store: Store, wake: WakeCallback, registry: Arc<DbRelayRegist
 /// [`serve`] with the bind IP + ports + agent backend port injected — production pins the
 /// well-known bridge gateway IP + `DB_GATEWAY_*` ports + `:80`; the on-box e2e binds `127.0.0.1`
 /// on ephemeral ports against a point-to-point DB VM.
+///
+/// NB the bind IP is `172.16.0.1` (the bridge gateway), NOT loopback — so unlike the control API /
+/// object store (`127.0.0.1`, which the kernel treats as martian on a physical NIC) it is not
+/// automatically shielded from an off-bridge packet on a multi-homed host. The load-bearing
+/// control is the source-IP auth below (an off-bridge / spoofed source matches no allocation →
+/// drop); `setup-bridge.sh` additionally DROPs `! -i jkbr0 -d $GW_IP` to those ports as
+/// defense-in-depth ([R1]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_on(
     store: Store,
     wake: WakeCallback,
     registry: Arc<DbRelayRegistry>,
+    host_id: String,
     ip: &str,
     http_port: u16,
     wire_port: u16,
@@ -112,7 +180,9 @@ pub(crate) async fn serve_on(
         store,
         wake,
         registry,
+        host_id,
         global: Arc::new(Semaphore::new(GLOBAL_MAX)),
+        rate: IpRateLimiter::new(PER_IP_RATE_PER_SEC, PER_IP_BURST),
         backend_port,
     });
 
@@ -161,6 +231,13 @@ impl Gateway {
         db_port: u16,
     ) -> Result<(), &'static str> {
         let _ = jkbase_wsproxy::set_relay_keepalive(&guest); // guest leg keepalive
+
+        // [R2] Per-source-IP rate gate FIRST — before any control-store read — so a guest that
+        // floods the bridge-open port can't drive unbounded alloc-table lookups (a store/CPU DoS).
+        // Over the rate ⇒ drop cheaply, having touched no backend and no store.
+        if !self.rate.allow(peer_ip, Instant::now()) {
+            return Err("per-ip rate limit");
+        }
 
         // Bound total in-flight relays BEFORE any project work — a cheap global gate.
         let _global = self
@@ -244,7 +321,7 @@ impl Gateway {
     /// the VM allocations — fine per-connection (a small table; the tenant's HTTP client keeps the
     /// connection alive, and the native wire is one long-lived connection).
     fn project_for_ip(&self, peer_ip: IpAddr) -> Option<String> {
-        project_for_ip_in(&self.store.list_vm_allocations().ok()?, peer_ip)
+        project_for_ip_in(&self.store.list_vm_allocations().ok()?, peer_ip, &self.host_id)
     }
 
     /// HTTP/1.1 `Upgrade` to `<vm_ip>:80/_jkbase/db` presenting the splice secret + the rhypedb
@@ -293,16 +370,22 @@ impl Gateway {
     }
 }
 
-/// Match a source IP to its owning project among the allocation table — the pinned, unforgeable
+/// Match a source IP to its owning project among THIS host's allocations — the pinned, unforgeable
 /// identity (the L2 source-guard guarantees `peer_ip` is the slot's own IP). Pure (the store read
-/// is the caller's), so the exact-match discipline is unit-testable. An app VM's alloc carries the
-/// BASE project id; a `.db` alloc carries `{base}.db` — but only app VMs run the loopback proxy, so
-/// in practice this resolves to the base id `get_db_splice_secret`/`wake_db_reach` expect.
-fn project_for_ip_in(allocs: &[VmAllocation], peer_ip: IpAddr) -> Option<String> {
+/// is the caller's), so the exact-match + host-filter discipline is unit-testable. An app VM's
+/// alloc carries the BASE project id; a `.db` alloc carries `{base}.db` — but only app VMs run the
+/// loopback proxy, so in practice this resolves to the base id `get_db_splice_secret`/
+/// `wake_db_reach` expect.
+///
+/// [R3] Filters by `host_id` exactly as `next_free_octet` does when ALLOCATING (an empty `host_id`
+/// = single-node / pre-HA = ours), so the `peer_ip → project` map is 1:1 on each host even when HA
+/// (a shared control store) legitimately reuses the same `172.16.0.x` on a different host's island.
+/// Without this, an IP-collision across hosts could resolve a guest to a foreign project.
+fn project_for_ip_in(allocs: &[VmAllocation], peer_ip: IpAddr, host_id: &str) -> Option<String> {
     let want = peer_ip.to_string();
     allocs
         .iter()
-        .find(|a| a.ip == want)
+        .find(|a| a.ip == want && (a.host_id.is_empty() || a.host_id == host_id))
         .map(|a| a.project_id.clone())
 }
 
@@ -311,12 +394,15 @@ mod tests {
     use super::*;
 
     fn alloc(project_id: &str, ip: &str) -> VmAllocation {
+        alloc_on(project_id, ip, "")
+    }
+    fn alloc_on(project_id: &str, ip: &str, host_id: &str) -> VmAllocation {
         VmAllocation {
             project_id: project_id.to_string(),
             ip: ip.to_string(),
             tap_device: "tap0".to_string(),
             mac: "AA:FC:00:00:00:02".to_string(),
-            host_id: String::new(),
+            host_id: host_id.to_string(),
             placement_epoch: 0,
         }
     }
@@ -333,29 +419,72 @@ mod tests {
 
         // The app VM's source IP resolves to the BASE project id.
         assert_eq!(
-            project_for_ip_in(&allocs, "172.16.0.2".parse().unwrap()).as_deref(),
+            project_for_ip_in(&allocs, "172.16.0.2".parse().unwrap(), "h").as_deref(),
             Some("foo")
         );
         assert_eq!(
-            project_for_ip_in(&allocs, "172.16.0.3".parse().unwrap()).as_deref(),
+            project_for_ip_in(&allocs, "172.16.0.3".parse().unwrap(), "h").as_deref(),
             Some("bar")
         );
         // The `.db` IP maps to `foo.db` (which has no splice secret of its own → the caller drops).
         assert_eq!(
-            project_for_ip_in(&allocs, "172.16.0.4".parse().unwrap()).as_deref(),
+            project_for_ip_in(&allocs, "172.16.0.4".parse().unwrap(), "h").as_deref(),
             Some("foo.db")
         );
         // An IP with no allocation (churn window / spoof attempt the source-guard already blocks)
         // maps to nothing → the caller drops the connection.
         assert_eq!(
-            project_for_ip_in(&allocs, "172.16.0.9".parse().unwrap()),
+            project_for_ip_in(&allocs, "172.16.0.9".parse().unwrap(), "h"),
             None
         );
         // No prefix/substring confusion: `172.16.0.2` must not match `172.16.0.20`-style entries.
         let allocs2 = vec![alloc("wide", "172.16.0.20")];
         assert_eq!(
-            project_for_ip_in(&allocs2, "172.16.0.2".parse().unwrap()),
+            project_for_ip_in(&allocs2, "172.16.0.2".parse().unwrap(), "h"),
             None
         );
+    }
+
+    #[test]
+    fn project_for_ip_filters_by_host_id() {
+        // [R3] Under HA two hosts legitimately hold the SAME IP on their own islands. The gateway
+        // on host Y must resolve its guest's IP to Y's project, NEVER X's foreign project.
+        let allocs = vec![
+            alloc_on("projX", "172.16.0.5", "hostX"),
+            alloc_on("projY", "172.16.0.5", "hostY"),
+        ];
+        assert_eq!(
+            project_for_ip_in(&allocs, "172.16.0.5".parse().unwrap(), "hostY").as_deref(),
+            Some("projY"),
+            "must pick THIS host's project, not the foreign host's colliding IP"
+        );
+        assert_eq!(
+            project_for_ip_in(&allocs, "172.16.0.5".parse().unwrap(), "hostX").as_deref(),
+            Some("projX")
+        );
+        // An empty host_id (single-node / pre-HA) always matches — the historical behavior.
+        let legacy = vec![alloc_on("legacy", "172.16.0.6", "")];
+        assert_eq!(
+            project_for_ip_in(&legacy, "172.16.0.6".parse().unwrap(), "hostZ").as_deref(),
+            Some("legacy")
+        );
+    }
+
+    #[test]
+    fn ip_rate_limiter_throttles_a_flood_and_refills() {
+        let lim = IpRateLimiter::new(10.0, 3.0); // 10/s steady, burst 3
+        let ip: IpAddr = "172.16.0.7".parse().unwrap();
+        let t0 = Instant::now();
+        // Burst of 3 is admitted instantly; the 4th (same instant) is refused.
+        assert!(lim.allow(ip, t0));
+        assert!(lim.allow(ip, t0));
+        assert!(lim.allow(ip, t0));
+        assert!(!lim.allow(ip, t0), "burst exhausted → throttled");
+        // After 1s, 10 tokens refill (capped at burst=3) → admits again.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(lim.allow(ip, t1));
+        // A different source IP has its own bucket.
+        let other: IpAddr = "172.16.0.8".parse().unwrap();
+        assert!(lim.allow(other, t0));
     }
 }

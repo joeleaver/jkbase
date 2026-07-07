@@ -127,6 +127,14 @@ iptables -w -A JKRUNFW -d "$GW_IP" -p tcp --dport 53 -j ACCEPT
 # the per-project authorization. (Ports must match jkbase-common config DB_GATEWAY_{HTTP,WIRE}_PORT.)
 # This is INPUT (guest→local gateway IP), so the FORWARD-chain SSRF/metadata DROP does not touch it.
 iptables -w -A JKRUNFW -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j ACCEPT
+# Defense-in-depth ([R1]): the DB gateway binds ${GW_IP} (a bridge IP, NOT loopback), so on a
+# multi-homed host Linux's weak-host model would otherwise deliver an OFF-bridge packet destined to
+# ${GW_IP} to INPUT — bypassing the `-i jkbr0`-scoped JKRUNFW above. DROP any such non-bridge packet
+# to the gateway ports outright (the load-bearing control is still the gateway's source-IP auth; an
+# off-bridge source matches no allocation and is dropped there too). Inserted at INPUT head.
+if ! iptables -w -C INPUT ! -i "$BRIDGE" -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j DROP 2>/dev/null; then
+    iptables -w -I INPUT 1 ! -i "$BRIDGE" -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j DROP
+fi
 if [ -n "${PUB_IPS// /}" ]; then
     for pub in $PUB_IPS; do
         iptables -w -A JKRUNFW -d "$pub" -p tcp -m multiport --dports 80,443 -j ACCEPT

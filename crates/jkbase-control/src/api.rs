@@ -776,6 +776,7 @@ async fn create_project(
     let _ = state.store.delete_all_access_keys(&id);
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
+    let _ = state.store.delete_deployed_tier(&id);
     // Managed-DB backups ([RB11]): drop the admin token + catalog rows, and reap the backup
     // blobs, so a recreated same-slug project can't inherit a prior tenant's snapshots.
     let _ = state.store.delete_db_admin_token(&id);
@@ -940,6 +941,7 @@ async fn delete_project(
                     // same-slug project must not inherit a prior tenant's DB credential.
                     let _ = state.store.delete_all_db_access_keys(&id);
                     let _ = state.store.delete_db_splice_secret(&id);
+                    let _ = state.store.delete_deployed_tier(&id);
                     // Managed-DB backups ([RB11]): admin token + catalog rows + backup blobs.
                     let _ = state.store.delete_db_admin_token(&id);
                     let _ = state.store.delete_all_db_backups(&id);

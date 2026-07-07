@@ -6329,7 +6329,14 @@ console.log("listening on " + port);
         // round-trip below fails clearly.
         let (gw_http, gw_wire) = (34230u16, 34231u16);
         tokio::spawn(crate::db_gateway::serve_on(
-            gw_store, wake, registry, "127.0.0.1", gw_http, gw_wire, 80,
+            gw_store,
+            wake,
+            registry,
+            String::new(), // host_id: the test alloc uses empty host_id → matches
+            "127.0.0.1",
+            gw_http,
+            gw_wire,
+            80,
         ));
 
         // ---- Drive a create+read through the leg (mirrors the OfflineDatabase app handler) -----
@@ -6556,7 +6563,8 @@ console.log("listening on " + port);
             Box::pin(async move { Ok(ip) })
         });
         let registry = jkbase_proxy::db_relay::DbRelayRegistry::new();
-        tokio::spawn(crate::db_gateway::serve(gw_store, wake, registry)); // binds 172.16.0.1:4230/4231
+        // host_id empty → the test alloc (also empty) matches. Binds 172.16.0.1:4230/4231.
+        tokio::spawn(crate::db_gateway::serve(gw_store, wake, registry, String::new()));
 
         // --- Boot the DB VM first (the app's very first query must find it up). ---
         let db_cfg = VmConfig {

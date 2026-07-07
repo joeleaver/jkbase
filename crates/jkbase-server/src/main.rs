@@ -1767,7 +1767,10 @@ async fn async_main() -> Result<()> {
             Box::pin(async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await })
         });
         let registry = db_relay_registry.clone();
-        tokio::spawn(async move { db_gateway::serve(store, gw_wake, registry).await });
+        // This host's id — the gateway resolves peer_ip→project only among THIS host's allocations
+        // ([R3], HA IP-collision safety); empty on single-node/pre-HA (matches every alloc).
+        let gw_host_id = platform.lock().await.host_id.clone();
+        tokio::spawn(async move { db_gateway::serve(store, gw_wake, registry, gw_host_id).await });
     }
 
     // Spawn log shipper loop (pulls guest logs into the persistent store)
@@ -2765,6 +2768,34 @@ async fn handle_deploy(
         }
     }
 
+    // [R4] Refuse an in-place managed-DB TIER FLIP (colocated↔dedicated) BEFORE any teardown, so a
+    // refused deploy leaves the running VM untouched. Flipping the tier between deploys would
+    // strand the existing DB data on the OLD tier's disk (colocated data on the app VM's
+    // `{id}.img`; dedicated data on the sibling `{id}.db.img`) and silently start an EMPTY DB (or
+    // orphan the sibling DB VM) — apparent total data loss on a config toggle. We only guard when
+    // BOTH the recorded prior deploy and the new deploy declare a managed DB (adding/removing
+    // `[database]` entirely, or a project that never had one, is not a data-stranding flip), so a
+    // plain project newly adding a dedicated DB is never refused. The tenant migrates explicitly:
+    // back up, recreate at the new tier, restore. (First flip of a pre-P2 project that never
+    // recorded a tier is not caught — dedicated is unreleased, so no such data exists yet.)
+    if check_project_has_database(&plat.data_dir, project_id) {
+        let new_tier = if project_is_dedicated(&plat.data_dir, project_id) {
+            "dedicated"
+        } else {
+            "colocated"
+        };
+        if let Ok(Some(prior)) = plat.store.get_deployed_tier(project_id)
+            && prior != new_tier
+        {
+            anyhow::bail!(
+                "project {project_id}: changing the managed-database [database] tier in place \
+                 ({prior} → {new_tier}) is not supported — it would strand your existing database \
+                 (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
+                 project at the new tier and restore into it."
+            );
+        }
+    }
+
     // A deploy/rollback supersedes any prior snapshot UNCONDITIONALLY — not only when
     // `Hibernated`. A VM that was restored-then-Running still carries its snapshot (restore
     // doesn't delete it), and the metadata image / layers it baked are about to be rewritten in
@@ -2935,6 +2966,15 @@ async fn handle_deploy(
     let mut db_reach = db_reach;
     if let Some(r) = db_reach.as_mut() {
         r.dedicated = dedicated;
+        // [R5] On a dedicated app VM the rhypedb admin token is dead weight (no co-located DB to
+        // inject it into) — and the app→DB leg makes a baked copy ACTIONABLE: a hostile app VM
+        // could read `_db_reach.json` and drive `/admin/*` (backup-stream exfil / restore-tamper)
+        // against its sibling DB VM through the leg. Strip it so the dedicated app VM is strictly
+        // better-isolated than co-located; only the DB VM's own image (`db_reach_for_db_vm`,
+        // where no tenant code runs) carries the token.
+        if dedicated {
+            r.admin_token.clear();
+        }
     }
     let plan = {
         let content_dir = content_dir.clone();
@@ -3088,6 +3128,18 @@ async fn handle_deploy(
     // this entirely (their DB is the loopback process inside the app VM booted above).
     if dedicated {
         boot_db_vm(project_id, &platform, db_reach_for_db_vm.as_ref()).await?;
+    }
+    // [R4] Stamp the tier this deploy committed so the NEXT deploy can detect an in-place flip.
+    // Record only for a managed-DB project (nothing to strand otherwise); drop the record when the
+    // project has no DB now (e.g. it removed `[database]`) so a later re-add isn't misread as a flip.
+    {
+        let plat = platform.lock().await;
+        if check_project_has_database(&plat.data_dir, project_id) {
+            let tier = if dedicated { "dedicated" } else { "colocated" };
+            let _ = plat.store.set_deployed_tier(project_id, tier);
+        } else {
+            let _ = plat.store.delete_deployed_tier(project_id);
+        }
     }
     Ok(())
 }
