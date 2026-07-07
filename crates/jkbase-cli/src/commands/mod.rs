@@ -593,20 +593,18 @@ async fn run_quota(
     let url = format!("{api}/projects/{project_id}/quota");
 
     if set_storage_gib.is_some() || set_bandwidth_gib.is_some() {
-        // Fill any unset field from the current values so a partial set is fine.
-        let cur: serde_json::Value = client.get(&url).send().await?.json().await?;
-        let storage = match set_storage_gib {
-            Some(g) => (g * GIB) as u64,
-            None => cur["storage_bytes_max"].as_u64().unwrap_or(0),
-        };
-        let bw = match set_bandwidth_gib {
-            Some(g) => (g * GIB) as u64,
-            None => cur["bandwidth_bytes_per_month"].as_u64().unwrap_or(0),
-        };
-        let mut post = client.post(&url).json(&serde_json::json!({
-            "storage_bytes_max": storage,
-            "bandwidth_bytes_per_month": bw,
-        }));
+        // Send ONLY the caps the operator actually passed; the server merges them onto the
+        // project's current values (an omitted cap is preserved, never zeroed). Sending a
+        // full body with defaulted-to-0 caps used to silently zero an untouched cap under
+        // --admin-token (the clamp that would have masked it is skipped for admins).
+        let mut body = serde_json::Map::new();
+        if let Some(g) = set_storage_gib {
+            body.insert("storage_bytes_max".into(), ((g * GIB) as u64).into());
+        }
+        if let Some(g) = set_bandwidth_gib {
+            body.insert("bandwidth_bytes_per_month".into(), ((g * GIB) as u64).into());
+        }
+        let mut post = client.post(&url).json(&serde_json::Value::Object(body));
         if let Some(tok) = &admin_token {
             post = post.header("X-Admin-Token", tok);
         }
@@ -624,7 +622,13 @@ async fn run_quota(
         );
     }
 
-    let v: serde_json::Value = client.get(&url).send().await?.json().await?;
+    // Pass the admin token on the read too, so an operator setting a quota on a tenant's
+    // project sees the real values back (the GET is owner-scoped otherwise → 404→default).
+    let mut get = client.get(&url);
+    if let Some(tok) = &admin_token {
+        get = get.header("X-Admin-Token", tok);
+    }
+    let v: serde_json::Value = get.send().await?.json().await?;
     println!("Quota for '{project_id}':");
     println!(
         "  Storage cap:   {}",
