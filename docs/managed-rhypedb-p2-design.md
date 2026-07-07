@@ -213,3 +213,92 @@ Introduce `VmKey{project_id, role}` and thread it through, **additively** (App r
 - Config: `DatabaseConfig` `crates/jkbase-common/src/config.rs:561-581`, `size_mib` `:657`,
   `database_json` `:807`.
 - Re-adoption: `adopt_or_reap_runtime_vms` `main.rs:4980`, `HandoffRecord` `handoff.rs:32`.
+
+---
+
+## 7. Grounded implementation seams (post-recon, 2026-07-07 — build guide)
+
+Three full code recons (map-access inventory + reach plane + build/boot side) pinned the exact
+seams. This section is the load-bearing build guide; it supersedes any earlier hand-waving.
+
+### 7.1 The two id "flavors" (the whole threading rule in one line)
+- **Base `project_id`** (`foo`) — anything that reads the *deployment / store / routes / quota*:
+  `hosting/<id>/live/…`, `store.get_project`, `get_quota_status`, `list_active_domains_for_project`,
+  `store.list_projects`, backups (`db-backups/<id>`). The DB VM has **no** `hosting/foo.db/` — it
+  reuses the app's `hosting/foo/live/` deployment content.
+- **Rendered `vm_id`** (`foo` for App, `foo.db` for Db) — anything that is *per-VM-instance*:
+  the 5 in-memory maps, `run/<id>`, `snapshots/<id>`, `content-images/<id>.ext4`, data disk
+  `<id>.img` + lease scope, cgroup leaf, FC api-sock, `VmAllocation` row, `handoff.json`.
+- `vm_id(project_id, role)`: App→`project_id`, Db→`format!("{project_id}.db")`.
+  `split_vm_id(id)`: `id.strip_suffix(".db")` → `(base, Db)` else `(id, App)`. Collision-proof:
+  `is_valid_project_id` forbids `.` in real ids, and `foo-db` ends in `-db` not `.db`.
+
+### 7.2 Builders need NO app/DB flag change for the DB VM — they're data-driven (recon B)
+`compute_layer_plan` + `build_metadata_image` + the agent DB supervisor already treat "DB-only"
+(a tree with `_database.json` + empty `_servers/`) as first-class: empty `_servers/` ⇒ `start_all`
+starts nothing; `_layers.json.database=Some` + `_database/schema.rhype` ⇒ agent runs rhypedb-only.
+Agent reach side is **loopback-only** (`handle_db_splice`→`127.0.0.1:4201`), so the DB VM's agent
+needs **zero IP changes** — it splices to its own loopback given the same `_db_reach.json` secrets.
+
+**Decision — build BOTH images from the SAME canonical `hosting/foo/live/` tree via additive
+`_with(…, ImageContent)` variants** (`ImageContent ∈ {All, AppNoDb, DbOnly}`); the bare
+`compute_layer_plan`/`build_metadata_image` delegate to `All` so the ~20 existing build-path/test
+callers are untouched. Only the deploy path uses the `_with` variants.
+- **Colocated app VM** = `All` (today's behavior, unchanged).
+- **Dedicated app VM** = `AppNoDb`: app layers + app files, but **skip the rhypedb overlay and skip
+  copying `_database.json`/`_database/`** — else the app agent co-locates a SECOND rhypedb → two
+  writers / split-brain (FATAL). `_db_reach.json` is orthogonal (gated by the `db_reach` arg), so
+  the app VM still gets reach facts (splice secret + the DB VM endpoint) for the app→DB leg.
+- **Dedicated DB VM** = `DbOnly`: rhypedb overlay + `_database.json`/`_database/` only; no app
+  layers/files/secrets (avoids copying big site trees into the DB image).
+
+`_database.json` stays in `hosting/foo/live/` for BOTH tiers (keyed by base id), so
+`check_project_has_database` / `data_disk_mib_for` work unchanged. App-VM `has_disk` when dedicated =
+`has_volumes || disk.exists` (NOT `has_database`) — the app isn't forced a disk for a DB it doesn't host.
+
+### 7.3 Reach seams (recon A) — 4 IP-selection sites, all resolve to the app VM today
+Redirect to the DB VM's IP (`wake` the `.db` VmKey) when dedicated:
+`db_ingress.rs:245` (external `:443` edge) · `do_db_query` `main.rs:4071` · `do_db_backup:3974` ·
+`do_db_restore:4175`. Each then dials `(vm_ip, 80)` with `x-jkbase-db-secret`. `DbRelayRegistry`
+(`db_relay.rs`) is project-keyed, no IP — but bakes "one warm VM/project"; the warm VM becomes the
+DB VM. App→DB leg: bake the DB VM endpoint into the APP VM's `_db_reach.json` (new field), app
+reaches it via own-agent→host→DB-VM (host-mediated, F2), splice-gated on the app leg too.
+
+### 7.4 Landmine checklist (must ALL land with the boot — several are data-loss / cross-tenant)
+1. **`reconcile_orphans_on_boot` `main.rs:2183`** — `registered` = base ids only; every reap site
+   (content-images `.ext4` :2210, **data-disks `.img` :2243 → loop-detach + rm = DB DATA LOSS**,
+   `run/snapshots` dirs :2281) must treat a `.db` artifact as registered iff its **base** is (map via
+   `split_vm_id`). Without this a clean restart destroys the DB disk.
+2. **`handle_teardown` `main.rs:2078`** — reap the sibling `.db` VM too (stop/reap_firecracker[dot-
+   escaped]/disk_tokens/`dd.destroy(foo.db)`/`remove_vm_allocation(foo.db)`/teardown its TAP/remove
+   `content-images/foo.db.ext4`+`data-disks/foo.db.{img,holder}`+`snapshots/foo.db`+`run/foo.db`),
+   else delete leaks the DB VM + disk + IP.
+3. **pkill dot-escape** — `reap_firecracker:4618` + `force_stop:5272` build ERE `/{id}/firecracker\.sock`;
+   an unescaped `foo.db` matches `fooadb` → **cross-tenant SIGKILL**. Escape `.` in the rendered id.
+4. **re-adoption `finish_adoption`/`adopt_one_survivor` `main.rs:5038-5218`** — `id` is the rendered
+   path segment; use **base** for `store.get_project`/`get_quota_status`/`list_active_domains`, **skip
+   route registration for Db**, keep lease/disk/maps on the rendered id. Assert role==path suffix.
+5. **snapshot version-gate fork** — `SnapshotMeta.deployment_version` gate (`snapshot_restore_decision`
+   `main.rs:3323`, stamped hibernate :3199 / read wake :3459) is app-deploy-version keyed; a DB VM's
+   snapshot is valid across app redeploys → fork the gate per role (DB uses a DB-stable version token,
+   e.g. schema/`_database.json` hash, not the app `current_version`).
+6. **`HandoffRecord` role** — add `#[serde(default)] role: VmRole` (VmRole default = App). **Do NOT bump
+   `SCHEMA_VERSION`** (read_strict rejects a bumped record → would bounce the whole app fleet on the
+   P2 rollout); a serde-default field keeps old app records re-adoptable.
+7. **DB-VM idle hibernation** — the idle loop (`main.rs:3821`) seeds every Running VM and hibernates on
+   proxy silence; app→DB host-mediated queries are invisible to the proxy `ActivityTracker`, so the DB
+   VM could scale to zero under an active app. Mirror the `conn_count>0` guard for host-mediated DB
+   activity (or couple the DB VM's idle clock to the app VM's).
+8. **metering** (`main.rs:5466`) — DB-VM cpu (`running_pids`) + bw (`allocs`) are captured under the
+   `foo.db` key but the per-project roll iterates `list_projects()` (base) → dropped. Add a `.db` roll
+   (`add_usage("foo.db",…)`); roll up base+`.db` in the usage GET / console (decision #3). Over-quota
+   enforcement should hibernate BOTH VMs.
+9. **`cleanup_orphans` `main.rs:2032`** — iterates `list_vm_allocations()` (sees the `foo.db` row);
+   make the reachability probe / alloc-reap role-aware so a hibernated DB VM's alloc isn't churned.
+
+### 7.5 Cohesion (CI `-D warnings`)
+`--all-targets` compiles the lib without test code, so any `VmRole::Db` / `vm_id` / `VmSize` /
+`ImageContent::DbOnly` constructed *only in tests* is dead → build fails. Everything above lands in
+one reviewed branch; the first compilable unit is foundation + DB-VM boot + the §7.4 teardown/reconcile
+safety (a boot that reaps its own disk is worse than no boot). Sub-commits are fine if each compiles
+clean (every newly-introduced item used in non-test code by the same commit).
