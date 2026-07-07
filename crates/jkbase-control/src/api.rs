@@ -2124,26 +2124,77 @@ pub struct QuotaResponse {
     pub blocked_reason: Option<String>,
 }
 
-fn default_build_seconds_quota() -> u64 {
-    crate::store::DEFAULT_QUOTA.build_seconds_per_month
-}
-fn default_max_objects_quota() -> u64 {
-    crate::store::DEFAULT_QUOTA.max_objects
-}
-fn default_max_buckets_quota() -> u64 {
-    crate::store::DEFAULT_QUOTA.max_buckets
+/// A partial quota update. EVERY cap is optional: an omitted field (`None`) keeps the
+/// project's CURRENT effective value rather than resetting it. This makes a partial set
+/// safe from ANY client — load-bearing under `--admin-token`, where the clamp is skipped
+/// and a spurious `0` would silently zero an untouched cap (the prod footgun that zeroed
+/// `oxidegen`'s storage cap while only raising its bandwidth, 2026-07-02).
+///
+/// `deny_unknown_fields` rejects a misspelled cap (e.g. `storage_gib`) instead of
+/// silently dropping it — without required fields there is otherwise nothing to force a
+/// 422 on a typo'd body.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SetQuotaRequest {
+    #[serde(default)]
+    pub storage_bytes_max: Option<u64>,
+    #[serde(default)]
+    pub bandwidth_bytes_per_month: Option<u64>,
+    #[serde(default)]
+    pub build_seconds_per_month: Option<u64>,
+    #[serde(default)]
+    pub max_objects: Option<u64>,
+    #[serde(default)]
+    pub max_buckets: Option<u64>,
 }
 
-#[derive(Deserialize)]
-pub struct SetQuotaRequest {
-    pub storage_bytes_max: u64,
-    pub bandwidth_bytes_per_month: u64,
-    #[serde(default = "default_build_seconds_quota")]
-    pub build_seconds_per_month: u64,
-    #[serde(default = "default_max_objects_quota")]
-    pub max_objects: u64,
-    #[serde(default = "default_max_buckets_quota")]
-    pub max_buckets: u64,
+impl SetQuotaRequest {
+    /// True if no cap was supplied at all. Such a body would merge to a pure no-op yet
+    /// still persist an override row (flipping `overridden` true) and return 200 — a
+    /// silent-success footgun, so callers reject it rather than write it.
+    fn is_empty(&self) -> bool {
+        self.storage_bytes_max.is_none()
+            && self.bandwidth_bytes_per_month.is_none()
+            && self.build_seconds_per_month.is_none()
+            && self.max_objects.is_none()
+            && self.max_buckets.is_none()
+    }
+}
+
+/// Merge a partial [`SetQuotaRequest`] onto the project's CURRENT effective limits.
+/// An omitted cap keeps `current` (never resets to 0). A present cap is clamped to the
+/// platform default for tenants; a platform-admin write (`is_admin`) may raise it above
+/// the default. Pure so the merge/clamp is unit-testable without an `AppState`.
+fn resolve_quota(
+    req: &SetQuotaRequest,
+    current: &crate::store::QuotaLimits,
+    is_admin: bool,
+) -> crate::store::QuotaLimits {
+    let field = |requested: Option<u64>, current: u64, default: u64| match requested {
+        None => current,
+        Some(v) if is_admin => v,
+        Some(v) => v.min(default),
+    };
+    let d = crate::store::DEFAULT_QUOTA;
+    crate::store::QuotaLimits {
+        storage_bytes_max: field(
+            req.storage_bytes_max,
+            current.storage_bytes_max,
+            d.storage_bytes_max,
+        ),
+        bandwidth_bytes_per_month: field(
+            req.bandwidth_bytes_per_month,
+            current.bandwidth_bytes_per_month,
+            d.bandwidth_bytes_per_month,
+        ),
+        build_seconds_per_month: field(
+            req.build_seconds_per_month,
+            current.build_seconds_per_month,
+            d.build_seconds_per_month,
+        ),
+        max_objects: field(req.max_objects, current.max_objects, d.max_objects),
+        max_buckets: field(req.max_buckets, current.max_buckets, d.max_buckets),
+    }
 }
 
 #[derive(Serialize)]
@@ -2206,9 +2257,14 @@ async fn get_project_quota(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
+    // Owner-scoped for tenants; a platform admin may read any project's quota (so the
+    // CLI's post-`set` confirmation read shows the real values instead of a 404→default
+    // when an operator sets a quota on a tenant's project via `--admin-token`).
+    let is_admin = state.is_admin_request(&headers);
     match state.store.get_project(&id) {
-        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        Ok(Some(p)) if is_admin || p.tenant_id.as_deref() == Some(&tenant.id) => {}
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -2241,12 +2297,15 @@ async fn get_project_quota(
     .into_response()
 }
 
-/// Set a per-project quota override. Owner-scoped and CLAMPED to the platform
-/// defaults for tenants: a tenant can only *restrict* their own limits, never
-/// raise them above [`DEFAULT_QUOTA`] (untrusted-tenant threat model). A platform
-/// operator presenting a valid `X-Admin-Token` (server `--admin-token`) bypasses
-/// both the owner-scoping and the clamp, so it can grant a specific project a
-/// higher limit. No admin token configured ⇒ no admin path: every set is clamped.
+/// Set a per-project quota override by merging a PARTIAL request onto the project's
+/// current effective limits. Owner-scoped. A cap the request actually carries is CLAMPED
+/// to [`DEFAULT_QUOTA`] for tenants — a tenant can only *restrict* the caps it sets, never
+/// raise one above the default (untrusted-tenant threat model); a cap it omits is left at
+/// its current value (so a tenant write can't disturb an admin-granted above-default cap
+/// it didn't touch). A platform operator presenting a valid `X-Admin-Token` (server
+/// `--admin-token`) bypasses both the owner-scoping and the clamp, so it can grant a
+/// higher limit. No admin token configured ⇒ no admin path: every set is clamped. A body
+/// carrying no cap at all is rejected (400) rather than written as a no-op override.
 async fn set_project_quota(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
@@ -2269,31 +2328,37 @@ async fn set_project_quota(
         )
             .into_response();
     }
-    // Tenants may only self-restrict (clamp to defaults); a platform-admin
-    // override may raise a limit ABOVE the default.
-    let limit = |requested: u64, default: u64| {
-        if is_admin {
-            requested
-        } else {
-            requested.min(default)
+    // A request that sets nothing is a no-op that would still write an override row and
+    // report success — reject it so a mistyped/empty body surfaces as an error.
+    if req.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "no quota fields provided".into(),
+            }),
+        )
+            .into_response();
+    }
+    // Merge the partial request onto the project's CURRENT effective limits: an omitted
+    // cap is preserved (NOT zeroed), a present cap is clamped to default for tenants and
+    // may be raised above it by an admin. Reading `current` here (not on the client) is
+    // what makes a partial admin set safe cross-tenant — the CLI's own GET is owner-scoped
+    // and would 404→0 for a project the admin doesn't own. FAIL CLOSED on a store read
+    // error: never merge onto DEFAULT_QUOTA, which would silently claw back an
+    // above-default admin grant on the caps this request leaves untouched.
+    let current = match state.store.get_quota(&id) {
+        Ok(limits) => limits,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to read current quota: {e}"),
+                }),
+            )
+                .into_response();
         }
     };
-    let limits = crate::store::QuotaLimits {
-        storage_bytes_max: limit(
-            req.storage_bytes_max,
-            crate::store::DEFAULT_QUOTA.storage_bytes_max,
-        ),
-        bandwidth_bytes_per_month: limit(
-            req.bandwidth_bytes_per_month,
-            crate::store::DEFAULT_QUOTA.bandwidth_bytes_per_month,
-        ),
-        build_seconds_per_month: limit(
-            req.build_seconds_per_month,
-            crate::store::DEFAULT_QUOTA.build_seconds_per_month,
-        ),
-        max_objects: limit(req.max_objects, crate::store::DEFAULT_QUOTA.max_objects),
-        max_buckets: limit(req.max_buckets, crate::store::DEFAULT_QUOTA.max_buckets),
-    };
+    let limits = resolve_quota(&req, &current, is_admin);
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
             storage_bytes_max: limits.storage_bytes_max,
@@ -4300,7 +4365,90 @@ fn to_response(p: &Project) -> ProjectResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ct_eq, hardlink_clone_dir};
+    use super::{ct_eq, hardlink_clone_dir, resolve_quota, SetQuotaRequest};
+    use crate::store::{QuotaLimits, DEFAULT_QUOTA};
+
+    const GIB: u64 = 1 << 30;
+
+    // A partial quota update must PRESERVE the caps the caller didn't pass, not reset
+    // them to 0. This is the prod footgun (2026-07-02): `--set-bandwidth-gib 1024` under
+    // `--admin-token` briefly zeroed an untouched storage cap.
+    #[test]
+    fn partial_quota_set_preserves_unspecified_caps() {
+        // A project carrying an admin-granted storage cap ABOVE the platform default.
+        let current = QuotaLimits {
+            storage_bytes_max: 100 * GIB,
+            bandwidth_bytes_per_month: 50 * GIB,
+            build_seconds_per_month: 4242,
+            max_objects: 5000,
+            max_buckets: 9,
+        };
+
+        // Admin raises ONLY bandwidth (above default); every other cap omitted.
+        let req = SetQuotaRequest {
+            bandwidth_bytes_per_month: Some(200 * GIB),
+            ..Default::default()
+        };
+        let out = resolve_quota(&req, &current, true);
+        assert_eq!(out.bandwidth_bytes_per_month, 200 * GIB, "admin may raise it");
+        // The untouched caps are preserved — NOT zeroed (the bug), NOT clamped to default.
+        assert_eq!(out.storage_bytes_max, current.storage_bytes_max);
+        assert_eq!(out.build_seconds_per_month, current.build_seconds_per_month);
+        assert_eq!(out.max_objects, current.max_objects);
+        assert_eq!(out.max_buckets, current.max_buckets);
+
+        // A non-admin tenant partial set: the omitted (admin-granted, above-default)
+        // storage cap is preserved, NOT clawed back to the default; the passed cap clamps.
+        let req_tenant = SetQuotaRequest {
+            bandwidth_bytes_per_month: Some(u64::MAX),
+            ..Default::default()
+        };
+        let out2 = resolve_quota(&req_tenant, &current, false);
+        assert_eq!(
+            out2.storage_bytes_max, current.storage_bytes_max,
+            "omitted cap kept as current, not reset to default"
+        );
+        assert_eq!(
+            out2.bandwidth_bytes_per_month, DEFAULT_QUOTA.bandwidth_bytes_per_month,
+            "a tenant's explicitly-passed cap is clamped to the platform default"
+        );
+    }
+
+    // The wire contract the CLI now relies on: a partial JSON body (only the passed caps)
+    // deserializes with every untouched cap as `None`, so the merge preserves them.
+    #[test]
+    fn partial_quota_body_deserializes_untouched_caps_as_none() {
+        let req: SetQuotaRequest =
+            serde_json::from_str(r#"{"bandwidth_bytes_per_month": 1099511627776}"#).unwrap();
+        assert_eq!(req.bandwidth_bytes_per_month, Some(1099511627776));
+        assert_eq!(req.storage_bytes_max, None);
+        assert_eq!(req.build_seconds_per_month, None);
+        assert_eq!(req.max_objects, None);
+        assert_eq!(req.max_buckets, None);
+
+        let current = QuotaLimits {
+            storage_bytes_max: 100 * GIB,
+            ..DEFAULT_QUOTA
+        };
+        let out = resolve_quota(&req, &current, true);
+        assert_eq!(out.storage_bytes_max, 100 * GIB, "untouched cap preserved");
+        assert_eq!(out.bandwidth_bytes_per_month, 1099511627776);
+    }
+
+    // The set handler rejects a body that carries no cap (would write a no-op override),
+    // and serde rejects a misspelled cap rather than silently dropping it.
+    #[test]
+    fn empty_and_mistyped_quota_bodies_are_rejected() {
+        let empty: SetQuotaRequest = serde_json::from_str("{}").unwrap();
+        assert!(empty.is_empty(), "an empty body sets nothing → rejected by the handler");
+
+        let full: SetQuotaRequest =
+            serde_json::from_str(r#"{"storage_bytes_max": 1}"#).unwrap();
+        assert!(!full.is_empty());
+
+        // A typo'd cap name is a deserialize error (deny_unknown_fields), not a silent drop.
+        assert!(serde_json::from_str::<SetQuotaRequest>(r#"{"storage_gib": 50}"#).is_err());
+    }
 
     #[test]
     fn ct_eq_matches_only_identical_bytes() {
