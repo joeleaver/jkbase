@@ -10,6 +10,7 @@ mod mirror;
 mod objectstore_service;
 mod rootfs_cas;
 mod socket_activation;
+mod vm_identity;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -2134,16 +2135,64 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
         // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
         // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
         // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
-        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
-        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
+        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
+        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
+        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
+        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
         .status()
         .await;
     if let Some(a) = alloc {
         let _ = teardown_tap(&a.tap_device).await;
     }
     remove_project_artifacts(&data_dir, project_id).await;
+    // Reap the sibling dedicated DB VM (`{id}.db`), if any — its VM handle, Firecracker, data disk,
+    // lease, snapshot, IP/TAP allocation, and on-disk artifacts. Unconditional + idempotent: a
+    // co-located or DB-less project has no `.db` VM, so every step no-ops; this also cleans up a
+    // project that toggled dedicated→colocated (or a half-built dedicated deploy) leaving a stale
+    // DB VM behind. Without it, deleting a dedicated project leaks its whole DB VM.
+    teardown_db_vm_sibling(project_id, platform).await;
     info!(project = %project_id, "project torn down");
     Ok(())
+}
+
+/// Best-effort teardown of a project's **sibling DB VM** (`{project_id}.db`). Mirrors
+/// [`handle_teardown`]'s reap keyed by the rendered DB id: stop the VM, hard-kill any surviving
+/// Firecracker (BEFORE destroying its disk, so a live FC can't corrupt a reused loop device),
+/// destroy the DB data disk + release its lease, drop lifecycle/snapshot state, free the IP/TAP,
+/// and remove the on-disk artifacts. Idempotent and safe for a project with no DB VM (every step
+/// no-ops). The rendered id's `.` is dot-escaped by [`vm_identity::fc_sock_pkill_pattern`], so the
+/// pkill can never match a sibling tenant's Firecracker.
+async fn teardown_db_vm_sibling(project_id: &str, platform: &Arc<Mutex<PlatformState>>) {
+    let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
+    let (alloc, data_dir) = {
+        let mut plat = platform.lock().await;
+        if let Some(mut vm) = plat.vms.remove(&db_id) {
+            let _ = vm.stop().await;
+        }
+        // Kill any DB Firecracker not tracked in `vms` BEFORE destroying its disk.
+        reap_firecracker(&db_id).await;
+        handoff::remove(&plat.data_dir.join("run"), &db_id);
+        if let Some(token) = plat.disk_tokens.remove(&db_id) {
+            let ls = plat.lease.clone();
+            let _ = ls.release(&token).await;
+        }
+        let dd = plat.data_disk.clone();
+        let _ = dd.destroy(&db_id).await;
+        plat.vm_states.remove(&db_id);
+        plat.vm_rootfs_hashes.remove(&db_id);
+        plat.wake_failures.remove(&db_id);
+        let alloc = plat.store.get_vm_allocation(&db_id).ok().flatten();
+        let _ = plat.store.remove_snapshot_meta(&db_id);
+        let _ = plat.store.remove_vm_allocation(&db_id);
+        (alloc, plat.data_dir.clone())
+    };
+    if let Some(a) = alloc {
+        let _ = teardown_tap(&a.tap_device).await;
+    }
+    // `remove_project_artifacts` for a `.db` id clears content-images/`{id}.db.ext4`,
+    // data-disks/`{id}.db.{img,holder}`, snapshots/`{id}.db`, run/`{id}.db`; the base-only trees
+    // (hosting/builds/git/buildcache/`{id}.db`) simply don't exist → no-ops.
+    remove_project_artifacts(&data_dir, &db_id).await;
 }
 
 /// Remove every per-project on-disk artifact (content image, data disk, snapshot,
@@ -2197,6 +2246,17 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     let data_dir = plat.data_dir.clone();
     drop(plat);
 
+    // A dedicated DB VM's artifacts are named by its RENDERED id (`{base}.db.img`,
+    // `snapshots/{base}.db`, `run/{base}.db`, `content-images/{base}.db.ext4`) but there is no
+    // `{base}.db` project row — the DB VM belongs to its BASE project. Protect a `.db` artifact iff
+    // its base is registered (or the DB VM is itself Running, inserted above). WITHOUT this, a clean
+    // restart with the DB VM not-yet-woken reaps `{base}.db.img` as an "orphan" — a loop-detach +
+    // delete that DESTROYS the tenant's database. (For an app-id artifact `base_project_id` is a
+    // no-op, so the check is unchanged for every existing project.)
+    let is_registered = |id: &str| {
+        registered.contains(id) || registered.contains(vm_identity::base_project_id(id))
+    };
+
     // Collect each directory's entries up front: removing files while iterating a
     // live read_dir handle skips entries (the kernel readdir cursor shifts under
     // the deletions), so a single pass would reap only a subset of the orphans.
@@ -2207,7 +2267,7 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             let Some(id) = name.strip_suffix(".ext4") else {
                 continue;
             };
-            if !registered.contains(id) {
+            if !is_registered(id) {
                 let _ = std::fs::remove_file(entry.path());
                 info!(project = %id, artifact = "content-images", "reaped orphaned artifact");
             }
@@ -2240,7 +2300,7 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             else {
                 continue;
             };
-            if registered.contains(id) {
+            if is_registered(id) {
                 continue;
             }
             let path = entry.path();
@@ -2278,7 +2338,7 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().to_string();
-            if !registered.contains(&id) {
+            if !is_registered(&id) {
                 let _ = std::fs::remove_dir_all(entry.path());
                 info!(project = %id, artifact = %sub, "reaped orphaned dir");
             }
@@ -2293,7 +2353,7 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             let Some(id) = name.strip_suffix(".git") else {
                 continue;
             };
-            if !registered.contains(id) {
+            if !is_registered(id) {
                 let _ = std::fs::remove_dir_all(entry.path());
                 info!(project = %id, artifact = "git", "reaped orphaned bare repo");
             }
@@ -2997,6 +3057,9 @@ fn write_handoff_record(
     let rec = handoff::HandoffRecord {
         schema_version: handoff::SCHEMA_VERSION,
         project_id: project_id.to_string(),
+        // `project_id` here is the RENDERED vm id (bare for App, `{id}.db` for a DB VM), so the
+        // role is implied by its suffix — App today, Db once the dedicated-DB boot writes its own.
+        role: vm_identity::split_vm_id(project_id).1,
         fc_pid: pid,
         fc_starttime: st,
         ip: alloc.ip.clone(),
@@ -4614,8 +4677,10 @@ async fn reap_firecracker(project_id: &str) {
         // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
         // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
         // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
-        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
-        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
+        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
+        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
+        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
+        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
         .status()
         .await;
 }
@@ -5268,8 +5333,10 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
         // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
         // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
         // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
-        // matches `/ab/`. (The dot is regex-escaped; ids carry no other ERE metacharacters.)
-        .args(["-f", &format!("/{project_id}/firecracker\\.sock")])
+        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
+        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
+        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
+        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
         .status()
         .await;
 
