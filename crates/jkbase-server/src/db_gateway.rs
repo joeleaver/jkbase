@@ -83,19 +83,43 @@ struct Gateway {
 /// bridge, and the per-connection source-IP auth does the rest.
 pub async fn serve(store: Store, wake: WakeCallback, registry: Arc<DbRelayRegistry>) {
     use jkbase_common::config::{DB_GATEWAY_HTTP_PORT, DB_GATEWAY_IP, DB_GATEWAY_WIRE_PORT};
+    serve_on(
+        store,
+        wake,
+        registry,
+        DB_GATEWAY_IP,
+        DB_GATEWAY_HTTP_PORT,
+        DB_GATEWAY_WIRE_PORT,
+        80,
+    )
+    .await;
+}
 
+/// [`serve`] with the bind IP + ports + agent backend port injected — production pins the
+/// well-known bridge gateway IP + `DB_GATEWAY_*` ports + `:80`; the on-box e2e binds `127.0.0.1`
+/// on ephemeral ports against a point-to-point DB VM.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_on(
+    store: Store,
+    wake: WakeCallback,
+    registry: Arc<DbRelayRegistry>,
+    ip: &str,
+    http_port: u16,
+    wire_port: u16,
+    backend_port: u16,
+) {
     let gw = Arc::new(Gateway {
         store,
         wake,
         registry,
         global: Arc::new(Semaphore::new(GLOBAL_MAX)),
-        backend_port: 80,
+        backend_port,
     });
 
     // Each listener maps to a fixed rhypedb loopback port on the DB VM (the header the agent
     // splices by): the wire port → 4201, the http port → 4200.
-    let wire = accept_loop(gw.clone(), DB_GATEWAY_IP, DB_GATEWAY_WIRE_PORT, 4201);
-    let http = accept_loop(gw.clone(), DB_GATEWAY_IP, DB_GATEWAY_HTTP_PORT, 4200);
+    let wire = accept_loop(gw.clone(), ip, wire_port, 4201);
+    let http = accept_loop(gw.clone(), ip, http_port, 4200);
     tokio::join!(wire, http);
 }
 

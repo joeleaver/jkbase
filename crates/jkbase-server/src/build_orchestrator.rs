@@ -6169,6 +6169,459 @@ console.log("listening on " + port);
         );
     }
 
+    /// The app→DB **in-guest leg** (P2 §7.6) end-to-end against real infra: a REAL host DB gateway
+    /// (`db_gateway`) in front of a REAL **DbOnly** DB VM. This is the DEDICATED counterpart to the
+    /// co-located loopback test — the DB runs ALONE in a `DbOnly` VM (no app), reachable only
+    /// host-mediated. A client connection to the gateway (standing in for a dedicated app VM's
+    /// in-guest loopback proxy) is authenticated by its **source IP** → project → the **host-held**
+    /// splice secret, `wake`d, and spliced to the DB VM agent's `/_jkbase/db` with
+    /// `x-jkbase-db-port: 4200` → the loopback rhypedb HTTP plane — and a create+read row
+    /// round-trips back. Proves: source-IP auth, the `DbReachFacts` split (DbOnly image), the
+    /// host-set port header on the splice, and the whole gateway spine against a live engine.
+    ///
+    /// The wire plane (`:4201`) uses the identical splice minus the port-header value and is proven
+    /// by `managed_db_reach_plane_e2e` (edge → `/_jkbase/db` → `:4201`); here we prove the HTTP
+    /// plane (`:4200`) end-to-end through the NEW gateway. Same prerequisites as the loopback test.
+    ///
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity.ext4 \
+    ///       <test-bin> --ignored --nocapture managed_db_dedicated_leg_e2e
+    #[tokio::test]
+    #[ignore = "dedicated app→DB leg e2e: needs KVM + root + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn managed_db_dedicated_leg_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        // Reuse the proven build fixture (the built app is unused — a DbOnly image drops it — but
+        // this gives us the baselayers store + a valid deployment tree the plan machinery expects).
+        let Some(fx) = bun_pipeline_build("dedleg", 1, Workload::OfflineDatabase).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Stage the managed DB (schema only; the DbOnly image carries no app). `tier=dedicated`
+        // documents intent — the DbOnly image build below is what actually excludes the app.
+        std::fs::write(
+            fx.staged.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":null,"tier":"dedicated"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.staged.join("_database")).unwrap();
+        std::fs::write(
+            fx.staged.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+
+        let splice_secret = "dedleg-splice-secret-0123456789abcdef";
+        let admin_token = "jkba_dedleg-admin-token-0123456789abcdef";
+
+        // DbOnly image: rhypedb overlay + `_database` + a forced data disk, NO app servers.
+        let plan = crate::layer_plan::compute_layer_plan_with(
+            &fx.staged,
+            &store_dir,
+            true,
+            true,
+            crate::layer_plan::ImageContent::DbOnly,
+        )
+        .expect("compute DbOnly layer plan");
+        assert!(
+            plan.runtime_layers.database.is_some(),
+            "DbOnly image must map the rhypedb overlay"
+        );
+        assert!(
+            plan.runtime_layers.data_device.is_some(),
+            "a managed DB forces a data-disk device"
+        );
+
+        let meta_img = fx.data.join("dedleg-metadata.ext4");
+        crate::layer_plan::build_metadata_image_with(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            // The DB VM's OWN image: the splice secret its `/_jkbase/db` will require, and NEVER
+            // `dedicated` (it is the DB, not an app that proxies to one).
+            Some(&jkbase_common::config::DbReachFacts {
+                splice_secret: splice_secret.to_string(),
+                admin_token: admin_token.to_string(),
+                dedicated: false,
+            }),
+            &meta_img,
+            crate::layer_plan::ImageContent::DbOnly,
+        )
+        .expect("build the DbOnly metadata image");
+
+        let data_disk = fx.data.join("dedleg-data.ext4");
+        let _ = std::fs::remove_file(&data_disk);
+        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+
+        // Point-to-point tap on a subnet clear of the other pipeline tests (26.x).
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("dedleg", "172.26.0.1", "172.26.0.2", "AA:FC:00:00:26:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: Some(data_disk.clone()),
+            vcpu_count: 1,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("dedleg-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("DbOnly DB VM should start");
+
+        // ---- The REAL host DB gateway ---------------------------------------------------------
+        // A temp control store maps the client's source IP (127.0.0.1 — we drive the gateway from
+        // the host loopback, standing in for the app VM's proxy) → project "ded", and holds the
+        // splice secret the gateway presents to the DB agent. `wake` returns the (already-booted)
+        // DB VM's IP; the agent backend port is the guest `:80`.
+        let gw_store = Store::open(&fx.data.join("dedleg-gw-store.redb")).expect("open gw store");
+        gw_store
+            .save_vm_allocation(&jkbase_control::store::VmAllocation {
+                project_id: "ded".to_string(),
+                ip: "127.0.0.1".to_string(),
+                tap_device: tap.clone(),
+                mac: guest_mac.to_string(),
+                host_id: String::new(),
+                placement_epoch: 0,
+            })
+            .unwrap();
+        gw_store.set_db_splice_secret("ded", splice_secret).unwrap();
+        let guest_ip_owned = guest_ip.to_string();
+        let wake: jkbase_proxy::WakeCallback = std::sync::Arc::new(move |_pid: String| {
+            let ip = guest_ip_owned.clone();
+            Box::pin(async move { Ok(ip) })
+        });
+        let registry = jkbase_proxy::db_relay::DbRelayRegistry::new();
+        // Fixed high test ports (bind on loopback only). A bind failure disables the leg → the
+        // round-trip below fails clearly.
+        let (gw_http, gw_wire) = (34230u16, 34231u16);
+        tokio::spawn(crate::db_gateway::serve_on(
+            gw_store, wake, registry, "127.0.0.1", gw_http, gw_wire, 80,
+        ));
+
+        // ---- Drive a create+read through the leg (mirrors the OfflineDatabase app handler) -----
+        // Each request: client → gateway (source-IP auth + wake + agent upgrade w/ port 4200) →
+        // splice → loopback rhypedb :4200 → back. Poll while the DB cold-opens/binds (the gateway
+        // drops connections until rhypedb is up, so a request errors → retry).
+        let base = format!("http://127.0.0.1:{gw_http}/query");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        async fn q(client: &reqwest::Client, base: &str, query: &str) -> Option<serde_json::Value> {
+            let r = client
+                .post(base)
+                .json(&serde_json::json!({ "query": query }))
+                .send()
+                .await
+                .ok()?;
+            if !r.status().is_success() {
+                return None;
+            }
+            r.json::<serde_json::Value>().await.ok()
+        }
+        let mut roundtrip: Option<String> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            // Read; if empty, seed alpha and re-read (idempotent against retries).
+            if let Some(mut res) = q(&client, &base, "User").await {
+                let mut objs = res
+                    .get("objects")
+                    .and_then(|o| o.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if objs.is_empty() {
+                    q(&client, &base, r#"User.create({ name: "alpha" })"#).await;
+                    res = q(&client, &base, "User").await.unwrap_or(res);
+                    objs = res
+                        .get("objects")
+                        .and_then(|o| o.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                }
+                if !objs.is_empty() {
+                    let mut names: Vec<String> = objs
+                        .iter()
+                        .filter_map(|o| o.get("fields")?.get("name")?.as_str().map(String::from))
+                        .collect();
+                    names.sort();
+                    roundtrip = Some(format!("users={} count={}", names.join(","), objs.len()));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        eprintln!("[dedleg-e2e] leg round-trip = {roundtrip:?}");
+
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+
+        assert_eq!(
+            roundtrip.as_deref(),
+            Some("users=alpha count=1"),
+            "the app→DB leg must create+read a row THROUGH the host gateway \
+             (source-IP auth -> wake -> agent /_jkbase/db x-jkbase-db-port:4200 -> loopback rhypedb)"
+        );
+        println!(
+            "PASS: dedicated app→DB leg e2e — create+read round-trip through the REAL host gateway \
+             + DbOnly DB VM ({roundtrip:?})"
+        );
+    }
+
+    /// The app→DB leg FULL-STACK proof: TWO real VMs — a dedicated **app VM** (AppNoDb, its agent
+    /// running the in-guest loopback proxy) and its sibling **DB VM** (DbOnly) — plus the REAL host
+    /// gateway bound on the well-known bridge gateway IP (`172.16.0.1:4230/4231`). The bun app,
+    /// UNCHANGED, `fetch`es `127.0.0.1:4200` exactly as co-located; its agent proxies that to the
+    /// gateway, which source-IP-authenticates the app VM → project → wakes + splices to the DB VM.
+    /// A `curl` of the app VM's `:80` returns the create+read row — proving the WHOLE leg incl. the
+    /// two pieces the isolated `managed_db_dedicated_leg_e2e` doesn't: the agent's loopback proxy
+    /// and the `DbReachFacts.dedicated` flag actually driving it.
+    ///
+    /// The app VM's tap host IP IS `172.16.0.1` (= `DB_GATEWAY_IP`) so the in-guest proxy reaches
+    /// the gateway; the DB VM sits on a separate /24 the host also reaches. No `jkbr0` needed.
+    ///
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… JKB_BASELAYERS=… JKB_AGENT=… \
+    ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity.ext4 \
+    ///       <test-bin> --ignored --nocapture managed_db_dedicated_leg_fullstack_e2e
+    #[tokio::test]
+    #[ignore = "dedicated app→DB FULL-STACK leg e2e (2 VMs): needs KVM + root + bun.ext4 + baselayers + verity rootfs"]
+    async fn managed_db_dedicated_leg_fullstack_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Some(fx) = bun_pipeline_build("dedfs", 1, Workload::OfflineDatabase).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Stage the managed DB (dedicated tier).
+        std::fs::write(
+            fx.staged.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":null,"tier":"dedicated"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.staged.join("_database")).unwrap();
+        std::fs::write(
+            fx.staged.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+
+        let splice_secret = "dedfs-splice-secret-0123456789abcdef";
+        let admin_token = "jkba_dedfs-admin-token-0123456789abcdef";
+
+        // --- Build BOTH per-VM images from the one tree, exactly as the deploy path does. ---
+        // App VM = AppNoDb (app layers + `_db_reach.json{dedicated:true}`, NO `_database`); it must
+        // NOT force a data disk (the DB lives in the sibling VM).
+        let app_plan = crate::layer_plan::compute_layer_plan_with(
+            &fx.staged,
+            &store_dir,
+            false,
+            true,
+            crate::layer_plan::ImageContent::AppNoDb,
+        )
+        .expect("compute AppNoDb layer plan");
+        assert!(
+            app_plan.runtime_layers.database.is_none(),
+            "AppNoDb must NOT carry the rhypedb overlay (else it co-locates a 2nd DB)"
+        );
+        let app_meta = fx.data.join("dedfs-app-metadata.ext4");
+        crate::layer_plan::build_metadata_image_with(
+            &fx.staged,
+            &app_plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            Some(&jkbase_common::config::DbReachFacts {
+                splice_secret: splice_secret.to_string(),
+                admin_token: String::new(),
+                dedicated: true, // ← drives the agent's in-guest loopback proxy
+            }),
+            &app_meta,
+            crate::layer_plan::ImageContent::AppNoDb,
+        )
+        .expect("build the AppNoDb metadata image");
+
+        // DB VM = DbOnly (rhypedb overlay + `_database` + forced data disk, no app).
+        let db_plan = crate::layer_plan::compute_layer_plan_with(
+            &fx.staged,
+            &store_dir,
+            true,
+            true,
+            crate::layer_plan::ImageContent::DbOnly,
+        )
+        .expect("compute DbOnly layer plan");
+        assert!(db_plan.runtime_layers.database.is_some());
+        let db_meta = fx.data.join("dedfs-db-metadata.ext4");
+        crate::layer_plan::build_metadata_image_with(
+            &fx.staged,
+            &db_plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            Some(&jkbase_common::config::DbReachFacts {
+                splice_secret: splice_secret.to_string(),
+                admin_token: admin_token.to_string(),
+                dedicated: false,
+            }),
+            &db_meta,
+            crate::layer_plan::ImageContent::DbOnly,
+        )
+        .expect("build the DbOnly metadata image");
+
+        let db_disk = fx.data.join("dedfs-db-data.ext4");
+        let _ = std::fs::remove_file(&db_disk);
+        sh("truncate", &["-s", "1G", db_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+        sh("mkfs.ext4", &["-F", "-q", db_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+
+        // --- Two point-to-point taps. The APP tap host IP is 172.16.0.1 (= DB_GATEWAY_IP) so the
+        //     in-guest proxy reaches the gateway; the DB tap is a separate /24 (no route overlap).
+        let app_tap = "jkdedfsapp".to_string();
+        let db_tap = "jkdedfsdb".to_string();
+        for (t, host, _g) in [
+            (&app_tap, "172.16.0.1", "172.16.0.2"),
+            (&db_tap, "172.21.0.1", "172.21.0.2"),
+        ] {
+            let _ = sh("ip", &["link", "del", t]).await;
+            sh("ip", &["tuntap", "add", "dev", t, "mode", "tap"])
+                .await
+                .unwrap();
+            sh("ip", &["addr", "add", &format!("{host}/24"), "dev", t])
+                .await
+                .unwrap();
+            sh("ip", &["link", "set", t, "up"]).await.unwrap();
+        }
+        let (app_guest, db_guest) = ("172.16.0.2", "172.21.0.2");
+
+        // --- The REAL host gateway on the well-known IP + ports (production `serve`). ---
+        let gw_store = Store::open(&fx.data.join("dedfs-gw-store.redb")).expect("open gw store");
+        gw_store
+            .save_vm_allocation(&jkbase_control::store::VmAllocation {
+                project_id: "ded".to_string(),
+                ip: app_guest.to_string(), // the app VM's (source-guard-pinned) source IP
+                tap_device: app_tap.clone(),
+                mac: "AA:FC:00:00:16:02".to_string(),
+                host_id: String::new(),
+                placement_epoch: 0,
+            })
+            .unwrap();
+        gw_store.set_db_splice_secret("ded", splice_secret).unwrap();
+        let db_guest_owned = db_guest.to_string();
+        let wake: jkbase_proxy::WakeCallback = std::sync::Arc::new(move |_pid: String| {
+            let ip = db_guest_owned.clone();
+            Box::pin(async move { Ok(ip) })
+        });
+        let registry = jkbase_proxy::db_relay::DbRelayRegistry::new();
+        tokio::spawn(crate::db_gateway::serve(gw_store, wake, registry)); // binds 172.16.0.1:4230/4231
+
+        // --- Boot the DB VM first (the app's very first query must find it up). ---
+        let db_cfg = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(db_meta.clone()),
+            layer_paths: db_plan.layer_paths.clone(),
+            data_disk_path: Some(db_disk.clone()),
+            vcpu_count: 1,
+            mem_size_mib: 1024,
+            tap_device: Some(db_tap.clone()),
+            guest_mac: Some("AA:FC:00:00:15:02".to_string()),
+            guest_ip: Some(db_guest.to_string()),
+            gateway_ip: Some("172.21.0.1".to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let mut db_vm = VmInstance::start("dedfsdb", &db_cfg, &fx.data.join("dedfs-db-run"))
+            .await
+            .expect("DbOnly DB VM should start");
+
+        // --- Boot the app VM (AppNoDb; its agent starts the loopback proxy → the gateway). ---
+        let app_cfg = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(app_meta.clone()),
+            layer_paths: app_plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 1,
+            mem_size_mib: 1024,
+            tap_device: Some(app_tap.clone()),
+            guest_mac: Some("AA:FC:00:00:16:02".to_string()),
+            guest_ip: Some(app_guest.to_string()),
+            gateway_ip: Some("172.16.0.1".to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let mut app_vm = VmInstance::start("dedfsapp", &app_cfg, &fx.data.join("dedfs-app-run"))
+            .await
+            .expect("AppNoDb app VM should start");
+
+        // curl the app's :80 — it fetches 127.0.0.1:4200 → agent loopback proxy → gateway → DB VM.
+        let body = poll_http_200(app_guest, 80, Duration::from_secs(120)).await;
+        eprintln!("[dedfs-e2e] app-over-leg body = {body:?}");
+
+        let _ = app_vm.stop().await;
+        let _ = db_vm.stop().await;
+        let _ = sh("ip", &["link", "del", &app_tap]).await;
+        let _ = sh("ip", &["link", "del", &db_tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+
+        assert_eq!(
+            body.as_deref(),
+            Some("users=alpha count=1"),
+            "the UNCHANGED app must create+read a row over 127.0.0.1:4200 → in-guest proxy → host \
+             gateway → sibling DB VM (the full app→DB leg)"
+        );
+        println!(
+            "PASS: dedicated app→DB FULL-STACK leg e2e — unchanged app queried its sibling DB VM \
+             over the in-guest loopback proxy + host gateway ({body:?})"
+        );
+    }
+
     /// Networked — the real-dependency proof. A Bun server importing `ms` is built
     /// through `run_project_build` with the isolated build network + egress proxy, so
     /// `bun install` MUST fetch `ms` through the proxy (fetch-then-seal), then the
