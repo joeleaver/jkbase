@@ -67,12 +67,21 @@ async fn serve_static(
 
     match serve_file(root, &file_path, block_internal, conds).await {
         Ok(resp) => Ok(resp),
-        // SPA fallback serves the root index.html, which is never `_`-prefixed. The
-        // fallback is a fresh document, so conditional/range headers meant for the
-        // missing asset don't apply — serve it whole.
-        Err(_) if spa => {
-            match serve_file(root, &root.join("index.html"), block_internal, &ReqConds::default())
-                .await
+        // SPA fallback serves the root index.html (never `_`-prefixed) for a route-like
+        // path so client-side routing resolves. A missing path that LOOKS like a build
+        // asset (`.wasm`/`.js`/`.css`/…) 404s instead: serving HTML in its place would
+        // let a client holding a stale index.html (old asset hash) fetch HTML as
+        // wasm/js and break `instantiate`. The fallback is a fresh document, so
+        // conditional/range headers meant for the missing asset don't apply — serve it
+        // whole.
+        Err(_) if spa && !has_asset_extension(Path::new(request_path)) => {
+            match serve_file(
+                root,
+                &root.join("index.html"),
+                block_internal,
+                &ReqConds::default(),
+            )
+            .await
             {
                 Ok(resp) => Ok(resp),
                 Err(_) => Ok(not_found()),
@@ -130,12 +139,18 @@ async fn serve_file(
     let etag = format!("\"{mtime:x}-{size:x}\"");
     let last_modified = httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(mtime));
     let mime = guess_mime(&canonical);
+    // Freshness policy from the resolved name: hashed assets are immutable-forever, HTML
+    // must revalidate (pick up redeploys), everything else gets a short max-age. Echoed
+    // on 200/206/304 alike so a revalidation carries the same policy a full GET would.
+    let cache = cache_control(&canonical);
 
     // Conditional GET: If-None-Match (precedence) then If-Modified-Since → 304.
     if not_modified(conds, &etag, mtime) {
-        return Ok(base_headers(StatusCode::NOT_MODIFIED, mime, &etag, &last_modified)
-            .body(Full::new(Bytes::new()))
-            .unwrap());
+        return Ok(
+            base_headers(StatusCode::NOT_MODIFIED, mime, &etag, &last_modified, cache)
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+        );
     }
 
     // Range → 206 (read only the requested slice) / 416.
@@ -143,10 +158,16 @@ async fn serve_file(
         match parse_range(spec, size) {
             RangeOutcome::Partial { start, end } => {
                 let slice = read_slice(&canonical, start, end).await?;
-                return Ok(base_headers(StatusCode::PARTIAL_CONTENT, mime, &etag, &last_modified)
-                    .header("Content-Range", format!("bytes {start}-{end}/{size}"))
-                    .body(Full::new(Bytes::from(slice)))
-                    .unwrap());
+                return Ok(base_headers(
+                    StatusCode::PARTIAL_CONTENT,
+                    mime,
+                    &etag,
+                    &last_modified,
+                    cache,
+                )
+                .header("Content-Range", format!("bytes {start}-{end}/{size}"))
+                .body(Full::new(Bytes::from(slice)))
+                .unwrap());
             }
             RangeOutcome::Unsatisfiable => {
                 return Ok(Response::builder()
@@ -161,24 +182,29 @@ async fn serve_file(
     }
 
     let content = tokio::fs::read(&canonical).await?;
-    Ok(base_headers(StatusCode::OK, mime, &etag, &last_modified)
-        .body(Full::new(Bytes::from(content)))
-        .unwrap())
+    Ok(
+        base_headers(StatusCode::OK, mime, &etag, &last_modified, cache)
+            .body(Full::new(Bytes::from(content)))
+            .unwrap(),
+    )
 }
 
 /// A response builder carrying the headers every representation shares: Content-Type,
-/// the cache validators (ETag, Last-Modified), and `Accept-Ranges: bytes`.
+/// the cache validators (ETag, Last-Modified), the freshness policy (`Cache-Control`),
+/// and `Accept-Ranges: bytes`.
 fn base_headers(
     status: StatusCode,
     mime: &str,
     etag: &str,
     last_modified: &str,
+    cache_control: &str,
 ) -> hyper::http::response::Builder {
     Response::builder()
         .status(status)
         .header("Content-Type", mime)
         .header("ETag", etag)
         .header("Last-Modified", last_modified)
+        .header("Cache-Control", cache_control)
         .header("Accept-Ranges", "bytes")
 }
 
@@ -265,6 +291,65 @@ fn not_found() -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// Freshness policy for a resolved file, keyed off its name (no config, no I/O):
+/// - `*.html`/`*.htm` → `no-cache` (must revalidate every load so a redeploy is picked
+///   up; the ETag machinery makes that a cheap 304). Also covers the SPA-fallback
+///   index.html, which resolves here.
+/// - a build-fingerprinted asset (`is_fingerprinted`) → `immutable`, cached ~forever:
+///   the content hash IS the version, so the byte stream never changes under that name.
+///   This is THE fix for the "11 MB wasm re-downloaded every load" report.
+/// - anything else → a short `max-age`; still revalidates via ETag/Last-Modified once
+///   stale, so an overwrite is picked up within the window.
+fn cache_control(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html" | "htm") => "no-cache",
+        _ if is_fingerprinted(path) => "public, max-age=31536000, immutable",
+        _ => "public, max-age=3600",
+    }
+}
+
+/// Heuristic: does this file name carry a build content-hash segment? Splits the stem
+/// (name minus final extension) on `-`, `.`, `_` and matches any 8–64 char ASCII-hex
+/// run. Covers trunk (`app-8f3a2b1c_bg.wasm`, `app-<hex>.js/.css`; splitting `_` peels
+/// wasm-bindgen's `_bg`), Vite (`index.4e2f8a91.js`), and webpack `[contenthash:8+]`.
+/// A hand-named `index.html` / `logo.png` / `main.js` has no such segment.
+fn is_fingerprinted(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    stem.split(['-', '.', '_'])
+        .any(|seg| (8..=64).contains(&seg.len()) && seg.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Does the request path name a build asset (a known non-HTML content extension)?
+/// Used to suppress the SPA index.html fallback for a missing asset — serving HTML as
+/// `application/wasm`/`javascript` breaks the client. HTML/dotless/unknown extensions
+/// stay eligible for the fallback (real client-side routes).
+fn has_asset_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some(
+            "js" | "mjs"
+                | "wasm"
+                | "css"
+                | "json"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "svg"
+                | "ico"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "txt"
+                | "xml"
+                | "pdf"
+                | "map"
+        )
+    )
+}
+
 fn guess_mime(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("html" | "htm") => "text/html; charset=utf-8",
@@ -302,10 +387,18 @@ mod tests {
     }
 
     async fn serve_conds(root: &Path, path: &str, conds: ReqConds) -> (u16, HeaderMap, Vec<u8>) {
-        let resp = serve_static(root, path, false, false, &conds).await.unwrap();
+        let resp = serve_static(root, path, false, false, &conds)
+            .await
+            .unwrap();
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
-        let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec();
         (status, headers, body)
     }
 
@@ -427,5 +520,134 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cache_control_by_asset_class() {
+        let dir = std::env::temp_dir().join(format!("ss-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), "<h1>ok</h1>").unwrap();
+        fs::write(dir.join("app-8f3a2b1c_bg.wasm"), b"\0asm").unwrap();
+        fs::write(dir.join("index.4e2f8a91.js"), "x").unwrap();
+        fs::write(dir.join("logo.png"), b"png").unwrap();
+
+        let cc = |h: &HeaderMap| {
+            h.get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // HTML must revalidate so redeploys are seen.
+        let (_, h, _) = serve_conds(&dir, "/index.html", ReqConds::default()).await;
+        assert_eq!(cc(&h), "no-cache");
+
+        // Fingerprinted assets are immutable-forever (trunk wasm + Vite js).
+        let (_, h, _) = serve_conds(&dir, "/app-8f3a2b1c_bg.wasm", ReqConds::default()).await;
+        assert_eq!(cc(&h), "public, max-age=31536000, immutable");
+        let (_, h, _) = serve_conds(&dir, "/index.4e2f8a91.js", ReqConds::default()).await;
+        assert_eq!(cc(&h), "public, max-age=31536000, immutable");
+
+        // Un-hashed asset → short max-age (still ETag-revalidated once stale).
+        let (_, h, _) = serve_conds(&dir, "/logo.png", ReqConds::default()).await;
+        assert_eq!(cc(&h), "public, max-age=3600");
+
+        // The policy rides 206 (Range) and 304 (conditional) responses too.
+        let (st, h, _) = serve_conds(
+            &dir,
+            "/app-8f3a2b1c_bg.wasm",
+            ReqConds {
+                range: Some("bytes=0-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(st, 206);
+        assert_eq!(cc(&h), "public, max-age=31536000, immutable");
+
+        let (_, h, _) = serve_conds(&dir, "/index.html", ReqConds::default()).await;
+        let etag = h.get("etag").unwrap().to_str().unwrap().to_string();
+        let (st, h, _) = serve_conds(
+            &dir,
+            "/index.html",
+            ReqConds {
+                if_none_match: Some(etag),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(st, 304);
+        assert_eq!(cc(&h), "no-cache");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn spa_fallback_only_for_route_like_paths() {
+        let dir = std::env::temp_dir().join(format!("ss-spa-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), "<h1>app</h1>").unwrap();
+
+        // Missing route-like path → SPA fallback serves index.html (no-cache).
+        let resp = serve_static(
+            &dir,
+            "/some/client/route",
+            true,
+            false,
+            &ReqConds::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        // Missing hashed asset → 404, NOT index.html served as wasm.
+        for missing in [
+            "/app-deadbeef_bg.wasm",
+            "/app-deadbeef.js",
+            "/style-deadbeef.css",
+        ] {
+            let resp = serve_static(&dir, missing, true, false, &ReqConds::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "asset {missing} must 404, not SPA-fallback"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_detection() {
+        for name in [
+            "pw-studio-web-8f3a2b1c_bg.wasm",
+            "app-8f3a2b1c.js",
+            "index.4e2f8a91.js",
+            "style.0a1b2c3d4e5f6789.css",
+        ] {
+            assert!(is_fingerprinted(Path::new(name)), "{name} should be hashed");
+        }
+        for name in [
+            "index.html",
+            "main.js",
+            "logo.png",
+            "robots.txt",
+            "app-1234.js",
+        ] {
+            assert!(
+                !is_fingerprinted(Path::new(name)),
+                "{name} should NOT be hashed"
+            );
+        }
     }
 }
