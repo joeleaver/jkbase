@@ -5836,6 +5836,7 @@ console.log("listening on " + port);
                 splice_secret: splice_secret.to_string(),
                 admin_token: admin_token.to_string(),
                 dedicated: false,
+                jwks: None,
             }),
             &meta_img,
         )
@@ -6253,6 +6254,7 @@ console.log("listening on " + port);
                 splice_secret: splice_secret.to_string(),
                 admin_token: admin_token.to_string(),
                 dedicated: false,
+                jwks: None,
             }),
             &meta_img,
             crate::layer_plan::ImageContent::DbOnly,
@@ -6483,6 +6485,7 @@ console.log("listening on " + port);
                 splice_secret: splice_secret.to_string(),
                 admin_token: String::new(),
                 dedicated: true, // ← drives the agent's in-guest loopback proxy
+                jwks: None,
             }),
             &app_meta,
             crate::layer_plan::ImageContent::AppNoDb,
@@ -6510,6 +6513,7 @@ console.log("listening on " + port);
                 splice_secret: splice_secret.to_string(),
                 admin_token: admin_token.to_string(),
                 dedicated: false,
+                jwks: None,
             }),
             &db_meta,
             crate::layer_plan::ImageContent::DbOnly,

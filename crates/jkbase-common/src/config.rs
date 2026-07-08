@@ -197,6 +197,15 @@ pub struct DbReachFacts {
     /// `false` = co-located (or old images), so this is additive with zero migration.
     #[serde(default)]
     pub dedicated: bool,
+    /// P4 data-plane authz: the project's PUBLIC JWKS (RFC 7517 `{"keys":[…]}`) minted from the
+    /// jkbase-Auth signing store, as a JSON string. Baked ONLY when the project opts into
+    /// `[database].rules`; the DB VM's agent writes it to the meta volume and points
+    /// `RHYPEDB_AUTH_JWKS` at it so the engine verifies end-user JWTs offline (P0-DBA-2/3). PUBLIC
+    /// keys only — no secret ever rides this channel (P0-AUTH-2 undisturbed). `None` ⇒ rules-off ⇒
+    /// the engine is byte-unchanged. Only ever non-empty (an empty JWKS would make the engine
+    /// refuse to start, so the host omits it rather than bake `{"keys":[]}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<String>,
 }
 
 impl DbReachFacts {
