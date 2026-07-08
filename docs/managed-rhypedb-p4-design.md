@@ -20,9 +20,10 @@ consumer** — the engine that verifies P3's tokens and enforces rules on them.
 
 ## 0. Scope + decisions taken (Joe AFK 2026-07-08 → recommended defaults, reversible)
 
-Two forks were genuinely Joe's call. He was asked (`AskUserQuestion`) but AFK; per the P2/P3
-precedent I proceeded on the **recommended** option for each and made both reversible. A one-line
-answer flips either.
+Two forks were genuinely Joe's call. **Both CONFIRMED by Joe on 2026-07-08** (he was first asked
+while AFK; I proceeded on the recommended option for each and he then confirmed both). They remain
+structured to be reversible (the DSL is a self-contained parser; the trust seam is behind a
+`PrincipalSource` seam) but this is now the committed direction, not a provisional default.
 
 - **DECISION 1 — Rules DSL surface → Firestore-familiar syntax + native edge traversal.**
   A `match Type { allow read/create/update/delete/subscribe: if <expr> }` grammar that a Firebase
