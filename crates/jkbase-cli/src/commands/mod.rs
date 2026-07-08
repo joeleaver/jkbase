@@ -266,6 +266,10 @@ pub enum AuthCommand {
     Key(AuthKeyCommand),
     /// Force a signing-key rotation (the old key stays in JWKS for the overlap window)
     Rotate {
+        /// Compromise revoke: drop the outgoing key from JWKS IMMEDIATELY, invalidating every
+        /// outstanding token now (instead of keeping it for the ~24h overlap window)
+        #[arg(long)]
+        hard: bool,
         /// Project name (inferred from jkbase.toml if not specified)
         #[arg(long)]
         project: Option<String>,
@@ -293,8 +297,9 @@ pub enum AuthCommand {
         /// The end-user subject (`sub`)
         #[arg(long)]
         sub: String,
-        /// The issuer key secret (`jkbk_…`)
-        #[arg(long)]
+        /// The issuer key secret (`jkbk_…`). Prefer the JKBASE_ISSUER_KEY env var over the flag so
+        /// the secret doesn't leak via `ps`/shell history.
+        #[arg(long, env = "JKBASE_ISSUER_KEY")]
         key: String,
         /// A custom claim `k=v` (repeatable)
         #[arg(long = "claim")]
@@ -1359,13 +1364,18 @@ async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {
 async fn run_auth(cmd: AuthCommand) -> anyhow::Result<()> {
     match cmd {
         AuthCommand::Key(cmd) => run_auth_key(cmd).await,
-        AuthCommand::Rotate { project, api } => {
+        AuthCommand::Rotate { hard, project, api } => {
             let project_id = resolve_project_id(project)?;
             let token = crate::credentials::load_token()?
                 .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
             let client = crate::credentials::authenticated_client(&token);
+            let url = if hard {
+                format!("{api}/projects/{project_id}/auth/rotate?hard=true")
+            } else {
+                format!("{api}/projects/{project_id}/auth/rotate")
+            };
             let resp = client
-                .post(format!("{api}/projects/{project_id}/auth/rotate"))
+                .post(url)
                 .send()
                 .await
                 .context("failed to connect to API")?;
@@ -1374,10 +1384,18 @@ async fn run_auth(cmd: AuthCommand) -> anyhow::Result<()> {
                 let kid = body["kid"].as_str().unwrap_or("");
                 println!("Rotated jkbase-Auth signing key for project '{project_id}'.");
                 println!("  New kid: {kid}");
-                println!(
-                    "  The previous key stays in JWKS for the overlap window so already-issued \
-                     tokens keep verifying."
-                );
+                if hard {
+                    println!(
+                        "  HARD rotation: prior keys were dropped from JWKS immediately — all \
+                         outstanding tokens are now invalid (allow up to ~5 min for cached JWKS \
+                         to expire)."
+                    );
+                } else {
+                    println!(
+                        "  The previous key stays in JWKS for the overlap window so already-issued \
+                         tokens keep verifying."
+                    );
+                }
             } else {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 let err = body["error"].as_str().unwrap_or("unknown error");
@@ -1449,6 +1467,9 @@ async fn run_auth(cmd: AuthCommand) -> anyhow::Result<()> {
                 let (k, v) = c
                     .split_once('=')
                     .ok_or_else(|| anyhow::anyhow!("expected --claim KEY=value, got '{c}'"))?;
+                if k.is_empty() {
+                    anyhow::bail!("--claim key must not be empty (got '{c}')");
+                }
                 claims_obj.insert(k.to_string(), serde_json::Value::String(v.to_string()));
             }
             let mut body = serde_json::json!({ "sub": sub });

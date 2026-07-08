@@ -72,11 +72,16 @@ key via JWKS. (At P4 the DB VM only needs the public key; it fetches JWKS or get
 existing reserved channel.)
 
 **Key identity & rotation (P0-AUTH-4).** `kid = "{project_id}.{serial}"`. The store holds a
-`current` keypair and an `Option<previous>` public key. Rotation mints a new `current`, demotes the
-old to `previous`, and **keeps the old public key in JWKS for a window ≥ the max token TTL** so
-in-flight tokens still verify — the existing per-deploy *hard-overwrite* rotation
-(`mint_db_admin_token`, `store.rs`) would strand valid tokens, so this needs the dual-key window.
-A *compromised* key is force-rotated AND dropped from JWKS immediately to hard-revoke.
+`current` keypair plus a **`Vec` of `retiring` public keys**, each still inside its `retire_at`
+window (≥ the max token TTL). A soft rotation mints a new `current`, pushes the outgoing key onto
+`retiring`, and **keeps every in-window key in JWKS** so in-flight tokens still verify — a `Vec`
+(not a single `previous` slot) so back-to-back rotations don't strand an earlier cohort. The set is
+window-pruned on each read/rotate and capped (`MAX_RETIRING_SIGNING_KEYS`) against a rotate-loop.
+A **hard** rotation (`POST /auth/rotate?hard=true`, `jkbase auth rotate --hard`) is the compromise
+control: it clears `retiring` so every outstanding token is invalidated at once — subject to the
+JWKS `Cache-Control: max-age=300`, so "immediate" means "within ~5 min of verifier/CDN cache".
+(Contrast the existing per-deploy *hard-overwrite* secret rotation, `mint_db_admin_token` — which
+would strand valid tokens, hence the windowed set here.)
 
 ---
 
@@ -87,7 +92,7 @@ A *compromised* key is force-rotated AND dropped from JWKS immediately to hard-r
 | **P0-AUTH-1** | **Per-project signing keys.** | A global key lets project A mint project B's tokens. Keypair keyed by `project_id`; JWKS is per-project; `iss`/`kid` name the project. |
 | **P0-AUTH-2** | **Private key never leaves the host.** | Asymmetric ⇒ only the public key is exported (JWKS). Private key at rest in the control store, host-only, never in a VM/env/tenant file. |
 | **P0-AUTH-3** | **Owner-rebind on the issuer-key path.** | A `jkbk_` minted under owner A must not mint after a same-slug recreate by owner B. Mirror the S3/git/console guard (`objectstore_service.rs:519-533`): key→project→`get_project`→`tenant_id` match, else deny. |
-| **P0-AUTH-4** | **kid rotation with an overlapping public window ≥ max TTL.** | Rotation never strands valid tokens; compromise → force-rotate + drop kid from JWKS = hard revoke. |
+| **P0-AUTH-4** | **kid rotation with a windowed `Vec` of retiring public keys ≥ max TTL.** | Rotation never strands valid tokens — every in-window cohort stays in JWKS (a `Vec`, so back-to-back rotations are safe; window-pruned + capped). Compromise → `hard` rotate clears the set = drop all old kids from JWKS now (reachable via `/auth/rotate?hard=true` / `jkbase auth rotate --hard`; effective within the JWKS `max-age=300`). |
 | **P0-AUTH-5** | **Verify PINS alg=EdDSA + kty=OKP/Ed25519.** | Classic JWT break: never trust the token header's `alg`; reject `alg:none` and alg-substitution. Our reference verifier (and the P5 gateway) hardcode EdDSA and look the kid up in JWKS. |
 | **P0-AUTH-6** | **`auth` is a RESERVED_LABEL; project is resolved from the authenticated key, not client input.** | Add `"auth"` to `RESERVED_LABELS` (`store.rs:85`) so no tenant claims `auth.{domain}`. The mint path takes the project from the issuer-key record (authoritative); a path/body project id is only cross-checked against it. |
 | **P0-AUTH-7** | **Short-lived tokens + minted-rate cap.** | Default TTL ≤ 1h, hard max (e.g. 24h); per-issuer-key token-mint rate limit (mirror `db_ingress` `PerIpLimiter`) bounds a leaked-key blast radius. |

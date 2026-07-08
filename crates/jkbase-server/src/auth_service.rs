@@ -38,6 +38,7 @@ const MAX_TTL_SECS: u64 = 24 * 3600; // 24h
 /// Caps on tenant-supplied token inputs — bound the size of a minted token (a giant `sub`/`claims`
 /// would inflate every token and the sign cost).
 const MAX_SUB_LEN: usize = 256;
+const MAX_AUD_LEN: usize = 256;
 const MAX_CLAIMS_BYTES: usize = 8 * 1024;
 
 /// Per-issuer-key mint rate (token bucket): generous for a legit backend (which caches a token per
@@ -191,6 +192,9 @@ async fn mint_token(
     let sub = body.sub.trim();
     if sub.is_empty() || sub.len() > MAX_SUB_LEN {
         return json_error(StatusCode::BAD_REQUEST, "invalid sub");
+    }
+    if body.aud.as_deref().is_some_and(|a| a.len() > MAX_AUD_LEN) {
+        return json_error(StatusCode::BAD_REQUEST, "aud too long");
     }
     if let Some(claims) = &body.claims {
         let size = serde_json::to_vec(claims)

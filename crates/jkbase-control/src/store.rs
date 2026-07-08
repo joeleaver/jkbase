@@ -84,8 +84,9 @@ const DB_BACKUPS_BY_PROJECT: TableDefinition<&str, &[u8]> =
     TableDefinition::new("db_backups_by_project");
 /// jkbase-Auth (P3) per-project **signing-key state**, keyed by `project_id` → [`SigningKeyState`]:
 /// the CURRENT Ed25519 keypair (32-byte private seed recoverable at rest, host-only — P0-AUTH-2)
-/// plus, during a rotation overlap window, the PREVIOUS *public* key so tokens minted under it still
-/// verify (P0-AUTH-4). Purged on teardown so a recreated same-slug project starts with a fresh key.
+/// plus the set of rotated-out *public* keys still inside their overlap windows so tokens minted
+/// under them still verify (P0-AUTH-4). Purged on teardown so a recreated same-slug project starts
+/// with a fresh key.
 const AUTH_SIGNING_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_signing_keys");
 /// jkbase-Auth **issuer keys** — the `jkbk_` bearer a tenant's own backend presents to the `auth.`
 /// mint endpoint to have a per-end-user JWT signed. A keyspace ENTIRELY SEPARATE from the S3
@@ -323,8 +324,9 @@ impl IssuerKey {
 
 /// One materialized Ed25519 signing key at rest. The `seed_b64` is the 32-byte PRIVATE seed
 /// (base64url) — recoverable host-only, exactly like the S3 secret, and NEVER emitted; only
-/// `public_b64` is published (JWKS). `kid` is `"{project_id}.{serial}"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `public_b64` is published (JWKS). `kid` is `"{project_id}.{serial}"`. Deliberately NOT `Debug`
+/// (P0-AUTH-2): a `tracing::debug!(?state)` would otherwise dump the private seed to logs.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StoredSigningKey {
     pub kid: String,
     pub seed_b64: String,
@@ -344,14 +346,18 @@ pub struct RetiringKey {
     pub retire_at: u64,
 }
 
-/// Per-project jkbase-Auth signing-key state. Exactly one CURRENT keypair (used to sign) plus at
-/// most one PREVIOUS public key inside its retirement window. `next_serial` monotonically numbers
-/// kids so a recreated key never reuses a retired kid.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-project jkbase-Auth signing-key state. Exactly one CURRENT keypair (used to sign) plus the
+/// set of `retiring` public keys still inside their retirement windows (P0-AUTH-4) — a Vec, not a
+/// single slot, so BACK-TO-BACK soft rotations don't strand tokens minted under a key whose window
+/// hasn't closed. `next_serial` monotonically numbers kids so a recreated key never reuses a retired
+/// kid. Not `Debug` because it embeds the private-seed-bearing [`StoredSigningKey`] (P0-AUTH-2).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SigningKeyState {
     pub current: StoredSigningKey,
+    /// Rotated-out public keys still within their `retire_at` windows (pruned on read/rotate;
+    /// cleared on a HARD rotation). Bounded by [`Store::MAX_RETIRING_SIGNING_KEYS`].
     #[serde(default)]
-    pub previous: Option<RetiringKey>,
+    pub retiring: Vec<RetiringKey>,
     pub next_serial: u64,
 }
 
@@ -2221,6 +2227,11 @@ impl Store {
     /// token is stranded (P0-AUTH-4). ≥ the max token TTL (24h) + clock skew.
     pub const AUTH_SIGNING_ROTATION_WINDOW_SECS: u64 = 24 * 3600 + 300;
 
+    /// Hard cap on retiring public keys kept in a project's key state — bounds the persisted blob
+    /// against a pathological rotate-in-a-loop. In-window keys past this many rotations are dropped
+    /// oldest-first (only reachable by >32 rotations inside the 24h window, absurd for a signing key).
+    pub const MAX_RETIRING_SIGNING_KEYS: usize = 32;
+
     /// Hard cap on issuer keys per project (mirrors [`Self::MAX_DB_ACCESS_KEYS_PER_PROJECT`]):
     /// bounds index growth and a compromised owner's blast radius.
     pub const MAX_AUTH_ISSUER_KEYS_PER_PROJECT: usize = 25;
@@ -2273,11 +2284,19 @@ impl Store {
     /// private seed never leaves this process (P0-AUTH-2). The redb write txn serializes concurrent
     /// mints, so two callers can't race two serial-0 keys into existence.
     pub fn ensure_signing_key(&self, project_id: &str, now: u64) -> Result<jose::SigningKeypair> {
+        // Fast path: after the first mint the key ALWAYS exists, so the steady state is a pure read.
+        // Taking the global write lock + a durable commit on every mint would serialize all mints
+        // (and every other control-plane write) through redb's single writer — a cross-tenant
+        // throughput ceiling on the hot "signing oracle" path. Only the rare first-mint escalates.
+        if let Some(state) = self.get_signing_state(project_id)? {
+            return Self::keypair_from_stored(&state.current);
+        }
         let txn = self.db.begin_write()?;
         let keypair = {
             let mut table = txn.open_table(AUTH_SIGNING_KEYS)?;
-            // Read into an owned value first so the AccessGuard's borrow of `table` is released
-            // before the None branch mutably inserts.
+            // Re-check under the write lock: a concurrent first-mint may have provisioned the key
+            // between our read above and acquiring this txn. redb serializes writers, so the loser
+            // reads the winner's key instead of clobbering it (closes the TOCTOU).
             let existing: Option<SigningKeyState> = match table.get(project_id)? {
                 Some(v) => Some(serde_json::from_slice(v.value())?),
                 None => None,
@@ -2290,7 +2309,7 @@ impl Store {
                     let stored = Self::stored_key_from_seed(kid.clone(), seed, now);
                     let state = SigningKeyState {
                         current: stored,
-                        previous: None,
+                        retiring: Vec::new(),
                         next_serial: 1,
                     };
                     table.insert(project_id, serde_json::to_vec(&state)?.as_slice())?;
@@ -2314,10 +2333,10 @@ impl Store {
             &state.current.kid,
             &state.current.public_b64,
         )];
-        if let Some(prev) = &state.previous
-            && now < prev.retire_at
-        {
-            keys.push(Self::jwk_from_public(&prev.kid, &prev.public_b64));
+        for r in &state.retiring {
+            if now < r.retire_at {
+                keys.push(Self::jwk_from_public(&r.kid, &r.public_b64));
+            }
         }
         Ok(jose::Jwks::new(keys))
     }
@@ -2339,27 +2358,41 @@ impl Store {
                 Some(v) => Some(serde_json::from_slice(v.value())?),
                 None => None,
             };
-            let (serial, previous) = match &existing {
+            let (serial, retiring) = match existing {
                 Some(state) => {
-                    let prev = if hard {
-                        None
+                    let retiring = if hard {
+                        // Compromise: drop EVERY rotated-out key from JWKS immediately (hard revoke).
+                        Vec::new()
                     } else {
-                        Some(RetiringKey {
+                        // Carry forward the still-in-window retiring keys (so a prior soft rotation's
+                        // cohort isn't stranded — P0-AUTH-4), prune expired ones, and add the
+                        // outgoing current. Bound the set oldest-first against rotate-in-a-loop.
+                        let mut r: Vec<RetiringKey> = state
+                            .retiring
+                            .into_iter()
+                            .filter(|k| now < k.retire_at)
+                            .collect();
+                        r.push(RetiringKey {
                             kid: state.current.kid.clone(),
                             public_b64: state.current.public_b64.clone(),
                             retire_at: now + Self::AUTH_SIGNING_ROTATION_WINDOW_SECS,
-                        })
+                        });
+                        if r.len() > Self::MAX_RETIRING_SIGNING_KEYS {
+                            let overflow = r.len() - Self::MAX_RETIRING_SIGNING_KEYS;
+                            r.drain(0..overflow);
+                        }
+                        r
                     };
-                    (state.next_serial, prev)
+                    (state.next_serial, retiring)
                 }
-                None => (0, None),
+                None => (0, Vec::new()),
             };
             let kid = format!("{project_id}.{serial}");
             let seed = auth::generate_signing_seed();
             let stored = Self::stored_key_from_seed(kid.clone(), seed, now);
             let state = SigningKeyState {
                 current: stored,
-                previous,
+                retiring,
                 next_serial: serial + 1,
             };
             table.insert(project_id, serde_json::to_vec(&state)?.as_slice())?;
@@ -2876,6 +2909,33 @@ mod tests {
         let jwks_hard = store.get_jwks("proj", now).unwrap();
         assert_eq!(jwks_hard.keys.len(), 1);
         assert_eq!(jwks_hard.keys[0].kid, "proj.2");
+    }
+
+    #[test]
+    fn signing_key_double_rotation_keeps_all_in_window_cohorts() {
+        // Two soft rotations inside the window must NOT strand the oldest cohort (P0-AUTH-4).
+        let (store, _p) = tmp_db();
+        let now = 1_000_000;
+        let k0 = store.ensure_signing_key("proj", now).unwrap(); // proj.0
+        let tok0 = k0.sign(&auth_claims("proj", now)).unwrap();
+        let k1 = store.rotate_signing_key("proj", now, false).unwrap(); // proj.1
+        let tok1 = k1.sign(&auth_claims("proj", now)).unwrap();
+        store.rotate_signing_key("proj", now, false).unwrap(); // proj.2
+
+        // All three kids are published in-window → neither pre-rotation token is stranded.
+        let jwks = store.get_jwks("proj", now).unwrap();
+        assert_eq!(jwks.keys.len(), 3);
+        assert!(jose::verify(&tok0, &jwks, &VerifyOptions::at(now)).is_ok());
+        assert!(jose::verify(&tok1, &jwks, &VerifyOptions::at(now)).is_ok());
+
+        // A HARD rotation clears the whole retiring set → both old tokens fail closed at once.
+        store.rotate_signing_key("proj", now, true).unwrap(); // proj.3
+        let jwks_hard = store.get_jwks("proj", now).unwrap();
+        assert_eq!(jwks_hard.keys.len(), 1);
+        assert_eq!(
+            jose::verify(&tok0, &jwks_hard, &VerifyOptions::at(now)).unwrap_err(),
+            jose::VerifyError::UnknownKid
+        );
     }
 
     #[test]

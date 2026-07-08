@@ -3383,6 +3383,15 @@ pub struct RotateResponse {
     pub kid: String,
 }
 
+/// Query for `POST /projects/{id}/auth/rotate`. `hard=true` is a compromise revoke: the outgoing
+/// key is dropped from JWKS IMMEDIATELY (invalidating every outstanding token) rather than kept for
+/// the overlap window — the reachable form of the P0-AUTH-4 hard-revoke control.
+#[derive(Deserialize)]
+pub struct RotateParams {
+    #[serde(default)]
+    pub hard: bool,
+}
+
 /// `POST /projects/{id}/auth/keys` — mint an owner-held jkbase-Auth issuer key. Owner-scoped.
 /// The 256-bit `jkbk_` secret is shown once here and never retrievable after (the store persists
 /// only its sha256 fingerprint).
@@ -3532,6 +3541,7 @@ async fn rotate_auth_key(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<RotateParams>,
 ) -> impl IntoResponse {
     match state.store.get_project(&id) {
         Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
@@ -3546,9 +3556,12 @@ async fn rotate_auth_key(
         }
     }
 
-    match state.store.rotate_signing_key(&id, auth::timestamp(), false) {
+    match state
+        .store
+        .rotate_signing_key(&id, auth::timestamp(), params.hard)
+    {
         Ok(kp) => {
-            info!(project = %id, kid = %kp.kid(), "jkbase-auth signing key rotated");
+            info!(project = %id, kid = %kp.kid(), hard = params.hard, "jkbase-auth signing key rotated");
             Json(RotateResponse {
                 kid: kp.kid().to_string(),
             })
@@ -3594,10 +3607,10 @@ async fn list_signing_keys(
                     created_unix: Some(st.current.created_unix),
                     retire_at: None,
                 });
-                if let Some(prev) = st.previous {
+                for prev in st.retiring {
                     out.push(SigningKeyResponse {
                         kid: prev.kid,
-                        status: "previous".to_string(),
+                        status: "retiring".to_string(),
                         created_unix: None,
                         retire_at: Some(prev.retire_at),
                     });
