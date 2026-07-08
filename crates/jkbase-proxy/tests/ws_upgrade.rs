@@ -117,6 +117,7 @@ fn base_config(proxy_port: u16) -> ProxyConfig {
         cert_manager: None,
         api_addr: None,
         storage_addr: None,
+        auth_addr: None,
         domains: None,
         activity_tracker: None,
         wake_callback: None,

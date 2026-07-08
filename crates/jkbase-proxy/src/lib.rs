@@ -113,6 +113,9 @@ pub struct ProxyConfig {
     /// Local address of the tenant S3 object-store service. `storage.{domain}` is
     /// forwarded here (streamed). `None` disables the reserved host.
     pub storage_addr: Option<String>,
+    /// Local address of the jkbase-Auth issuer service (P3). `auth.{domain}` is forwarded
+    /// here. `None` disables the reserved host. Same in-process-loopback model as `storage_addr`.
+    pub auth_addr: Option<String>,
     pub domains: Option<DomainMap>,
     pub activity_tracker: Option<ActivityTracker>,
     pub wake_callback: Option<WakeCallback>,
@@ -153,6 +156,7 @@ struct SharedState {
     domain: Arc<String>,
     api_addr: Arc<Option<String>>,
     storage_addr: Arc<Option<String>>,
+    auth_addr: Arc<Option<String>>,
     domains: Option<DomainMap>,
     activity: Option<ActivityTracker>,
     wake_cb: Option<WakeCallback>,
@@ -206,6 +210,7 @@ pub async fn serve(
         domain,
         api_addr: Arc::new(config.api_addr),
         storage_addr: Arc::new(config.storage_addr),
+        auth_addr: Arc::new(config.auth_addr),
         domains: config.domains,
         activity,
         wake_cb: config.wake_callback,
@@ -534,6 +539,21 @@ async fn proxy_request(
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(error = %e, "object-store forward failed");
+                Ok(bad_gateway())
+            }
+        };
+    }
+
+    // Route auth.{domain} to the jkbase-Auth issuer service (P3; infra host, never a tenant
+    // project — `auth` is a RESERVED_LABEL). Same local-forward pattern as storage; the issuer
+    // reads the project from the path + the `jkbk_` bearer, so the Host rewrite is harmless.
+    if subdomain.as_deref() == Some("auth")
+        && let Some(ref addr) = *shared.auth_addr
+    {
+        return match forward_to_api(&shared, addr, req).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                error!(error = %e, "jkbase-auth forward failed");
                 Ok(bad_gateway())
             }
         };
