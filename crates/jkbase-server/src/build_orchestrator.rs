@@ -3724,6 +3724,11 @@ esac
         /// Like `OfflineNoDep`, but the app talks to the co-located managed DB over
         /// loopback at runtime (no build network — the query is a runtime `fetch`).
         OfflineDatabase,
+        /// Like `OfflineDatabase`, but the app FORWARDS the incoming request's
+        /// `Authorization` header to the DB `/query` (P4 data-plane authz). Lets the test
+        /// present / omit an end-user JWT per request and observe the rules engine's
+        /// allow/deny — without baking any token into the image.
+        AuthDatabase,
         /// Workspace monorepo with transitive deps + a dev dep to prune (fetch-then-seal).
         NetworkedMonorepo,
         /// A Solid/Vite app whose `bun run build` (`vite build`) only resolves
@@ -3836,6 +3841,47 @@ Bun.serve({ port, async fetch() {
     }
     const names = objs.map((o) => o.fields.name).sort();
     return new Response("users=" + names.join(",") + " count=" + objs.length + "\n");
+  } catch (e) {
+    return new Response("db-not-ready: " + e + "\n", { status: 503 });
+  }
+} });
+console.log("listening on " + port);
+"#,
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+            }
+            // The P4 data-plane-authz rung: like OfflineDatabase, but the app FORWARDS the
+            // incoming request's `Authorization` header to the DB `/query`. `GET /` reads all
+            // `User`s (echoing `count=<n> status=<s>`); `GET /seed` creates one. So the test
+            // presents / omits an end-user JWT per request and observes the rules engine:
+            // authenticated ⇒ create/read allowed (count>0), anonymous ⇒ read filtered to 0 /
+            // create refused (500). A failed fetch (DB cold-opening) ⇒ 503 so the poll retries.
+            Workload::AuthDatabase => {
+                write(
+                    src.join("server/server.ts"),
+                    r#"const port = Number(process.env.PORT) || 3000;
+const DB = "http://127.0.0.1:4200/query";
+async function q(query, auth) {
+  const headers = { "content-type": "application/json" };
+  if (auth) headers["authorization"] = auth;
+  const r = await fetch(DB, { method: "POST", headers, body: JSON.stringify({ query }) });
+  return { status: r.status, text: await r.text() };
+}
+Bun.serve({ port, async fetch(req) {
+  const auth = req.headers.get("authorization") || "";
+  const path = new URL(req.url).pathname;
+  try {
+    if (path === "/seed") {
+      const c = await q('User.create({ name: "alpha" })', auth);
+      return new Response("seed status=" + c.status + "\n");
+    }
+    const r = await q("User", auth);
+    let n = 0;
+    try { n = (JSON.parse(r.text).objects || []).length; } catch {}
+    return new Response("count=" + n + " status=" + r.status + "\n");
   } catch (e) {
     return new Response("db-not-ready: " + e + "\n", { status: 503 });
   }
@@ -5725,6 +5771,221 @@ console.log("listening on " + port);
         );
         println!(
             "PASS: managed DB boots in-VM -> loopback round-trip -> HTTP 200 -> survives hibernate→wake AND hard-kill + cold reboot ({cold:?})"
+        );
+    }
+
+    /// The P4 data-plane-authz end-to-end proof: a co-located managed DB booted with a baked
+    /// `rules.rhype` + the project's PUBLIC JWKS (delivered over the reserved `_db_reach.json`
+    /// channel, exactly as the deploy path bakes `DbReachFacts.jwks`) ENFORCES default-deny rules
+    /// against a REAL end-user JWT. The app forwards each request's `Authorization` to the DB
+    /// `/query`, so presenting / omitting a token minted by the jkbase issuer's `jose` (the exact
+    /// format `auth.jkbase.app` emits and the engine's `rhypedb-authz` verifies) drives the engine:
+    ///   - authenticated ⇒ create ALLOWED (200) + read returns the row (count=1)
+    ///   - anonymous     ⇒ read filtered to 0, create REFUSED (500)
+    /// This exercises the WHOLE jkbase-side chain under test: agent seeds `rules.rhype` + `jwks.json`
+    /// into the meta volume + sets `RHYPEDB_RULES`/`RHYPEDB_AUTH_JWKS` → the engine verifies the
+    /// EdDSA JWT offline against the baked JWKS → the rules gate the query. Rules-OFF is already the
+    /// `managed_db_loopback_*` test above (this is the opt-in that closes the doors).
+    #[tokio::test]
+    #[ignore = "P4 rules e2e: needs KVM + root + bun.ext4 + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn managed_db_rules_enforced_e2e() {
+        use jkbase_common::config::DbReachFacts;
+        use jkbase_control::jose::{Claims, Jwks, SigningKeypair};
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Some(fx) = bun_pipeline_build("rulesdb", 1, Workload::AuthDatabase).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!(
+                "skip: set JKB_ROOTFS to the verity-capable agent rootfs (tools/build-runtime-rootfs.sh)"
+            );
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Mint a real end-user token + its JWKS with the jkbase issuer's jose — byte-identical to
+        // what `auth.jkbase.app` emits and what the engine's rhypedb-authz verifies (kid ties them).
+        let kp = SigningKeypair::from_seed("rulesproj.0", [7u8; 32]);
+        let jwks_json = serde_json::to_string(&Jwks::new(vec![kp.jwk()])).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token = kp
+            .sign(&Claims {
+                iss: "https://auth.jkbase.app".into(),
+                sub: "user-1".into(),
+                aud: "rulesproj".into(),
+                iat: now,
+                exp: now + 3600,
+                jti: "e2e-1".into(),
+                claims: None,
+            })
+            .unwrap();
+        let bearer = format!("Bearer {token}");
+
+        // Stage the managed-DB sidecars: schema + a default-deny rule that admits only an
+        // authenticated principal, and `_database.json` opting into rules.
+        std::fs::write(
+            fx.staged.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":"rules.rhype"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.staged.join("_database")).unwrap();
+        std::fs::write(
+            fx.staged.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fx.staged.join("_database/rules.rhype"),
+            "match User {\n  allow read, create: if request.auth != null;\n}\n",
+        )
+        .unwrap();
+
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, true, true)
+            .expect("compute layer plan with a managed DB + data disk");
+        assert!(
+            plan.runtime_layers.database.is_some(),
+            "_layers.json must map the managed DB overlay (rhypedb:base)"
+        );
+
+        // The host-authored JWKS rides the reserved channel (`_db_reach.json`), exactly as the
+        // deploy path bakes it; the agent seeds it to the meta volume + points RHYPEDB_AUTH_JWKS at
+        // it. splice/admin are unused here but are non-forgeable placeholders (co-located tier).
+        let db_reach = DbReachFacts {
+            splice_secret: "e2e-splice".into(),
+            admin_token: "e2e-admin".into(),
+            dedicated: false,
+            jwks: Some(jwks_json),
+        };
+        let meta_img = fx.data.join("rulesdb-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            Some(&db_reach),
+            &meta_img,
+        )
+        .expect("build the metadata image (rules + JWKS)");
+
+        let data_disk = fx.data.join("rulesdb-data.ext4");
+        let _ = std::fs::remove_file(&data_disk);
+        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()])
+            .await
+            .unwrap();
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("rulesdb", "172.28.0.1", "172.28.0.2", "AA:FC:00:00:28:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: Some(data_disk.clone()),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("rulesdb-run");
+
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("runtime VM with a rules-on managed DB should start");
+
+        // Readiness: an unauthenticated GET / returns 200 once the DB is up (a denied read is a
+        // FILTERED 200, not an error) — so this doubles as the first deny observation. If rules or
+        // the JWKS failed to load the engine would exit (fail-closed) → the DB never binds → the app
+        // stays 503 → this times out to None and the assert below fails loud.
+        let ready = poll_http_200(guest_ip, 80, Duration::from_secs(90)).await;
+        eprintln!("[rules-e2e] ready (anon read) = {ready:?}");
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        async fn get(
+            client: &reqwest::Client,
+            ip: &str,
+            path: &str,
+            bearer: Option<&str>,
+        ) -> Option<String> {
+            let mut rb = client.get(format!("http://{ip}:80{path}"));
+            if let Some(b) = bearer {
+                rb = rb.header("authorization", b);
+            }
+            let r = rb.send().await.ok()?;
+            r.text().await.ok()
+        }
+
+        // Authenticated: create ALLOWED (200) + read returns the row (count=1).
+        let seed_auth = get(&client, guest_ip, "/seed", Some(&bearer)).await;
+        eprintln!("[rules-e2e] seed WITH token = {seed_auth:?}");
+        let read_auth = get(&client, guest_ip, "/", Some(&bearer)).await;
+        eprintln!("[rules-e2e] read WITH token = {read_auth:?}");
+        // Anonymous: read filtered to zero, create REFUSED (500).
+        let read_anon = get(&client, guest_ip, "/", None).await;
+        eprintln!("[rules-e2e] read WITHOUT token = {read_anon:?}");
+        let seed_anon = get(&client, guest_ip, "/seed", None).await;
+        eprintln!("[rules-e2e] seed WITHOUT token = {seed_anon:?}");
+
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+
+        assert!(
+            ready.is_some(),
+            "DB must boot + the app must serve (a rules-on engine that couldn't load rules/JWKS \
+             exits fail-closed and never binds)"
+        );
+        assert_eq!(
+            seed_auth.as_deref(),
+            Some("seed status=200\n"),
+            "authenticated create must be ALLOWED by the rule (request.auth != null)"
+        );
+        assert_eq!(
+            read_auth.as_deref(),
+            Some("count=1 status=200\n"),
+            "authenticated read must see the created row"
+        );
+        assert_eq!(
+            read_anon.as_deref(),
+            Some("count=0 status=200\n"),
+            "anonymous read must be DEFAULT-DENIED (the row filtered out) — the whole point of P4"
+        );
+        assert_eq!(
+            seed_anon.as_deref(),
+            Some("seed status=500\n"),
+            "anonymous create must be REFUSED (a denied write fails loud)"
+        );
+        println!(
+            "PASS: P4 rules enforced in-VM — authenticated create/read ALLOWED, anonymous read \
+             filtered + write refused (baked rules.rhype + reserved-channel JWKS)"
         );
     }
 
