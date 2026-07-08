@@ -74,5 +74,10 @@ rcgen = "0.13"
 rustls-pemfile = "2"
 argon2 = { version = "0.5", features = ["std", "rand"] }
 base64 = "0.22"
+# EdDSA (Ed25519) for the per-project jkbase-Auth JWT issuer. Default features only
+# (no `rand` feature): keypairs are built from a 32-byte seed via `SigningKey::from_bytes`
+# using the same `OsRng.fill_bytes` the rest of the credential-minting family uses, so
+# there's no second rand_core in the tree.
+ed25519-dalek = "2"
 cron = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
