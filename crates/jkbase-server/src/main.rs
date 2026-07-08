@@ -2964,12 +2964,36 @@ async fn handle_deploy(
                         .store
                         .mint_db_admin_token(project_id)
                         .unwrap_or_default();
+                    // P4: when the project opts into security rules (`[database].rules`), provision
+                    // (if needed) + read its PUBLIC JWKS from the jkbase-Auth signing store and bake
+                    // it over this reserved channel so the DB VM's engine verifies end-user JWTs
+                    // offline (P0-DBA-2/3) — no network on the query path. `ensure_signing_key`
+                    // guarantees a NON-EMPTY key set (the engine refuses to start on an empty JWKS),
+                    // so a rules-on DB never boots without a verifier. Best-effort like the rest of
+                    // this block: a store error leaves `jwks=None`, and the agent then starts the
+                    // engine with RHYPEDB_RULES but no JWKS ⇒ the engine fails CLOSED (refuses to
+                    // serve an open DB), never silently rules-off. PUBLIC keys only (P0-AUTH-2).
+                    let jwks = if project_db_rules_enabled(&data_dir, project_id) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let _ = plat.store.ensure_signing_key(project_id, now);
+                        plat.store
+                            .get_jwks(project_id, now)
+                            .ok()
+                            .filter(|j| !j.keys.is_empty())
+                            .and_then(|j| serde_json::to_string(&j).ok())
+                    } else {
+                        None
+                    };
                     jkbase_common::config::DbReachFacts {
                         splice_secret,
                         admin_token,
                         // Base value (the DB VM's own image keeps this); the app VM's copy is
                         // flipped to `dedicated` below so its agent starts the app→DB loopback proxy.
                         dedicated: false,
+                        jwks,
                     }
                 })
         } else {
@@ -5344,6 +5368,30 @@ fn project_is_dedicated(data_dir: &Path, project_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the project opts into the P4 security-rules engine via a non-empty
+/// `[database].rules` (baked into `_database.json`'s `rules` field). This is the opt-in that
+/// turns the managed DB from open-on-loopback into default-deny: only then does the host mint +
+/// bake the project's PUBLIC JWKS ([`DbReachFacts::jwks`]) and the agent point
+/// `RHYPEDB_RULES`/`RHYPEDB_AUTH_JWKS` at the baked files. Absent/null/empty ⇒ rules-off (the
+/// engine stays byte-for-byte unchanged). Mirrors [`project_is_dedicated`] — reads the same
+/// host-baked, tenant-unforgeable sidecar.
+fn project_db_rules_enabled(data_dir: &Path, project_id: &str) -> bool {
+    let path = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_database.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| {
+            v.get("rules")
+                .and_then(serde_json::Value::as_str)
+                .map(|r| !r.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
 /// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
 /// (parsed host-side at deploy into `_database.json`'s `size_mib`) when present, else
 /// the platform default [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized
@@ -6956,6 +7004,40 @@ mod tests {
         for id in ["colo", "notier", "junk"] {
             assert!(!project_is_dedicated(&data, id), "{id} must be co-located");
             assert_eq!(db_reach_target_vm(&data, id), id);
+        }
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn db_rules_opt_in_parsing_is_fail_safe() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!("jkbase-dbrules-{nanos}"));
+        let live = |id: &str| data.join("hosting").join(id).join("live");
+        let write_db = |id: &str, json: &str| {
+            std::fs::create_dir_all(live(id)).unwrap();
+            std::fs::write(live(id).join("_database.json"), json).unwrap();
+        };
+
+        // No _database.json → rules-off (no managed DB, or a DB without rules).
+        assert!(!project_db_rules_enabled(&data, "none"));
+
+        // A non-empty `rules` path is the opt-in that makes the host mint + bake the JWKS.
+        write_db("on", r#"{"engine":"rhypedb","schema":"s.rhype","rules":"rules.rhype"}"#);
+        assert!(project_db_rules_enabled(&data, "on"));
+
+        // Absent / null / empty / whitespace `rules`, and garbage, all fail SAFE to rules-off so a
+        // malformed sidecar never provisions keys nor half-enables enforcement.
+        write_db("norules", r#"{"engine":"rhypedb","schema":"s.rhype"}"#);
+        write_db("nullrules", r#"{"engine":"rhypedb","schema":"s.rhype","rules":null}"#);
+        write_db("emptyrules", r#"{"engine":"rhypedb","schema":"s.rhype","rules":""}"#);
+        write_db("wsrules", r#"{"engine":"rhypedb","schema":"s.rhype","rules":"   "}"#);
+        write_db("junk", r#"not even json"#);
+        for id in ["norules", "nullrules", "emptyrules", "wsrules", "junk"] {
+            assert!(!project_db_rules_enabled(&data, id), "{id} must be rules-off");
         }
 
         let _ = std::fs::remove_dir_all(&data);
