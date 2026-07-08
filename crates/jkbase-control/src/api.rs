@@ -345,6 +345,16 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             axum::routing::delete(revoke_db_key),
         )
         .route(
+            "/projects/{id}/auth/keys",
+            get(list_auth_keys).post(issue_auth_key),
+        )
+        .route(
+            "/projects/{id}/auth/keys/{key_id}",
+            axum::routing::delete(revoke_auth_key),
+        )
+        .route("/projects/{id}/auth/rotate", post(rotate_auth_key))
+        .route("/projects/{id}/auth/signing-keys", get(list_signing_keys))
+        .route(
             "/projects/{id}/db/backups",
             get(list_db_backups).post(trigger_db_backup),
         )
@@ -3323,6 +3333,278 @@ async fn revoke_db_key(
             }),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// -- jkbase-Auth (P3) issuer keys + signing keys --
+
+/// Returned ONCE, at creation — the only time an issuer key's secret is exposed. The owner puts
+/// `{key_id, secret}` in their backend so it can call `auth.{domain}/v1/projects/{id}/token`.
+#[derive(Serialize)]
+pub struct IssuerKeyCreatedResponse {
+    pub key_id: String,
+    pub secret: String,
+    pub label: String,
+    pub created_unix: u64,
+}
+
+/// Listing view of an issuer key — only the fingerprint exists at rest, so there is no secret to
+/// surface here even in principle.
+#[derive(Serialize)]
+pub struct IssuerKeyResponse {
+    pub key_id: String,
+    pub label: String,
+    pub created_unix: u64,
+}
+
+/// One signing key in the project's key state: the `current` signer, and (during a rotation
+/// window) the `previous` one still published in JWKS.
+#[derive(Serialize)]
+pub struct SigningKeyResponse {
+    pub kid: String,
+    /// `"current"` or `"previous"`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_unix: Option<u64>,
+    /// Unix time this key drops out of JWKS (previous only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retire_at: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct RotateResponse {
+    pub kid: String,
+}
+
+/// `POST /projects/{id}/auth/keys` — mint an owner-held jkbase-Auth issuer key. Owner-scoped.
+/// The 256-bit `jkbk_` secret is shown once here and never retrievable after (the store persists
+/// only its sha256 fingerprint).
+async fn issue_auth_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateAccessKeyRequest>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    let label = req.label.trim();
+    if label.len() > 64 || label.bytes().any(|b| b.is_ascii_control()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "label must be <= 64 chars and contain no control characters".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match state.store.create_issuer_key(&id, &tenant.id, label) {
+        Ok((key, secret)) => {
+            info!(project = %id, key_id = %key.key_id, "jkbase-auth issuer key issued");
+            (
+                StatusCode::CREATED,
+                Json(IssuerKeyCreatedResponse {
+                    key_id: key.key_id,
+                    secret,
+                    label: key.label,
+                    created_unix: key.created_unix,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/auth/keys` — list the project's issuer keys (ids + labels, never secrets).
+/// Owner-scoped.
+async fn list_auth_keys(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.list_issuer_keys(&id) {
+        Ok(keys) => {
+            let out: Vec<IssuerKeyResponse> = keys
+                .into_iter()
+                .map(|k| IssuerKeyResponse {
+                    key_id: k.key_id,
+                    label: k.label,
+                    created_unix: k.created_unix,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /projects/{id}/auth/keys/{key_id}` — revoke one issuer key. Owner-scoped and key-scoped
+/// (the store removes it only if it belongs to this project). A revoked key can no longer mint;
+/// already-issued JWTs still verify until they expire (they're stateless) — rotate the signing key
+/// to invalidate outstanding tokens.
+async fn revoke_auth_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path((id, key_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.delete_issuer_key(&id, &key_id) {
+        Ok(true) => {
+            info!(project = %id, key_id = %key_id, "jkbase-auth issuer key revoked");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("issuer key '{key_id}' not found"),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /projects/{id}/auth/rotate` — force a signing-key rotation (soft: the outgoing key stays
+/// in JWKS for the overlap window so live tokens keep verifying — P0-AUTH-4). Owner-scoped.
+async fn rotate_auth_key(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.rotate_signing_key(&id, auth::timestamp(), false) {
+        Ok(kp) => {
+            info!(project = %id, kid = %kp.kid(), "jkbase-auth signing key rotated");
+            Json(RotateResponse {
+                kid: kp.kid().to_string(),
+            })
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/auth/signing-keys` — the project's current + (in-window) previous signing
+/// kids, so an owner can see what JWKS is publishing. Owner-scoped. Empty until the first mint.
+async fn list_signing_keys(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.get_signing_state(&id) {
+        Ok(state_opt) => {
+            let mut out = Vec::new();
+            if let Some(st) = state_opt {
+                out.push(SigningKeyResponse {
+                    kid: st.current.kid,
+                    status: "current".to_string(),
+                    created_unix: Some(st.current.created_unix),
+                    retire_at: None,
+                });
+                if let Some(prev) = st.previous {
+                    out.push(SigningKeyResponse {
+                        kid: prev.kid,
+                        status: "previous".to_string(),
+                        created_unix: None,
+                        retire_at: Some(prev.retire_at),
+                    });
+                }
+            }
+            Json(out).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

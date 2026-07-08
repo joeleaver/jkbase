@@ -117,6 +117,9 @@ pub enum Command {
     /// Manage the project's managed database (RhypeDB)
     #[command(subcommand)]
     Db(DbCommand),
+    /// Manage jkbase-Auth (per-project EdDSA-JWT issuer): issuer keys, key rotation, JWKS
+    #[command(subcommand)]
+    Auth(AuthCommand),
 }
 
 #[derive(Subcommand)]
@@ -249,6 +252,87 @@ pub enum DbKeyCommand {
     Rm {
         /// Access key id to revoke
         access_key_id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommand {
+    /// Manage issuer keys (the `jkbk_` bearer your backend uses to mint end-user JWTs)
+    #[command(subcommand)]
+    Key(AuthKeyCommand),
+    /// Force a signing-key rotation (the old key stays in JWKS for the overlap window)
+    Rotate {
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Show the project's current + (in-window) previous signing key ids
+    SigningKeys {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Fetch the project's public JWKS from the issuer (for inspection / offline verification)
+    Jwks {
+        #[arg(long)]
+        project: Option<String>,
+        /// Issuer base URL (defaults to the platform auth host)
+        #[arg(long, default_value = "https://auth.jkbase.app")]
+        issuer: String,
+    },
+    /// Mint a token for a subject using an issuer key (dev convenience; your backend normally
+    /// calls the issuer directly)
+    Mint {
+        /// The end-user subject (`sub`)
+        #[arg(long)]
+        sub: String,
+        /// The issuer key secret (`jkbk_…`)
+        #[arg(long)]
+        key: String,
+        /// A custom claim `k=v` (repeatable)
+        #[arg(long = "claim")]
+        claims: Vec<String>,
+        /// Token lifetime in seconds
+        #[arg(long)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://auth.jkbase.app")]
+        issuer: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuthKeyCommand {
+    /// Create a new issuer key (the secret is shown ONCE)
+    Create {
+        /// Optional label (e.g. web-backend)
+        #[arg(long, default_value = "")]
+        label: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// List issuer keys (ids + labels; secrets are never shown)
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Revoke an issuer key
+    #[command(alias = "revoke")]
+    Rm {
+        /// Issuer key id to revoke
+        key_id: String,
         #[arg(long)]
         project: Option<String>,
         #[arg(long, default_value = "https://api.jkbase.app")]
@@ -400,6 +484,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Domain(cmd) => run_domain(cmd).await,
         Command::Repo(cmd) => repo::run(cmd).await,
         Command::Db(cmd) => run_db(cmd).await,
+        Command::Auth(cmd) => run_auth(cmd).await,
     }
 }
 
@@ -1265,6 +1350,222 @@ async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 let err = body["error"].as_str().unwrap_or("unknown error");
                 anyhow::bail!("failed to revoke db key: {err}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_auth(cmd: AuthCommand) -> anyhow::Result<()> {
+    match cmd {
+        AuthCommand::Key(cmd) => run_auth_key(cmd).await,
+        AuthCommand::Rotate { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+            let resp = client
+                .post(format!("{api}/projects/{project_id}/auth/rotate"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await?;
+                let kid = body["kid"].as_str().unwrap_or("");
+                println!("Rotated jkbase-Auth signing key for project '{project_id}'.");
+                println!("  New kid: {kid}");
+                println!(
+                    "  The previous key stays in JWKS for the overlap window so already-issued \
+                     tokens keep verifying."
+                );
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to rotate signing key: {err}");
+            }
+            Ok(())
+        }
+        AuthCommand::SigningKeys { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+            let resp = client
+                .get(format!("{api}/projects/{project_id}/auth/signing-keys"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            if resp.status().is_success() {
+                let keys: Vec<serde_json::Value> = resp.json().await?;
+                if keys.is_empty() {
+                    println!(
+                        "No signing key for project '{project_id}' yet (provisioned on first token mint)."
+                    );
+                } else {
+                    for k in &keys {
+                        let kid = k["kid"].as_str().unwrap_or("");
+                        let status = k["status"].as_str().unwrap_or("");
+                        match k["retire_at"].as_u64() {
+                            Some(r) => println!("  {kid}  ({status}, retires at {r})"),
+                            None => println!("  {kid}  ({status})"),
+                        }
+                    }
+                }
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to list signing keys: {err}");
+            }
+            Ok(())
+        }
+        AuthCommand::Jwks { project, issuer } => {
+            let project_id = resolve_project_id(project)?;
+            let resp = reqwest::Client::new()
+                .get(format!(
+                    "{issuer}/v1/projects/{project_id}/.well-known/jwks.json"
+                ))
+                .send()
+                .await
+                .context("failed to connect to issuer")?;
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&body)?);
+            } else {
+                anyhow::bail!("failed to fetch JWKS: HTTP {}", resp.status());
+            }
+            Ok(())
+        }
+        AuthCommand::Mint {
+            sub,
+            key,
+            claims,
+            ttl,
+            project,
+            issuer,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let mut claims_obj = serde_json::Map::new();
+            for c in &claims {
+                let (k, v) = c
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("expected --claim KEY=value, got '{c}'"))?;
+                claims_obj.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            }
+            let mut body = serde_json::json!({ "sub": sub });
+            if let Some(t) = ttl {
+                body["ttl"] = serde_json::json!(t);
+            }
+            if !claims_obj.is_empty() {
+                body["claims"] = serde_json::Value::Object(claims_obj);
+            }
+            let resp = reqwest::Client::new()
+                .post(format!("{issuer}/v1/projects/{project_id}/token"))
+                .bearer_auth(&key)
+                .json(&body)
+                .send()
+                .await
+                .context("failed to connect to issuer")?;
+            if resp.status().is_success() {
+                let out: serde_json::Value = resp.json().await?;
+                let token = out["token"].as_str().unwrap_or("");
+                let exp = out["exp"].as_u64().unwrap_or(0);
+                println!("{token}");
+                eprintln!("(expires at unix {exp}; kid {})", out["kid"].as_str().unwrap_or(""));
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to mint token: {err}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_auth_key(cmd: AuthKeyCommand) -> anyhow::Result<()> {
+    match cmd {
+        AuthKeyCommand::Create {
+            label,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+            let resp = client
+                .post(format!("{api}/projects/{project_id}/auth/keys"))
+                .json(&serde_json::json!({ "label": label }))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await?;
+                let key_id = body["key_id"].as_str().unwrap_or("");
+                let secret = body["secret"].as_str().unwrap_or("");
+                println!("jkbase-Auth issuer key created for project '{project_id}':");
+                println!("  Key ID: {key_id}");
+                println!("  Secret: {secret}");
+                println!("\n  Save the secret now — it is not shown again.");
+                println!("  Your backend presents it to auth.jkbase.app to mint per-user JWTs.");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to create issuer key: {err}");
+            }
+            Ok(())
+        }
+        AuthKeyCommand::List { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+            let resp = client
+                .get(format!("{api}/projects/{project_id}/auth/keys"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            if resp.status().is_success() {
+                let keys: Vec<serde_json::Value> = resp.json().await?;
+                if keys.is_empty() {
+                    println!("No issuer keys for project '{project_id}'");
+                } else {
+                    for k in &keys {
+                        let key_id = k["key_id"].as_str().unwrap_or("");
+                        let label = k["label"].as_str().unwrap_or("");
+                        if label.is_empty() {
+                            println!("  {key_id}");
+                        } else {
+                            println!("  {key_id}  ({label})");
+                        }
+                    }
+                }
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to list issuer keys: {err}");
+            }
+            Ok(())
+        }
+        AuthKeyCommand::Rm {
+            key_id,
+            project,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let token = crate::credentials::load_token()?
+                .ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+            let client = crate::credentials::authenticated_client(&token);
+            let resp = client
+                .delete(format!("{api}/projects/{project_id}/auth/keys/{key_id}"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            if resp.status().is_success() {
+                println!("Issuer key '{key_id}' revoked from project '{project_id}'");
+            } else {
+                let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let err = body["error"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("failed to revoke issuer key: {err}");
             }
             Ok(())
         }
