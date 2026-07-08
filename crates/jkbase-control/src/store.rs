@@ -1,9 +1,16 @@
 use crate::auth::{self, ApiToken, Tenant};
+use crate::jose;
 use anyhow::{Context, Result};
+use base64::Engine;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+
+/// base64url (no pad) — the encoding for jkbase-Auth key material at rest (private seed + public
+/// key) and in emitted JWKs.
+const B64URL: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 const PROJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("projects");
 const VM_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("vm_allocations");
@@ -75,6 +82,22 @@ const DB_DEPLOYED_TIER: TableDefinition<&str, &[u8]> = TableDefinition::new("db_
 const DB_BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("db_backups");
 const DB_BACKUPS_BY_PROJECT: TableDefinition<&str, &[u8]> =
     TableDefinition::new("db_backups_by_project");
+/// jkbase-Auth (P3) per-project **signing-key state**, keyed by `project_id` → [`SigningKeyState`]:
+/// the CURRENT Ed25519 keypair (32-byte private seed recoverable at rest, host-only — P0-AUTH-2)
+/// plus, during a rotation overlap window, the PREVIOUS *public* key so tokens minted under it still
+/// verify (P0-AUTH-4). Purged on teardown so a recreated same-slug project starts with a fresh key.
+const AUTH_SIGNING_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_signing_keys");
+/// jkbase-Auth **issuer keys** — the `jkbk_` bearer a tenant's own backend presents to the `auth.`
+/// mint endpoint to have a per-end-user JWT signed. A keyspace ENTIRELY SEPARATE from the S3
+/// (`JKBA`) and DB (`JKBD`) keys: distinct `jkbk_` prefix + distinct table. Keyed by the secret's
+/// sha256 fingerprint for an O(1) auth lookup (the secret itself is never stored — [R4] discipline);
+/// the record carries `project_id`+`tenant_id` for owner-rebind (P0-AUTH-3).
+const AUTH_ISSUER_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("auth_issuer_keys");
+/// Secondary index for per-project list/revoke/teardown, keyed `{project_id}:{key_id}` → the
+/// primary's fingerprint. Mirrors the [`DB_ACCESS_KEYS_BY_PROJECT`] split so list/teardown stay
+/// O(keys-for-this-project) and one project can't address another's key by guessing an id.
+const AUTH_ISSUER_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("auth_issuer_keys_by_project");
 /// Cluster fleet membership (HA), one row per `jkbase-server` host instance, keyed
 /// by `host_id`. The leader's placement + dead-host detection (P3) read this; at HA
 /// P0 it is schema only — CRUD + tests, no loop touches it yet.
@@ -82,7 +105,7 @@ const HOSTS: TableDefinition<&str, &[u8]> = TableDefinition::new("hosts");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
-pub const RESERVED_LABELS: &[&str] = &["api", "www", "console", "storage"];
+pub const RESERVED_LABELS: &[&str] = &["api", "www", "console", "storage", "auth"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -269,6 +292,67 @@ impl DbAccessKey {
     pub fn verify_secret(&self, presented_secret: &str) -> bool {
         auth::fingerprint_eq(presented_secret, &self.token_fingerprint)
     }
+}
+
+/// A jkbase-Auth **issuer key** (P3): the `jkbk_` bearer a tenant's own backend presents to the
+/// `auth.` mint endpoint. Like [`DbAccessKey`] it stores ONLY the secret's sha256 fingerprint
+/// ([R4]) and is `tenant_id`-bound so the mint path can re-check the project's current owner
+/// (P0-AUTH-3) — a key orphaned by a crash-interrupted teardown can't be inherited by a recreated
+/// same-slug project. `key_id` is a public, non-secret handle used only for list/revoke.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuerKey {
+    pub key_id: String,
+    pub project_id: String,
+    /// The tenant that minted the key; re-checked against the project's current owner.
+    /// `#[serde(default)]` so an older record deserializes (empty tenant → fails the re-bind → safe).
+    #[serde(default)]
+    pub tenant_id: String,
+    /// SHA-256 (hex) of the secret. The plaintext is shown once at mint and never stored.
+    pub token_fingerprint: String,
+    /// Optional owner-supplied label (e.g. "web-backend"); never authoritative.
+    pub label: String,
+    pub created_unix: u64,
+}
+
+impl IssuerKey {
+    /// Const-time check that `presented_secret` matches this key's stored fingerprint.
+    pub fn verify_secret(&self, presented_secret: &str) -> bool {
+        auth::fingerprint_eq(presented_secret, &self.token_fingerprint)
+    }
+}
+
+/// One materialized Ed25519 signing key at rest. The `seed_b64` is the 32-byte PRIVATE seed
+/// (base64url) — recoverable host-only, exactly like the S3 secret, and NEVER emitted; only
+/// `public_b64` is published (JWKS). `kid` is `"{project_id}.{serial}"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredSigningKey {
+    pub kid: String,
+    pub seed_b64: String,
+    pub public_b64: String,
+    pub created_unix: u64,
+}
+
+/// A signing key that has been rotated out but is still inside the overlap window (P0-AUTH-4): its
+/// PUBLIC half stays in JWKS until `retire_at` so tokens minted just before the rotation keep
+/// verifying. The private seed is dropped at rotation — a retiring key can verify, never sign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetiringKey {
+    pub kid: String,
+    pub public_b64: String,
+    /// Unix time after which this key drops out of JWKS. Set to `rotation_time + window`, where the
+    /// window is ≥ the max token TTL so no live token is stranded.
+    pub retire_at: u64,
+}
+
+/// Per-project jkbase-Auth signing-key state. Exactly one CURRENT keypair (used to sign) plus at
+/// most one PREVIOUS public key inside its retirement window. `next_serial` monotonically numbers
+/// kids so a recreated key never reuses a retired kid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningKeyState {
+    pub current: StoredSigningKey,
+    #[serde(default)]
+    pub previous: Option<RetiringKey>,
+    pub next_serial: u64,
 }
 
 /// Lifecycle of a managed-DB backup ([RB8]). A backup is a two-phase operation: the row is
@@ -677,6 +761,9 @@ impl Store {
         let _ = txn.open_table(DB_ADMIN_TOKEN)?;
         let _ = txn.open_table(DB_BACKUPS)?;
         let _ = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
+        let _ = txn.open_table(AUTH_SIGNING_KEYS)?;
+        let _ = txn.open_table(AUTH_ISSUER_KEYS)?;
+        let _ = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(HOSTS)?;
         txn.commit()?;
 
@@ -2128,6 +2215,314 @@ impl Store {
         Ok(())
     }
 
+    // -- jkbase-Auth signing keys (P3; see [`SigningKeyState`], P0-AUTH-2/4) --
+
+    /// Rotation overlap window: a rotated-out key's PUBLIC half stays in JWKS this long so no live
+    /// token is stranded (P0-AUTH-4). ≥ the max token TTL (24h) + clock skew.
+    pub const AUTH_SIGNING_ROTATION_WINDOW_SECS: u64 = 24 * 3600 + 300;
+
+    /// Hard cap on issuer keys per project (mirrors [`Self::MAX_DB_ACCESS_KEYS_PER_PROJECT`]):
+    /// bounds index growth and a compromised owner's blast radius.
+    pub const MAX_AUTH_ISSUER_KEYS_PER_PROJECT: usize = 25;
+
+    fn stored_key_from_seed(kid: String, seed: [u8; 32], now: u64) -> StoredSigningKey {
+        let public = jose::SigningKeypair::from_seed(kid.clone(), seed).public_bytes();
+        StoredSigningKey {
+            kid,
+            seed_b64: B64URL.encode(seed),
+            public_b64: B64URL.encode(public),
+            created_unix: now,
+        }
+    }
+
+    fn keypair_from_stored(sk: &StoredSigningKey) -> Result<jose::SigningKeypair> {
+        let raw = B64URL
+            .decode(sk.seed_b64.as_bytes())
+            .context("corrupt signing-key seed")?;
+        let seed: [u8; 32] = raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("signing-key seed not 32 bytes"))?;
+        Ok(jose::SigningKeypair::from_seed(sk.kid.clone(), seed))
+    }
+
+    /// A public JWK straight from stored `public_b64` (which is already the JWK `x` value), so a
+    /// retiring key (whose private seed is gone) can still be published.
+    fn jwk_from_public(kid: &str, public_b64: &str) -> jose::Jwk {
+        jose::Jwk {
+            kty: "OKP".into(),
+            crv: "Ed25519".into(),
+            use_: "sig".into(),
+            alg: jose::ALG_EDDSA.into(),
+            kid: kid.into(),
+            x: public_b64.to_string(),
+        }
+    }
+
+    /// The project's signing-key state, or `None` if it has never minted a token.
+    pub fn get_signing_state(&self, project_id: &str) -> Result<Option<SigningKeyState>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(AUTH_SIGNING_KEYS)?;
+        match table.get(project_id)? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load-or-mint the project's CURRENT signing keypair (lazy provision on first token mint). The
+    /// private seed never leaves this process (P0-AUTH-2). The redb write txn serializes concurrent
+    /// mints, so two callers can't race two serial-0 keys into existence.
+    pub fn ensure_signing_key(&self, project_id: &str, now: u64) -> Result<jose::SigningKeypair> {
+        let txn = self.db.begin_write()?;
+        let keypair = {
+            let mut table = txn.open_table(AUTH_SIGNING_KEYS)?;
+            // Read into an owned value first so the AccessGuard's borrow of `table` is released
+            // before the None branch mutably inserts.
+            let existing: Option<SigningKeyState> = match table.get(project_id)? {
+                Some(v) => Some(serde_json::from_slice(v.value())?),
+                None => None,
+            };
+            match existing {
+                Some(state) => Self::keypair_from_stored(&state.current)?,
+                None => {
+                    let kid = format!("{project_id}.0");
+                    let seed = auth::generate_signing_seed();
+                    let stored = Self::stored_key_from_seed(kid.clone(), seed, now);
+                    let state = SigningKeyState {
+                        current: stored,
+                        previous: None,
+                        next_serial: 1,
+                    };
+                    table.insert(project_id, serde_json::to_vec(&state)?.as_slice())?;
+                    jose::SigningKeypair::from_seed(kid, seed)
+                }
+            }
+        };
+        txn.commit()?;
+        Ok(keypair)
+    }
+
+    /// Build the project's public JWKS (current + previous-if-still-in-window). Empty `{keys:[]}` if
+    /// the project has never minted — fail-closed (verifies nothing). Callers 404 a NONEXISTENT
+    /// project before calling; an existing-but-unprovisioned project legitimately has an empty set.
+    pub fn get_jwks(&self, project_id: &str, now: u64) -> Result<jose::Jwks> {
+        let state = match self.get_signing_state(project_id)? {
+            Some(s) => s,
+            None => return Ok(jose::Jwks::default()),
+        };
+        let mut keys = vec![Self::jwk_from_public(
+            &state.current.kid,
+            &state.current.public_b64,
+        )];
+        if let Some(prev) = &state.previous
+            && now < prev.retire_at
+        {
+            keys.push(Self::jwk_from_public(&prev.kid, &prev.public_b64));
+        }
+        Ok(jose::Jwks::new(keys))
+    }
+
+    /// Rotate the project's signing key (P0-AUTH-4). Mints a fresh CURRENT keypair under the next
+    /// kid serial; the outgoing key's PUBLIC half becomes PREVIOUS with a retirement window (so live
+    /// tokens keep verifying) UNLESS `hard` (compromise) — then it's dropped immediately (hard
+    /// revoke). Provisions serial 0 if the project had no key yet. Returns the new keypair.
+    pub fn rotate_signing_key(
+        &self,
+        project_id: &str,
+        now: u64,
+        hard: bool,
+    ) -> Result<jose::SigningKeypair> {
+        let txn = self.db.begin_write()?;
+        let keypair = {
+            let mut table = txn.open_table(AUTH_SIGNING_KEYS)?;
+            let existing: Option<SigningKeyState> = match table.get(project_id)? {
+                Some(v) => Some(serde_json::from_slice(v.value())?),
+                None => None,
+            };
+            let (serial, previous) = match &existing {
+                Some(state) => {
+                    let prev = if hard {
+                        None
+                    } else {
+                        Some(RetiringKey {
+                            kid: state.current.kid.clone(),
+                            public_b64: state.current.public_b64.clone(),
+                            retire_at: now + Self::AUTH_SIGNING_ROTATION_WINDOW_SECS,
+                        })
+                    };
+                    (state.next_serial, prev)
+                }
+                None => (0, None),
+            };
+            let kid = format!("{project_id}.{serial}");
+            let seed = auth::generate_signing_seed();
+            let stored = Self::stored_key_from_seed(kid.clone(), seed, now);
+            let state = SigningKeyState {
+                current: stored,
+                previous,
+                next_serial: serial + 1,
+            };
+            table.insert(project_id, serde_json::to_vec(&state)?.as_slice())?;
+            jose::SigningKeypair::from_seed(kid, seed)
+        };
+        txn.commit()?;
+        Ok(keypair)
+    }
+
+    /// Drop the project's signing key entirely (teardown), so a recreated same-slug project starts
+    /// with a fresh keypair and any token still bearing an old kid fails closed (unknown kid).
+    pub fn delete_signing_key(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(AUTH_SIGNING_KEYS)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // -- jkbase-Auth issuer keys (P3; see [`IssuerKey`], P0-AUTH-3) --
+
+    /// Count a project's issuer keys via a bounded range scan over the index.
+    pub fn count_issuer_keys(&self, project_id: &str) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        Ok(index.range(lo.as_str()..hi.as_str())?.count())
+    }
+
+    /// Mint an issuer key for `project_id`. Returns `(record, secret)` — the 256-bit `jkbk_`
+    /// plaintext is exposed ONLY here (shown once); the record persists just its sha256 fingerprint
+    /// ([R4]). Primary (keyed by fingerprint for an O(1) auth lookup) + per-project index written in
+    /// one txn. Errs at the per-project cap.
+    pub fn create_issuer_key(
+        &self,
+        project_id: &str,
+        tenant_id: &str,
+        label: &str,
+    ) -> Result<(IssuerKey, String)> {
+        let secret = auth::generate_issuer_key();
+        let key = IssuerKey {
+            key_id: auth::generate_issuer_key_id(),
+            project_id: project_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+            token_fingerprint: auth::token_fingerprint(&secret),
+            label: label.to_string(),
+            created_unix: auth::timestamp(),
+        };
+        let index_key = format!("{}:{}", project_id, key.key_id);
+        let txn = self.db.begin_write()?;
+        {
+            let lo = format!("{project_id}:");
+            let hi = format!("{project_id};");
+            let mut index = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
+            let current = index.range(lo.as_str()..hi.as_str())?.count();
+            if current >= Self::MAX_AUTH_ISSUER_KEYS_PER_PROJECT {
+                return Err(anyhow::anyhow!(
+                    "issuer key limit reached ({} per project)",
+                    Self::MAX_AUTH_ISSUER_KEYS_PER_PROJECT
+                ));
+            }
+            let mut primary = txn.open_table(AUTH_ISSUER_KEYS)?;
+            if primary.get(key.token_fingerprint.as_str())?.is_some() {
+                return Err(anyhow::anyhow!("issuer key collision; retry"));
+            }
+            let data = serde_json::to_vec(&key)?;
+            primary.insert(key.token_fingerprint.as_str(), data.as_slice())?;
+            index.insert(index_key.as_str(), key.token_fingerprint.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok((key, secret))
+    }
+
+    /// Resolve a presented `jkbk_` secret to its issuer-key record — the O(1) lookup the mint path
+    /// performs (the primary is keyed by the secret's fingerprint, so the get IS the credential
+    /// check). `None` if unknown/revoked. The caller then re-binds to the project's current owner
+    /// (P0-AUTH-3) and cross-checks the path project id.
+    pub fn lookup_issuer_key_by_secret(&self, secret: &str) -> Result<Option<IssuerKey>> {
+        let fp = auth::token_fingerprint(secret);
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(AUTH_ISSUER_KEYS)?;
+        match table.get(fp.as_str())? {
+            Some(v) => Ok(Some(serde_json::from_slice(v.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List a project's issuer keys (console/CLI). Records carry only fingerprints — no secret to
+    /// leak. Bounded range scan over the index.
+    pub fn list_issuer_keys(&self, project_id: &str) -> Result<Vec<IssuerKey>> {
+        let txn = self.db.begin_read()?;
+        let index = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
+        let primary = txn.open_table(AUTH_ISSUER_KEYS)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let mut out = Vec::new();
+        for entry in index.range(lo.as_str()..hi.as_str())? {
+            let (_k, v) = entry?;
+            let fp = String::from_utf8_lossy(v.value()).into_owned();
+            if let Some(rec) = primary.get(fp.as_str())? {
+                out.push(serde_json::from_slice::<IssuerKey>(rec.value())?);
+            }
+        }
+        out.sort_by_key(|k| k.created_unix);
+        Ok(out)
+    }
+
+    /// Revoke one issuer key, scoped to `project_id` via the index compound key (a tenant can't
+    /// revoke another project's key by guessing its id). Returns whether it existed for this project.
+    pub fn delete_issuer_key(&self, project_id: &str, key_id: &str) -> Result<bool> {
+        let index_key = format!("{project_id}:{key_id}");
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut index = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
+            match index.remove(index_key.as_str())? {
+                Some(guard) => {
+                    let fp = String::from_utf8_lossy(guard.value()).into_owned();
+                    let mut primary = txn.open_table(AUTH_ISSUER_KEYS)?;
+                    primary.remove(fp.as_str())?;
+                    true
+                }
+                None => false,
+            }
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Revoke ALL of a project's issuer keys (teardown). Collect-then-delete (redb forbids mutating
+    /// a table mid-iteration). Without this, a recreated same-slug project could inherit a prior
+    /// tenant's issuer credential.
+    pub fn delete_all_issuer_keys(&self, project_id: &str) -> Result<usize> {
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut index = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
+            let entries: Vec<(String, String)> = index
+                .range(lo.as_str()..hi.as_str())?
+                .filter_map(|e| e.ok())
+                .map(|(k, v)| {
+                    (
+                        k.value().to_string(),
+                        String::from_utf8_lossy(v.value()).into_owned(),
+                    )
+                })
+                .collect();
+            let mut primary = txn.open_table(AUTH_ISSUER_KEYS)?;
+            for (index_key, fp) in entries {
+                index.remove(index_key.as_str())?;
+                if primary.remove(fp.as_str())?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
     // -- Managed-DB backup catalog ([RB6]/[RB8]) --
 
     /// Hard cap on retained backups per project (retention bound). The nightly loop prunes to
@@ -2394,6 +2789,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jose::{self, Claims, VerifyOptions};
 
     fn tmp_db() -> (Store, std::path::PathBuf) {
         let nanos = std::time::SystemTime::now()
@@ -2411,6 +2807,138 @@ mod tests {
             created_at: version, // arbitrary but ordered
             layer_digests: Vec::new(),
         }
+    }
+
+    fn auth_claims(project: &str, now: u64) -> Claims {
+        Claims {
+            iss: format!("https://auth.jkbase.app/v1/projects/{project}"),
+            sub: "end-user-1".into(),
+            aud: project.into(),
+            iat: now,
+            exp: now + 3600,
+            jti: "jti".into(),
+            claims: None,
+        }
+    }
+
+    #[test]
+    fn signing_key_lazy_provision_sign_and_verify() {
+        let (store, _p) = tmp_db();
+        let now = 1_000_000;
+        assert!(store.get_signing_state("proj").unwrap().is_none());
+        // First call provisions serial 0 and returns a usable signer.
+        let kp = store.ensure_signing_key("proj", now).unwrap();
+        assert_eq!(kp.kid(), "proj.0");
+        // Idempotent: a second call returns the SAME key (no rotation, byte-stable).
+        let kp2 = store.ensure_signing_key("proj", now + 5).unwrap();
+        assert_eq!(kp2.kid(), "proj.0");
+        assert_eq!(kp2.public_bytes(), kp.public_bytes());
+        // A token it signs verifies against the published JWKS.
+        let tok = kp.sign(&auth_claims("proj", now)).unwrap();
+        let jwks = store.get_jwks("proj", now).unwrap();
+        assert_eq!(jwks.keys.len(), 1);
+        let v = jose::verify(&tok, &jwks, &VerifyOptions::at(now + 10)).unwrap();
+        assert_eq!(v.kid, "proj.0");
+        assert_eq!(v.claims.sub, "end-user-1");
+        // An unprovisioned project has an empty JWKS (fail-closed, verifies nothing).
+        assert!(store.get_jwks("other", now).unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn signing_key_rotation_window() {
+        let (store, _p) = tmp_db();
+        let now = 1_000_000;
+        let old = store.ensure_signing_key("proj", now).unwrap(); // proj.0
+        let tok_old = old.sign(&auth_claims("proj", now)).unwrap();
+
+        let new = store.rotate_signing_key("proj", now, false).unwrap(); // proj.1, soft
+        assert_eq!(new.kid(), "proj.1");
+        assert_ne!(new.public_bytes(), old.public_bytes());
+
+        // In-window JWKS carries BOTH kids → the pre-rotation token still verifies (P0-AUTH-4).
+        let jwks_in = store.get_jwks("proj", now).unwrap();
+        assert_eq!(jwks_in.keys.len(), 2);
+        assert!(jose::verify(&tok_old, &jwks_in, &VerifyOptions::at(now)).is_ok());
+
+        // After the window closes the old kid is gone → the same token fails closed.
+        let after = now + Store::AUTH_SIGNING_ROTATION_WINDOW_SECS + 10;
+        let jwks_after = store.get_jwks("proj", after).unwrap();
+        assert_eq!(jwks_after.keys.len(), 1);
+        assert_eq!(jwks_after.keys[0].kid, "proj.1");
+        assert_eq!(
+            jose::verify(&tok_old, &jwks_after, &VerifyOptions::at(now)).unwrap_err(),
+            jose::VerifyError::UnknownKid
+        );
+
+        // A HARD rotation (compromise) drops the outgoing key from JWKS immediately.
+        let hard = store.rotate_signing_key("proj", now, true).unwrap(); // proj.2
+        assert_eq!(hard.kid(), "proj.2");
+        let jwks_hard = store.get_jwks("proj", now).unwrap();
+        assert_eq!(jwks_hard.keys.len(), 1);
+        assert_eq!(jwks_hard.keys[0].kid, "proj.2");
+    }
+
+    #[test]
+    fn issuer_key_create_lookup_and_owner_binding() {
+        let (store, _p) = tmp_db();
+        let (rec, secret) = store.create_issuer_key("proj", "tenantA", "web").unwrap();
+        assert!(secret.starts_with("jkbk_"));
+        assert_eq!(rec.project_id, "proj");
+        assert_eq!(rec.tenant_id, "tenantA");
+        // Correct secret resolves the record (O(1) fingerprint lookup); it carries the owner
+        // binding the mint path re-checks (P0-AUTH-3).
+        let found = store.lookup_issuer_key_by_secret(&secret).unwrap().unwrap();
+        assert_eq!(found.key_id, rec.key_id);
+        assert_eq!(found.tenant_id, "tenantA");
+        // A wrong / unknown secret resolves to nothing (fail-closed).
+        assert!(
+            store
+                .lookup_issuer_key_by_secret("jkbk_not-a-real-secret")
+                .unwrap()
+                .is_none()
+        );
+        // Listed, then scoped-revoked; after revoke the secret no longer resolves.
+        assert_eq!(store.list_issuer_keys("proj").unwrap().len(), 1);
+        assert!(store.delete_issuer_key("proj", &rec.key_id).unwrap());
+        assert!(
+            store
+                .lookup_issuer_key_by_secret(&secret)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.list_issuer_keys("proj").unwrap().len(), 0);
+        // Revoking a non-existent id is a no-op false (not an error).
+        assert!(!store.delete_issuer_key("proj", "JKBK00").unwrap());
+    }
+
+    #[test]
+    fn issuer_key_cap_and_teardown_purge_is_project_scoped() {
+        let (store, _p) = tmp_db();
+        for i in 0..Store::MAX_AUTH_ISSUER_KEYS_PER_PROJECT {
+            store
+                .create_issuer_key("proj", "t", &format!("k{i}"))
+                .unwrap();
+        }
+        // Cap enforced.
+        assert!(store.create_issuer_key("proj", "t", "over").is_err());
+        // A second project is unaffected by the first's cap or teardown.
+        let (_r, other_secret) = store.create_issuer_key("proj2", "t", "x").unwrap();
+
+        // Teardown purges ONLY the target project's keys + signing key.
+        store.ensure_signing_key("proj", 1).unwrap();
+        let removed = store.delete_all_issuer_keys("proj").unwrap();
+        assert_eq!(removed, Store::MAX_AUTH_ISSUER_KEYS_PER_PROJECT);
+        assert_eq!(store.count_issuer_keys("proj").unwrap(), 0);
+        store.delete_signing_key("proj").unwrap();
+        assert!(store.get_signing_state("proj").unwrap().is_none());
+        // proj2's credential still resolves.
+        assert!(
+            store
+                .lookup_issuer_key_by_secret(&other_secret)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.count_issuer_keys("proj2").unwrap(), 1);
     }
 
     #[test]

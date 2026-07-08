@@ -782,6 +782,11 @@ async fn create_project(
     let _ = state.store.delete_db_admin_token(&id);
     let _ = state.store.delete_all_db_backups(&id);
     let _ = std::fs::remove_dir_all(data_dir(&state).join("db-backups").join(&id));
+    // jkbase-Auth (P3): drop the project's signing key + all issuer keys so a recreated same-slug
+    // project starts with a fresh keypair and can't inherit a prior tenant's issuer credential
+    // (P0-AUTH-3); any token still bearing an old kid then fails closed (unknown kid).
+    let _ = state.store.delete_signing_key(&id);
+    let _ = state.store.delete_all_issuer_keys(&id);
     // [R5] Drop any LIVE managed-DB relay for this project now that its credentials are gone.
     if let Some(cb) = &state.db_revoke_callback {
         cb(DbRevokeScope::Project(id.clone()));
@@ -948,6 +953,11 @@ async fn delete_project(
                     let _ =
                         tokio::fs::remove_dir_all(data_dir(&state).join("db-backups").join(&id))
                             .await;
+                    // jkbase-Auth (P3): drop the signing key + all issuer keys so a recreated
+                    // same-slug project starts fresh and can't inherit a prior issuer credential
+                    // (P0-AUTH-3); any token bearing an old kid fails closed.
+                    let _ = state.store.delete_signing_key(&id);
+                    let _ = state.store.delete_all_issuer_keys(&id);
                     // [R5] Drop any LIVE managed-DB relay now that credentials are gone.
                     if let Some(cb) = &state.db_revoke_callback {
                         cb(DbRevokeScope::Project(id.clone()));

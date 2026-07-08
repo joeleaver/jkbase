@@ -133,6 +133,44 @@ pub fn generate_rhypedb_admin_token() -> String {
     )
 }
 
+/// Generate a 32-byte Ed25519 signing seed — the per-project jkbase-Auth PRIVATE key material
+/// (P3). Uses the same `OsRng.fill_bytes` as the rest of the minting family; the seed becomes a
+/// keypair via `jose::SigningKeypair::from_seed` and is stored base64url'd, host-only and never
+/// emitted (P0-AUTH-2 — only the derived public key is published via JWKS).
+pub fn generate_signing_seed() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+}
+
+/// Mint a public, non-secret jkbase-Auth issuer-key HANDLE (`key_id`) — used only to address a key
+/// for list/revoke. The credential itself is the `jkbk_` secret ([`generate_issuer_key`]); this id
+/// is safe to log/show. `JKBK` prefix + hex, AKID-shaped (`[A-Z0-9]`, 20 chars) like the S3/DB ids.
+pub fn generate_issuer_key_id() -> String {
+    let mut bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(20);
+    s.push_str("JKBK");
+    for b in bytes {
+        s.push_str(&format!("{b:02X}"));
+    }
+    s
+}
+
+/// Mint a jkbase-Auth **issuer key** secret (256-bit) — the `jkbk_` bearer a tenant's own backend
+/// presents to the `auth.` mint endpoint to have a per-end-user JWT signed. UNLIKE the S3 secret it
+/// is NEVER stored — only its [`token_fingerprint`] is — so the high entropy makes sha256
+/// preimage-safe. Distinct `jkbk_` prefix so a leaked value is self-identifying (vs the `jkbd_` DB
+/// secret, `jkbg_` git, `jkb_` tenant). Shown once at mint.
+pub fn generate_issuer_key() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "jkbk_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 /// SHA-256 (hex) fingerprint of a high-entropy token, used to store and look up
 /// the per-project git-push token WITHOUT keeping the plaintext. A 256-bit random
 /// token makes SHA-256 preimage-resistant (unlike a low-entropy password, which
