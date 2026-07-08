@@ -362,3 +362,42 @@ console rules/Auth tab) is the next arc.
   (`admin_token` `:868`).
 - jkbase issuer (P4 must accept its tokens): `jkbase-control/src/jose.rs` (whole file — the port
   source), `Claims` `:107-118`, `verify` `:256-309`, `Jwk`/`Jwks` `:120-164`.
+
+---
+
+## 9. Post-review hardening (2026-07-08) — as-built deltas from the multi-agent review
+
+A 6-dimension adversarial review (each finding independently verified) of the built engine surfaced
+9 findings (all verified); the fixes changed four load-bearing semantics. Recorded here as the
+authoritative as-built behavior (rhypedb commit `936dfc6`):
+
+- **Rules evaluation is three-valued (SQL/CEL-style), not two-valued.** A resolved-*absent* datum (a
+  missing field, unlinked relation, absent claim, the anonymous uid, or a stored `null`) is a
+  distinct value from the `null` literal. **Any comparison or negation involving an absent value is
+  `Unknown`, and a clause grants only when it is `True`** — so `request.auth.uid == resource.ownerUid`
+  denies when the owner is unset (was: `null == null` ⇒ grant), and `!resource.flag` denies when the
+  flag is absent/non-boolean (was: ⇒ grant). The `request.auth (==|!=) null` idiom still works because
+  `request.auth` resolves to a concrete `Null`/`Present`, never `Absent`. Net: **absence and type
+  mismatch fail closed** — P0-DBA-7 now holds by construction. Rule authors: a missing value never
+  grants; use positive presence checks.
+- **The `read` rule is applied to a mutation's RETURN value.** Any object surfaced to the caller is a
+  read, so a `create`/`update` that returns a post-image the principal may not read collapses to void
+  (a denied `Single` → `Done`; multi-row results are filtered row-wise). Closes the "update-more-
+  permissive-than-read exfiltrates the object via its update response" bypass. (Firestore returns void
+  from writes for the same reason.)
+- **The subscribe per-event gate authorizes the event's delivered snapshot, not a live re-fetch.**
+  This makes authorize-and-deliver self-consistent (a re-fetch authorized *current* state while
+  delivering the *commit-time* snapshot, leaking a private-era value across an unreadable→readable
+  transition). Consequence + v1 limitation: **relationship-based read rules fail closed on
+  subscriptions** (the event snapshot carries scalars only) — subscription-visible read rules should
+  key on scalar fields (denormalize an owner id), not edge traversals.
+- **`REQ_VECTOR_BATCH` is refused when a rules program is active.** Vector-batch ingest is a bulk
+  write of embeddings for arbitrary object ids that doesn't flow through the rules-gated executor and
+  isn't expressible in the rules language, so under rules it would be an ungated write bypass. The
+  trusted-backend path (rules off) keeps the fast bulk-ingest op. **P5 note:** the `db.` gateway must
+  therefore *not* blindly relay every raw TCP frame kind to a rules-on engine — this refusal is the
+  backstop, but the gateway should also constrain the frame kinds it forwards.
+
+Lower-severity fixes: rule relationship traversals now charge the governor for the full edge set
+examined (not the capped slice), so a high-fan-out rule trips the row budget; and the HTTP `bearer`
+auth-scheme is matched case-insensitively (RFC 6750).
