@@ -1,3 +1,4 @@
+mod auth_service;
 mod build_ca;
 mod build_orchestrator;
 mod db_backup_store;
@@ -60,6 +61,11 @@ struct Args {
     /// reached only via the proxy's `storage.{domain}` reserved-host branch.
     #[arg(long, default_value = "9091")]
     storage_port: u16,
+
+    /// Local port for the jkbase-Auth issuer service (P3). Bound on 127.0.0.1 and
+    /// reached only via the proxy's `auth.{domain}` reserved-host branch.
+    #[arg(long, default_value = "9092")]
+    auth_port: u16,
 
     #[arg(long, default_value = "8080")]
     proxy_port: u16,
@@ -1097,6 +1103,7 @@ async fn async_main() -> Result<()> {
     // restart (cancelled in shutdown_signal's upgrade branch; bounded by the DRAIN_GRACE watchdog).
     let proxy_shutdown = tokio_util::sync::CancellationToken::new();
     let storage_shutdown = tokio_util::sync::CancellationToken::new();
+    let auth_shutdown = tokio_util::sync::CancellationToken::new();
     let storage_join = {
         let storage_tok = storage_shutdown.clone();
         let svc = Arc::new(objectstore_service::ObjectStoreService::new(
@@ -1139,6 +1146,31 @@ async fn async_main() -> Result<()> {
                     }
                 }
                 Err(e) => tracing::error!(error = %e, addr = %bind, "object-store bind failed"),
+            }
+        })
+    };
+    // jkbase-Auth issuer service (P3): same in-process loopback model as the object store — the
+    // proxy's `auth.{domain}` reserved-host branch forwards to it; it is never reachable off
+    // loopback (P0 invariant). It signs per-project JWTs with host-held private keys.
+    let auth_join = {
+        let auth_tok = auth_shutdown.clone();
+        let svc = Arc::new(auth_service::AuthService::new(
+            store.clone(),
+            format!("auth.{}", args.domain),
+        ));
+        let bind = format!("127.0.0.1:{}", args.auth_port);
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(&bind).await {
+                Ok(listener) => {
+                    info!(auth = %bind, "jkbase-auth issuer service listening");
+                    if let Err(e) = axum::serve(listener, svc.into_router())
+                        .with_graceful_shutdown(async move { auth_tok.cancelled().await })
+                        .await
+                    {
+                        tracing::error!(error = %e, "jkbase-auth service error");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, addr = %bind, "jkbase-auth bind failed"),
             }
         })
     };
@@ -1703,6 +1735,7 @@ async fn async_main() -> Result<()> {
         cert_manager: cert_manager.clone(),
         api_addr: Some(api_addr),
         storage_addr: Some(format!("127.0.0.1:{}", args.storage_port)),
+        auth_addr: Some(format!("127.0.0.1:{}", args.auth_port)),
         domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
         wake_callback: Some(wake_callback),
@@ -1922,6 +1955,7 @@ async fn async_main() -> Result<()> {
             shipper_for_shutdown,
             proxy_shutdown.clone(),
             storage_shutdown.clone(),
+            auth_shutdown.clone(),
             upgrade_kind.clone(),
         ))
         .await;
@@ -1935,6 +1969,7 @@ async fn async_main() -> Result<()> {
         let _ = tokio::time::timeout(DRAIN_GRACE, async {
             let _ = proxy_join.await; // serve() returns once its in-flight connections drain
             let _ = storage_join.await; // axum storage graceful drain returns
+            let _ = auth_join.await; // axum jkbase-auth graceful drain returns
         })
         .await;
         // exit(0): survivors live in the jkbase-runtime cgroup, adopted by the successor; the open
@@ -1978,6 +2013,7 @@ async fn shutdown_signal(
     shipper: Arc<LogShipper>,
     proxy_shutdown: tokio_util::sync::CancellationToken,
     storage_shutdown: tokio_util::sync::CancellationToken,
+    auth_shutdown: tokio_util::sync::CancellationToken,
     upgrade_kind: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let ctrl_c = tokio::signal::ctrl_c();
@@ -2010,6 +2046,7 @@ async fn shutdown_signal(
         // SharedState is disjoint from PlatformState.vms), so no survivor is dropped.
         proxy_shutdown.cancel();
         storage_shutdown.cancel();
+        auth_shutdown.cancel();
         upgrade_kind.store(true, std::sync::atomic::Ordering::SeqCst);
         // Watchdog (adversarial BLOCKER-1): GUARANTEE the process exits within DRAIN_GRACE of the
         // SIGTERM no matter what any drain is doing — axum's graceful shutdown has NO internal
