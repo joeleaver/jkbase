@@ -549,11 +549,16 @@ async fn main() -> Result<()> {
         match std::fs::read(&schema_path) {
             Ok(schema) => {
                 let rules = std::fs::read(serve_dir.join("_database/rules.rhype")).ok();
+                // P4: the per-project PUBLIC JWKS rides the reserved channel (`_db_reach.json`),
+                // host-authored like the admin token — never a tenant source file. Baked only when
+                // the project opts into `[database].rules`; absent ⇒ rules-off.
+                let jwks = db_reach.jwks.as_deref().map(str::as_bytes);
                 if let Err(e) = containers
                     .start_database(
                         db_admin_token.as_deref(),
                         &schema,
                         rules.as_deref(),
+                        jwks,
                         lowerdirs,
                     )
                     .await

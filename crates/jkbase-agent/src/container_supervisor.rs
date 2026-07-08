@@ -19,6 +19,13 @@ use tracing::{error, info, warn};
 /// fences the name from `[routes.*]`/server/site names at deploy (validate_manifest).
 const DB_SERVER_NAME: &str = "rhypedb";
 
+/// Agent-visible source of the DB's meta volume, bind-mounted to `/etc/rhypedb` inside the DB
+/// server's namespace. `start_database` seeds the host-baked `schema.rhype` (+ optional
+/// `rules.rhype` and the per-project `jwks.json`) here before the bind; `db_manifest` probes it
+/// to decide whether to point the engine at the P4 rules/JWKS. Persistent (on the data disk), so
+/// stale files from a prior deploy must be cleared, not merely overwritten.
+const RHYPEDB_META_DIR: &str = "/mnt/data/volumes/rhypedb-meta";
+
 /// Host-side path where a restore snapshot is staged (guest-written; the host never touches
 /// it — [RB5]). Bound into the DB's namespace as `/restore` and pointed at by
 /// `RHYPEDB_RESTORE_FROM=/restore/snapshot` when its `MANIFEST.json` is present. A complete
@@ -61,15 +68,33 @@ pub(crate) fn snapshot_is_complete(dir: &Path) -> bool {
 /// restore is idempotent + sentinel-guarded, so re-applying across a crash-respawn is safe;
 /// [`ContainerSupervisor::finalize_restore`] clears the staging + resets this once healthy.
 ///
-/// NB: rhypedb-server has no `--rules` flag yet (the security-rules engine is the upstream RBAC
-/// epic). v1 is backend-only — the DB is reachable only by the tenant's own app over loopback +
-/// the authenticated reach plane — so no rules are enforced; rules are staged for when the
-/// engine gains them. The data plane (`/query`) is open on loopback by design; `/admin/*` is
-/// gated by the admin token.
-fn db_manifest(admin_token: Option<&str>) -> ServerManifest {
+/// P4 data-plane authz (opt-in via `[database].rules`): when the host baked a `rules.rhype` +
+/// the project's PUBLIC `jwks.json` into the meta volume, point the engine at them so it verifies
+/// end-user JWTs offline and enforces default-deny rules. When neither is present the DB is
+/// backend-only exactly as before — open on loopback by design (the tenant's own app is trusted),
+/// `/admin/*` gated by the admin token, and the engine byte-for-byte unchanged. Setting
+/// `RHYPEDB_RULES` WITHOUT a JWKS makes the engine refuse to start (fail-CLOSED): the correct
+/// posture if the host couldn't provision keys — a rules-on DB must never serve open.
+fn db_manifest(admin_token: Option<&str>, meta_dir: &Path) -> ServerManifest {
     let mut env = HashMap::new();
     if let Some(token) = admin_token {
         env.insert("RHYPEDB_ADMIN_TOKEN".to_string(), token.to_string());
+    }
+    // Probe the (persistent) meta volume, which `start_database` seeds/clears to reflect the
+    // CURRENT deploy — so this is self-consistent across cold boot, restore, and finalize (which
+    // all rebuild the manifest without re-seeding). Env values are the in-namespace MOUNT paths.
+    let meta = meta_dir;
+    if meta.join("rules.rhype").exists() {
+        env.insert(
+            "RHYPEDB_RULES".to_string(),
+            "/etc/rhypedb/rules.rhype".to_string(),
+        );
+    }
+    if meta.join("jwks.json").exists() {
+        env.insert(
+            "RHYPEDB_AUTH_JWKS".to_string(),
+            "/etc/rhypedb/jwks.json".to_string(),
+        );
     }
     let mut volumes = vec![
         VolumeMount {
@@ -304,6 +329,7 @@ impl ContainerSupervisor {
         admin_token: Option<&str>,
         schema: &[u8],
         rules: Option<&[u8]>,
+        jwks: Option<&[u8]>,
         lowerdirs: Vec<PathBuf>,
     ) -> Result<()> {
         const NAME: &str = DB_SERVER_NAME;
@@ -323,15 +349,28 @@ impl ContainerSupervisor {
         // /mnt/data/volumes/rhypedb-meta → /etc/rhypedb, so the files must already exist.
         // Rewritten every boot from the current metadata image, so a redeploy's schema
         // takes effect on the next boot.
-        let meta_src = PathBuf::from("/mnt/data/volumes/rhypedb-meta");
+        let meta_src = PathBuf::from(RHYPEDB_META_DIR);
         std::fs::create_dir_all(&meta_src).context("create rhypedb meta volume dir")?;
         std::fs::write(meta_src.join("schema.rhype"), schema).context("seed DB schema")?;
-        if let Some(r) = rules {
-            std::fs::write(meta_src.join("rules.rhype"), r).context("seed DB rules")?;
+        // Rules + JWKS (P4) reflect the CURRENT deploy: seed when present, and CLEAR a prior
+        // deploy's copy when absent. The meta volume is persistent, so a stale `rules.rhype` +
+        // `jwks.json` left behind would keep the engine enforcing an orphaned ruleset after the
+        // tenant removed `[database].rules` — fail-safe only if we actively remove them.
+        match rules {
+            Some(r) => std::fs::write(meta_src.join("rules.rhype"), r).context("seed DB rules")?,
+            None => {
+                let _ = std::fs::remove_file(meta_src.join("rules.rhype"));
+            }
+        }
+        match jwks {
+            Some(j) => std::fs::write(meta_src.join("jwks.json"), j).context("seed DB JWKS")?,
+            None => {
+                let _ = std::fs::remove_file(meta_src.join("jwks.json"));
+            }
         }
         let _ = std::fs::create_dir_all("/mnt/data/volumes/rhypedb-data");
 
-        let manifest = db_manifest(admin_token);
+        let manifest = db_manifest(admin_token, &meta_src);
         info!(
             port = manifest.port,
             layers = lowerdirs.len(),
@@ -374,7 +413,7 @@ impl ContainerSupervisor {
             let _ = child.start_kill();
             let _ = child.wait().await; // reap → release the single-writer data-dir lock
         }
-        let manifest = db_manifest(admin_token); // sees the staged snapshot → restore env
+        let manifest = db_manifest(admin_token, Path::new(RHYPEDB_META_DIR)); // sees the staged snapshot → restore env
         let process = spawn_server_layered(&srv.name, &manifest, &lowerdirs, &self.logs)?;
         srv.manifest = manifest;
         srv.process = Some(process);
@@ -394,7 +433,7 @@ impl ContainerSupervisor {
         let _ = std::fs::remove_dir_all(RHYPEDB_RESTORE_STAGING);
         let mut servers = self.servers.write().await;
         if let Some(srv) = servers.iter_mut().find(|s| s.name == DB_SERVER_NAME) {
-            srv.manifest = db_manifest(admin_token);
+            srv.manifest = db_manifest(admin_token, Path::new(RHYPEDB_META_DIR));
         }
     }
 
@@ -1075,6 +1114,49 @@ mod tests {
             assert!(restart_backoff(n) >= Duration::from_secs(1));
             assert!(restart_backoff(n + 1) >= restart_backoff(n));
         }
+    }
+
+    #[test]
+    fn db_manifest_p4_env_reflects_meta_volume() {
+        // P4: db_manifest points the engine at the rules/JWKS ONLY when the host baked them into the
+        // meta volume (the `[database].rules` opt-in), using the in-namespace MOUNT paths. Setting
+        // RHYPEDB_RULES without a JWKS is deliberately allowed — the engine then fails CLOSED at
+        // startup rather than serving an open DB.
+        let base = std::env::temp_dir().join(format!("jkdb-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Neither present ⇒ rules-off: no P4 env at all (engine byte-unchanged), admin token rides.
+        let m = db_manifest(Some("tok"), &base);
+        assert_eq!(
+            m.env.get("RHYPEDB_ADMIN_TOKEN").map(String::as_str),
+            Some("tok")
+        );
+        assert!(!m.env.contains_key("RHYPEDB_RULES"));
+        assert!(!m.env.contains_key("RHYPEDB_AUTH_JWKS"));
+
+        // Both present ⇒ enforce: both env vars resolve to the bind-mount paths inside the DB ns.
+        std::fs::write(base.join("rules.rhype"), b"match X {}").unwrap();
+        std::fs::write(base.join("jwks.json"), br#"{"keys":[]}"#).unwrap();
+        let m = db_manifest(None, &base);
+        assert_eq!(
+            m.env.get("RHYPEDB_RULES").map(String::as_str),
+            Some("/etc/rhypedb/rules.rhype")
+        );
+        assert_eq!(
+            m.env.get("RHYPEDB_AUTH_JWKS").map(String::as_str),
+            Some("/etc/rhypedb/jwks.json")
+        );
+        assert!(!m.env.contains_key("RHYPEDB_ADMIN_TOKEN")); // None ⇒ unset
+
+        // Rules present but JWKS missing (host couldn't provision keys) ⇒ RULES set, JWKS unset —
+        // the fail-CLOSED posture: the engine refuses to start, never serves rules-off-by-accident.
+        std::fs::remove_file(base.join("jwks.json")).unwrap();
+        let m = db_manifest(None, &base);
+        assert!(m.env.contains_key("RHYPEDB_RULES"));
+        assert!(!m.env.contains_key("RHYPEDB_AUTH_JWKS"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
