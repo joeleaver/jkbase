@@ -1,6 +1,9 @@
 pub mod db_ingress;
 pub mod db_preamble;
 pub mod db_relay;
+pub mod l4_egress;
+pub mod l4_ingress;
+pub mod l4_plane;
 pub mod tls;
 
 use anyhow::Result;
@@ -38,6 +41,10 @@ pub enum WakeError {
     /// wake until the owner redeploys. Surfaced as 503 with a clear message and NO
     /// retry encouragement, so the proxy doesn't loop forever on "starting up".
     Gone(String),
+    /// Throttled — the per-project `WAKE_BACKOFF` or the L4 plane's rate/budget cap refused
+    /// this wake (distinct from a transient failure). Surfaced like [`WakeError::Unavailable`]
+    /// at the HTTP/DB edge (503 + `Retry-After`); the L4 UDP responder drops silently.
+    RateLimited(String),
 }
 
 pub type WakeCallback = Arc<
@@ -620,6 +627,17 @@ async fn proxy_request(
         }
         Err(WakeError::Unavailable(e)) => {
             error!(project = %project_id, error = %e, "failed to wake project");
+            Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "text/plain")
+                .header("Retry-After", "5")
+                .body(full_body("project is starting up, please retry"))
+                .unwrap())
+        }
+        Err(WakeError::RateLimited(reason)) => {
+            // Throttled (per-project backoff / plane rate cap) — same client-facing shape as a
+            // transient failure: retry shortly.
+            info!(project = %project_id, %reason, "refusing wake: rate limited");
             Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
                 .header("Content-Type", "text/plain")

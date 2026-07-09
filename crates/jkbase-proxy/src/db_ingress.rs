@@ -255,6 +255,11 @@ impl DbIngress {
                     debug!(project = %project_id, %m, "db wake gone");
                     return Err("gone");
                 }
+                Err(WakeError::RateLimited(m)) => {
+                    // Throttled — transient from the caller's view (retry), like Unavailable.
+                    debug!(project = %project_id, %m, "db wake rate limited");
+                    return Err("rate limited");
+                }
             },
         };
 
