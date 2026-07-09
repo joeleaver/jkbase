@@ -979,7 +979,6 @@ impl PlatformState {
     ///   incumbent); `None` draws from the auto range (strictly below the kernel ephemeral
     ///   floor).
     /// - Enforces [`Store::MAX_L4_PORTS_PER_PROJECT`].
-    #[allow(dead_code)] // wired into the deploy path by the reserved-channel/firewall slice
     fn allocate_port(
         &self,
         project_id: &str,
@@ -1085,17 +1084,14 @@ fn next_free_octet(allocations: &[VmAllocation], host_id: &str) -> Option<u8> {
 /// (`ip_local_port_range`, default floor 32768) so `allocate_port` never draws a port the
 /// kernel also hands to host outbound sockets — a collision the control-store scan can't
 /// see [mechanics H3]. An admin PIN may sit outside this range (e.g. TeamSpeak's 9987).
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 const L4_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=30000;
 
 /// Reuse-cooldown (seconds) for a freed L4 external port [threat M1]: longer than plausible
 /// client retransmit / SRV TTL, so a torn-down tenant's stale clients can't have their
 /// datagrams admitted into a different tenant that reused the port.
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 const L4_PORT_QUARANTINE_SECS: u64 = 3600;
 
 /// Current unix time in whole seconds (0 on a pre-epoch clock — never panics).
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1106,7 +1102,6 @@ fn unix_now() -> u64 {
 /// The kernel's `ip_local_port_range` low bound. The auto L4 range MUST sit strictly below
 /// it. Fails closed (a missing/garbled sysctl aborts the L4 allocation rather than risking
 /// an overlap that silently steals a kernel ephemeral port).
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 fn ip_local_port_range_floor() -> Result<u16> {
     let s = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .context("read /proc/sys/net/ipv4/ip_local_port_range")?;
@@ -1119,7 +1114,6 @@ fn ip_local_port_range_floor() -> Result<u16> {
 /// Fail closed if the auto L4 port range overlaps the kernel ephemeral range. Checked
 /// lazily at first allocation (not unconditionally at startup) so a host that never uses
 /// L4 is unaffected by an aggressive local `ip_local_port_range`.
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 fn validate_l4_port_range() -> Result<()> {
     let floor = ip_local_port_range_floor()?;
     if *L4_PORT_RANGE.end() >= floor {
@@ -1139,7 +1133,6 @@ fn validate_l4_port_range() -> Result<()> {
 /// (`start_offset`) rather than lowest-free, to further cut reuse-collision odds [threat
 /// M1]. The caller bind-probes each in order — this is candidate selection only, pure and
 /// unit-testable. `now` compares against the quarantine freed-at.
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 fn l4_port_candidates(
     existing: &[PortAllocation],
     quarantine: &[(u16, u64)],
@@ -1170,7 +1163,6 @@ fn l4_port_candidates(
 /// ephemeral socket the control-store scan can't see [mechanics H3]. The real edge socket
 /// (L4Ingress) is the true arbiter and fails the deploy loud if it later can't bind; this
 /// probe only avoids reserving an obviously-taken port.
-#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
 fn l4_bind_probe(proto: L4Proto, port: u16) -> bool {
     let addr = (std::net::Ipv4Addr::UNSPECIFIED, port);
     match proto {
@@ -2384,6 +2376,17 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
             let _ = plat.store.remove_snapshot_meta(project_id);
             let _ = plat.store.remove_vm_allocation(project_id);
+            // Free the project's L4 public ports, quarantining each so a stale client of the
+            // torn-down tenant can't later be admitted into a reused port's new owner
+            // [threat M1]. (The edge socket + firewall teardown land with the runtime relay.)
+            for port in plat
+                .store
+                .list_port_allocations_for_project(project_id)
+                .unwrap_or_default()
+            {
+                let _ = plat.store.quarantine_port(port.external_port, unix_now());
+            }
+            let _ = plat.store.remove_all_port_allocations(project_id);
             break (alloc, plat.data_dir.clone());
         }
     };
@@ -3196,6 +3199,50 @@ async fn handle_deploy(
         } else {
             None
         };
+
+    // Raw L4 (UDP/TCP) ingress: for each `[l4.*]` the tenant declared (baked into the new
+    // deploy's `_l4_ports.json`), allocate — or sticky-reuse — the PUBLIC `external_port` +
+    // in-VM `agent_udp_port`, and author the host→agent reach facts (`_l4.json`) baked into
+    // the image below. Neither host-asserted port is tenant-authored [P0-L4-8]; an admin PIN
+    // is a pre-existing pinned allocation honored by `allocate_port`'s stickiness. Per-port
+    // best-effort: an allocation failure skips that port (fail-closed — no public port) and
+    // never fails the deploy. The public edge socket + firewall open land with the runtime
+    // relay (design §3(a)); this slice only reserves the port and delivers the facts.
+    let l4_decls = read_l4_port_decls(&data_dir, project_id);
+    let l4_facts: Option<jkbase_common::config::L4Facts> = {
+        let mut facts = Vec::new();
+        for (name, proto, guest_port) in &l4_decls {
+            match plat.allocate_port(project_id, name, *proto, *guest_port, None) {
+                Ok(a) => facts.push(jkbase_common::config::L4PortFact {
+                    name: a.name,
+                    proto: a.proto,
+                    agent_udp_port: a.agent_udp_port,
+                    guest_port: a.guest_port,
+                }),
+                Err(e) => warn!(
+                    project = %project_id, l4_port = %name, error = %e,
+                    "L4 port allocation failed; skipping (no public port opened this deploy)"
+                ),
+            }
+        }
+        (!facts.is_empty()).then_some(jkbase_common::config::L4Facts { ports: facts })
+    };
+    // Reconcile: free + quarantine any previously-allocated port whose `[l4.*]` stanza was
+    // REMOVED in this deploy, so a stale client of the gone port can't later be admitted
+    // into a reused port's new owner [threat M1].
+    {
+        let declared: HashSet<&str> = l4_decls.iter().map(|(n, _, _)| n.as_str()).collect();
+        for old in plat
+            .store
+            .list_port_allocations_for_project(project_id)
+            .unwrap_or_default()
+        {
+            if !declared.contains(old.name.as_str()) {
+                let _ = plat.store.remove_port_allocation(project_id, &old.name);
+                let _ = plat.store.quarantine_port(old.external_port, unix_now());
+            }
+        }
+    }
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -3250,6 +3297,7 @@ async fn handle_deploy(
                 &platform_egress,
                 storage_binding.as_ref(),
                 db_reach.as_ref(),
+                l4_facts.as_ref(),
                 &out,
                 app_content,
             )?;
@@ -3497,6 +3545,7 @@ async fn boot_db_vm(
                 &platform_egress,
                 None,
                 db_reach.as_ref(),
+                None, // the DB VM carries no L4 ports (L4 is app-VM only)
                 &out,
                 layer_plan::ImageContent::DbOnly,
             )?;
@@ -5587,6 +5636,40 @@ fn project_db_rules_enabled(data_dir: &Path, project_id: &str) -> bool {
                 .map(|r| !r.trim().is_empty())
         })
         .unwrap_or(false)
+}
+
+/// Read the host-baked `_l4_ports.json` (the tenant's `[l4.*]` declarations) for a
+/// project's live deployment, resolved to `(name, proto, guest_port)`. A missing/garbled
+/// file ⇒ empty. Entries with an unresolvable proto or a zero/oversize `guest_port` are
+/// dropped, and TCP is skipped defensively (preflight already rejected it, but the v1
+/// runtime data path is UDP-only). Mirrors [`project_is_dedicated`] — the same
+/// tenant-unforgeable sidecar.
+fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<(String, L4Proto, u16)> {
+    let path = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_l4_ports.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
+        return Vec::new();
+    };
+    arr.into_iter()
+        .filter_map(|v| {
+            let name = v.get("name")?.as_str()?.to_string();
+            let proto = match v.get("proto")?.as_str()? {
+                "udp" => L4Proto::Udp,
+                _ => return None, // TCP data path unbuilt in v1; anything else is invalid.
+            };
+            let guest_port = v.get("guest_port")?.as_u64()?;
+            if guest_port == 0 || guest_port > u16::MAX as u64 {
+                return None;
+            }
+            Some((name, proto, guest_port as u16))
+        })
+        .collect()
 }
 
 /// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`

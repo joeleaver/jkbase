@@ -3582,6 +3582,7 @@ esac
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -4872,6 +4873,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5030,6 +5032,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5272,6 +5275,7 @@ console.log("listening on " + port);
             &platform,
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5668,6 +5672,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5886,6 +5891,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             Some(&db_reach),
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image (rules + JWKS)");
@@ -6114,6 +6120,7 @@ console.log("listening on " + port);
                 dedicated: false,
                 jwks: None,
             }),
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -6532,6 +6539,7 @@ console.log("listening on " + port);
                 dedicated: false,
                 jwks: None,
             }),
+            None /* l4_facts */,
             &meta_img,
             crate::layer_plan::ImageContent::DbOnly,
         )
@@ -6763,6 +6771,7 @@ console.log("listening on " + port);
                 dedicated: true, // ← drives the agent's in-guest loopback proxy
                 jwks: None,
             }),
+            None /* l4_facts */,
             &app_meta,
             crate::layer_plan::ImageContent::AppNoDb,
         )
@@ -6791,6 +6800,7 @@ console.log("listening on " + port);
                 dedicated: false,
                 jwks: None,
             }),
+            None /* l4_facts */,
             &db_meta,
             crate::layer_plan::ImageContent::DbOnly,
         )
@@ -7496,6 +7506,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("metadata image");
