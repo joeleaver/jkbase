@@ -376,3 +376,45 @@ A `tools/dev test` gauntlet analog on a real microVM (this box is KVM/jailer-cap
 **v1 limitations (honest).** (i) UDP only — TCP L4 unbuilt. (ii) **Reflection is bounded, not zero** — a funded attacker spending continuous ingress can pull a sustained ~1× (≤3×) reflected stream at a victim, plus a rate-limited one-shot ≤`C0` spray per fresh victim and source-IP laundering; all inherent to protocol-agnosticism, contained by ratio caps + global egress budget + metering + the automatic kill-switch (§3(c) axis 2, §8). (iii) **Economic-DoS is bounded, not prevented** — a funded attacker can pin one *targeted* tenant's single VM warm (bounded by wake-rate + global warm ceiling); mitigated by UDP warm-hours being **unbilled in v1** + kill-switch, not by pretending establishment verifies the peer (P0-L4-12). (iv) **High-egress asymmetric apps unsupported by default** — an app whose *sustained* egress:ingress exceeds `k` (media broadcast / RTP push / game world-state fan-out / TFTP) is clamped; such a tenant needs an **admin-granted per-port egress ceiling decoupled from ingress** (analog of `l4 pin`), with the explicit note that raising it raises that port's reflection factor and moves protection entirely onto the absolute per-source/per-project/per-/24/global caps (completeness H2). (v) Not gapless across host restart (reconnect); stateful tuple-keyed sessions may reset across an aggressive hibernate cycle (§5, mechanics H4). (vi) No keepalive assumption ⇒ a tenant whose app's silence gaps exceed the port's `UDP_RELAY_IDLE_TIMEOUT` re-wakes on the next datagram (tunable per port). (vii) First-connect-after-deploy cold boot can exceed a short-connect-window app's first attempt (one-time blip). (viii) Warm-VM-hour billing instrumented but deferred (v1 = unbilled). (ix) Non-pinned tenants need an SRV record for discovery, which advertises the port publicly. (x) v4 only in v1; dual-stack requires /64-keyed aux maps as a **blocking** prerequisite (§5, threat M3).
 
 **Build order:** decision-independent control work first — **DONE** (config, `PortAllocation`, `allocate_port`, deploy/teardown/reconcile, admin pin, CLI). Then the runtime socket-reconcile loop + datagram pump + flow-id/epoch transit + agent land-forward, then the generic wake-throttle (per-tenant fair-share budget + global warm ceiling + RAM reservation) + egress controls (ratio clamp + one-shot `C0` + per-source/per-project/per-/24/global + TTL-evicted maps) + `WakeError::RateLimited`, then firewall open + readiness/replay + observability + kill-switch + on-box e2e. This new untrusted external L4 seam **gets the multi-agent adversarial review before merge (project convention)**; the review must re-derive both bounds (P0-L4-2 cost, P0-L4-6 reflection) and probe: cross-tenant fair-share starvation of the global budget/flow-table, cross-plane RAM pressure vs the reservation, permit-per-boot single-flight (no multi-permit-per-burst), egress-clamp bypass / credit-accounting races / `C0`-spray, per-source IP-vs-ip:port keying + egress-map cardinality, transit-header forgery/replay + `flow_id`/epoch cross-wire, port-reuse cross-tenant injection, allocator/ephemeral collision, agent-map exhaustion, readiness boot-loop, and datagram-boundary/reply mis-demux. Deploy note: the agent-binary change ships an agent-rootfs update; no toolchain rebake unless a base layer changes (per [[prod-toolchain-rebake-on-build-change]]).
+
+## 10. As-built — runtime seam + adversarial-review deltas
+
+The runtime seam (§8 items 7–12) is **BUILT** across `jkbase-proxy` (`l4_plane` throttle/egress
+controller + `l4_egress` pure credit/bucket types + `l4_ingress` datagram pump), `jkbase-agent`
+(`l4_forward` land-forward), and `jkbase-server` (`l4_runtime` reconcile loop + `JKL4` iptables +
+the wake/idle/metering wiring). The multi-agent adversarial review (6 dimension finders →
+refute-by-default verification, 18 raw → 12 confirmed) ran and **all confirmed findings were
+fixed**. Load-bearing as-built deltas vs. the design above:
+
+- **Transit MAC is direction-bound (P0-L4-11, review HIGH).** The two legs share one per-VM secret
+  but keep independent nonce windows, so a bare MAC over `flow_id‖epoch‖nonce‖payload` let an L2
+  co-tenant replay a host→agent frame back at the host's return path (cross-direction replay). The
+  MAC now prefixes an [`L4Dir`] domain-separation byte (`HostToAgent`/`AgentToHost`); the receiver
+  passes the direction it expects, so a wrong-leg frame fails the tag. **Not on the wire** —
+  `L4_HEADER_LEN` unchanged.
+- **Hibernated L4 projects re-wake (review HIGH).** The pump does not latch a cached `vm_dst`: a
+  reach-loop MISS re-validates VM liveness against the routing table (a hibernated project is
+  removed from it), forwarding to a warm VM (no wake-rate spend) or entering the wake gate for a
+  cold one. This also fixes the wake-rate being burned per-new-flow on an already-warm VM (new
+  clients on a popular warm server are no longer throttled to the boot rate).
+- **Keep-warm gates on ESTABLISHED flows only (P0-L4-12, review HIGH).** Provisional (spoofable)
+  flows never stamp a keep-warm signal, so a spoof flood that never establishes cannot pin the VM
+  warm past the base wake cost — hibernation gates purely on the L4 `conn_count` (established) gauge
+  ANDed with the shared idle path, never back-dating the shared `ActivityTracker`.
+- **The reflection kill-switch fires (P0-L4-6, review HIGH).** The metering loop force-hibernates
+  the exact `reflection_suspected_projects()` set (the billing `warm_projects()` view deliberately
+  excludes suspected bases), and the suspected flag auto-clears on a time window after a base
+  quiesces.
+- **Host-RAM floor accounts for in-flight boots**; `next_agent_udp_port` excludes every sibling
+  stanza's `guest_port` (not just agent ports) so a multi-port project can't seat its transit
+  listener on a port one of its own apps holds.
+- **Agent flow-map self-bound (documented limitation).** With the synchronous host→agent teardown
+  signal deferred (§7), the agent caps its `(flow_id,epoch)→loopback` map at 256 with a **120s**
+  idle reaper and **LRU eviction on overflow** (not a fail-closed drop), so a churn flood cannot
+  wedge the port; a recycled-then-returning flow transparently re-creates on its next datagram
+  (best-effort loopback-port continuity, §9(v)). Genuine auth failures still drop fail-closed.
+- **Known v1 limitation (review MEDIUM, accepted):** per-port tunables (`idle_timeout`/`amp_k`)
+  changed on a **redeploy** do not propagate to an already-live edge socket, because the port is
+  sticky and the reconcile loop does not rebind it. They take effect on the next fresh bind
+  (new allocation / post-quarantine reuse). Acceptable — tunables are rarely retuned and never a
+  safety boundary.
