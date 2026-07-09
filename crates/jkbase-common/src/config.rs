@@ -235,6 +235,13 @@ pub struct L4Facts {
     /// agent starts no land-forward, fail-closed.
     #[serde(default)]
     pub ports: Vec<L4PortFact>,
+    /// The per-VM host↔guest transit secret (`jkbl_…`) authenticating every L4 transit
+    /// datagram (`l4_transit`). Minted host-side (sticky, control-store-backed) and baked
+    /// LAST like the rest of this file, so it's tenant-unforgeable. Covers ALL the VM's L4
+    /// ports (one agent, one key). Empty (old images) ⇒ the agent starts no land-forward
+    /// (fail-closed). NOT the DB splice secret — L4 is minted independently of `[database]`.
+    #[serde(default)]
+    pub transit_secret: String,
 }
 
 /// One host-asserted L4 port binding the agent land-forwards. The PUBLIC `external_port`
@@ -1684,16 +1691,21 @@ mod tests {
 
         let facts = L4Facts {
             ports: vec![L4PortFact {
-                name: "teamspeak".into(),
+                name: "voice".into(),
                 proto: "udp".into(),
                 agent_udp_port: 40000,
                 guest_port: 9987,
             }],
+            transit_secret: "jkbl_secret".into(),
         };
         let json = serde_json::to_string(&facts).unwrap();
         // The public external_port must never ride the guest-facing channel.
         assert!(!json.contains("external_port"));
         assert_eq!(serde_json::from_str::<L4Facts>(&json).unwrap(), facts);
+        // Old images (absent transit_secret) fail closed to empty, not an error.
+        let legacy: L4Facts =
+            serde_json::from_str(r#"{"ports":[]}"#).unwrap();
+        assert!(legacy.transit_secret.is_empty());
     }
 
     #[test]

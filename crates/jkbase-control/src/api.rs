@@ -791,6 +791,7 @@ async fn create_project(
     let _ = state.store.delete_all_secrets(&id);
     let _ = state.store.delete_all_access_keys(&id);
     let _ = state.store.remove_all_port_allocations(&id);
+    let _ = state.store.delete_l4_transit_secret(&id);
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
     let _ = state.store.delete_deployed_tier(&id);

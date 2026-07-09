@@ -2412,6 +2412,7 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
                 let _ = plat.store.quarantine_port(port.external_port, unix_now());
             }
             let _ = plat.store.remove_all_port_allocations(project_id);
+            let _ = plat.store.delete_l4_transit_secret(project_id);
             break (alloc, plat.data_dir.clone());
         }
     };
@@ -3250,7 +3251,20 @@ async fn handle_deploy(
                 ),
             }
         }
-        (!facts.is_empty()).then_some(jkbase_common::config::L4Facts { ports: facts })
+        if facts.is_empty() {
+            None
+        } else {
+            // Per-VM transit secret (sticky) authenticating the host↔guest datagram leg
+            // (§3(a-auth)); baked into `_l4.json` for the agent, read from the store by the
+            // host relay. Minted independently of `[database]` — a pure-L4 project has no
+            // DB splice secret. A mint error ⇒ empty ⇒ the agent starts no land-forward
+            // (fail-closed), never a failed deploy.
+            let transit_secret = plat.store.l4_transit_secret(project_id).unwrap_or_default();
+            Some(jkbase_common::config::L4Facts {
+                ports: facts,
+                transit_secret,
+            })
+        }
     };
     // Reconcile: free + quarantine any previously-allocated port whose `[l4.*]` stanza was
     // REMOVED in this deploy, so a stale client of the gone port can't later be admitted

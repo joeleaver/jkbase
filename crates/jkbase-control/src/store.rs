@@ -61,6 +61,11 @@ const DB_ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
 /// guest fs), so the edge needs an independent copy here to present it. `project_id` →
 /// secret; overwritten each deploy (like the own-bucket binding), purged on teardown.
 const DB_SPLICE: TableDefinition<&str, &[u8]> = TableDefinition::new("db_splice_secret");
+/// Per-project **L4 transit secret** (`jkbl_…`): the host↔guest shared key authenticating
+/// every L4 UDP transit datagram. Minted sticky (once per project, reused across redeploys)
+/// so the host relay's copy and the agent's baked `_l4.json` copy always agree. Distinct
+/// from `DB_SPLICE` — L4 is not DB-coupled. See docs/managed-l4-udp-ingress-design.md §3(a-auth).
+const L4_TRANSIT: TableDefinition<&str, &[u8]> = TableDefinition::new("l4_transit_secret");
 /// Per-project rhypedb **admin token** ([RB1]): the per-deploy `RHYPEDB_ADMIN_TOKEN` the
 /// agent injects into the DB env to authorize `/admin/backup/stream`. Like [`DB_SPLICE`],
 /// it is generated host-side at deploy, baked into the per-VM image (which the host never
@@ -822,6 +827,7 @@ impl Store {
         let _ = txn.open_table(HOSTS)?;
         let _ = txn.open_table(PORT_ALLOCATIONS)?;
         let _ = txn.open_table(PORT_QUARANTINE)?;
+        let _ = txn.open_table(L4_TRANSIT)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -1073,6 +1079,50 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    // -- L4 transit secret (host<->guest per-datagram auth) --
+
+    /// The project's L4 transit secret, minting + persisting a fresh one on first use.
+    /// **Sticky**: reused across redeploys so the host relay's copy and the agent's baked
+    /// `_l4.json` copy always agree; distinct from the DB splice secret (L4 isn't DB-coupled).
+    /// Called at deploy with the returned value baked into `_l4.json`.
+    pub fn l4_transit_secret(&self, project_id: &str) -> Result<String> {
+        if let Some(s) = self.get_l4_transit_secret(project_id)? {
+            return Ok(s);
+        }
+        let secret = auth::generate_l4_transit_secret();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(L4_TRANSIT)?;
+            table.insert(project_id, secret.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(secret)
+    }
+
+    /// The project's L4 transit secret, or `None` if none has been minted. The host relay
+    /// reads this to seal/open transit datagrams; a `None` (or a mismatch with the agent's
+    /// baked copy) makes the transit auth fail closed.
+    pub fn get_l4_transit_secret(&self, project_id: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(L4_TRANSIT)?;
+        match table.get(project_id)? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(v.value()).into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a project's L4 transit secret (teardown), so a recreated same-slug project
+    /// can't inherit it.
+    pub fn delete_l4_transit_secret(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(L4_TRANSIT)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     // -- Hosts (HA cluster fleet; schema only at P0) --
