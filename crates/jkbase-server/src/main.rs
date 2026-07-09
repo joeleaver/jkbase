@@ -987,8 +987,28 @@ impl PlatformState {
         guest_port: u16,
         pinned_port: Option<u16>,
     ) -> Result<PortAllocation> {
-        // Sticky reuse — the whole point: a tenant's port must survive redeploy.
-        if let Some(existing) = self.store.get_port_allocation(project_id, name)? {
+        // Sticky reuse — the whole point: the HOST-asserted `external_port` (+ `pinned`)
+        // must survive redeploy. But refresh the TENANT-asserted `proto`/`guest_port` from
+        // this deploy (the tenant may have edited `[l4.*]`), and fill a placeholder
+        // `agent_udp_port` for a row created by a PRE-deploy admin pin (transit port == 0).
+        if let Some(mut existing) = self.store.get_port_allocation(project_id, name)? {
+            let mut changed = false;
+            if existing.proto != proto.as_str() {
+                existing.proto = proto.as_str().to_string();
+                changed = true;
+            }
+            if existing.guest_port != guest_port {
+                existing.guest_port = guest_port;
+                changed = true;
+            }
+            if existing.agent_udp_port == 0 {
+                let all = self.store.list_port_allocations()?;
+                existing.agent_udp_port = next_agent_udp_port(&all, project_id, guest_port)?;
+                changed = true;
+            }
+            if changed {
+                self.store.save_port_allocation(&existing)?;
+            }
             return Ok(existing);
         }
         // Lazy so non-L4 hosts are unaffected: the auto range must sit below the kernel
@@ -1034,17 +1054,7 @@ impl PlatformState {
             .find(|p| l4_bind_probe(proto, *p))
             .context("no bindable L4 external port available (range exhausted or contended)")?;
 
-        // The in-VM transit listen port: distinct from `guest_port`, unique within this
-        // project's VM (agent listens on eth0:agent_udp_port; loopback-forwards to
-        // 127.0.0.1:guest_port). Per-VM namespace, so only per-project uniqueness matters.
-        let used_agent: HashSet<u16> = all
-            .iter()
-            .filter(|p| p.project_id == project_id)
-            .map(|p| p.agent_udp_port)
-            .collect();
-        let agent_udp_port = (40000u16..=40999)
-            .find(|p| !used_agent.contains(p) && *p != guest_port)
-            .context("no free in-VM transit port for project")?;
+        let agent_udp_port = next_agent_udp_port(&all, project_id, guest_port)?;
 
         let alloc = PortAllocation {
             project_id: project_id.to_string(),
@@ -1169,6 +1179,21 @@ fn l4_bind_probe(proto: L4Proto, port: u16) -> bool {
         L4Proto::Udp => std::net::UdpSocket::bind(addr).is_ok(),
         L4Proto::Tcp => std::net::TcpListener::bind(addr).is_ok(),
     }
+}
+
+/// The next free in-VM transit port for a project's L4 land-forward: distinct from
+/// `guest_port` and from the project's other allocations' transit ports. Per-VM namespace
+/// (the agent listens on `eth0:agent_udp_port` inside the project's own VM), so only
+/// per-project uniqueness matters — not host-island scope.
+fn next_agent_udp_port(all: &[PortAllocation], project_id: &str, guest_port: u16) -> Result<u16> {
+    let used: HashSet<u16> = all
+        .iter()
+        .filter(|p| p.project_id == project_id)
+        .map(|p| p.agent_udp_port)
+        .collect();
+    (40000u16..=40999)
+        .find(|p| !used.contains(p) && *p != guest_port)
+        .context("no free in-VM transit port for project")
 }
 
 /// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
