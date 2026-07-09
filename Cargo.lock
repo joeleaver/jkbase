@@ -1815,6 +1815,7 @@ name = "jkbase-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hmac",
  "jkbase-sigv4",
  "serde",
  "serde_json",
