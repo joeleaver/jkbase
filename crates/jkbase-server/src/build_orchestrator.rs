@@ -2107,6 +2107,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         }
     }
 
+    // Raw L4 ingress ports: each `[l4.<name>]` resolves its proto (reject unknown), has a
+    // non-zero `guest_port`, and — in v1 — is UDP (TCP rejected until the follow-on data
+    // path lands). Fail-closed so a typo'd proto or an unbuilt transport aborts the deploy
+    // rather than allocating a dead public port. See docs/managed-l4-udp-ingress-design.md.
+    for (name, l4) in &config.l4 {
+        l4.validate(name)
+            .with_context(|| format!("[l4.{name}] section"))?;
+    }
+
     // The managed DB is supervised in-VM under the reserved server name `rhypedb` and is
     // loopback-only / NEVER routed. Fence that name from tenant input on both axes,
     // fail-closed at deploy: (1) a tenant server/function/site named `rhypedb` would

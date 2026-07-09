@@ -24,6 +24,16 @@ pub struct ProjectConfig {
     /// the project VM, reachable only by the project's own app/functions over
     /// loopback (no end-user identity yet).
     pub database: Option<DatabaseConfig>,
+    /// `[l4.<name>]` — raw L4 (UDP/TCP) ingress ports served behind the always-on host
+    /// edge socket with scale-to-zero (the guest service still hibernates to zero and
+    /// wakes on a return-routability-proven datagram). See
+    /// `docs/managed-l4-udp-ingress-design.md`. Each entry is one public port the
+    /// platform allocates for the project; the tenant declares only the loopback
+    /// `guest_port` its service binds + the `proto`. The PUBLIC `external_port` and the
+    /// in-VM transit port are HOST-asserted (tenant-unforgeable, ride the reserved
+    /// channel), never authored here. v1 = UDP (TeamSpeak voice); TCP is a follow-on.
+    #[serde(default)]
+    pub l4: HashMap<String, L4PortConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -738,6 +748,77 @@ impl DatabaseConfig {
     }
 }
 
+/// `[l4.<name>]` — one raw L4 (UDP/TCP) ingress port for the project. Mirrors the
+/// `[database]` typed-section pattern: a `proto` resolver that fails closed on an unknown
+/// value (a typo must abort the deploy, never silently open nothing). The tenant declares
+/// ONLY what it legitimately owns — the loopback `guest_port` its service binds and the
+/// `proto`; the PUBLIC `external_port` and the in-VM transit port are host-decided and
+/// tenant-unforgeable [P0-L4-8]. See `docs/managed-l4-udp-ingress-design.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct L4PortConfig {
+    /// Transport: `"udp"` or `"tcp"` (case-insensitive). Only `udp` is served in v1; a
+    /// `tcp` value resolves but is rejected at preflight (the control plane is shared but
+    /// the TCP data path is a follow-on). An unrecognised value is rejected (fail-closed,
+    /// mirrors [`DatabaseConfig::engine`]).
+    pub proto: String,
+    /// The loopback port the tenant's service binds INSIDE the guest (TeamSpeak → `9987`).
+    /// The service binds `127.0.0.1:<guest_port>` ONLY — never eth0 — and the `jkbase-agent`
+    /// land-forwards admitted datagrams to it [P0-L4-1]. REQUIRED: an L4 port with nothing
+    /// to forward to is meaningless.
+    pub guest_port: u16,
+}
+
+/// Resolved L4 transport — the fail-closed boundary for `[l4.<name>].proto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L4Proto {
+    Udp,
+    Tcp,
+}
+
+impl L4Proto {
+    /// Lowercase wire name (`"udp"`/`"tcp"`) — the value persisted in `PortAllocation` and
+    /// used to key the host firewall/socket family.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            L4Proto::Udp => "udp",
+            L4Proto::Tcp => "tcp",
+        }
+    }
+}
+
+impl L4PortConfig {
+    /// Resolve the `proto` field. `udp`/`tcp` (case-insensitive) resolve; any other value
+    /// is rejected at preflight so `proto = "udo"` fails the deploy instead of quietly
+    /// opening no port (mirrors [`DatabaseConfig::engine`]).
+    pub fn proto(&self) -> Result<L4Proto> {
+        match self.proto.trim().to_ascii_lowercase().as_str() {
+            "udp" => Ok(L4Proto::Udp),
+            "tcp" => Ok(L4Proto::Tcp),
+            other => anyhow::bail!("unknown L4 proto {other:?} (expected \"udp\" or \"tcp\")"),
+        }
+    }
+
+    /// Validate an `[l4.<name>]` section at deploy preflight: resolve the proto (reject
+    /// unknown), require a non-zero `guest_port`, and — in v1 — reject `tcp` (the control
+    /// plane is shared but the TCP relay is not built; see
+    /// `docs/managed-l4-udp-ingress-design.md` §3(e)). Fails closed so a typo or an
+    /// unbuilt transport aborts the deploy rather than opening a dead public port.
+    pub fn validate(&self, name: &str) -> Result<()> {
+        let proto = self.proto()?;
+        if self.guest_port == 0 {
+            anyhow::bail!(
+                "[l4.{name}]: `guest_port` must be a non-zero port the service binds on guest loopback"
+            );
+        }
+        if proto == L4Proto::Tcp {
+            anyhow::bail!(
+                "[l4.{name}]: TCP L4 ingress is not supported yet (UDP only in v1); see docs/managed-l4-udp-ingress-design.md"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -1415,5 +1496,51 @@ mod tests {
             assert!(db.size_mib().is_err(), "size {bad:?} should be rejected");
             assert!(db.validate().is_err(), "validate should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn l4_ports_parse_resolve_proto_and_fail_closed() {
+        // A UDP port parses; the tenant declares ONLY proto + the loopback guest_port.
+        let cfg: ProjectConfig = toml::from_str(
+            "[project]\nname = \"ts\"\n[l4.teamspeak]\nproto = \"udp\"\nguest_port = 9987\n",
+        )
+        .unwrap();
+        let l4 = &cfg.l4["teamspeak"];
+        assert_eq!(l4.proto().unwrap(), L4Proto::Udp);
+        assert_eq!(l4.guest_port, 9987);
+        l4.validate("teamspeak").unwrap();
+
+        // Proto is case-insensitive.
+        let cfg: ProjectConfig =
+            toml::from_str("[l4.v]\nproto = \"UDP\"\nguest_port = 5000\n").unwrap();
+        assert_eq!(cfg.l4["v"].proto().unwrap(), L4Proto::Udp);
+
+        // Unknown proto is rejected (a typo must fail the deploy, not open nothing).
+        let cfg: ProjectConfig =
+            toml::from_str("[l4.v]\nproto = \"udo\"\nguest_port = 5000\n").unwrap();
+        assert!(cfg.l4["v"].proto().is_err());
+        assert!(cfg.l4["v"].validate("v").is_err());
+
+        // guest_port = 0 is rejected (nothing to forward to).
+        let cfg: ProjectConfig =
+            toml::from_str("[l4.v]\nproto = \"udp\"\nguest_port = 0\n").unwrap();
+        assert!(cfg.l4["v"].validate("v").is_err());
+
+        // TCP resolves but is rejected at preflight in v1 (data path is a follow-on).
+        let cfg: ProjectConfig =
+            toml::from_str("[l4.ft]\nproto = \"tcp\"\nguest_port = 30033\n").unwrap();
+        assert_eq!(cfg.l4["ft"].proto().unwrap(), L4Proto::Tcp);
+        assert!(cfg.l4["ft"].validate("ft").is_err());
+
+        // No [l4.*] → empty map, no field required.
+        let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        assert!(bare.l4.is_empty());
+
+        // Multiple ports per project (composite-keyed downstream).
+        let cfg: ProjectConfig = toml::from_str(
+            "[l4.voice]\nproto = \"udp\"\nguest_port = 9987\n[l4.alt]\nproto = \"udp\"\nguest_port = 9988\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.l4.len(), 2);
     }
 }
