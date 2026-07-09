@@ -16,12 +16,12 @@ mod vm_identity;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use jkbase_common::config::PlatformEgress;
+use jkbase_common::config::{L4Proto, PlatformEgress};
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, Project, ProjectState,
-    QuotaStatus, SnapshotMeta, Store, VmAllocation, month_start_epoch,
+    DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, PortAllocation, Project,
+    ProjectState, QuotaStatus, SnapshotMeta, Store, VmAllocation, month_start_epoch,
 };
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
@@ -965,6 +965,105 @@ impl PlatformState {
             None => anyhow::bail!("no available IP addresses in this host's 172.16.0.0/24 island"),
         }
     }
+
+    /// Allocate (or reuse) the public `external_port` + in-VM `agent_udp_port` for a
+    /// project's `[l4.<name>]` port. See docs/managed-l4-udp-ingress-design.md §3(b).
+    ///
+    /// - **Idempotent + sticky:** an existing allocation for `(project, name)` is returned
+    ///   verbatim — `external_port`/`agent_udp_port`/`pinned` never move under a redeploy,
+    ///   rollback, or VM re-adoption (load-bearing for a pinned flagship port + SRV targets).
+    /// - **Reservation, then bind is the arbiter:** the control-store scan can't see host
+    ///   outbound-ephemeral or non-jkbase sockets, so a candidate is host-island-scanned +
+    ///   quarantine-skipped + randomized, then **bind-probed**; `EADDRINUSE` → next candidate.
+    /// - **`pinned_port`:** `Some(p)` forces an admin-granted fixed port (never evicts an
+    ///   incumbent); `None` draws from the auto range (strictly below the kernel ephemeral
+    ///   floor).
+    /// - Enforces [`Store::MAX_L4_PORTS_PER_PROJECT`].
+    #[allow(dead_code)] // wired into the deploy path by the reserved-channel/firewall slice
+    fn allocate_port(
+        &self,
+        project_id: &str,
+        name: &str,
+        proto: L4Proto,
+        guest_port: u16,
+        pinned_port: Option<u16>,
+    ) -> Result<PortAllocation> {
+        // Sticky reuse — the whole point: a tenant's port must survive redeploy.
+        if let Some(existing) = self.store.get_port_allocation(project_id, name)? {
+            return Ok(existing);
+        }
+        // Lazy so non-L4 hosts are unaffected: the auto range must sit below the kernel
+        // ephemeral floor, else we'd draw a port the kernel also hands to outbound sockets.
+        validate_l4_port_range()?;
+
+        let all = self.store.list_port_allocations()?;
+        let mine = all.iter().filter(|p| p.project_id == project_id).count();
+        if mine >= Store::MAX_L4_PORTS_PER_PROJECT {
+            anyhow::bail!(
+                "L4 port limit reached ({} per project)",
+                Store::MAX_L4_PORTS_PER_PROJECT
+            );
+        }
+        let quarantine = self.store.list_port_quarantine()?;
+        let now = unix_now();
+
+        let candidates: Vec<u16> = match pinned_port {
+            Some(p) => {
+                if p == 80 || p == 443 {
+                    anyhow::bail!("cannot pin reserved port {p}");
+                }
+                // Never evict an incumbent: a pin onto a port already held in this island
+                // is rejected. Quarantine does NOT block a deliberate admin pin.
+                let taken = all.iter().any(|a| {
+                    (a.host_id.is_empty() || a.host_id == self.host_id) && a.external_port == p
+                });
+                if taken {
+                    anyhow::bail!("port {p} is already allocated on this host");
+                }
+                vec![p]
+            }
+            None => {
+                let span = (*L4_PORT_RANGE.end() - *L4_PORT_RANGE.start()) as u64 + 1;
+                let offset = (now % span) as u16;
+                l4_port_candidates(&all, &quarantine, &self.host_id, now, offset)
+            }
+        };
+
+        // Bind-probe: the first candidate that actually binds wins.
+        let external_port = candidates
+            .into_iter()
+            .find(|p| l4_bind_probe(proto, *p))
+            .context("no bindable L4 external port available (range exhausted or contended)")?;
+
+        // The in-VM transit listen port: distinct from `guest_port`, unique within this
+        // project's VM (agent listens on eth0:agent_udp_port; loopback-forwards to
+        // 127.0.0.1:guest_port). Per-VM namespace, so only per-project uniqueness matters.
+        let used_agent: HashSet<u16> = all
+            .iter()
+            .filter(|p| p.project_id == project_id)
+            .map(|p| p.agent_udp_port)
+            .collect();
+        let agent_udp_port = (40000u16..=40999)
+            .find(|p| !used_agent.contains(p) && *p != guest_port)
+            .context("no free in-VM transit port for project")?;
+
+        let alloc = PortAllocation {
+            project_id: project_id.to_string(),
+            name: name.to_string(),
+            proto: proto.as_str().to_string(),
+            external_port,
+            guest_port,
+            agent_udp_port,
+            pinned: pinned_port.is_some(),
+            host_id: self.host_id.clone(),
+            placement_epoch: 0,
+        };
+        self.store.save_port_allocation(&alloc)?;
+        // A deliberately-pinned port may have been cooling; claiming it clears the entry so
+        // the cooldown bookkeeping doesn't linger. (Auto-alloc already skips cooling ports.)
+        let _ = self.store.unquarantine_port(external_port);
+        Ok(alloc)
+    }
 }
 
 /// HA P4 — the next free last-octet in THIS host's `172.16.0.0/24` island, considering
@@ -980,6 +1079,104 @@ fn next_free_octet(allocations: &[VmAllocation], host_id: &str) -> Option<u8> {
         .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
         .collect();
     (2..=254u8).find(|o| !used.contains(o))
+}
+
+/// Auto-allocated L4 external-port range. Chosen strictly BELOW the kernel ephemeral range
+/// (`ip_local_port_range`, default floor 32768) so `allocate_port` never draws a port the
+/// kernel also hands to host outbound sockets — a collision the control-store scan can't
+/// see [mechanics H3]. An admin PIN may sit outside this range (e.g. TeamSpeak's 9987).
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+const L4_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=30000;
+
+/// Reuse-cooldown (seconds) for a freed L4 external port [threat M1]: longer than plausible
+/// client retransmit / SRV TTL, so a torn-down tenant's stale clients can't have their
+/// datagrams admitted into a different tenant that reused the port.
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+const L4_PORT_QUARANTINE_SECS: u64 = 3600;
+
+/// Current unix time in whole seconds (0 on a pre-epoch clock — never panics).
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The kernel's `ip_local_port_range` low bound. The auto L4 range MUST sit strictly below
+/// it. Fails closed (a missing/garbled sysctl aborts the L4 allocation rather than risking
+/// an overlap that silently steals a kernel ephemeral port).
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+fn ip_local_port_range_floor() -> Result<u16> {
+    let s = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .context("read /proc/sys/net/ipv4/ip_local_port_range")?;
+    s.split_whitespace()
+        .next()
+        .and_then(|t| t.parse::<u16>().ok())
+        .context("parse ip_local_port_range low bound")
+}
+
+/// Fail closed if the auto L4 port range overlaps the kernel ephemeral range. Checked
+/// lazily at first allocation (not unconditionally at startup) so a host that never uses
+/// L4 is unaffected by an aggressive local `ip_local_port_range`.
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+fn validate_l4_port_range() -> Result<()> {
+    let floor = ip_local_port_range_floor()?;
+    if *L4_PORT_RANGE.end() >= floor {
+        anyhow::bail!(
+            "L4 auto port range {}..={} overlaps the kernel ephemeral range (ip_local_port_range floor {floor}); \
+             lower L4_PORT_RANGE below {floor}",
+            L4_PORT_RANGE.start(),
+            L4_PORT_RANGE.end(),
+        );
+    }
+    Ok(())
+}
+
+/// Candidate external ports for a NEW non-pinned L4 allocation, in try-order. Excludes
+/// ports already allocated in THIS host-island, ports still within the reuse-cooldown, and
+/// (belt-and-suspenders) the reserved 80/443. Randomized start within the range
+/// (`start_offset`) rather than lowest-free, to further cut reuse-collision odds [threat
+/// M1]. The caller bind-probes each in order — this is candidate selection only, pure and
+/// unit-testable. `now` compares against the quarantine freed-at.
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+fn l4_port_candidates(
+    existing: &[PortAllocation],
+    quarantine: &[(u16, u64)],
+    host_id: &str,
+    now: u64,
+    start_offset: u16,
+) -> Vec<u16> {
+    let used: HashSet<u16> = existing
+        .iter()
+        .filter(|p| p.host_id.is_empty() || p.host_id == host_id)
+        .map(|p| p.external_port)
+        .collect();
+    let cooling: HashSet<u16> = quarantine
+        .iter()
+        .filter(|(_, freed)| now.saturating_sub(*freed) < L4_PORT_QUARANTINE_SECS)
+        .map(|(port, _)| *port)
+        .collect();
+    let span = (*L4_PORT_RANGE.end() - *L4_PORT_RANGE.start()) as u32 + 1;
+    let base = *L4_PORT_RANGE.start();
+    (0..span)
+        .map(|i| base + ((start_offset as u32 + i) % span) as u16)
+        .filter(|p| !used.contains(p) && !cooling.contains(p) && *p != 80 && *p != 443)
+        .collect()
+}
+
+/// Bind-probe an L4 external port on the host wildcard: a successful bind (then immediate
+/// close) means the port is free of BOTH jkbase allocations and any other host listener /
+/// ephemeral socket the control-store scan can't see [mechanics H3]. The real edge socket
+/// (L4Ingress) is the true arbiter and fails the deploy loud if it later can't bind; this
+/// probe only avoids reserving an obviously-taken port.
+#[allow(dead_code)] // L4 allocator core; wired by the reserved-channel/firewall slice
+fn l4_bind_probe(proto: L4Proto, port: u16) -> bool {
+    let addr = (std::net::Ipv4Addr::UNSPECIFIED, port);
+    match proto {
+        L4Proto::Udp => std::net::UdpSocket::bind(addr).is_ok(),
+        L4Proto::Tcp => std::net::TcpListener::bind(addr).is_ok(),
+    }
 }
 
 /// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
@@ -6630,6 +6827,48 @@ mod tests {
         assert_eq!(next_free_octet(&allocs, "peer"), Some(3));
         // Empty pool starts at .2.
         assert_eq!(next_free_octet(&[], "me"), Some(2));
+    }
+
+    #[test]
+    fn l4_port_candidates_scope_quarantine_and_randomize() {
+        let p = |ext: u16, host: &str| PortAllocation {
+            project_id: "x".into(),
+            name: format!("n{ext}"),
+            proto: "udp".into(),
+            external_port: ext,
+            guest_port: 9987,
+            agent_udp_port: 40000,
+            pinned: false,
+            host_id: host.into(),
+            placement_epoch: 0,
+        };
+        let base = *L4_PORT_RANGE.start();
+
+        // Host-island scoping: a peer's use of a port does NOT remove it from our candidates.
+        let existing = vec![p(base, "me"), p(base + 1, "peer")];
+        let cands = l4_port_candidates(&existing, &[], "me", 0, 0);
+        assert!(!cands.contains(&base), "our own allocated port is excluded");
+        assert!(
+            cands.contains(&(base + 1)),
+            "a peer-island port stays available to us"
+        );
+
+        // Quarantine: a still-cooling freed port is skipped; an expired one is offered.
+        let now = 10_000_000;
+        let q = vec![
+            (base + 2, now - 10),                          // cooling (< 3600s) → skip
+            (base + 3, now - (L4_PORT_QUARANTINE_SECS + 1)), // expired → offer
+        ];
+        let cands = l4_port_candidates(&[], &q, "me", now, 0);
+        assert!(!cands.contains(&(base + 2)), "cooling port skipped");
+        assert!(cands.contains(&(base + 3)), "expired-cooldown port offered");
+
+        // Randomized start: a non-zero offset rotates the try-order (not lowest-first).
+        let cands = l4_port_candidates(&[], &[], "me", 0, 5);
+        assert_eq!(cands.first(), Some(&(base + 5)));
+
+        // Never offers the reserved ports (they're outside the range anyway, but explicit).
+        assert!(!l4_port_candidates(&[], &[], "me", 0, 0).contains(&443));
     }
 
     #[test]
