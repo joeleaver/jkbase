@@ -1012,6 +1012,37 @@ impl ProjectConfig {
         }))
         .ok()
     }
+
+    /// `_l4_ports.json` sidecar: the tenant's declared `[l4.*]` ports as
+    /// `[{name, proto, guest_port}]`, sorted by name for stable output regardless of
+    /// HashMap iteration order. The host reads this baked, tenant-unforgeable file at deploy
+    /// to allocate each port's PUBLIC `external_port` + in-VM `agent_udp_port` — NEITHER of
+    /// which is tenant-authored, and neither of which appears here (they ride the reserved
+    /// `_l4.json` channel). `None` when no `[l4.*]` is declared. Preflight `validate` has
+    /// already rejected an unknown proto, so a still-unresolvable entry is dropped rather
+    /// than emitting a half-formed sidecar (mirrors [`Self::database_json`]).
+    pub fn l4_json(&self) -> Option<String> {
+        if self.l4.is_empty() {
+            return None;
+        }
+        let mut ports: Vec<_> = self.l4.iter().collect();
+        ports.sort_by(|a, b| a.0.cmp(b.0));
+        let arr: Vec<_> = ports
+            .into_iter()
+            .filter_map(|(name, l4)| {
+                let proto = l4.proto().ok()?;
+                Some(serde_json::json!({
+                    "name": name,
+                    "proto": proto.as_str(),
+                    "guest_port": l4.guest_port,
+                }))
+            })
+            .collect();
+        if arr.is_empty() {
+            return None;
+        }
+        serde_json::to_string_pretty(&arr).ok()
+    }
 }
 
 impl ServerConfig {
@@ -1599,5 +1630,30 @@ mod tests {
         // The public external_port must never ride the guest-facing channel.
         assert!(!json.contains("external_port"));
         assert_eq!(serde_json::from_str::<L4Facts>(&json).unwrap(), facts);
+    }
+
+    #[test]
+    fn l4_json_sidecar_emits_tenant_facts_only() {
+        // No [l4.*] → no sidecar.
+        let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        assert!(bare.l4_json().is_none());
+
+        // Two ports emit name/proto/guest_port, sorted by name, and NEVER a host-asserted
+        // external_port/agent_udp_port.
+        let cfg: ProjectConfig = toml::from_str(
+            "[l4.voice]\nproto = \"udp\"\nguest_port = 9987\n[l4.alt]\nproto = \"udp\"\nguest_port = 9988\n",
+        )
+        .unwrap();
+        let j = cfg.l4_json().unwrap();
+        assert!(!j.contains("external_port") && !j.contains("agent_udp_port"));
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Stable sort by name: "alt" before "voice".
+        assert_eq!(arr[0]["name"], "alt");
+        assert_eq!(arr[0]["proto"], "udp");
+        assert_eq!(arr[0]["guest_port"], 9988);
+        assert_eq!(arr[1]["name"], "voice");
+        assert_eq!(arr[1]["guest_port"], 9987);
     }
 }

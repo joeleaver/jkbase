@@ -2243,6 +2243,12 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     if let Some(j) = config.database_json() {
         std::fs::write(staged.join("_database.json"), j)?;
     }
+    // Raw L4 ports marker (name/proto/guest_port; NEVER a host-asserted external_port or
+    // agent_udp_port — those the host allocates at deploy and delivers over the reserved
+    // `_l4.json` channel). Its presence drives the host's port allocation + firewall open.
+    if let Some(j) = config.l4_json() {
+        std::fs::write(staged.join("_l4_ports.json"), j)?;
+    }
 
     // Stamp each function's RESOLVED public-egress policy into its `_functions/{name}.json`
     // sidecar. Precedence (project ceiling × per-function) is collapsed HERE, host-side,
