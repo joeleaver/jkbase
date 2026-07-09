@@ -223,6 +223,41 @@ impl DbReachFacts {
     pub const FILE: &'static str = "_db_reach.json";
 }
 
+/// Host-authored L4 (UDP/TCP) ingress facts, baked into the per-VM metadata image
+/// (`_l4.json`) for a project that declares `[l4.*]`. Written LAST into the image (like
+/// [`DbReachFacts`]) so a tenant file of the same name can't forge it — genuinely
+/// host-authored and tenant-unforgeable [P0-L4-8]. Tells the in-VM agent which transit
+/// port to listen on (`agent_udp_port`, host-dialed) and which guest loopback port to
+/// land-forward each admitted datagram to. See `docs/managed-l4-udp-ingress-design.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L4Facts {
+    /// One entry per allocated `[l4.<name>]` port. Empty/absent (old images / no L4) ⇒ the
+    /// agent starts no land-forward, fail-closed.
+    #[serde(default)]
+    pub ports: Vec<L4PortFact>,
+}
+
+/// One host-asserted L4 port binding the agent land-forwards. The PUBLIC `external_port`
+/// is deliberately NOT here: the guest never needs it and must not learn another project's
+/// public port. The agent only ever sees its own transit + loopback ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct L4PortFact {
+    /// The `[l4.<name>]` key — for the agent's logs/metrics only.
+    pub name: String,
+    /// Transport wire name, `"udp"` | `"tcp"` (from [`L4Proto::as_str`]).
+    pub proto: String,
+    /// The in-VM transit port the agent listens on; the host dials `vm_ip:agent_udp_port`.
+    pub agent_udp_port: u16,
+    /// The guest loopback port the agent forwards admitted datagrams to
+    /// (`127.0.0.1:guest_port`) — the port the tenant's service binds.
+    pub guest_port: u16,
+}
+
+impl L4Facts {
+    /// Metadata-image filename. `_`-prefixed, so the agent's static server never serves it.
+    pub const FILE: &'static str = "_l4.json";
+}
+
 /// Well-known runtime-bridge gateway IP (host side of `jkbr0`). The app→DB leg's host gateway
 /// (P2 §7.6) binds here; a dedicated app VM's agent dials it over eth0. Must match
 /// `tools/setup-bridge.sh`'s `GW_IP` and the boot-time `gateway_ip`.
@@ -1542,5 +1577,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.l4.len(), 2);
+    }
+
+    #[test]
+    fn l4_facts_round_trip_and_default_empty() {
+        // Absent/`{}` → no ports (fail-closed: the agent starts no land-forward).
+        let empty: L4Facts = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, L4Facts::default());
+        assert!(empty.ports.is_empty());
+        assert_eq!(L4Facts::FILE, "_l4.json");
+
+        let facts = L4Facts {
+            ports: vec![L4PortFact {
+                name: "teamspeak".into(),
+                proto: "udp".into(),
+                agent_udp_port: 40000,
+                guest_port: 9987,
+            }],
+        };
+        let json = serde_json::to_string(&facts).unwrap();
+        // The public external_port must never ride the guest-facing channel.
+        assert!(!json.contains("external_port"));
+        assert_eq!(serde_json::from_str::<L4Facts>(&json).unwrap(), facts);
     }
 }
