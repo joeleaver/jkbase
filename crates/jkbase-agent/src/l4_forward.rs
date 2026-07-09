@@ -9,18 +9,22 @@
 //! host wake/quota/idle machinery.
 //!
 //! Threat model on this seam: on a shared L2 bridge a co-tenant can address (or spoof toward) the
-//! transit listener, so EVERY host→guest datagram is authenticated and every anomalous path
-//! fails **closed** (P0-L4-9): a missing/forged MAC, a replayed nonce, a stale epoch, a full flow
-//! map, or a guest that isn't listening ⇒ DROP — never a silent passthrough into the
-//! unauthenticated app. Anti-replay is a per-`(flow_id, epoch)` monotonic high-water window the
-//! caller owns (`l4_transit` is stateless); we own it here (P0-L4-13).
+//! transit listener, so EVERY host→guest datagram is authenticated and every anomalous AUTH path
+//! fails **closed** (P0-L4-9): a missing/forged MAC, a replayed nonce, a stale epoch, or a guest
+//! that isn't listening ⇒ DROP — never a silent passthrough into the unauthenticated app. A full
+//! flow map is NOT a passthrough: it LRU-recycles the least-recently-active (authenticated) flow
+//! so a client-churn flood can't wedge the port, since the deferred host→agent teardown signal
+//! (§7) leaves the agent to self-bound the map. Anti-replay is a per-`(flow_id, epoch)` monotonic
+//! high-water window the caller owns (`l4_transit` is stateless); we own it here (P0-L4-13). The
+//! MAC is direction-bound (`L4Dir`) so a reply frame can't be replayed back into the guest, and
+//! vice versa (P0-L4-11).
 //!
 //! Modelled on the agent's loopback DB reach leg (`db_leg_loopback_proxy`, main.rs): bind-or-disable
 //! (a bind failure logs + returns, it never crashes the agent), a bounded map fail-closed on
 //! overflow, one self-contained task per port.
 
 use jkbase_common::config::L4PortFact;
-use jkbase_common::l4_transit::{self, L4TransitHeader, L4_HEADER_LEN};
+use jkbase_common::l4_transit::{self, L4Dir, L4TransitHeader, L4_HEADER_LEN};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -32,9 +36,14 @@ use tracing::{debug, error, info, warn};
 
 /// Max distinct `flow_id`s one port's land-forward will hold (one connected loopback socket +
 /// one reply task each). Its OWN explicit bound, sized to the microVM's fd/RAM headroom and
-/// `<=` the host per-project flow cap; fail-closed (DROP) on overflow so a flow flood can't
-/// exhaust guest fds (P0-L4-5/-9). Only ever filled by flow_ids the AUTHENTICATED host issues —
-/// a co-tenant with no transit secret cannot mint one past `l4_transit::open`.
+/// `<=` the host per-project flow cap, so a flow flood can't exhaust guest fds (P0-L4-5). Only
+/// ever filled by flow_ids the AUTHENTICATED host issues — a co-tenant with no transit secret
+/// cannot mint one past `l4_transit::open`. On overflow the map LRU-evicts its least-recently-
+/// active entry (`create_flow`) rather than DROPping the new flow: with no host teardown signal
+/// (§7), a churn flood of short-lived flows would otherwise fill the map with dead entries the
+/// host already evicted and wedge the port. Recycling is replay-safe — a still-live evicted flow
+/// is re-created on its next datagram, and epoch-distinctness + the host's monotonic
+/// per-`(flow_id,epoch)` nonces keep every window unambiguous.
 const AGENT_L4_MAX_FLOWS: usize = 256;
 
 /// recv buffer for one datagram. UDP truncates silently past the buffer, so size it to the max
@@ -60,12 +69,15 @@ const READINESS_POLL: Duration = Duration::from_millis(100);
 const REPLAY_MAX_PKTS: usize = 4;
 const REPLAY_MAX_BYTES: usize = 8 * 1024;
 
-/// Idle backstop for the per-flow loopback map. The HOST owns authoritative idle teardown
-/// (`idle_timeout`, `[15,600]s` — deliberately NOT carried in `_l4.json`); this is a leak backstop
-/// comfortably above the host ceiling so the host tears a flow down first in normal operation and
-/// this only reaps entries the host forgot. A superseding epoch evicts the prior entry immediately
-/// (below), so this fires only for genuinely-abandoned flows.
-const FLOW_IDLE_TTL: Duration = Duration::from_secs(660);
+/// Idle TTL for the per-flow loopback map — a self-bound against client churn. The synchronous
+/// host→agent teardown signal is deferred (epoch-distinctness gives correctness, §7), so with no
+/// signal the agent MUST reap dead flows itself rather than rely on the host to release them. Set
+/// ABOVE the DEFAULT host `idle_timeout` (60s; range `[15,600]`) so a still-live host flow isn't
+/// dropped agent-side mid-session, but NOT the multiples of headroom that would let dead entries
+/// pile up under churn and wedge the bounded 256-entry map. A superseding epoch evicts the prior
+/// entry immediately (below) and a full map LRU-evicts the least-recently-active
+/// (`create_flow`); this TTL is the steady-state reaper for genuinely-abandoned flows.
+const FLOW_IDLE_TTL: Duration = Duration::from_secs(120);
 
 /// Idle-sweep cadence.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -114,6 +126,8 @@ struct DropCounters {
     replay_buffer_overflow: u64,
     udp_readiness_timeout: u64,
     loopback_bind_fail: u64,
+    /// NOT a drop: count of flows LRU-recycled to admit a new one under a full map (churn signal).
+    map_full_evicted: u64,
 }
 
 impl DropCounters {
@@ -125,6 +139,7 @@ impl DropCounters {
             + self.replay_buffer_overflow
             + self.udp_readiness_timeout
             + self.loopback_bind_fail
+            + self.map_full_evicted
     }
 
     fn flush(&mut self, name: &str) {
@@ -140,7 +155,8 @@ impl DropCounters {
             replay_buffer_overflow = self.replay_buffer_overflow,
             udp_readiness_timeout = self.udp_readiness_timeout,
             loopback_bind_fail = self.loopback_bind_fail,
-            "l4 land-forward: dropped datagrams (fail-closed)"
+            map_full_evicted = self.map_full_evicted,
+            "l4 land-forward: dropped/recycled datagrams (auth-fail drops fail-closed; map_full_evicted = churn LRU recycle)"
         );
         *self = Self::default();
     }
@@ -318,7 +334,10 @@ impl LandForward {
     /// Authenticate one transit frame and forward its payload to the guest loopback port. Every
     /// failure path drops (P0-L4-9): forged MAC, replayed nonce, stale epoch, full map.
     async fn deliver(&mut self, frame: &[u8], src: SocketAddr) {
-        let Some((hdr, payload)) = l4_transit::open(&self.secret, frame) else {
+        // This leg only ever opens the forward direction; binding the MAC to `HostToAgent`
+        // domain-separates it from the return leg, so a co-tenant can't replay a captured
+        // agent→host reply back into the guest (cross-direction replay, P0-L4-11).
+        let Some((hdr, payload)) = l4_transit::open(&self.secret, L4Dir::HostToAgent, frame) else {
             self.drops.header_auth_fail += 1;
             return;
         };
@@ -370,9 +389,33 @@ impl LandForward {
     /// first payload, and spawn the reply pump. `in_nonce_hw` starts at the first accepted nonce so
     /// the host may start its counter at 0 or 1; every later datagram must strictly exceed it.
     async fn create_flow(&mut self, hdr: L4TransitHeader, payload: &[u8], src: SocketAddr) {
+        // Map full: LRU-evict the least-recently-active entry to make room rather than DROP this
+        // (authenticated) new flow. Dropping would let a churn flood of short-lived flows wedge the
+        // port once the map fills with dead entries the host already evicted but sent no teardown
+        // signal for (§7). The evicted flow, if still live host-side, is re-created on its next
+        // datagram (fresh loopback socket); epoch-distinctness + the host's monotonic
+        // per-`(flow_id,epoch)` nonces mean this can't be turned into a replay. Genuine AUTH
+        // failures still DROP (in `deliver`) — fail-closed is preserved for those.
         if self.flows.len() >= AGENT_L4_MAX_FLOWS {
-            self.drops.agent_map_full += 1;
-            return;
+            match self
+                .flows
+                .iter()
+                .min_by_key(|(_, f)| f.last_seen)
+                .map(|(&id, _)| id)
+            {
+                Some(victim) => {
+                    if let Some(old) = self.flows.remove(&victim) {
+                        old.cancel.notify_one();
+                    }
+                    self.drops.map_full_evicted += 1;
+                }
+                // Unreachable (cap >= 1 ⇒ a full map has a victim), but stay fail-closed if it ever
+                // isn't: DROP rather than grow past the bound.
+                None => {
+                    self.drops.agent_map_full += 1;
+                    return;
+                }
+            }
         }
         let sock = match connect_loopback(self.guest_port).await {
             Ok(s) => Arc::new(s),
@@ -467,8 +510,11 @@ impl ReplyPump {
                         debug!(port = %self.name, len = n, "l4 reply pump: reply too large to frame; dropping datagram");
                         continue;
                     }
+                    // Seal the reply on the return leg (`AgentToHost`): domain-separated from the
+                    // forward leg so this frame can't be replayed back into the guest (P0-L4-11).
                     l4_transit::seal(
                         &self.secret,
+                        L4Dir::AgentToHost,
                         L4TransitHeader { flow_id: self.flow_id, epoch: self.epoch, nonce: out_nonce },
                         &buf[..n],
                         &mut sealed,
