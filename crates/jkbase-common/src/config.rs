@@ -1073,10 +1073,16 @@ impl ProjectConfig {
             .into_iter()
             .filter_map(|(name, l4)| {
                 let proto = l4.proto().ok()?;
+                // Carry the RESOLVED per-port tunables (§3(b)/§3(d) — completeness M1): the host's
+                // runtime relay reads them from here to size the per-flow idle timeout + the egress
+                // amp ratio. Baked resolved (already clamped to bounds) so the sidecar is
+                // self-describing and the reconcile loop needs no re-parse of the raw config.
                 Some(serde_json::json!({
                     "name": name,
                     "proto": proto.as_str(),
                     "guest_port": l4.guest_port,
+                    "idle_timeout": l4.idle_timeout_secs(),
+                    "amp_k": l4.amp_k(),
                 }))
             })
             .collect();
@@ -1714,10 +1720,10 @@ mod tests {
         let bare: ProjectConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
         assert!(bare.l4_json().is_none());
 
-        // Two ports emit name/proto/guest_port, sorted by name, and NEVER a host-asserted
-        // external_port/agent_udp_port.
+        // Two ports emit name/proto/guest_port + resolved tunables, sorted by name, and NEVER a
+        // host-asserted external_port/agent_udp_port.
         let cfg: ProjectConfig = toml::from_str(
-            "[l4.voice]\nproto = \"udp\"\nguest_port = 9987\n[l4.alt]\nproto = \"udp\"\nguest_port = 9988\n",
+            "[l4.voice]\nproto = \"udp\"\nguest_port = 9987\nidle_timeout = 120\namp_k = 2\n[l4.alt]\nproto = \"udp\"\nguest_port = 9988\n",
         )
         .unwrap();
         let j = cfg.l4_json().unwrap();
@@ -1729,7 +1735,13 @@ mod tests {
         assert_eq!(arr[0]["name"], "alt");
         assert_eq!(arr[0]["proto"], "udp");
         assert_eq!(arr[0]["guest_port"], 9988);
+        // "alt" omits tunables → resolved defaults (60s idle, k=1).
+        assert_eq!(arr[0]["idle_timeout"], 60);
+        assert_eq!(arr[0]["amp_k"], 1);
         assert_eq!(arr[1]["name"], "voice");
         assert_eq!(arr[1]["guest_port"], 9987);
+        // "voice" carries its declared (clamped) tunables.
+        assert_eq!(arr[1]["idle_timeout"], 120);
+        assert_eq!(arr[1]["amp_k"], 2);
     }
 }
