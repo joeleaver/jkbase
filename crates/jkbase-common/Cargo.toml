@@ -13,3 +13,6 @@ anyhow = { workspace = true }
 jkbase-sigv4 = { workspace = true }
 # `sha2` is still used directly here by `layers.rs` (content-addressed layer digests).
 sha2 = { workspace = true }
+# HMAC-SHA256 for the L4 UDP transit wire auth (`l4_transit`), the same pure-Rust
+# RustCrypto pair the SigV4 signer uses — builds for the agent's musl target.
+hmac = { workspace = true }
