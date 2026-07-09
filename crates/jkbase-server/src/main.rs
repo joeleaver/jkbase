@@ -5,6 +5,7 @@ mod db_backup_store;
 mod db_gateway;
 mod egress;
 mod handoff;
+mod l4_runtime;
 mod layer_plan;
 mod log_shipper;
 mod metering;
@@ -2020,6 +2021,40 @@ async fn async_main() -> Result<()> {
         tokio::spawn(async move { db_gateway::serve(store, gw_wake, registry, gw_host_id).await });
     }
 
+    // L4 UDP scale-to-zero ingress — the plane-global throttle/egress controller + the reconcile
+    // loop that materializes `[l4.*]` port allocations into live edge sockets + the datagram pump.
+    // The plane is shared with the idle + metering loops (they read its established-flow gauge,
+    // last-activity clock, drop counters, and reflection-suspected kill-switch flags). Its wake
+    // closure mirrors the proxy/DB gateway (all call `wake_db_reach`, resolving the app VM);
+    // Axis-1/Axis-2 abuse bounds live inside the plane + pump, keyed on base-project/tenant/dest-IP
+    // — never the spoofable source (design §3(c)).
+    let l4_plane: Arc<jkbase_proxy::l4_plane::L4Plane> = {
+        let platform_for_l4 = platform.clone();
+        let routing_for_l4 = routing_table.clone();
+        let domain_for_l4 = domain_map.clone();
+        let shipper_for_l4 = log_shipper.clone();
+        let l4_wake: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
+            let platform = platform_for_l4.clone();
+            let routing = routing_for_l4.clone();
+            let domains = domain_for_l4.clone();
+            let shipper = shipper_for_l4.clone();
+            Box::pin(async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await })
+        });
+        let plane = jkbase_proxy::l4_plane::L4Plane::new(Default::default(), l4_wake);
+        let (l4_host_id, l4_data_dir) = {
+            let plat = platform.lock().await;
+            (plat.host_id.clone(), plat.data_dir.clone())
+        };
+        tokio::spawn(l4_runtime::serve(
+            store.clone(),
+            routing_table.clone(),
+            plane.clone(),
+            l4_host_id,
+            l4_data_dir,
+        ));
+        plane
+    };
+
     // Spawn log shipper loop (pulls guest logs into the persistent store)
     tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
 
@@ -2040,6 +2075,7 @@ async fn async_main() -> Result<()> {
             idle_timeout,
             log_shipper.clone(),
             Some(db_relay_registry.clone()),
+            Some(l4_plane.clone()),
         ));
     }
 
@@ -2061,6 +2097,7 @@ async fn async_main() -> Result<()> {
         routing_table.clone(),
         log_shipper.clone(),
         Some(db_relay_registry.clone()),
+        Some(l4_plane.clone()),
     ));
 
     // Spawn the build egress proxy (default-deny forward proxy + SSRF defense).
@@ -2293,6 +2330,7 @@ async fn shutdown_signal(
             platform.clone(),
             routing.clone(),
             shipper.clone(),
+            None,
             None,
         )
         .await
@@ -3237,8 +3275,9 @@ async fn handle_deploy(
     let l4_decls = read_l4_port_decls(&data_dir, project_id);
     let l4_facts: Option<jkbase_common::config::L4Facts> = {
         let mut facts = Vec::new();
-        for (name, proto, guest_port) in &l4_decls {
-            match plat.allocate_port(project_id, name, *proto, *guest_port, None) {
+        for decl in &l4_decls {
+            let (name, proto, guest_port) = (&decl.name, decl.proto, decl.guest_port);
+            match plat.allocate_port(project_id, name, proto, guest_port, None) {
                 Ok(a) => facts.push(jkbase_common::config::L4PortFact {
                     name: a.name,
                     proto: a.proto,
@@ -3270,7 +3309,7 @@ async fn handle_deploy(
     // REMOVED in this deploy, so a stale client of the gone port can't later be admitted
     // into a reused port's new owner [threat M1].
     {
-        let declared: HashSet<&str> = l4_decls.iter().map(|(n, _, _)| n.as_str()).collect();
+        let declared: HashSet<&str> = l4_decls.iter().map(|d| d.name.as_str()).collect();
         for old in plat
             .store
             .list_port_allocations_for_project(project_id)
@@ -3759,10 +3798,12 @@ async fn hibernate_project(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
-    // Idle-path callers pass the DB relay registry so we can re-check for a LIVE managed-DB
-    // relay UNDER the platform lock (§5); shutdown/quota callers pass `None` — those paths
-    // hibernate regardless (relays are force-closed on drain; over-quota must win).
+    // Idle-path callers pass the DB relay registry + L4 plane so we can re-check for a LIVE
+    // managed-DB relay / L4 established flow UNDER the platform lock (§5/§3(d)); shutdown/quota
+    // callers pass `None` — those paths hibernate regardless (relays are force-closed on drain;
+    // over-quota must win).
     db_registry: Option<&Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
+    l4_plane: Option<&Arc<jkbase_proxy::l4_plane::L4Plane>>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
 
@@ -3776,6 +3817,21 @@ async fn hibernate_project(
             // connect and the client retries, waking the VM cleanly.
             if db_registry
                 .map(|r| r.conn_count(vm_identity::base_project_id(project_id)) > 0)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            // §3(d): symmetric L4 re-check — an established L4 flow (or fresh L4 traffic) that
+            // promoted since the idle loop's unlocked read keeps the VM warm, so a live UDP
+            // session isn't snapshotted mid-stream.
+            if l4_plane
+                .map(|p| {
+                    let base = vm_identity::base_project_id(project_id);
+                    p.conn_count(base) > 0
+                        || p.last_activity_age(base)
+                            .map(|a| a <= Duration::from_secs(5))
+                            .unwrap_or(false)
+                })
                 .unwrap_or(false)
             {
                 return Ok(());
@@ -4026,6 +4082,17 @@ async fn wake_project(
             return Err(jkbase_proxy::WakeError::Gone(
                 "no deployable content — redeploy to bring it back".to_string(),
             ));
+        }
+        // Surface the WAKE_BACKOFF throttle as `RateLimited` (distinct from a transient
+        // `Unavailable`) so a rate-cap read is legible in metrics and the L4 wake plane can
+        // tell "throttled" from "boot failed" — the design's promote-the-bail delta (§3(c)).
+        // `wake_project_inner` keeps its own backoff check as a TOCTOU backstop.
+        if let Some(t) = plat.wake_failures.get(project_id)
+            && t.elapsed() < WAKE_BACKOFF
+        {
+            return Err(jkbase_proxy::WakeError::RateLimited(format!(
+                "project {project_id} recently failed to wake; retry shortly"
+            )));
         }
     }
     wake_project_inner(project_id, platform, routing, domain_map, shipper)
@@ -4586,6 +4653,11 @@ async fn idle_detection_loop(
     idle_timeout: Duration,
     shipper: Arc<LogShipper>,
     db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
+    // The L4 plane contributes its OWN keep-warm signals (an established-flow gauge + an
+    // un-throttled last-datagram clock), read here and ANDed into `should_hibernate` — NEVER
+    // written back into the shared `activity` tracker, which would back-date another plane's
+    // hibernate clock and snapshot an HTTP/DB-active project mid-serve (§3(d) mechanics H5).
+    l4_plane: Option<Arc<jkbase_proxy::l4_plane::L4Plane>>,
 ) {
     let check_interval = Duration::from_secs(60);
 
@@ -4635,6 +4707,19 @@ async fn idle_detection_loop(
             && db_registry
                 .as_ref()
                 .map(|r| r.conn_count(vm_identity::base_project_id(&project_id)) == 0)
+                .unwrap_or(true)
+            // §3(d): keep an L4 project warm while it has an ESTABLISHED flow (a byte-silent but
+            // live inbound-only/streaming app) OR its own last-datagram clock is still fresh. Both
+            // read from the L4 plane (keyed on the base project); neither back-dates the shared
+            // tracker. When L4 drains, the established gauge → 0 and the own-clock ages, so the
+            // AND lets it hibernate promptly on the normal idle path.
+            && l4_plane
+                .as_ref()
+                .map(|p| {
+                    let base = vm_identity::base_project_id(&project_id);
+                    p.conn_count(base) == 0
+                        && p.last_activity_age(base).map(|a| a > idle_timeout).unwrap_or(true)
+                })
                 .unwrap_or(true);
 
             if should_hibernate {
@@ -4645,6 +4730,7 @@ async fn idle_detection_loop(
                     routing.clone(),
                     shipper.clone(),
                     db_registry.as_ref(),
+                    l4_plane.as_ref(),
                 )
                 .await
                 {
@@ -5683,7 +5769,20 @@ fn project_db_rules_enabled(data_dir: &Path, project_id: &str) -> bool {
 /// dropped, and TCP is skipped defensively (preflight already rejected it, but the v1
 /// runtime data path is UDP-only). Mirrors [`project_is_dedicated`] — the same
 /// tenant-unforgeable sidecar.
-fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<(String, L4Proto, u16)> {
+/// One tenant-declared `[l4.*]` port, read back from the baked `_l4_ports.json` sidecar. Carries
+/// the tenant facts (`name`/`proto`/`guest_port`) plus the RESOLVED per-port tunables
+/// (`idle_timeout_secs`/`amp_k`, already clamped at bake) the runtime relay needs — the design's
+/// completeness-M1 carriage (§3(b)/§3(d)). A pre-tunable sidecar (older bake) falls back to the
+/// `L4PortConfig` defaults so an old image never mis-sizes the relay.
+struct L4PortDecl {
+    name: String,
+    proto: L4Proto,
+    guest_port: u16,
+    idle_timeout_secs: u64,
+    amp_k: u8,
+}
+
+fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<L4PortDecl> {
     let path = data_dir
         .join("hosting")
         .join(project_id)
@@ -5706,7 +5805,25 @@ fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<(String, L4Proto
             if guest_port == 0 || guest_port > u16::MAX as u64 {
                 return None;
             }
-            Some((name, proto, guest_port as u16))
+            // Older sidecars predate the tunables → resolved defaults (60s idle, k=1). Re-clamp
+            // defensively even though the bake already clamped.
+            let idle_timeout_secs = v
+                .get("idle_timeout")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(60)
+                .clamp(15, 600);
+            let amp_k = v
+                .get("amp_k")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 3) as u8;
+            Some(L4PortDecl {
+                name,
+                proto,
+                guest_port: guest_port as u16,
+                idle_timeout_secs,
+                amp_k,
+            })
         })
         .collect()
 }
@@ -6382,6 +6499,10 @@ async fn metering_loop(
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
     db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
+    // The L4 plane's drop/event counters are drained + logged here (observability §8), and its
+    // reflection kill-switch is enforced: a flow flagged reflection-suspected (sustained
+    // egress:ingress above `amp_k`, or a destination-entropy spike) force-hibernates its VM.
+    l4_plane: Option<Arc<jkbase_proxy::l4_plane::L4Plane>>,
 ) {
     let mut state = metering::SamplerState::default();
     let mut last_sample = Instant::now();
@@ -6390,6 +6511,68 @@ async fn metering_loop(
     loop {
         tokio::time::sleep(METERING_TICK).await;
         ticks += 1;
+
+        // L4 observability + kill-switch (independent of the per-project rollups below). Drain the
+        // per-reason drop/event counters and emit a sampled structured log so an operator can SEE a
+        // spoof flood or reflection attempt in flight. Then force-hibernate any base project the
+        // plane flagged reflection-suspected (design §8 automatic egress kill-switch): closing the
+        // guest stops the reflected replies at the source, and the plane's own signature clears on
+        // cooldown so it can wake again cleanly.
+        if let Some(plane) = &l4_plane {
+            let c = plane.drain_counters();
+            if c.rate_cap
+                | c.budget_full
+                | c.warm_full_global
+                | c.flow_full_project
+                | c.flow_full_global
+                | c.header_auth_fail
+                | c.nonce_replay
+                | c.stale_epoch
+                | c.egress_amp_clamp
+                | c.egress_per_source
+                | c.egress_per_project
+                | c.egress_per_24
+                | c.egress_global
+                | c.c0_grant_rejected
+                | c.wakes_admitted
+                | c.promotions
+                != 0
+            {
+                info!(
+                    target: "l4_metrics",
+                    rate_cap = c.rate_cap, budget_full = c.budget_full, warm_full_global = c.warm_full_global,
+                    flow_full_project = c.flow_full_project, flow_full_global = c.flow_full_global,
+                    header_auth_fail = c.header_auth_fail, nonce_replay = c.nonce_replay, stale_epoch = c.stale_epoch,
+                    egress_amp_clamp = c.egress_amp_clamp, egress_per_source = c.egress_per_source,
+                    egress_per_project = c.egress_per_project, egress_per_24 = c.egress_per_24, egress_global = c.egress_global,
+                    c0_grant_rejected = c.c0_grant_rejected, c0_grants = c.c0_grants,
+                    wakes_admitted = c.wakes_admitted, wakes_coalesced = c.wakes_coalesced,
+                    promotions = c.promotions, provisional_expired = c.provisional_expired,
+                    "l4 plane counters (tick)"
+                );
+            }
+            for base in plane.warm_projects() {
+                if plane.is_reflection_suspected(&base) {
+                    let is_running =
+                        { platform.lock().await.vm_states.get(&base) == Some(&VmLifecycle::Running) };
+                    if is_running {
+                        tracing::warn!(project = %base, "l4 reflection kill-switch: force-hibernating high-ratio/high-entropy flows");
+                        if let Err(e) = hibernate_project(
+                            &base,
+                            platform.clone(),
+                            routing.clone(),
+                            shipper.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::error!(project = %base, error = %e, "l4 kill-switch hibernate failed");
+                        }
+                    }
+                }
+            }
+        }
         let now = jkbase_control::auth::timestamp();
         let hour_epoch = now / 3600 * 3600;
         let elapsed = last_sample.elapsed().as_secs().max(1);
@@ -6531,6 +6714,7 @@ async fn metering_loop(
                         platform.clone(),
                         routing.clone(),
                         shipper.clone(),
+                        None,
                         None,
                     )
                     .await
