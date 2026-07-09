@@ -23,7 +23,7 @@ use crate::l4_plane::{
     BootAdmit, DropReason, EgressReject, L4Event, L4FlowGuard, L4Plane, ReserveReject,
     WakeInFlight, FlowReservation,
 };
-use jkbase_common::l4_transit::{self, L4TransitHeader};
+use jkbase_common::l4_transit::{self, L4Dir, L4TransitHeader};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::future::Future;
@@ -190,6 +190,15 @@ pub struct L4Ingress {
 
 /// What the reach-loop decision (under the port lock) tells the loop to do afterwards (outside it).
 enum ReachOutcome {
+    /// A MISS that reserved a flow slot — the loop must resolve liveness (`resolve_vm_ip`, async,
+    /// OUTSIDE the port lock) then call [`L4Ingress::reach_admit`]: a warm VM forwards WITHOUT
+    /// spending a wake-rate token or booting; a cold VM runs the wake gate. Carries the RAII
+    /// reservation across the async gap.
+    CheckLiveness {
+        project_id: String,
+        src: SocketAddr,
+        reservation: FlowReservation,
+    },
     /// Forward the just-received datagram to the guest with this framed header.
     Forward {
         flow_id: u32,
@@ -296,7 +305,21 @@ impl L4Ingress {
                 }
             };
             let now = Instant::now();
-            match self.reach_decide(src, &buf[..n], now) {
+            // On a MISS, resolve backend liveness OUTSIDE the port lock, then admit; a HIT (and the
+            // drop paths) return a terminal outcome directly.
+            let outcome = match self.reach_decide(src, &buf[..n], now) {
+                ReachOutcome::CheckLiveness {
+                    project_id,
+                    src,
+                    reservation,
+                } => {
+                    let live = (self.resolve_vm_ip)(project_id.clone()).await;
+                    let now2 = Instant::now();
+                    self.reach_admit(src, &buf[..n], now2, reservation, project_id, live)
+                }
+                terminal => terminal,
+            };
+            match outcome {
                 ReachOutcome::Forward {
                     flow_id,
                     epoch,
@@ -305,6 +328,7 @@ impl L4Ingress {
                 } => {
                     l4_transit::seal(
                         self.spec.transit_secret.as_bytes(),
+                        L4Dir::HostToAgent,
                         L4TransitHeader {
                             flow_id,
                             epoch,
@@ -321,14 +345,94 @@ impl L4Ingress {
                 ReachOutcome::BootWait { project_id } => {
                     tokio::spawn(self.clone().wait_task(project_id));
                 }
-                ReachOutcome::Buffered | ReachOutcome::Dropped => {}
+                // `reach_admit` never returns CheckLiveness; the other arms are terminal.
+                ReachOutcome::CheckLiveness { .. }
+                | ReachOutcome::Buffered
+                | ReachOutcome::Dropped => {}
             }
         }
     }
 
-    /// The synchronous reach-loop decision (holds the port lock; NO `.await`). On a MISS it runs
-    /// only the non-blocking wake gates (§2.2 steps 1–4) and defers the boot to a spawned task.
+    /// The synchronous reach-loop decision (holds the port lock; NO `.await`). A HIT is finalized
+    /// here (forward to the cached live `vm_dst`, or buffer during boot); a MISS only RESERVES a
+    /// flow slot and returns [`ReachOutcome::CheckLiveness`] — the wake-rate token / boot are
+    /// deferred to [`Self::reach_admit`] after an async liveness resolve, so a datagram to an
+    /// already-WARM VM neither burns a wake-rate token nor forwards to a stale `vm_dst`.
     fn reach_decide(self: &Arc<Self>, src: SocketAddr, payload: &[u8], now: Instant) -> ReachOutcome {
+        let n = payload.len();
+        let base = &self.spec.base_project;
+        let tenant = self.spec.tenant_id.as_deref();
+        let amp_k = self.spec.amp_k;
+
+        let mut st = self.state.lock().unwrap();
+        let PortState { flows, vm_dst, .. } = &mut *st;
+
+        // ---- HIT: a known flow ----
+        if let Some(flow) = flows.get_mut(&src) {
+            flow.last_seen = now;
+            flow.bytes_in = flow.bytes_in.saturating_add(n as u64);
+            flow.pkts = flow.pkts.saturating_add(1);
+            flow.egress.on_ingress(n, amp_k);
+            self.plane.note_ingress(base, n, amp_k, now);
+            return match *vm_dst {
+                Some(dst) => {
+                    // Forwarding to the live VM — promote only here (not while buffering during boot,
+                    // nor against a dead VM). A HIT implies a flow, which kept the VM warm at the
+                    // `vm_dst` its creating MISS validated, so `dst` is live.
+                    self.maybe_promote(flow, base, tenant, now);
+                    flow.out_nonce += 1;
+                    ReachOutcome::Forward {
+                        flow_id: flow.flow_id,
+                        epoch: flow.epoch,
+                        nonce: flow.out_nonce,
+                        dst,
+                    }
+                }
+                None => {
+                    self.buffer_push(flow, payload);
+                    ReachOutcome::Buffered
+                }
+            };
+        }
+
+        // ---- MISS: reserve the flow slot (bounds the table), then defer to reach_admit ----
+        // No wake-rate here — it is spent only if the async liveness resolve finds the VM cold.
+        match self.plane.try_reserve_flow(base, tenant, now) {
+            Ok(reservation) => ReachOutcome::CheckLiveness {
+                project_id: self.spec.project_id.clone(),
+                src,
+                reservation,
+            },
+            Err(ReserveReject::Project) => {
+                self.plane.count(DropReason::FlowFullProject);
+                ReachOutcome::Dropped
+            }
+            Err(ReserveReject::Global) => {
+                self.plane.count(DropReason::FlowFullGlobal);
+                ReachOutcome::Dropped
+            }
+            Err(ReserveReject::WarmCeiling | ReserveReject::Ram) => {
+                self.plane.count(DropReason::WarmFullGlobal);
+                ReachOutcome::Dropped
+            }
+        }
+    }
+
+    /// Finalize a reserved MISS after the async liveness resolve (holds the port lock; NO `.await`).
+    /// `live` is `resolve_vm_ip(project)`: `Some(ip)` ⇒ the VM is WARM (the server removes a project
+    /// from the routing table on hibernate), so forward WITHOUT a wake-rate token or a boot and
+    /// refresh the cached `vm_dst`; `None` ⇒ the VM is cold, so run the wake gate (wake-rate +
+    /// single-flight + budget). A brand-new flow doesn't promote (age 0). On any drop the local
+    /// `flow` unwinds, releasing its reservation.
+    fn reach_admit(
+        self: &Arc<Self>,
+        src: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+        reservation: FlowReservation,
+        project_id: String,
+        live: Option<String>,
+    ) -> ReachOutcome {
         let n = payload.len();
         let base = &self.spec.base_project;
         let tenant = self.spec.tenant_id.as_deref();
@@ -346,95 +450,63 @@ impl L4Ingress {
             ..
         } = &mut *st;
 
-        // ---- HIT: a known flow ----
-        if let Some(flow) = flows.get_mut(&src) {
-            flow.last_seen = now;
-            flow.bytes_in = flow.bytes_in.saturating_add(n as u64);
-            flow.pkts = flow.pkts.saturating_add(1);
-            flow.egress.on_ingress(n, amp_k);
-            self.plane.note_ingress(base, n, amp_k, now);
-            self.maybe_promote(flow, base, tenant, now);
-            return match *vm_dst {
-                Some(dst) => {
-                    flow.out_nonce += 1;
-                    ReachOutcome::Forward {
-                        flow_id: flow.flow_id,
-                        epoch: flow.epoch,
-                        nonce: flow.out_nonce,
-                        dst,
-                    }
-                }
-                None => {
-                    self.buffer_push(flow, payload);
-                    ReachOutcome::Buffered
-                }
-            };
-        }
-
-        // ---- MISS: wake gate (Axis 1) ----
-        // 1. per-base-project wake-rate.
-        if !self.plane.try_wake_rate(base, now) {
-            self.plane.count(DropReason::RateCap);
-            return ReachOutcome::Dropped;
-        }
-        // 2. flow reservation (per-base + global + tenant share + warm ceiling + RAM). No conn_count.
-        let reservation = match self.plane.try_reserve_flow(base, tenant, now) {
-            Ok(r) => r,
-            Err(ReserveReject::Project) => {
-                self.plane.count(DropReason::FlowFullProject);
-                return ReachOutcome::Dropped;
-            }
-            Err(ReserveReject::Global) => {
-                self.plane.count(DropReason::FlowFullGlobal);
-                return ReachOutcome::Dropped;
-            }
-            Err(ReserveReject::WarmCeiling | ReserveReject::Ram) => {
-                self.plane.count(DropReason::WarmFullGlobal);
-                return ReachOutcome::Dropped;
-            }
-        };
         let (flow_id, epoch) = alloc_flow_id(next_flow_id, epoch_for, *epoch_base);
         let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
         flow.bytes_in = n as u64;
         flow.pkts = 1;
-        flow.egress.on_ingress(n, amp_k);
-        self.plane.note_ingress(base, n, amp_k, now);
 
-        let project_id = self.spec.project_id.clone();
-        let outcome = if let Some(dst) = *vm_dst {
-            // VM already warm (a sibling flow booted it) — forward immediately.
-            flow.out_nonce += 1;
-            ReachOutcome::Forward {
-                flow_id,
-                epoch,
-                nonce: flow.out_nonce,
-                dst,
+        // A parseable live IP ⇒ warm forward; otherwise (cold, or an unparseable backend) wake.
+        let live_dst = live.and_then(|ip| {
+            format!("{}:{}", ip, self.spec.agent_udp_port)
+                .parse::<SocketAddr>()
+                .ok()
+        });
+
+        let outcome = match live_dst {
+            Some(dst) => {
+                // WARM: forward now. No wake-rate token, no boot. Refresh the cache for HITs.
+                *vm_dst = Some(dst);
+                flow.out_nonce += 1;
+                ReachOutcome::Forward {
+                    flow_id,
+                    epoch,
+                    nonce: flow.out_nonce,
+                    dst,
+                }
             }
-        } else if *booting {
-            // A boot is already in flight for this port — buffer; it will flush on readiness.
-            self.buffer_push(&mut flow, payload);
-            ReachOutcome::Buffered
-        } else {
-            // 3+4. single-flight + global wake budget within the tenant's fair-share.
-            match self.plane.ensure_boot(base, tenant) {
-                BootAdmit::Spawn(guard) => {
-                    *booting = true;
-                    self.buffer_push(&mut flow, payload);
-                    ReachOutcome::BootSpawn { guard, project_id }
+            None if *booting => {
+                // COLD, but a boot is already in flight for this port — coalesce (no wake-rate).
+                self.buffer_push(&mut flow, payload);
+                ReachOutcome::Buffered
+            }
+            None => {
+                // COLD, first MISS for this port since the last boot cleared → the wake gate.
+                if !self.plane.try_wake_rate(base, now) {
+                    self.plane.count(DropReason::RateCap);
+                    return ReachOutcome::Dropped; // `flow` unwinds → reservation released
                 }
-                BootAdmit::Coalesced => {
-                    *booting = true;
-                    self.buffer_push(&mut flow, payload);
-                    self.plane.event(L4Event::WakeCoalesced);
-                    ReachOutcome::BootWait { project_id }
-                }
-                BootAdmit::BudgetFull => {
-                    // Release the reservation (flow never admitted) — over-budget costs no slot.
-                    self.plane.count(DropReason::BudgetFull);
-                    return ReachOutcome::Dropped; // `flow` drops here → reservation released
+                self.buffer_push(&mut flow, payload);
+                match self.plane.ensure_boot(base, tenant) {
+                    BootAdmit::Spawn(guard) => {
+                        *booting = true;
+                        ReachOutcome::BootSpawn { guard, project_id }
+                    }
+                    BootAdmit::Coalesced => {
+                        *booting = true;
+                        self.plane.event(L4Event::WakeCoalesced);
+                        ReachOutcome::BootWait { project_id }
+                    }
+                    BootAdmit::BudgetFull => {
+                        self.plane.count(DropReason::BudgetFull);
+                        return ReachOutcome::Dropped; // `flow` unwinds → reservation released
+                    }
                 }
             }
         };
+        // Stamp ingress only on the admitted paths (never for a dropped datagram — counting it would
+        // wrongly credit the reflection ratio). Then insert.
+        flow.egress.on_ingress(n, amp_k);
+        self.plane.note_ingress(base, n, amp_k, now);
         flows.insert(src, flow);
         by_flow_id.insert(flow_id, src);
         outcome
@@ -453,10 +525,13 @@ impl L4Ingress {
                 }
             };
             let now = Instant::now();
-            // Verify + strip the agent's transit header FIRST (fail-closed).
-            let Some((hdr, payload)) =
-                l4_transit::open(self.spec.transit_secret.as_bytes(), &buf[..n])
-            else {
+            // Verify + strip the agent's transit header FIRST (fail-closed). The reply leg is bound
+            // to `AgentToHost`, so a host→agent frame replayed back here fails the tag (P0-L4-11).
+            let Some((hdr, payload)) = l4_transit::open(
+                self.spec.transit_secret.as_bytes(),
+                L4Dir::AgentToHost,
+                &buf[..n],
+            ) else {
                 self.plane.count(DropReason::HeaderAuthFail);
                 continue;
             };
@@ -664,6 +739,7 @@ impl L4Ingress {
         for (flow_id, epoch, nonce, datagram) in jobs {
             l4_transit::seal(
                 secret,
+                L4Dir::HostToAgent,
                 L4TransitHeader {
                     flow_id,
                     epoch,

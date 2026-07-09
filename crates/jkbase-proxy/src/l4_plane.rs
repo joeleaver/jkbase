@@ -23,7 +23,7 @@ use crate::WakeCallback;
 use crate::l4_egress::{BoundedTtlMap, TokenBucket};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -57,6 +57,26 @@ const REFL_MAP_MAX: usize = 8192;
 const REFL_TTL: Duration = Duration::from_secs(60);
 /// Re-read `/proc/meminfo` at most this often (the RAM floor tolerates second-scale staleness).
 const MEM_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Estimated RAM a single in-flight boot will claim, charged against the host-RAM floor so a
+/// concurrent burst of boots can't all read `MemAvailable > floor` and collectively breach it. A
+/// deliberately conservative constant (a real microVM is larger, but this bounds the projection
+/// without a per-project size lookup on the hot reserve path).
+const EST_VM_BOOT_MIB: u64 = 512;
+/// A base flagged reflection-suspected auto-clears once its egress window has been quiescent this
+/// long (the periodic sweep re-checks) — so a base the kill-switch hibernated recovers without
+/// needing fresh traffic to complete a clean window.
+const REFLECTION_CLEAR: Duration = REFLECTION_WINDOW;
+
+/// The host-RAM floor test, factored pure so it is deterministically unit-testable (the live read
+/// depends on `/proc/meminfo`). `true` ⇒ a new warm VM is admissible: projected availability
+/// (`mem − in-flight boots × EST`) still clears the reserve. An unreadable `mem` (non-Linux / parse
+/// failure) is treated as OK so a read failure never bricks the plane — only logs.
+fn ram_floor_ok(mem_mib: Option<u64>, inflight_boots: usize, reserve_mib: u64) -> bool {
+    match mem_mib {
+        Some(m) => m.saturating_sub(inflight_boots as u64 * EST_VM_BOOT_MIB) >= reserve_mib,
+        None => true,
+    }
+}
 
 /// Tunable plane-global limits. The server builds these from constants/config; every field has a
 /// sane default so a bare `L4PlaneLimits::default()` is safe.
@@ -351,6 +371,10 @@ pub(crate) enum Dir {
 /// One base's rolling reflection window.
 struct RefWindow {
     start: Instant,
+    /// Last time this window was touched (either direction) — the periodic sweep clears a stale
+    /// `suspected` flag once this is older than [`REFLECTION_CLEAR`], so a quiesced/hibernated base
+    /// auto-recovers without needing a fresh clean window.
+    last_activity: Instant,
     ingress: u64,
     egress: u64,
     dests: HashSet<IpAddr>,
@@ -362,6 +386,7 @@ impl RefWindow {
     fn fresh(now: Instant, amp_k: u8) -> Self {
         Self {
             start: now,
+            last_activity: now,
             ingress: 0,
             egress: 0,
             dests: HashSet::new(),
@@ -398,6 +423,10 @@ pub struct L4Plane {
     activity: Mutex<ActivityState>,
     mem: Mutex<MemCache>,
     counters: AtomicCounters,
+    /// Count of boots currently in flight (== live [`WakeInFlight`] guards), charged against the
+    /// host-RAM floor so concurrent boots can't collectively breach it. Lock-free so the RAM check
+    /// in [`Self::try_reserve_flow`] (under the flow lock) can read it without nesting a plane mutex.
+    inflight_boots: AtomicUsize,
 }
 
 impl L4Plane {
@@ -443,6 +472,7 @@ impl L4Plane {
                 mib: None,
             }),
             counters: AtomicCounters::default(),
+            inflight_boots: AtomicUsize::new(0),
         })
     }
 
@@ -584,9 +614,10 @@ impl L4Plane {
             if fs.by_base.len() >= self.limits.global_warm_ceiling {
                 return Err(ReserveReject::WarmCeiling);
             }
-            if let Some(avail) = mem_mib
-                && avail < self.limits.host_ram_reserve_mib
-            {
+            // Host-RAM floor WITH in-flight-boot accounting: charge each concurrent boot's estimate
+            // so a burst can't all read `MemAvailable > floor` and collectively breach it.
+            let inflight = self.inflight_boots.load(Ordering::Relaxed);
+            if !ram_floor_ok(mem_mib, inflight, self.limits.host_ram_reserve_mib) {
                 return Err(ReserveReject::Ram);
             }
         }
@@ -634,6 +665,8 @@ impl L4Plane {
         if let Some(t) = tenant {
             *ws.tenant_inflight.entry(t.to_string()).or_insert(0) += 1;
         }
+        // Charge this boot's estimated RAM against the host-RAM floor for its whole life.
+        self.inflight_boots.fetch_add(1, Ordering::Relaxed);
         BootAdmit::Spawn(WakeInFlight {
             plane: self.clone(),
             base: base.to_string(),
@@ -810,6 +843,7 @@ impl L4Plane {
             return;
         };
         w.amp_k = amp_k;
+        w.last_activity = now;
         match dir {
             Dir::In => w.ingress = w.ingress.saturating_add(bytes as u64),
             Dir::Out => {
@@ -856,10 +890,34 @@ impl L4Plane {
         }
         {
             let mut act = self.activity.lock().unwrap();
-            let ActivityState { last, refl, .. } = &mut *act;
+            let ActivityState {
+                last,
+                refl,
+                suspected,
+            } = &mut *act;
             last.sweep(now);
             refl.sweep(now);
+            // Time-based kill-switch recovery: clear `suspected` for any base whose reflection
+            // window has gone quiet (or been TTL-evicted) past `REFLECTION_CLEAR`, so a base the
+            // kill-switch hibernated auto-recovers without needing fresh traffic to close a window.
+            suspected.retain(|base| match refl.get(base) {
+                Some(w) => now.saturating_duration_since(w.last_activity) < REFLECTION_CLEAR,
+                None => false,
+            });
         }
+    }
+
+    /// The currently reflection-suspected base-projects (kill-switch set). The server's kill-switch
+    /// loop iterates THIS — `warm_projects()` deliberately EXCLUDES suspected bases (the billing
+    /// view, §6), so iterating that and re-testing would be dead code.
+    pub fn reflection_suspected_projects(&self) -> Vec<String> {
+        self.activity
+            .lock()
+            .unwrap()
+            .suspected
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// `/proc/meminfo` MemAvailable in MiB, cached for [`MEM_CACHE_TTL`]. `None` when unreadable
@@ -906,6 +964,7 @@ pub(crate) struct WakeInFlight {
 
 impl Drop for WakeInFlight {
     fn drop(&mut self) {
+        self.plane.inflight_boots.fetch_sub(1, Ordering::Relaxed);
         let mut ws = self.plane.wake_state.lock().unwrap();
         ws.inflight.remove(&self.base);
         if let Some(t) = &self.tenant
@@ -1271,5 +1330,47 @@ mod tests {
         // Drained → reset.
         let c2 = p.drain_counters();
         assert_eq!(c2.rate_cap, 0);
+    }
+
+    #[test]
+    fn reflection_suspected_projects_lists_the_kill_switch_set() {
+        let p = plane();
+        assert!(p.reflection_suspected_projects().is_empty());
+        let t0 = Instant::now();
+        let victim: IpAddr = "192.0.2.60".parse().unwrap();
+        p.note_ingress("bad", 1000, 1, t0);
+        p.note_egress("bad", 1_000_000, 1, victim, t0);
+        let t1 = t0 + REFLECTION_WINDOW + Duration::from_millis(1);
+        p.note_egress("bad", 1, 1, victim, t1);
+        assert_eq!(p.reflection_suspected_projects(), vec!["bad".to_string()]);
+    }
+
+    #[test]
+    fn suspected_auto_clears_when_the_window_goes_quiet() {
+        let p = plane();
+        let t0 = Instant::now();
+        let victim: IpAddr = "192.0.2.61".parse().unwrap();
+        p.note_ingress("q", 1000, 1, t0);
+        p.note_egress("q", 1_000_000, 1, victim, t0);
+        let t1 = t0 + REFLECTION_WINDOW + Duration::from_millis(1);
+        p.note_egress("q", 1, 1, victim, t1);
+        assert!(p.is_reflection_suspected("q"));
+        // No further traffic (the kill-switch hibernated it). A sweep BEFORE the clear window keeps
+        // it flagged...
+        p.sweep(t1 + Duration::from_secs(1));
+        assert!(p.is_reflection_suspected("q"));
+        // ...but a sweep after REFLECTION_CLEAR of quiet auto-clears it.
+        p.sweep(t1 + REFLECTION_CLEAR + Duration::from_millis(1));
+        assert!(!p.is_reflection_suspected("q"));
+    }
+
+    #[test]
+    fn ram_floor_charges_inflight_boots() {
+        // 4096 MiB available, 512 floor, 512/boot.
+        assert!(ram_floor_ok(Some(4096), 0, 512)); // 4096 ≥ 512
+        assert!(ram_floor_ok(Some(4096), 7, 512)); // 4096 − 3584 = 512 ≥ 512
+        assert!(!ram_floor_ok(Some(4096), 8, 512)); // 4096 − 4096 = 0 < 512 (collective breach)
+        // An unreadable meminfo never bricks the plane (treated as OK).
+        assert!(ram_floor_ok(None, 100, 512));
     }
 }
