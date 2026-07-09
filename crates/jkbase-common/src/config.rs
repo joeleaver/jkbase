@@ -796,11 +796,24 @@ pub struct L4PortConfig {
     /// the TCP data path is a follow-on). An unrecognised value is rejected (fail-closed,
     /// mirrors [`DatabaseConfig::engine`]).
     pub proto: String,
-    /// The loopback port the tenant's service binds INSIDE the guest (TeamSpeak → `9987`).
-    /// The service binds `127.0.0.1:<guest_port>` ONLY — never eth0 — and the `jkbase-agent`
-    /// land-forwards admitted datagrams to it [P0-L4-1]. REQUIRED: an L4 port with nothing
-    /// to forward to is meaningless.
+    /// The loopback port the tenant's service binds INSIDE the guest (e.g. `9987` for a
+    /// voice server). The service binds `127.0.0.1:<guest_port>` ONLY — never eth0 — and the
+    /// `jkbase-agent` land-forwards admitted datagrams to it [P0-L4-1]. REQUIRED: an L4 port
+    /// with nothing to forward to is meaningless.
     pub guest_port: u16,
+    /// Optional idle timeout (seconds): the flow is torn down + the VM becomes a hibernation
+    /// candidate after this long with no traffic in EITHER direction (§3(d)). Clamped to
+    /// `[15, 600]`; omitted → 60. Tune UP for an app whose legitimate silence gaps are long,
+    /// DOWN for snappier scale-to-zero.
+    #[serde(default)]
+    pub idle_timeout: Option<u64>,
+    /// Optional egress:ingress amplification ratio `k` (§3(c) axis 2): the relay lets the
+    /// app reply at most `k`× the bytes the client sent, bounding reflection. Clamped to
+    /// `[1, 3]` (3 = QUIC's anti-amplification number); omitted → 1 (byte-for-byte). Raising
+    /// it raises this port's reflection factor — only widen it for a legitimately
+    /// reply-heavier protocol.
+    #[serde(default)]
+    pub amp_k: Option<u8>,
 }
 
 /// Resolved L4 transport — the fail-closed boundary for `[l4.<name>].proto`.
@@ -852,6 +865,28 @@ impl L4PortConfig {
         }
         Ok(())
     }
+
+    /// Resolved idle timeout (seconds), clamped to `[Self::IDLE_FLOOR, Self::IDLE_CEIL]`;
+    /// omitted → [`Self::IDLE_DEFAULT`]. A tuning knob, not a correctness gate — an
+    /// out-of-range value is CLAMPED (not rejected), so a typo can't fail a deploy over a
+    /// timeout.
+    pub fn idle_timeout_secs(&self) -> u64 {
+        self.idle_timeout
+            .unwrap_or(Self::IDLE_DEFAULT)
+            .clamp(Self::IDLE_FLOOR, Self::IDLE_CEIL)
+    }
+
+    /// Resolved egress:ingress ratio `k`, clamped to `[1, Self::AMP_K_CEIL]`; omitted → 1
+    /// (byte-for-byte). Clamped, not rejected (see [`Self::idle_timeout_secs`]).
+    pub fn amp_k(&self) -> u8 {
+        self.amp_k.unwrap_or(1).clamp(1, Self::AMP_K_CEIL)
+    }
+
+    pub const IDLE_DEFAULT: u64 = 60;
+    pub const IDLE_FLOOR: u64 = 15;
+    pub const IDLE_CEIL: u64 = 600;
+    /// 3 = QUIC's anti-amplification factor; the reflection ceiling a port may opt into.
+    pub const AMP_K_CEIL: u8 = 3;
 }
 
 impl ProjectConfig {
@@ -1608,6 +1643,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.l4.len(), 2);
+    }
+
+    #[test]
+    fn l4_port_tunables_default_and_clamp() {
+        // Omitted → defaults (idle 60, k 1).
+        let cfg: ProjectConfig =
+            toml::from_str("[l4.v]\nproto = \"udp\"\nguest_port = 9987\n").unwrap();
+        assert_eq!(cfg.l4["v"].idle_timeout_secs(), 60);
+        assert_eq!(cfg.l4["v"].amp_k(), 1);
+
+        // In-range values pass through.
+        let cfg: ProjectConfig = toml::from_str(
+            "[l4.v]\nproto = \"udp\"\nguest_port = 9987\nidle_timeout = 120\namp_k = 2\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.l4["v"].idle_timeout_secs(), 120);
+        assert_eq!(cfg.l4["v"].amp_k(), 2);
+
+        // Out-of-range is CLAMPED (not rejected): a tuning knob never fails a deploy.
+        let cfg: ProjectConfig = toml::from_str(
+            "[l4.lo]\nproto = \"udp\"\nguest_port = 1\nidle_timeout = 1\namp_k = 0\n[l4.hi]\nproto = \"udp\"\nguest_port = 2\nidle_timeout = 99999\namp_k = 250\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.l4["lo"].idle_timeout_secs(), 15); // floor
+        assert_eq!(cfg.l4["lo"].amp_k(), 1); // floor (0 → 1)
+        assert_eq!(cfg.l4["hi"].idle_timeout_secs(), 600); // ceiling
+        assert_eq!(cfg.l4["hi"].amp_k(), 3); // ceiling
+        // Clamped tunables still validate (they're not correctness gates).
+        cfg.l4["lo"].validate("lo").unwrap();
     }
 
     #[test]
