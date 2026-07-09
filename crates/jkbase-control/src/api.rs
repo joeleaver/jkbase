@@ -1,7 +1,7 @@
 use crate::auth::{self, ApiToken, Tenant};
 use crate::logstore::LogStore;
 use crate::store::{
-    BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, Project, Store,
+    BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, PortAllocation, Project, Store,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
@@ -354,6 +354,12 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route("/projects/{id}/auth/rotate", post(rotate_auth_key))
         .route("/projects/{id}/auth/signing-keys", get(list_signing_keys))
+        // L4 (UDP/TCP) ingress ports: owner lists allocations; a platform admin pins a
+        // fixed external port (`X-Admin-Token`). See docs/managed-l4-udp-ingress-design.md.
+        .route(
+            "/projects/{id}/l4",
+            get(list_l4_ports).post(pin_l4_port),
+        )
         .route(
             "/projects/{id}/db/backups",
             get(list_db_backups).post(trigger_db_backup),
@@ -784,6 +790,7 @@ async fn create_project(
     // NEW owner (cross-tenant inheritance). Purge it before the slug is reused.
     let _ = state.store.delete_all_secrets(&id);
     let _ = state.store.delete_all_access_keys(&id);
+    let _ = state.store.remove_all_port_allocations(&id);
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
     let _ = state.store.delete_deployed_tier(&id);
@@ -2970,6 +2977,222 @@ async fn list_secrets(
     }
 }
 
+#[derive(Serialize)]
+struct L4PortResponse {
+    name: String,
+    proto: String,
+    external_port: u16,
+    guest_port: u16,
+    pinned: bool,
+}
+
+/// `GET /projects/{id}/l4` — owner-scoped list of the project's allocated L4 ports. This is
+/// how a non-pinned tenant discovers its random `external_port`. See
+/// docs/managed-l4-udp-ingress-design.md.
+async fn list_l4_ports(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => {}
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+    }
+    match state.store.list_port_allocations_for_project(&id) {
+        Ok(mut ports) => {
+            ports.sort_by(|a, b| a.name.cmp(&b.name));
+            let out: Vec<L4PortResponse> = ports
+                .into_iter()
+                .map(|p| L4PortResponse {
+                    name: p.name,
+                    proto: p.proto,
+                    external_port: p.external_port,
+                    guest_port: p.guest_port,
+                    pinned: p.pinned,
+                })
+                .collect();
+            Json(out).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PinL4Request {
+    name: String,
+    port: u16,
+}
+
+/// Why a pin was refused — the handler maps each to a distinct HTTP status.
+#[derive(Debug, PartialEq, Eq)]
+enum L4PinError {
+    /// Port 0 or a reserved platform port (80/443).
+    ReservedPort(u16),
+    /// The port is already held by another `(project, name)` — pins never evict incumbents.
+    Conflict(u16),
+}
+
+/// Pure decision core for a pin: validate the port + compute the allocation to save and any
+/// prior port to quarantine. Admin-gating and project-existence are the handler's job; this
+/// is the port logic, unit-tested. Preserves a post-deploy row's tenant fields (proto/
+/// guest_port/transit) via struct-update; a pre-deploy pin creates a placeholder the next
+/// deploy fills.
+fn plan_l4_pin(
+    existing: Option<&PortAllocation>,
+    all: &[PortAllocation],
+    project_id: &str,
+    name: &str,
+    port: u16,
+) -> Result<(PortAllocation, Option<u16>), L4PinError> {
+    if port == 0 || port == 80 || port == 443 {
+        return Err(L4PinError::ReservedPort(port));
+    }
+    // Never evict an incumbent: reject a port held by any OTHER (project, name).
+    if all
+        .iter()
+        .any(|a| a.external_port == port && !(a.project_id == project_id && a.name == name))
+    {
+        return Err(L4PinError::Conflict(port));
+    }
+    let alloc = match existing {
+        Some(cur) => PortAllocation {
+            external_port: port,
+            pinned: true,
+            ..cur.clone()
+        },
+        None => PortAllocation {
+            project_id: project_id.to_string(),
+            name: name.to_string(),
+            proto: "udp".to_string(),
+            external_port: port,
+            guest_port: 0,
+            agent_udp_port: 0,
+            pinned: true,
+            host_id: String::new(),
+            placement_epoch: 0,
+        },
+    };
+    // Quarantine a MOVED port's prior value so a stale client can't hit the reused port.
+    let quarantine = existing
+        .filter(|cur| cur.external_port != port)
+        .map(|cur| cur.external_port);
+    Ok((alloc, quarantine))
+}
+
+/// `POST /projects/{id}/l4` — PLATFORM-ADMIN pin of a fixed external port for a project's
+/// `[l4.<name>]` (e.g. TeamSpeak's 9987). Requires a valid `X-Admin-Token`; a tenant can
+/// never self-pin a well-known port. Writes `pinned=true` + the fixed `external_port` to the
+/// allocation, which the deploy path sticky-reuses (filling proto/guest_port/transit at the
+/// next deploy). Never evicts an incumbent: a port already held by ANOTHER (project,name) is
+/// rejected. A moved port's prior value is quarantined. See §3(b).
+async fn pin_l4_port(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PinL4Request>,
+) -> impl IntoResponse {
+    if !state.is_admin_request(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "pinning an L4 port requires a platform-admin token (X-Admin-Token)".into(),
+            }),
+        )
+            .into_response();
+    }
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "`name` (the [l4.<name>] key) is required".into(),
+            }),
+        )
+            .into_response();
+    }
+    // The project must exist (a pin may precede the stanza's first deploy, so no allocation
+    // need exist yet — but the project must).
+    if !matches!(state.store.get_project(&id), Ok(Some(_))) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    let all = match state.store.list_port_allocations() {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let existing = state.store.get_port_allocation(&id, &name).ok().flatten();
+    let (alloc, quarantine) = match plan_l4_pin(existing.as_ref(), &all, &id, &name, req.port) {
+        Ok(x) => x,
+        Err(L4PinError::ReservedPort(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "port must be non-zero and not a reserved platform port (80/443)".into(),
+                }),
+            )
+                .into_response();
+        }
+        Err(L4PinError::Conflict(p)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("port {p} is already allocated to another project"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Some(old) = quarantine {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = state.store.quarantine_port(old, now);
+    }
+    if let Err(e) = state.store.save_port_allocation(&alloc) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "name": alloc.name,
+        "external_port": alloc.external_port,
+        "pinned": alloc.pinned,
+    }))
+    .into_response()
+}
+
 async fn delete_secret(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
@@ -4752,6 +4975,61 @@ mod tests {
         let out = resolve_quota(&req, &current, true);
         assert_eq!(out.storage_bytes_max, 100 * GIB, "untouched cap preserved");
         assert_eq!(out.bandwidth_bytes_per_month, 1099511627776);
+    }
+
+    #[test]
+    fn l4_pin_validates_conflicts_placeholder_and_move() {
+        use super::{plan_l4_pin, L4PinError};
+        use crate::store::PortAllocation;
+
+        let mk = |proj: &str, name: &str, ext: u16| PortAllocation {
+            project_id: proj.into(),
+            name: name.into(),
+            proto: "udp".into(),
+            external_port: ext,
+            guest_port: 9987,
+            agent_udp_port: 40000,
+            pinned: false,
+            host_id: String::new(),
+            placement_epoch: 0,
+        };
+
+        // Zero / reserved platform ports are rejected.
+        for p in [0u16, 80, 443] {
+            assert!(matches!(
+                plan_l4_pin(None, &[], "p", "voice", p),
+                Err(L4PinError::ReservedPort(q)) if q == p
+            ));
+        }
+
+        // A port held by ANOTHER (project, name) is a conflict — a pin never evicts it.
+        let others = vec![mk("other", "voice", 9987)];
+        assert!(matches!(
+            plan_l4_pin(None, &others, "p", "voice", 9987),
+            Err(L4PinError::Conflict(9987))
+        ));
+
+        // Pre-deploy pin: placeholder (guest/transit = 0), pinned, nothing to quarantine.
+        let (alloc, q) = plan_l4_pin(None, &[], "p", "voice", 9987).unwrap();
+        assert_eq!((alloc.external_port, alloc.pinned), (9987, true));
+        assert_eq!((alloc.guest_port, alloc.agent_udp_port), (0, 0));
+        assert_eq!(q, None);
+
+        // Post-deploy pin MOVING a port: preserve tenant fields, quarantine the old port.
+        let cur = mk("p", "voice", 25000);
+        let (alloc, q) = plan_l4_pin(Some(&cur), std::slice::from_ref(&cur), "p", "voice", 9987)
+            .unwrap();
+        assert_eq!(alloc.external_port, 9987);
+        assert!(alloc.pinned);
+        assert_eq!(alloc.guest_port, 9987, "tenant guest_port preserved");
+        assert_eq!(alloc.agent_udp_port, 40000, "transit port preserved");
+        assert_eq!(q, Some(25000), "moved-from public port quarantined");
+
+        // Re-pinning to the SAME port is idempotent — no quarantine, no self-conflict.
+        let same = mk("p", "voice", 9987);
+        let (_, q) = plan_l4_pin(Some(&same), std::slice::from_ref(&same), "p", "voice", 9987)
+            .unwrap();
+        assert_eq!(q, None);
     }
 
     // The set handler rejects a body that carries no cap (would write a no-op override),
