@@ -1187,13 +1187,20 @@ fn l4_bind_probe(proto: L4Proto, port: u16) -> bool {
 /// (the agent listens on `eth0:agent_udp_port` inside the project's own VM), so only
 /// per-project uniqueness matters — not host-island scope.
 fn next_agent_udp_port(all: &[PortAllocation], project_id: &str, guest_port: u16) -> Result<u16> {
-    let used: HashSet<u16> = all
+    // Inside the VM the agent land-forward binds `0.0.0.0:agent_udp_port` while EACH stanza's
+    // tenant app binds `127.0.0.1:guest_port`. A `0.0.0.0:P` UDP bind conflicts with a
+    // `127.0.0.1:P` bind, so the transit port must avoid not just sibling agent ports but EVERY
+    // sibling stanza's guest_port too (and this stanza's own) — else a two-port project could
+    // seat its agent listener on a port another of its apps already holds, and one of the two
+    // binds fails at boot (a silent no-service). Exclude the union across the project.
+    let mut used: HashSet<u16> = all
         .iter()
         .filter(|p| p.project_id == project_id)
-        .map(|p| p.agent_udp_port)
+        .flat_map(|p| [p.agent_udp_port, p.guest_port])
         .collect();
+    used.insert(guest_port);
     (40000u16..=40999)
-        .find(|p| !used.contains(p) && *p != guest_port)
+        .find(|p| !used.contains(p))
         .context("no free in-VM transit port for project")
 }
 
@@ -3821,17 +3828,11 @@ async fn hibernate_project(
             {
                 return Ok(());
             }
-            // §3(d): symmetric L4 re-check — an established L4 flow (or fresh L4 traffic) that
-            // promoted since the idle loop's unlocked read keeps the VM warm, so a live UDP
-            // session isn't snapshotted mid-stream.
+            // §3(d): symmetric L4 re-check — an ESTABLISHED L4 flow that promoted since the idle
+            // loop's unlocked read keeps the VM warm, so a live UDP session isn't snapshotted
+            // mid-stream. Provisional flows deliberately don't count (they can't pin warm).
             if l4_plane
-                .map(|p| {
-                    let base = vm_identity::base_project_id(project_id);
-                    p.conn_count(base) > 0
-                        || p.last_activity_age(base)
-                            .map(|a| a <= Duration::from_secs(5))
-                            .unwrap_or(false)
-                })
+                .map(|p| p.conn_count(vm_identity::base_project_id(project_id)) > 0)
                 .unwrap_or(false)
             {
                 return Ok(());
@@ -4708,18 +4709,16 @@ async fn idle_detection_loop(
                 .as_ref()
                 .map(|r| r.conn_count(vm_identity::base_project_id(&project_id)) == 0)
                 .unwrap_or(true)
-            // §3(d): keep an L4 project warm while it has an ESTABLISHED flow (a byte-silent but
-            // live inbound-only/streaming app) OR its own last-datagram clock is still fresh. Both
-            // read from the L4 plane (keyed on the base project); neither back-dates the shared
-            // tracker. When L4 drains, the established gauge → 0 and the own-clock ages, so the
-            // AND lets it hibernate promptly on the normal idle path.
+            // §3(d): keep an L4 project warm ONLY while it has an ESTABLISHED flow (a byte-silent
+            // but live inbound-only/streaming app stays warm via conn_count > 0). PROVISIONAL
+            // (unpromoted, spoofable) flows deliberately do NOT count — they carry their own 5s
+            // timeout and must not pin the VM warm, else a spoof flood that never establishes would
+            // hold it warm for the full idle_timeout (P0-L4-12 / §3(d)). When established flows
+            // drain, conn_count → 0 (the per-port idle sweep evicts them) and the VM hibernates on
+            // the normal shared-seed idle path — never back-dating the shared ActivityTracker.
             && l4_plane
                 .as_ref()
-                .map(|p| {
-                    let base = vm_identity::base_project_id(&project_id);
-                    p.conn_count(base) == 0
-                        && p.last_activity_age(base).map(|a| a > idle_timeout).unwrap_or(true)
-                })
+                .map(|p| p.conn_count(vm_identity::base_project_id(&project_id)) == 0)
                 .unwrap_or(true);
 
             if should_hibernate {
@@ -6551,24 +6550,26 @@ async fn metering_loop(
                     "l4 plane counters (tick)"
                 );
             }
-            for base in plane.warm_projects() {
-                if plane.is_reflection_suspected(&base) {
-                    let is_running =
-                        { platform.lock().await.vm_states.get(&base) == Some(&VmLifecycle::Running) };
-                    if is_running {
-                        tracing::warn!(project = %base, "l4 reflection kill-switch: force-hibernating high-ratio/high-entropy flows");
-                        if let Err(e) = hibernate_project(
-                            &base,
-                            platform.clone(),
-                            routing.clone(),
-                            shipper.clone(),
-                            None,
-                            None,
-                        )
-                        .await
-                        {
-                            tracing::error!(project = %base, error = %e, "l4 kill-switch hibernate failed");
-                        }
+            // Iterate the SUSPECTED set directly: warm_projects() is the billing view and
+            // deliberately EXCLUDES reflection-suspected bases (§6 unbilled-suspected-hours), so
+            // iterating it here would never see a suspected project (the kill-switch would be dead
+            // code). reflection_suspected_projects() returns exactly the set to force-hibernate.
+            for base in plane.reflection_suspected_projects() {
+                let is_running =
+                    { platform.lock().await.vm_states.get(&base) == Some(&VmLifecycle::Running) };
+                if is_running {
+                    tracing::warn!(project = %base, "l4 reflection kill-switch: force-hibernating high-ratio/high-entropy flows");
+                    if let Err(e) = hibernate_project(
+                        &base,
+                        platform.clone(),
+                        routing.clone(),
+                        shipper.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::error!(project = %base, error = %e, "l4 kill-switch hibernate failed");
                     }
                 }
             }
