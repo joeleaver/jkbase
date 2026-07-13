@@ -28,18 +28,28 @@
 //! egress + a forced resolver) is a separate, larger arc; [`DnsPolicy`] is the seam it would attach
 //! to without reshaping the data path.
 //!
+//! ## Availability tradeoff (accepted)
+//! Guest DNS is now coupled to this process: while jkbase-server restarts, `172.16.0.1:53` has a
+//! brief gap (the old process holds the port until it exits; the new one's [`bind_udp_retry`] wins
+//! it back). Unlike the public proxy's :80/:443 (socket-activated for zero-bounce), :53 is NOT
+//! socket-activated: DNS is UDP and every client retries, so a sub-second gap on an upgrade is
+//! tolerable. Socket-activating :53 is a tracked follow-on, not a v1 requirement.
+//!
 //! ## Hardening (all-tenants-untrusted)
-//! * Bind `172.16.0.1` specifically, never `0.0.0.0` — off the public interface. `JKRUNFW` opens
-//!   only `${GW}:53` from the bridge, and setup-bridge.sh adds a weak-host `! -i jkbr0 -d ${GW}:53
-//!   DROP` (a bridge IP is not loopback-shielded on a multi-homed host — mirrors the DB gateway).
-//! * Source-IP fence: serve ONLY the bridge `/24` (`172.16.0.0/24`, IPv4); silently drop the rest.
+//! * Bind the bridge gateway IP specifically, never `0.0.0.0` — off the public interface. `JKRUNFW`
+//!   opens only `${GW}:53` from the bridge, and setup-bridge.sh adds a weak-host `! -i jkbr0 -d
+//!   ${GW}:53 DROP` (a bridge IP is not loopback-shielded on a multi-homed host — mirrors the DB gw).
+//! * Source-IP fence: serve ONLY the bridge's own `/24` (derived from the bind IP); drop the rest.
 //! * Relay-only to a FIXED host upstream — never a recursive/open resolver, so no internet source
 //!   can elicit a reply (anti open-resolver / anti amplification). Drop responses (QR=1) that
 //!   arrive at the listener (anti reflection).
-//! * Bounded everywhere: 4096 B UDP ceiling; length-prefixed TCP with a cap + idle deadline;
-//!   question parse capped (255 B name / 63 B label / no compression in the question); in-flight
-//!   upstream queries + TCP conns semaphore-bounded; a per-query upstream timeout.
-//! * Per-source-IP token bucket ([`IpRateLimiter`], reused from the DB gateway).
+//! * Per-source-IP token bucket ([`IpRateLimiter`], reused from the DB gateway) on EVERY query —
+//!   per-datagram on UDP, per-message inside the TCP pipeline loop (a TCP connection cannot escape
+//!   the budget by pipelining). Per-source-IP concurrent-TCP-connection cap so one guest can't
+//!   monopolise the global pool. Bounded parse (255 B name / 63 B label / no compression), bounded
+//!   in-flight upstream + TCP conns, per-query upstream timeout, a short first-byte TCP deadline.
+//! * Response cache keyed on the RAW wire question bytes (lowercased) — never a lossy dotted string,
+//!   so a label containing a dot cannot collide with a multi-label name (anti cross-tenant poison).
 
 use crate::Store;
 use crate::db_gateway::{IpRateLimiter, project_for_ip_in};
@@ -57,9 +67,6 @@ use tracing::{debug, error, info, warn};
 
 /// Standard DNS port. Matches the guest side (`RUNTIME_RESOLV_CONF`, `function_egress::RESOLVER_PORT`).
 const DNS_PORT: u16 = 53;
-/// The bridge subnet guests live on (`jkbr0` = `172.16.0.1/24`, `setup-bridge.sh`). Only IPv4
-/// sources whose first three octets match are served; everything else is dropped.
-const BRIDGE_NET: (u8, u8, u8) = (172, 16, 0);
 /// Max UDP datagram accepted/emitted — the EDNS0 ceiling. Larger ⇒ dropped (the guest retries TCP).
 const MAX_UDP: usize = 4096;
 /// A DNS message header is 12 bytes; shorter ⇒ malformed.
@@ -73,15 +80,25 @@ const PER_IP_BURST: f64 = 200.0;
 const MAX_INFLIGHT: usize = 1024;
 /// Global ceiling on concurrent guest TCP/53 connections.
 const MAX_TCP_CONNS: usize = 256;
+/// Per-source-IP concurrent guest TCP/53 connections — a fraction of the global ceiling so one
+/// guest can't slow-loris the whole pool and starve every other tenant's DNS-over-TCP.
+const PER_IP_TCP_MAX: usize = 16;
+/// Hard backstop on messages relayed over a single TCP connection (defence-in-depth on top of the
+/// per-message rate limit) so a pipelined connection is bounded even if the rate bucket is generous.
+const MAX_MSGS_PER_CONN: u32 = 10_000;
 /// Per-query upstream deadline — a slow/dead upstream can't pin a task or the guest.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
-/// TCP idle/read deadline (guest opens a conn but a full length-prefixed message never arrives).
+/// TCP idle/read deadline between pipelined messages on an established connection.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the FIRST length prefix on a fresh TCP connection — a legit client sends it
+/// immediately, so a short deadline sheds slow-loris connections that open and then stall.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Refresh cadence for the source-IP→project snapshot (attribution/logging only; matches l4).
 const ALLOC_REFRESH: Duration = Duration::from_secs(5);
 /// Keep retrying the `:53` bind while systemd-resolved releases the port at startup (setup-bridge.sh
 /// restarts resolved without the extra listener in the server's ExecStartPre; this covers any
-/// residual race). Best-effort — give up (logged) after the budget, like the DB gateway.
+/// residual race, and reclaims the port from a draining old process on an upgrade). Best-effort —
+/// give up (logged) after the budget, like the DB gateway.
 const BIND_RETRY_BUDGET: Duration = Duration::from_secs(15);
 const BIND_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// Fallback upstream when `/etc/resolv.conf` yields no usable nameserver — systemd-resolved's stub.
@@ -109,9 +126,19 @@ impl DnsPolicy {
     }
 }
 
-/// Entry point: bind `172.16.0.1:53` (UDP + TCP) and serve forever, forwarding to the host resolver
-/// discovered from `/etc/resolv.conf`. Best-effort — a bind failure disables guest DNS and is
-/// logged, never fatal (mirrors `db_gateway::serve`).
+/// A parsed DNS question: the lowercased dotted name (for logging), the type/class, and `end` —
+/// the byte offset just past the question (`QNAME`+`QTYPE`+`QCLASS`), used to slice the RAW wire
+/// question for the collision-free cache key.
+struct Question {
+    name: String,
+    qtype: u16,
+    qclass: u16,
+    end: usize,
+}
+
+/// Entry point: bind the bridge gateway `172.16.0.1:53` (UDP + TCP) and serve forever, forwarding to
+/// the host resolver discovered from `/etc/resolv.conf`. Best-effort — a bind failure disables guest
+/// DNS and is logged, never fatal (mirrors `db_gateway::serve`).
 pub async fn serve(store: Store, host_id: String) {
     let upstream = discover_upstream();
     info!(upstream = %upstream, "dns forwarder: upstream resolver");
@@ -119,7 +146,7 @@ pub async fn serve(store: Store, host_id: String) {
 }
 
 /// [`serve`] with the bind IP + port + upstream injected — production pins `172.16.0.1:53`; tests
-/// bind `127.0.0.1` on an ephemeral port against a mock upstream.
+/// bind a chosen subnet on an ephemeral port against a mock/real upstream.
 pub(crate) async fn serve_on(
     store: Store,
     host_id: String,
@@ -127,7 +154,7 @@ pub(crate) async fn serve_on(
     port: u16,
     upstream: SocketAddr,
 ) {
-    let fw = Arc::new(Forwarder::new(store, host_id, upstream));
+    let fw = Arc::new(Forwarder::new(store, host_id, upstream, ip));
     {
         let fw = fw.clone();
         tokio::spawn(async move { fw.refresh_loop().await });
@@ -149,11 +176,18 @@ struct Forwarder {
     /// ([R3], as in the DB gateway: per-host-island IPs can collide under HA). Empty ⇒ single-node.
     host_id: String,
     upstream: SocketAddr,
+    /// The `/24` this forwarder serves, derived from the bind IP (the bridge is always a `/24`). A
+    /// source outside it is dropped — the guest's source IP is L2-source-guard-pinned, so this is a
+    /// sound, unspoofable fence.
+    allowed_prefix: [u8; 3],
     rate: IpRateLimiter,
     /// Bounds concurrent in-flight upstream queries (UDP + TCP legs share the budget).
     inflight: Arc<Semaphore>,
-    /// Bounds concurrent guest TCP/53 connections.
+    /// Bounds concurrent guest TCP/53 connections, globally.
     tcp_conns: Arc<Semaphore>,
+    /// Per-source-IP concurrent-TCP-connection counts (bounded by the `/24`; entries drop to 0 are
+    /// removed) — enforces [`PER_IP_TCP_MAX`] so no single guest monopolises the global pool.
+    tcp_per_ip: Mutex<HashMap<IpAddr, usize>>,
     /// Source-IP→project snapshot, refreshed on a tick to avoid a control-store read per datagram.
     allocs: RwLock<Arc<Vec<VmAllocation>>>,
     cache: DnsCache,
@@ -164,7 +198,16 @@ struct Forwarder {
 }
 
 impl Forwarder {
-    fn new(store: Store, host_id: String, upstream: SocketAddr) -> Self {
+    fn new(store: Store, host_id: String, upstream: SocketAddr, bind_ip: &str) -> Self {
+        // The served /24 is the bind IP's network. Production binds 172.16.0.1 ⇒ serve 172.16.0.0/24.
+        let allowed_prefix = match bind_ip.parse::<Ipv4Addr>() {
+            Ok(v4) => {
+                let o = v4.octets();
+                [o[0], o[1], o[2]]
+            }
+            // Non-v4 bind (shouldn't happen in prod) ⇒ the runtime-bridge default.
+            Err(_) => [172, 16, 0],
+        };
         // Prime the attribution snapshot so queries in the first refresh window still map to a
         // project; the refresh loop keeps it current thereafter.
         let allocs = store.list_vm_allocations().unwrap_or_default();
@@ -172,9 +215,11 @@ impl Forwarder {
             store,
             host_id,
             upstream,
+            allowed_prefix,
             rate: IpRateLimiter::new(PER_IP_RATE_PER_SEC, PER_IP_BURST),
             inflight: Arc::new(Semaphore::new(MAX_INFLIGHT)),
             tcp_conns: Arc::new(Semaphore::new(MAX_TCP_CONNS)),
+            tcp_per_ip: Mutex::new(HashMap::new()),
             allocs: RwLock::new(Arc::new(allocs)),
             cache: DnsCache::new(),
             q_total: AtomicU64::new(0),
@@ -184,22 +229,28 @@ impl Forwarder {
         }
     }
 
-    /// Only serve IPv4 sources on the runtime bridge `/24`. Belt-and-braces with `JKRUNFW`'s
-    /// `-i jkbr0` scope and setup-bridge.sh's weak-host DROP — an off-bridge / spoofed source must
-    /// never be served (and would map to no allocation anyway).
-    fn src_allowed(ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                (o[0], o[1], o[2]) == BRIDGE_NET
-            }
-            IpAddr::V6(_) => false,
-        }
+    fn src_allowed(&self, ip: IpAddr) -> bool {
+        src_in_prefix(ip, self.allowed_prefix)
     }
 
     fn project_for(&self, ip: IpAddr) -> Option<String> {
         let snap = self.allocs.read().unwrap().clone();
         project_for_ip_in(&snap, ip, &self.host_id)
+    }
+
+    /// Acquire a per-source-IP TCP slot, or `None` if the guest is already at [`PER_IP_TCP_MAX`].
+    /// The returned guard decrements on drop (and prunes the map entry at zero).
+    fn acquire_tcp_ip(self: &Arc<Self>, ip: IpAddr) -> Option<TcpIpGuard> {
+        let mut m = self.tcp_per_ip.lock().unwrap();
+        let c = m.entry(ip).or_insert(0);
+        if *c >= PER_IP_TCP_MAX {
+            return None;
+        }
+        *c += 1;
+        Some(TcpIpGuard {
+            fw: self.clone(),
+            ip,
+        })
     }
 
     async fn refresh_loop(&self) {
@@ -230,9 +281,10 @@ impl Forwarder {
         }
     }
 
-    /// Common front-of-pipeline validation for a raw query (shared by UDP + TCP): reject responses
-    /// (anti-reflection) and anything but a single-question query. Returns the parsed question.
-    fn accept_query(&self, msg: &[u8]) -> Option<(String, u16, u16)> {
+    /// Validate a raw query (shared by UDP + TCP): reject a response (anti-reflection) or anything
+    /// but a single-question query, and parse the question. `None` means "not a single-question
+    /// query" — callers additionally forward a valid-but-unparsed name verbatim (see the sites).
+    fn accept_query(&self, msg: &[u8]) -> Option<Question> {
         if msg.len() < DNS_HDR_LEN {
             return None;
         }
@@ -242,10 +294,36 @@ impl Forwarder {
         if u16::from_be_bytes([msg[4], msg[5]]) != 1 {
             return None; // QDCOUNT must be exactly 1
         }
-        // A parse failure is non-fatal for forwarding (we relay bytes verbatim) — attribution/cache
-        // just lose the qname. Returning None here would drop a valid-but-unparsed query, so callers
-        // treat `None` as "forward without a question", not "reject".
         parse_question(msg)
+    }
+}
+
+/// RAII guard for a per-source-IP TCP slot (see [`Forwarder::acquire_tcp_ip`]).
+struct TcpIpGuard {
+    fw: Arc<Forwarder>,
+    ip: IpAddr,
+}
+
+impl Drop for TcpIpGuard {
+    fn drop(&mut self) {
+        let mut m = self.fw.tcp_per_ip.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.ip) {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// True iff `ip` is an IPv4 address in the served `/24` (`prefix.0/24`). IPv6 is never served.
+fn src_in_prefix(ip: IpAddr, prefix: [u8; 3]) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            [o[0], o[1], o[2]] == prefix
+        }
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -268,7 +346,7 @@ async fn serve_udp(fw: Arc<Forwarder>, ip: String, port: u16) {
             }
         };
         let src_ip = src.ip();
-        if !Forwarder::src_allowed(src_ip) {
+        if !fw.src_allowed(src_ip) {
             continue; // off-bridge → silent drop
         }
         if n < DNS_HDR_LEN {
@@ -283,7 +361,7 @@ async fn serve_udp(fw: Arc<Forwarder>, ip: String, port: u16) {
         let query = buf[..n].to_vec();
         let question = fw.accept_query(&query);
         if question.is_none() && query[2] & 0x80 != 0 {
-            // A response (QR=1) or non-single-question query slipped `accept_query`; drop it.
+            // A response (QR=1) arriving at the listener; drop it (no reflection).
             fw.q_dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -298,7 +376,7 @@ impl Forwarder {
         self: Arc<Self>,
         sock: Arc<UdpSocket>,
         query: Vec<u8>,
-        question: Option<(String, u16, u16)>,
+        question: Option<Question>,
         src: SocketAddr,
     ) {
         self.q_total.fetch_add(1, Ordering::Relaxed);
@@ -307,13 +385,13 @@ impl Forwarder {
         match DnsPolicy::for_project(project.as_deref()) {
             DnsPolicy::Allow => {}
         }
-        if let Some((name, qtype, qclass)) = &question {
-            debug!(src = %src.ip(), project = ?project, %name, qtype, qclass, "dns query (udp)");
-            if let Some(mut hit) = self.cache.get(name, *qtype, *qclass) {
-                hit[0] = query[0]; // graft the live transaction id onto the cached answer
-                hit[1] = query[1];
+        if let Some(q) = &question {
+            debug!(src = %src.ip(), project = ?project, name = %q.name, q.qtype, q.qclass, "dns query (udp)");
+            let key = qkey(&query, q.end);
+            if let Some(cached) = self.cache.get(&key) {
+                let out = serve_from_cache(&cached, &query, q.end);
                 self.q_cache_hit.fetch_add(1, Ordering::Relaxed);
-                let _ = sock.send_to(&hit, src).await;
+                let _ = sock.send_to(&out, src).await;
                 return;
             }
         }
@@ -327,8 +405,8 @@ impl Forwarder {
         match upstream_udp(self.upstream, &query).await {
             Some(resp) => {
                 let _ = sock.send_to(&resp, src).await;
-                if let Some((name, qtype, qclass)) = &question {
-                    self.cache.maybe_insert(name, *qtype, *qclass, &resp);
+                if let Some(q) = &question {
+                    self.cache.maybe_insert(qkey(&query, q.end), &resp);
                 }
             }
             None => {
@@ -374,20 +452,28 @@ async fn serve_tcp(fw: Arc<Forwarder>, ip: String, port: u16) {
                 continue;
             }
         };
-        if !Forwarder::src_allowed(peer.ip()) {
+        if !fw.src_allowed(peer.ip()) {
             continue;
         }
+        // Cheap early shed on the accept itself (per-query rate is enforced inside handle_tcp).
         if !fw.rate.allow(peer.ip(), Instant::now()) {
             fw.q_dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        // Per-source-IP slot FIRST (so a flood of accepts from one IP can't drain the global pool),
+        // then the global ceiling.
+        let Some(ip_guard) = fw.acquire_tcp_ip(peer.ip()) else {
+            fw.q_dropped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
         let permit = match fw.tcp_conns.clone().try_acquire_owned() {
             Ok(p) => p,
-            Err(_) => continue, // at the connection ceiling → drop
+            Err(_) => continue, // at the global ceiling → drop (ip_guard drops here too)
         };
         let fw = fw.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _ip_guard = ip_guard;
             let _ = fw.handle_tcp(stream, peer).await;
         });
     }
@@ -395,12 +481,18 @@ async fn serve_tcp(fw: Arc<Forwarder>, ip: String, port: u16) {
 
 impl Forwarder {
     async fn handle_tcp(&self, mut guest: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
+        let mut count: u32 = 0;
         loop {
-            // DNS/TCP framing: a 2-byte big-endian length prefix + that many message bytes.
+            // First length prefix has a short deadline (slow-loris); pipelined ones use the idle one.
+            let read_deadline = if count == 0 {
+                FIRST_BYTE_TIMEOUT
+            } else {
+                TCP_IDLE_TIMEOUT
+            };
             let mut lenb = [0u8; 2];
-            match tokio::time::timeout(TCP_IDLE_TIMEOUT, guest.read_exact(&mut lenb)).await {
+            match tokio::time::timeout(read_deadline, guest.read_exact(&mut lenb)).await {
                 Ok(Ok(_)) => {}
-                _ => return Ok(()), // idle timeout or EOF → close
+                _ => return Ok(()), // idle/first-byte timeout or EOF → close
             }
             let mlen = u16::from_be_bytes(lenb) as usize;
             if mlen < DNS_HDR_LEN {
@@ -411,14 +503,30 @@ impl Forwarder {
                 Ok(Ok(_)) => {}
                 _ => return Ok(()),
             }
+            count += 1;
+            if count > MAX_MSGS_PER_CONN {
+                return Ok(()); // hard backstop on a pipelined connection
+            }
+            // Per-MESSAGE rate limit — a pipelined TCP connection cannot escape the per-IP budget.
+            if !self.rate.allow(peer.ip(), Instant::now()) {
+                self.q_dropped.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             let question = self.accept_query(&msg);
             if question.is_none() && (msg[2] & 0x80 != 0 || u16::from_be_bytes([msg[4], msg[5]]) != 1)
             {
                 return Ok(()); // response or multi-question over TCP → drop the connection
             }
             self.q_total.fetch_add(1, Ordering::Relaxed);
-            if let Some((name, qtype, qclass)) = &question {
-                debug!(src = %peer.ip(), %name, qtype, qclass, "dns query (tcp)");
+            if let Some(q) = &question {
+                debug!(src = %peer.ip(), name = %q.name, q.qtype, q.qclass, "dns query (tcp)");
+                let key = qkey(&msg, q.end);
+                if let Some(cached) = self.cache.get(&key) {
+                    let out = serve_from_cache(&cached, &msg, q.end);
+                    self.q_cache_hit.fetch_add(1, Ordering::Relaxed);
+                    write_tcp_msg(&mut guest, &out).await?;
+                    continue;
+                }
             }
             let permit = match self.inflight.clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -431,9 +539,10 @@ impl Forwarder {
             drop(permit);
             match relayed {
                 Some(resp) if resp.len() <= u16::MAX as usize => {
-                    let rlen = (resp.len() as u16).to_be_bytes();
-                    guest.write_all(&rlen).await?;
-                    guest.write_all(&resp).await?;
+                    if let Some(q) = &question {
+                        self.cache.maybe_insert(qkey(&msg, q.end), &resp);
+                    }
+                    write_tcp_msg(&mut guest, &resp).await?;
                 }
                 _ => {
                     self.q_upstream_err.fetch_add(1, Ordering::Relaxed);
@@ -442,6 +551,12 @@ impl Forwarder {
             }
         }
     }
+}
+
+async fn write_tcp_msg(guest: &mut TcpStream, msg: &[u8]) -> std::io::Result<()> {
+    let len = (msg.len() as u16).to_be_bytes();
+    guest.write_all(&len).await?;
+    guest.write_all(msg).await
 }
 
 /// Relay one query to the upstream over TCP (used for the guest's TCP fallback on truncation).
@@ -502,11 +617,11 @@ async fn bind_tcp_retry(ip: &str, port: u16) -> Option<TcpListener> {
 
 // ── query parsing + upstream discovery ────────────────────────────────────────────────────────
 
-/// Bounds-checked, read-only walk of the single question: returns `(lowercased qname, qtype,
-/// qclass)`. Rejects a name > 255 B, any label > 63 B, and a compression pointer in the question
-/// (questions must not use compression). Never allocates beyond the name string; never follows a
-/// pointer, so it cannot loop.
-fn parse_question(msg: &[u8]) -> Option<(String, u16, u16)> {
+/// Bounds-checked, read-only walk of the single question. Rejects a name > 255 B, any label > 63 B,
+/// and a compression pointer in the question (questions must not use compression). Never follows a
+/// pointer, so it cannot loop. `name` is the lowercased dotted form (for logging ONLY — the cache
+/// keys on the raw wire bytes via `end`, so a label that itself contains a `.` cannot collide).
+fn parse_question(msg: &[u8]) -> Option<Question> {
     if msg.len() < DNS_HDR_LEN {
         return None;
     }
@@ -542,7 +657,37 @@ fn parse_question(msg: &[u8]) -> Option<(String, u16, u16)> {
     }
     let qtype = u16::from_be_bytes([*msg.get(i)?, *msg.get(i + 1)?]);
     let qclass = u16::from_be_bytes([*msg.get(i + 2)?, *msg.get(i + 3)?]);
-    Some((name, qtype, qclass))
+    Some(Question {
+        name,
+        qtype,
+        qclass,
+        end: i + 4,
+    })
+}
+
+/// The collision-free cache key: the RAW wire question bytes (`QNAME`+`QTYPE`+`QCLASS`), ASCII-
+/// lowercased for DNS's case-insensitivity. Two distinct wire questions always differ here (a label
+/// containing a `.` byte can't collide with a multi-label name — the bug a dotted string would have).
+fn qkey(msg: &[u8], q_end: usize) -> Vec<u8> {
+    let mut k = msg[DNS_HDR_LEN..q_end.min(msg.len())].to_vec();
+    k.make_ascii_lowercase();
+    k
+}
+
+/// Build the bytes to send for a cache hit: the cached response with (a) the live transaction id
+/// grafted in, and (b) the echoed question section rewritten to the REQUESTER's exact question bytes
+/// (case fidelity — closes 0x20 case-verification, which a lowercased-key cache would otherwise
+/// break). The question lengths match because the cache key matched (same lowercased question bytes).
+fn serve_from_cache(cached: &[u8], query: &[u8], q_end: usize) -> Vec<u8> {
+    let mut out = cached.to_vec();
+    if out.len() >= 2 {
+        out[0] = query[0];
+        out[1] = query[1];
+    }
+    if q_end <= query.len() && out.len() >= q_end {
+        out[DNS_HDR_LEN..q_end].copy_from_slice(&query[DNS_HDR_LEN..q_end]);
+    }
+    out
 }
 
 /// The upstream resolver: the first usable `nameserver` in `/etc/resolv.conf` that is not our own
@@ -573,12 +718,12 @@ fn upstream_from_resolv(content: &str, self_ip: IpAddr) -> Option<SocketAddr> {
 
 // ── response cache ──────────────────────────────────────────────────────────────────────────────
 
-type CacheKey = (String, u16, u16); // (lowercased qname, qtype, qclass)
+type CacheKey = Vec<u8>; // lowercased raw wire question bytes (QNAME+QTYPE+QCLASS)
 type CacheVal = (Arc<Vec<u8>>, Instant); // (raw response bytes, expiry)
 
 /// Small bounded response cache. Only successful (NOERROR/NXDOMAIN), non-truncated answers are
-/// cached; the TTL is the min RR TTL (clamped). Keying is case-insensitive on the qname (DNS is);
-/// the served bytes echo the cached question's case, which every client tolerates.
+/// cached; the TTL is the min RR TTL (clamped). The key is the raw wire question (collision-free);
+/// on a full cache the nearest-to-expiry entry is evicted so one tenant can't permanently starve it.
 struct DnsCache {
     map: Mutex<HashMap<CacheKey, CacheVal>>,
 }
@@ -590,19 +735,18 @@ impl DnsCache {
         }
     }
 
-    fn get(&self, name: &str, qtype: u16, qclass: u16) -> Option<Vec<u8>> {
-        let key = (name.to_string(), qtype, qclass);
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let mut m = self.map.lock().unwrap();
-        if let Some((bytes, exp)) = m.get(&key) {
+        if let Some((bytes, exp)) = m.get(key) {
             if Instant::now() < *exp {
                 return Some(bytes.as_ref().clone());
             }
-            m.remove(&key);
+            m.remove(key);
         }
         None
     }
 
-    fn maybe_insert(&self, name: &str, qtype: u16, qclass: u16, resp: &[u8]) {
+    fn maybe_insert(&self, key: CacheKey, resp: &[u8]) {
         if resp.len() < DNS_HDR_LEN {
             return;
         }
@@ -618,17 +762,24 @@ impl DnsCache {
         };
         let ttl = ttl.clamp(CACHE_MIN_TTL, CACHE_MAX_TTL);
         let mut m = self.map.lock().unwrap();
-        if m.len() >= CACHE_MAX_ENTRIES {
+        if m.len() >= CACHE_MAX_ENTRIES && !m.contains_key(&key) {
             let now = Instant::now();
             m.retain(|_, (_, exp)| *exp > now);
             if m.len() >= CACHE_MAX_ENTRIES {
-                return; // still full after sweeping expired → skip (simple, bounded)
+                // Evict the nearest-to-expiry live entry rather than skip, so a tenant filling the
+                // cache with long-TTL entries can't permanently deny caching to everyone else.
+                if let Some(k) = m
+                    .iter()
+                    .min_by_key(|(_, (_, exp))| *exp)
+                    .map(|(k, _)| k.clone())
+                {
+                    m.remove(&k);
+                } else {
+                    return;
+                }
             }
         }
-        m.insert(
-            (name.to_string(), qtype, qclass),
-            (Arc::new(resp.to_vec()), Instant::now() + ttl),
-        );
+        m.insert(key, (Arc::new(resp.to_vec()), Instant::now() + ttl));
     }
 }
 
@@ -659,7 +810,7 @@ fn min_ttl(resp: &[u8]) -> Option<Duration> {
 mod tests {
     use super::*;
 
-    /// Build a minimal DNS query datagram for `name` (A/IN), id `0xABCD`.
+    /// Build a minimal DNS query datagram for `name` (A/IN), id `0xABCD`. Splits on `.` into labels.
     fn query(name: &str) -> Vec<u8> {
         let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
         for label in name.split('.') {
@@ -671,9 +822,19 @@ mod tests {
         q
     }
 
+    /// Build a query whose QNAME is a SINGLE label with the given raw bytes (which may contain a
+    /// `.`), to exercise the cache-key collision case.
+    fn query_single_label(label: &[u8]) -> Vec<u8> {
+        let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        q.push(label.len() as u8);
+        q.extend_from_slice(label);
+        q.push(0);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        q
+    }
+
     /// Build a minimal A response: echo the query's id + question, one A RR with the given ttl.
     fn a_response(q: &[u8], ip: [u8; 4], ttl: u32, rcode: u8, tc: bool) -> Vec<u8> {
-        // question end
         let mut i = 12usize;
         while q[i] != 0 {
             i += 1 + q[i] as usize;
@@ -686,42 +847,45 @@ mod tests {
         r.extend_from_slice(&[0, 1]); // QDCOUNT
         r.extend_from_slice(&[0, 1]); // ANCOUNT
         r.extend_from_slice(&[0, 0, 0, 0]); // NS, AR
-        r.extend_from_slice(&q[12..q_end]); // question
+        r.extend_from_slice(&q[12..q_end]); // question (echoed)
         r.extend_from_slice(&[0xc0, 0x0c]); // name ptr
         r.extend_from_slice(&[0, 1, 0, 1]); // TYPE=A CLASS=IN
-        r.extend_from_slice(&ttl.to_be_bytes()); // TTL
+        r.extend_from_slice(&ttl.to_be_bytes());
         r.extend_from_slice(&[0, 4]); // RDLENGTH
         r.extend_from_slice(&ip);
         r
     }
 
+    fn parse(q: &[u8]) -> Question {
+        parse_question(q).unwrap()
+    }
+
     #[test]
     fn parse_question_basic() {
-        let q = query("example.com");
-        let (name, qtype, qclass) = parse_question(&q).unwrap();
-        assert_eq!(name, "example.com");
-        assert_eq!(qtype, 1);
-        assert_eq!(qclass, 1);
+        let p = parse(&query("example.com"));
+        assert_eq!(p.name, "example.com");
+        assert_eq!(p.qtype, 1);
+        assert_eq!(p.qclass, 1);
+        assert_eq!(p.end, query("example.com").len());
     }
 
     #[test]
     fn parse_question_lowercases() {
-        let q = query("EXample.COM");
-        assert_eq!(parse_question(&q).unwrap().0, "example.com");
+        assert_eq!(parse(&query("EXample.COM")).name, "example.com");
     }
 
     #[test]
     fn parse_question_rejects_truncated() {
         let q = query("example.com");
-        assert!(parse_question(&q[..q.len() - 2]).is_none()); // missing part of qtype/qclass
-        assert!(parse_question(&q[..15]).is_none()); // mid-label
-        assert!(parse_question(&[0u8; 8]).is_none()); // shorter than header
+        assert!(parse_question(&q[..q.len() - 2]).is_none());
+        assert!(parse_question(&q[..15]).is_none());
+        assert!(parse_question(&[0u8; 8]).is_none());
     }
 
     #[test]
     fn parse_question_rejects_compression_pointer() {
         let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        q.extend_from_slice(&[0xC0, 0x0C]); // pointer where a label length is expected
+        q.extend_from_slice(&[0xC0, 0x0C]);
         q.extend_from_slice(&[0, 1, 0, 1]);
         assert!(parse_question(&q).is_none());
     }
@@ -729,7 +893,7 @@ mod tests {
     #[test]
     fn parse_question_rejects_oversized_label() {
         let mut q = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        q.push(64); // > 63
+        q.push(64);
         q.extend_from_slice(&[b'a'; 64]);
         q.push(0);
         q.extend_from_slice(&[0, 1, 0, 1]);
@@ -737,57 +901,83 @@ mod tests {
     }
 
     #[test]
-    fn src_allowed_only_bridge_v4() {
-        assert!(Forwarder::src_allowed("172.16.0.2".parse().unwrap()));
-        assert!(Forwarder::src_allowed("172.16.0.254".parse().unwrap()));
-        assert!(!Forwarder::src_allowed("172.16.1.2".parse().unwrap())); // wrong /24
-        assert!(!Forwarder::src_allowed("10.0.0.1".parse().unwrap()));
-        assert!(!Forwarder::src_allowed("127.0.0.1".parse().unwrap()));
-        assert!(!Forwarder::src_allowed("::1".parse().unwrap())); // no v6
+    fn src_in_prefix_only_bridge_v4() {
+        let p = [172, 16, 0];
+        assert!(src_in_prefix("172.16.0.2".parse().unwrap(), p));
+        assert!(src_in_prefix("172.16.0.254".parse().unwrap(), p));
+        assert!(!src_in_prefix("172.16.1.2".parse().unwrap(), p));
+        assert!(!src_in_prefix("10.0.0.1".parse().unwrap(), p));
+        assert!(!src_in_prefix("127.0.0.1".parse().unwrap(), p));
+        assert!(!src_in_prefix("::1".parse().unwrap(), p));
+        // A different bind prefix serves a different /24.
+        assert!(src_in_prefix("10.77.0.5".parse().unwrap(), [10, 77, 0]));
     }
 
     #[test]
     fn upstream_discovery_skips_self_and_v6_falls_back() {
         let self_ip: IpAddr = "172.16.0.1".parse().unwrap();
-        // Picks the first usable v4, skipping self + v6.
         let c = "nameserver 172.16.0.1\nnameserver ::1\nnameserver 127.0.0.53\n";
         assert_eq!(
             upstream_from_resolv(c, self_ip).unwrap(),
             "127.0.0.53:53".parse().unwrap()
         );
-        // Real host resolver wins when listed first.
         assert_eq!(
             upstream_from_resolv("nameserver 10.0.0.53\n", self_ip).unwrap(),
             "10.0.0.53:53".parse().unwrap()
         );
-        // Nothing usable → None (caller falls back).
         assert!(upstream_from_resolv("# empty\nnameserver 172.16.0.1\n", self_ip).is_none());
     }
 
     #[test]
-    fn cache_roundtrips_a_record_and_grafts_id() {
+    fn cache_key_is_collision_free_across_dot_boundary() {
+        // Two DIFFERENT wire questions that a naive dotted-string key would collide: the multi-label
+        // name a.b vs a single label whose bytes are "a.b". Their qnames stringify identically...
+        let q_multi = query("a.b");
+        let q_single = query_single_label(b"a.b");
+        assert_eq!(parse(&q_multi).name, parse(&q_single).name); // both "a.b" as a string
+        // ...but the raw-wire cache keys MUST differ (else cross-tenant cache poisoning).
+        let k_multi = qkey(&q_multi, parse(&q_multi).end);
+        let k_single = qkey(&q_single, parse(&q_single).end);
+        assert_ne!(k_multi, k_single);
+    }
+
+    #[test]
+    fn cache_roundtrips_and_serve_rewrites_question_and_id() {
         let q = query("cache.test");
         let resp = a_response(&q, [93, 184, 216, 34], 30, 0, false);
         let cache = DnsCache::new();
-        assert!(cache.get("cache.test", 1, 1).is_none());
-        cache.maybe_insert("cache.test", 1, 1, &resp);
-        let hit = cache.get("cache.test", 1, 1).expect("cached");
-        assert_eq!(&hit[2..], &resp[2..]); // body identical; only the id is grafted by the caller
+        let key = qkey(&q, parse(&q).end);
+        assert!(cache.get(&key).is_none());
+        cache.maybe_insert(key.clone(), &resp);
+        let cached = cache.get(&key).expect("cached");
+        // A new query for the same name but different id + case: the served bytes must carry the new
+        // id and echo the requester's exact (upper-case) question.
+        let q2 = {
+            let mut v = query("CACHE.test");
+            v[0] = 0x11;
+            v[1] = 0x22;
+            v
+        };
+        let out = serve_from_cache(&cached, &q2, parse(&q2).end);
+        assert_eq!(&out[0..2], &[0x11, 0x22]); // grafted id
+        let q2end = parse(&q2).end;
+        assert_eq!(&out[12..q2end], &q2[12..q2end]); // question rewritten to requester's exact bytes
+        assert_eq!(&out[out.len() - 4..], &[93, 184, 216, 34]); // answer preserved
     }
 
     #[test]
     fn cache_refuses_truncated_and_servfail() {
         let q = query("bad.test");
         let cache = DnsCache::new();
-        cache.maybe_insert("bad.test", 1, 1, &a_response(&q, [1, 2, 3, 4], 30, 0, true)); // TC=1
-        assert!(cache.get("bad.test", 1, 1).is_none());
-        cache.maybe_insert("bad.test", 1, 1, &a_response(&q, [1, 2, 3, 4], 30, 2, false)); // SERVFAIL
-        assert!(cache.get("bad.test", 1, 1).is_none());
+        let key = qkey(&q, parse(&q).end);
+        cache.maybe_insert(key.clone(), &a_response(&q, [1, 2, 3, 4], 30, 0, true)); // TC=1
+        assert!(cache.get(&key).is_none());
+        cache.maybe_insert(key.clone(), &a_response(&q, [1, 2, 3, 4], 30, 2, false)); // SERVFAIL
+        assert!(cache.get(&key).is_none());
     }
 
     #[tokio::test]
     async fn upstream_udp_relays_verbatim() {
-        // A mock upstream that echoes a canned A response for whatever it receives.
         let up = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let up_addr = up.local_addr().unwrap();
         tokio::spawn(async move {
@@ -798,17 +988,14 @@ mod tests {
         });
         let q = query("relay.test");
         let resp = upstream_udp(up_addr, &q).await.expect("relayed");
-        assert_eq!(&resp[0..2], &q[0..2]); // id echoed
-        assert_eq!(resp[2] & 0x80, 0x80); // QR=1
-        assert_eq!(&resp[resp.len() - 4..], &[203, 0, 113, 5]); // the A record
+        assert_eq!(&resp[0..2], &q[0..2]);
+        assert_eq!(resp[2] & 0x80, 0x80);
+        assert_eq!(&resp[resp.len() - 4..], &[203, 0, 113, 5]);
     }
 
     #[tokio::test]
     async fn upstream_udp_times_out_on_silent_upstream() {
-        // A bound-but-silent upstream: no reply ⇒ the per-query timeout returns None. Use a short
-        // wait by pointing at a black-hole port on loopback that accepts the datagram but never
-        // answers (an unbound ephemeral port ⇒ ICMP unreachable ⇒ recv errors ⇒ None quickly).
-        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap(); // discard-ish; no responder
+        let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(upstream_udp(dead, &query("timeout.test")).await.is_none());
     }
 }
