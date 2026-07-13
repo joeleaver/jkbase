@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn mount_filesystems() {
     use std::ffi::CString;
@@ -194,6 +194,53 @@ fn load_l4_facts(serve_dir: &Path) -> jkbase_common::config::L4Facts {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
+}
+
+/// Guest loopback MTU (bytes) the agent sets when a project serves L4 UDP ports. The default `lo`
+/// MTU is 65536, which LIES to a loopback-bound server about the real path: it then emits UDP
+/// datagrams far larger than the ~1500-MTU host↔guest transit leg (and the ~1500 client path) can
+/// carry, so an oversized reply — e.g. a TS3 channel-list sync for a POPULATED server — EMSGSIZE-
+/// drops on the agent's transit send and never reaches the client (a deterministic large-datagram
+/// failure; small syncs fit and work). Lowering `lo` to ~1400 makes the app size its datagrams to
+/// fit BOTH the 32-byte transit header AND the 1500 client leg — exactly as it would on a normal
+/// 1500-MTU public interface (which is why TS3 works on dedicated hosting). Value leaves margin:
+/// a ≤1372-byte UDP payload + 32 transit + 28 IP/UDP = ≤1432 < 1500 on the transit leg, and
+/// ≤1400 < 1500 on the client leg. Scoped to L4 projects so DB/function-only loopback throughput
+/// is untouched. (A companion transit-MTU bump to also carry a FULL-1500 client→guest datagram in
+/// the FORWARD direction is a follow-up — TS3 clients send small datagrams, so it isn't blocking.)
+const L4_GUEST_LOOPBACK_MTU: i32 = 1400;
+
+/// Set the guest loopback interface MTU via `SIOCSIFMTU` (no iproute2 dependency — the runtime
+/// rootfs is a minimal apko userland; the agent already drives raw `ioctl`s). Best-effort: on any
+/// failure the app still runs (only large loopback datagrams would be affected), so we log, not
+/// bail.
+fn set_loopback_mtu(mtu: i32) -> std::io::Result<()> {
+    // `libc::ioctl`'s request arg is `c_int` on musl (the shipped target) and `c_ulong` on glibc
+    // (the dev-host debug build); match each so both compile.
+    #[cfg(target_env = "musl")]
+    const SIOCSIFMTU: libc::c_int = 0x8922;
+    #[cfg(not(target_env = "musl"))]
+    const SIOCSIFMTU: libc::c_ulong = 0x8922;
+    // struct ifreq: `char ifr_name[16]` then a union whose first member is `int ifr_mtu`
+    // (40 bytes total on x86_64). Set name = "lo", mtu at offset 16.
+    let mut req = [0u8; 40];
+    req[..2].copy_from_slice(b"lo");
+    req[16..20].copy_from_slice(&mtu.to_ne_bytes());
+    // SAFETY: AF_INET dgram socket + a correctly-sized, correctly-laid-out ifreq; fd is closed
+    // before returning on every path.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let rc = libc::ioctl(fd, SIOCSIFMTU, req.as_mut_ptr());
+        let err = std::io::Error::last_os_error();
+        libc::close(fd);
+        if rc < 0 {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 /// dm-verity mapper name for a layer block device (e.g. `/dev/vdc` → `jkverity-vdc`):
@@ -512,6 +559,25 @@ async fn main() -> Result<()> {
         info!(functions = ?func_names, "loaded WASM functions");
     }
 
+    // Load the host-authored L4 facts (used again below to start the land-forward). If this project
+    // serves any L4 UDP port, shrink the guest loopback MTU BEFORE the tenant server starts, so a
+    // loopback-bound app (e.g. TS3) sizes its datagrams to the real transit + client path instead
+    // of loopback's 64 KiB lie (see `L4_GUEST_LOOPBACK_MTU`). Best-effort — a failure only affects
+    // oversized datagrams and never blocks startup.
+    let l4 = load_l4_facts(&serve_dir);
+    if !l4.ports.is_empty() {
+        match set_loopback_mtu(L4_GUEST_LOOPBACK_MTU) {
+            Ok(()) => info!(
+                mtu = L4_GUEST_LOOPBACK_MTU,
+                "l4: lowered guest loopback MTU so the app sizes datagrams to the real path"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "l4: failed to lower guest loopback MTU (large UDP replies may EMSGSIZE-drop)"
+            ),
+        }
+    }
+
     let containers = Arc::new(ContainerSupervisor::new(
         servers_dir,
         layer_map,
@@ -642,7 +708,7 @@ async fn main() -> Result<()> {
     // and tenant-unforgeable (`_l4.json`). Empty transit secret (old images / no `[l4.*]`) ⇒ start
     // nothing (fail-closed — an empty key would let a co-tenant forge the MAC). One task per port,
     // each self-contained (not a field on AgentState) so a fault on one port can't wedge another.
-    let l4 = load_l4_facts(&serve_dir);
+    // `l4` was loaded above (for the loopback-MTU decision); reuse it to start the land-forward.
     if !l4.transit_secret.is_empty() {
         for fact in &l4.ports {
             tokio::spawn(l4_forward::run_l4_land_forward(

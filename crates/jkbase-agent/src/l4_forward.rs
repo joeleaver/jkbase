@@ -51,6 +51,13 @@ const AGENT_L4_MAX_FLOWS: usize = 256;
 /// UDP payload; the host frames exactly one record per datagram (no coalescing, P0-L4-7).
 const UDP_MAX_DATAGRAM: usize = 65535;
 
+/// Largest sealed frame (transit header + payload) that fits a 1500-MTU host↔guest transit leg (and
+/// the ~1500 client path) without IP fragmentation: `1500 − 20 (IP) − 8 (UDP) = 1472`. A frame past
+/// this EMSGSIZE-drops on the DF-set transit send; the guest is kept under it by the lowered
+/// loopback MTU (`L4_GUEST_LOOPBACK_MTU`, host `main.rs`). Diagnostic threshold only — nothing here
+/// enforces it.
+const TRANSIT_SAFE_FRAME: usize = 1472;
+
 /// How long to wait for the guest to bind `127.0.0.1:guest_port` before giving up on the first
 /// datagram of a port. The host cannot prove the guest UDP bind is up; the agent polls
 /// `/proc/net/udp` (a fact, not an active probe — there is no reliable UDP liveness probe).
@@ -544,6 +551,11 @@ impl ReplyPump {
         let mut buf = vec![0u8; UDP_MAX_DATAGRAM];
         let mut sealed: Vec<u8> = Vec::with_capacity(UDP_MAX_DATAGRAM + L4_HEADER_LEN);
         let mut out_nonce: u64 = 1;
+        // One-shot diagnostic: the first return datagram whose sealed frame won't fit a 1500-MTU
+        // transit/client leg. With the guest loopback MTU lowered (`L4_GUEST_LOOPBACK_MTU`) a
+        // well-behaved app never trips this; if it fires, the app is NOT sizing to the loopback MTU
+        // and its large replies will EMSGSIZE-drop (large-datagram transit failure).
+        let mut warned_oversize = false;
         loop {
             tokio::select! {
                 _ = self.cancel.notified() => break,
@@ -558,6 +570,14 @@ impl ReplyPump {
                     // Return-leg activity: keep this flow off the idle reaper while the app streams
                     // server→client even if the client is silent (W0.1 bug a).
                     self.last_seen.store(elapsed_ms(self.base), Ordering::Relaxed);
+                    if n + L4_HEADER_LEN > TRANSIT_SAFE_FRAME && !warned_oversize {
+                        warned_oversize = true;
+                        warn!(
+                            port = %self.name, payload = n, sealed = n + L4_HEADER_LEN,
+                            "l4 reply pump: return datagram exceeds the ~1500 transit/client MTU; \
+                             it will drop on the 1500-MTU legs — is the app sizing to the loopback MTU?"
+                        );
+                    }
                     // Sealing adds L4_HEADER_LEN; if that would exceed the max UDP datagram, this
                     // single reply can't be framed on the wire — drop it (don't wedge the flow).
                     if n + L4_HEADER_LEN > UDP_MAX_DATAGRAM {
