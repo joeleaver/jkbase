@@ -998,4 +998,108 @@ mod tests {
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(upstream_udp(dead, &query("timeout.test")).await.is_none());
     }
+
+    /// On-box e2e: the REAL forwarder resolving a REAL guest's query. A veth pair puts a "guest" in
+    /// its own netns (10.77.0.2, ingress on a real veth with an in-`/24` source, exactly like a VM on
+    /// the bridge); the forwarder binds 10.77.0.1:53 and relays to the host's own resolver. We drive
+    /// it two ways: `dig` straight at the forwarder (bind + src-fence + relay), and glibc `getent`
+    /// through a netns `resolv.conf` — the EXACT `getaddrinfo` path TeamSpeak stalled on with
+    /// EAI_AGAIN. 10.77.0.0/24 (not 172.16.0.0/24) so it never fights the box's systemd-resolved.
+    /// Run: `sudo -E env JKB_ONBOX_DNS=1 cargo test -p jkbase-server dns_forwarder_on_box_e2e -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "on-box dns e2e: needs root + ip/netns/dig/getent + a working host resolver; set JKB_ONBOX_DNS=1"]
+    async fn dns_forwarder_on_box_e2e() {
+        use tokio::process::Command;
+        if std::env::var("JKB_ONBOX_DNS").is_err() {
+            eprintln!("skip: set JKB_ONBOX_DNS=1 (needs root; creates a netns + veth)");
+            return;
+        }
+        async fn run(cmd: &str, args: &[&str]) -> (bool, String) {
+            match Command::new(cmd).args(args).output().await {
+                Ok(o) => (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                ),
+                Err(e) => (false, e.to_string()),
+            }
+        }
+
+        let (ns, veth_h, veth_g) = ("jkdnsg", "jkdns-h", "jkdns-g");
+        let (host_ip, guest_ip) = ("10.77.0.1", "10.77.0.2");
+
+        // Clean any leftovers, then build the topology.
+        let _ = run("ip", &["netns", "del", ns]).await;
+        let _ = run("ip", &["link", "del", veth_h]).await;
+        run("ip", &["netns", "add", ns]).await;
+        run(
+            "ip",
+            &["link", "add", veth_h, "type", "veth", "peer", "name", veth_g],
+        )
+        .await;
+        run("ip", &["link", "set", veth_g, "netns", ns]).await;
+        run("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", veth_h]).await;
+        run("ip", &["link", "set", veth_h, "up"]).await;
+        run(
+            "ip",
+            &["-n", ns, "addr", "add", &format!("{guest_ip}/24"), "dev", veth_g],
+        )
+        .await;
+        run("ip", &["-n", ns, "link", "set", veth_g, "up"]).await;
+        run("ip", &["-n", ns, "link", "set", "lo", "up"]).await;
+
+        // netns resolv.conf → the forwarder, so glibc getaddrinfo (the TS3 path) uses it.
+        let _ = std::fs::create_dir_all(format!("/etc/netns/{ns}"));
+        let _ = std::fs::write(
+            format!("/etc/netns/{ns}/resolv.conf"),
+            format!("nameserver {host_ip}\noptions timeout:2 attempts:2\n"),
+        );
+
+        // The real forwarder: bind 10.77.0.1:53, relay to the host's own resolver (127.0.0.53).
+        let store =
+            crate::Store::open(&std::env::temp_dir().join("jkdns-e2e.redb")).expect("open store");
+        let _ = store.save_vm_allocation(&jkbase_control::store::VmAllocation {
+            project_id: "dnse2e".into(),
+            ip: guest_ip.into(),
+            tap_device: veth_g.into(),
+            mac: "AA:FC:00:00:77:02".into(),
+            host_id: String::new(),
+            placement_epoch: 0,
+        });
+        let upstream = discover_upstream();
+        eprintln!("forwarder upstream = {upstream}");
+        let fw = tokio::spawn(serve_on(store, String::new(), host_ip, 53, upstream));
+        tokio::time::sleep(Duration::from_millis(800)).await; // let both listeners bind
+
+        // (1) dig straight at the forwarder — proves bind + src-fence + relay.
+        let (_dig_ok, dig_out) = run(
+            "ip",
+            &[
+                "netns", "exec", ns, "dig", &format!("@{host_ip}"), "example.com", "A", "+short",
+                "+time=3", "+tries=2",
+            ],
+        )
+        .await;
+        // (2) glibc getaddrinfo via the netns resolv.conf — the exact TS3 EAI_AGAIN path.
+        let (ge_ok, ge_out) =
+            run("ip", &["netns", "exec", ns, "getent", "hosts", "example.com"]).await;
+
+        // Teardown BEFORE asserting so cleanup always runs.
+        fw.abort();
+        let _ = std::fs::remove_file(format!("/etc/netns/{ns}/resolv.conf"));
+        let _ = std::fs::remove_dir(format!("/etc/netns/{ns}"));
+        let _ = run("ip", &["netns", "del", ns]).await;
+        let _ = run("ip", &["link", "del", veth_h]).await;
+
+        eprintln!("dig +short:\n{dig_out}\ngetent hosts: ok={ge_ok} {ge_out}");
+        let is_ipv4 =
+            |l: &str| l.split('.').filter(|o| o.parse::<u8>().is_ok()).count() == 4 && !l.is_empty();
+        assert!(
+            dig_out.lines().map(str::trim).any(is_ipv4),
+            "forwarder did not resolve example.com via dig: {dig_out:?}"
+        );
+        assert!(
+            ge_ok && !ge_out.trim().is_empty(),
+            "glibc getaddrinfo failed through the forwarder: ok={ge_ok} out={ge_out:?}"
+        );
+    }
 }
