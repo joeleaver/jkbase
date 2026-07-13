@@ -94,14 +94,17 @@ if command -v ip6tables >/dev/null 2>&1; then
 fi
 
 # Guest DNS via a GATEWAY forwarder. Tenant apps need a resolver, but many hosts (OVH,
-# for one) block outbound UDP/53 to public resolvers — so guests can't just use
-# 1.1.1.1. Instead, expose the host's already-working systemd-resolved on the bridge IP
-# (DNSStubListenerExtra) and open ONLY ${GW_IP}:53 from the bridge. Guests do UDP/53 to
-# the LOCAL gateway (always allowed) and the host forwards upstream however it can —
-# provider-agnostic, and it works for every DNS client (getaddrinfo, c-ares, Go, …),
-# not just glibc. The agent points each container's /etc/resolv.conf at ${GW_IP}.
-# (A non-systemd-resolved host should run some forwarder on ${GW_IP}:53 instead — the
-# only contract is "a resolver answers at the gateway".)
+# for one) block outbound UDP/53 to public resolvers — so guests can't just use 1.1.1.1.
+# Instead, jkbase-server runs an IN-PROCESS DNS forwarder bound on ${GW_IP}:53
+# (crates/jkbase-server/src/dns_forwarder.rs); we open ONLY ${GW_IP}:53 from the bridge.
+# Guests do UDP/53 to the LOCAL gateway (always allowed) and the forwarder relays to the
+# host's own resolver (whatever /etc/resolv.conf lists — e.g. systemd-resolved's
+# 127.0.0.53), which reaches upstream however this host can — provider-agnostic, and it
+# works for every DNS client (getaddrinfo, c-ares, Go, …), not just glibc. The agent points
+# each container's /etc/resolv.conf at ${GW_IP}. Owning the listener (vs systemd-resolved's
+# DNSStubListenerExtra, which this script used to configure) makes guest DNS per-guest
+# rate-limited, logged, attributable, and lifecycle-bound to the server — the port handoff
+# from resolved is at the bottom of this script.
 # Host-service isolation. A dedicated JKRUNFW INPUT chain (flushed + rebuilt each run, so
 # idempotent) gates EVERYTHING arriving from the runtime bridge to the host. A guest may
 # reach ONLY: the gateway DNS forwarder (${GW_IP}:53) and the public reverse proxy
@@ -135,6 +138,16 @@ iptables -w -A JKRUNFW -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j ACC
 if ! iptables -w -C INPUT ! -i "$BRIDGE" -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j DROP 2>/dev/null; then
     iptables -w -I INPUT 1 ! -i "$BRIDGE" -d "$GW_IP" -p tcp -m multiport --dports 4230,4231 -j DROP
 fi
+# Same weak-host DROP for the DNS forwarder ([R1]): jkbase-server binds ${GW_IP}:53 (a bridge IP,
+# NOT loopback), so on a multi-homed host an OFF-bridge packet to ${GW_IP}:53 could reach INPUT and
+# bypass the `-i jkbr0`-scoped JKRUNFW — turning the forwarder into an internet-facing open resolver.
+# DROP any non-bridge packet to :53 outright (the forwarder also source-checks 172.16.0.0/24
+# in-process; this is the firewall belt-and-braces).
+for dnsproto in udp tcp; do
+    if ! iptables -w -C INPUT ! -i "$BRIDGE" -d "$GW_IP" -p "$dnsproto" --dport 53 -j DROP 2>/dev/null; then
+        iptables -w -I INPUT 1 ! -i "$BRIDGE" -d "$GW_IP" -p "$dnsproto" --dport 53 -j DROP
+    fi
+done
 if [ -n "${PUB_IPS// /}" ]; then
     for pub in $PUB_IPS; do
         iptables -w -A JKRUNFW -d "$pub" -p tcp -m multiport --dports 80,443 -j ACCEPT
@@ -152,18 +165,15 @@ for proto in udp tcp; do
         iptables -w -D INPUT -i "$BRIDGE" -d "$GW_IP" -p "$proto" --dport 53 -j ACCEPT
     done
 done
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-    mkdir -p /etc/systemd/resolved.conf.d
-    want="# jkbase: answer guest DNS on the runtime bridge gateway (managed by setup-bridge.sh)
-[Resolve]
-DNSStubListenerExtra=${GW_IP}"
-    if [ "$(cat /etc/systemd/resolved.conf.d/jkbase-stub.conf 2>/dev/null)" != "$want" ]; then
-        printf '%s\n' "$want" > /etc/systemd/resolved.conf.d/jkbase-stub.conf
-    fi
-    # At boot systemd-resolved starts before this bridge exists, so its bind to
-    # ${GW_IP}:53 would have failed — (re)bind now the bridge is up. Restart only when
-    # it isn't already listening there, to avoid needless host-DNS blips.
-    if ! ss -ulnH 2>/dev/null | grep -q "${GW_IP}:53"; then
+# Hand ${GW_IP}:53 off from systemd-resolved to jkbase-server's in-process forwarder. Older versions
+# of this script exposed systemd-resolved on the bridge IP via a DNSStubListenerExtra drop-in; REMOVE
+# it and restart resolved so it RELEASES ${GW_IP}:53 for the forwarder to bind. jkbase-server starts
+# right after this ExecStartPre and the forwarder retries the bind briefly, covering any residual
+# race. The host's own resolver (systemd-resolved on 127.0.0.53) is untouched — the forwarder relays
+# to it. (On a non-systemd-resolved host there was never a drop-in; nothing to undo.)
+if [ -f /etc/systemd/resolved.conf.d/jkbase-stub.conf ]; then
+    rm -f /etc/systemd/resolved.conf.d/jkbase-stub.conf
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         systemctl try-restart systemd-resolved 2>/dev/null || true
     fi
 fi

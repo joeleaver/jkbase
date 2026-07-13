@@ -70,6 +70,9 @@ webpki-roots = "0.26"
 hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
 # hickory-client for ACME DNS-01 via RFC2136 dynamic UPDATE + TSIG (dnssec-ring = TSIG/ring).
 hickory-client = { version = "0.24", features = ["dnssec-ring"] }
+# hickory-proto: read-only DNS message parse (the dns_forwarder cache's min-TTL). Already resolved
+# transitively (hickory-client/-resolver) — a direct, default-features-off dep adds no new crate.
+hickory-proto = { version = "0.24", default-features = false }
 rcgen = "0.13"
 rustls-pemfile = "2"
 argon2 = { version = "0.5", features = ["std", "rand"] }

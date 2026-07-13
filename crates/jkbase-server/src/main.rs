@@ -3,6 +3,7 @@ mod build_ca;
 mod build_orchestrator;
 mod db_backup_store;
 mod db_gateway;
+mod dns_forwarder;
 mod egress;
 mod handoff;
 mod l4_runtime;
@@ -2026,6 +2027,19 @@ async fn async_main() -> Result<()> {
         // ([R3], HA IP-collision safety); empty on single-node/pre-HA (matches every alloc).
         let gw_host_id = platform.lock().await.host_id.clone();
         tokio::spawn(async move { db_gateway::serve(store, gw_wake, registry, gw_host_id).await });
+    }
+
+    // Host DNS forwarder — answers runtime-guest `/etc/resolv.conf` queries on `172.16.0.1:53` and
+    // relays them to the host's own resolver. Replaces systemd-resolved's `DNSStubListenerExtra`
+    // (setup-bridge.sh removes the drop-in + restarts resolved to hand off the port in the server's
+    // ExecStartPre), so DNS is jkbase-owned: bound to this process (no boot-order race), per-guest
+    // rate-limited, logged, and attributed by unforgeable source IP. Best-effort bind (mirrors the
+    // DB gateway). NOT a containment boundary — server-app egress is open NAT — it is observability
+    // + abuse-control + listener ownership (see dns_forwarder.rs).
+    {
+        let store = store.clone();
+        let dns_host_id = platform.lock().await.host_id.clone();
+        tokio::spawn(async move { dns_forwarder::serve(store, dns_host_id).await });
     }
 
     // L4 UDP scale-to-zero ingress — the plane-global throttle/egress controller + the reconcile
