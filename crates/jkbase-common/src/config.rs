@@ -258,6 +258,14 @@ pub struct L4PortFact {
     /// The guest loopback port the agent forwards admitted datagrams to
     /// (`127.0.0.1:guest_port`) — the port the tenant's service binds.
     pub guest_port: u16,
+    /// The host's resolved per-port ESTABLISHED idle timeout (seconds,
+    /// `L4PortConfig::idle_timeout_secs()`, clamped `[15, 600]`). The agent sizes its OWN flow-map
+    /// idle reaper ABOVE this so it can never evict a flow the host still considers live — which
+    /// would restart the reply pump's nonce counter into the host's high-water and blank the return
+    /// leg on re-wake. `#[serde(default)]` ⇒ old images deserialize to `0`; the agent then falls
+    /// back to the host ceiling (600s) so it stays fail-safe against any live host window.
+    #[serde(default)]
+    pub idle_timeout_secs: u64,
 }
 
 impl L4Facts {
@@ -1701,6 +1709,7 @@ mod tests {
                 proto: "udp".into(),
                 agent_udp_port: 40000,
                 guest_port: 9987,
+                idle_timeout_secs: 120,
             }],
             transit_secret: "jkbl_secret".into(),
         };
@@ -1712,6 +1721,13 @@ mod tests {
         let legacy: L4Facts =
             serde_json::from_str(r#"{"ports":[]}"#).unwrap();
         assert!(legacy.transit_secret.is_empty());
+        // Old images predating idle_timeout_secs deserialize it to 0 (the agent then falls back to
+        // the host ceiling, W0.1), never an error.
+        let legacy_port: L4Facts = serde_json::from_str(
+            r#"{"ports":[{"name":"v","proto":"udp","agent_udp_port":40000,"guest_port":9987}],"transit_secret":"jkbl_x"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_port.ports[0].idle_timeout_secs, 0);
     }
 
     #[test]

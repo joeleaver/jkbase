@@ -3304,6 +3304,9 @@ async fn handle_deploy(
                     proto: a.proto,
                     agent_udp_port: a.agent_udp_port,
                     guest_port: a.guest_port,
+                    // Hand the agent the host's per-port idle window so its own flow reaper can
+                    // never evict a still-live flow (return-leg nonce blank on re-wake, W0.1).
+                    idle_timeout_secs: decl.idle_timeout_secs,
                 }),
                 Err(e) => warn!(
                     project = %project_id, l4_port = %name, error = %e,

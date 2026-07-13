@@ -69,15 +69,32 @@ const READINESS_POLL: Duration = Duration::from_millis(100);
 const REPLAY_MAX_PKTS: usize = 4;
 const REPLAY_MAX_BYTES: usize = 8 * 1024;
 
-/// Idle TTL for the per-flow loopback map — a self-bound against client churn. The synchronous
-/// host→agent teardown signal is deferred (epoch-distinctness gives correctness, §7), so with no
-/// signal the agent MUST reap dead flows itself rather than rely on the host to release them. Set
-/// ABOVE the DEFAULT host `idle_timeout` (60s; range `[15,600]`) so a still-live host flow isn't
-/// dropped agent-side mid-session, but NOT the multiples of headroom that would let dead entries
-/// pile up under churn and wedge the bounded 256-entry map. A superseding epoch evicts the prior
-/// entry immediately (below) and a full map LRU-evicts the least-recently-active
-/// (`create_flow`); this TTL is the steady-state reaper for genuinely-abandoned flows.
-const FLOW_IDLE_TTL: Duration = Duration::from_secs(120);
+/// Headroom added ON TOP of the host's per-port `idle_timeout` to derive the agent's flow-map idle
+/// reaper (`flow_idle_ttl`, W0.1). The agent MUST NOT reap a flow the host still considers live: a
+/// premature agent eviction re-creates the flow on the client's next datagram with a fresh reply
+/// pump whose `out_nonce` restarts at 1 into the host's already-high `in_nonce_hw`, blanking the
+/// return leg until the pump climbs back (a ~N-datagram NonceReplay blackout on re-wake). The
+/// headroom covers the sweep granularity ([`SWEEP_INTERVAL`]) plus host↔agent clock skew, so the
+/// agent's reaper always trails the host's. A superseding epoch still evicts the prior entry
+/// immediately (below) and a full map LRU-evicts the least-recently-active (`create_flow`), so this
+/// looser TTL cannot wedge the bounded map — it is only the steady-state reaper for abandoned flows.
+const FLOW_IDLE_HEADROOM: Duration = Duration::from_secs(60);
+
+/// Fallback host idle window (seconds) when the fact predates `idle_timeout_secs` (old image ⇒
+/// deserializes to `0`): assume the host ceiling (`L4PortConfig::IDLE_CEIL`) so the agent never
+/// reaps below ANY window the host might hold (fail-safe).
+const HOST_IDLE_CEIL_FALLBACK_SECS: u64 = 600;
+
+/// Derive the agent flow reaper from the host's resolved per-port idle window: `host_idle +
+/// headroom`, falling back to the host ceiling when the host didn't tell us (old image, `0`).
+fn flow_idle_ttl_for(host_idle_secs: u64) -> Duration {
+    let host = if host_idle_secs == 0 {
+        HOST_IDLE_CEIL_FALLBACK_SECS
+    } else {
+        host_idle_secs
+    };
+    Duration::from_secs(host) + FLOW_IDLE_HEADROOM
+}
 
 /// Idle-sweep cadence.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
@@ -174,6 +191,9 @@ struct LandForward {
     /// Bounded first-packet buffer: `(raw frame, host source addr)`.
     pending: Vec<(Vec<u8>, SocketAddr)>,
     pending_bytes: usize,
+    /// Idle reaper derived from the host's per-port `idle_timeout` (`flow_idle_ttl_for`, W0.1) so
+    /// the agent never evicts a flow the host still holds live.
+    flow_idle_ttl: Duration,
     drops: DropCounters,
 }
 
@@ -205,10 +225,13 @@ pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String) {
             return;
         }
     };
+    let flow_idle_ttl = flow_idle_ttl_for(fact.idle_timeout_secs);
     info!(
         name = %fact.name,
         agent_udp_port = fact.agent_udp_port,
         guest_port = fact.guest_port,
+        host_idle_timeout_secs = fact.idle_timeout_secs,
+        flow_idle_ttl_secs = flow_idle_ttl.as_secs(),
         "l4 land-forward listening"
     );
     let lf = LandForward {
@@ -220,6 +243,7 @@ pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String) {
         readiness: Readiness::Unknown,
         pending: Vec::new(),
         pending_bytes: 0,
+        flow_idle_ttl,
         drops: DropCounters::default(),
     };
     lf.run().await;
@@ -457,8 +481,9 @@ impl LandForward {
     /// Idle-evict abandoned flows (leak backstop) + flush the rate-limited drop summary.
     fn sweep(&mut self) {
         let now = Instant::now();
+        let ttl = self.flow_idle_ttl;
         self.flows.retain(|_, f| {
-            if now.duration_since(f.last_seen) > FLOW_IDLE_TTL {
+            if now.duration_since(f.last_seen) > ttl {
                 f.cancel.notify_one();
                 false
             } else {
@@ -599,6 +624,23 @@ fn addr_is_loopback_or_wildcard(addr_hex: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_idle_ttl_always_trails_the_host_window() {
+        // A known host window → host + headroom, so the agent reaper fires strictly after the host
+        // still-live window (no premature eviction → no return-leg nonce blank on re-wake, W0.1).
+        assert_eq!(flow_idle_ttl_for(60), Duration::from_secs(120));
+        assert_eq!(flow_idle_ttl_for(600), Duration::from_secs(660));
+        // Old image (0 ⇒ field absent) falls back to the host ceiling, never below any live window.
+        assert_eq!(flow_idle_ttl_for(0), Duration::from_secs(660));
+        // Holds across every legal idle_timeout in [15, 600].
+        for host in [15u64, 60, 120, 300, 600] {
+            assert!(
+                flow_idle_ttl_for(host) > Duration::from_secs(host),
+                "ttl for host={host} must exceed the host window"
+            );
+        }
+    }
 
     // A representative /proc/net/udp header (columns beyond local_address are ignored).
     const HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";

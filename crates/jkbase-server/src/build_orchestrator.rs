@@ -6081,6 +6081,7 @@ console.log("listening on " + port);
                 proto: "udp".into(),
                 agent_udp_port: AGENT_UDP_PORT,
                 guest_port: GUEST_PORT,
+                idle_timeout_secs: 60,
             }],
             transit_secret: TRANSIT_SECRET.into(),
         };
