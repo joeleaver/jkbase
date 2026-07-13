@@ -28,6 +28,7 @@ use jkbase_common::l4_transit::{self, L4_HEADER_LEN, L4Dir, L4TransitHeader};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -125,7 +126,12 @@ struct LoopbackFlow {
     sock: Arc<UdpSocket>,
     /// Anti-replay high-water for the host→agent direction of THIS `(flow_id, epoch)`.
     in_nonce_hw: u64,
-    last_seen: Instant,
+    /// Last-activity clock in EITHER direction — millis since [`LandForward::base`]. Bumped by the
+    /// forward leg (`deliver`) AND the reply pump (`ReplyPump::run`), so a server→client-only flow
+    /// (client silent, app streaming) is not reaped mid-stream (W0.1 bug a): the host keeps such a
+    /// flow live on its egress signal, so the agent must too. `Arc<AtomicU64>` because the reply
+    /// pump runs as a separate task with no access to the flow map.
+    last_seen: Arc<AtomicU64>,
     /// Fired on eviction/supersession to stop this flow's reply pump (which then drops its socket
     /// handle, closing the loopback socket).
     cancel: Arc<Notify>,
@@ -194,7 +200,15 @@ struct LandForward {
     /// Idle reaper derived from the host's per-port `idle_timeout` (`flow_idle_ttl_for`, W0.1) so
     /// the agent never evicts a flow the host still holds live.
     flow_idle_ttl: Duration,
+    /// Monotonic epoch for the per-flow `last_seen` millis clock (shared with the reply pumps).
+    base: Instant,
     drops: DropCounters,
+}
+
+/// Millis since `base` — the shared monotonic clock stamped into `LoopbackFlow::last_seen` by both
+/// legs and read by the sweep.
+fn elapsed_ms(base: Instant) -> u64 {
+    base.elapsed().as_millis() as u64
 }
 
 /// Start the land-forward for one host-asserted L4 port. Bind failure ⇒ `error!` + return (never
@@ -244,6 +258,7 @@ pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String) {
         pending: Vec::new(),
         pending_bytes: 0,
         flow_idle_ttl,
+        base: Instant::now(),
         drops: DropCounters::default(),
     };
     lf.run().await;
@@ -389,10 +404,11 @@ impl LandForward {
             Decision::Replay => self.drops.nonce_replay += 1,
             Decision::Stale => self.drops.stale_epoch += 1,
             Decision::Forward => {
+                let now_ms = elapsed_ms(self.base);
                 let sock = {
                     let flow = self.flows.get_mut(&hdr.flow_id).expect("present");
                     flow.in_nonce_hw = hdr.nonce;
-                    flow.last_seen = Instant::now();
+                    flow.last_seen.store(now_ms, Ordering::Relaxed);
                     flow.sock.clone()
                 };
                 if let Err(e) = sock.send(payload).await {
@@ -424,7 +440,7 @@ impl LandForward {
             match self
                 .flows
                 .iter()
-                .min_by_key(|(_, f)| f.last_seen)
+                .min_by_key(|(_, f)| f.last_seen.load(Ordering::Relaxed))
                 .map(|(&id, _)| id)
             {
                 Some(victim) => {
@@ -453,6 +469,9 @@ impl LandForward {
             debug!(error = %e, port = %self.name, "l4 land-forward: loopback send failed");
         }
         let cancel = Arc::new(Notify::new());
+        // Shared either-direction activity clock: the reply pump stamps it on every server→client
+        // datagram so a client-silent, app-streaming flow is not idle-reaped (W0.1 bug a).
+        let last_seen = Arc::new(AtomicU64::new(elapsed_ms(self.base)));
         tokio::spawn(
             ReplyPump {
                 flow_id: hdr.flow_id,
@@ -463,6 +482,8 @@ impl LandForward {
                 listener: self.listener.clone(),
                 reply_to: src,
                 cancel: cancel.clone(),
+                last_seen: last_seen.clone(),
+                base: self.base,
             }
             .run(),
         );
@@ -472,7 +493,7 @@ impl LandForward {
                 epoch: hdr.epoch,
                 sock,
                 in_nonce_hw: hdr.nonce,
-                last_seen: Instant::now(),
+                last_seen,
                 cancel,
             },
         );
@@ -480,10 +501,10 @@ impl LandForward {
 
     /// Idle-evict abandoned flows (leak backstop) + flush the rate-limited drop summary.
     fn sweep(&mut self) {
-        let now = Instant::now();
-        let ttl = self.flow_idle_ttl;
+        let now = elapsed_ms(self.base);
+        let ttl_ms = self.flow_idle_ttl.as_millis() as u64;
         self.flows.retain(|_, f| {
-            if now.duration_since(f.last_seen) > ttl {
+            if now.saturating_sub(f.last_seen.load(Ordering::Relaxed)) > ttl_ms {
                 f.cancel.notify_one();
                 false
             } else {
@@ -508,6 +529,11 @@ struct ReplyPump {
     listener: Arc<UdpSocket>,
     reply_to: SocketAddr,
     cancel: Arc<Notify>,
+    /// This flow's shared either-direction activity clock (millis since `base`); stamped on every
+    /// reply so the land-forward sweep does not idle-reap a flow that is actively streaming
+    /// server→client (W0.1 bug a).
+    last_seen: Arc<AtomicU64>,
+    base: Instant,
 }
 
 impl ReplyPump {
@@ -529,6 +555,9 @@ impl ReplyPump {
                             break;
                         }
                     };
+                    // Return-leg activity: keep this flow off the idle reaper while the app streams
+                    // server→client even if the client is silent (W0.1 bug a).
+                    self.last_seen.store(elapsed_ms(self.base), Ordering::Relaxed);
                     // Sealing adds L4_HEADER_LEN; if that would exceed the max UDP datagram, this
                     // single reply can't be framed on the wire — drop it (don't wedge the flow).
                     if n + L4_HEADER_LEN > UDP_MAX_DATAGRAM {
