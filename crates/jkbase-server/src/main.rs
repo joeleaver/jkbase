@@ -5821,8 +5821,11 @@ fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<L4PortDecl> {
             if guest_port == 0 || guest_port > u16::MAX as u64 {
                 return None;
             }
-            // Older sidecars predate the tunables → resolved defaults (60s idle, k=1). Re-clamp
-            // defensively even though the bake already clamped.
+            // Older sidecars predate the tunables → resolved defaults (60s idle; amp clamp OFF).
+            // Re-clamp defensively even though the bake already clamped — but MATCH
+            // `L4PortConfig::amp_k()`: absent/0 ⇒ 0 (clamp disabled, the W-econ default), NOT 1.
+            // A stale `.unwrap_or(1)/.clamp(1,3)` here would re-floor a baked `amp_k:0` back to 1
+            // and silently re-arm the retired ratio clamp + auto-hibernate kill-switch.
             let idle_timeout_secs = v
                 .get("idle_timeout")
                 .and_then(|x| x.as_u64())
@@ -5831,8 +5834,8 @@ fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<L4PortDecl> {
             let amp_k = v
                 .get("amp_k")
                 .and_then(|x| x.as_u64())
-                .unwrap_or(1)
-                .clamp(1, 3) as u8;
+                .unwrap_or(0)
+                .min(3) as u8;
             Some(L4PortDecl {
                 name,
                 proto,
@@ -5842,6 +5845,64 @@ fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<L4PortDecl> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod l4_port_decl_tests {
+    use super::read_l4_port_decls;
+    use std::path::PathBuf;
+
+    /// Write a `_l4_ports.json` sidecar under a scratch data-dir and return `(data_dir, project)`.
+    fn stage_sidecar(tag: &str, json: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("jkb-l4decl-{tag}"));
+        let live = dir.join("hosting").join("proj").join("live");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("_l4_ports.json"), json).unwrap();
+        dir
+    }
+
+    // The load-bearing regression (BLOCKER, W-econ review): the readback must resolve amp_k the
+    // SAME way `L4PortConfig::amp_k()` bakes it — absent/0 ⇒ 0 (clamp OFF, the default), 1..=3 pass,
+    // >3 clamps to 3. A stale `.unwrap_or(1)/.clamp(1,3)` here re-floored 0→1 and silently re-armed
+    // the retired ratio clamp on every default port.
+    #[test]
+    fn amp_k_readback_matches_bake_semantics() {
+        let dir = stage_sidecar(
+            "ampk",
+            r#"[
+              {"name":"off",   "proto":"udp","guest_port":9987,"idle_timeout":60,"amp_k":0},
+              {"name":"absent","proto":"udp","guest_port":9988,"idle_timeout":60},
+              {"name":"opt2",  "proto":"udp","guest_port":9989,"idle_timeout":120,"amp_k":2},
+              {"name":"hi",    "proto":"udp","guest_port":9990,"idle_timeout":60,"amp_k":250}
+            ]"#,
+        );
+        let decls = read_l4_port_decls(&dir, "proj");
+        let k = |name: &str| decls.iter().find(|d| d.name == name).unwrap().amp_k;
+        assert_eq!(k("off"), 0, "explicit 0 stays OFF (must not re-floor to 1)");
+        assert_eq!(k("absent"), 0, "omitted ⇒ clamp OFF (the W-econ default)");
+        assert_eq!(k("opt2"), 2, "explicit in-range opt-in passes through");
+        assert_eq!(k("hi"), 3, "out-of-range high clamps to the ceiling");
+        // idle stays clamped to [15,600] independently.
+        let idle = |name: &str| {
+            decls
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap()
+                .idle_timeout_secs
+        };
+        assert_eq!(idle("opt2"), 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_sidecar_yields_no_decls() {
+        // A project with no sidecar (and thus resolve_spec's `.unwrap_or((60, 0))` fallback) is the
+        // clamp-OFF default, never a re-armed clamp.
+        let dir = std::env::temp_dir().join("jkb-l4decl-none-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(read_l4_port_decls(&dir, "proj").is_empty());
+    }
 }
 
 /// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
