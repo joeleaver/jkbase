@@ -179,13 +179,15 @@ fn resolve_spec(
         .flatten()
         .and_then(|p| p.tenant_id);
 
-    // Per-port tunables from the sidecar; default (60s idle, k=1) if the stanza isn't found (e.g. an
-    // in-flight redeploy that already removed it — the port is being torn down anyway).
+    // Per-port tunables from the sidecar; default (60s idle; amp clamp OFF = 0) if the stanza isn't
+    // found (e.g. an in-flight redeploy that already removed it — the port is being torn down
+    // anyway). The `0` fallback MUST match `L4PortConfig::amp_k()`'s clamp-off default: a stale `1`
+    // here would re-arm the retired ratio clamp on any port whose decl momentarily can't be read.
     let (idle_timeout_secs, amp_k) = crate::read_l4_port_decls(data_dir, &alloc.project_id)
         .into_iter()
         .find(|d| d.name == alloc.name)
         .map(|d| (d.idle_timeout_secs, d.amp_k))
-        .unwrap_or((60, 1));
+        .unwrap_or((60, 0));
 
     Some(L4PortSpec {
         base_project: vm_identity::base_project_id(&alloc.project_id).to_string(),

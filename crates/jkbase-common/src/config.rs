@@ -258,6 +258,14 @@ pub struct L4PortFact {
     /// The guest loopback port the agent forwards admitted datagrams to
     /// (`127.0.0.1:guest_port`) — the port the tenant's service binds.
     pub guest_port: u16,
+    /// The host's resolved per-port ESTABLISHED idle timeout (seconds,
+    /// `L4PortConfig::idle_timeout_secs()`, clamped `[15, 600]`). The agent sizes its OWN flow-map
+    /// idle reaper ABOVE this so it can never evict a flow the host still considers live — which
+    /// would restart the reply pump's nonce counter into the host's high-water and blank the return
+    /// leg on re-wake. `#[serde(default)]` ⇒ old images deserialize to `0`; the agent then falls
+    /// back to the host ceiling (600s) so it stays fail-safe against any live host window.
+    #[serde(default)]
+    pub idle_timeout_secs: u64,
 }
 
 impl L4Facts {
@@ -814,11 +822,13 @@ pub struct L4PortConfig {
     /// DOWN for snappier scale-to-zero.
     #[serde(default)]
     pub idle_timeout: Option<u64>,
-    /// Optional egress:ingress amplification ratio `k` (§3(c) axis 2): the relay lets the
-    /// app reply at most `k`× the bytes the client sent, bounding reflection. Clamped to
-    /// `[1, 3]` (3 = QUIC's anti-amplification number); omitted → 1 (byte-for-byte). Raising
-    /// it raises this port's reflection factor — only widen it for a legitimately
-    /// reply-heavier protocol.
+    /// Optional per-flow amplification clamp `k` (§3(c) axis 2). **Omitted → the clamp is OFF**
+    /// (smarter-limiting arc / W-econ): the app replies freely — arbitrary asymmetric workloads
+    /// (voice sync, game snapshot, broadcast) are supported by default, with third-party reflection
+    /// bounded by the absolute per-source/-24/-project/global caps + the metered per-tenant egress
+    /// budget. Set `amp_k = k` (`1..=3`, 3 = QUIC's anti-amplification number) to OPT IN to the
+    /// byte-for-byte shaper on this specific port (the app then replies at most `k`× the client's
+    /// bytes). `0` also means off.
     #[serde(default)]
     pub amp_k: Option<u8>,
 }
@@ -883,10 +893,15 @@ impl L4PortConfig {
             .clamp(Self::IDLE_FLOOR, Self::IDLE_CEIL)
     }
 
-    /// Resolved egress:ingress ratio `k`, clamped to `[1, Self::AMP_K_CEIL]`; omitted → 1
-    /// (byte-for-byte). Clamped, not rejected (see [`Self::idle_timeout_secs`]).
+    /// Resolved egress:ingress ratio `k`. **`0` = the per-flow amplification clamp is DISABLED**
+    /// (the default, smarter-limiting arc / W-econ): the app replies freely and third-party
+    /// reflection is bounded by the absolute per-source/-24/-project/global caps + the metered
+    /// per-tenant egress budget, not a per-packet ratio that breaks legit asymmetric workloads. An
+    /// explicit `amp_k = k` (`1..=Self::AMP_K_CEIL`) OPTS IN to the byte-for-byte shaper on that
+    /// port. Omitted (or `0`) → `0` (disabled); out-of-range high → the ceiling. Clamped, not
+    /// rejected (see [`Self::idle_timeout_secs`]).
     pub fn amp_k(&self) -> u8 {
-        self.amp_k.unwrap_or(1).clamp(1, Self::AMP_K_CEIL)
+        self.amp_k.unwrap_or(0).min(Self::AMP_K_CEIL)
     }
 
     pub const IDLE_DEFAULT: u64 = 60;
@@ -1660,11 +1675,11 @@ mod tests {
 
     #[test]
     fn l4_port_tunables_default_and_clamp() {
-        // Omitted → defaults (idle 60, k 1).
+        // Omitted → defaults (idle 60; amp clamp OFF = 0, W-econ).
         let cfg: ProjectConfig =
             toml::from_str("[l4.v]\nproto = \"udp\"\nguest_port = 9987\n").unwrap();
         assert_eq!(cfg.l4["v"].idle_timeout_secs(), 60);
-        assert_eq!(cfg.l4["v"].amp_k(), 1);
+        assert_eq!(cfg.l4["v"].amp_k(), 0);
 
         // In-range values pass through.
         let cfg: ProjectConfig = toml::from_str(
@@ -1680,9 +1695,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.l4["lo"].idle_timeout_secs(), 15); // floor
-        assert_eq!(cfg.l4["lo"].amp_k(), 1); // floor (0 → 1)
+        assert_eq!(cfg.l4["lo"].amp_k(), 0); // 0 = clamp off (explicit opt-out)
         assert_eq!(cfg.l4["hi"].idle_timeout_secs(), 600); // ceiling
-        assert_eq!(cfg.l4["hi"].amp_k(), 3); // ceiling
+        assert_eq!(cfg.l4["hi"].amp_k(), 3); // ceiling (opt-in shaper, clamped)
         // Clamped tunables still validate (they're not correctness gates).
         cfg.l4["lo"].validate("lo").unwrap();
     }
@@ -1701,6 +1716,7 @@ mod tests {
                 proto: "udp".into(),
                 agent_udp_port: 40000,
                 guest_port: 9987,
+                idle_timeout_secs: 120,
             }],
             transit_secret: "jkbl_secret".into(),
         };
@@ -1712,6 +1728,13 @@ mod tests {
         let legacy: L4Facts =
             serde_json::from_str(r#"{"ports":[]}"#).unwrap();
         assert!(legacy.transit_secret.is_empty());
+        // Old images predating idle_timeout_secs deserialize it to 0 (the agent then falls back to
+        // the host ceiling, W0.1), never an error.
+        let legacy_port: L4Facts = serde_json::from_str(
+            r#"{"ports":[{"name":"v","proto":"udp","agent_udp_port":40000,"guest_port":9987}],"transit_secret":"jkbl_x"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_port.ports[0].idle_timeout_secs, 0);
     }
 
     #[test]
@@ -1735,9 +1758,9 @@ mod tests {
         assert_eq!(arr[0]["name"], "alt");
         assert_eq!(arr[0]["proto"], "udp");
         assert_eq!(arr[0]["guest_port"], 9988);
-        // "alt" omits tunables → resolved defaults (60s idle, k=1).
+        // "alt" omits tunables → resolved defaults (60s idle; amp clamp OFF = 0, W-econ).
         assert_eq!(arr[0]["idle_timeout"], 60);
-        assert_eq!(arr[0]["amp_k"], 1);
+        assert_eq!(arr[0]["amp_k"], 0);
         assert_eq!(arr[1]["name"], "voice");
         assert_eq!(arr[1]["guest_port"], 9987);
         // "voice" carries its declared (clamped) tunables.
