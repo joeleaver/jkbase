@@ -1943,6 +1943,7 @@ dependencies = [
  "cron",
  "flate2",
  "futures-util",
+ "hickory-proto",
  "http-body-util",
  "hyper",
  "hyper-util",

@@ -74,14 +74,14 @@ const PER_IP_BURST: f64 = 50.0;
 /// `PER_IP_RATE_PER_SEC`). The bucket map is bounded by the number of distinct source IPs on the
 /// host's `/24` island (≤253) — a guest can only ever present its own source-guard-pinned IP — so
 /// it needs no pruning.
-struct IpRateLimiter {
+pub(crate) struct IpRateLimiter {
     buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
     rate_per_sec: f64,
     burst: f64,
 }
 
 impl IpRateLimiter {
-    fn new(rate_per_sec: f64, burst: f64) -> Self {
+    pub(crate) fn new(rate_per_sec: f64, burst: f64) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
             rate_per_sec,
@@ -91,7 +91,7 @@ impl IpRateLimiter {
 
     /// Consume one token for `ip`; `false` ⇒ over the rate → drop the connection cheaply, BEFORE
     /// any control-store read. `now` is injected so the bucket math is unit-testable.
-    fn allow(&self, ip: IpAddr, now: Instant) -> bool {
+    pub(crate) fn allow(&self, ip: IpAddr, now: Instant) -> bool {
         let mut m = self.buckets.lock().unwrap();
         let (tokens, last) = m.entry(ip).or_insert((self.burst, now));
         let refill = now.saturating_duration_since(*last).as_secs_f64() * self.rate_per_sec;
@@ -382,7 +382,11 @@ impl Gateway {
 /// = single-node / pre-HA = ours), so the `peer_ip → project` map is 1:1 on each host even when HA
 /// (a shared control store) legitimately reuses the same `172.16.0.x` on a different host's island.
 /// Without this, an IP-collision across hosts could resolve a guest to a foreign project.
-fn project_for_ip_in(allocs: &[VmAllocation], peer_ip: IpAddr, host_id: &str) -> Option<String> {
+pub(crate) fn project_for_ip_in(
+    allocs: &[VmAllocation],
+    peer_ip: IpAddr,
+    host_id: &str,
+) -> Option<String> {
     let want = peer_ip.to_string();
     allocs
         .iter()
