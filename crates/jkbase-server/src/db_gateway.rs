@@ -282,6 +282,7 @@ impl Gateway {
                 Ok(ip) => ip,
                 Err(WakeError::OverQuota(_)) => return Err("over quota"),
                 Err(WakeError::Unavailable(_)) => return Err("unavailable"),
+                Err(WakeError::RateLimited(_)) => return Err("rate limited"),
                 Err(WakeError::Gone(_)) => return Err("gone"),
             },
         };

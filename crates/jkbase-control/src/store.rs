@@ -61,6 +61,11 @@ const DB_ACCESS_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
 /// guest fs), so the edge needs an independent copy here to present it. `project_id` →
 /// secret; overwritten each deploy (like the own-bucket binding), purged on teardown.
 const DB_SPLICE: TableDefinition<&str, &[u8]> = TableDefinition::new("db_splice_secret");
+/// Per-project **L4 transit secret** (`jkbl_…`): the host↔guest shared key authenticating
+/// every L4 UDP transit datagram. Minted sticky (once per project, reused across redeploys)
+/// so the host relay's copy and the agent's baked `_l4.json` copy always agree. Distinct
+/// from `DB_SPLICE` — L4 is not DB-coupled. See docs/managed-l4-udp-ingress-design.md §3(a-auth).
+const L4_TRANSIT: TableDefinition<&str, &[u8]> = TableDefinition::new("l4_transit_secret");
 /// Per-project rhypedb **admin token** ([RB1]): the per-deploy `RHYPEDB_ADMIN_TOKEN` the
 /// agent injects into the DB env to authorize `/admin/backup/stream`. Like [`DB_SPLICE`],
 /// it is generated host-side at deploy, baked into the per-VM image (which the host never
@@ -103,6 +108,18 @@ const AUTH_ISSUER_KEYS_BY_PROJECT: TableDefinition<&str, &[u8]> =
 /// by `host_id`. The leader's placement + dead-host detection (P3) read this; at HA
 /// P0 it is schema only — CRUD + tests, no loop touches it yet.
 const HOSTS: TableDefinition<&str, &[u8]> = TableDefinition::new("hosts");
+
+/// L4 (UDP/TCP) public-port allocations, keyed by the composite `{project_id}:{name}`
+/// so one project can hold several named ports (many-per-project like `SECRETS`, unlike
+/// the one-per-project `VM_ALLOCATIONS`). Each row reserves one always-on host edge
+/// port. See docs/managed-l4-udp-ingress-design.md §3(b).
+const PORT_ALLOCATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("port_allocations");
+
+/// Recently-freed L4 external ports in a reuse-cooldown, keyed by the port (decimal
+/// string) → freed-at unix seconds. `allocate_port` skips a port still within the
+/// cooldown so a torn-down tenant's stale clients can't have their datagrams admitted
+/// into a different tenant that reused the port [threat M1]. Pruned on expiry.
+const PORT_QUARANTINE: TableDefinition<&str, &[u8]> = TableDefinition::new("port_quarantine");
 
 /// Subdomain labels reserved for the platform; tenants cannot claim them as new
 /// hostnames (existing projects with these ids are grandfathered at backfill).
@@ -182,6 +199,43 @@ pub struct VmAllocation {
     /// a host. The single-writer safety core (P2): a host self-terminates its
     /// Firecracker before any survivor attaches once its held epoch goes stale. 0 for
     /// single-node / pre-HA records.
+    #[serde(default)]
+    pub placement_epoch: u64,
+}
+
+/// One reserved L4 (UDP/TCP) public port for a project, keyed in `PORT_ALLOCATIONS` by
+/// the composite `{project_id}:{name}`. Mirrors [`VmAllocation`] (a control-store-backed,
+/// host-island-scoped reservation) but many-per-project.
+///
+/// The split of who-decides-what is load-bearing [P0-L4-8]: the tenant authors ONLY
+/// `proto` + `guest_port` (via `[l4.<name>]`); `external_port` (the public bound port) and
+/// `agent_udp_port` (the in-VM transit listen port) are HOST-decided and tenant-unforgeable.
+/// `external_port` is **sticky** — stable across redeploy/rollback/VM re-adoption so a
+/// flagship tenant's pinned port (and every SRV target) never moves under it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortAllocation {
+    pub project_id: String,
+    /// The `[l4.<name>]` key; the composite `{project_id}:{name}` is the table key so a
+    /// project can hold several ports.
+    pub name: String,
+    /// Transport wire name, `"udp"` | `"tcp"` (from [`jkbase_common::config::L4Proto::as_str`]).
+    pub proto: String,
+    /// The public host-bound port. Host-asserted and STICKY (see type docs).
+    pub external_port: u16,
+    /// The loopback port the tenant's service binds inside the guest.
+    pub guest_port: u16,
+    /// The in-VM transit listen port the host dials (`vm_ip:agent_udp_port`); the agent
+    /// land-forwards to `127.0.0.1:guest_port`. Host-set and DISTINCT from `guest_port`.
+    pub agent_udp_port: u16,
+    /// Admin-granted fixed port (e.g. TeamSpeak's `9987`): never auto-reallocated away,
+    /// never drawn for another project. See §3(b) pin-grant.
+    #[serde(default)]
+    pub pinned: bool,
+    /// The cluster host that owns this allocation (`HostRecord.host_id`); empty for
+    /// single-node. Ports are allocated per host-island, so the allocator scans by this.
+    #[serde(default)]
+    pub host_id: String,
+    /// Placement epoch, mirrors [`VmAllocation::placement_epoch`]; 0 single-node/pre-HA.
     #[serde(default)]
     pub placement_epoch: u64,
 }
@@ -771,6 +825,9 @@ impl Store {
         let _ = txn.open_table(AUTH_ISSUER_KEYS)?;
         let _ = txn.open_table(AUTH_ISSUER_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(HOSTS)?;
+        let _ = txn.open_table(PORT_ALLOCATIONS)?;
+        let _ = txn.open_table(PORT_QUARANTINE)?;
+        let _ = txn.open_table(L4_TRANSIT)?;
         txn.commit()?;
 
         Ok(Store { db: Arc::new(db) })
@@ -865,6 +922,207 @@ impl Store {
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    // -- L4 (UDP/TCP) public-port allocations --
+
+    /// Hard cap on the number of L4 public ports a single project may hold. Bounds
+    /// public-port exhaustion, the always-on edge-socket count, AND the wake axis (the
+    /// wake budget keys on base-project, so ports can't multiply a tenant's share). See
+    /// docs/managed-l4-udp-ingress-design.md §6. Enforced in `allocate_port` under a write
+    /// txn (like [`Self::MAX_ACCESS_KEYS_PER_PROJECT`]).
+    pub const MAX_L4_PORTS_PER_PROJECT: usize = 5;
+
+    /// Upsert an L4 port allocation, keyed by the composite `{project_id}:{name}`.
+    pub fn save_port_allocation(&self, alloc: &PortAllocation) -> Result<()> {
+        let key = format!("{}:{}", alloc.project_id, alloc.name);
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(PORT_ALLOCATIONS)?;
+            let data = serde_json::to_vec(alloc)?;
+            table.insert(key.as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_port_allocation(
+        &self,
+        project_id: &str,
+        name: &str,
+    ) -> Result<Option<PortAllocation>> {
+        let key = format!("{project_id}:{name}");
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PORT_ALLOCATIONS)?;
+        match table.get(key.as_str())? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// All L4 allocations across every project — the host-island scan input for
+    /// `allocate_port` (which filters by `host_id`) and for reconcile.
+    pub fn list_port_allocations(&self) -> Result<Vec<PortAllocation>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PORT_ALLOCATIONS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (_k, v) = entry?;
+            out.push(serde_json::from_slice::<PortAllocation>(v.value())?);
+        }
+        Ok(out)
+    }
+
+    /// A single project's L4 allocations (CLI `l4 ls`, redeploy reconcile). Half-open
+    /// range over the composite key so `forumall` never matches `forumall2:*`.
+    pub fn list_port_allocations_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<PortAllocation>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PORT_ALLOCATIONS)?;
+        let lo = format!("{project_id}:");
+        let hi = format!("{project_id};");
+        let mut out = Vec::new();
+        for entry in table.range(lo.as_str()..hi.as_str())? {
+            let (_k, v) = entry?;
+            out.push(serde_json::from_slice::<PortAllocation>(v.value())?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_port_allocation(&self, project_id: &str, name: &str) -> Result<bool> {
+        let key = format!("{project_id}:{name}");
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(PORT_ALLOCATIONS)?;
+            table.remove(key.as_str())?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// Remove ALL of a project's L4 allocations (project teardown). The `:` separator
+    /// makes the prefix exact — `forumall` never matches `forumall2:*`. Returns the count
+    /// removed. Without this a recreated project of the same slug could inherit a prior
+    /// tenant's ports.
+    pub fn remove_all_port_allocations(&self, project_id: &str) -> Result<usize> {
+        let prefix = format!("{project_id}:");
+        let txn = self.db.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut table = txn.open_table(PORT_ALLOCATIONS)?;
+            // Collect first: redb forbids mutating a table while its iterator is live.
+            let keys: Vec<String> = table
+                .iter()?
+                .filter_map(|e| e.ok())
+                .map(|(k, _)| k.value().to_string())
+                .filter(|k| k.starts_with(&prefix))
+                .collect();
+            for k in keys {
+                if table.remove(k.as_str())?.is_some() {
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    // -- L4 external-port reuse quarantine [threat M1] --
+
+    /// Record a freed external port entering the reuse-cooldown at `freed_at_unix`.
+    /// `allocate_port` skips a port whose cooldown has not elapsed so a torn-down
+    /// tenant's stale clients can't be admitted into a reused port's new owner.
+    pub fn quarantine_port(&self, port: u16, freed_at_unix: u64) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(PORT_QUARANTINE)?;
+            let data = serde_json::to_vec(&freed_at_unix)?;
+            table.insert(port.to_string().as_str(), data.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The freed-at time of a quarantined port, or `None` if it isn't quarantined.
+    pub fn get_port_quarantine(&self, port: u16) -> Result<Option<u64>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PORT_QUARANTINE)?;
+        match table.get(port.to_string().as_str())? {
+            Some(data) => Ok(Some(serde_json::from_slice(data.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a port from quarantine (cooldown elapsed / explicit reclaim).
+    pub fn unquarantine_port(&self, port: u16) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(PORT_QUARANTINE)?;
+            table.remove(port.to_string().as_str())?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    /// All quarantined ports → freed-at unix. `allocate_port` consults this to skip
+    /// still-cooling ports and to prune elapsed ones.
+    pub fn list_port_quarantine(&self) -> Result<Vec<(u16, u64)>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PORT_QUARANTINE)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            if let Ok(port) = k.value().parse::<u16>() {
+                out.push((port, serde_json::from_slice::<u64>(v.value())?));
+            }
+        }
+        Ok(out)
+    }
+
+    // -- L4 transit secret (host<->guest per-datagram auth) --
+
+    /// The project's L4 transit secret, minting + persisting a fresh one on first use.
+    /// **Sticky**: reused across redeploys so the host relay's copy and the agent's baked
+    /// `_l4.json` copy always agree; distinct from the DB splice secret (L4 isn't DB-coupled).
+    /// Called at deploy with the returned value baked into `_l4.json`.
+    pub fn l4_transit_secret(&self, project_id: &str) -> Result<String> {
+        if let Some(s) = self.get_l4_transit_secret(project_id)? {
+            return Ok(s);
+        }
+        let secret = auth::generate_l4_transit_secret();
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(L4_TRANSIT)?;
+            table.insert(project_id, secret.as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(secret)
+    }
+
+    /// The project's L4 transit secret, or `None` if none has been minted. The host relay
+    /// reads this to seal/open transit datagrams; a `None` (or a mismatch with the agent's
+    /// baked copy) makes the transit auth fail closed.
+    pub fn get_l4_transit_secret(&self, project_id: &str) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(L4_TRANSIT)?;
+        match table.get(project_id)? {
+            Some(v) => Ok(Some(String::from_utf8_lossy(v.value()).into_owned())),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop a project's L4 transit secret (teardown), so a recreated same-slug project
+    /// can't inherit it.
+    pub fn delete_l4_transit_secret(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(L4_TRANSIT)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     // -- Hosts (HA cluster fleet; schema only at P0) --
@@ -2852,6 +3110,73 @@ mod tests {
             jti: "jti".into(),
             claims: None,
         }
+    }
+
+    #[test]
+    fn l4_port_allocations_crud_sticky_and_quarantine() {
+        let (store, _p) = tmp_db();
+
+        let a = |name: &str, ext: u16, pinned: bool| PortAllocation {
+            project_id: "proj".into(),
+            name: name.into(),
+            proto: "udp".into(),
+            external_port: ext,
+            guest_port: 9987,
+            agent_udp_port: 40000 + ext,
+            pinned,
+            host_id: String::new(),
+            placement_epoch: 0,
+        };
+
+        // Upsert + get by composite key; host-asserted sticky fields round-trip.
+        store.save_port_allocation(&a("voice", 20001, true)).unwrap();
+        store.save_port_allocation(&a("alt", 20002, false)).unwrap();
+        let got = store.get_port_allocation("proj", "voice").unwrap().unwrap();
+        assert_eq!(got.external_port, 20001);
+        assert_eq!(got.agent_udp_port, 60001);
+        assert!(got.pinned);
+
+        // A same-prefix sibling project must NOT bleed into the per-project range scan.
+        store
+            .save_port_allocation(&PortAllocation {
+                project_id: "proj2".into(),
+                name: "voice".into(),
+                proto: "udp".into(),
+                external_port: 20003,
+                guest_port: 9987,
+                agent_udp_port: 60003,
+                pinned: false,
+                host_id: String::new(),
+                placement_epoch: 0,
+            })
+            .unwrap();
+        let mine = store.list_port_allocations_for_project("proj").unwrap();
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().all(|p| p.project_id == "proj"));
+        assert_eq!(store.list_port_allocations().unwrap().len(), 3);
+
+        // Remove-one then remove-all clears only this project; the sibling survives.
+        assert!(store.remove_port_allocation("proj", "alt").unwrap());
+        assert_eq!(store.remove_all_port_allocations("proj").unwrap(), 1);
+        assert!(store.get_port_allocation("proj", "voice").unwrap().is_none());
+        assert_eq!(
+            store
+                .list_port_allocations_for_project("proj2")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Reuse quarantine: record → read → prune.
+        assert!(store.get_port_quarantine(20001).unwrap().is_none());
+        store.quarantine_port(20001, 1_000_000).unwrap();
+        assert_eq!(store.get_port_quarantine(20001).unwrap(), Some(1_000_000));
+        assert_eq!(
+            store.list_port_quarantine().unwrap(),
+            vec![(20001, 1_000_000)]
+        );
+        assert!(store.unquarantine_port(20001).unwrap());
+        assert!(store.get_port_quarantine(20001).unwrap().is_none());
     }
 
     #[test]

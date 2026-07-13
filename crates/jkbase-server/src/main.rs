@@ -5,6 +5,7 @@ mod db_backup_store;
 mod db_gateway;
 mod egress;
 mod handoff;
+mod l4_runtime;
 mod layer_plan;
 mod log_shipper;
 mod metering;
@@ -16,12 +17,12 @@ mod vm_identity;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use jkbase_common::config::PlatformEgress;
+use jkbase_common::config::{L4Proto, PlatformEgress};
 use jkbase_control::api::{self, AppState};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, Project, ProjectState,
-    QuotaStatus, SnapshotMeta, Store, VmAllocation, month_start_epoch,
+    DomainKind, DomainRecord, DomainStatus, HostCapacity, HostRecord, PortAllocation, Project,
+    ProjectState, QuotaStatus, SnapshotMeta, Store, VmAllocation, month_start_epoch,
 };
 use jkbase_orch::rootfs;
 use jkbase_orch::vm::{VmConfig, VmInstance};
@@ -965,6 +966,114 @@ impl PlatformState {
             None => anyhow::bail!("no available IP addresses in this host's 172.16.0.0/24 island"),
         }
     }
+
+    /// Allocate (or reuse) the public `external_port` + in-VM `agent_udp_port` for a
+    /// project's `[l4.<name>]` port. See docs/managed-l4-udp-ingress-design.md §3(b).
+    ///
+    /// - **Idempotent + sticky:** an existing allocation for `(project, name)` is returned
+    ///   verbatim — `external_port`/`agent_udp_port`/`pinned` never move under a redeploy,
+    ///   rollback, or VM re-adoption (load-bearing for a pinned flagship port + SRV targets).
+    /// - **Reservation, then bind is the arbiter:** the control-store scan can't see host
+    ///   outbound-ephemeral or non-jkbase sockets, so a candidate is host-island-scanned +
+    ///   quarantine-skipped + randomized, then **bind-probed**; `EADDRINUSE` → next candidate.
+    /// - **`pinned_port`:** `Some(p)` forces an admin-granted fixed port (never evicts an
+    ///   incumbent); `None` draws from the auto range (strictly below the kernel ephemeral
+    ///   floor).
+    /// - Enforces [`Store::MAX_L4_PORTS_PER_PROJECT`].
+    fn allocate_port(
+        &self,
+        project_id: &str,
+        name: &str,
+        proto: L4Proto,
+        guest_port: u16,
+        pinned_port: Option<u16>,
+    ) -> Result<PortAllocation> {
+        // Sticky reuse — the whole point: the HOST-asserted `external_port` (+ `pinned`)
+        // must survive redeploy. But refresh the TENANT-asserted `proto`/`guest_port` from
+        // this deploy (the tenant may have edited `[l4.*]`), and fill a placeholder
+        // `agent_udp_port` for a row created by a PRE-deploy admin pin (transit port == 0).
+        if let Some(mut existing) = self.store.get_port_allocation(project_id, name)? {
+            let mut changed = false;
+            if existing.proto != proto.as_str() {
+                existing.proto = proto.as_str().to_string();
+                changed = true;
+            }
+            if existing.guest_port != guest_port {
+                existing.guest_port = guest_port;
+                changed = true;
+            }
+            if existing.agent_udp_port == 0 {
+                let all = self.store.list_port_allocations()?;
+                existing.agent_udp_port = next_agent_udp_port(&all, project_id, guest_port)?;
+                changed = true;
+            }
+            if changed {
+                self.store.save_port_allocation(&existing)?;
+            }
+            return Ok(existing);
+        }
+        // Lazy so non-L4 hosts are unaffected: the auto range must sit below the kernel
+        // ephemeral floor, else we'd draw a port the kernel also hands to outbound sockets.
+        validate_l4_port_range()?;
+
+        let all = self.store.list_port_allocations()?;
+        let mine = all.iter().filter(|p| p.project_id == project_id).count();
+        if mine >= Store::MAX_L4_PORTS_PER_PROJECT {
+            anyhow::bail!(
+                "L4 port limit reached ({} per project)",
+                Store::MAX_L4_PORTS_PER_PROJECT
+            );
+        }
+        let quarantine = self.store.list_port_quarantine()?;
+        let now = unix_now();
+
+        let candidates: Vec<u16> = match pinned_port {
+            Some(p) => {
+                if p == 80 || p == 443 {
+                    anyhow::bail!("cannot pin reserved port {p}");
+                }
+                // Never evict an incumbent: a pin onto a port already held in this island
+                // is rejected. Quarantine does NOT block a deliberate admin pin.
+                let taken = all.iter().any(|a| {
+                    (a.host_id.is_empty() || a.host_id == self.host_id) && a.external_port == p
+                });
+                if taken {
+                    anyhow::bail!("port {p} is already allocated on this host");
+                }
+                vec![p]
+            }
+            None => {
+                let span = (*L4_PORT_RANGE.end() - *L4_PORT_RANGE.start()) as u64 + 1;
+                let offset = (now % span) as u16;
+                l4_port_candidates(&all, &quarantine, &self.host_id, now, offset)
+            }
+        };
+
+        // Bind-probe: the first candidate that actually binds wins.
+        let external_port = candidates
+            .into_iter()
+            .find(|p| l4_bind_probe(proto, *p))
+            .context("no bindable L4 external port available (range exhausted or contended)")?;
+
+        let agent_udp_port = next_agent_udp_port(&all, project_id, guest_port)?;
+
+        let alloc = PortAllocation {
+            project_id: project_id.to_string(),
+            name: name.to_string(),
+            proto: proto.as_str().to_string(),
+            external_port,
+            guest_port,
+            agent_udp_port,
+            pinned: pinned_port.is_some(),
+            host_id: self.host_id.clone(),
+            placement_epoch: 0,
+        };
+        self.store.save_port_allocation(&alloc)?;
+        // A deliberately-pinned port may have been cooling; claiming it clears the entry so
+        // the cooldown bookkeeping doesn't linger. (Auto-alloc already skips cooling ports.)
+        let _ = self.store.unquarantine_port(external_port);
+        Ok(alloc)
+    }
 }
 
 /// HA P4 — the next free last-octet in THIS host's `172.16.0.0/24` island, considering
@@ -980,6 +1089,119 @@ fn next_free_octet(allocations: &[VmAllocation], host_id: &str) -> Option<u8> {
         .filter_map(|a| a.ip.split('.').next_back()?.parse::<u8>().ok())
         .collect();
     (2..=254u8).find(|o| !used.contains(o))
+}
+
+/// Auto-allocated L4 external-port range. Chosen strictly BELOW the kernel ephemeral range
+/// (`ip_local_port_range`, default floor 32768) so `allocate_port` never draws a port the
+/// kernel also hands to host outbound sockets — a collision the control-store scan can't
+/// see [mechanics H3]. An admin PIN may sit outside this range (e.g. TeamSpeak's 9987).
+const L4_PORT_RANGE: std::ops::RangeInclusive<u16> = 20000..=30000;
+
+/// Reuse-cooldown (seconds) for a freed L4 external port [threat M1]: longer than plausible
+/// client retransmit / SRV TTL, so a torn-down tenant's stale clients can't have their
+/// datagrams admitted into a different tenant that reused the port.
+const L4_PORT_QUARANTINE_SECS: u64 = 3600;
+
+/// Current unix time in whole seconds (0 on a pre-epoch clock — never panics).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The kernel's `ip_local_port_range` low bound. The auto L4 range MUST sit strictly below
+/// it. Fails closed (a missing/garbled sysctl aborts the L4 allocation rather than risking
+/// an overlap that silently steals a kernel ephemeral port).
+fn ip_local_port_range_floor() -> Result<u16> {
+    let s = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .context("read /proc/sys/net/ipv4/ip_local_port_range")?;
+    s.split_whitespace()
+        .next()
+        .and_then(|t| t.parse::<u16>().ok())
+        .context("parse ip_local_port_range low bound")
+}
+
+/// Fail closed if the auto L4 port range overlaps the kernel ephemeral range. Checked
+/// lazily at first allocation (not unconditionally at startup) so a host that never uses
+/// L4 is unaffected by an aggressive local `ip_local_port_range`.
+fn validate_l4_port_range() -> Result<()> {
+    let floor = ip_local_port_range_floor()?;
+    if *L4_PORT_RANGE.end() >= floor {
+        anyhow::bail!(
+            "L4 auto port range {}..={} overlaps the kernel ephemeral range (ip_local_port_range floor {floor}); \
+             lower L4_PORT_RANGE below {floor}",
+            L4_PORT_RANGE.start(),
+            L4_PORT_RANGE.end(),
+        );
+    }
+    Ok(())
+}
+
+/// Candidate external ports for a NEW non-pinned L4 allocation, in try-order. Excludes
+/// ports already allocated in THIS host-island, ports still within the reuse-cooldown, and
+/// (belt-and-suspenders) the reserved 80/443. Randomized start within the range
+/// (`start_offset`) rather than lowest-free, to further cut reuse-collision odds [threat
+/// M1]. The caller bind-probes each in order — this is candidate selection only, pure and
+/// unit-testable. `now` compares against the quarantine freed-at.
+fn l4_port_candidates(
+    existing: &[PortAllocation],
+    quarantine: &[(u16, u64)],
+    host_id: &str,
+    now: u64,
+    start_offset: u16,
+) -> Vec<u16> {
+    let used: HashSet<u16> = existing
+        .iter()
+        .filter(|p| p.host_id.is_empty() || p.host_id == host_id)
+        .map(|p| p.external_port)
+        .collect();
+    let cooling: HashSet<u16> = quarantine
+        .iter()
+        .filter(|(_, freed)| now.saturating_sub(*freed) < L4_PORT_QUARANTINE_SECS)
+        .map(|(port, _)| *port)
+        .collect();
+    let span = (*L4_PORT_RANGE.end() - *L4_PORT_RANGE.start()) as u32 + 1;
+    let base = *L4_PORT_RANGE.start();
+    (0..span)
+        .map(|i| base + ((start_offset as u32 + i) % span) as u16)
+        .filter(|p| !used.contains(p) && !cooling.contains(p) && *p != 80 && *p != 443)
+        .collect()
+}
+
+/// Bind-probe an L4 external port on the host wildcard: a successful bind (then immediate
+/// close) means the port is free of BOTH jkbase allocations and any other host listener /
+/// ephemeral socket the control-store scan can't see [mechanics H3]. The real edge socket
+/// (L4Ingress) is the true arbiter and fails the deploy loud if it later can't bind; this
+/// probe only avoids reserving an obviously-taken port.
+fn l4_bind_probe(proto: L4Proto, port: u16) -> bool {
+    let addr = (std::net::Ipv4Addr::UNSPECIFIED, port);
+    match proto {
+        L4Proto::Udp => std::net::UdpSocket::bind(addr).is_ok(),
+        L4Proto::Tcp => std::net::TcpListener::bind(addr).is_ok(),
+    }
+}
+
+/// The next free in-VM transit port for a project's L4 land-forward: distinct from
+/// `guest_port` and from the project's other allocations' transit ports. Per-VM namespace
+/// (the agent listens on `eth0:agent_udp_port` inside the project's own VM), so only
+/// per-project uniqueness matters — not host-island scope.
+fn next_agent_udp_port(all: &[PortAllocation], project_id: &str, guest_port: u16) -> Result<u16> {
+    // Inside the VM the agent land-forward binds `0.0.0.0:agent_udp_port` while EACH stanza's
+    // tenant app binds `127.0.0.1:guest_port`. A `0.0.0.0:P` UDP bind conflicts with a
+    // `127.0.0.1:P` bind, so the transit port must avoid not just sibling agent ports but EVERY
+    // sibling stanza's guest_port too (and this stanza's own) — else a two-port project could
+    // seat its agent listener on a port another of its apps already holds, and one of the two
+    // binds fails at boot (a silent no-service). Exclude the union across the project.
+    let mut used: HashSet<u16> = all
+        .iter()
+        .filter(|p| p.project_id == project_id)
+        .flat_map(|p| [p.agent_udp_port, p.guest_port])
+        .collect();
+    used.insert(guest_port);
+    (40000u16..=40999)
+        .find(|p| !used.contains(p))
+        .context("no free in-VM transit port for project")
 }
 
 /// Pick the guest kernel: prefer the bumped 6.12 LTS image (erofs/fs-verity/
@@ -1806,6 +2028,40 @@ async fn async_main() -> Result<()> {
         tokio::spawn(async move { db_gateway::serve(store, gw_wake, registry, gw_host_id).await });
     }
 
+    // L4 UDP scale-to-zero ingress — the plane-global throttle/egress controller + the reconcile
+    // loop that materializes `[l4.*]` port allocations into live edge sockets + the datagram pump.
+    // The plane is shared with the idle + metering loops (they read its established-flow gauge,
+    // last-activity clock, drop counters, and reflection-suspected kill-switch flags). Its wake
+    // closure mirrors the proxy/DB gateway (all call `wake_db_reach`, resolving the app VM);
+    // Axis-1/Axis-2 abuse bounds live inside the plane + pump, keyed on base-project/tenant/dest-IP
+    // — never the spoofable source (design §3(c)).
+    let l4_plane: Arc<jkbase_proxy::l4_plane::L4Plane> = {
+        let platform_for_l4 = platform.clone();
+        let routing_for_l4 = routing_table.clone();
+        let domain_for_l4 = domain_map.clone();
+        let shipper_for_l4 = log_shipper.clone();
+        let l4_wake: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
+            let platform = platform_for_l4.clone();
+            let routing = routing_for_l4.clone();
+            let domains = domain_for_l4.clone();
+            let shipper = shipper_for_l4.clone();
+            Box::pin(async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await })
+        });
+        let plane = jkbase_proxy::l4_plane::L4Plane::new(Default::default(), l4_wake);
+        let (l4_host_id, l4_data_dir) = {
+            let plat = platform.lock().await;
+            (plat.host_id.clone(), plat.data_dir.clone())
+        };
+        tokio::spawn(l4_runtime::serve(
+            store.clone(),
+            routing_table.clone(),
+            plane.clone(),
+            l4_host_id,
+            l4_data_dir,
+        ));
+        plane
+    };
+
     // Spawn log shipper loop (pulls guest logs into the persistent store)
     tokio::spawn(log_shipper_loop(platform.clone(), log_shipper.clone()));
 
@@ -1826,6 +2082,7 @@ async fn async_main() -> Result<()> {
             idle_timeout,
             log_shipper.clone(),
             Some(db_relay_registry.clone()),
+            Some(l4_plane.clone()),
         ));
     }
 
@@ -1847,6 +2104,7 @@ async fn async_main() -> Result<()> {
         routing_table.clone(),
         log_shipper.clone(),
         Some(db_relay_registry.clone()),
+        Some(l4_plane.clone()),
     ));
 
     // Spawn the build egress proxy (default-deny forward proxy + SSRF defense).
@@ -2080,6 +2338,7 @@ async fn shutdown_signal(
             routing.clone(),
             shipper.clone(),
             None,
+            None,
         )
         .await
         {
@@ -2187,6 +2446,18 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
             let _ = plat.store.remove_snapshot_meta(project_id);
             let _ = plat.store.remove_vm_allocation(project_id);
+            // Free the project's L4 public ports, quarantining each so a stale client of the
+            // torn-down tenant can't later be admitted into a reused port's new owner
+            // [threat M1]. (The edge socket + firewall teardown land with the runtime relay.)
+            for port in plat
+                .store
+                .list_port_allocations_for_project(project_id)
+                .unwrap_or_default()
+            {
+                let _ = plat.store.quarantine_port(port.external_port, unix_now());
+            }
+            let _ = plat.store.remove_all_port_allocations(project_id);
+            let _ = plat.store.delete_l4_transit_secret(project_id);
             break (alloc, plat.data_dir.clone());
         }
     };
@@ -2999,6 +3270,64 @@ async fn handle_deploy(
         } else {
             None
         };
+
+    // Raw L4 (UDP/TCP) ingress: for each `[l4.*]` the tenant declared (baked into the new
+    // deploy's `_l4_ports.json`), allocate — or sticky-reuse — the PUBLIC `external_port` +
+    // in-VM `agent_udp_port`, and author the host→agent reach facts (`_l4.json`) baked into
+    // the image below. Neither host-asserted port is tenant-authored [P0-L4-8]; an admin PIN
+    // is a pre-existing pinned allocation honored by `allocate_port`'s stickiness. Per-port
+    // best-effort: an allocation failure skips that port (fail-closed — no public port) and
+    // never fails the deploy. The public edge socket + firewall open land with the runtime
+    // relay (design §3(a)); this slice only reserves the port and delivers the facts.
+    let l4_decls = read_l4_port_decls(&data_dir, project_id);
+    let l4_facts: Option<jkbase_common::config::L4Facts> = {
+        let mut facts = Vec::new();
+        for decl in &l4_decls {
+            let (name, proto, guest_port) = (&decl.name, decl.proto, decl.guest_port);
+            match plat.allocate_port(project_id, name, proto, guest_port, None) {
+                Ok(a) => facts.push(jkbase_common::config::L4PortFact {
+                    name: a.name,
+                    proto: a.proto,
+                    agent_udp_port: a.agent_udp_port,
+                    guest_port: a.guest_port,
+                }),
+                Err(e) => warn!(
+                    project = %project_id, l4_port = %name, error = %e,
+                    "L4 port allocation failed; skipping (no public port opened this deploy)"
+                ),
+            }
+        }
+        if facts.is_empty() {
+            None
+        } else {
+            // Per-VM transit secret (sticky) authenticating the host↔guest datagram leg
+            // (§3(a-auth)); baked into `_l4.json` for the agent, read from the store by the
+            // host relay. Minted independently of `[database]` — a pure-L4 project has no
+            // DB splice secret. A mint error ⇒ empty ⇒ the agent starts no land-forward
+            // (fail-closed), never a failed deploy.
+            let transit_secret = plat.store.l4_transit_secret(project_id).unwrap_or_default();
+            Some(jkbase_common::config::L4Facts {
+                ports: facts,
+                transit_secret,
+            })
+        }
+    };
+    // Reconcile: free + quarantine any previously-allocated port whose `[l4.*]` stanza was
+    // REMOVED in this deploy, so a stale client of the gone port can't later be admitted
+    // into a reused port's new owner [threat M1].
+    {
+        let declared: HashSet<&str> = l4_decls.iter().map(|d| d.name.as_str()).collect();
+        for old in plat
+            .store
+            .list_port_allocations_for_project(project_id)
+            .unwrap_or_default()
+        {
+            if !declared.contains(old.name.as_str()) {
+                let _ = plat.store.remove_port_allocation(project_id, &old.name);
+                let _ = plat.store.quarantine_port(old.external_port, unix_now());
+            }
+        }
+    }
     drop(plat);
 
     setup_tap(&alloc.tap_device).await?;
@@ -3053,6 +3382,7 @@ async fn handle_deploy(
                 &platform_egress,
                 storage_binding.as_ref(),
                 db_reach.as_ref(),
+                l4_facts.as_ref(),
                 &out,
                 app_content,
             )?;
@@ -3300,6 +3630,7 @@ async fn boot_db_vm(
                 &platform_egress,
                 None,
                 db_reach.as_ref(),
+                None, // the DB VM carries no L4 ports (L4 is app-VM only)
                 &out,
                 layer_plan::ImageContent::DbOnly,
             )?;
@@ -3474,10 +3805,12 @@ async fn hibernate_project(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
-    // Idle-path callers pass the DB relay registry so we can re-check for a LIVE managed-DB
-    // relay UNDER the platform lock (§5); shutdown/quota callers pass `None` — those paths
-    // hibernate regardless (relays are force-closed on drain; over-quota must win).
+    // Idle-path callers pass the DB relay registry + L4 plane so we can re-check for a LIVE
+    // managed-DB relay / L4 established flow UNDER the platform lock (§5/§3(d)); shutdown/quota
+    // callers pass `None` — those paths hibernate regardless (relays are force-closed on drain;
+    // over-quota must win).
     db_registry: Option<&Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
+    l4_plane: Option<&Arc<jkbase_proxy::l4_plane::L4Plane>>,
 ) -> Result<()> {
     let mut plat = platform.lock().await;
 
@@ -3491,6 +3824,15 @@ async fn hibernate_project(
             // connect and the client retries, waking the VM cleanly.
             if db_registry
                 .map(|r| r.conn_count(vm_identity::base_project_id(project_id)) > 0)
+                .unwrap_or(false)
+            {
+                return Ok(());
+            }
+            // §3(d): symmetric L4 re-check — an ESTABLISHED L4 flow that promoted since the idle
+            // loop's unlocked read keeps the VM warm, so a live UDP session isn't snapshotted
+            // mid-stream. Provisional flows deliberately don't count (they can't pin warm).
+            if l4_plane
+                .map(|p| p.conn_count(vm_identity::base_project_id(project_id)) > 0)
                 .unwrap_or(false)
             {
                 return Ok(());
@@ -3741,6 +4083,17 @@ async fn wake_project(
             return Err(jkbase_proxy::WakeError::Gone(
                 "no deployable content — redeploy to bring it back".to_string(),
             ));
+        }
+        // Surface the WAKE_BACKOFF throttle as `RateLimited` (distinct from a transient
+        // `Unavailable`) so a rate-cap read is legible in metrics and the L4 wake plane can
+        // tell "throttled" from "boot failed" — the design's promote-the-bail delta (§3(c)).
+        // `wake_project_inner` keeps its own backoff check as a TOCTOU backstop.
+        if let Some(t) = plat.wake_failures.get(project_id)
+            && t.elapsed() < WAKE_BACKOFF
+        {
+            return Err(jkbase_proxy::WakeError::RateLimited(format!(
+                "project {project_id} recently failed to wake; retry shortly"
+            )));
         }
     }
     wake_project_inner(project_id, platform, routing, domain_map, shipper)
@@ -4301,6 +4654,11 @@ async fn idle_detection_loop(
     idle_timeout: Duration,
     shipper: Arc<LogShipper>,
     db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
+    // The L4 plane contributes its OWN keep-warm signals (an established-flow gauge + an
+    // un-throttled last-datagram clock), read here and ANDed into `should_hibernate` — NEVER
+    // written back into the shared `activity` tracker, which would back-date another plane's
+    // hibernate clock and snapshot an HTTP/DB-active project mid-serve (§3(d) mechanics H5).
+    l4_plane: Option<Arc<jkbase_proxy::l4_plane::L4Plane>>,
 ) {
     let check_interval = Duration::from_secs(60);
 
@@ -4350,6 +4708,17 @@ async fn idle_detection_loop(
             && db_registry
                 .as_ref()
                 .map(|r| r.conn_count(vm_identity::base_project_id(&project_id)) == 0)
+                .unwrap_or(true)
+            // §3(d): keep an L4 project warm ONLY while it has an ESTABLISHED flow (a byte-silent
+            // but live inbound-only/streaming app stays warm via conn_count > 0). PROVISIONAL
+            // (unpromoted, spoofable) flows deliberately do NOT count — they carry their own 5s
+            // timeout and must not pin the VM warm, else a spoof flood that never establishes would
+            // hold it warm for the full idle_timeout (P0-L4-12 / §3(d)). When established flows
+            // drain, conn_count → 0 (the per-port idle sweep evicts them) and the VM hibernates on
+            // the normal shared-seed idle path — never back-dating the shared ActivityTracker.
+            && l4_plane
+                .as_ref()
+                .map(|p| p.conn_count(vm_identity::base_project_id(&project_id)) == 0)
                 .unwrap_or(true);
 
             if should_hibernate {
@@ -4360,6 +4729,7 @@ async fn idle_detection_loop(
                     routing.clone(),
                     shipper.clone(),
                     db_registry.as_ref(),
+                    l4_plane.as_ref(),
                 )
                 .await
                 {
@@ -5392,6 +5762,71 @@ fn project_db_rules_enabled(data_dir: &Path, project_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the host-baked `_l4_ports.json` (the tenant's `[l4.*]` declarations) for a
+/// project's live deployment, resolved to `(name, proto, guest_port)`. A missing/garbled
+/// file ⇒ empty. Entries with an unresolvable proto or a zero/oversize `guest_port` are
+/// dropped, and TCP is skipped defensively (preflight already rejected it, but the v1
+/// runtime data path is UDP-only). Mirrors [`project_is_dedicated`] — the same
+/// tenant-unforgeable sidecar.
+/// One tenant-declared `[l4.*]` port, read back from the baked `_l4_ports.json` sidecar. Carries
+/// the tenant facts (`name`/`proto`/`guest_port`) plus the RESOLVED per-port tunables
+/// (`idle_timeout_secs`/`amp_k`, already clamped at bake) the runtime relay needs — the design's
+/// completeness-M1 carriage (§3(b)/§3(d)). A pre-tunable sidecar (older bake) falls back to the
+/// `L4PortConfig` defaults so an old image never mis-sizes the relay.
+struct L4PortDecl {
+    name: String,
+    proto: L4Proto,
+    guest_port: u16,
+    idle_timeout_secs: u64,
+    amp_k: u8,
+}
+
+fn read_l4_port_decls(data_dir: &Path, project_id: &str) -> Vec<L4PortDecl> {
+    let path = data_dir
+        .join("hosting")
+        .join(project_id)
+        .join("live")
+        .join("_l4_ports.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&content) else {
+        return Vec::new();
+    };
+    arr.into_iter()
+        .filter_map(|v| {
+            let name = v.get("name")?.as_str()?.to_string();
+            let proto = match v.get("proto")?.as_str()? {
+                "udp" => L4Proto::Udp,
+                _ => return None, // TCP data path unbuilt in v1; anything else is invalid.
+            };
+            let guest_port = v.get("guest_port")?.as_u64()?;
+            if guest_port == 0 || guest_port > u16::MAX as u64 {
+                return None;
+            }
+            // Older sidecars predate the tunables → resolved defaults (60s idle, k=1). Re-clamp
+            // defensively even though the bake already clamped.
+            let idle_timeout_secs = v
+                .get("idle_timeout")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(60)
+                .clamp(15, 600);
+            let amp_k = v
+                .get("amp_k")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(1)
+                .clamp(1, 3) as u8;
+            Some(L4PortDecl {
+                name,
+                proto,
+                guest_port: guest_port as u16,
+                idle_timeout_secs,
+                amp_k,
+            })
+        })
+        .collect()
+}
+
 /// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
 /// (parsed host-side at deploy into `_database.json`'s `size_mib`) when present, else
 /// the platform default [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized
@@ -6063,6 +6498,10 @@ async fn metering_loop(
     routing: jkbase_proxy::RoutingTable,
     shipper: Arc<LogShipper>,
     db_registry: Option<Arc<jkbase_proxy::db_relay::DbRelayRegistry>>,
+    // The L4 plane's drop/event counters are drained + logged here (observability §8), and its
+    // reflection kill-switch is enforced: a flow flagged reflection-suspected (sustained
+    // egress:ingress above `amp_k`, or a destination-entropy spike) force-hibernates its VM.
+    l4_plane: Option<Arc<jkbase_proxy::l4_plane::L4Plane>>,
 ) {
     let mut state = metering::SamplerState::default();
     let mut last_sample = Instant::now();
@@ -6071,6 +6510,70 @@ async fn metering_loop(
     loop {
         tokio::time::sleep(METERING_TICK).await;
         ticks += 1;
+
+        // L4 observability + kill-switch (independent of the per-project rollups below). Drain the
+        // per-reason drop/event counters and emit a sampled structured log so an operator can SEE a
+        // spoof flood or reflection attempt in flight. Then force-hibernate any base project the
+        // plane flagged reflection-suspected (design §8 automatic egress kill-switch): closing the
+        // guest stops the reflected replies at the source, and the plane's own signature clears on
+        // cooldown so it can wake again cleanly.
+        if let Some(plane) = &l4_plane {
+            let c = plane.drain_counters();
+            if c.rate_cap
+                | c.budget_full
+                | c.warm_full_global
+                | c.flow_full_project
+                | c.flow_full_global
+                | c.header_auth_fail
+                | c.nonce_replay
+                | c.stale_epoch
+                | c.egress_amp_clamp
+                | c.egress_per_source
+                | c.egress_per_project
+                | c.egress_per_24
+                | c.egress_global
+                | c.c0_grant_rejected
+                | c.wakes_admitted
+                | c.promotions
+                != 0
+            {
+                info!(
+                    target: "l4_metrics",
+                    rate_cap = c.rate_cap, budget_full = c.budget_full, warm_full_global = c.warm_full_global,
+                    flow_full_project = c.flow_full_project, flow_full_global = c.flow_full_global,
+                    header_auth_fail = c.header_auth_fail, nonce_replay = c.nonce_replay, stale_epoch = c.stale_epoch,
+                    egress_amp_clamp = c.egress_amp_clamp, egress_per_source = c.egress_per_source,
+                    egress_per_project = c.egress_per_project, egress_per_24 = c.egress_per_24, egress_global = c.egress_global,
+                    c0_grant_rejected = c.c0_grant_rejected, c0_grants = c.c0_grants,
+                    wakes_admitted = c.wakes_admitted, wakes_coalesced = c.wakes_coalesced,
+                    promotions = c.promotions, provisional_expired = c.provisional_expired,
+                    "l4 plane counters (tick)"
+                );
+            }
+            // Iterate the SUSPECTED set directly: warm_projects() is the billing view and
+            // deliberately EXCLUDES reflection-suspected bases (§6 unbilled-suspected-hours), so
+            // iterating it here would never see a suspected project (the kill-switch would be dead
+            // code). reflection_suspected_projects() returns exactly the set to force-hibernate.
+            for base in plane.reflection_suspected_projects() {
+                let is_running =
+                    { platform.lock().await.vm_states.get(&base) == Some(&VmLifecycle::Running) };
+                if is_running {
+                    tracing::warn!(project = %base, "l4 reflection kill-switch: force-hibernating high-ratio/high-entropy flows");
+                    if let Err(e) = hibernate_project(
+                        &base,
+                        platform.clone(),
+                        routing.clone(),
+                        shipper.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::error!(project = %base, error = %e, "l4 kill-switch hibernate failed");
+                    }
+                }
+            }
+        }
         let now = jkbase_control::auth::timestamp();
         let hour_epoch = now / 3600 * 3600;
         let elapsed = last_sample.elapsed().as_secs().max(1);
@@ -6212,6 +6715,7 @@ async fn metering_loop(
                         platform.clone(),
                         routing.clone(),
                         shipper.clone(),
+                        None,
                         None,
                     )
                     .await
@@ -6630,6 +7134,48 @@ mod tests {
         assert_eq!(next_free_octet(&allocs, "peer"), Some(3));
         // Empty pool starts at .2.
         assert_eq!(next_free_octet(&[], "me"), Some(2));
+    }
+
+    #[test]
+    fn l4_port_candidates_scope_quarantine_and_randomize() {
+        let p = |ext: u16, host: &str| PortAllocation {
+            project_id: "x".into(),
+            name: format!("n{ext}"),
+            proto: "udp".into(),
+            external_port: ext,
+            guest_port: 9987,
+            agent_udp_port: 40000,
+            pinned: false,
+            host_id: host.into(),
+            placement_epoch: 0,
+        };
+        let base = *L4_PORT_RANGE.start();
+
+        // Host-island scoping: a peer's use of a port does NOT remove it from our candidates.
+        let existing = vec![p(base, "me"), p(base + 1, "peer")];
+        let cands = l4_port_candidates(&existing, &[], "me", 0, 0);
+        assert!(!cands.contains(&base), "our own allocated port is excluded");
+        assert!(
+            cands.contains(&(base + 1)),
+            "a peer-island port stays available to us"
+        );
+
+        // Quarantine: a still-cooling freed port is skipped; an expired one is offered.
+        let now = 10_000_000;
+        let q = vec![
+            (base + 2, now - 10),                          // cooling (< 3600s) → skip
+            (base + 3, now - (L4_PORT_QUARANTINE_SECS + 1)), // expired → offer
+        ];
+        let cands = l4_port_candidates(&[], &q, "me", now, 0);
+        assert!(!cands.contains(&(base + 2)), "cooling port skipped");
+        assert!(cands.contains(&(base + 3)), "expired-cooldown port offered");
+
+        // Randomized start: a non-zero offset rotates the try-order (not lowest-first).
+        let cands = l4_port_candidates(&[], &[], "me", 0, 5);
+        assert_eq!(cands.first(), Some(&(base + 5)));
+
+        // Never offers the reserved ports (they're outside the range anyway, but explicit).
+        assert!(!l4_port_candidates(&[], &[], "me", 0, 0).contains(&443));
     }
 
     #[test]

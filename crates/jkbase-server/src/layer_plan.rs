@@ -15,7 +15,7 @@
 //! mount, no root — `mkfs.ext4 -d`, threat-model P0-3).
 
 use anyhow::{Context, Result, ensure};
-use jkbase_common::config::{DbReachFacts, PlatformEgress};
+use jkbase_common::config::{DbReachFacts, L4Facts, PlatformEgress};
 use jkbase_common::layers::{RuntimeLayers, ServerLayers, VerityParams};
 
 /// The platform-managed own-bucket binding credential written into each function sidecar's
@@ -499,7 +499,7 @@ impl Drop for TempCleanup {
 /// The ergonomic default ([`ImageContent::All`]) call shape, exercised by the build-path tests;
 /// the production deploy path always names an explicit [`ImageContent`], so the bin target sees no
 /// non-test caller.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn build_metadata_image(
     deployment_dir: &Path,
     plan: &LayerPlan,
@@ -507,6 +507,7 @@ pub fn build_metadata_image(
     platform: &PlatformEgress,
     binding: Option<&StorageBinding>,
     db_reach: Option<&DbReachFacts>,
+    l4_facts: Option<&L4Facts>,
     out: &Path,
 ) -> Result<()> {
     build_metadata_image_with(
@@ -516,6 +517,7 @@ pub fn build_metadata_image(
         platform,
         binding,
         db_reach,
+        l4_facts,
         out,
         ImageContent::All,
     )
@@ -534,6 +536,7 @@ pub fn build_metadata_image_with(
     platform: &PlatformEgress,
     binding: Option<&StorageBinding>,
     db_reach: Option<&DbReachFacts>,
+    l4_facts: Option<&L4Facts>,
     out: &Path,
     content: ImageContent,
 ) -> Result<()> {
@@ -610,6 +613,13 @@ pub fn build_metadata_image_with(
             stage.join(DbReachFacts::FILE),
             serde_json::to_vec_pretty(reach)?,
         )?;
+    }
+
+    // Host-authored L4 ingress facts (`_l4.json`): the per-port agent-transit + guest
+    // loopback ports for the agent's land-forward. Written LAST (same reasoning as
+    // `_db_reach.json`) so it's tenant-unforgeable, and only for a project with `[l4.*]`.
+    if let Some(l4) = l4_facts {
+        std::fs::write(stage.join(L4Facts::FILE), serde_json::to_vec_pretty(l4)?)?;
     }
 
     build_ro_ext4_from_dir(&stage, &tmp_img, 8)

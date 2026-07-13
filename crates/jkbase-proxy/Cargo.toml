@@ -24,3 +24,4 @@ reqwest = { workspace = true }
 rustls-pemfile = { workspace = true }
 hickory-client = { workspace = true }
 base64 = { workspace = true }
+socket2 = "0.6"

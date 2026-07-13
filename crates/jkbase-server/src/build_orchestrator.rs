@@ -2107,6 +2107,15 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
         }
     }
 
+    // Raw L4 ingress ports: each `[l4.<name>]` resolves its proto (reject unknown), has a
+    // non-zero `guest_port`, and — in v1 — is UDP (TCP rejected until the follow-on data
+    // path lands). Fail-closed so a typo'd proto or an unbuilt transport aborts the deploy
+    // rather than allocating a dead public port. See docs/managed-l4-udp-ingress-design.md.
+    for (name, l4) in &config.l4 {
+        l4.validate(name)
+            .with_context(|| format!("[l4.{name}] section"))?;
+    }
+
     // The managed DB is supervised in-VM under the reserved server name `rhypedb` and is
     // loopback-only / NEVER routed. Fence that name from tenant input on both axes,
     // fail-closed at deploy: (1) a tenant server/function/site named `rhypedb` would
@@ -2233,6 +2242,12 @@ fn assemble_sidecars(config: &ProjectConfig, staged: &Path) -> Result<()> {
     // both compute_layer_plan (attach the rhypedb runtime) and the agent's DB supervisor.
     if let Some(j) = config.database_json() {
         std::fs::write(staged.join("_database.json"), j)?;
+    }
+    // Raw L4 ports marker (name/proto/guest_port; NEVER a host-asserted external_port or
+    // agent_udp_port — those the host allocates at deploy and delivers over the reserved
+    // `_l4.json` channel). Its presence drives the host's port allocation + firewall open.
+    if let Some(j) = config.l4_json() {
+        std::fs::write(staged.join("_l4_ports.json"), j)?;
     }
 
     // Stamp each function's RESOLVED public-egress policy into its `_functions/{name}.json`
@@ -3567,6 +3582,7 @@ esac
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -3737,6 +3753,12 @@ esac
         /// '../dist/babel.cjs'`). `bun run build` delegates vite's node-shebang bin to
         /// node when node is on PATH; without node it runs vite on bun's engine + fails.
         NetworkedSolidVite,
+        /// A generic L4 UDP echo tenant: an HTTP server on :3000 (readiness) plus a loopback
+        /// UDP echo on `127.0.0.1:9999` (the L4 service — bound in the app's own code, loopback
+        /// ONLY, so the agent must `/proc/net/udp`-poll for readiness). Drives the whole L4 seam
+        /// end-to-end: host edge socket → framed transit → agent land-forward → loopback echo →
+        /// back. Offline (no deps, no build network).
+        UdpEcho,
     }
     impl Workload {
         fn networked(self) -> bool {
@@ -3941,6 +3963,28 @@ console.log("listening on " + port);
                 write(
                     src.join("server/server.ts"),
                     "const port = Number(process.env.PORT) || 3000;\nBun.serve({ port, fetch() { return new Response(\"ok\\n\"); } });\nconsole.log(\"listening on \" + port);\n",
+                );
+            }
+            // L4 UDP: an HTTP server (readiness) + a loopback UDP echo (the L4 tenant service).
+            // The app binds 127.0.0.1:9999/udp in its OWN code (loopback only), so there is no
+            // manifest bind to synchronize on — the agent's /proc/net/udp readiness poll is what
+            // gates forwarding. Generic: no jkbase bytes, the app speaks only its own echo wire.
+            Workload::UdpEcho => {
+                write(
+                    src.join("server/server.ts"),
+                    r#"const port = Number(process.env.PORT) || 3000;
+Bun.serve({ port, fetch() { return new Response("ok\n"); } });
+Bun.udpSocket({
+  port: 9999,
+  hostname: "127.0.0.1",
+  socket: { data(socket, buf, p, addr) { socket.send(buf, p, addr); } },
+}).then(() => console.log("udp echo on 127.0.0.1:9999")).catch((e) => console.error("udp bind failed", e));
+console.log("listening on " + port);
+"#,
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
                 );
             }
         }
@@ -4857,6 +4901,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5015,6 +5060,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5257,6 +5303,7 @@ console.log("listening on " + port);
             &platform,
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5653,6 +5700,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -5871,6 +5919,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             Some(&db_reach),
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image (rules + JWKS)");
@@ -5989,6 +6038,179 @@ console.log("listening on " + port);
         );
     }
 
+    /// L4 UDP scale-to-zero ingress END-TO-END: a STOCK UDP client (zero jkbase bytes on its
+    /// wire) reaches a loopback-only UDP echo tenant through the WHOLE seam — host edge
+    /// `UdpSocket` → framed + direction-bound HMAC transit → agent land-forward → the app's
+    /// `127.0.0.1:9999/udp` echo → back. Boots a real microVM (the agent runs the land-forward
+    /// on `agent_udp_port`), stands up a host `L4Ingress` pointed at it, drives datagrams at
+    /// `host:external_port`, and asserts the exact payloads echo back with datagram boundaries
+    /// preserved. Proves design §7 items 1 (cold round-trip, no protocol inspection), 2
+    /// (boundary preservation), 8 (the agent `/proc/net/udp` readiness gate — a pure-UDP app
+    /// binds loopback in its own code, so nothing else could gate forwarding).
+    #[tokio::test]
+    #[ignore = "L4 UDP e2e: needs KVM + root + bun.ext4 + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn l4_udp_echo_e2e() {
+        use jkbase_common::config::{L4Facts, L4PortFact};
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use jkbase_proxy::l4_ingress::{L4Ingress, L4PortSpec, ResolveVmIp};
+        use jkbase_proxy::l4_plane::L4Plane;
+        use std::net::UdpSocket as StdUdp;
+        use std::sync::Arc;
+
+        let Some(fx) = bun_pipeline_build("udpecho", 1, Workload::UdpEcho).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        // Host-authored reserved-channel L4 facts (`_l4.json`): the agent land-forward listens on
+        // `agent_udp_port` and forwards to `127.0.0.1:guest_port`; the per-VM transit secret gates
+        // the wire (same value handed to the host `L4Ingress` below — the two MUST match).
+        const AGENT_UDP_PORT: u16 = 40000;
+        const GUEST_PORT: u16 = 9999;
+        const TRANSIT_SECRET: &str = "jkbl_e2e_transit_secret_0123456789abcdef";
+        let l4_facts = L4Facts {
+            ports: vec![L4PortFact {
+                name: "echo".into(),
+                proto: "udp".into(),
+                agent_udp_port: AGENT_UDP_PORT,
+                guest_port: GUEST_PORT,
+            }],
+            transit_secret: TRANSIT_SECRET.into(),
+        };
+
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, false)
+            .expect("compute layer plan (no DB, no data disk)");
+        let meta_img = fx.data.join("udpecho-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+            Some(&l4_facts),
+            &meta_img,
+        )
+        .expect("build metadata image with _l4.json");
+
+        // TAP + host/guest IPs (own /24, distinct from the DB e2es).
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("udpecho", "172.29.0.1", "172.29.0.2", "AA:FC:00:00:29:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("udpecho-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("udp echo VM should start");
+
+        // App booted (HTTP :80 answers). The agent's /proc/net/udp readiness poll then admits
+        // forwarding once the app binds 127.0.0.1:9999.
+        let ready = poll_http_200(guest_ip, 80, Duration::from_secs(90)).await;
+        eprintln!("[l4-e2e] http ready = {ready:?}");
+        assert!(ready.is_some(), "udp echo app never became HTTP-ready");
+
+        // --- HOST side: stand up an L4Ingress pointed at the (already-booted) VM. ---
+        // Test WakeCallback + resolve_vm_ip: the VM is already up, so both return its IP (the
+        // liveness path forwards without a boot).
+        let ip = guest_ip.to_string();
+        let wake: jkbase_proxy::WakeCallback = Arc::new(move |_pid: String| {
+            let ip = ip.clone();
+            Box::pin(async move { Ok(ip) })
+        });
+        let plane = L4Plane::new(Default::default(), wake);
+        let ip2 = guest_ip.to_string();
+        let resolve_vm_ip: ResolveVmIp = Arc::new(move |_pid: String| {
+            let ip = ip2.clone();
+            Box::pin(async move { Some(ip) })
+        });
+        const EXTERNAL_PORT: u16 = 21999;
+        let spec = L4PortSpec {
+            project_id: "udpecho".into(),
+            base_project: "udpecho".into(),
+            tenant_id: None,
+            name: "echo".into(),
+            proto: "udp".into(),
+            external_port: EXTERNAL_PORT,
+            agent_udp_port: AGENT_UDP_PORT,
+            guest_port: GUEST_PORT,
+            idle_timeout: Duration::from_secs(60),
+            amp_k: 1,
+            transit_secret: TRANSIT_SECRET.into(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ingress = L4Ingress::bind(spec, plane.clone(), resolve_vm_ip, cancel.clone())
+            .await
+            .expect("edge socket binds");
+        tokio::spawn(ingress.run());
+
+        // --- Drive a STOCK UDP client at host:EXTERNAL_PORT; assert exact-payload echo. ---
+        let echo = tokio::task::spawn_blocking(move || {
+            let sock = StdUdp::bind("0.0.0.0:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+            let dst = format!("127.0.0.1:{EXTERNAL_PORT}");
+            // Retry: the first datagram cold-admits the flow and may race the agent's readiness
+            // poll / buffered replay. Assert the LAST-sent payload echoes exactly (boundary kept).
+            for i in 0..12 {
+                let msg = format!("hello-l4-{i}");
+                let _ = sock.send_to(msg.as_bytes(), &dst);
+                let mut buf = [0u8; 256];
+                if let Ok((n, _)) = sock.recv_from(&mut buf)
+                    && &buf[..n] == msg.as_bytes()
+                {
+                    return Some(msg);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            None
+        })
+        .await
+        .unwrap();
+        eprintln!("[l4-e2e] echo = {echo:?}");
+
+        cancel.cancel();
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+
+        assert!(
+            echo.as_deref()
+                .map(|s| s.starts_with("hello-l4-"))
+                .unwrap_or(false),
+            "L4 UDP echo did not round-trip through the seam; got {echo:?}"
+        );
+        println!("PASS: L4 UDP echo round-tripped the full seam (edge → transit → agent → loopback → back)");
+    }
+
     /// The managed-DB REACH-PLANE end-to-end proof: a genuine `@rhypedb/client` round-trip
     /// travels the WHOLE external path — real `jkbase db proxy` sidecar → TLS `:443`-style
     /// edge (ALPN demux + preamble auth + tls-exporter channel-bind + wake) → agent
@@ -6099,6 +6321,7 @@ console.log("listening on " + port);
                 dedicated: false,
                 jwks: None,
             }),
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("build the metadata image");
@@ -6517,6 +6740,7 @@ console.log("listening on " + port);
                 dedicated: false,
                 jwks: None,
             }),
+            None /* l4_facts */,
             &meta_img,
             crate::layer_plan::ImageContent::DbOnly,
         )
@@ -6748,6 +6972,7 @@ console.log("listening on " + port);
                 dedicated: true, // ← drives the agent's in-guest loopback proxy
                 jwks: None,
             }),
+            None /* l4_facts */,
             &app_meta,
             crate::layer_plan::ImageContent::AppNoDb,
         )
@@ -6776,6 +7001,7 @@ console.log("listening on " + port);
                 dedicated: false,
                 jwks: None,
             }),
+            None /* l4_facts */,
             &db_meta,
             crate::layer_plan::ImageContent::DbOnly,
         )
@@ -7481,6 +7707,7 @@ console.log("listening on " + port);
             &Default::default(),
             None,
             None,
+            None /* l4_facts */,
             &meta_img,
         )
         .expect("metadata image");

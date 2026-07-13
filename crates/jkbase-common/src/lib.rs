@@ -4,6 +4,7 @@ pub mod config;
 /// so client and server can never drift on a security seam.
 pub mod db_preamble;
 pub mod egress;
+pub mod l4_transit;
 pub mod layers;
 pub mod logs;
 pub mod routing;

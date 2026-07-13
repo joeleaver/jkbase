@@ -3,6 +3,7 @@ mod container_supervisor;
 mod dmverity;
 mod function_egress;
 mod function_runtime;
+mod l4_forward;
 mod log_sink;
 mod objectstore_host;
 mod static_server;
@@ -177,6 +178,18 @@ fn load_platform_egress(serve_dir: &Path) -> jkbase_common::config::PlatformEgre
 /// unreachable and the admin token stays unset — fail-closed, never open.
 fn load_db_reach_facts(serve_dir: &Path) -> jkbase_common::config::DbReachFacts {
     let path = serve_dir.join(jkbase_common::config::DbReachFacts::FILE);
+    std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Read the host-written `_l4.json` L4 (UDP) reach facts from the metadata image. Absent/malformed
+/// ⇒ default (no ports, empty transit secret), so the agent starts no land-forward — fail-closed,
+/// never a silent unauthenticated UDP surface on the hostile L2 segment (P0-L4-8/-9). Sibling of
+/// [`load_db_reach_facts`]; the same host-authored `_`-channel family.
+fn load_l4_facts(serve_dir: &Path) -> jkbase_common::config::L4Facts {
+    let path = serve_dir.join(jkbase_common::config::L4Facts::FILE);
     std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -620,6 +633,23 @@ async fn main() -> Result<()> {
                 containers_for_health.run_health_checks().await;
             }
         });
+    }
+
+    // L4 (UDP) scale-to-zero ingress land-forward. The host relay dials `vm_ip:agent_udp_port` with
+    // per-datagram-authenticated transit frames (`l4_transit`); each task const-time verifies +
+    // strips the header and forwards the payload to `127.0.0.1:guest_port` (the port the tenant's
+    // service binds in its OWN code — the agent never binds eth0, P0-L4-1). Facts are host-authored
+    // and tenant-unforgeable (`_l4.json`). Empty transit secret (old images / no `[l4.*]`) ⇒ start
+    // nothing (fail-closed — an empty key would let a co-tenant forge the MAC). One task per port,
+    // each self-contained (not a field on AgentState) so a fault on one port can't wedge another.
+    let l4 = load_l4_facts(&serve_dir);
+    if !l4.transit_secret.is_empty() {
+        for fact in &l4.ports {
+            tokio::spawn(l4_forward::run_l4_land_forward(
+                fact.clone(),
+                l4.transit_secret.clone(),
+            ));
+        }
     }
 
     let port: u16 = std::env::var("JKBASE_PORT")

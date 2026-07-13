@@ -120,6 +120,40 @@ pub enum Command {
     /// Manage jkbase-Auth (per-project EdDSA-JWT issuer): issuer keys, key rotation, JWKS
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Manage raw L4 (UDP/TCP) ingress ports (scale-to-zero) — e.g. a TeamSpeak server
+    #[command(subcommand)]
+    L4(L4Command),
+}
+
+#[derive(Subcommand)]
+pub enum L4Command {
+    /// List the project's allocated L4 ports (name, proto, public + guest port, pinned).
+    /// This is how a non-pinned tenant discovers its randomly-allocated public port.
+    Ls {
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
+    /// Pin a fixed public port for an `[l4.<name>]` port (PLATFORM-ADMIN only). Use for a
+    /// well-known port like TeamSpeak's 9987 so existing client bookmarks keep working.
+    Pin {
+        /// The `[l4.<name>]` key to pin
+        name: String,
+        /// The fixed public port to grant (must be free; never evicts another project)
+        port: u16,
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform-operator admin token (falls back to $JKBASE_ADMIN_TOKEN)
+        #[arg(long, env = "JKBASE_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -490,6 +524,72 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Repo(cmd) => repo::run(cmd).await,
         Command::Db(cmd) => run_db(cmd).await,
         Command::Auth(cmd) => run_auth(cmd).await,
+        Command::L4(cmd) => run_l4(cmd).await,
+    }
+}
+
+async fn run_l4(cmd: L4Command) -> anyhow::Result<()> {
+    match cmd {
+        L4Command::Ls { project, api } => {
+            let project_id = resolve_project_id(project)?;
+            let client = auth_client()?;
+            let resp = client
+                .get(format!("{api}/projects/{project_id}/l4"))
+                .send()
+                .await
+                .context("failed to connect to API")?;
+            let ports: Vec<serde_json::Value> = api_json(resp).await?;
+            if ports.is_empty() {
+                println!("No L4 ports allocated for project '{project_id}'");
+                return Ok(());
+            }
+            println!(
+                "{:<16} {:<6} {:<8} {:<8} PINNED",
+                "NAME", "PROTO", "PUBLIC", "GUEST"
+            );
+            for p in &ports {
+                let guest = p["guest_port"].as_u64().unwrap_or(0);
+                println!(
+                    "{:<16} {:<6} {:<8} {:<8} {}",
+                    p["name"].as_str().unwrap_or(""),
+                    p["proto"].as_str().unwrap_or(""),
+                    p["external_port"].as_u64().unwrap_or(0),
+                    // A pre-deploy pin has no guest_port yet (filled at the next deploy).
+                    if guest == 0 { "-".to_string() } else { guest.to_string() },
+                    if p["pinned"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            Ok(())
+        }
+        L4Command::Pin {
+            name,
+            port,
+            project,
+            admin_token,
+            api,
+        } => {
+            let project_id = resolve_project_id(project)?;
+            let client = auth_client()?;
+            let mut post = client
+                .post(format!("{api}/projects/{project_id}/l4"))
+                .json(&serde_json::json!({ "name": name, "port": port }));
+            if let Some(tok) = &admin_token {
+                post = post.header("X-Admin-Token", tok);
+            }
+            let resp = post.send().await.context("failed to connect to API")?;
+            let body: serde_json::Value = api_json(resp).await?;
+            println!(
+                "Pinned L4 port '{}' of project '{project_id}' to public port {}.",
+                body["name"].as_str().unwrap_or(&name),
+                body["external_port"].as_u64().unwrap_or(port as u64),
+            );
+            println!("  Redeploy the project for the pin to take effect on the edge socket.");
+            Ok(())
+        }
     }
 }
 

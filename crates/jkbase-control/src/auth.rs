@@ -133,6 +133,21 @@ pub fn generate_rhypedb_admin_token() -> String {
     )
 }
 
+/// Mint a per-VM **L4 transit secret** (256-bit) — the host↔guest shared key that
+/// authenticates every L4 UDP transit datagram (`l4_transit::seal`/`open`), so a co-tenant on
+/// the L2 bridge can't inject into the agent's land-forward. Distinct `jkbl_` prefix so a
+/// leaked value is self-identifying. Unlike the DB splice secret this is minted for ANY
+/// project with `[l4.*]` (not only managed-DB projects). Stored host-side (control db + the
+/// per-VM `_l4.json`), never tenant-facing.
+pub fn generate_l4_transit_secret() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!(
+        "jkbl_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
+}
+
 /// Generate a 32-byte Ed25519 signing seed — the per-project jkbase-Auth PRIVATE key material
 /// (P3). Uses the same `OsRng.fill_bytes` as the rest of the minting family; the seed becomes a
 /// keypair via `jose::SigningKeypair::from_seed` and is stored base64url'd, host-only and never
