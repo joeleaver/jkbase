@@ -172,6 +172,10 @@ pub struct L4Counters {
     pub promotions: u64,
     pub provisional_expired: u64,
     pub c0_grants: u64,
+    /// Clamp-off (`amp_k==0`) ports whose reflection window closed with a shape signal (high
+    /// egress:ingress or destination spray) that was NOT auto-hibernated — the operator/abuse
+    /// signal for the retired kill-switch (W-econ/W4). NOT a drop.
+    pub reflection_shape_flagged: u64,
 }
 
 /// The proxy-side counters the pump increments. Agent-side reasons (`agent_map_full`,
@@ -229,6 +233,7 @@ struct AtomicCounters {
     promotions: AtomicU64,
     provisional_expired: AtomicU64,
     c0_grants: AtomicU64,
+    reflection_shape_flagged: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -258,6 +263,7 @@ impl AtomicCounters {
             promotions: self.promotions.swap(0, Ordering::Relaxed),
             provisional_expired: self.provisional_expired.swap(0, Ordering::Relaxed),
             c0_grants: self.c0_grants.swap(0, Ordering::Relaxed),
+            reflection_shape_flagged: self.reflection_shape_flagged.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -851,7 +857,13 @@ impl L4Plane {
         else {
             return;
         };
-        w.amp_k = amp_k;
+        // Sticky-MAX over the window, not last-write: the window is keyed by BASE but `amp_k` is
+        // per-PORT, so a project mixing a clamp-off port and an opt-in shaper port must not let
+        // whichever port's datagram happens to close the 10s window decide the kill-switch. Max
+        // means "any shaped port in this window ⇒ the shaper's kill-switch applies," which also
+        // defeats an attacker pinning a clamp-off trickle to zero out `amp_k` at window close and
+        // evade a co-located shaped port's kill-switch (review MEDIUM).
+        w.amp_k = w.amp_k.max(amp_k);
         w.last_activity = now;
         match dir {
             Dir::In => w.ingress = w.ingress.saturating_add(bytes as u64),
@@ -873,20 +885,33 @@ impl L4Plane {
                     .saturating_mul(w.ingress)
                     .saturating_add(REFLECTION_SLACK_BYTES);
             let entropy_exceeded = w.dest_overflow || w.dests.len() > REFLECTION_DEST_ENTROPY;
+            let shape_signal =
+                w.egress >= REFLECTION_MIN_EGRESS && (ratio_exceeded || entropy_exceeded);
             // The auto-hibernate kill-switch is a *shape* signal (ratio / destination spray), which
             // for an arbitrary workload is indistinguishable from a legit asymmetric or high-fan-out
-            // app (design §1.1). So it fires ONLY for a port that opted into the per-flow shaper
-            // (`amp_k != 0`); a default clamp-off port is bounded by the absolute aggregate caps +
-            // the metered per-tenant egress budget (over-cap ⇒ the monthly-quota hibernation), and
-            // its shape signal is surfaced to a human as an alert instead (W4), never an auto-kill
-            // that would strangle a legitimate broadcaster (smarter-limiting arc, W-econ/W-killswitch).
-            let flag = w.amp_k != 0
-                && w.egress >= REFLECTION_MIN_EGRESS
-                && (ratio_exceeded || entropy_exceeded);
-            if flag {
-                suspected.insert(base.to_string());
-            } else {
-                suspected.remove(base);
+            // app (design §1.1). So it AUTO-HIBERNATES only for a port that opted into the per-flow
+            // shaper (`amp_k != 0`). A default clamp-off port is bounded instead by the absolute
+            // aggregate caps + the metered per-tenant egress budget (over-cap ⇒ monthly-quota
+            // hibernation), and its shape signal is ATTRIBUTED + ALERTED to a human rather than
+            // auto-killed — never strangling a legitimate broadcaster (W-econ/W-killswitch/W4).
+            if w.amp_k != 0 {
+                if shape_signal {
+                    suspected.insert(base.to_string());
+                } else {
+                    suspected.remove(base);
+                }
+            } else if shape_signal {
+                self.counters
+                    .reflection_shape_flagged
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    project = %base,
+                    egress = w.egress,
+                    ingress = w.ingress,
+                    dests = w.dests.len(),
+                    dest_overflow = w.dest_overflow,
+                    "l4: clamp-off port shows a reflection shape (high egress:ingress or destination spray) — bounded by absolute caps + metered budget; review for abuse (no auto-hibernate)"
+                );
             }
             *w = RefWindow::fresh(now, amp_k);
         }
@@ -1333,11 +1358,31 @@ mod tests {
         let t1 = t0 + REFLECTION_WINDOW + Duration::from_millis(1);
         p.note_egress("wide", 1, 0, v, t1);
         assert!(!p.is_reflection_suspected("wide"));
+        // ...but the shape signal is ATTRIBUTED + ALERTED (counter), not silently dropped.
+        assert!(p.drain_counters().reflection_shape_flagged >= 1);
         // An OPT-IN shaper port (amp_k=1) with the same shape IS still flagged.
         p.note_ingress("shaped", 100, 1, t0);
         p.note_egress("shaped", 5_000_000, 1, v, t0);
         p.note_egress("shaped", 1, 1, v, t1);
         assert!(p.is_reflection_suspected("shaped"));
+    }
+
+    #[test]
+    fn refwindow_amp_k_is_sticky_max_across_ports() {
+        // A base mixing a clamp-off port (0) and a shaped port (2) in one window: the kill-switch
+        // must apply (sticky-max ⇒ w.amp_k=2), even if a clamp-off datagram closes the window —
+        // defeating the "pin a clamp-off trickle to evade the shaped port's kill-switch" attack.
+        let p = plane();
+        let t0 = Instant::now();
+        let v: IpAddr = "192.0.2.71".parse().unwrap();
+        p.note_ingress("mix", 100, 2, t0); // shaped-port datagram opens the window
+        p.note_egress("mix", 5_000_000, 2, v, t0);
+        let t1 = t0 + REFLECTION_WINDOW + Duration::from_millis(1);
+        p.note_egress("mix", 1, 0, v, t1); // clamp-off datagram CLOSES the window
+        assert!(
+            p.is_reflection_suspected("mix"),
+            "sticky-max amp_k keeps the shaped port's kill-switch armed at window close"
+        );
     }
 
     #[test]
