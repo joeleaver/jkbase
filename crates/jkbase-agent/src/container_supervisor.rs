@@ -745,12 +745,12 @@ fn spawn_server_chroot(
 const LAYER_RUN_BASE: &str = "/tmp/jkbase-run";
 
 /// DNS resolver written into each runtime container's `/etc/resolv.conf`: the runtime
-/// BRIDGE GATEWAY (172.16.0.1), where the host runs a DNS forwarder (systemd-resolved
-/// exposed on the bridge IP; see tools/setup-bridge.sh). Without this an app can reach
-/// literal IPs but cannot resolve hostnames. We point at the gateway rather than a
-/// public resolver because many hosts (e.g. OVH) block outbound UDP/53 to public
-/// resolvers — a UDP/53 query to the LOCAL gateway always works, and the host forwards
-/// upstream however it can (provider-agnostic, works for every DNS client).
+/// BRIDGE GATEWAY (172.16.0.1), where the host runs a DNS forwarder (jkbase-server's
+/// `dns_forwarder`, which relays to the host's own resolver; see tools/setup-bridge.sh).
+/// Without this an app can reach literal IPs but cannot resolve hostnames. We point at the
+/// gateway rather than a public resolver because many hosts (e.g. OVH) block outbound UDP/53
+/// to public resolvers — a UDP/53 query to the LOCAL gateway always works, and the host
+/// forwards upstream however it can (provider-agnostic, works for every DNS client).
 const RUNTIME_RESOLV_CONF: &str = "nameserver 172.16.0.1\noptions edns0\n";
 
 /// Layered server: compose `lowerdir=app:runtime:base` over a tmpfs upper, then
@@ -790,25 +790,21 @@ fn spawn_server_layered(
     // /etc/resolv.conf (custom resolver / search / ndots).
     let image_self = lowerdirs.len() == 1;
 
-    // Give the container working DNS: write /etc/resolv.conf into the overlay UPPER dir,
-    // so it shadows the lower and appears in the merged root the child pivots into.
-    // Best-effort — a missing resolver degrades to literal-IP-only egress, not a server
-    // failure. EXCEPTION: for a self-contained image that ships its OWN resolv.conf,
-    // honour it rather than clobbering it with our public resolvers.
-    let lower_has_resolv = image_self
-        && lowerdirs
-            .first()
-            .map(|l| l.join("etc/resolv.conf").exists())
-            .unwrap_or(false);
-    if lower_has_resolv {
-        info!(server = %name, "image ships its own /etc/resolv.conf; not overriding");
-    } else {
-        let etc = upper.join("etc");
-        if let Err(e) = std::fs::create_dir_all(&etc)
-            .and_then(|()| std::fs::write(etc.join("resolv.conf"), RUNTIME_RESOLV_CONF))
-        {
-            warn!(server = %name, error = %e, "failed to write container resolv.conf; DNS may not resolve");
-        }
+    // Give the container working DNS: write /etc/resolv.conf into the overlay UPPER dir, so it
+    // shadows the lower and appears in the merged root the child pivots into. FORCE it even for a
+    // self-contained image (`image_self`): the guest's ONLY reachable resolver is the bridge
+    // gateway (`172.16.0.1`) — it has no route to any other nameserver (public UDP/53 is NAT'd out
+    // but blackholed by many hosts, and 127.0.0.53 is dead inside the VM). An image-shipped
+    // resolv.conf (a baked `127.0.0.53`, an empty file → glibc's `127.0.0.1`, or a static public
+    // resolver) therefore points at a resolver the guest can't reach → `EAI_AGAIN` and a
+    // multi-second-per-lookup stall (hit live deploying TeamSpeak 3, a Dockerfile image). So we
+    // never honour the image's file — we overwrite unconditionally. Best-effort: a write failure
+    // degrades to whatever the image shipped, not a server crash.
+    let etc = upper.join("etc");
+    if let Err(e) = std::fs::create_dir_all(&etc)
+        .and_then(|()| std::fs::write(etc.join("resolv.conf"), RUNTIME_RESOLV_CONF))
+    {
+        warn!(server = %name, error = %e, "failed to write container resolv.conf; DNS may not resolve");
     }
 
     let working_dir = manifest
@@ -890,6 +886,7 @@ struct LayeredSetup {
     proc_target: CString,  // merged/proc
     sys_target: CString,   // merged/sys
     dev_target: CString,   // merged/dev
+    shm_target: CString,   // merged/dev/shm
     oldroot_dir: CString,  // merged/oldroot (mkdir before pivot)
     volume_binds: Vec<(CString, CString)>, // (host src, merged/<mount>)
     working_dir: CString,  // chdir target inside the new root
@@ -899,6 +896,8 @@ struct LayeredSetup {
     c_proc: CString,
     c_sysfs: CString,
     c_devtmpfs: CString,
+    c_tmpfs: CString,
+    shm_opts: CString,      // "size=64m,mode=1777" — /dev/shm tmpfs bound + sticky
     c_oldroot_abs: CString, // "/oldroot" after pivot
 }
 
@@ -942,6 +941,7 @@ impl LayeredSetup {
             proc_target: cpath(&merged.join("proc"))?,
             sys_target: cpath(&merged.join("sys"))?,
             dev_target: cpath(&merged.join("dev"))?,
+            shm_target: cpath(&merged.join("dev/shm"))?,
             oldroot_dir: cpath(&merged.join("oldroot"))?,
             volume_binds,
             working_dir: cstr(working_dir)?,
@@ -950,6 +950,8 @@ impl LayeredSetup {
             c_proc: cstr("proc")?,
             c_sysfs: cstr("sysfs")?,
             c_devtmpfs: cstr("devtmpfs")?,
+            c_tmpfs: cstr("tmpfs")?,
+            shm_opts: cstr("size=64m,mode=1777")?,
             c_oldroot_abs: cstr("/oldroot")?,
         })
     }
@@ -1021,6 +1023,22 @@ impl LayeredSetup {
             {
                 return Err(io::Error::last_os_error());
             }
+            // /dev/shm: POSIX shared memory (`shm_open`) + process-shared pthread mutexes/condvars.
+            // Docker provides it (a 64 MiB tmpfs) by default, so off-the-shelf apps assume it
+            // exists — TeamSpeak's accounting service + its process-shared mutexes abort with
+            // "mutex lock failed: Invalid argument" without it. Mount into the freshly-mounted
+            // devtmpfs at `/dev/shm`, size-capped (64 MiB) so a tenant can't turn it into unbounded
+            // host memory pressure, mode 1777 (world-writable + sticky, like Docker's). Best-effort:
+            // a mount failure just degrades to no-/dev/shm (the prior behaviour), never fatal — an
+            // app that needs it will surface its own clear error, one that doesn't is unaffected.
+            libc::mkdir(self.shm_target.as_ptr(), 0o755);
+            let _ = libc::mount(
+                self.c_tmpfs.as_ptr(),
+                self.shm_target.as_ptr(),
+                self.c_tmpfs.as_ptr(),
+                0,
+                self.shm_opts.as_ptr().cast(),
+            );
             // Bind persistent volumes (data disk) into the new root. Best-effort: a
             // volume that vanished between the host-side check and here must not kill
             // the server — it runs without that volume, matching the flat path's
