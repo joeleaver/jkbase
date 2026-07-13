@@ -590,24 +590,31 @@ impl L4Ingress {
         flow.last_seen = now;
 
         // ---- Egress controls (Axis 2, §2.5) ----
-        // 1. per-flow ratio credit + one-shot C0.
-        match flow.egress.try_egress(n, c0_bytes) {
-            RatioVerdict::Allowed => {}
-            RatioVerdict::Denied => {
-                self.plane.count(DropReason::EgressAmpClamp);
-                return None;
-            }
-            RatioVerdict::NeedC0 => {
-                // Per-port rate first (local), then the plane's fresh-source + global rate.
-                if !c0_rate.try_take(1.0, now) || !self.plane.try_c0_grant(src.ip(), now) {
-                    self.plane.count(DropReason::C0GrantRejected);
+        // 1. Per-flow ratio credit + one-shot C0 — an OPT-IN per-port shaper (`amp_k` 1..=3).
+        //    RETIRED as the default gate (`amp_k == 0`, smarter-limiting arc / W-econ): arbitrary
+        //    asymmetric workloads reply freely, bounded instead by the absolute aggregate caps below
+        //    + the metered per-tenant egress budget. Only a port that explicitly opts into the
+        //    byte-for-byte shaper runs this clamp.
+        if amp_k != 0 {
+            match flow.egress.try_egress(n, c0_bytes) {
+                RatioVerdict::Allowed => {}
+                RatioVerdict::Denied => {
+                    self.plane.count(DropReason::EgressAmpClamp);
                     return None;
                 }
-                flow.egress.commit_c0(n);
-                self.plane.event(L4Event::C0Grant);
+                RatioVerdict::NeedC0 => {
+                    // Per-port rate first (local), then the plane's fresh-source + global rate.
+                    if !c0_rate.try_take(1.0, now) || !self.plane.try_c0_grant(src.ip(), now) {
+                        self.plane.count(DropReason::C0GrantRejected);
+                        return None;
+                    }
+                    flow.egress.commit_c0(n);
+                    self.plane.event(L4Event::C0Grant);
+                }
             }
         }
-        // 2–5. per-source(IP) → per-/24 → per-project → global aggregate caps.
+        // 2–5. per-source(IP) → per-/24 → per-project → global aggregate caps — ALWAYS enforced
+        //    (the workload-agnostic third-party bound that never breaks a legit app).
         if let Err(rej) = self.plane.try_egress_aggregate(base, src.ip(), n, now) {
             self.plane.count(match rej {
                 EgressReject::PerSource => DropReason::EgressPerSource,

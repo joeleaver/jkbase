@@ -904,7 +904,16 @@ impl L4Plane {
                     .saturating_mul(w.ingress)
                     .saturating_add(REFLECTION_SLACK_BYTES);
             let entropy_exceeded = w.dest_overflow || w.dests.len() > REFLECTION_DEST_ENTROPY;
-            let flag = w.egress >= REFLECTION_MIN_EGRESS && (ratio_exceeded || entropy_exceeded);
+            // The auto-hibernate kill-switch is a *shape* signal (ratio / destination spray), which
+            // for an arbitrary workload is indistinguishable from a legit asymmetric or high-fan-out
+            // app (design §1.1). So it fires ONLY for a port that opted into the per-flow shaper
+            // (`amp_k != 0`); a default clamp-off port is bounded by the absolute aggregate caps +
+            // the metered per-tenant egress budget (over-cap ⇒ the monthly-quota hibernation), and
+            // its shape signal is surfaced to a human as an alert instead (W4), never an auto-kill
+            // that would strangle a legitimate broadcaster (smarter-limiting arc, W-econ/W-killswitch).
+            let flag = w.amp_k != 0
+                && w.egress >= REFLECTION_MIN_EGRESS
+                && (ratio_exceeded || entropy_exceeded);
             if flag {
                 suspected.insert(base.to_string());
             } else {
@@ -1339,6 +1348,27 @@ mod tests {
         p.note_egress("bad", 1, 1, victim, t1);
         assert!(p.is_reflection_suspected("bad"));
         assert!(p.warm_projects().is_empty()); // suspected excluded from warm accrual
+    }
+
+    #[test]
+    fn clamp_off_port_is_never_shape_killed() {
+        // amp_k=0 (the default; per-flow clamp retired, W-econ): even a massive egress:ingress
+        // asymmetry must NOT auto-hibernate — a legit asymmetric/broadcast app is in-band
+        // indistinguishable from a reflector (§1.1), so shape can't gate it. Its bound is the
+        // absolute caps + the metered egress budget instead.
+        let p = plane();
+        let t0 = Instant::now();
+        let v: IpAddr = "192.0.2.70".parse().unwrap();
+        p.note_ingress("wide", 100, 0, t0);
+        p.note_egress("wide", 5_000_000, 0, v, t0);
+        let t1 = t0 + REFLECTION_WINDOW + Duration::from_millis(1);
+        p.note_egress("wide", 1, 0, v, t1);
+        assert!(!p.is_reflection_suspected("wide"));
+        // An OPT-IN shaper port (amp_k=1) with the same shape IS still flagged.
+        p.note_ingress("shaped", 100, 1, t0);
+        p.note_egress("shaped", 5_000_000, 1, v, t0);
+        p.note_egress("shaped", 1, 1, v, t1);
+        assert!(p.is_reflection_suspected("shaped"));
     }
 
     #[test]
