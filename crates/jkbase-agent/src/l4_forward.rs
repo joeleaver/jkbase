@@ -24,7 +24,7 @@
 //! overflow, one self-contained task per port.
 
 use jkbase_common::config::L4PortFact;
-use jkbase_common::l4_transit::{self, L4Dir, L4TransitHeader, L4_HEADER_LEN};
+use jkbase_common::l4_transit::{self, L4_HEADER_LEN, L4Dir, L4TransitHeader};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;

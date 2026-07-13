@@ -585,11 +585,9 @@ impl L4Plane {
         let mut ws = self.wake_state.lock().unwrap();
         let burst = self.limits.wake_rate_burst as f64;
         let refill = self.limits.wake_rate_refill_per_sec;
-        match ws
-            .wake_rate
-            .get_or_insert_with(base.to_string(), now, || {
-                TokenBucket::new(refill, burst, now)
-            }) {
+        match ws.wake_rate.get_or_insert_with(base.to_string(), now, || {
+            TokenBucket::new(refill, burst, now)
+        }) {
             Some(b) => b.try_take(1.0, now),
             // Wake-rate map itself at capacity (many distinct bases) ⇒ fail-closed = DROP.
             None => false,
@@ -661,7 +659,8 @@ impl L4Plane {
             Ok(p) => p,
             Err(_) => return BootAdmit::BudgetFull,
         };
-        ws.inflight.insert(base.to_string(), tenant.map(str::to_string));
+        ws.inflight
+            .insert(base.to_string(), tenant.map(str::to_string));
         if let Some(t) = tenant {
             *ws.tenant_inflight.entry(t.to_string()).or_insert(0) += 1;
         }
@@ -790,8 +789,9 @@ impl L4Plane {
         let pp_bps = self.limits.egress_per_project_bps as f64;
         let ok = match eg
             .per_project
-            .get_or_insert_with(base.to_string(), now, || TokenBucket::new(pp_bps, pp_bps, now))
-        {
+            .get_or_insert_with(base.to_string(), now, || {
+                TokenBucket::new(pp_bps, pp_bps, now)
+            }) {
             Some(b) => b.try_take(amount, now),
             None => false,
         };
@@ -824,7 +824,15 @@ impl L4Plane {
         self.note(base, Dir::Out, bytes, amp_k, Some(dest_ip), now);
     }
 
-    fn note(&self, base: &str, dir: Dir, bytes: usize, amp_k: u8, dest: Option<IpAddr>, now: Instant) {
+    fn note(
+        &self,
+        base: &str,
+        dir: Dir,
+        bytes: usize,
+        amp_k: u8,
+        dest: Option<IpAddr>,
+        now: Instant,
+    ) {
         let mut act = self.activity.lock().unwrap();
         let ActivityState {
             last,
@@ -838,7 +846,8 @@ impl L4Plane {
         }
         // Update the reflection window (skip if the map is full — fail-open on a monitor stamp,
         // never on an enforcement path).
-        let Some(w) = refl.get_or_insert_with(base.to_string(), now, || RefWindow::fresh(now, amp_k))
+        let Some(w) =
+            refl.get_or_insert_with(base.to_string(), now, || RefWindow::fresh(now, amp_k))
         else {
             return;
         };
@@ -1184,17 +1193,26 @@ mod tests {
             _ => panic!("expected Spawn"),
         };
         // A second packet for the SAME base coalesces (no 2nd permit).
-        assert!(matches!(p.ensure_boot("a", Some("t")), BootAdmit::Coalesced));
+        assert!(matches!(
+            p.ensure_boot("a", Some("t")),
+            BootAdmit::Coalesced
+        ));
         // A different base takes the 2nd permit.
         let _g2 = match p.ensure_boot("b", Some("t2")) {
             BootAdmit::Spawn(g) => g,
             _ => panic!("expected Spawn"),
         };
         // Budget now exhausted for a third distinct base.
-        assert!(matches!(p.ensure_boot("c", Some("t3")), BootAdmit::BudgetFull));
+        assert!(matches!(
+            p.ensure_boot("c", Some("t3")),
+            BootAdmit::BudgetFull
+        ));
         // Releasing a1's boot frees the permit + inflight.
         drop(g1);
-        assert!(matches!(p.ensure_boot("c", Some("t3")), BootAdmit::Spawn(_)));
+        assert!(matches!(
+            p.ensure_boot("c", Some("t3")),
+            BootAdmit::Spawn(_)
+        ));
     }
 
     #[test]
@@ -1210,7 +1228,10 @@ mod tests {
             _ => panic!(),
         };
         // Same tenant, different base: over the tenant's fair-share of 1 (even though budget=8).
-        assert!(matches!(p.ensure_boot("b", Some("t")), BootAdmit::BudgetFull));
+        assert!(matches!(
+            p.ensure_boot("b", Some("t")),
+            BootAdmit::BudgetFull
+        ));
         // A different tenant still gets its share.
         assert!(matches!(p.ensure_boot("c", Some("u")), BootAdmit::Spawn(_)));
     }

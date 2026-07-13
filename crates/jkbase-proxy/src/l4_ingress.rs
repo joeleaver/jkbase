@@ -20,8 +20,8 @@
 
 use crate::l4_egress::{RatioCredit, RatioVerdict, TokenBucket};
 use crate::l4_plane::{
-    BootAdmit, DropReason, EgressReject, L4Event, L4FlowGuard, L4Plane, ReserveReject,
-    WakeInFlight, FlowReservation,
+    BootAdmit, DropReason, EgressReject, FlowReservation, L4Event, L4FlowGuard, L4Plane,
+    ReserveReject, WakeInFlight,
 };
 use jkbase_common::l4_transit::{self, L4Dir, L4TransitHeader};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -358,7 +358,12 @@ impl L4Ingress {
     /// flow slot and returns [`ReachOutcome::CheckLiveness`] — the wake-rate token / boot are
     /// deferred to [`Self::reach_admit`] after an async liveness resolve, so a datagram to an
     /// already-WARM VM neither burns a wake-rate token nor forwards to a stale `vm_dst`.
-    fn reach_decide(self: &Arc<Self>, src: SocketAddr, payload: &[u8], now: Instant) -> ReachOutcome {
+    fn reach_decide(
+        self: &Arc<Self>,
+        src: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> ReachOutcome {
         let n = payload.len();
         let base = &self.spec.base_project;
         let tenant = self.spec.tenant_id.as_deref();
@@ -711,7 +716,8 @@ impl L4Ingress {
     /// packets. Setting `vm_dst` and draining under the SAME lock closes the race with a concurrent
     /// reach-loop decision — no datagram is buffered after `vm_dst` is set without being flushed.
     async fn on_ready(self: &Arc<Self>, vm_ip: String) {
-        let Ok(dst) = format!("{}:{}", vm_ip, self.spec.agent_udp_port).parse::<SocketAddr>() else {
+        let Ok(dst) = format!("{}:{}", vm_ip, self.spec.agent_udp_port).parse::<SocketAddr>()
+        else {
             // A vm_ip we can't parse is unusable; unwind cleanly (flows expire, client retransmits).
             self.clear_booting();
             return;
@@ -768,7 +774,9 @@ impl L4Ingress {
         }
         let bytes = flow.bytes_in.saturating_add(flow.bytes_out);
         let age = now.saturating_duration_since(flow.created);
-        if bytes >= MIN_ESTABLISH_BYTES && flow.pkts >= MIN_ESTABLISH_PKTS && age >= MIN_ESTABLISH_MS
+        if bytes >= MIN_ESTABLISH_BYTES
+            && flow.pkts >= MIN_ESTABLISH_PKTS
+            && age >= MIN_ESTABLISH_MS
             && let Some(guard) = self.plane.try_establish(base, tenant)
         {
             flow.established_guard = Some(guard);

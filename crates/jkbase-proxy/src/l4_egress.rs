@@ -319,11 +319,20 @@ mod tests {
     fn bounded_map_is_fail_closed_on_overflow() {
         let t = t0();
         let mut m: BoundedTtlMap<u32, TokenBucket> = BoundedTtlMap::new(2, Duration::from_secs(60));
-        assert!(m.get_or_insert_with(1, t, || TokenBucket::new(1.0, 1.0, t)).is_some());
-        assert!(m.get_or_insert_with(2, t, || TokenBucket::new(1.0, 1.0, t)).is_some());
+        assert!(
+            m.get_or_insert_with(1, t, || TokenBucket::new(1.0, 1.0, t))
+                .is_some()
+        );
+        assert!(
+            m.get_or_insert_with(2, t, || TokenBucket::new(1.0, 1.0, t))
+                .is_some()
+        );
         // Full + all entries live ⇒ a third distinct key is REFUSED (fail-closed), not seated by
         // evicting a live limiter.
-        assert!(m.get_or_insert_with(3, t, || TokenBucket::new(1.0, 1.0, t)).is_none());
+        assert!(
+            m.get_or_insert_with(3, t, || TokenBucket::new(1.0, 1.0, t))
+                .is_none()
+        );
         // An existing key is still served (no growth).
         assert!(m.get_or_insert_with(1, t, || unreachable!()).is_some());
         assert_eq!(m.len(), 2);

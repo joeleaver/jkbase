@@ -97,7 +97,8 @@ pub async fn serve(
             };
             let external_port = spec.external_port;
             let cancel = CancellationToken::new();
-            match L4Ingress::bind(spec, plane.clone(), resolve_vm_ip.clone(), cancel.clone()).await {
+            match L4Ingress::bind(spec, plane.clone(), resolve_vm_ip.clone(), cancel.clone()).await
+            {
                 Ok(ingress) => {
                     // Open the host firewall for this port BEFORE we start pumping (idempotent).
                     fw.allow(external_port).await;
@@ -160,8 +161,15 @@ pub async fn serve(
 /// the base-project throttle key, the owning tenant (fair-share key), the per-port tunables (read
 /// from the tenant's baked `_l4_ports.json` sidecar — completeness M1), and the per-VM transit
 /// secret (from the store; `None`/empty ⇒ `None` ⇒ skip, fail-closed).
-fn resolve_spec(store: &Store, data_dir: &std::path::Path, alloc: &PortAllocation) -> Option<L4PortSpec> {
-    let transit_secret = store.get_l4_transit_secret(&alloc.project_id).ok().flatten()?;
+fn resolve_spec(
+    store: &Store,
+    data_dir: &std::path::Path,
+    alloc: &PortAllocation,
+) -> Option<L4PortSpec> {
+    let transit_secret = store
+        .get_l4_transit_secret(&alloc.project_id)
+        .ok()
+        .flatten()?;
     if transit_secret.is_empty() {
         return None;
     }
@@ -251,7 +259,9 @@ impl L4Firewall {
                 .status()
                 .await;
             if st.map(|s| !s.success()).unwrap_or(true) {
-                warn!("l4 firewall: could not hook JKL4 into INPUT (iptables absent?); per-port opens are best-effort");
+                warn!(
+                    "l4 firewall: could not hook JKL4 into INPUT (iptables absent?); per-port opens are best-effort"
+                );
             }
         }
     }
@@ -278,10 +288,16 @@ impl L4Firewall {
             "1".to_string(),
         ];
         args.extend(rule);
-        if let Ok(st) = tokio::process::Command::new("iptables").args(&args).status().await
+        if let Ok(st) = tokio::process::Command::new("iptables")
+            .args(&args)
+            .status()
+            .await
             && !st.success()
         {
-            warn!(port, "l4 firewall: iptables -I JKL4 (udp allow) failed; port may be unreachable");
+            warn!(
+                port,
+                "l4 firewall: iptables -I JKL4 (udp allow) failed; port may be unreachable"
+            );
         }
     }
 
