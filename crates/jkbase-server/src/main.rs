@@ -6648,6 +6648,19 @@ async fn metering_loop(
                 bw.insert(id.clone(), state.tap_delta(id, tap, rx, tx));
             }
         }
+        // Fold in L4 (UDP) bandwidth: reflected egress leaves via the host edge socket, NOT the
+        // tenant TAP the sampler above reads, so it is invisible to `read_tap_bytes`. Drain the
+        // plane's per-base accrual and add it under the base project (rx = L4 egress = the metered,
+        // reflection-relevant direction; tx = L4 ingress), so L4 traffic counts toward the monthly
+        // bandwidth cap exactly like HTTP egress — the economic bound that replaces the retired
+        // per-flow ratio clamp (smarter-limiting arc, W-econ).
+        if let Some(plane) = &l4_plane {
+            for (base, (egress, ingress)) in plane.drain_bandwidth() {
+                let e = bw.entry(base).or_insert((0, 0));
+                e.0 = e.0.saturating_add(egress);
+                e.1 = e.1.saturating_add(ingress);
+            }
+        }
 
         // A dedicated project's DB VM has its OWN alloc row (`{id}.db`) but no project row, so the
         // per-project roll below skips it — accrue its usage under the rendered id (decision #3:

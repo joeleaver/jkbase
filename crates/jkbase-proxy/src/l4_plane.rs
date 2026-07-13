@@ -423,6 +423,15 @@ pub struct L4Plane {
     activity: Mutex<ActivityState>,
     mem: Mutex<MemCache>,
     counters: AtomicCounters,
+    /// Per-base **billable bandwidth** accrued since the last drain: `base → (egress, ingress)`
+    /// bytes of ADMITTED L4 traffic. The server's metering loop drains this each tick and folds it
+    /// into the project's bandwidth usage + monthly cap (`store.add_usage`), so L4 reflected egress
+    /// — which leaves via the host edge socket, NOT the tenant TAP the TAP sampler reads — is
+    /// metered exactly like HTTP egress (smarter-limiting arc, W-econ). This is the economic bound
+    /// that replaces the retired per-flow ratio clamp: reflected volume costs the (identified)
+    /// tenant and, over the monthly cap, hibernates the project. Own mutex, never nested under
+    /// another plane lock (drained off the hot path).
+    bandwidth: Mutex<HashMap<String, (u64, u64)>>,
     /// Count of boots currently in flight (== live [`WakeInFlight`] guards), charged against the
     /// host-RAM floor so concurrent boots can't collectively breach it. Lock-free so the RAM check
     /// in [`Self::try_reserve_flow`] (under the flow lock) can read it without nesting a plane mutex.
@@ -472,6 +481,7 @@ impl L4Plane {
                 mib: None,
             }),
             counters: AtomicCounters::default(),
+            bandwidth: Mutex::new(HashMap::new()),
             inflight_boots: AtomicUsize::new(0),
         })
     }
@@ -506,6 +516,15 @@ impl L4Plane {
     /// Snapshot + reset the drop/event counters for the metering tick.
     pub fn drain_counters(&self) -> L4Counters {
         self.counters.drain()
+    }
+
+    /// Drain + reset the per-base billable bandwidth (`base → (egress, ingress)` bytes) accrued
+    /// since the last call. The server's metering loop folds this into each project's bandwidth
+    /// usage so L4 egress counts toward the monthly cap (W-econ). Read-and-reset like
+    /// [`Self::drain_counters`]; a dropped tick loses at most one interval's L4 bytes (same
+    /// tolerance as the TAP sampler's delta re-seed).
+    pub fn drain_bandwidth(&self) -> std::collections::HashMap<String, (u64, u64)> {
+        std::mem::take(&mut *self.bandwidth.lock().unwrap())
     }
 
     /// Base-projects with ≥1 ESTABLISHED flow (warm-seconds accrual), EXCLUDING any currently
@@ -833,6 +852,18 @@ impl L4Plane {
         dest: Option<IpAddr>,
         now: Instant,
     ) {
+        // Billable-bandwidth accrual (drained by the metering loop). Its OWN lock, taken and
+        // released BEFORE the activity lock so no two plane mutexes are ever held at once (the
+        // `port → plane`, single-plane-mutex discipline). Egress = server→client (the metered,
+        // reflection-relevant direction); ingress = client→server.
+        {
+            let mut bw = self.bandwidth.lock().unwrap();
+            let e = bw.entry(base.to_string()).or_insert((0, 0));
+            match dir {
+                Dir::Out => e.0 = e.0.saturating_add(bytes as u64),
+                Dir::In => e.1 = e.1.saturating_add(bytes as u64),
+            }
+        }
         let mut act = self.activity.lock().unwrap();
         let ActivityState {
             last,
@@ -1335,6 +1366,22 @@ mod tests {
         p.note_ingress("z", 10, 1, t);
         // Age is small and defined now.
         assert!(p.last_activity_age("z").is_some());
+    }
+
+    #[test]
+    fn bandwidth_accrues_per_base_and_drains() {
+        let p = plane();
+        let t = Instant::now();
+        let v: IpAddr = "203.0.113.7".parse().unwrap();
+        // Egress = server→client, ingress = client→server; accrued per base as (egress, ingress).
+        p.note_ingress("proj", 100, 1, t);
+        p.note_egress("proj", 250, 1, v, t);
+        p.note_ingress("other", 40, 1, t);
+        let bw = p.drain_bandwidth();
+        assert_eq!(bw.get("proj"), Some(&(250, 100)));
+        assert_eq!(bw.get("other"), Some(&(0, 40)));
+        // Read-and-reset: a second drain is empty.
+        assert!(p.drain_bandwidth().is_empty());
     }
 
     #[test]
