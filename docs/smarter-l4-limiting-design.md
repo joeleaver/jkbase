@@ -33,10 +33,14 @@
   gate** — it adds almost no third-party protection over the absolute caps, and its only marginal
   effect ("attacker must spend 1× their own bandwidth") is served better by *billing egress*
   (attacker pays money, and is attributable) without breaking every asymmetric app.
-- **The concrete gap:** jkbase already meters per-project bandwidth (TAP `rx/tx_bytes`), enforces a
-  monthly cap, and hibernates over-quota projects — but **L4 egress leaves via the host edge socket,
-  not the tenant TAP, so L4 reflected bytes are currently metered against nothing.** Wiring L4
-  egress into the per-project meter/budget is the **centerpiece** of this arc, not the admin ceiling.
+- **The economic bound already exists (corrected by the pre-merge review):** L4 transit crosses the
+  tenant VM's **TAP** (the host↔guest legs go over the VM NIC), so `read_tap_bytes` **already meters
+  L4 traffic** toward the per-project monthly bandwidth cap — over-cap hibernates the project and
+  `wake_project` refuses re-wake (`WakeError::OverQuota`). An earlier draft of this arc wrongly
+  believed L4 "bypasses the TAP" and added a second per-payload accrual — that **double-counted**
+  and doubled an attacker-controllable quota-DoS (the un-rate-capped ingress leg), and was reverted.
+  So W-econ is **not** "add L4 metering"; it is **retire the clamp** — the existing TAP metering is
+  the metered economic bound that replaces it.
 
 ## 1. The principle — you cannot shape-gate arbitrary workloads
 
@@ -58,10 +62,15 @@ shape:
   broken (a genuinely large broadcaster just needs more egress **budget**, i.e. pays more), while
   no third party can be flooded faster than the cap **regardless of what any tenant runs**. Prod
   proves these never fire for a normal app (all 0 during the TS3 failure).
-- **(b) Per-tenant egress metering + budget + accountability** — meter L4 egress against the project
-  (today it is unmetered), enforce a per-tenant egress budget, and make abuse **attributable +
-  terminable**. This is the economic deterrent: a booter is worth building only because reflection
-  is *free* and *anonymous*; metered, budgeted, attributable, terminable egress is neither.
+- **(b) Metered per-project budget + accountability** — L4 traffic already crosses the tenant VM's
+  TAP, so it is **already metered** toward the per-project **monthly bandwidth cap** (over-cap ⇒
+  hibernate + `wake_project` `OverQuota` refuses re-wake), and every tenant is identified, so abuse
+  is **attributable + terminable**. This is the economic deterrent: a booter is worth building only
+  because reflection is *free* and *anonymous*; metered, capped, attributable, terminable egress is
+  neither. *Honest limitation:* the bound is per-**project** (16 MB/s rate + monthly cap) + global
+  (64 MB/s), not a real-time per-**tenant** ceiling — a tenant with N clamp-off projects can source
+  up to `min(N×16, 64)` MB/s until the monthly cap trips (see §5). Adding a per-tenant real-time
+  egress dimension is a follow-on.
 
 The per-flow **ratio amp-clamp** — the thing that broke TS3 — is redundant with (a) for third-party
 protection (the absolute caps already bound every victim/network/global rate) and uniquely
@@ -123,27 +132,32 @@ hatch, a human (W-admin).
    `PortAllocation` change, bind-new-before-drop-old (no ingress gap). Prereq for any live
    egress-policy change (W-econ budget, W-admin grant).
 
-### W-econ — Meter L4 egress into the per-project budget + retire the ratio clamp (**CENTERPIECE**)
+### W-econ — Retire the ratio clamp; the existing TAP metering is the economic bound (**CENTERPIECE**)
 
 The heart of the re-architecture. Makes arbitrary asymmetric workloads work by default while keeping
-the reflection bound provable.
+the reflection bound provable. **As-built (post-review):**
 
-- **Meter L4 egress against the project.** Today per-project bandwidth is metered from the tenant
-  **TAP** (`metering.rs:sample_tap`), which L4 bypasses (host edge socket). Feed admitted L4 egress
-  bytes (already counted per datagram in `return_decide` → `note_egress`) into the same per-project
-  bandwidth accounting + monthly cap + over-quota hibernation (`main.rs:6698`). Now L4 reflected
-  volume **costs the tenant** exactly like HTTP egress.
-- **Per-tenant egress budget** as the primary economic bound (bytes/sec + monthly), sized by plan.
-  A tenant can raise it (pay more); a free tier gets a modest budget. This is the lever that bounds
-  *how much reflection any one account can source* — decoupled from ingress ratio, so it never
-  breaks a legit app.
-- **Retire the per-flow `RatioCredit` amp-clamp + one-shot `C0` as the default gate.** Third-party
-  protection is now: absolute per-victim/-24/global caps (concentration) + per-tenant egress budget
-  (attribution/economics) + the kill-switch (below). The ratio clamp becomes, at most, an
-  **optional per-port soft default** a tenant can disable — not a hard wall. (`amp_k`/`C0` code stays
-  for that optional mode; the default path stops denying on ratio.)
-- **Re-derive the bound + get the adversarial review.** The review must confirm no absolute cap
-  changed and that per-account/global egress is the binding reflection ceiling (§5).
+- **L4 egress is ALREADY metered — no new metering code.** L4 transit crosses the tenant VM's TAP,
+  so `read_tap_bytes` already counts it toward the per-project monthly bandwidth cap + over-quota
+  hibernation (`main.rs`), and `wake_db_reach → wake_project` refuses re-wake of an over-quota
+  project (`WakeError::OverQuota`). *(An earlier attempt to add a second per-payload accrual
+  double-counted and doubled an attacker-controllable quota-DoS via the un-rate-capped ingress leg;
+  it was reverted — the TAP already does this wire-accurately.)*
+- **Retire the per-flow `RatioCredit` amp-clamp + one-shot `C0` as the default gate.** `amp_k`
+  omitted/0 ⇒ clamp OFF (`config.rs`); `1..=3` ⇒ opt-in shaper. `return_decide` runs the
+  `RatioCredit`+`C0` gate only when `amp_k != 0`; the absolute aggregate caps
+  (`try_egress_aggregate`) run **unconditionally**. Third-party protection is now: absolute
+  per-victim/-24/-project/global caps (concentration) + the metered per-project monthly cap
+  (economics) + accountability. **Load-bearing:** the readback seams (`read_l4_port_decls`,
+  `resolve_spec`) must resolve `amp_k` with the SAME 0-default as the bake, or the retirement is a
+  runtime no-op (review BLOCKER — fixed + regression-tested).
+- **Kill-switch:** auto-hibernate fires only for `amp_k != 0` ports (opt-in shaper); a clamp-off
+  port's shape signal is attributed + alerted (`reflection_shape_flagged` counter + `warn!`), never
+  auto-killed (§1.1). The `RefWindow` `amp_k` is sticky-**max** over the window (a base mixing a
+  clamp-off and a shaped port keeps the shaper's kill-switch armed; defeats the trickle-to-evade
+  attack).
+- **Reviewed** (multi-agent adversarial pass): P0-L4-6 ceiling confirmed byte-for-byte unchanged;
+  BLOCKER (no-op retirement) + HIGH (double-count) + 2 MEDIUM fixed. See §5 for the re-derived bound.
 
 ### W-killswitch — Re-scope the kill-switch from auto-hibernate to alert + clamp + attribute
 
@@ -187,17 +201,26 @@ shelf; do not build unless the clamp is retained as the default.
 unchanged, so no victim, network, or the platform can be made to receive more than today —
 independent of workload.
 
-| Lever | Sustained ratio / victim | Absolute rate / victim IP | Per-/24 | Global | Per-tenant total |
+| Lever | Sustained ratio / victim | Absolute rate / victim IP | Per-/24 | Per-project | Global |
 |---|---|---|---|---|---|
-| **Today (ratio clamp on)** | ≤ 1× (attacker pays 1× bandwidth) | ≤ 1 MB/s | ≤ 8 MB/s | ≤ 64 MB/s | unmetered (L4) |
-| **Re-centered (clamp retired)** | unbounded *ratio* (any asymmetric app works) | ≤ 1 MB/s (**unchanged**) | ≤ 8 MB/s (**unchanged**) | ≤ 64 MB/s (**unchanged**) | **≤ per-tenant egress budget (new, billed)** |
+| **Today (ratio clamp on)** | ≤ 1× (attacker pays 1× bandwidth) | ≤ 1 MB/s | ≤ 8 MB/s | ≤ 16 MB/s | ≤ 64 MB/s |
+| **Re-centered (clamp retired)** | unbounded *ratio* (any asymmetric app works) | ≤ 1 MB/s (**unchanged**) | ≤ 8 MB/s (**unchanged**) | ≤ 16 MB/s (**unchanged**) | ≤ 64 MB/s (**unchanged**) |
 
 The honest trade: retiring the ratio clamp raises the reflection **factor** (an attacker no longer
-spends 1× bandwidth) but **not** the reflection **ceiling** at any victim/network/platform — those
-were always the absolute caps, which prod shows are the real (and never-firing-for-legit) bound. The
-"attacker pays" deterrent moves from *their bandwidth* to *their money + identity* (per-tenant
-metered budget + terminate-on-abuse). Platform-wide reflection stays hard-capped at the global
-64 MB/s and ≤8 MB/s at any one victim network, regardless of workload or account count.
+spends 1× bandwidth) but **not** the reflection **ceiling** at any victim/network/project/platform —
+those were always the absolute caps, which prod shows are the real (and never-firing-for-legit)
+bound. The "attacker pays" deterrent moves from *their bandwidth* to *their money + identity*
+(existing per-project monthly bandwidth cap via the TAP + terminate-on-abuse). Platform-wide
+reflection stays hard-capped at the global 64 MB/s and ≤8 MB/s at any one victim network, regardless
+of workload or account count.
+
+**Two honest regressions the review surfaced (ceiling intact, but):** (i) **duration** — a clamp-off
+port has no ~60 s auto-hibernate, so a victim can be held at the ≤1 MB/s ceiling for the attack's
+duration; mitigated by the `reflection_shape_flagged` alert → human/terminate, not by auto-kill
+(which would strangle legit broadcasters). (ii) **per-tenant real-time** — aggregate caps stop at
+per-project (16 MB/s), so an identified tenant with ≥4 clamp-off projects can source the full global
+64 MB/s until the monthly cap trips (hours). A per-tenant real-time egress dimension (≤ global) is a
+follow-on; for now the bound is per-project + global + monthly cap + attribution.
 
 **The residual that the accountability model governs (§7 — RESOLVED):** jkbase has **no anonymous
 accounts** (every tenant is identified; "unlimited" = a trusted super-user class only), so an

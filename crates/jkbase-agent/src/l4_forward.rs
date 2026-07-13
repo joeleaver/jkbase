@@ -82,9 +82,9 @@ const REPLAY_MAX_BYTES: usize = 8 * 1024;
 const FLOW_IDLE_HEADROOM: Duration = Duration::from_secs(60);
 
 /// Fallback host idle window (seconds) when the fact predates `idle_timeout_secs` (old image ⇒
-/// deserializes to `0`): assume the host ceiling (`L4PortConfig::IDLE_CEIL`) so the agent never
-/// reaps below ANY window the host might hold (fail-safe).
-const HOST_IDLE_CEIL_FALLBACK_SECS: u64 = 600;
+/// deserializes to `0`): assume the host ceiling so the agent never reaps below ANY window the host
+/// might hold (fail-safe). Bound directly to the host's clamp ceiling so the two can't drift.
+const HOST_IDLE_CEIL_FALLBACK_SECS: u64 = jkbase_common::config::L4PortConfig::IDLE_CEIL;
 
 /// Derive the agent flow reaper from the host's resolved per-port idle window: `host_idle +
 /// headroom`, falling back to the host ceiling when the host didn't tell us (old image, `0`).
