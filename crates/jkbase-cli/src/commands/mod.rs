@@ -37,7 +37,7 @@ pub enum Command {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
-    /// Show month-to-date metered usage (CPU, bandwidth, storage)
+    /// Show month-to-date metered usage (CPU, bandwidth, storage, build-minutes)
     Usage {
         /// Project name (inferred from jkbase.toml if not specified)
         #[arg(long)]
@@ -58,6 +58,10 @@ pub enum Command {
         /// Set the monthly bandwidth cap, in GiB (clamped to the platform default)
         #[arg(long)]
         set_bandwidth_gib: Option<f64>,
+        /// Set the monthly server-side build cap, in build-minutes (clamped to the
+        /// platform default unless a valid --admin-token raises it).
+        #[arg(long)]
+        set_build_minutes: Option<f64>,
         /// Platform-operator admin token. With a valid token the server allows
         /// raising limits above the platform defaults (operator-only; ignored by a
         /// server started without --admin-token). Falls back to $JKBASE_ADMIN_TOKEN.
@@ -454,6 +458,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             project,
             set_storage_gib,
             set_bandwidth_gib,
+            set_build_minutes,
             admin_token,
             api,
         } => {
@@ -461,6 +466,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
                 project,
                 set_storage_gib,
                 set_bandwidth_gib,
+                set_build_minutes,
                 admin_token,
                 api,
             )
@@ -756,6 +762,9 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     let rx = v["rx_bytes"].as_u64().unwrap_or(0);
     let tx = v["tx_bytes"].as_u64().unwrap_or(0);
     let storage = v["storage_bytes"].as_u64().unwrap_or(0);
+    // Server-side build-VM time, metered on build exit. Distinct from `cpu_seconds`
+    // (runtime-VM CPU); it's the field the build-minute quota gate counts against.
+    let build_seconds = v["build_seconds"].as_u64().unwrap_or(0);
 
     println!("Usage for '{project_id}' (month-to-date):");
     println!("  CPU:       {cpu:.1} cpu-seconds");
@@ -766,6 +775,10 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
         fmt_bytes(tx)
     );
     println!("  Storage:   {}", fmt_bytes(storage));
+    println!(
+        "  Build:     {:.1} build-minutes ({build_seconds} build-seconds)",
+        build_seconds as f64 / 60.0
+    );
     Ok(())
 }
 
@@ -773,6 +786,7 @@ async fn run_quota(
     project: Option<String>,
     set_storage_gib: Option<f64>,
     set_bandwidth_gib: Option<f64>,
+    set_build_minutes: Option<f64>,
     admin_token: Option<String>,
     api: String,
 ) -> anyhow::Result<()> {
@@ -782,7 +796,7 @@ async fn run_quota(
     let client = crate::credentials::authenticated_client(&token);
     let url = format!("{api}/projects/{project_id}/quota");
 
-    if set_storage_gib.is_some() || set_bandwidth_gib.is_some() {
+    if set_storage_gib.is_some() || set_bandwidth_gib.is_some() || set_build_minutes.is_some() {
         // Send ONLY the caps the operator actually passed; the server merges them onto the
         // project's current values (an omitted cap is preserved, never zeroed). Sending a
         // full body with defaulted-to-0 caps used to silently zero an untouched cap under
@@ -793,6 +807,11 @@ async fn run_quota(
         }
         if let Some(g) = set_bandwidth_gib {
             body.insert("bandwidth_bytes_per_month".into(), ((g * GIB) as u64).into());
+        }
+        if let Some(m) = set_build_minutes {
+            // Quota is stored in build-SECONDS; the CLI takes minutes for parity with the
+            // 200-build-minute default. Non-admin sets are clamped to that default server-side.
+            body.insert("build_seconds_per_month".into(), ((m * 60.0) as u64).into());
         }
         let mut post = client.post(&url).json(&serde_json::Value::Object(body));
         if let Some(tok) = &admin_token {
@@ -833,6 +852,10 @@ async fn run_quota(
     println!(
         "  Bandwidth cap: {} / month",
         fmt_bytes(v["bandwidth_bytes_per_month"].as_u64().unwrap_or(0))
+    );
+    println!(
+        "  Build cap:     {:.0} build-minutes / month",
+        v["build_seconds_per_month"].as_u64().unwrap_or(0) as f64 / 60.0
     );
     println!(
         "  Source:        {}",
