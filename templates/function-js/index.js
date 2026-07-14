@@ -5,10 +5,11 @@
 // the per-project microVM. The same `wasi:http/incoming-handler` ABI as every other
 // jkbase function language. TypeScript works too (rename to `index.ts`; esbuild handles it).
 //
-// Available today: the request, response, compute, and your project's **secrets** via
-// `process.env`. NOT available yet: outbound network (`fetch`) and object-store access —
-// those arrive together in the host-mediated outbound-I/O work; until then an outbound
-// request is denied by the platform (shown by the `egress` line below).
+// Available today: the request, response, compute, your project's **secrets** via
+// `process.env`, and host-mediated **outbound HTTP** (`fetch`) — policed per-function by
+// `egress` in `jkbase.toml` (default: public allowed + observed; `egress = ["host", ...]`
+// to enforce an allowlist; `egress = false` to sandbox). The `egress` line below probes a
+// real outbound request and reports whether the host allowed it.
 
 addEventListener('fetch', (event) => {
   event.respondWith(handle(event.request));
@@ -28,8 +29,9 @@ async function handle(request) {
   return new Response(body, { headers: { 'content-type': 'text/plain' } });
 }
 
-// The platform denies all egress today, so this reports DENIED (the host rejects the
-// outbound request before any socket opens).
+// Probe outbound HTTP. `fetch` succeeds when the host allows the destination (default
+// policy, or on your `egress` allowlist) and rejects otherwise (sandbox, off-allowlist, or
+// a platform/internal address). So we AWAIT it: ALLOWED only when a response arrives.
 async function probeEgress() {
   try {
     await fetch('https://example.com/');
