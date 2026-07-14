@@ -3759,6 +3759,11 @@ esac
         /// end-to-end: host edge socket → framed transit → agent land-forward → loopback echo →
         /// back. Offline (no deps, no build network).
         UdpEcho,
+        /// A tenant with long-lived connection endpoints: HTTP :3000 readiness, a `/ws`
+        /// WebSocket echo, and a `/events` Server-Sent-Events tick stream. Drives the
+        /// wake-on-WS activity re-stamp seam end-to-end (edge relay + ActivityBody through
+        /// the real agent hop + a real microVM). Offline (no deps, no build network).
+        WebSocket,
     }
     impl Workload {
         fn networked(self) -> bool {
@@ -3979,6 +3984,48 @@ Bun.udpSocket({
   hostname: "127.0.0.1",
   socket: { data(socket, buf, p, addr) { socket.send(buf, p, addr); } },
 }).then(() => console.log("udp echo on 127.0.0.1:9999")).catch((e) => console.error("udp bind failed", e));
+console.log("listening on " + port);
+"#,
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+            }
+            // Long-lived connections: a `/ws` echo + a `/events` SSE tick stream + HTTP
+            // readiness. `sendPings: false` so an idle-but-open WS emits NO byte traffic — the
+            // e2e relies on that to prove an open socket alone does not keep the VM warm.
+            Workload::WebSocket => {
+                write(
+                    src.join("server/server.ts"),
+                    r#"const port = Number(process.env.PORT) || 3000;
+Bun.serve({
+  port,
+  fetch(req, server) {
+    const url = new URL(req.url);
+    if (url.pathname === "/ws") {
+      if (server.upgrade(req)) return undefined;
+      return new Response("expected websocket", { status: 426 });
+    }
+    if (url.pathname === "/events") {
+      const enc = new TextEncoder();
+      let n = 0;
+      const stream = new ReadableStream({
+        start(controller) {
+          const iv = setInterval(() => {
+            try { controller.enqueue(enc.encode(`data: tick ${n++}\n\n`)); }
+            catch { clearInterval(iv); }
+          }, 200);
+        },
+      });
+      return new Response(stream, {
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+      });
+    }
+    return new Response("ok\n");
+  },
+  websocket: { sendPings: false, message(ws, msg) { ws.send(msg); } },
+});
 console.log("listening on " + port);
 "#,
                 );
@@ -4976,6 +5023,268 @@ console.log("listening on " + port);
         let _ = vm.stop().await;
         let _ = sh("ip", &["link", "del", &tap]).await;
         res
+    }
+
+    /// wake-on-WS activity re-stamp — END TO END through a real microVM. Boots the WebSocket
+    /// tenant (Bun `/ws` echo + `/events` SSE), stands up the REAL edge proxy in front of it, and
+    /// drives real connections, asserting the shared ActivityTracker behaves as wake-on-WS needs:
+    ///   1. an ACTIVE WebSocket (frames flowing) keeps activity fresh — the VM would NOT hibernate
+    ///      mid-session;
+    ///   2. an idle-but-OPEN WebSocket (no frames) lets activity go STALE — an open socket does
+    ///      not pin the VM warm (traffic-driven, not socket-pinned);
+    ///   3. an ACTIVE SSE stream keeps activity fresh via the ActivityBody wrapper.
+    /// Each active phase runs past the 30s re-stamp throttle so a re-stamp must actually re-fire.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=... JKB_FC_RELEASE=... JKB_BASELAYERS=... JKB_AGENT=... JKB_ROOTFS=... \
+    ///       <test-bin> --ignored --nocapture wake_on_ws_restamp_e2e
+    #[tokio::test]
+    #[ignore = "wake-on-WS e2e: needs KVM + root + bun.ext4 + baselayers + JKB_ROOTFS"]
+    async fn wake_on_ws_restamp_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use jkbase_proxy::{DomainTarget, ProxyConfig, new_domain_map, new_routing_table};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::RwLock;
+        use tokio::time::timeout;
+
+        let Some(fx) = bun_pipeline_build("wsecho", 1, Workload::WebSocket).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let rootfs_img = match std::env::var("JKB_ROOTFS").map(PathBuf::from) {
+            Ok(p) if p.exists() => p,
+            _ => {
+                eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+                return;
+            }
+        };
+
+        // --- Layer plan + metadata image + boot the tenant VM (mirror boot_layered_and_curl). ---
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, true)
+            .expect("compute layer plan");
+        let meta_img = fx.data.join("wsecho-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+            None,
+            &meta_img,
+        )
+        .expect("build metadata image");
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("wsecho", "172.30.0.1", "172.30.0.2", "AA:FC:00:00:30:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("wsecho-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("ws echo VM should start");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(90))
+                .await
+                .is_some(),
+            "ws echo app never became HTTP-ready"
+        );
+
+        // --- Stand up the real edge proxy in front of the VM. ---
+        let domains = new_domain_map();
+        domains.write().await.insert(
+            "wsecho".to_string(),
+            DomainTarget {
+                project_id: "wsecho".to_string(),
+                site: None,
+            },
+        );
+        let routes = new_routing_table();
+        routes
+            .write()
+            .await
+            .insert("wsecho".to_string(), guest_ip.to_string());
+        let tracker: jkbase_proxy::ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
+        let proxy_port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cfg = ProxyConfig {
+            http_port: proxy_port,
+            https_port: None,
+            platform_domain: "test.local".to_string(),
+            cert_manager: None,
+            api_addr: None,
+            storage_addr: None,
+            auth_addr: None,
+            domains: Some(domains),
+            activity_tracker: Some(tracker.clone()),
+            wake_callback: None,
+            backend_port: 80,
+            relay_idle_timeout: Duration::from_secs(600),
+            max_concurrent_upgrades: 64,
+            http_listener: None,
+            https_listener: None,
+            db_auth_callback: None,
+            db_relay_registry: None,
+            db_max_concurrent: 1024,
+            db_preauth_max: 256,
+            db_preauth_per_ip_max: 32,
+            db_max_per_project: 64,
+        };
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let proxy = tokio::spawn(jkbase_proxy::serve(cfg, routes, shutdown.clone()));
+
+        async fn dial(port: u16) -> TcpStream {
+            for _ in 0..100 {
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("proxy never came up on {port}");
+        }
+        // A masked WebSocket text frame — client→server frames MUST be masked (RFC 6455 §5.3).
+        fn ws_frame(payload: &[u8]) -> Vec<u8> {
+            let mask = [0x21u8, 0x9a, 0x37, 0xc5];
+            let mut f = vec![0x81, 0x80 | payload.len() as u8];
+            f.extend_from_slice(&mask);
+            f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+            f
+        }
+        async fn stamp_age(t: &jkbase_proxy::ActivityTracker) -> Option<Duration> {
+            t.read().await.get("wsecho").map(|i| i.elapsed())
+        }
+
+        // === (1) ACTIVE WS keeps activity fresh: send frames for ~35s (past the 30s throttle). ===
+        let mut ws = dial(proxy_port).await;
+        ws.write_all(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: wsecho.test.local\r\n\
+              Connection: Upgrade\r\n\
+              Upgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        {
+            let mut buf = [0u8; 1024];
+            let mut seen = Vec::new();
+            loop {
+                let n = timeout(Duration::from_secs(10), ws.read(&mut buf))
+                    .await
+                    .expect("101 read timeout")
+                    .unwrap();
+                assert!(n > 0, "backend closed before 101");
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                String::from_utf8_lossy(&seen).starts_with("HTTP/1.1 101"),
+                "expected WS 101, got: {:?}",
+                String::from_utf8_lossy(&seen)
+            );
+        }
+        let mut got_echo = false;
+        let active_deadline = Instant::now() + Duration::from_secs(35);
+        while Instant::now() < active_deadline {
+            ws.write_all(&ws_frame(b"tick")).await.unwrap();
+            let mut buf = [0u8; 256];
+            if let Ok(Ok(n)) = timeout(Duration::from_millis(500), ws.read(&mut buf)).await
+                && n > 0
+            {
+                got_echo = true;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        assert!(
+            got_echo,
+            "Bun WS app must echo frames (proves the upgrade relayed correctly)"
+        );
+        let a = stamp_age(&tracker).await;
+        assert!(
+            a.map(|x| x < Duration::from_secs(31)).unwrap_or(false),
+            "an ACTIVE WS must keep activity fresh (age={a:?}) — else it would hibernate mid-session"
+        );
+
+        // === (2) idle-but-OPEN WS lets activity go stale (a socket must not pin the VM warm). ===
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        let a = stamp_age(&tracker).await;
+        assert!(
+            a.map(|x| x > Duration::from_secs(33)).unwrap_or(false),
+            "an idle-but-open WS must let activity go stale (age={a:?}) — a socket must not pin warm"
+        );
+
+        // === (3) ACTIVE SSE keeps activity fresh via ActivityBody: stream ~40s (past the throttle). ===
+        let mut sse = dial(proxy_port).await;
+        sse.write_all(
+            b"GET /events HTTP/1.1\r\n\
+              Host: wsecho.test.local\r\n\
+              Accept: text/event-stream\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut got_tick = false;
+        let sse_deadline = Instant::now() + Duration::from_secs(40);
+        let mut buf = [0u8; 512];
+        while Instant::now() < sse_deadline {
+            if let Ok(Ok(n)) = timeout(Duration::from_secs(2), sse.read(&mut buf)).await
+                && n > 0
+            {
+                got_tick = true;
+            }
+        }
+        assert!(got_tick, "SSE stream must deliver frames");
+        let a = stamp_age(&tracker).await;
+        assert!(
+            a.map(|x| x < Duration::from_secs(31)).unwrap_or(false),
+            "an ACTIVE SSE stream must keep activity fresh via ActivityBody (age={a:?})"
+        );
+
+        // --- teardown ---
+        shutdown.cancel();
+        let _ = timeout(Duration::from_secs(10), proxy).await;
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
     }
 
     /// Function deploy e2e — the runtime DEPLOY + SERVE half end to end. A built
