@@ -133,18 +133,24 @@ fn activity_stamp(
     }))
 }
 
-/// Wraps a STREAMED backend response body so that, while data frames flow, it re-stamps the
-/// project's activity — throttled to [`jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL`]. A long-lived
-/// streaming response (Server-Sent Events, a chunked feed, a slow download) never re-enters
-/// [`proxy_request`] after the initial stamp, so without this the idle loop would hibernate the
-/// VM out from under the live stream (wake-on-WS, the SSE/streaming half). Short responses are
-/// already covered by the initial `proxy_request` stamp and simply complete before the throttle
-/// re-fires. Only wraps tenant responses (never infra api/storage/auth, which aren't projects).
+/// Wraps a STREAMED backend response body so that, once the stream OUTLIVES
+/// [`jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL`], each subsequent data frame re-stamps the
+/// project's activity (again throttled to that interval). A long-lived streaming response
+/// (Server-Sent Events, a chunked feed, a slow download) never re-enters [`proxy_request`]
+/// after the opening request, so without this the idle loop would hibernate the VM out from
+/// under the live stream (wake-on-WS, the SSE/streaming half).
+///
+/// `last` is SEEDED at construction, not left empty: the synchronous `proxy_request` stamp
+/// already marks t=0, so a short/normal response — the overwhelmingly common case — completes
+/// within the interval and adds NO extra stamp (no redundant spawn or tracker write on the hot
+/// path). Only a stream still alive past the interval starts re-stamping. Only wraps tenant
+/// responses (never infra api/storage/auth, which aren't hibernatable projects).
 struct ActivityBody<B> {
     inner: B,
     stamp: Arc<dyn Fn() + Send + Sync>,
-    /// Last stamp instant; `None` until the first data frame (which stamps immediately).
-    last: Option<Instant>,
+    /// Instant of the last stamp; seeded to construction time (≈ the `proxy_request` stamp) so
+    /// the first re-stamp can only fire once the stream outlives `ACTIVITY_STAMP_INTERVAL`.
+    last: Instant,
 }
 
 impl<B> ActivityBody<B> {
@@ -152,7 +158,7 @@ impl<B> ActivityBody<B> {
         Self {
             inner,
             stamp,
-            last: None,
+            last: Instant::now(),
         }
     }
 }
@@ -173,15 +179,10 @@ where
         // once per ACTIVITY_STAMP_INTERVAL so a chatty stream doesn't spawn a write per frame.
         if let Poll::Ready(Some(Ok(ref frame))) = res
             && frame.data_ref().is_some()
+            && self.last.elapsed() >= jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL
         {
-            let due = self
-                .last
-                .map(|t| t.elapsed() >= jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL)
-                .unwrap_or(true);
-            if due {
-                self.last = Some(Instant::now());
-                (self.stamp)();
-            }
+            self.last = Instant::now();
+            (self.stamp)();
         }
         res
     }
@@ -1038,18 +1039,24 @@ mod tests {
         }
     }
 
-    // ActivityBody stamps the FIRST data frame immediately, then throttles: two frames
-    // within ACTIVITY_STAMP_INTERVAL (30s) produce exactly one stamp.
-    #[tokio::test]
-    async fn activity_body_stamps_first_frame_then_throttles() {
+    fn counting_stamp() -> (Arc<std::sync::atomic::AtomicUsize>, Arc<dyn Fn() + Send + Sync>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let hits = Arc::new(AtomicUsize::new(0));
-        let stamp = {
+        let cb = {
             let hits = hits.clone();
             Arc::new(move || {
                 hits.fetch_add(1, Ordering::SeqCst);
             }) as Arc<dyn Fn() + Send + Sync>
         };
+        (hits, cb)
+    }
+
+    // A FRESH stream (last seeded at construction) adds NO extra stamp — the request-start stamp
+    // already covers t=0, so a short/normal response within the interval never re-stamps.
+    #[tokio::test]
+    async fn activity_body_fresh_stream_adds_no_stamp() {
+        use std::sync::atomic::Ordering;
+        let (hits, stamp) = counting_stamp();
         let inner = FramesBody(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
         let mut body = ActivityBody::new(inner, stamp);
         while let Some(frame) = body.frame().await {
@@ -1057,24 +1064,50 @@ mod tests {
         }
         assert_eq!(
             hits.load(Ordering::SeqCst),
-            1,
-            "first frame stamps; the second (within the throttle window) is suppressed"
+            0,
+            "a fresh short stream is covered by the request-start stamp and must add none"
         );
     }
 
-    // A trailers-only frame carries no traffic, so it must NOT stamp.
+    // A stream that has OUTLIVED the interval re-stamps on its next data frame, then throttles:
+    // the second frame (within the reset window) is suppressed.
+    #[tokio::test]
+    async fn activity_body_restamps_once_past_interval() {
+        use std::sync::atomic::Ordering;
+        let (hits, stamp) = counting_stamp();
+        let inner = FramesBody(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        // Seed `last` well into the past so the first data frame is due.
+        let aged = Instant::now()
+            .checked_sub(jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL * 2)
+            .expect("monotonic clock older than 60s");
+        let mut body = ActivityBody {
+            inner,
+            stamp,
+            last: aged,
+        };
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a stream past the interval re-stamps once; the next frame is throttled"
+        );
+    }
+
+    // A trailers-only / empty body carries no traffic, so it must NOT stamp even when aged.
     #[tokio::test]
     async fn activity_body_ignores_trailers_only_frame() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let hits = Arc::new(AtomicUsize::new(0));
-        let stamp = {
-            let hits = hits.clone();
-            Arc::new(move || {
-                hits.fetch_add(1, Ordering::SeqCst);
-            }) as Arc<dyn Fn() + Send + Sync>
+        use std::sync::atomic::Ordering;
+        let (hits, stamp) = counting_stamp();
+        let aged = Instant::now()
+            .checked_sub(jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL * 2)
+            .expect("monotonic clock older than 60s");
+        let mut body = ActivityBody {
+            inner: FramesBody(vec![]),
+            stamp,
+            last: aged,
         };
-        // An empty body yields no data frames at all.
-        let mut body = ActivityBody::new(FramesBody(vec![]), stamp);
         while let Some(frame) = body.frame().await {
             frame.unwrap();
         }

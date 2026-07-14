@@ -481,9 +481,12 @@ async fn websocket_frame_flow_restamps_activity() {
 }
 
 #[tokio::test]
-async fn streamed_response_restamps_activity() {
-    // wake-on-WS (SSE/streaming half): a frame of a long-lived streamed response must
-    // re-stamp activity, so a quiet-but-streaming SSE feed keeps its VM warm.
+async fn streamed_response_streams_through_activity_wrapper() {
+    // wake-on-WS (SSE/streaming half): a streamed tenant body is wrapped in ActivityBody. Prove
+    // the wrapper is byte-transparent — a delayed-then-streamed frame arrives intact through it,
+    // so framing/size_hint delegation is unbroken. (A FRESH short stream deliberately does NOT
+    // re-stamp — the request-start stamp covers it; the >interval re-stamp is unit- + on-box-
+    // tested, since the 30s throttle can't be observed in a fast in-process test.)
     let backend_port = spawn_delayed_stream_backend().await;
     let proxy_port = free_port().await;
 
@@ -519,18 +522,37 @@ async fn streamed_response_restamps_activity() {
         .await
         .unwrap();
 
-    // The head arrives first (request-start stamp already happened); the streamed body frame
-    // lands ~200ms later, so a stamp past this reference proves the per-frame re-stamp.
     let head = read_head(&mut client).await;
     assert!(
         head.starts_with("HTTP/1.1 200"),
         "expected 200, got: {head:?}"
     );
-    let t_ref = Instant::now();
 
+    // The delayed body frame must arrive intact through the wrapper.
+    let mut all = Vec::new();
+    loop {
+        let mut buf = [0u8; 512];
+        let n = timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("timed out reading streamed body")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+        if all.windows(8).any(|w| w == b"data: hi") {
+            break;
+        }
+    }
     assert!(
-        wait_stamp_after(&tracker, "myapp", t_ref).await,
-        "a streamed response frame must re-stamp activity"
+        String::from_utf8_lossy(&all).contains("data: hi"),
+        "streamed body must pass through the ActivityBody wrapper intact"
+    );
+
+    // The request-start stamp exists; the fresh stream added no extra one (seeded `last`).
+    assert!(
+        tracker.read().await.contains_key("myapp"),
+        "request-start stamp must still be recorded"
     );
 }
 
