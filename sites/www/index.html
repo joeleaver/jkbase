@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>jkbase -- the self-hostable Firebase alternative</title>
-<meta name="description" content="Self-hostable Firebase alternative built in Rust. Static hosting, WASM functions, server containers, Firecracker isolation, automatic TLS. Deploy in seconds.">
+<meta name="description" content="Self-hostable Firebase alternative built in Rust. Static sites, server apps, WASI functions, a managed database, object storage, and raw UDP services -- each in its own Firecracker microVM, with automatic TLS. Deploy from source.">
 <style>
 *, *::before, *::after {
   margin: 0;
@@ -485,6 +485,9 @@ footer {
   .feature-card:nth-child(4) { animation-delay: 0.54s; }
   .feature-card:nth-child(5) { animation-delay: 0.62s; }
   .feature-card:nth-child(6) { animation-delay: 0.7s; }
+  .feature-card:nth-child(7) { animation-delay: 0.78s; }
+  .feature-card:nth-child(8) { animation-delay: 0.86s; }
+  .feature-card:nth-child(9) { animation-delay: 0.94s; }
 
   @keyframes fadeUp {
     from {
@@ -520,7 +523,7 @@ footer {
   <section class="hero">
     <div class="hero-label">open source / self-hostable / Rust</div>
     <h1>jkbase<span class="dot">.</span></h1>
-    <p class="hero-sub">The self-hostable Firebase alternative. Built in Rust.</p>
+    <p class="hero-sub">The self-hostable Firebase alternative. Sites, server apps, functions, a managed database, and object storage &mdash; each in its own Firecracker microVM. Built in Rust.</p>
     <a href="https://console.jkbase.app" class="hero-cta">
       Get Started <span class="arrow">-></span>
     </a>
@@ -530,38 +533,53 @@ footer {
   <section id="features">
     <p class="section-label">Capabilities</p>
     <h2 class="section-title">Everything you need to ship.</h2>
-    <p class="section-desc">Six primitives that compose into a complete platform. No vendor lock-in. Deploy on your own hardware.</p>
+    <p class="section-desc">Nine primitives that compose into a complete platform. Deploy any kind of app &mdash; then the database, storage, and auth to back it. No vendor lock-in; runs on your own hardware.</p>
 
     <div class="features-grid">
       <div class="feature-card">
         <div class="feature-icon">01</div>
         <h3>Static Hosting</h3>
-        <p>Deploy any static site or SPA. Push files, get a URL with automatic TLS. Global edge caching. Zero configuration required.</p>
+        <p>Deploy any static site or SPA. Push files, get an HTTPS URL. Multiple sites, prefixes, and custom domains per project. Zero configuration.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">02</div>
-        <h3>WASM Functions</h3>
-        <p>Write serverless functions in Rust or JavaScript, compiled to WebAssembly. Sub-millisecond cold starts. Scale to zero when idle.</p>
+        <h3>Server Apps</h3>
+        <p>Push source in Bun, Node, Rust, Python, or Go &mdash; built server-side, no Docker on your laptop. Bring a Dockerfile if you'd rather. Persistent volumes, health checks.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">03</div>
-        <h3>Server Containers</h3>
-        <p>Deploy long-running services from a Dockerfile. Persistent volumes, health checks, automatic restarts. Full control over your runtime.</p>
+        <h3>Functions</h3>
+        <p>Write Rust or JS/TS, compiled server-side to a wasi:http component. Run on request or a cron schedule. Outbound HTTP and own-bucket storage, default-deny sandboxed.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">04</div>
-        <h3>Firecracker Isolation</h3>
-        <p>Every project runs in its own Firecracker microVM. Hardware-level isolation with minimal overhead. The same technology behind AWS Lambda.</p>
+        <h3>Managed Database</h3>
+        <p>A RhypeDB instance per project &mdash; backed up automatically, reachable over TLS, with a built-in JWT issuer and default-deny per-user rules. No database to run.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">05</div>
-        <h3>Automatic TLS</h3>
-        <p>Certificates provisioned and renewed automatically via ACME. Wildcard support for project subdomains. HTTPS everywhere, always.</p>
+        <h3>Object Storage</h3>
+        <p>S3-compatible buckets per project. SigV4 auth, presigned URLs, multipart uploads &mdash; point any AWS SDK at it. No separate service to stand up.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">06</div>
+        <h3>Raw UDP Services</h3>
+        <p>Host a game server, voice server, or any UDP protocol. Scale to zero; the first packet wakes it. Proven with a real TeamSpeak deployment.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">07</div>
+        <h3>Firecracker Isolation</h3>
+        <p>Every project runs in its own Firecracker microVM &mdash; a real kernel, hardware-isolated. All tenants untrusted by design. The same technology behind AWS Lambda.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">08</div>
+        <h3>Automatic TLS</h3>
+        <p>Certificates provisioned and renewed automatically via ACME. Wildcard for project subdomains, HTTP-01 for custom domains. HTTPS everywhere, always.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">09</div>
         <h3>CLI-First Workflow</h3>
-        <p>Everything is a command. Init, deploy, logs, rollback -- all from your terminal. Scriptable. Composable. No clicking through dashboards.</p>
+        <p>Everything is a command &mdash; deploy, logs, rollback, secrets, domains &mdash; or push-to-deploy over git. Scriptable, composable, no clicking through dashboards.</p>
       </div>
     </div>
   </section>
@@ -569,19 +587,19 @@ footer {
   <!-- HOW IT WORKS -->
   <section class="how-section" id="how">
     <p class="section-label">Workflow</p>
-    <h2 class="section-title">Three commands to production.</h2>
-    <p class="section-desc">No build pipelines. No YAML files. No waiting. Write code, deploy, done.</p>
+    <h2 class="section-title">From source to production.</h2>
+    <p class="section-desc">No build pipelines to wire up. No YAML. Push source; jkbase builds it server-side and serves it on HTTPS.</p>
 
     <div class="steps">
       <div class="step">
         <div class="step-num">01</div>
-        <span class="step-cmd">$ jkbase init</span>
-        <p>Scaffold a project. Pick your primitives. Generates a jkbase.toml with sensible defaults.</p>
+        <span class="step-cmd">$ jkbase project create</span>
+        <p>Create a project on jkbase.app or on a platform you host yourself. Describe it in one jkbase.toml.</p>
       </div>
       <div class="step">
         <div class="step-num">02</div>
         <span class="step-cmd">$ jkbase deploy</span>
-        <p>Push to production in seconds. Assets uploaded, containers built, functions compiled -- all in one command.</p>
+        <p>Push source. jkbase builds it in a sealed, network-fenced microVM -- no Docker on your machine.</p>
       </div>
       <div class="step">
         <div class="step-num">03</div>
@@ -594,7 +612,7 @@ footer {
   <!-- TERMINAL DEMO -->
   <section class="terminal-section">
     <p class="section-label">In practice</p>
-    <h2 class="section-title">Deploy a site in 20 seconds.</h2>
+    <h2 class="section-title">Deploy in one command.</h2>
     <p class="section-desc">A real workflow. No tricks, no cuts.</p>
 
     <div class="terminal">
@@ -605,15 +623,13 @@ footer {
         <span>terminal</span>
       </div>
       <div class="terminal-body">
-        <div><span class="prompt">~ $ </span><span class="cmd">mkdir my-app && cd my-app</span></div>
-        <div><span class="prompt">~/my-app $ </span><span class="cmd">jkbase init</span></div>
-        <div><span class="output">  created jkbase.toml</span></div>
-        <div><span class="output">  created index.html</span></div>
+        <div><span class="prompt">~ $ </span><span class="cmd">jkbase project create my-app</span></div>
+        <div><span class="output">  created project 'my-app'</span></div>
         <div>&nbsp;</div>
         <div><span class="prompt">~/my-app $ </span><span class="cmd">jkbase deploy</span></div>
-        <div><span class="output">  uploading 2 files (4.2 KB)</span></div>
-        <div><span class="output">  provisioning TLS certificate</span></div>
-        <div><span class="output">  deploying to microVM</span></div>
+        <div><span class="output">  tarring source &middot; building in a sealed microVM</span></div>
+        <div><span class="output">  bun install &middot; bun run build</span></div>
+        <div><span class="output">  provisioning TLS &middot; booting microVM</span></div>
         <div>&nbsp;</div>
         <div><span class="output-accent">  live at https://my-app.jkbase.app</span></div>
       </div>
