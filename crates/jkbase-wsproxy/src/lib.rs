@@ -29,8 +29,9 @@ pub const DEFAULT_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// write-lock on every 8 KiB read.
 pub const ACTIVITY_STAMP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Optional hooks for [`relay_bidirectional_hooked`]. The managed-DB reach plane uses
-/// them; the (short-lived) WebSocket path passes none via [`relay_bidirectional`].
+/// Optional hooks for [`relay_bidirectional_hooked`]. The managed-DB reach plane and the
+/// tenant WebSocket splice ([`spawn_upgrade_relay`]) both use `on_activity`; callers that
+/// need neither pass [`RelayHooks::default`] via [`relay_bidirectional`].
 #[derive(Default)]
 pub struct RelayHooks {
     /// Force-close BOTH directions when this fires. A raw DB relay never EOFs on its
@@ -325,11 +326,18 @@ pub enum UpgradeOutcome {
 ///
 /// The caller builds the `101` response itself (its body type differs) and only on
 /// [`UpgradeOutcome::Relayed`]; on the other arms it returns the mapped error status.
+///
+/// `on_activity` (throttled to [`ACTIVITY_STAMP_INTERVAL`]) is stamped on byte flow in
+/// either direction. A spliced upgrade never re-enters the edge's `proxy_request`, so
+/// without it a byte-active but request-quiet WebSocket's VM would be hibernated out from
+/// under the live socket (wake-on-WS, §5). Callers with no tracker (the in-VM agent,
+/// tests) pass `None` — behaviour is then identical to the un-hooked relay.
 pub fn spawn_upgrade_relay(
     client_upgrade: Option<OnUpgrade>,
     backend_resp: &mut Response<Incoming>,
     idle_timeout: Duration,
     relay_permits: &Arc<Semaphore>,
+    on_activity: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> UpgradeOutcome {
     let Some(client_upgrade) = client_upgrade else {
         return UpgradeOutcome::Unsolicited;
@@ -342,8 +350,16 @@ pub fn spawn_upgrade_relay(
         let _permit = permit; // released when the relay ends
         match tokio::join!(client_upgrade, backend_upgrade) {
             (Ok(client), Ok(backend)) => {
-                relay_bidirectional(TokioIo::new(client), TokioIo::new(backend), idle_timeout)
-                    .await;
+                relay_bidirectional_hooked(
+                    TokioIo::new(client),
+                    TokioIo::new(backend),
+                    idle_timeout,
+                    RelayHooks {
+                        cancel: None,
+                        on_activity,
+                    },
+                )
+                .await;
             }
             (c, b) => error!(
                 client_err = ?c.err(),

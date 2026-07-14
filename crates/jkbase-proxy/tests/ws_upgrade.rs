@@ -5,10 +5,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use jkbase_proxy::{
-    DomainTarget, ProxyConfig, RoutingTable, new_domain_map, new_routing_table, serve,
+    ActivityTracker, DomainTarget, ProxyConfig, RoutingTable, new_domain_map, new_routing_table,
+    serve,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -357,6 +358,201 @@ async fn non_upgrade_response_is_buffered_and_sanitized() {
     assert!(
         !lower.contains("strict-transport-security"),
         "tenant HSTS must be stripped: {resp:?}"
+    );
+}
+
+/// A backend that answers `200` with a fixed-length `text/event-stream` body, but writes
+/// the body bytes only AFTER a short delay — so the response head reaches the client (and a
+/// reference instant can be taken) BEFORE the streamed frame the proxy re-stamps on.
+async fn spawn_delayed_stream_backend() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let mut seen = Vec::new();
+                loop {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    seen.extend_from_slice(&buf[..n]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = b"data: hi\n\n"; // 10 bytes
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                // Delay the body so the client sets its reference instant on just the head.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let _ = sock.write_all(body).await;
+            });
+        }
+    });
+    port
+}
+
+/// Poll `tracker[key]` until it advances strictly past `t_ref` (proving a re-stamp that
+/// happened after `t_ref`, not the earlier handshake/request stamp). Bounded ~4s.
+async fn wait_stamp_after(tracker: &ActivityTracker, key: &str, t_ref: Instant) -> bool {
+    for _ in 0..200 {
+        if let Some(&t) = tracker.read().await.get(key)
+            && t > t_ref
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn websocket_frame_flow_restamps_activity() {
+    // wake-on-WS: byte flow over an already-upgraded WebSocket must re-stamp the shared
+    // ActivityTracker, or the idle loop would hibernate the VM out from under a live socket.
+    let backend_port = spawn_echo_upgrade_backend().await;
+    let proxy_port = free_port().await;
+
+    let domains = new_domain_map();
+    domains.write().await.insert(
+        "myapp".to_string(),
+        DomainTarget {
+            project_id: "myapp".to_string(),
+            site: None,
+        },
+    );
+    let routes = new_routing_table();
+    routes
+        .write()
+        .await
+        .insert("myapp".to_string(), "127.0.0.1".to_string());
+
+    let tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
+    let mut config = base_config(proxy_port);
+    config.domains = Some(domains);
+    config.backend_port = backend_port;
+    config.activity_tracker = Some(tracker.clone());
+    let mut err = spawn_proxy(config, routes);
+    let mut client = connect_proxy(proxy_port, &mut err).await;
+
+    client
+        .write_all(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: myapp.test.local\r\n\
+              Connection: Upgrade\r\n\
+              Upgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let head = read_head(&mut client).await;
+    assert!(
+        head.starts_with("HTTP/1.1 101"),
+        "expected 101, got: {head:?}"
+    );
+
+    // The handshake stamped once already; take the reference AFTER it, so a pass proves the
+    // stamp came from FRAME FLOW (the relay stamps its first byte immediately).
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let t_ref = Instant::now();
+
+    client.write_all(b"tenant-ws").await.unwrap();
+    let mut echo = [0u8; 9];
+    timeout(Duration::from_secs(5), client.read_exact(&mut echo))
+        .await
+        .expect("timed out waiting for tenant echo")
+        .unwrap();
+    assert_eq!(&echo, b"tenant-ws");
+
+    assert!(
+        wait_stamp_after(&tracker, "myapp", t_ref).await,
+        "WebSocket frame flow must re-stamp activity after the handshake"
+    );
+}
+
+#[tokio::test]
+async fn streamed_response_streams_through_activity_wrapper() {
+    // wake-on-WS (SSE/streaming half): a streamed tenant body is wrapped in ActivityBody. Prove
+    // the wrapper is byte-transparent — a delayed-then-streamed frame arrives intact through it,
+    // so framing/size_hint delegation is unbroken. (A FRESH short stream deliberately does NOT
+    // re-stamp — the request-start stamp covers it; the >interval re-stamp is unit- + on-box-
+    // tested, since the 30s throttle can't be observed in a fast in-process test.)
+    let backend_port = spawn_delayed_stream_backend().await;
+    let proxy_port = free_port().await;
+
+    let domains = new_domain_map();
+    domains.write().await.insert(
+        "myapp".to_string(),
+        DomainTarget {
+            project_id: "myapp".to_string(),
+            site: None,
+        },
+    );
+    let routes = new_routing_table();
+    routes
+        .write()
+        .await
+        .insert("myapp".to_string(), "127.0.0.1".to_string());
+
+    let tracker: ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
+    let mut config = base_config(proxy_port);
+    config.domains = Some(domains);
+    config.backend_port = backend_port;
+    config.activity_tracker = Some(tracker.clone());
+    let mut err = spawn_proxy(config, routes);
+    let mut client = connect_proxy(proxy_port, &mut err).await;
+
+    client
+        .write_all(
+            b"GET /events HTTP/1.1\r\n\
+              Host: myapp.test.local\r\n\
+              Accept: text/event-stream\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+    let head = read_head(&mut client).await;
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {head:?}"
+    );
+
+    // The delayed body frame must arrive intact through the wrapper.
+    let mut all = Vec::new();
+    loop {
+        let mut buf = [0u8; 512];
+        let n = timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("timed out reading streamed body")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        all.extend_from_slice(&buf[..n]);
+        if all.windows(8).any(|w| w == b"data: hi") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&all).contains("data: hi"),
+        "streamed body must pass through the ActivityBody wrapper intact"
+    );
+
+    // The request-start stamp exists; the fresh stream added no extra one (seeded `last`).
+    assert!(
+        tracker.read().await.contains_key("myapp"),
+        "request-start stamp must still be recorded"
     );
 }
 
