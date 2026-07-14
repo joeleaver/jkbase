@@ -11,7 +11,7 @@ mod static_server;
 use anyhow::{Context, Result};
 use container_supervisor::ContainerSupervisor;
 use function_runtime::{FunctionRequest, FunctionRuntime};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -835,11 +835,30 @@ fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
         .collect()
 }
 
+/// Unified agent response body. Most branches build a buffered [`Full`] (health, control
+/// endpoints, errors, static files); the tenant server-app proxy STREAMS the app's response
+/// through instead of buffering it (so an SSE/chunked feed flushes frame-by-frame, and a large
+/// download isn't loaded wholly into guest RAM). A boxed body lets both coexist in one handler.
+type AgentBody = BoxBody<Bytes, std::io::Error>;
+
+/// Box a buffered [`Full`] response into [`AgentBody`] (the `Full` error is `Infallible`, mapped
+/// to the `io::Error` the boxed type declares — the closure is never called).
+fn box_full(resp: Response<Full<Bytes>>) -> Response<AgentBody> {
+    resp.map(|b| b.map_err(|e: std::convert::Infallible| match e {}).boxed())
+}
+
+/// Box a buffered byte body into [`AgentBody`].
+fn full_body(b: impl Into<Bytes>) -> AgentBody {
+    Full::new(b.into())
+        .map_err(|e: std::convert::Infallible| match e {})
+        .boxed()
+}
+
 async fn handle_request(
     state: Arc<AgentState>,
     req: Request<hyper::body::Incoming>,
     on_loopback: bool,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<AgentBody>, hyper::Error> {
     let path = req.uri().path().to_string();
 
     // [R3] Control endpoints are for the HOST (reached over the VM's eth0), never the
@@ -847,51 +866,51 @@ async fn handle_request(
     // depth atop each endpoint's own auth (the `/_jkbase/db` splice secret). 404 (not 403)
     // so a probing tenant can't even confirm the endpoint exists.
     if on_loopback && path.starts_with("/_jkbase/") {
-        return Ok(not_found_response());
+        return Ok(box_full(not_found_response()));
     }
 
     if path == "/_jkbase/health" {
-        return Ok(health_response(&state).await);
+        return Ok(box_full(health_response(&state).await));
     }
 
     if path == "/_jkbase/db" {
-        return Ok(handle_db_splice(state, req).await);
+        return Ok(box_full(handle_db_splice(state, req).await));
     }
 
     if path == "/_jkbase/db/backup" {
-        return Ok(handle_db_backup(state, req).await);
+        return Ok(box_full(handle_db_backup(state, req).await));
     }
 
     if path == "/_jkbase/db/restore" {
-        return Ok(handle_db_restore(state, req).await);
+        return Ok(box_full(handle_db_restore(state, req).await));
     }
 
     if path == "/_jkbase/db/query" {
-        return Ok(handle_db_query(state, req, DbHttpOp::Query).await);
+        return Ok(box_full(handle_db_query(state, req, DbHttpOp::Query).await));
     }
 
     if path == "/_jkbase/db/schema" {
-        return Ok(handle_db_query(state, req, DbHttpOp::Schema).await);
+        return Ok(box_full(handle_db_query(state, req, DbHttpOp::Schema).await));
     }
 
     if path == "/_jkbase/db/status" {
-        return Ok(handle_db_query(state, req, DbHttpOp::Status).await);
+        return Ok(box_full(handle_db_query(state, req, DbHttpOp::Status).await));
     }
 
     if path == "/_jkbase/sync" {
         unsafe { libc::sync() };
         return Ok(Response::builder()
             .status(StatusCode::OK)
-            .body(Full::new(Bytes::from("{\"synced\":true}")))
+            .body(full_body("{\"synced\":true}"))
             .unwrap());
     }
 
     if path == "/_jkbase/resync-clock" {
-        return Ok(resync_clock_response(req).await);
+        return Ok(box_full(resync_clock_response(req).await));
     }
 
     if path == "/_jkbase/logs" || path.starts_with("/_jkbase/logs?") {
-        return Ok(logs_response(&state, &req).await);
+        return Ok(box_full(logs_response(&state, &req).await));
     }
 
     // Walk the tenant route table, dispatching by backend kind. A FUNCTION route is
@@ -912,15 +931,15 @@ async fn handle_request(
             }
             RouteKind::Function => {
                 if jkbase_wsproxy::is_upgrade_request(req.headers()) {
-                    return Ok(upgrade_required_response());
+                    return Ok(box_full(upgrade_required_response()));
                 }
                 if state.functions.has_function(&route.name) {
                     // Own the name so nothing borrows `state.route_config` across the move.
                     let name = route.name.clone();
                     info!(function = %name, path = %path, "routing to function (route)");
-                    return Ok(invoke_function(state.clone(), &name, req).await);
+                    return Ok(box_full(invoke_function(state.clone(), &name, req).await));
                 }
-                return Ok(not_found_response());
+                return Ok(box_full(not_found_response()));
             }
         }
     }
@@ -929,13 +948,13 @@ async fn handle_request(
     // 426 on upgrade, 404 (no fallthrough) on a missing function.
     if let Some(func_name) = extract_function_name(&path) {
         if jkbase_wsproxy::is_upgrade_request(req.headers()) {
-            return Ok(upgrade_required_response());
+            return Ok(box_full(upgrade_required_response()));
         }
         if state.functions.has_function(&func_name) {
             info!(function = %func_name, path = %path, "routing to function");
-            return Ok(invoke_function(state, &func_name, req).await);
+            return Ok(box_full(invoke_function(state, &func_name, req).await));
         }
-        return Ok(not_found_response());
+        return Ok(box_full(not_found_response()));
     }
 
     // Host-bound site: the proxy sets X-Jkbase-Site (stripped from inbound, so
@@ -953,7 +972,8 @@ async fn handle_request(
             site.spa,
             &static_server::ReqConds::from_headers(req.headers()),
         )
-        .await;
+        .await
+        .map(box_full);
     }
 
     // Multi-site routing: find the best matching site by prefix
@@ -972,7 +992,8 @@ async fn handle_request(
                     site.spa,
                     &static_server::ReqConds::from_headers(req.headers()),
                 )
-                .await;
+                .await
+                .map(box_full);
             }
         }
     }
@@ -984,7 +1005,9 @@ async fn handle_request(
     // `_`-prefixed top-level entry, keeping tenant config off the public surface.
     // (Site roots `_site_<name>/` are served via the site paths above, where
     // `_`-prefixed framework dirs like `_next/` remain legitimate.)
-    static_server::handle_static(&state.serve_dir, req).await
+    static_server::handle_static(&state.serve_dir, req)
+        .await
+        .map(box_full)
 }
 
 async fn health_response(state: &AgentState) -> Response<Full<Bytes>> {
@@ -1105,7 +1128,7 @@ fn extract_function_name(path: &str) -> Option<String> {
 async fn proxy_to_server(
     port: u16,
     mut req: Request<hyper::body::Incoming>,
-) -> Response<Full<Bytes>> {
+) -> Response<AgentBody> {
     let addr = format!("127.0.0.1:{port}");
     let path = req
         .uri()
@@ -1124,7 +1147,7 @@ async fn proxy_to_server(
             error!(port, error = %e, "failed to connect to server");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(Bytes::from("server not available")))
+                .body(full_body("server not available"))
                 .unwrap();
         }
     };
@@ -1136,7 +1159,7 @@ async fn proxy_to_server(
             error!(port, error = %e, "server handshake failed");
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(Bytes::from("server handshake failed")))
+                .body(full_body("server handshake failed"))
                 .unwrap();
         }
     };
@@ -1177,13 +1200,13 @@ async fn proxy_to_server(
                     for (key, value) in resp.headers() {
                         builder = builder.header(key, value);
                     }
-                    builder.body(Full::new(Bytes::new())).unwrap()
+                    builder.body(full_body(Bytes::new())).unwrap()
                 }
                 UpgradeOutcome::Unsolicited => {
                     error!("container sent 101 without a client upgrade request");
                     Response::builder()
                         .status(StatusCode::BAD_GATEWAY)
-                        .body(Full::new(Bytes::from("unsolicited upgrade")))
+                        .body(full_body("unsolicited upgrade"))
                         .unwrap()
                 }
                 UpgradeOutcome::CapReached => {
@@ -1191,7 +1214,7 @@ async fn proxy_to_server(
                     Response::builder()
                         .status(StatusCode::SERVICE_UNAVAILABLE)
                         .header("Retry-After", "5")
-                        .body(Full::new(Bytes::from("too many concurrent upgrades")))
+                        .body(full_body("too many concurrent upgrades"))
                         .unwrap()
                 }
             }
@@ -1199,21 +1222,30 @@ async fn proxy_to_server(
         Ok(resp) => {
             let status = resp.status();
             let headers = resp.headers().clone();
-            let body = match resp.into_body().collect().await {
-                Ok(b) => b.to_bytes(),
-                Err(_) => Bytes::new(),
-            };
+            // Stream the app's response through instead of buffering it: an SSE/chunked feed must
+            // flush frame-by-frame (a buffered `collect()` never completes on an endless stream),
+            // and a large download must not sit wholly in guest RAM.
+            let body = resp.into_body().map_err(std::io::Error::other).boxed();
             let mut builder = Response::builder().status(status);
             for (key, value) in &headers {
+                // Drop framing hop-by-hop headers: hyper re-frames the streamed body from its own
+                // size hint, so forwarding the backend's Transfer-Encoding/Connection verbatim
+                // would double-frame. A finite response's Content-Length is kept (and honoured).
+                let k = key.as_str();
+                if k.eq_ignore_ascii_case("transfer-encoding")
+                    || k.eq_ignore_ascii_case("connection")
+                {
+                    continue;
+                }
                 builder = builder.header(key, value);
             }
-            builder.body(Full::new(body)).unwrap()
+            builder.body(body).unwrap()
         }
         Err(e) => {
             error!(port, error = %e, "server request failed");
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(Bytes::from("server request failed")))
+                .body(full_body("server request failed"))
                 .unwrap()
         }
     }
