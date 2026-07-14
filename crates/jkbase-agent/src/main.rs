@@ -1168,6 +1168,9 @@ async fn proxy_to_server(
                 &mut resp,
                 jkbase_wsproxy::DEFAULT_RELAY_IDLE_TIMEOUT,
                 upgrade_permits(),
+                // In-VM hop inside the tenant's own container — no host idle tracker to
+                // re-stamp (the edge proxy owns wake-on-WS keep-warm, not the agent).
+                None,
             ) {
                 UpgradeOutcome::Relayed => {
                     let mut builder = Response::builder().status(StatusCode::SWITCHING_PROTOCOLS);
