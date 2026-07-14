@@ -1937,6 +1937,8 @@ body {
     deploymentsLoading: false,
     rollbackConfirm: null,  // version awaiting rollback confirmation
     rollbackBusy: false,
+    restartConfirm: false,  // restart awaiting confirmation
+    restartBusy: false,
     // storage / object-store access keys
     accessKeys: [],
     accessKeysLoading: false,
@@ -2174,6 +2176,8 @@ body {
     state.deployments = [];
     state.rollbackConfirm = null;
     state.rollbackBusy = false;
+    state.restartConfirm = false;
+    state.restartBusy = false;
     state.error = null;
     state.success = null;
     state.showAddSecret = false;
@@ -3067,6 +3071,25 @@ body {
     });
   }
 
+  // Relaunch the running server with current secrets re-injected, WITHOUT a
+  // rebuild — the lightweight way to apply a changed secret (a full deploy
+  // rebuilds from source; rollback changes the live version).
+  function restartServer(projectId) {
+    state.restartBusy = true;
+    state.error = null;
+    render();
+    api("POST", "/projects/" + projectId + "/restart", {}).then(function() {
+      state.restartBusy = false;
+      state.restartConfirm = false;
+      loadStatus(projectId);
+    }).catch(function(e) {
+      state.restartBusy = false;
+      state.restartConfirm = false;
+      state.error = e.message;
+      render();
+    });
+  }
+
   // --- Account ---
 
   function generateToken() {
@@ -3939,13 +3962,45 @@ body {
       body = rows;
     }
 
+    // Restart re-injects current secrets and relaunches the running server WITHOUT
+    // a rebuild — the lightweight way to apply a changed secret. Only meaningful
+    // once something is live.
+    var hasLive = state.deployments.some(function(d) { return d.active; });
+    var restartAction;
+    if (!hasLive) {
+      restartAction = null;
+    } else if (state.restartConfirm) {
+      restartAction = h("div", { className: "domain-actions" },
+        h("button", {
+          className: "btn btn-secondary btn-sm",
+          onClick: function() { state.restartConfirm = false; render(); },
+        }, "Cancel"),
+        h("button", {
+          className: "btn btn-primary btn-sm",
+          disabled: state.restartBusy ? "disabled" : null,
+          onClick: function() { restartServer(project.id); },
+        }, state.restartBusy ? "Restarting..." : "Confirm restart")
+      );
+    } else {
+      restartAction = h("button", {
+        className: "btn btn-secondary btn-sm",
+        onClick: function() { state.restartConfirm = true; render(); },
+      }, "Restart server");
+    }
+
     return h("div", { className: "feature-content-inner" },
       state.error ? h("div", { className: "error-banner" }, state.error) : null,
       h("div", { className: "card" },
         h("div", { className: "card-static" },
-          h("div", { className: "card-title", style: "margin-bottom: 6px" }, "Deployment history"),
-          h("div", { className: "section-desc", style: "margin-bottom: 6px" },
-            "Each deploy is an immutable version. Roll back to instantly repoint the live version."
+          h("div", { style: "display: flex; align-items: flex-start; justify-content: space-between; gap: 12px" },
+            h("div", null,
+              h("div", { className: "card-title", style: "margin-bottom: 6px" }, "Deployment history"),
+              h("div", { className: "section-desc", style: "margin-bottom: 6px" },
+                "Each deploy is an immutable version. Roll back to instantly repoint the live version, " +
+                "or restart to re-inject changed secrets without a rebuild."
+              )
+            ),
+            restartAction
           ),
           body
         )
