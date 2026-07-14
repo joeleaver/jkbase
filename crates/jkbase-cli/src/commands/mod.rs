@@ -37,7 +37,7 @@ pub enum Command {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
-    /// Show month-to-date metered usage (CPU, bandwidth, storage)
+    /// Show month-to-date metered usage (CPU, bandwidth, storage, build-minutes)
     Usage {
         /// Project name (inferred from jkbase.toml if not specified)
         #[arg(long)]
