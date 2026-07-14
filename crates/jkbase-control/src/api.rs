@@ -2710,6 +2710,26 @@ async fn restart(
         }
     };
 
+    // A project whose monthly bandwidth cap is exhausted is hibernated and its wake
+    // is blocked (see the metering loop + `wake_project`'s `bandwidth_blocked` gate).
+    // Restart drives the deploy callback DIRECTLY, bypassing that wake gate — so gate
+    // here too, else a `jkbase restart` re-boots the blocked VM back into the routing
+    // table and hands it unmetered egress for the rest of the month (the meter only
+    // ever CLEARS a block, it never re-blocks an already-Running VM). Fail closed (402).
+    if let Ok(Some(status)) = state.store.get_quota_status(&id)
+        && status.bandwidth_blocked
+    {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(ErrorResponse {
+                error: status
+                    .blocked_reason
+                    .unwrap_or_else(|| "monthly bandwidth cap exceeded".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
     // Defence in depth: the live deployment's on-disk artifacts must still exist
     // (they're what the deploy callback rebuilds the metadata image from). A
     // missing dir means a corrupt/half-pruned state — fail closed rather than
@@ -2752,11 +2772,28 @@ async fn restart(
 
     match result {
         Ok(()) => {
-            info!(project_id = %id, version = target, "restarted");
+            // The callback booted a fresh VM from `live` but — unlike deploy/rollback —
+            // persists no store row and can't move the version. Re-read FRESH under the
+            // still-held guard to (a) heal `state` to Active (restarting an idle-Hibernated
+            // project leaves the row Hibernated while the VM is Running), and (b) report the
+            // TRUE current version: a deploy/rollback that raced the pre-lock read would have
+            // moved `live`, and the callback rebuilt from whatever `live` now points at, so
+            // the fresh `current_version` is what actually booted (not the stale `target`).
+            let version = match state.store.get_project(&id) {
+                Ok(Some(mut p)) => {
+                    if p.state != crate::store::ProjectState::Active {
+                        p.state = crate::store::ProjectState::Active;
+                        let _ = state.store.update_project(&p);
+                    }
+                    p.current_version.unwrap_or(target)
+                }
+                _ => target,
+            };
+            info!(project_id = %id, version, "restarted");
             (
                 StatusCode::OK,
                 Json(DeployResponse {
-                    version: target,
+                    version,
                     project_id: id,
                 }),
             )

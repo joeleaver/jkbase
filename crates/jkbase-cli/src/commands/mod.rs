@@ -41,7 +41,7 @@ pub enum Command {
         /// Platform API URL
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
-        /// Output as JSON
+        /// Output as JSON (implies non-interactive: skips the confirmation prompt)
         #[arg(long)]
         json: bool,
     },
@@ -1009,8 +1009,19 @@ async fn run_restart(
         }
         Ok(())
     } else {
+        // Capture the status BEFORE consuming the body so a non-JSON error (e.g. a bare 502
+        // from an upstream) still surfaces something actionable rather than "unknown error".
+        let status = resp.status();
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let err = body["error"].as_str().unwrap_or("unknown error");
+        let err = body["error"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        // Keep stdout machine-readable on failure too (mirrors the success branch); the
+        // non-zero exit still comes from the `bail!`, so scripters can detect it either way.
+        if json {
+            println!("{}", serde_json::json!({ "error": err }));
+        }
         anyhow::bail!("restart failed: {err}");
     }
 }
