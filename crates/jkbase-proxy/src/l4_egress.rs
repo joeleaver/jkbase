@@ -351,4 +351,123 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m.contains(&2) && !m.contains(&1));
     }
+
+    // -----------------------------------------------------------------------
+    // Cost probe (not a unit test)
+    // -----------------------------------------------------------------------
+
+    /// **A measurement, not an assertion.** `#[ignore]`d so CI never runs it — a timing number is
+    /// not something to gate a merge on, and a loaded runner would make it lie.
+    ///
+    /// ```text
+    /// cargo test -p jkbase-proxy --release -- --ignored --nocapture l4_pump_cpu_cost
+    /// ```
+    ///
+    /// Answers what the shipped workloads never ask: what does **one datagram** cost on the pump's
+    /// hot path? A voice or game tenant is tens of pps on a handful of flows, where the transit
+    /// HMAC and the four-level egress bucket chain are free by inspection. A conference SFU's
+    /// egress leg is tens of *thousands* of pps — `K` participants each receiving `K-1` fan-out
+    /// streams — and "free by inspection" stops being an argument.
+    ///
+    /// Scope, stated honestly: this is the **pure-CPU** portion only — seal, open, ratio credit,
+    /// four token buckets and their bounded-map lookups. The real pump adds two syscalls per
+    /// datagram (edge `recv_from` + guest-facing `send`) plus the TAP/virtio crossing, and on most
+    /// hosts *those* dominate. So the pps ceiling printed here is an upper bound on the crypto and
+    /// accounting, and the end-to-end harness (`tools/l4-load`) is what measures reality. If this
+    /// probe alone can't clear the conference requirement, the end-to-end run cannot either — that
+    /// is the only inference it supports.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn l4_pump_cpu_cost() {
+        use jkbase_common::l4_transit::{L4Dir, L4TransitHeader, open, seal};
+        use std::hint::black_box;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        const ITERS: u32 = 200_000;
+        const SECRET: &[u8] = b"jkbl_transit_secret_for_the_cost_probe";
+
+        for (label, size) in [("video 1200B", 1200usize), ("audio 160B", 160usize)] {
+            let payload = vec![0xABu8; size];
+            let mut frame = Vec::with_capacity(size + 64);
+
+            // Leg 1: the crypto both ends pay — host seals, agent opens (and the reply leg pays
+            // the mirror image, so this is one full round of transit auth per datagram).
+            let t = Instant::now();
+            for i in 0..ITERS {
+                let hdr = L4TransitHeader {
+                    flow_id: 7,
+                    epoch: 1,
+                    nonce: i as u64 + 1,
+                };
+                seal(SECRET, L4Dir::HostToAgent, hdr, &payload, &mut frame);
+                let got = open(SECRET, L4Dir::HostToAgent, black_box(&frame));
+                black_box(got.is_some());
+            }
+            let crypto_ns = t.elapsed().as_nanos() as f64 / ITERS as f64;
+
+            // Leg 2: the egress accounting chain a reply runs before it may be sent — ratio
+            // credit, then per-source, per-/24, per-project and global buckets, each behind its
+            // bounded TTL map (the map lookup is part of the cost, not an aside).
+            let now = Instant::now();
+            let mut ratio = RatioCredit::new();
+            let mut per_source: BoundedTtlMap<IpAddr, TokenBucket> =
+                BoundedTtlMap::new(65536, Duration::from_secs(120));
+            let mut per_24: BoundedTtlMap<u32, TokenBucket> =
+                BoundedTtlMap::new(8192, Duration::from_secs(120));
+            let mut per_project: BoundedTtlMap<String, TokenBucket> =
+                BoundedTtlMap::new(8192, Duration::from_secs(600));
+            let mut global = TokenBucket::new(64.0 * 1048576.0, 64.0 * 1048576.0, now);
+            let dest = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+            let project = "proj-cost-probe".to_string();
+
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                let now = Instant::now();
+                // Ingress accrues credit exactly as the reach loop would before a reply.
+                ratio.on_ingress(size, 1);
+                let verdict = ratio.try_egress(size, 1500);
+                let b = size as f64;
+                let ok = per_source
+                    .get_or_insert_with(dest, now, || TokenBucket::new(1048576.0, 65536.0, now))
+                    .map(|tb| tb.try_take(b, now))
+                    .unwrap_or(false)
+                    && per_24
+                        .get_or_insert_with(0xCB00_7100, now, || {
+                            TokenBucket::new(8.0 * 1048576.0, 8.0 * 1048576.0, now)
+                        })
+                        .map(|tb| tb.try_take(b, now))
+                        .unwrap_or(false)
+                    && per_project
+                        .get_or_insert_with(project.clone(), now, || {
+                            TokenBucket::new(16.0 * 1048576.0, 16.0 * 1048576.0, now)
+                        })
+                        .map(|tb| tb.try_take(b, now))
+                        .unwrap_or(false)
+                    && global.try_take(b, now);
+                black_box((verdict, ok));
+            }
+            let limiter_ns = t.elapsed().as_nanos() as f64 / ITERS as f64;
+
+            let total_ns = crypto_ns + limiter_ns;
+            let pps_ceiling = 1e9 / total_ns;
+            println!(
+                "{label}: transit seal+open {crypto_ns:.0}ns  egress chain {limiter_ns:.0}ns  \
+                 total {total_ns:.0}ns/datagram  ⇒ {:.0}k pps/core (CPU only, no syscalls)",
+                pps_ceiling / 1000.0
+            );
+        }
+
+        // What a conference actually asks for, so the numbers above land against a requirement
+        // instead of floating free. Egress pps = K participants × (K-1) fan-out streams × per-
+        // stream pps; 1500kbps video in 1200B packets ≈ 156 pps, 40kbps audio in 160B ≈ 31 pps.
+        for k in [5u64, 10, 20] {
+            let streams = k * (k - 1);
+            let pps = streams * (156 + 31);
+            println!(
+                "requirement: {k} participants ⇒ {streams} egress streams ⇒ {pps} pps \
+                 ({:.1} MiB/s at mixed sizes)",
+                (streams as f64 * (156.0 * 1200.0 + 31.0 * 160.0)) / 1048576.0
+            );
+        }
+    }
 }
