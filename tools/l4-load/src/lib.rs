@@ -195,21 +195,37 @@ impl JoinProfile {
 // Pacing
 // ---------------------------------------------------------------------------
 
-/// A deadline-accumulating pacer. Deadlines advance from a fixed origin rather than from "now +
-/// interval", so a slow send never lets the series drift permanently behind — the harness must
-/// not silently under-offer load and then report the shortfall as the plane's fault.
+/// A deadline-accumulating, **batching** pacer. Deadlines advance from a fixed origin rather than
+/// from "now + interval", so a slow send never lets the series drift permanently behind — a load
+/// generator that silently under-offers and then reports the shortfall as the plane's fault is
+/// worse than no harness at all.
 ///
-/// Above `SPIN_THRESHOLD` pps, `thread::sleep` granularity (~50–100µs, worse under load) becomes
-/// a larger error than the interval itself, so the pacer switches to a yielding spin. Burning a
-/// core to keep the offered rate honest is the right trade for a load generator.
+/// **Why batching rather than one-packet-per-wakeup.** A 50-participant conference is ~7.6k pps
+/// on a *single* participant's video series. Sleeping per packet can't hold that (`thread::sleep`
+/// granularity is ~50–100µs, worse under load), and spinning per packet costs a whole core per
+/// series — 50 spinning threads to drive 50 participants, which no box has and which would make
+/// the *harness* the bottleneck being measured. So each wakeup emits every packet that has come
+/// due since the last one: at ~1ms wakeups a 7.6k pps series sends ~8 packets per tick, and the
+/// thread sleeps in between.
+///
+/// The cost of batching is micro-burstiness (up to [`MAX_BATCH`] datagrams back to back). That is
+/// well inside the plane's per-source burst allowance (64 KiB by default ≈ 55 × 1200B packets),
+/// and real RTP pacers burst similarly, so it does not distort what is being measured. It would
+/// matter if the burst exceeded the bucket capacity — hence the cap.
 pub struct Pacer {
     origin: Instant,
     interval_nanos: u128,
     sent: u128,
 }
 
-/// Above this rate, sleep-based pacing costs more accuracy than it saves CPU.
-const SPIN_THRESHOLD: u32 = 2_000;
+/// Most datagrams one wakeup may emit. Bounds the burst after a scheduling stall: without it, a
+/// thread descheduled for 200ms would come back and fire 1500 packets in a row, which the plane
+/// would (correctly) shape — and the harness would misread its own stall as plane loss.
+pub const MAX_BATCH: u32 = 64;
+
+/// Target wakeup granularity. Long enough that sleep overshoot is a small fraction of the tick,
+/// short enough that a batch stays well under [`MAX_BATCH`] at conference rates.
+const TICK: Duration = Duration::from_micros(1000);
 
 impl Pacer {
     pub fn new(pps: u32, origin: Instant) -> Self {
@@ -229,28 +245,31 @@ impl Pacer {
         self.interval_nanos == 0
     }
 
-    /// Block until the next packet is due, then account for it. Returns `false` if this pacer
-    /// is idle (zero pps) — the caller should park instead of hot-looping.
-    pub fn wait(&mut self, pps: u32) -> bool {
+    /// Block until at least one packet is due, then return how many are due now (1..=[`MAX_BATCH`]),
+    /// accounting for them. Returns `0` only for an idle (zero-pps) pacer, whose caller should
+    /// park rather than hot-loop.
+    ///
+    /// Packets beyond `MAX_BATCH` stay owed and are emitted on subsequent ticks — the debt is
+    /// never forgiven, so a stalled thread catches back up to the offered rate instead of
+    /// quietly delivering less than it claimed.
+    pub fn wait_batch(&mut self) -> u32 {
         if self.idle() {
-            return false;
+            return 0;
         }
-        let due = Duration::from_nanos((self.sent * self.interval_nanos) as u64);
         loop {
-            let elapsed = self.origin.elapsed();
-            if elapsed >= due {
-                break;
+            let elapsed = self.origin.elapsed().as_nanos();
+            let due_total = elapsed / self.interval_nanos;
+            if due_total > self.sent {
+                let batch = (due_total - self.sent).min(MAX_BATCH as u128) as u32;
+                self.sent += batch as u128;
+                return batch;
             }
-            let remaining = due - elapsed;
-            if pps <= SPIN_THRESHOLD && remaining > Duration::from_micros(200) {
-                std::thread::sleep(remaining - Duration::from_micros(100));
-            } else {
-                std::hint::spin_loop();
-                std::thread::yield_now();
-            }
+            // Nothing due yet: sleep until the next deadline, but never longer than a tick, so a
+            // very slow series still wakes often enough to stay responsive to the stop flag.
+            let next_due_nanos = (self.sent + 1) * self.interval_nanos;
+            let wait = Duration::from_nanos((next_due_nanos - elapsed).min(u64::MAX as u128) as u64);
+            std::thread::sleep(wait.min(TICK));
         }
-        self.sent += 1;
-        true
     }
 }
 
@@ -513,6 +532,43 @@ mod tests {
         assert_eq!(percentile(&v, 0.95), 95);
         assert_eq!(percentile(&v, 1.0), 100);
         assert_eq!(percentile(&[], 0.5), 0);
+    }
+
+    #[test]
+    fn pacer_holds_the_offered_rate_at_conference_scale() {
+        // 7644 pps is one participant's video series in a 50-way conference — the rate at which
+        // per-packet sleeping fails and per-packet spinning would cost a core.
+        let pps = 7644;
+        let origin = Instant::now();
+        let mut p = Pacer::new(pps, origin);
+        let mut emitted = 0u32;
+        while origin.elapsed() < Duration::from_millis(300) {
+            emitted += p.wait_batch();
+        }
+        let expected = (pps as f64 * origin.elapsed().as_secs_f64()) as u32;
+        let ratio = emitted as f64 / expected as f64;
+        assert!(
+            ratio > 0.9 && ratio < 1.1,
+            "offered {emitted} vs expected {expected} ({ratio:.2}x) — the pacer must not \
+             under-offer, or the shortfall gets reported as plane loss"
+        );
+    }
+
+    #[test]
+    fn pacer_batches_rather_than_spins() {
+        // The batch is what makes a high rate affordable: one wakeup must cover many packets.
+        let mut p = Pacer::new(50_000, Instant::now());
+        std::thread::sleep(Duration::from_millis(5));
+        let batch = p.wait_batch();
+        assert!(batch > 1, "expected a multi-packet batch, got {batch}");
+        assert!(batch <= MAX_BATCH, "batch {batch} exceeds the burst cap");
+    }
+
+    #[test]
+    fn idle_pacer_reports_zero_rather_than_spinning() {
+        let mut p = Pacer::new(0, Instant::now());
+        assert!(p.idle());
+        assert_eq!(p.wait_batch(), 0);
     }
 
     #[test]

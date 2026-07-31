@@ -458,15 +458,25 @@ mod tests {
         }
 
         // What a conference actually asks for, so the numbers above land against a requirement
-        // instead of floating free. Egress pps = K participants × (K-1) fan-out streams × per-
-        // stream pps; 1500kbps video in 1200B packets ≈ 156 pps, 40kbps audio in 160B ≈ 31 pps.
-        for k in [5u64, 10, 20] {
-            let streams = k * (k - 1);
-            let pps = streams * (156 + 31);
+        // instead of floating free.
+        //
+        // Video fan-out is capped at the visible tiles, audio is not: a 50-way meeting decodes a
+        // handful of videos while forwarding everyone's audio. Modelling video as (K-1) full-rate
+        // streams at that size describes a workload no SFU ships (50 participants would be
+        // 3.8 Gbps) and would make this probe's requirement line fiction.
+        //
+        // Rates: 600kbps video (a simulcast mid layer) in 1200B packets ≈ 62 pps; 40kbps audio in
+        // 160B ≈ 31 pps.
+        const VISIBLE: u64 = 9;
+        for k in [10u64, 20, 50] {
+            let v_streams = (k - 1).min(VISIBLE) * k;
+            let a_streams = (k - 1) * k;
+            let pps = v_streams * 62 + a_streams * 31;
+            let bps = v_streams as f64 * 62.0 * 1200.0 + a_streams as f64 * 31.0 * 160.0;
             println!(
-                "requirement: {k} participants ⇒ {streams} egress streams ⇒ {pps} pps \
-                 ({:.1} MiB/s at mixed sizes)",
-                (streams as f64 * (156.0 * 1200.0 + 31.0 * 160.0)) / 1048576.0
+                "requirement: {k} participants ({VISIBLE} visible) ⇒ {v_streams} video + \
+                 {a_streams} audio egress streams ⇒ {pps} pps ({:.1} MiB/s)",
+                bps / 1048576.0
             );
         }
     }

@@ -6,7 +6,12 @@
 #   ./run.sh plane <host> <port>      # through the deployed plane (see `jkbase l4 ls`)
 #   ./run.sh both <host> <port>       # baseline, then plane, then the comparison
 #
-# Env: PARTICIPANTS (10) DURATION (60) WARMUP (5) VIDEO_KBPS (1500) AUDIO_KBPS (40) IPS (auto)
+# Env: PARTICIPANTS (10) DURATION (60) WARMUP (5) VIDEO_KBPS (1500) AUDIO_KBPS (40)
+#      VISIBLE (0 = every camera) IPS (auto)
+#
+# At 20+ participants set VISIBLE (and drop VIDEO_KBPS to a simulcast layer). Every camera at
+# full rate is not a workload any SFU ships — 50 x 49 x 1500kbps is 3.8 Gbps, which measures the
+# NIC, not the plane.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -16,6 +21,7 @@ DURATION="${DURATION:-60}"
 WARMUP="${WARMUP:-5}"
 VIDEO_KBPS="${VIDEO_KBPS:-1500}"
 AUDIO_KBPS="${AUDIO_KBPS:-40}"
+VISIBLE="${VISIBLE:-0}"
 OUT="${OUT:-$HERE/results}"
 
 build() {
@@ -67,6 +73,7 @@ run_load() {
     --warmup "$WARMUP" \
     --video-kbps "$VIDEO_KBPS" \
     --audio-kbps "$AUDIO_KBPS" \
+    --visible-streams "$VISIBLE" \
     --json \
     "${extra[@]}" | tee "$OUT/$label.txt"
 }

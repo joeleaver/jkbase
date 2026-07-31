@@ -73,6 +73,7 @@ fn main() {
         "audio-kbps",
         "video-bytes",
         "audio-bytes",
+        "visible-streams",
         "bind-ips",
         "limits-per-source-bps",
         "limits-per-project-bps",
@@ -91,6 +92,9 @@ fn main() {
              --audio-kbps K         per-stream audio rate (default 40)\n\
              --video-bytes B        video packet size (default 1200)\n\
              --audio-bytes B        audio packet size (default 160)\n\
+             --visible-streams N    cap video fan-out per participant (0 = all N-1).\n\
+             \x20                      Large meetings do NOT send every camera at full rate;\n\
+             \x20                      see the README before running 20+ without this.\n\
              --bind-ips A,B,C       source IPs, round-robin per participant\n\
              --limits-per-source-bps N   plane's per-source ceiling, for diagnosis\n\
              --limits-per-project-bps N  plane's per-project ceiling, for diagnosis\n\
@@ -160,12 +164,23 @@ fn main() {
     // let the harness over-drive and blame the plane.
     let v_pps_stream = (video_kbps as u64 * 1000 / 8 / video_bytes.max(1) as u64).max(1) as u32;
     let a_pps_stream = (audio_kbps as u64 * 1000 / 8 / audio_bytes.max(1) as u64).max(1) as u32;
-    let fanout = (n - 1) as u32; // Streams each participant receives.
+
+    // Video fan-out is capped separately from audio because that is what SFUs actually do: a
+    // 50-way meeting decodes a handful of visible videos, not 49, while audio stays mixed or
+    // forwarded for everyone. Modelling video as N-1 full-rate streams at that size doesn't
+    // stress-test the plane — it invents a workload no conference product ships.
+    let visible: u32 = args.num("visible-streams", 0);
+    let audio_fanout = (n - 1) as u32;
+    let video_fanout = if visible == 0 {
+        audio_fanout
+    } else {
+        visible.min(audio_fanout)
+    };
 
     let down_profile = JoinProfile {
-        v_pps: v_pps_stream * fanout,
+        v_pps: v_pps_stream * video_fanout,
         v_bytes: video_bytes,
-        a_pps: a_pps_stream * fanout,
+        a_pps: a_pps_stream * audio_fanout,
         a_bytes: audio_bytes,
     };
 
@@ -174,7 +189,9 @@ fn main() {
 
     println!("── L4 load harness ─────────────────────────────────────────");
     println!("target                {target}");
-    println!("participants          {n} (fan-out {fanout} streams each)");
+    println!(
+        "participants          {n} (fan-out: {video_fanout} video, {audio_fanout} audio per participant)"
+    );
     println!("per-stream            video {video_kbps}kbps/{video_bytes}B  audio {audio_kbps}kbps/{audio_bytes}B");
     println!(
         "offered downstream    {} per participant, {} aggregate",
@@ -185,8 +202,27 @@ fn main() {
         "offered uplink        {} per participant",
         fmt_bps((v_pps_stream * video_bytes as u32 + a_pps_stream * audio_bytes as u32) as f64)
     );
-    if fanout == 0 {
+    if audio_fanout == 0 {
         println!("note                  1 participant ⇒ zero fan-out; downstream is idle by construction");
+    }
+
+    // Two sanity gates before a big run, because both failure modes look like "the plane is
+    // broken" and neither is.
+    if visible == 0 && n >= 20 {
+        println!(
+            "!! every participant is receiving all {audio_fanout} videos at {video_kbps}kbps. No SFU\n\
+             \x20  ships that at this size — real ones send a few visible streams plus simulcast\n\
+             \x20  low layers. Pass --visible-streams (and/or a lower --video-kbps) or this run\n\
+             \x20  measures a workload unrambler will never generate."
+        );
+    }
+    let nic_mbps = offered_total * 8.0 / 1e6;
+    if nic_mbps > 900.0 {
+        println!(
+            "!! offered aggregate is {nic_mbps:.0} Mbps — past a 1GbE path. Saturating the NIC or\n\
+             \x20  the loopback stack would be measured as plane loss. Check the baseline run\n\
+             \x20  reaches this rate before believing anything the plane run says."
+        );
     }
     println!("warm-up {}s, measure {}s", warmup.as_secs(), duration.as_secs());
     println!();
@@ -350,20 +386,23 @@ fn spawn_tx(
         let mut buf = vec![0u8; size];
         let mut seq: u32 = 0;
         while !shared.stop.load(Ordering::Relaxed) {
-            if !pacer.wait(pps) {
+            let batch = pacer.wait_batch();
+            if batch == 0 {
                 return;
             }
-            put_header(
-                &mut buf,
-                Header {
-                    kind: Kind::Up,
-                    class,
-                    seq,
-                    stamp: now_nanos(origin),
-                },
-            );
-            let _ = sock.send(&buf);
-            seq = seq.wrapping_add(1);
+            for _ in 0..batch {
+                put_header(
+                    &mut buf,
+                    Header {
+                        kind: Kind::Up,
+                        class,
+                        seq,
+                        stamp: now_nanos(origin),
+                    },
+                );
+                let _ = sock.send(&buf);
+                seq = seq.wrapping_add(1);
+            }
         }
     })
 }

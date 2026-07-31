@@ -126,6 +126,41 @@ PARTICIPANTS=20 DURATION=120 VIDEO_KBPS=2500 ./run.sh both <host> <port>
 it the transit leg fragments and the loss numbers stop meaning what they say; the agent lowers
 the guest loopback MTU for exactly this reason).
 
+### Running 40–50 participants
+
+Set `VISIBLE`. Video fan-out defaults to *every* camera, which is right at 10 and fiction at 50:
+50 × 49 × 1500kbps is **3.8 Gbps**, a number that measures your NIC and nothing else. Real SFUs
+send a few visible videos plus simulcast low layers, while forwarding everyone's audio — so
+video fan-out is capped and audio fan-out is not.
+
+```bash
+sudo ./setup-source-ips.sh add 50
+PARTICIPANTS=50 VISIBLE=9 VIDEO_KBPS=600 DURATION=120 ./run.sh both <host> <port>
+```
+
+That profile (9 visible at a 600kbps simulcast layer, 49 audio) is what a 50-way meeting really
+offers, and it lands here:
+
+| | Per participant | Aggregate |
+|---|---|---|
+| Offered | 891 KiB/s | 43.5 MiB/s, ~104k pps |
+| vs `per_source_bps` (1 MiB/s) | **87% of the cap** | — |
+| vs `egress_per_project_bps` (16 MiB/s) | — | **2.7× over** |
+| vs `egress_global_bps` (64 MiB/s) | — | **68% of the whole platform** |
+
+So a single 50-way meeting is over the per-project ceiling by 2.7× and eats two thirds of the
+platform-wide budget, while each participant sits just under the per-source cap — one bad tile
+layout or a bitrate bump puts them over it too. Raising those limits is a prerequisite for this
+workload, not a tuning exercise.
+
+The CPU side is comfortable at that scale: ~104k pps against 738k pps/core (video) means the
+transit crypto costs well under a tenth of a core. Syscalls and the TAP crossing are what the
+end-to-end run is actually there to measure.
+
+The harness itself has been verified to 50 participants at 449 MiB/s (3.8 Gbps) on loopback with
+zero loss, so it will not be the bottleneck — but always confirm the baseline reaches your target
+rate before believing a plane run at the same settings.
+
 ## Design notes
 
 Zero dependencies, on purpose: `l4-sfu-sim` builds inside a network-fenced build VM, so no

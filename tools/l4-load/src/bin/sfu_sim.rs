@@ -242,28 +242,33 @@ fn emit(
     let mut buf = vec![0u8; size];
     let mut seq: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
-        if !pacer.wait(pps) {
+        let batch = pacer.wait_batch();
+        if batch == 0 {
             return;
         }
-        put_header(
-            &mut buf,
-            Header {
-                kind: Kind::Down,
-                class,
-                seq,
-                stamp: now_nanos(origin),
-            },
-        );
-        match sock.send_to(&buf, dst) {
-            Ok(_) => {
-                totals.down_packets.fetch_add(1, Ordering::Relaxed);
-                totals.down_bytes.fetch_add(size as u64, Ordering::Relaxed);
+        for _ in 0..batch {
+            put_header(
+                &mut buf,
+                Header {
+                    kind: Kind::Down,
+                    class,
+                    seq,
+                    // Stamped per packet, not per batch: a shared stamp would make a batch look
+                    // like it arrived with zero inter-packet delay and flatten the jitter figure.
+                    stamp: now_nanos(origin),
+                },
+            );
+            match sock.send_to(&buf, dst) {
+                Ok(_) => {
+                    totals.down_packets.fetch_add(1, Ordering::Relaxed);
+                    totals.down_bytes.fetch_add(size as u64, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    totals.send_errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            Err(_) => {
-                totals.send_errors.fetch_add(1, Ordering::Relaxed);
-            }
+            seq = seq.wrapping_add(1);
         }
-        seq = seq.wrapping_add(1);
     }
 }
 
