@@ -86,7 +86,7 @@ pub async fn serve(
             if live.contains_key(&key) {
                 continue;
             }
-            let Some(spec) = resolve_spec(&store, &data_dir, alloc) else {
+            let Some(spec) = resolve_spec(&store, &data_dir, &plane, alloc) else {
                 // No transit secret yet / unresolved — skip THIS tick, retry next (fail-closed:
                 // an empty HMAC key is forgeable, so we never bind without one).
                 debug!(
@@ -164,6 +164,7 @@ pub async fn serve(
 fn resolve_spec(
     store: &Store,
     data_dir: &std::path::Path,
+    plane: &L4Plane,
     alloc: &PortAllocation,
 ) -> Option<L4PortSpec> {
     let transit_secret = store
@@ -189,6 +190,23 @@ fn resolve_spec(
         .map(|d| (d.idle_timeout_secs, d.amp_k))
         .unwrap_or((60, 0));
 
+    // Resolve the project's egress limits ONCE, here on the cold path, layering any admin
+    // override over the platform defaults field-by-field. An override that omits a field leaves
+    // the default in place rather than zeroing it — a zero-rate bucket admits nothing, and that
+    // failure would present as total packet loss rather than as the config mistake it is.
+    let mut egress = plane.default_port_egress_limits();
+    if let Ok(Some(o)) = store.get_l4_egress_limits(&alloc.project_id) {
+        if let Some(v) = o.per_source_bps {
+            egress.per_source_bps = v;
+        }
+        if let Some(v) = o.per_source_burst {
+            egress.per_source_burst = v;
+        }
+        if let Some(v) = o.per_project_bps {
+            egress.per_project_bps = v;
+        }
+    }
+
     Some(L4PortSpec {
         base_project: vm_identity::base_project_id(&alloc.project_id).to_string(),
         project_id: alloc.project_id.clone(),
@@ -201,6 +219,7 @@ fn resolve_spec(
         idle_timeout: Duration::from_secs(idle_timeout_secs),
         amp_k,
         transit_secret,
+        egress,
     })
 }
 

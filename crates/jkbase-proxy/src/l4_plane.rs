@@ -110,10 +110,20 @@ pub struct L4PlaneLimits {
     pub c0_bytes: u64,
     /// Global C0-grant rate (grants/sec).
     pub c0_grant_per_sec_global: f64,
-    /// Per-source(IP) egress rate (bytes/sec).
-    pub per_source_bps: u64,
-    /// Per-source(IP) egress burst (bytes).
-    pub per_source_burst: u64,
+    /// **Platform victim backstop**: total egress any single destination IP may receive, summed
+    /// across EVERY project (bytes/sec). This is the third-party reflection bound — the ceiling on
+    /// what a spoofed victim can be made to receive from jkbase as a whole. A per-project override
+    /// can lower a project's own share but can NEVER raise egress past this; only a platform
+    /// operator can move it, and doing so widens the residual in §1.2 of the L4 design doc.
+    pub per_victim_bps: u64,
+    /// Platform victim backstop burst (bytes).
+    pub per_victim_burst: u64,
+    /// DEFAULT per-(port, destination IP) egress rate for a project with no override (bytes/sec).
+    /// Equal to [`Self::per_victim_bps`] by default, so an un-overridden platform behaves exactly
+    /// as it did before per-project limits existed.
+    pub default_per_source_bps: u64,
+    /// Default per-(port, destination IP) burst (bytes).
+    pub default_per_source_burst: u64,
     /// Per-source aux-map cardinality bound.
     pub source_map_max: usize,
 }
@@ -135,8 +145,10 @@ impl Default for L4PlaneLimits {
             egress_global_bps: 64 * 1024 * 1024,
             c0_bytes: 1500,
             c0_grant_per_sec_global: 500.0,
-            per_source_bps: 1024 * 1024,
-            per_source_burst: 64 * 1024,
+            per_victim_bps: 1024 * 1024,
+            per_victim_burst: 64 * 1024,
+            default_per_source_bps: 1024 * 1024,
+            default_per_source_burst: 64 * 1024,
             source_map_max: 65536,
         }
     }
@@ -159,6 +171,7 @@ pub struct L4Counters {
     pub stale_epoch: u64,
     pub egress_amp_clamp: u64,
     pub egress_per_source: u64,
+    pub egress_per_victim: u64,
     pub egress_per_project: u64,
     pub egress_per_24: u64,
     pub egress_global: u64,
@@ -192,6 +205,7 @@ pub(crate) enum DropReason {
     StaleEpoch,
     EgressAmpClamp,
     EgressPerSource,
+    EgressPerVictim,
     EgressPerProject,
     EgressPer24,
     EgressGlobal,
@@ -222,6 +236,7 @@ struct AtomicCounters {
     stale_epoch: AtomicU64,
     egress_amp_clamp: AtomicU64,
     egress_per_source: AtomicU64,
+    egress_per_victim: AtomicU64,
     egress_per_project: AtomicU64,
     egress_per_24: AtomicU64,
     egress_global: AtomicU64,
@@ -251,6 +266,7 @@ impl AtomicCounters {
             stale_epoch: self.stale_epoch.swap(0, Ordering::Relaxed),
             egress_amp_clamp: self.egress_amp_clamp.swap(0, Ordering::Relaxed),
             egress_per_source: self.egress_per_source.swap(0, Ordering::Relaxed),
+            egress_per_victim: self.egress_per_victim.swap(0, Ordering::Relaxed),
             egress_per_project: self.egress_per_project.swap(0, Ordering::Relaxed),
             egress_per_24: self.egress_per_24.swap(0, Ordering::Relaxed),
             egress_global: self.egress_global.swap(0, Ordering::Relaxed),
@@ -347,7 +363,7 @@ fn net_key(ip: IpAddr) -> NetKey {
 }
 
 struct EgressState {
-    per_source: BoundedTtlMap<IpAddr, TokenBucket>,
+    per_victim: BoundedTtlMap<IpAddr, TokenBucket>,
     per_24: BoundedTtlMap<NetKey, TokenBucket>,
     per_project: BoundedTtlMap<String, TokenBucket>,
     global: TokenBucket,
@@ -359,10 +375,27 @@ struct EgressState {
 /// Which egress aggregate cap refused a reply (design §3(c) axis 2 items 2–5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressReject {
-    PerSource,
+    /// The PLATFORM bound on what one destination IP may receive across all projects.
+    PerVictim,
     Per24,
     PerProject,
     Global,
+}
+
+/// The egress limits in force for one L4 port, resolved ONCE when the port is registered (deploy /
+/// reconcile) — never looked up per datagram, so a per-project override costs the hot path nothing.
+///
+/// A project's override can raise these, but every reply still passes the platform victim backstop
+/// ([`L4PlaneLimits::per_victim_bps`]) afterwards, so raising a project's numbers alone cannot
+/// widen what a third party receives. That takes a deliberate, separate platform-operator change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L4PortEgressLimits {
+    /// This port's egress rate toward any ONE destination IP (bytes/sec).
+    pub per_source_bps: u64,
+    /// Burst for the above (bytes).
+    pub per_source_burst: u64,
+    /// This project's total egress across all its L4 ports (bytes/sec).
+    pub per_project_bps: u64,
 }
 
 // ---- last-activity + reflection kill-switch ---------------------------------------------------
@@ -439,7 +472,7 @@ impl L4Plane {
     pub fn new(limits: L4PlaneLimits, wake: WakeCallback) -> Arc<Self> {
         let now = Instant::now();
         let egress = EgressState {
-            per_source: BoundedTtlMap::new(limits.source_map_max, PER_SOURCE_TTL),
+            per_victim: BoundedTtlMap::new(limits.source_map_max, PER_SOURCE_TTL),
             per_24: BoundedTtlMap::new(limits.source_map_max, PER_24_TTL),
             per_project: BoundedTtlMap::new(PER_PROJECT_MAP_MAX, PER_PROJECT_TTL),
             global: TokenBucket::new(
@@ -551,6 +584,17 @@ impl L4Plane {
         &self.limits
     }
 
+    /// The port limits a project with no override gets. Callers resolving a port's limits start
+    /// here and replace only the fields an override actually sets, so a partial override can never
+    /// silently zero a field it didn't mention (a zero-capacity bucket admits nothing).
+    pub fn default_port_egress_limits(&self) -> L4PortEgressLimits {
+        L4PortEgressLimits {
+            per_source_bps: self.limits.default_per_source_bps,
+            per_source_burst: self.limits.default_per_source_burst,
+            per_project_bps: self.limits.egress_per_project_bps,
+        }
+    }
+
     pub(crate) fn count(&self, r: DropReason) {
         let c = &self.counters;
         let field = match r {
@@ -564,6 +608,7 @@ impl L4Plane {
             DropReason::StaleEpoch => &c.stale_epoch,
             DropReason::EgressAmpClamp => &c.egress_amp_clamp,
             DropReason::EgressPerSource => &c.egress_per_source,
+            DropReason::EgressPerVictim => &c.egress_per_victim,
             DropReason::EgressPerProject => &c.egress_per_project,
             DropReason::EgressPer24 => &c.egress_per_24,
             DropReason::EgressGlobal => &c.egress_global,
@@ -751,32 +796,43 @@ impl L4Plane {
         true
     }
 
-    /// Axis-2 aggregate caps (per-source(IP) → per-/24 → per-project → global), evaluated in
-    /// magnitude order. `Err(_)` names the tripped cap (fail-closed on any full map).
+    /// Axis-2 aggregate caps (platform victim backstop → per-/24 → per-project → global),
+    /// evaluated in magnitude order. `Err(_)` names the tripped cap (fail-closed on any full map).
+    ///
+    /// The per-(port, destination) cap is NOT here — it is enforced port-side by
+    /// [`crate::l4_ingress`] before this call, because its rate is per-project and the maps here
+    /// are platform-wide. This function is the part a tenant cannot influence.
+    ///
+    /// `limits` carries the calling port's resolved per-project numbers. Note the per-project
+    /// bucket keeps whatever rate it was created with until its TTL expires, so a limits change
+    /// takes effect for a live project within [`PER_PROJECT_TTL`] rather than instantly.
     pub(crate) fn try_egress_aggregate(
         &self,
         base: &str,
         dest_ip: IpAddr,
         bytes: usize,
+        limits: L4PortEgressLimits,
         now: Instant,
     ) -> Result<(), EgressReject> {
         let mut eg = self.egress.lock().unwrap();
         let amount = bytes as f64;
-        let (ps_bps, ps_burst) = (
-            self.limits.per_source_bps as f64,
-            self.limits.per_source_burst as f64,
+        let (pv_bps, pv_burst) = (
+            self.limits.per_victim_bps as f64,
+            self.limits.per_victim_burst as f64,
         );
-        // Per-source(IP /32) — map-full ⇒ fail-closed drop. (Bind then take: a match *guard*
-        // can't hold the `&mut` bucket, so the take is the arm body.)
+        // PLATFORM victim backstop (IP /32), across every project — map-full ⇒ fail-closed drop.
+        // This is the third-party reflection bound: no per-project override can widen it, which is
+        // why it is checked here rather than alongside the tenant's own per-source cap.
+        // (Bind then take: a match *guard* can't hold the `&mut` bucket, so the take is the body.)
         let ok = match eg
-            .per_source
-            .get_or_insert_with(dest_ip, now, || TokenBucket::new(ps_bps, ps_burst, now))
+            .per_victim
+            .get_or_insert_with(dest_ip, now, || TokenBucket::new(pv_bps, pv_burst, now))
         {
             Some(b) => b.try_take(amount, now),
             None => false,
         };
         if !ok {
-            return Err(EgressReject::PerSource);
+            return Err(EgressReject::PerVictim);
         }
         // Per-/24 backstop.
         let n24 = net_key(dest_ip);
@@ -791,8 +847,8 @@ impl L4Plane {
         if !ok {
             return Err(EgressReject::Per24);
         }
-        // Per-project.
-        let pp_bps = self.limits.egress_per_project_bps as f64;
+        // Per-project — the calling port's resolved rate (platform default unless overridden).
+        let pp_bps = limits.per_project_bps as f64;
         let ok = match eg
             .per_project
             .get_or_insert_with(base.to_string(), now, || {
@@ -926,7 +982,7 @@ impl L4Plane {
         }
         {
             let mut eg = self.egress.lock().unwrap();
-            eg.per_source.sweep(now);
+            eg.per_victim.sweep(now);
             eg.per_24.sweep(now);
             eg.per_project.sweep(now);
             eg.c0_sources.sweep(now);
@@ -1270,44 +1326,109 @@ mod tests {
         assert!(matches!(p.ensure_boot("c", Some("u")), BootAdmit::Spawn(_)));
     }
 
+    /// Generous port limits, so a test targeting a PLATFORM cap isn't refused by the port's own.
+    fn wide_port_limits() -> L4PortEgressLimits {
+        L4PortEgressLimits {
+            per_source_bps: 1_000_000,
+            per_source_burst: 1_000_000,
+            per_project_bps: 1_000_000,
+        }
+    }
+
     #[test]
     fn egress_aggregate_trips_the_right_cap() {
         let t = Instant::now();
-        // --- per-source(IP): a tight per-source burst trips first (it's checked first). ---
+        // --- platform victim backstop: a tight burst trips first (it's checked first). ---
         let lim = L4PlaneLimits {
-            per_source_bps: 1000,
-            per_source_burst: 1000,
+            per_victim_bps: 1000,
+            per_victim_burst: 1000,
             egress_per_24_bps: 1_000_000,
-            egress_per_project_bps: 1_000_000,
             egress_global_bps: 1_000_000,
             ..Default::default()
         };
         let p = L4Plane::new(lim, noop_wake());
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        assert!(p.try_egress_aggregate("a", ip, 1000, t).is_ok());
+        let wide = wide_port_limits();
+        assert!(p.try_egress_aggregate("a", ip, 1000, wide, t).is_ok());
         assert_eq!(
-            p.try_egress_aggregate("a", ip, 1, t).unwrap_err(),
-            EgressReject::PerSource
+            p.try_egress_aggregate("a", ip, 1, wide, t).unwrap_err(),
+            EgressReject::PerVictim
         );
 
-        // --- per-project: per-source generous, distinct /24s, tight project cap. ---
+        // --- per-project: victim/24 generous, distinct /24s, tight project cap. ---
         let lim2 = L4PlaneLimits {
-            per_source_bps: 1_000_000,
-            per_source_burst: 1_000_000,
+            per_victim_bps: 1_000_000,
+            per_victim_burst: 1_000_000,
             egress_per_24_bps: 1_000_000,
-            egress_per_project_bps: 10_000,
             egress_global_bps: 1_000_000,
             ..Default::default()
         };
         let p2 = L4Plane::new(lim2, noop_wake());
+        let tight = L4PortEgressLimits {
+            per_project_bps: 10_000,
+            ..wide_port_limits()
+        };
         let ip_a: IpAddr = "203.0.113.9".parse().unwrap();
         let ip_b: IpAddr = "198.51.100.9".parse().unwrap(); // different /24
-        assert!(p2.try_egress_aggregate("proj", ip_a, 6000, t).is_ok());
-        // The 2nd 6000 pushes the project past 10_000 (per-source + per-/24 both fit).
+        assert!(
+            p2.try_egress_aggregate("proj", ip_a, 6000, tight, t)
+                .is_ok()
+        );
+        // The 2nd 6000 pushes the project past 10_000 (victim + per-/24 both fit).
         assert_eq!(
-            p2.try_egress_aggregate("proj", ip_b, 6000, t).unwrap_err(),
+            p2.try_egress_aggregate("proj", ip_b, 6000, tight, t)
+                .unwrap_err(),
             EgressReject::PerProject
         );
+    }
+
+    #[test]
+    fn platform_victim_backstop_bounds_every_project_together() {
+        // THE load-bearing property of the two-level split: a per-project override raises what a
+        // project may send, but a third party's total intake is still bounded platform-wide. Two
+        // projects, each with a generous port allowance, aimed at ONE victim IP.
+        let t = Instant::now();
+        let p = L4Plane::new(
+            L4PlaneLimits {
+                per_victim_bps: 10_000,
+                per_victim_burst: 10_000,
+                egress_per_24_bps: 10_000_000,
+                egress_global_bps: 10_000_000,
+                ..Default::default()
+            },
+            noop_wake(),
+        );
+        let victim: IpAddr = "203.0.113.9".parse().unwrap();
+        let generous = L4PortEgressLimits {
+            per_source_bps: 10_000_000,
+            per_source_burst: 10_000_000,
+            per_project_bps: 10_000_000,
+        };
+
+        assert!(
+            p.try_egress_aggregate("proj-a", victim, 6000, generous, t)
+                .is_ok()
+        );
+        // Project B is a different tenant with its own generous grant — and still cannot push the
+        // victim past the platform bound, which is the whole point of checking it separately.
+        assert_eq!(
+            p.try_egress_aggregate("proj-b", victim, 6000, generous, t)
+                .unwrap_err(),
+            EgressReject::PerVictim
+        );
+    }
+
+    #[test]
+    fn default_port_limits_match_the_platform_defaults() {
+        // An un-overridden project must behave EXACTLY as it did before per-project limits
+        // existed: the port default and the victim backstop are the same number, so their
+        // composition is the single 1 MiB/s cap the platform shipped with.
+        let p = L4Plane::new(L4PlaneLimits::default(), noop_wake());
+        let d = p.default_port_egress_limits();
+        let plat = L4PlaneLimits::default();
+        assert_eq!(d.per_source_bps, plat.per_victim_bps);
+        assert_eq!(d.per_source_burst, plat.per_victim_burst);
+        assert_eq!(d.per_project_bps, plat.egress_per_project_bps);
     }
 
     #[test]

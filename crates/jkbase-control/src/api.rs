@@ -383,6 +383,10 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
             get(get_project_quota).post(set_project_quota),
         )
         .route(
+            "/projects/{id}/l4/limits",
+            get(get_project_l4_limits).post(set_project_l4_limits),
+        )
+        .route(
             "/tenants/{tenant_id}/quota",
             get(get_tenant_quota).post(set_tenant_quota),
         )
@@ -2420,6 +2424,139 @@ async fn set_project_quota(
             }),
         )
             .into_response(),
+    }
+}
+
+/// `GET /projects/{id}/l4/limits` — the project's L4 egress override, or `{}` when it has none.
+/// Owner-readable (a tenant may see what it has been granted); ADMIN-ONLY to write.
+async fn get_project_l4_limits(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let is_admin = state.is_admin_request(&headers);
+    let permitted = match state.store.get_project(&id) {
+        Ok(Some(p)) => is_admin || p.tenant_id.as_deref() == Some(&tenant.id),
+        _ => false,
+    };
+    if !permitted {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    match state.store.get_l4_egress_limits(&id) {
+        Ok(limits) => Json(limits.unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /projects/{id}/l4/limits` — PLATFORM-ADMIN set of a project's L4 egress limits.
+///
+/// Admin-only with no owner-scoped path at all, unlike the quota routes: these numbers govern how
+/// much a project may REPLY, so a tenant able to write its own would write infinity. Raising them
+/// still cannot widen what a third party receives — every reply passes the platform victim
+/// backstop afterwards (see `L4EgressLimits`).
+///
+/// Takes effect for a running project when its ports are next reconciled (redeploy), and for the
+/// per-project aggregate bucket within its TTL. Not instant, deliberately: the alternative is a
+/// control-store read on the per-datagram path.
+async fn set_project_l4_limits(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<jkbase_control_l4_limits_req::SetL4LimitsRequest>,
+) -> impl IntoResponse {
+    if !state.is_admin_request(&headers) {
+        // 404 rather than 403: an unauthenticated caller learns nothing about which projects exist.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    if state.store.get_project(&id).ok().flatten().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    // An empty body would write a row that changes nothing and report success; reject it so a
+    // mistyped field surfaces instead of silently doing nothing.
+    if req.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "no L4 limit fields provided".into(),
+            }),
+        )
+            .into_response();
+    }
+    // Merge onto the CURRENT override so a partial set preserves fields it didn't mention. A
+    // field left unset stays unset, and the platform default applies to it at resolve time.
+    let mut limits = state
+        .store
+        .get_l4_egress_limits(&id)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if let Some(v) = req.per_source_bps {
+        limits.per_source_bps = Some(v);
+    }
+    if let Some(v) = req.per_source_burst {
+        limits.per_source_burst = Some(v);
+    }
+    if let Some(v) = req.per_project_bps {
+        limits.per_project_bps = Some(v);
+    }
+    match state.store.set_l4_egress_limits(&id, &limits) {
+        Ok(()) => Json(limits).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for [`set_project_l4_limits`]. Separate from the stored type so an absent field
+/// means "leave alone" rather than "clear".
+mod jkbase_control_l4_limits_req {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct SetL4LimitsRequest {
+        #[serde(default)]
+        pub per_source_bps: Option<u64>,
+        #[serde(default)]
+        pub per_source_burst: Option<u64>,
+        #[serde(default)]
+        pub per_project_bps: Option<u64>,
+    }
+
+    impl SetL4LimitsRequest {
+        pub fn is_empty(&self) -> bool {
+            self.per_source_bps.is_none()
+                && self.per_source_burst.is_none()
+                && self.per_project_bps.is_none()
+        }
     }
 }
 
