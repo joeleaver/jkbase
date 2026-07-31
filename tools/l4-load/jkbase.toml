@@ -1,0 +1,41 @@
+# Deploy manifest for the L4 load harness' guest half.
+#
+#   cd tools/l4-load && jkbase project create l4-load-sim && jkbase deploy
+#
+# The rust buildpack builds every `[[bin]]` and launches the FIRST one (`l4-sfu-sim`) from
+# `/app/`; the explicit `command` pins that choice and passes the ports rather than relying on
+# defaults, so a manifest reader can see the whole runtime contract in one place.
+
+[project]
+name = "l4-load-sim"
+
+[servers.sim]
+source = "."
+language = "rust"
+# Authoritative for HTTP routing and the health check. The simulator's media plane is UDP —
+# this port exists so the platform has something to health-check and so `/stats` is reachable
+# over the ordinary HTTPS route while a load run is in flight.
+port = 8080
+command = ["/app/l4-sfu-sim", "--port", "9300", "--http-port", "8080", "--bind", "127.0.0.1"]
+health_check = { path = "/health", interval = "10s", timeout = "5s" }
+
+[routes]
+"/*" = { service = "server", name = "sim" }
+
+# The media plane. `guest_port` is what the simulator binds on guest loopback (P0-L4-1: never
+# eth0); the PUBLIC external port is host-decided and tenant-unforgeable.
+#
+# For an SFU the external port must EQUAL the guest port, because mediasoup advertises the port
+# it bound (there is no `announcedPort` in mediasoup 3.19) — so a real SFU deployment needs a
+# platform-admin pin (`POST /projects/{id}/l4`). The harness does not: it is told the external
+# port via `--target`, so a randomly allocated port is fine here. Read the allocation back with
+# `jkbase l4 ls`.
+[l4.media]
+proto = "udp"
+guest_port = 9300
+# Conference media is continuous; the default 60s idle timeout would only matter between runs.
+# Kept at the ceiling so a paused run doesn't tear flows down mid-measurement.
+idle_timeout = 600
+# `amp_k` deliberately UNSET: the per-flow amplification clamp is off by default (W-econ), which
+# is the configuration a real SFU would run under. Setting it here would measure a shaper that
+# production wouldn't have. To measure the clamp's cost, set `amp_k = 1` and re-run.
