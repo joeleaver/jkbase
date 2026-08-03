@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
@@ -841,6 +841,52 @@ fn build_quota_state(deps: &BuildDeps, project_id: &str) -> Option<(u64, u64)> {
     Some((used, cap))
 }
 
+/// Fraction of the monthly cap at which a project is warned it is approaching the
+/// build-minute wall. A tenant blocked mid-sprint with no prior signal has no way to
+/// ask for a raise in time; this puts the approach in the operator's log.
+const BUILD_QUOTA_WARN_FRACTION: u64 = 80;
+
+/// Slack above the monthly cap that an ALREADY-RUNNING build may consume before the
+/// mid-fan-out breaker stops it (see [`build_one_target_inner`]).
+///
+/// A deploy that passed the intake gate should finish: cutting it off mid-fan-out
+/// bills the tenant for the targets that already built and then activates nothing, so
+/// they pay for a deploy they never received. The overdraft lets the in-flight deploy
+/// land and leaves the *next* one to the intake 402. It is bounded so it can't be
+/// farmed: `MAX_TARGETS` is 64, so without a ceiling one crafted manifest could ride a
+/// single overrun into 64 x 900 s of compute.
+const BUILD_QUOTA_OVERDRAFT_SECS: u64 = 1800;
+
+/// Whether an in-flight fan-out must stop: month-to-date use has exhausted the cap
+/// AND the overdraft that lets an admitted deploy finish. Pure so the threshold is
+/// unit-testable without a store.
+fn build_quota_tripped(used: u64, cap: u64) -> bool {
+    used >= cap.saturating_add(BUILD_QUOTA_OVERDRAFT_SECS)
+}
+
+/// Whether a project has crossed [`BUILD_QUOTA_WARN_FRACTION`] of its cap. A zero cap
+/// (build disabled) never warns — the intake gate refuses it outright. Pure so the
+/// threshold is unit-testable without a store.
+fn build_quota_low(used: u64, cap: u64) -> bool {
+    cap > 0 && used.saturating_mul(100) >= cap.saturating_mul(BUILD_QUOTA_WARN_FRACTION)
+}
+
+/// Log when a project crosses [`BUILD_QUOTA_WARN_FRACTION`] of its monthly build cap.
+/// Best-effort and non-blocking: a store error just means no warning.
+fn warn_if_build_quota_low(deps: &BuildDeps, project_id: &str, target: &str) {
+    let Some((used, cap)) = build_quota_state(deps, project_id) else {
+        return;
+    };
+    if !build_quota_low(used, cap) {
+        return;
+    }
+    warn!(
+        project = %project_id, target = %target, used, cap,
+        pct = used.saturating_mul(100) / cap,
+        "project approaching its monthly build-minute cap"
+    );
+}
+
 async fn run_ip(args: &[&str]) -> Result<()> {
     let status = tokio::process::Command::new("ip")
         .args(args)
@@ -1177,13 +1223,23 @@ async fn build_one_target_inner(
     build_id: u64,
 ) -> Result<(Option<Vec<u8>>, BuildProvenance)> {
     // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
-    // intake, but a build fans out one metered VM per target — refuse remaining
-    // targets once month-to-date build-seconds reach the cap, so a many-target
-    // manifest can't overrun the cap by the target count (threat-model P1-4).
+    // intake, but a build fans out one metered VM per target, so a many-target
+    // manifest could otherwise overrun the cap by the target count (threat-model
+    // P1-4).
+    //
+    // The breaker trips at cap + BUILD_QUOTA_OVERDRAFT_SECS, not at the cap itself: a
+    // deploy admitted by the intake gate is allowed to FINISH. Tripping at the cap
+    // billed the targets that had already built and then activated nothing — the
+    // tenant paid for a deploy they never got, and the failure looked like a build
+    // error rather than a quota one. The overdraft is bounded, so a crafted 64-target
+    // manifest still can't ride one overrun into hours of compute.
     if let Some((used, cap)) = build_quota_state(deps, project_id)
-        && used >= cap
+        && build_quota_tripped(used, cap)
     {
-        bail!("build-minute quota exhausted ({used}/{cap} build-seconds this month)");
+        bail!(
+            "build-minute quota exhausted ({used}/{cap} build-seconds this month, \
+             including a {BUILD_QUOTA_OVERDRAFT_SECS}s overdraft for the in-flight build)"
+        );
     }
 
     // The CONTEXT dir is what becomes the RO image and is mounted at /src; the build
@@ -1439,10 +1495,22 @@ async fn build_one_target_inner(
     let run = run_res.with_context(|| format!("run build VM for '{}'", spec.name))?;
 
     // Meter on exit BEFORE any outcome bail — even timed-out/crashed builds held
-    // resources (anti-mining, threat-model P1-4). build_seconds = max(cgroup CPU,
-    // wall-clock floor), so a sub-tick build can't escape billing.
-    let cpu_secs = run.cpu_usec.map(|u| u.div_ceil(1_000_000)).unwrap_or(0);
-    let build_secs = cpu_secs.max(run.wall.as_secs());
+    // resources (anti-mining, threat-model P1-4).
+    //
+    // Billed on the VM's WALL time, NOT its CPU time. The cgroup runs at
+    // `cpu.max = 400%` over `vcpu_count: 4`, so CPU-second billing charged up to 4
+    // quota-seconds per wall-second — every parallel build (npm/Vite/cargo/go all
+    // parallelize by default) paid a ~3.5x multiplier against a cap the CLI and the
+    // quota API both call "build-MINUTES". The unit now means what it says.
+    //
+    // Anti-mining is unweakened: a miner has to HOLD the VM for the compute it
+    // steals, and wall-clock bills exactly that. The real containment is the 900 s
+    // per-build wall ceiling, `cpu.max` throttling, and `max_concurrent`. CPU-time
+    // billing never distinguished a miner from a legitimate `cargo build --release`
+    // (both saturate 4 vCPUs) — it only taxed tenants for using the cores we gave
+    // them. `wall` starts before drive staging + boot, so idle/sub-tick builds still
+    // bill ≥1 s and cannot escape the meter.
+    let build_secs = run.wall.as_secs();
     if build_secs > 0 {
         let hour = (now() / 3600) * 3600;
         if let Err(e) = deps.store.add_build_usage(project_id, hour, build_secs) {
@@ -1450,6 +1518,15 @@ async fn build_one_target_inner(
                   "failed to record build-minute usage");
         }
     }
+    // CPU is no longer billed, but keep it observable: a build whose CPU-seconds far
+    // exceed its wall time is a parallelism signal, and one with near-zero CPU over a
+    // long wall is stalled (usually on the fetch phase).
+    debug!(
+        project = %project_id, target = %spec.name, build_secs,
+        cpu_secs = run.cpu_usec.map(|u| u.div_ceil(1_000_000)).unwrap_or(0),
+        "build VM metered"
+    );
+    warn_if_build_quota_low(deps, project_id, &spec.name);
     let outcome = run.outcome;
 
     // Best-effort: the log tail is useful even when the build failed.
@@ -2481,6 +2558,33 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_breaker_lets_an_admitted_build_finish_then_stops_it() {
+        let cap = 12_000; // the 200-build-minute platform default
+        // Admitted at the cap, the fan-out continues into the overdraft: the deploy the
+        // intake gate let in is not billed for targets it then refuses to activate.
+        assert!(!build_quota_tripped(cap, cap));
+        assert!(!build_quota_tripped(cap + BUILD_QUOTA_OVERDRAFT_SECS - 1, cap));
+        // Past the overdraft it stops, so one crafted MAX_TARGETS manifest can't ride a
+        // single overrun into hours of compute.
+        assert!(build_quota_tripped(cap + BUILD_QUOTA_OVERDRAFT_SECS, cap));
+        // A zero cap can't underflow into a free pass.
+        assert!(build_quota_tripped(u64::MAX, 0));
+    }
+
+    #[test]
+    fn quota_warning_fires_at_the_warn_fraction() {
+        let cap = 12_000;
+        assert!(!build_quota_low(9_599, cap)); // 79.9%
+        assert!(build_quota_low(9_600, cap)); // 80.0%
+        assert!(build_quota_low(cap, cap));
+        // A zero cap never warns (the intake gate refuses it outright) and can't divide by zero.
+        assert!(!build_quota_low(0, 0));
+        assert!(!build_quota_low(50, 0));
+        // Near-u64 usage saturates rather than wrapping into a false negative.
+        assert!(build_quota_low(u64::MAX, cap));
+    }
 
     #[test]
     fn enumerate_and_assemble_are_deterministic() {

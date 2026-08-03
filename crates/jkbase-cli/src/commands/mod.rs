@@ -785,8 +785,9 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     let rx = v["rx_bytes"].as_u64().unwrap_or(0);
     let tx = v["tx_bytes"].as_u64().unwrap_or(0);
     let storage = v["storage_bytes"].as_u64().unwrap_or(0);
-    // Server-side build-VM time, metered on build exit. Distinct from `cpu_seconds`
-    // (runtime-VM CPU); it's the field the build-minute quota gate counts against.
+    // Server-side build-VM WALL time, metered on build exit — one VM per build target,
+    // so a fan-out build sums its targets. Distinct from `cpu_seconds` (runtime-VM CPU);
+    // it's the field the build-minute quota gate counts against.
     let build_seconds = v["build_seconds"].as_u64().unwrap_or(0);
 
     println!("Usage for '{project_id}' (month-to-date):");
