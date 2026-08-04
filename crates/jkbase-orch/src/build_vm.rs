@@ -187,8 +187,14 @@ pub struct BuildRun {
     pub outcome: BuildOutcome,
     /// Total CPU the build cgroup consumed (microseconds), from `cpu.stat` read
     /// just before the cgroup is reaped; `None` if unreadable.
+    ///
+    /// OBSERVABILITY ONLY — deliberately NOT the billing basis. The cgroup runs at
+    /// `cpu.max = 400%`, so billing this charged a parallel build up to 4 quota-
+    /// seconds per wall-second against a cap denominated in build-MINUTES. Bill
+    /// [`Self::wall`] instead; the wall-clock timeout is what bounds a runaway build.
     pub cpu_usec: Option<u64>,
-    /// Wall-clock from stage→exit (or timeout-kill), excluding teardown.
+    /// Wall-clock from stage→exit (or timeout-kill), excluding teardown. THE BILLING
+    /// BASIS: it starts before drive staging and boot, so every VM bills ≥1 s.
     pub wall: Duration,
 }
 
@@ -615,7 +621,7 @@ impl BuildVm {
         }
 
         // Read the build cgroup's cumulative CPU (cpu.stat `usage_usec`) before it
-        // is reaped below — for build-minute metering (design §8).
+        // is reaped below — observability only; billing is on `wall` (see `BuildRun`).
         let cpu_usec = read_cgroup_cpu_usec(&layout.cgroup_dir);
 
         // Liveness assertion: rmdir of the leaf cgroup only succeeds when it is

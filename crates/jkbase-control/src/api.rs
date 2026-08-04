@@ -376,11 +376,18 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/logs", get(get_project_logs))
         .route("/projects/{id}/deployments", get(list_deployments))
         .route("/projects/{id}/rollback", post(rollback))
+        .route("/projects/{id}/restart", post(restart))
         .route("/projects/{id}/status", get(get_project_status))
         .route("/projects/{id}/usage", get(get_project_usage))
         .route(
             "/projects/{id}/quota",
             get(get_project_quota).post(set_project_quota),
+        )
+        .route(
+            "/projects/{id}/l4/limits",
+            get(get_project_l4_limits)
+                .post(set_project_l4_limits)
+                .delete(clear_project_l4_limits),
         )
         .route(
             "/tenants/{tenant_id}/quota",
@@ -795,6 +802,9 @@ async fn create_project(
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
     let _ = state.store.delete_deployed_tier(&id);
+    // An admin-granted L4 egress override is per-slug, so an interrupted teardown would hand the
+    // grant to the new owner of the name.
+    let _ = state.store.remove_l4_egress_limits(&id);
     // Managed-DB backups ([RB11]): drop the admin token + catalog rows, and reap the backup
     // blobs, so a recreated same-slug project can't inherit a prior tenant's snapshots.
     let _ = state.store.delete_db_admin_token(&id);
@@ -951,6 +961,11 @@ async fn delete_project(
                     let _ = state.store.purge_usage(&id);
                     let _ = state.store.remove_quota(&id);
                     let _ = state.store.remove_quota_status(&id);
+                    // ...including any admin-granted L4 egress override. Project ids are a GLOBAL
+                    // first-come slug namespace, so leaving this row behind lets the next tenant to
+                    // claim the slug inherit a raised aggregate they were never vetted for — with
+                    // no admin action and nothing in the log.
+                    let _ = state.store.remove_l4_egress_limits(&id);
                     // Purge the project's secrets so a recreated project of the same
                     // slug can't inherit them — the deploy path injects secrets into the
                     // container env, so a stale secret would leak to a new tenant.
@@ -2423,6 +2438,230 @@ async fn set_project_quota(
     }
 }
 
+/// `GET /projects/{id}/l4/limits` — the project's L4 egress override, or `{}` when it has none.
+/// Owner-readable (a tenant may see what it has been granted); ADMIN-ONLY to write.
+async fn get_project_l4_limits(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let is_admin = state.is_admin_request(&headers);
+    let permitted = match state.store.get_project(&id) {
+        Ok(Some(p)) => is_admin || p.tenant_id.as_deref() == Some(&tenant.id),
+        _ => false,
+    };
+    if !permitted {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    match state.store.get_l4_egress_limits(&id) {
+        Ok(limits) => Json(limits.unwrap_or_default()).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /projects/{id}/l4/limits` — PLATFORM-ADMIN revoke of a project's L4 egress override,
+/// returning it to the platform defaults.
+///
+/// Needed because every field of the override is `Option` with "absent = leave alone", so `POST`
+/// can raise or change a grant but can never UNSET one — without this a grant was permanent for
+/// the lifetime of the project id, and the only way back to defaults was deleting the project.
+/// Revoking a grant is the action an operator most needs to be able to take quickly.
+async fn clear_project_l4_limits(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !state.is_admin_request(&headers) {
+        // 404, not 403 — same reasoning as the setter: reveal nothing about which projects exist.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    match state.store.remove_l4_egress_limits(&id) {
+        Ok(existed) => {
+            if existed {
+                info!(project = %id, "l4 egress override revoked (back to platform defaults)");
+            }
+            // Takes effect on any live port within a reconcile tick, like a POST.
+            Json(serde_json::json!({ "cleared": existed })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("could not clear L4 limits: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /projects/{id}/l4/limits` — PLATFORM-ADMIN set of a project's L4 egress limits.
+///
+/// Admin-only with no owner-scoped path at all, unlike the quota routes: these numbers govern how
+/// much a project may REPLY, so a tenant able to write its own would write infinity. Raising them
+/// still cannot widen what a third party receives — every reply passes the platform victim
+/// backstop afterwards (see `L4EgressLimits`).
+///
+/// Takes effect on a RUNNING port within one reconcile tick — the loop re-resolves each live
+/// port's limits every pass and pushes any change into the pump. Not instant, deliberately: the
+/// alternative is a control-store read on the per-datagram path.
+///
+/// A LOWERED limit binds from the next token refill rather than clawing back tokens already
+/// granted, so at most one burst of over-send survives a tightening. For an immediate stop the
+/// lever is still port teardown + quarantine (L4 design §8), not this endpoint.
+async fn set_project_l4_limits(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<jkbase_control_l4_limits_req::SetL4LimitsRequest>,
+) -> impl IntoResponse {
+    if !state.is_admin_request(&headers) {
+        // 404 rather than 403: an unauthenticated caller learns nothing about which projects exist.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    if state.store.get_project(&id).ok().flatten().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    // An empty body would write a row that changes nothing and report success; reject it so a
+    // mistyped field surfaces instead of silently doing nothing.
+    if req.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "no L4 limit fields provided".into(),
+            }),
+        )
+            .into_response();
+    }
+    // Reject values that would silently blackhole the project. The resolve path is careful that an
+    // OMITTED field falls back to the platform default — but an explicitly supplied `0` sailed
+    // straight through to `TokenBucket::new(0.0, 0.0, _)`, which admits nothing. The tenant would
+    // see total packet loss and every counter would read "the platform refused it", i.e. the
+    // config mistake would present as a pump fault. A burst below one MTU-sized datagram is the
+    // same bug in slower motion: the bucket can never accumulate enough for a full packet.
+    const MIN_BURST_BYTES: u64 = 1500;
+    const MAX_BPS: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB/s — a typo guard, not a policy bound.
+    let mut bad: Vec<String> = Vec::new();
+    for (name, v) in [
+        ("per_source_bps", req.per_source_bps),
+        ("per_project_bps", req.per_project_bps),
+    ] {
+        match v {
+            Some(0) => bad.push(format!("{name} must be > 0 (0 admits nothing)")),
+            Some(x) if x > MAX_BPS => bad.push(format!("{name} exceeds {MAX_BPS} bytes/sec")),
+            _ => {}
+        }
+    }
+    if let Some(b) = req.per_source_burst {
+        if b < MIN_BURST_BYTES {
+            bad.push(format!(
+                "per_source_burst must be >= {MIN_BURST_BYTES} (a burst below one datagram never admits a full packet)"
+            ));
+        } else if b > MAX_BPS {
+            bad.push(format!("per_source_burst exceeds {MAX_BPS} bytes"));
+        }
+    }
+    if !bad.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: bad.join("; "),
+            }),
+        )
+            .into_response();
+    }
+    // Merge onto the CURRENT override so a partial set preserves fields it didn't mention. A
+    // field left unset stays unset, and the platform default applies to it at resolve time.
+    //
+    // FAIL CLOSED on a read error rather than merging onto an empty override: swallowing it would
+    // silently REVOKE previously granted fields while reporting success, which is the same class
+    // of bug as a silent grant. Mirrors `set_project_quota`.
+    let mut limits = match state.store.get_l4_egress_limits(&id) {
+        Ok(existing) => existing.unwrap_or_default(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("could not read existing L4 limits: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Some(v) = req.per_source_bps {
+        limits.per_source_bps = Some(v);
+    }
+    if let Some(v) = req.per_source_burst {
+        limits.per_source_burst = Some(v);
+    }
+    if let Some(v) = req.per_project_bps {
+        limits.per_project_bps = Some(v);
+    }
+    match state.store.set_l4_egress_limits(&id, &limits) {
+        Ok(()) => Json(limits).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Request body for [`set_project_l4_limits`]. Separate from the stored type so an absent field
+/// means "leave alone" rather than "clear".
+mod jkbase_control_l4_limits_req {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct SetL4LimitsRequest {
+        #[serde(default)]
+        pub per_source_bps: Option<u64>,
+        #[serde(default)]
+        pub per_source_burst: Option<u64>,
+        #[serde(default)]
+        pub per_project_bps: Option<u64>,
+    }
+
+    impl SetL4LimitsRequest {
+        pub fn is_empty(&self) -> bool {
+            self.per_source_bps.is_none()
+                && self.per_source_burst.is_none()
+                && self.per_project_bps.is_none()
+        }
+    }
+}
+
 async fn get_tenant_quota(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
@@ -2641,6 +2880,171 @@ async fn do_rollback(
     }
 
     Ok(())
+}
+
+/// Why a restart can't proceed, kept as a pure decision separate from the
+/// handler's IO so it can be unit-tested (mirrors [`plan_l4_pin`]).
+#[derive(Debug, PartialEq)]
+enum RestartError {
+    /// The project has never been deployed — there is no live server to restart.
+    NoDeployment,
+}
+
+/// Decide which deployment version a restart relaunches: the project's CURRENT
+/// live version. A restart re-runs the deploy callback against the UNCHANGED
+/// `live` deployment — rebuilding the per-project metadata image so the store's
+/// current secrets/env are re-injected — WITHOUT a source rebuild. It is the
+/// lightweight way to pick up a `jkbase secret set` (a full `deploy` rebuilds
+/// from source; `rollback` moves the live version). Fails closed when nothing is
+/// deployed yet.
+fn plan_restart(project: &Project) -> Result<u64, RestartError> {
+    project.current_version.ok_or(RestartError::NoDeployment)
+}
+
+/// `POST /projects/{id}/restart` — relaunch the current deployment's VM with the
+/// project's current secrets/env re-injected, WITHOUT rebuilding from source. The
+/// metadata image (which bakes secrets) is rebuilt ONLY on deploy/rollback, so
+/// before this a changed secret needed a full `jkbase deploy`; a restart applies
+/// it in seconds. Owner-scoped; serialized against deploy/build/rollback.
+async fn restart(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let project = match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
+        Ok(Some(_)) | Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let target = match plan_restart(&project) {
+        Ok(v) => v,
+        Err(RestartError::NoDeployment) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "project '{id}' has no deployment to restart — run `jkbase deploy` first"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // A project whose monthly bandwidth cap is exhausted is hibernated and its wake
+    // is blocked (see the metering loop + `wake_project`'s `bandwidth_blocked` gate).
+    // Restart drives the deploy callback DIRECTLY, bypassing that wake gate — so gate
+    // here too, else a `jkbase restart` re-boots the blocked VM back into the routing
+    // table and hands it unmetered egress for the rest of the month (the meter only
+    // ever CLEARS a block, it never re-blocks an already-Running VM). Fail closed (402).
+    if let Ok(Some(status)) = state.store.get_quota_status(&id)
+        && status.bandwidth_blocked
+    {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(ErrorResponse {
+                error: status
+                    .blocked_reason
+                    .unwrap_or_else(|| "monthly bandwidth cap exceeded".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    // Defence in depth: the live deployment's on-disk artifacts must still exist
+    // (they're what the deploy callback rebuilds the metadata image from). A
+    // missing dir means a corrupt/half-pruned state — fail closed rather than
+    // restart into nothing.
+    let deploy_path = state
+        .deploy_dir
+        .join(&id)
+        .join("deployments")
+        .join(format!("v{target}"));
+    if !deploy_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("deployment v{target} artifacts not found for project '{id}'"),
+            }),
+        )
+            .into_response();
+    }
+
+    // Reuse the deploy lock so a restart can't race a concurrent deploy/build/
+    // rollback; the guard releases on drop, even if the callback unwinds.
+    let Some(_guard) = DeployLockGuard::try_acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "a deploy or rollback is already in progress".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    // Re-run the deploy callback against the unchanged `live` version: it rebuilds
+    // the metadata image from the store's CURRENT secrets and restarts the VM. No
+    // `live` symlink change (that's rollback) and no source rebuild (that's
+    // deploy). `None` (e.g. tests without an orchestrator) is a no-op success.
+    let result = match &state.deploy_callback {
+        Some(cb) => cb(id.clone(), target).await,
+        None => Ok(()),
+    };
+
+    match result {
+        Ok(()) => {
+            // The callback booted a fresh VM from `live` but — unlike deploy/rollback —
+            // persists no store row and can't move the version. Re-read FRESH under the
+            // still-held guard to (a) heal `state` to Active (restarting an idle-Hibernated
+            // project leaves the row Hibernated while the VM is Running), and (b) report the
+            // TRUE current version: a deploy/rollback that raced the pre-lock read would have
+            // moved `live`, and the callback rebuilt from whatever `live` now points at, so
+            // the fresh `current_version` is what actually booted (not the stale `target`).
+            let version = match state.store.get_project(&id) {
+                Ok(Some(mut p)) => {
+                    if p.state != crate::store::ProjectState::Active {
+                        p.state = crate::store::ProjectState::Active;
+                        let _ = state.store.update_project(&p);
+                    }
+                    p.current_version.unwrap_or(target)
+                }
+                _ => target,
+            };
+            info!(project_id = %id, version, "restarted");
+            (
+                StatusCode::OK,
+                Json(DeployResponse {
+                    version,
+                    project_id: id,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 fn slug(name: &str) -> String {
@@ -4976,6 +5380,31 @@ mod tests {
         let out = resolve_quota(&req, &current, true);
         assert_eq!(out.storage_bytes_max, 100 * GIB, "untouched cap preserved");
         assert_eq!(out.bandwidth_bytes_per_month, 1099511627776);
+    }
+
+    // A restart relaunches the CURRENT live version (to re-inject secrets) and
+    // fails closed when the project has never been deployed.
+    #[test]
+    fn plan_restart_targets_current_version_or_fails_closed() {
+        use super::{plan_restart, RestartError};
+        use crate::store::{Project, ProjectState};
+
+        let mk = |current_version| Project {
+            id: "app".into(),
+            name: "app".into(),
+            tenant_id: Some("t1".into()),
+            current_version,
+            state: ProjectState::Active,
+            vm_ip: None,
+            domains: vec![],
+        };
+
+        // A deployed project restarts its current live version — never a rebuild
+        // or a version change.
+        assert_eq!(plan_restart(&mk(Some(7))), Ok(7));
+
+        // Nothing deployed yet ⇒ there's no server to restart.
+        assert_eq!(plan_restart(&mk(None)), Err(RestartError::NoDeployment));
     }
 
     #[test]

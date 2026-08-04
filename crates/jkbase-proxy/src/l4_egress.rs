@@ -69,6 +69,43 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Whether `amount` is available at `now`, **without debiting**. Refills first, so a
+    /// [`Self::commit`] at the same `now` is exact.
+    ///
+    /// Paired with `commit` so a chain of buckets can be all-or-nothing. Debiting as you go and
+    /// bailing on the first refusal charges every earlier bucket for a datagram that is then never
+    /// sent — which, when the refusal comes from a bucket SHARED with other tenants (the global
+    /// one), lets a tenant that loses the shared race have its own private budgets drained by
+    /// someone else's traffic.
+    pub fn can_take(&mut self, amount: f64, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= amount
+    }
+
+    /// Re-point an existing bucket at a new rate/capacity, keeping its current fill (clamped to
+    /// the new capacity). Used when an admin changes a project's limits: the bucket was created
+    /// with the old rate and, because every access refreshes its TTL, an actively-sending project
+    /// would otherwise keep the original rate indefinitely — precisely the project an operator
+    /// most wants to retune.
+    /// The configured refill rate, so a caller can detect a limits change without re-creating the
+    /// bucket (which would reset its fill and hand out a free burst).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    pub fn retune(&mut self, rate: f64, capacity: f64) {
+        self.rate = rate.max(0.0);
+        self.capacity = capacity.max(0.0);
+        self.tokens = self.tokens.min(self.capacity);
+    }
+
+    /// Debit `amount`. Only meaningful after [`Self::can_take`] returned `true` at the same `now`;
+    /// floored at zero so a misuse cannot drive the bucket negative and hand out free capacity on
+    /// the next refill.
+    pub fn commit(&mut self, amount: f64) {
+        self.tokens = (self.tokens - amount).max(0.0);
+    }
 }
 
 /// Verdict of a [`RatioCredit::try_egress`] check.
@@ -350,5 +387,169 @@ mod tests {
         assert!(m.get_or_insert_with(2, t1, || 20).is_some());
         assert_eq!(m.len(), 1);
         assert!(m.contains(&2) && !m.contains(&1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Cost probe (not a unit test)
+    // -----------------------------------------------------------------------
+
+    /// **A measurement, not an assertion.** `#[ignore]`d so CI never runs it — a timing number is
+    /// not something to gate a merge on, and a loaded runner would make it lie.
+    ///
+    /// ```text
+    /// cargo test -p jkbase-proxy --release -- --ignored --nocapture l4_pump_cpu_cost
+    /// ```
+    ///
+    /// Answers what the shipped workloads never ask: what does **one datagram** cost on the pump's
+    /// hot path? A voice or game tenant is tens of pps on a handful of flows, where the transit
+    /// HMAC and the four-level egress bucket chain are free by inspection. A conference SFU's
+    /// egress leg is tens of *thousands* of pps — `K` participants each receiving `K-1` fan-out
+    /// streams — and "free by inspection" stops being an argument.
+    ///
+    /// Scope, stated honestly — and the honesty matters, because a security limit gets argued from
+    /// these numbers:
+    ///
+    /// - **Pure CPU only.** The real pump adds two syscalls per datagram (edge `recv_from` +
+    ///   guest-facing `send`) plus the TAP/virtio crossing, and on most hosts *those* dominate.
+    /// - **It UNDERSTATES the host's real per-datagram accounting by roughly 6x.** `return_decide`
+    ///   also takes the port mutex, does two flow-table lookups, runs `is_reflection_suspected`
+    ///   (mutex + `HashSet<String>` probe) and `note_egress` (another mutex, two `String` allocs,
+    ///   two bounded-map lookups, a `HashSet<IpAddr>` insert). None of that is here.
+    /// - **It OVERSTATES the crypto by ~2x**, charging both `seal` and `open` to one datagram. The
+    ///   host pays exactly one; the guest agent pays the other, on a different vCPU in a different
+    ///   VM. Those two errors partially cancel, which is why the printed figure stays a *safe*
+    ///   underestimate rather than a flattering one.
+    /// - **Not "per core".** `L4Plane::egress` and `::activity` are process-global mutexes, so this
+    ///   accounting does not scale with cores — it degrades under contention. The printed number is
+    ///   a host-wide ceiling with one thread and no contention.
+    ///
+    /// So the pps ceiling here is an upper bound on crypto+accounting under ideal conditions, and
+    /// the end-to-end harness (`tools/l4-load`) is what measures reality. If this probe alone
+    /// can't clear the conference requirement, the end-to-end run certainly cannot — that is the
+    /// only inference it supports.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn l4_pump_cpu_cost() {
+        use jkbase_common::l4_transit::{L4Dir, L4TransitHeader, open, seal};
+        use std::hint::black_box;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        const ITERS: u32 = 200_000;
+        const SECRET: &[u8] = b"jkbl_transit_secret_for_the_cost_probe";
+
+        for (label, size) in [("video 1200B", 1200usize), ("audio 160B", 160usize)] {
+            let payload = vec![0xABu8; size];
+            let mut frame = Vec::with_capacity(size + 64);
+
+            // Leg 1: the crypto both ends pay — host seals, agent opens (and the reply leg pays
+            // the mirror image, so this is one full round of transit auth per datagram).
+            let t = Instant::now();
+            for i in 0..ITERS {
+                let hdr = L4TransitHeader {
+                    flow_id: 7,
+                    epoch: 1,
+                    nonce: i as u64 + 1,
+                };
+                seal(SECRET, L4Dir::HostToAgent, hdr, &payload, &mut frame);
+                let got = open(SECRET, L4Dir::HostToAgent, black_box(&frame));
+                black_box(got.is_some());
+            }
+            let crypto_ns = t.elapsed().as_nanos() as f64 / ITERS as f64;
+
+            // Leg 2: the egress accounting chain a reply runs before it may be sent — ratio
+            // credit, then per-source, per-/24, per-project and global buckets, each behind its
+            // bounded TTL map (the map lookup is part of the cost, not an aside).
+            // Buckets are sized so they never refuse: this measures the COST of the chain, not
+            // its policy, and a refusal short-circuits the very work being timed.
+            const RATE: f64 = 1e15;
+            let now = Instant::now();
+            let mut ratio = RatioCredit::new();
+            let mut per_source: BoundedTtlMap<IpAddr, TokenBucket> =
+                BoundedTtlMap::new(65536, Duration::from_secs(120));
+            let mut per_24: BoundedTtlMap<u32, TokenBucket> =
+                BoundedTtlMap::new(8192, Duration::from_secs(120));
+            let mut per_project: BoundedTtlMap<String, TokenBucket> =
+                BoundedTtlMap::new(8192, Duration::from_secs(600));
+            let mut global = TokenBucket::new(64.0 * 1048576.0, 64.0 * 1048576.0, now);
+            let dest = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42));
+            let project = "proj-cost-probe".to_string();
+
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                // Ingress accrues credit exactly as the reach loop would before a reply.
+                ratio.on_ingress(size, 1);
+                let verdict = ratio.try_egress(size, 1500);
+                let b = size as f64;
+                // NOT `&&`: short-circuiting is what the real path does, but it made this
+                // measurement a lie. At the shipped 1 MiB/s per-source rate the first bucket
+                // drains after ~55 iterations and every later iteration returns at stage 1, so
+                // ~99.97% of the loop measured ONE bucket, not four — and never paid
+                // `project.clone()` (a String alloc + hash), the per-/24 lookup or the global
+                // bucket. The tell was that 1200B and 160B both printed an identical 43ns, which
+                // a byte-denominated four-level chain cannot do. `&` forces all four every time,
+                // which is what "the cost of the chain" has to mean.
+                let ok = per_source
+                    .get_or_insert_with(dest, now, || TokenBucket::new(RATE, RATE, now))
+                    .map(|tb| tb.try_take(b, now))
+                    .unwrap_or(false)
+                    & per_24
+                        .get_or_insert_with(0xCB00_7100, now, || TokenBucket::new(RATE, RATE, now))
+                        .map(|tb| tb.try_take(b, now))
+                        .unwrap_or(false)
+                    & per_project
+                        .get_or_insert_with(project.clone(), now, || {
+                            TokenBucket::new(RATE, RATE, now)
+                        })
+                        .map(|tb| tb.try_take(b, now))
+                        .unwrap_or(false)
+                    & global.try_take(b, now);
+                black_box((verdict, ok));
+            }
+            let limiter_ns = t.elapsed().as_nanos() as f64 / ITERS as f64;
+
+            let total_ns = crypto_ns + limiter_ns;
+            let pps_ceiling = 1e9 / total_ns;
+            println!(
+                "{label}: transit seal+open {crypto_ns:.0}ns  egress chain {limiter_ns:.0}ns  \
+                 total {total_ns:.0}ns/datagram  ⇒ {:.0}k pps (CPU only; no syscalls, no \
+                 contention)",
+                pps_ceiling / 1000.0
+            );
+        }
+
+        // What a conference actually asks for, so the numbers above land against a requirement
+        // instead of floating free.
+        //
+        // Video fan-out is capped at the visible tiles, audio is not: a 50-way meeting decodes a
+        // handful of videos while forwarding everyone's audio. Modelling video as (K-1) full-rate
+        // streams at that size describes a workload no SFU ships (50 participants would be
+        // 3.8 Gbps) and would make this probe's requirement line fiction.
+        //
+        // Rates: 600kbps video (a simulcast mid layer) in 1200B packets ≈ 62 pps; 40kbps audio in
+        // 160B ≈ 31 pps.
+        //
+        // NOTE the audio packetization, because an egress ceiling gets argued from these numbers.
+        // 40kbps in 160B implies a **32ms ptime**; standard Opus/WebRTC is **20ms** (~50 pps at
+        // ~100B), which at k=50 raises the requirement from 103,850 pps to ~150,400 — about 45%
+        // more. Packet RATE is the axis the per-datagram cost multiplies against, so this is the
+        // load-bearing parameter and 20ms is the conservative reading. Both are printed rather
+        // than one being chosen silently: the CPU conclusion survives either, but a limit should
+        // be sized against the larger.
+        const VISIBLE: u64 = 9;
+        for k in [10u64, 20, 50] {
+            let v_streams = (k - 1).min(VISIBLE) * k;
+            let a_streams = (k - 1) * k;
+            for (ptime, a_pps, a_bytes) in [(32u64, 31u64, 160.0f64), (20, 50, 100.0)] {
+                let pps = v_streams * 62 + a_streams * a_pps;
+                let bps =
+                    v_streams as f64 * 62.0 * 1200.0 + a_streams as f64 * a_pps as f64 * a_bytes;
+                println!(
+                    "requirement: {k} participants ({VISIBLE} visible, {ptime}ms audio) ⇒ \
+                     {v_streams} video + {a_streams} audio egress streams ⇒ {pps} pps \
+                     ({:.1} MiB/s)",
+                    bps / 1048576.0
+                );
+            }
+        }
     }
 }

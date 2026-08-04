@@ -29,6 +29,10 @@ const QUOTA_STATUS: TableDefinition<&str, &[u8]> = TableDefinition::new("quota_s
 /// tenant-scoped quota (all others are per-project); today it holds only the
 /// warm-VM cap. Absent override -> [`DEFAULT_TENANT_QUOTA`].
 const TENANT_QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_quotas");
+/// Per-project L4 EGRESS limits, keyed by `project_id`. Absent override -> the platform defaults
+/// resolved from `L4PlaneLimits`. Platform-admin-set only: these numbers govern how much a project
+/// may reply, so a tenant that could set its own would simply set them to infinity.
+const L4_EGRESS_LIMITS: TableDefinition<&str, &[u8]> = TableDefinition::new("l4_egress_limits");
 /// Per-project connected-repo trigger credentials (build · D): the git-push
 /// token fingerprint, bound to the owning tenant. Kept out of the app-`SECRETS`
 /// table (those are tenant env vars) so the two never leak into each other.
@@ -610,8 +614,11 @@ pub struct UsageBucket {
     /// Latest sampled storage gauge (bytes).
     pub storage_bytes_last: u64,
     pub sample_count: u32,
-    /// Build-VM seconds billed this hour, metered on build exit (not the 60 s
-    /// sampler tick). Distinct from `cpu_jiffies` (runtime-VM CPU).
+    /// Build-VM WALL seconds billed this hour, metered on build exit (not the 60 s
+    /// sampler tick). Distinct from `cpu_jiffies` (runtime-VM CPU) — and deliberately
+    /// not the build VM's CPU time either, so a build that uses the 4 vCPUs it was
+    /// given costs the same as one that leaves them idle. One VM per build target, so
+    /// a fan-out build sums its targets.
     #[serde(default)]
     pub build_seconds: u64,
     /// Seconds this hour the runtime VM was held warm by a managed-DB reach-plane
@@ -620,6 +627,45 @@ pub struct UsageBucket {
     /// `#[serde(default)]` for back-compat with pre-warm-metering buckets.
     #[serde(default)]
     pub warm_seconds: u64,
+}
+
+/// A per-project override of the L4 egress ceilings, for a workload the platform defaults were not
+/// sized for.
+///
+/// **Which field can actually help, and which cannot.** Effective egress toward one destination is
+/// `min(per_source_bps, per_victim_bps)`, and `per_victim_bps` is the platform-wide third-party
+/// bound (1 MiB/s). So `per_source_bps` is **restriction-only**: setting it ABOVE the platform
+/// victim bound changes nothing observable, because the backstop binds first. That is not a defect
+/// — it is exactly why a grant cannot widen third-party exposure — but an operator who expects it
+/// to raise per-client throughput will grant it, see no change, and reach for `per_victim_bps`,
+/// which is the one number that widens exposure for every victim on the platform. Don't.
+///
+/// The field a grant can meaningfully raise is `per_project_bps`: the project's TOTAL egress
+/// across all destinations. That is breadth, not concentration — how many clients a tenant can
+/// serve at the per-victim ceiling, never how hard any one of them can be hit.
+///
+/// Every field is optional and layered over the platform default individually: a partial override
+/// must not silently zero a field it didn't mention, because a zero-rate bucket admits nothing and
+/// the failure would look like total packet loss rather than a config error.
+///
+/// **This cannot widen what a THIRD PARTY receives.** Every reply still passes the platform victim
+/// backstop (`L4PlaneLimits::per_victim_bps`) after these, so raising a project's numbers alone
+/// changes only how that project's own budget is divided. Moving the third-party bound is a
+/// separate, deliberate platform-operator action.
+///
+/// Platform-admin-set only (`X-Admin-Token`), for the obvious reason: a tenant able to write its
+/// own limits would write infinity.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct L4EgressLimits {
+    /// Egress toward any ONE destination IP, per port (bytes/sec).
+    #[serde(default)]
+    pub per_source_bps: Option<u64>,
+    /// Burst for the above (bytes).
+    #[serde(default)]
+    pub per_source_burst: Option<u64>,
+    /// The project's total L4 egress across all its ports (bytes/sec).
+    #[serde(default)]
+    pub per_project_bps: Option<u64>,
 }
 
 /// Per-project resource limits. Absent override -> [`DEFAULT_QUOTA`].
@@ -1494,9 +1540,10 @@ impl Store {
         Ok(())
     }
 
-    /// Add `build_seconds` to a project's hourly bucket. Metered on build-VM exit
-    /// (we own the lifecycle), so a build killed between 60 s sampler ticks is
-    /// still billed — closing the free-compute window (threat-model P1-4).
+    /// Add `build_seconds` (build-VM WALL seconds) to a project's hourly bucket.
+    /// Metered on build-VM exit (we own the lifecycle), so a build killed between
+    /// 60 s sampler ticks is still billed — closing the free-compute window
+    /// (threat-model P1-4).
     pub fn add_build_usage(
         &self,
         project_id: &str,
@@ -1701,6 +1748,44 @@ impl Store {
         let txn = self.db.begin_write()?;
         let existed = {
             let mut table = txn.open_table(QUOTAS)?;
+            table.remove(project_id)?.is_some()
+        };
+        txn.commit()?;
+        Ok(existed)
+    }
+
+    // -- Per-project L4 egress limits --
+
+    pub fn set_l4_egress_limits(&self, project_id: &str, limits: &L4EgressLimits) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(L4_EGRESS_LIMITS)?;
+            let bytes = serde_json::to_vec(limits)?;
+            table.insert(project_id, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The project's override, or `None` when it has never been given one. Callers layer this over
+    /// the platform defaults field-by-field rather than substituting wholesale — see
+    /// [`L4EgressLimits`].
+    pub fn get_l4_egress_limits(&self, project_id: &str) -> Result<Option<L4EgressLimits>> {
+        let txn = self.db.begin_read()?;
+        let table = match txn.open_table(L4_EGRESS_LIMITS) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        match table.get(project_id)? {
+            Some(v) => Ok(serde_json::from_slice(v.value()).ok()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn remove_l4_egress_limits(&self, project_id: &str) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let existed = {
+            let mut table = txn.open_table(L4_EGRESS_LIMITS)?;
             table.remove(project_id)?.is_some()
         };
         txn.commit()?;

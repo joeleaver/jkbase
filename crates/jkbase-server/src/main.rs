@@ -6607,6 +6607,7 @@ async fn metering_loop(
                 | c.stale_epoch
                 | c.egress_amp_clamp
                 | c.egress_per_source
+                | c.egress_per_victim
                 | c.egress_per_project
                 | c.egress_per_24
                 | c.egress_global
@@ -6621,7 +6622,12 @@ async fn metering_loop(
                     rate_cap = c.rate_cap, budget_full = c.budget_full, warm_full_global = c.warm_full_global,
                     flow_full_project = c.flow_full_project, flow_full_global = c.flow_full_global,
                     header_auth_fail = c.header_auth_fail, nonce_replay = c.nonce_replay, stale_epoch = c.stale_epoch,
-                    egress_amp_clamp = c.egress_amp_clamp, egress_per_source = c.egress_per_source,
+                    egress_amp_clamp = c.egress_amp_clamp,
+                    // egress_per_source = the TENANT's own per-(port,destination) cap refused it.
+                    // egress_per_victim = the PLATFORM third-party backstop refused it. These are
+                    // different questions and must never be read as one number: the second is the
+                    // reflection bound, and a tick reporting only it used to emit no line at all.
+                    egress_per_source = c.egress_per_source, egress_per_victim = c.egress_per_victim,
                     egress_per_project = c.egress_per_project, egress_per_24 = c.egress_per_24, egress_global = c.egress_global,
                     c0_grant_rejected = c.c0_grant_rejected, c0_grants = c.c0_grants,
                     wakes_admitted = c.wakes_admitted, wakes_coalesced = c.wakes_coalesced,
