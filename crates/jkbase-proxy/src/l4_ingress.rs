@@ -18,17 +18,17 @@
 //! this port's `Mutex<PortState>` FIRST and any [`L4Plane`] mutex second (global order `port →
 //! plane`, no cycle); no lock is ever held across an `.await`.
 
-use crate::l4_egress::{RatioCredit, RatioVerdict, TokenBucket};
+use crate::l4_egress::{BoundedTtlMap, RatioCredit, RatioVerdict, TokenBucket};
 use crate::l4_plane::{
     BootAdmit, DropReason, EgressReject, FlowReservation, L4Event, L4FlowGuard, L4Plane,
-    ReserveReject, WakeInFlight,
+    L4PortEgressLimits, ReserveReject, WakeInFlight,
 };
 use jkbase_common::l4_transit::{self, L4Dir, L4TransitHeader};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,6 +47,13 @@ const MIN_ESTABLISH_PKTS: u64 = 3;
 const MIN_ESTABLISH_MS: Duration = Duration::from_millis(250);
 /// Hard ceiling on a wake; on expiry the boot task force-releases the permit + warm slot.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Distinct destination IPs one port tracks an egress bucket for. Bounded + fail-closed on
+/// overflow like every other aux map (P0-L4-5/-9): refusing a newcomer's egress is the correct
+/// posture, since evicting a live bucket would reset a victim's rate cap.
+const PORT_SOURCE_MAP_MAX: usize = 16_384;
+/// Idle TTL for a per-port destination bucket. Matches the plane's per-source TTL so a client that
+/// pauses and resumes is treated the same by both levels.
+const PORT_SOURCE_TTL: Duration = Duration::from_secs(120);
 /// Idle-sweep tick — well under [`PROVISIONAL_IDLE`] so provisional flows don't overstay (L3).
 const SWEEP_TICK: Duration = Duration::from_secs(1);
 /// Poll cadence while a coalesced flow waits for a sibling's boot to resolve `vm_ip`.
@@ -93,6 +100,9 @@ pub struct L4PortSpec {
     pub amp_k: u8,
     /// Per-VM transit secret (`Store::get_l4_transit_secret`); fail-closed if empty.
     pub transit_secret: String,
+    /// Egress limits for this port, resolved at registration from the project's override (or the
+    /// platform defaults). Never re-read per datagram.
+    pub egress: L4PortEgressLimits,
 }
 
 /// A flow's lifecycle state (design §3(c)). Provisional flows do NOT touch `conn_count`; only an
@@ -175,6 +185,25 @@ struct PortState {
     booting: bool,
     /// Per-port one-shot C0-grant rate limiter.
     c0_rate: TokenBucket,
+    /// This port's egress toward each destination IP, at the PROJECT's resolved rate.
+    ///
+    /// Lives here rather than on the plane because its rate is per-project: a plane-wide map keyed
+    /// only by IP would hand whichever project touched an address first the right to fix the rate
+    /// for everyone else. A port belongs to exactly one project, so keying by IP alone is correct
+    /// here — and costs no per-datagram allocation, which a `(project, IP)` key would.
+    ///
+    /// Bounding a project's egress toward a THIRD party is not this map's job; the plane's
+    /// platform victim backstop does that, after this, and no override can widen it.
+    per_source: BoundedTtlMap<IpAddr, TokenBucket>,
+    /// This port's egress limits, LIVE.
+    ///
+    /// Deliberately here rather than frozen into [`L4PortSpec`] at bind. The reconcile loop only
+    /// resolves a spec for a port that is not already live, and `allocate_port` is sticky (a
+    /// redeploy updates the allocation row in place rather than removing it), so a spec-frozen
+    /// limit could never change for the lifetime of a port — an admin LOWERING a limit during an
+    /// incident would get 200 OK and no effect on the live socket. Keeping it in `PortState`
+    /// costs the datagram path nothing: `return_decide` already holds this lock.
+    egress: L4PortEgressLimits,
 }
 
 /// The edge half of one L4 port.
@@ -265,6 +294,8 @@ impl L4Ingress {
             vm_dst: None,
             booting: false,
             c0_rate: TokenBucket::new(C0_PER_PORT_RATE, C0_PER_PORT_BURST, now),
+            per_source: BoundedTtlMap::new(PORT_SOURCE_MAP_MAX, PORT_SOURCE_TTL),
+            egress: spec.egress,
         };
         Ok(Arc::new(Self {
             spec,
@@ -278,6 +309,26 @@ impl L4Ingress {
     }
 
     /// Run the reach + return pump loops and the idle sweep until `cancel`.
+    /// Apply new egress limits to this LIVE port. Returns `true` if anything changed.
+    ///
+    /// Called from the reconcile loop when an admin edits a project's override. Without this the
+    /// knob is write-only: the loop resolves a spec only for a port that is not already live, and
+    /// `allocate_port` is sticky, so a port's limits would be frozen from first bind until the
+    /// allocation is deleted or the host restarts — an operator LOWERING a limit mid-incident
+    /// would get 200 OK and no effect.
+    ///
+    /// Only the configuration changes; the live token buckets keep their current fill. A LOWERED
+    /// rate therefore binds from the next refill rather than clawing back already-granted tokens
+    /// (bounded by the burst, so at most one burst of over-send survives a tightening).
+    pub fn update_egress_limits(&self, new: L4PortEgressLimits) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if st.egress == new {
+            return false;
+        }
+        st.egress = new;
+        true
+    }
+
     pub async fn run(self: Arc<Self>) {
         let s1 = self.clone();
         let s2 = self.clone();
@@ -571,8 +622,11 @@ impl L4Ingress {
             flows,
             by_flow_id,
             c0_rate,
+            per_source,
+            egress: port_egress,
             ..
         } = &mut *st;
+        let port_egress = *port_egress;
 
         // Demux by flow_id → client src. An unknown id is a late reply for an evicted flow — drop.
         let src = *by_flow_id.get(&hdr.flow_id)?;
@@ -613,11 +667,38 @@ impl L4Ingress {
                 }
             }
         }
-        // 2–5. per-source(IP) → per-/24 → per-project → global aggregate caps — ALWAYS enforced
+        // 2. Per-(port, destination IP) at the PROJECT's resolved rate. Checked here, before the
+        //    platform caps, so a tenant that has been given a larger allowance still meets every
+        //    platform bound afterwards — the override can only ever be the tighter of the two.
+        let (ps_bps, ps_burst) = (
+            port_egress.per_source_bps as f64,
+            port_egress.per_source_burst as f64,
+        );
+        //    CHECKED here but not yet debited: if a platform cap below refuses the datagram, this
+        //    bucket must not have been charged for something never sent. Otherwise a tenant that
+        //    loses the shared global race also burns its own port budget, and its effective rate
+        //    falls below the limit it was granted.
+        let ok = match per_source
+            .get_or_insert_with(src.ip(), now, || TokenBucket::new(ps_bps, ps_burst, now))
+        {
+            Some(b) => b.can_take(n as f64, now),
+            None => false, // map full ⇒ fail-closed, as everywhere else on this path
+        };
+        if !ok {
+            self.plane.count(DropReason::EgressPerSource);
+            return None;
+        }
+
+        // 3–6. platform victim backstop → per-/24 → per-project → global — ALWAYS enforced
         //    (the workload-agnostic third-party bound that never breaks a legit app).
-        if let Err(rej) = self.plane.try_egress_aggregate(base, src.ip(), n, now) {
+        //    Lock order is still port → plane: the port lock is held across this synchronous call
+        //    and there is no `.await` between, so the commit below cannot interleave.
+        if let Err(rej) = self
+            .plane
+            .try_egress_aggregate(base, src.ip(), n, port_egress, now)
+        {
             self.plane.count(match rej {
-                EgressReject::PerSource => DropReason::EgressPerSource,
+                EgressReject::PerVictim => DropReason::EgressPerVictim,
                 EgressReject::Per24 => DropReason::EgressPer24,
                 EgressReject::PerProject => DropReason::EgressPerProject,
                 EgressReject::Global => DropReason::EgressGlobal,
@@ -625,7 +706,17 @@ impl L4Ingress {
             return None;
         }
 
-        // Admitted.
+        // Admitted by every level — NOW debit the port bucket we only checked above, so the whole
+        // chain is all-or-nothing. Safe because the port lock has been held throughout and the
+        // plane call is synchronous, so nothing could have taken this bucket in between.
+        // (`get_or_insert_with` rather than a lookup because it is the only `&mut` accessor; the
+        // key was inserted by the check above, so the constructor cannot run here.)
+        if let Some(b) =
+            per_source.get_or_insert_with(src.ip(), now, || TokenBucket::new(ps_bps, ps_burst, now))
+        {
+            b.commit(n as f64);
+        }
+
         flow.bytes_out = flow.bytes_out.saturating_add(n as u64);
         flow.pkts = flow.pkts.saturating_add(1);
         self.maybe_promote(flow, base, tenant, now);
@@ -652,8 +743,13 @@ impl L4Ingress {
                 by_flow_id,
                 quarantine,
                 epoch_for,
+                per_source,
                 ..
             } = &mut *st;
+            // Reclaim expired destination buckets. Without this the map only fills, and a full map
+            // is fail-closed — a long-lived port would eventually refuse egress to every client it
+            // hadn't already seen.
+            per_source.sweep(now);
             let mut removed: Vec<(u32, u32)> = Vec::new();
             flows.retain(|_src, flow| {
                 let timeout = match flow.kind {

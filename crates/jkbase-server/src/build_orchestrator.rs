@@ -6581,6 +6581,8 @@ console.log("listening on " + port);
             idle_timeout: Duration::from_secs(60),
             amp_k: 1,
             transit_secret: TRANSIT_SECRET.into(),
+            // Platform defaults — this e2e exercises the transit path, not the limits.
+            egress: plane.default_port_egress_limits(),
         };
         let cancel = tokio_util::sync::CancellationToken::new();
         let ingress = L4Ingress::bind(spec, plane.clone(), resolve_vm_ip, cancel.clone())

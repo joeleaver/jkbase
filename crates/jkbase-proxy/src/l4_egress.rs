@@ -69,6 +69,43 @@ impl TokenBucket {
             false
         }
     }
+
+    /// Whether `amount` is available at `now`, **without debiting**. Refills first, so a
+    /// [`Self::commit`] at the same `now` is exact.
+    ///
+    /// Paired with `commit` so a chain of buckets can be all-or-nothing. Debiting as you go and
+    /// bailing on the first refusal charges every earlier bucket for a datagram that is then never
+    /// sent — which, when the refusal comes from a bucket SHARED with other tenants (the global
+    /// one), lets a tenant that loses the shared race have its own private budgets drained by
+    /// someone else's traffic.
+    pub fn can_take(&mut self, amount: f64, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= amount
+    }
+
+    /// Re-point an existing bucket at a new rate/capacity, keeping its current fill (clamped to
+    /// the new capacity). Used when an admin changes a project's limits: the bucket was created
+    /// with the old rate and, because every access refreshes its TTL, an actively-sending project
+    /// would otherwise keep the original rate indefinitely — precisely the project an operator
+    /// most wants to retune.
+    /// The configured refill rate, so a caller can detect a limits change without re-creating the
+    /// bucket (which would reset its fill and hand out a free burst).
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    pub fn retune(&mut self, rate: f64, capacity: f64) {
+        self.rate = rate.max(0.0);
+        self.capacity = capacity.max(0.0);
+        self.tokens = self.tokens.min(self.capacity);
+    }
+
+    /// Debit `amount`. Only meaningful after [`Self::can_take`] returned `true` at the same `now`;
+    /// floored at zero so a misuse cannot drive the bucket negative and hand out free capacity on
+    /// the next refill.
+    pub fn commit(&mut self, amount: f64) {
+        self.tokens = (self.tokens - amount).max(0.0);
+    }
 }
 
 /// Verdict of a [`RatioCredit::try_egress`] check.
