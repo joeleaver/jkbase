@@ -27,6 +27,32 @@ usage() { echo "usage: $0 {add|del|list} [count]  (BASE=$BASE DEV=$DEV)" >&2; ex
 case "$COUNT" in ''|*[!0-9]*) usage ;; esac
 [ "$COUNT" -ge 1 ] && [ "$COUNT" -le 250 ] || { echo "count must be 1..250" >&2; exit 2; }
 
+# BASE/DEV are overridable because a run against a REMOTE plane needs real routable sources —
+# loopback aliases cannot be the source for an off-box destination (connect(2) → EINVAL). But an
+# unvalidated override silently adds up to 250 addresses to a production NIC, so anything outside
+# the loopback default has to be acknowledged. CONFIRM=1 for non-interactive use.
+case "$BASE" in
+  127.*) ;;
+  *)
+    if [ "${CONFIRM:-0}" != "1" ] && [ "$CMD" != "list" ]; then
+      cat >&2 <<EOF
+!! BASE=$BASE DEV=$DEV is NOT loopback: this ${CMD}s up to $COUNT real addresses on a real
+   interface, and they persist until you run '$0 del $COUNT' or reboot.
+
+   Intended for a remote-plane run, where real sources are required. If that is what you
+   want, re-run with CONFIRM=1:
+
+       sudo CONFIRM=1 BASE=$BASE DEV=$DEV $0 $CMD $COUNT
+EOF
+      exit 2
+    fi
+    ;;
+esac
+# A bad DEV would otherwise be swallowed by the `|| true` on each add.
+if [ "$CMD" != "list" ] && ! ip link show dev "$DEV" >/dev/null 2>&1; then
+  echo "no such interface: DEV=$DEV" >&2; exit 2
+fi
+
 case "$CMD" in
   add)
     for i in $(seq 1 "$COUNT"); do

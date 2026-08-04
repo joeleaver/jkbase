@@ -32,8 +32,19 @@ build() {
 # Source aliases matter only when the plane is in the path (it is the plane that keys egress on
 # the destination IP). The baseline is unaffected either way, so the same list is used for both
 # runs — an A/B whose two halves differ in more than one variable proves nothing.
+#
+# $1 (optional) = the target host. Loopback aliases CANNOT be used as the source for an off-box
+# destination: Linux refuses to route a 127.x source off the loopback interface and connect(2)
+# returns EINVAL, which used to abort the documented remote run at participant 0. So they are only
+# offered when the target is itself loopback; for a remote target the caller must supply real
+# addresses via IPS= (see setup-source-ips.sh with BASE/DEV set to a routable subnet + NIC).
 ips() {
   if [ -n "${IPS:-}" ]; then echo "$IPS"; return; fi
+  local target_host="${1:-}"
+  case "$target_host" in
+    ''|localhost|127.*|::1|'[::1]') ;;   # loopback target: aliases are usable
+    *) echo ""; return ;;                # remote target: loopback aliases would EINVAL
+  esac
   if ip addr show dev lo 2>/dev/null | grep -q '127\.0\.1\.1/32'; then
     "$HERE/setup-source-ips.sh" list "$PARTICIPANTS"
   else
@@ -44,20 +55,40 @@ ips() {
 # Only meaningful when the plane is in the path — it is the plane that keys egress on the
 # destination address.
 warn_shared_ip() {
-  if [ -z "$(ips)" ]; then
-    cat >&2 <<'EOF'
+  local target_host="${1:-}"
+  if [ -n "$(ips "$target_host")" ]; then return; fi
+  case "$target_host" in
+    ''|localhost|127.*|::1|'[::1]')
+      cat >&2 <<'EOF'
 !! No source-IP aliases found. All participants will share one address, so they share ONE
    per-source egress bucket instead of getting one each — the plane run will look far worse
    than reality. Fix with:  sudo ./setup-source-ips.sh add <participants>
 EOF
-  fi
+      ;;
+    *)
+      cat >&2 <<EOF
+!! Remote target ($target_host) with no source IPs, so all $PARTICIPANTS participants will share
+   ONE per-source egress bucket instead of getting one each. The run will look far worse than
+   reality and the reporter will refuse to draw a verdict from it.
+
+   Loopback aliases CANNOT be used here — Linux will not route a 127.x source off-box, so
+   connect(2) fails with EINVAL. You need real addresses on a routable interface:
+
+       sudo BASE=<your-subnet-prefix> DEV=<your-nic> ./setup-source-ips.sh add $PARTICIPANTS
+       IPS="\$(BASE=<prefix> ./setup-source-ips.sh list $PARTICIPANTS)" $0 $*
+
+   Or set IPS=a,b,c directly. Proceeding anyway — the result is not a conference measurement.
+EOF
+      ;;
+  esac
 }
 
 run_load() {
   local label="$1" target="$2"
   local extra=()
   local ip_list
-  ip_list="$(ips)"
+  # Pass the destination host so loopback aliases are never offered for a remote target.
+  ip_list="$(ips "${target%%:*}")"
   [ -n "$ip_list" ] && extra+=(--bind-ips "$ip_list")
   # The ceiling diagnosis describes the plane; applying it to the control run would invent
   # findings that run cannot support.
@@ -110,9 +141,9 @@ case "${1:-both}" in
   baseline) build; baseline ;;
   plane)
     [ $# -ge 3 ] || { echo "usage: $0 plane <host> <port>" >&2; exit 2; }
-    build; warn_shared_ip; run_load plane "$2:$3" ;;
+    build; warn_shared_ip "$2"; run_load plane "$2:$3" ;;
   both)
     [ $# -ge 3 ] || { echo "usage: $0 both <host> <port>" >&2; exit 2; }
-    build; warn_shared_ip; baseline; run_load plane "$2:$3"; compare ;;
+    build; warn_shared_ip "$2"; baseline; run_load plane "$2:$3"; compare ;;
   *) echo "usage: $0 {baseline|plane|both} [host port]" >&2; exit 2 ;;
 esac

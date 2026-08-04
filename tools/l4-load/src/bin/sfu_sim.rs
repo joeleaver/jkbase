@@ -84,7 +84,20 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // Generous buffers: a starved socket buffer would show up as "the plane lost packets".
+    // Generous buffers: a starved socket buffer would show up as "the plane lost packets". The
+    // comment used to sit here with no code under it — the socket ran at the default ~208 KiB,
+    // which at fan-out rates is well under a second of queue, so an ordinary scheduling hiccup
+    // inside the microVM overflowed the kernel queue and every dropped datagram was attributed to
+    // the plane.
+    let (rcv, snd) = l4wire::set_socket_buffers(&sock, l4wire::SOCK_BUF_BYTES);
+    if rcv < l4wire::SOCK_BUF_BYTES / 2 || snd < l4wire::SOCK_BUF_BYTES / 2 {
+        eprintln!(
+            "l4-sfu-sim: warning — requested {}B socket buffers, kernel granted rcv={rcv}B \
+             snd={snd}B (net.core.rmem_max/wmem_max clamping). Queue overflow inside the guest \
+             is indistinguishable from plane loss; raise the sysctls before trusting a result.",
+            l4wire::SOCK_BUF_BYTES
+        );
+    }
     let origin = Instant::now();
     println!("l4-sfu-sim listening on {bind}:{port}");
 
@@ -238,7 +251,16 @@ fn emit(
     totals: Arc<Totals>,
     origin: Instant,
 ) {
-    let mut pacer = l4wire::Pacer::new(pps, Instant::now());
+    // Half the per-source burst each: the video and audio emitters for one participant send to the
+    // same destination and so share one per-source token bucket. Sizing both at the full burst
+    // lets coincident batches overshoot it by 2x, and the resulting drops are the plane correctly
+    // shaping the HARNESS — indistinguishable, downstream, from the pump losing packets.
+    let mut pacer = l4wire::Pacer::new(
+        pps,
+        size as u32,
+        l4wire::PER_SOURCE_BURST_BYTES / 2,
+        Instant::now(),
+    );
     let mut buf = vec![0u8; size];
     let mut seq: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
@@ -314,6 +336,13 @@ fn spawn_http(port: u16, flows: Arc<Mutex<HashMap<SocketAddr, Flow>>>, totals: A
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            // Serial accept loop with a blocking read: one peer that opens a connection and sends
+            // nothing would wedge /health and /stats permanently, and the platform health check
+            // would then hibernate the project mid-run. A deadline on both directions bounds it.
+            // This is deployed as an ordinary untrusted tenant workload, so "the only client is
+            // our own harness" is not an assumption available to us.
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
             let mut buf = [0u8; 1024];
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);

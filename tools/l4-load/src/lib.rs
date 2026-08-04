@@ -9,12 +9,23 @@
 //!
 //! Two deliberate modelling choices, both load-bearing:
 //!
-//! 1. **Asymmetric by construction.** A naive echo probe (1 reply per request) can never trip
-//!    `egress_per_source` / `egress_per_project` / `RatioCredit`, because those gates only fire
-//!    when egress outruns ingress — exactly the shape an SFU has and an echo does not. The guest
-//!    simulator therefore emits an *unsolicited* downstream at a configured rate per admitted
-//!    flow, driven by a tiny JOIN control datagram. That is the SFU shape, and it is the only
-//!    shape that exercises the reflection controls the way real media will.
+//! 1. **Asymmetric by construction — a MAGNITUDE argument, not a shape one.** The guest simulator
+//!    emits an *unsolicited* downstream at a configured rate per admitted flow, driven by a tiny
+//!    JOIN control datagram, rather than echoing.
+//!
+//!    Be precise about why, because the obvious justification is wrong: `egress_per_source`,
+//!    `egress_per_24` and `egress_per_project` are **absolute byte-rate token buckets keyed on the
+//!    reply's destination** (`l4_plane.rs`, `try_egress_aggregate`). They never read ingress, so
+//!    an echo trips them at exactly the same *rate* — shape is irrelevant to them. And
+//!    `RatioCredit`, the one gate the shape argument does fit, sits behind `if amp_k != 0`
+//!    (`l4_ingress.rs`); `amp_k` defaults to 0 since the clamp was retired as the default gate
+//!    (smarter-limiting arc, W-econ), and this harness's manifest leaves it unset — so
+//!    `RatioCredit`, the C0 grant path and `EgressAmpClamp` do not execute here at all.
+//!
+//!    What the asymmetry actually buys is magnitude: a per-participant downstream of ~1.65 MiB/s
+//!    against a ~192 KiB/s uplink puts the reply leg within reach of `per_source_bps` at
+//!    conference bitrates, which an echo bounded by its own request rate never approaches. Set
+//!    `amp_k = 1` in the manifest to bring the ratio clamp back into scope and measure its cost.
 //! 2. **One flow per participant, one port.** Matches mediasoup `WebRtcServer` (a single UDP
 //!    socket per worker, transports demuxed by ICE ufrag), which is the only mediasoup topology
 //!    that fits a per-port L4 plane. Flow count therefore tracks participant count, not transport
@@ -25,7 +36,75 @@
 //! to compile.
 
 use std::net::UdpSocket;
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------------
+// Socket buffers
+// ---------------------------------------------------------------------------
+
+// Declared here rather than pulled from `libc`/`socket2` to keep the zero-dependency property —
+// the simulator half builds inside a network-fenced build VM. Linux-only, which the whole platform
+// already is.
+unsafe extern "C" {
+    fn setsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        val: *const core::ffi::c_void,
+        len: u32,
+    ) -> i32;
+    fn getsockopt(
+        fd: i32,
+        level: i32,
+        name: i32,
+        val: *mut core::ffi::c_void,
+        len: *mut u32,
+    ) -> i32;
+}
+
+const SOL_SOCKET: i32 = 1;
+const SO_SNDBUF: i32 = 7;
+const SO_RCVBUF: i32 = 8;
+
+/// Socket buffer to request, per direction. At 50 participants a receiver takes ~1.65 MiB/s; the
+/// default `net.core.rmem_default` (~208 KiB) is ~126ms of queue, and a scheduling hiccup longer
+/// than that overflows the kernel receive queue. That overflow appears to the reporter as a
+/// **sequence gap — i.e. indistinguishable from plane loss**, which is precisely the attribution
+/// the harness exists to get right. 4 MiB is ~2.4s of queue at that rate.
+pub const SOCK_BUF_BYTES: i32 = 4 * 1024 * 1024;
+
+/// Request `SO_RCVBUF`/`SO_SNDBUF` and report what the kernel actually granted.
+///
+/// The kernel silently CLAMPS to `net.core.rmem_max`/`wmem_max` (and doubles the value it reports
+/// for bookkeeping), so the request is not the grant. Returns the effective single-direction sizes
+/// `(rcv, snd)` in bytes so a caller can WARN when the box hasn't been tuned — a silent clamp back
+/// to 208 KiB would reintroduce exactly the misattribution this exists to prevent.
+pub fn set_socket_buffers(sock: &UdpSocket, bytes: i32) -> (i32, i32) {
+    let fd = sock.as_raw_fd();
+    let mut effective = [0i32; 2];
+    for (i, name) in [SO_RCVBUF, SO_SNDBUF].into_iter().enumerate() {
+        // SAFETY: `fd` is owned by `sock` and outlives both calls; the value/len pair describes a
+        // live, correctly-sized i32. A failure is non-fatal — we read back what we actually got.
+        unsafe {
+            setsockopt(
+                fd,
+                SOL_SOCKET,
+                name,
+                (&raw const bytes).cast(),
+                size_of::<i32>() as u32,
+            );
+            let mut got: i32 = 0;
+            let mut len = size_of::<i32>() as u32;
+            if getsockopt(fd, SOL_SOCKET, name, (&raw mut got).cast(), &raw mut len) == 0 {
+                // Linux reports double the usable size; halve it back so the caller compares
+                // like with like.
+                effective[i] = got / 2;
+            }
+        }
+    }
+    (effective[0], effective[1])
+}
 
 // ---------------------------------------------------------------------------
 // Wire format
@@ -208,19 +287,28 @@ impl JoinProfile {
 /// due since the last one: at ~1ms wakeups a 7.6k pps series sends ~8 packets per tick, and the
 /// thread sleeps in between.
 ///
-/// The cost of batching is micro-burstiness (up to [`MAX_BATCH`] datagrams back to back). That is
-/// well inside the plane's per-source burst allowance (64 KiB by default ≈ 55 × 1200B packets),
-/// and real RTP pacers burst similarly, so it does not distort what is being measured. It would
-/// matter if the burst exceeded the bucket capacity — hence the cap.
+/// The cost of batching is micro-burstiness. That burst MUST fit inside the plane's per-source
+/// token-bucket capacity, or the harness manufactures exactly the drops it exists to attribute —
+/// and, because the average stays under the ceiling, the reporter's per-source detector never
+/// fires and the self-inflicted loss is misread as a pump finding. So the batch cap is derived
+/// from the byte budget at construction rather than being a flat packet count: see
+/// [`Pacer::new`].
 pub struct Pacer {
     origin: Instant,
     interval_nanos: u128,
     sent: u128,
+    /// Datagrams one wakeup may emit, derived from `burst_budget / packet_bytes`.
+    max_batch: u32,
 }
 
-/// Most datagrams one wakeup may emit. Bounds the burst after a scheduling stall: without it, a
-/// thread descheduled for 200ms would come back and fire 1500 packets in a row, which the plane
-/// would (correctly) shape — and the harness would misread its own stall as plane loss.
+/// The plane's default per-source burst allowance (`L4PlaneLimits::per_source_burst`, bytes). The
+/// harness mirrors it only to size its own batches; the plane remains authoritative.
+pub const PER_SOURCE_BURST_BYTES: u32 = 64 * 1024;
+
+/// Absolute ceiling on a batch, whatever the packet size. Bounds the burst after a scheduling
+/// stall: without it a thread descheduled for 200ms would return and fire 1500 packets in a row,
+/// which the plane would (correctly) shape — and the harness would misread its own stall as plane
+/// loss.
 pub const MAX_BATCH: u32 = 64;
 
 /// Target wakeup granularity. Long enough that sleep overshoot is a small fraction of the tick,
@@ -228,28 +316,43 @@ pub const MAX_BATCH: u32 = 64;
 const TICK: Duration = Duration::from_micros(1000);
 
 impl Pacer {
-    pub fn new(pps: u32, origin: Instant) -> Self {
+    /// `packet_bytes` is the datagram size this series emits and `burst_budget` the bytes it may
+    /// burst back-to-back. Callers pass a budget SMALLER than the full per-source burst when
+    /// several series share one destination bucket — video and audio for one participant do, so
+    /// each gets half; sizing both at the full budget would let coincident batches overshoot by 2×.
+    pub fn new(pps: u32, packet_bytes: u32, burst_budget: u32, origin: Instant) -> Self {
         let interval_nanos = if pps == 0 {
             0
         } else {
             1_000_000_000u128 / pps as u128
         };
+        // Round DOWN, floor at 1: a batch of one is always allowed (a single datagram cannot be
+        // made to fit a budget smaller than itself, and refusing to send would under-offer).
+        let max_batch = burst_budget
+            .checked_div(packet_bytes)
+            .map_or(MAX_BATCH, |b| b.clamp(1, MAX_BATCH));
         Self {
             origin,
             interval_nanos,
             sent: 0,
+            max_batch,
         }
+    }
+
+    /// The derived per-wakeup datagram cap, exposed so a caller can report it.
+    pub fn max_batch(&self) -> u32 {
+        self.max_batch
     }
 
     pub fn idle(&self) -> bool {
         self.interval_nanos == 0
     }
 
-    /// Block until at least one packet is due, then return how many are due now (1..=[`MAX_BATCH`]),
-    /// accounting for them. Returns `0` only for an idle (zero-pps) pacer, whose caller should
-    /// park rather than hot-loop.
+    /// Block until at least one packet is due, then return how many are due now
+    /// (1..=[`Self::max_batch`]), accounting for them. Returns `0` only for an idle (zero-pps)
+    /// pacer, whose caller should park rather than hot-loop.
     ///
-    /// Packets beyond `MAX_BATCH` stay owed and are emitted on subsequent ticks — the debt is
+    /// Packets beyond the batch cap stay owed and are emitted on subsequent ticks — the debt is
     /// never forgiven, so a stalled thread catches back up to the offered rate instead of
     /// quietly delivering less than it claimed.
     pub fn wait_batch(&mut self) -> u32 {
@@ -260,7 +363,7 @@ impl Pacer {
             let elapsed = self.origin.elapsed().as_nanos();
             let due_total = elapsed / self.interval_nanos;
             if due_total > self.sent {
-                let batch = (due_total - self.sent).min(MAX_BATCH as u128) as u32;
+                let batch = (due_total - self.sent).min(self.max_batch as u128) as u32;
                 self.sent += batch as u128;
                 return batch;
             }
@@ -540,7 +643,7 @@ mod tests {
         // per-packet sleeping fails and per-packet spinning would cost a core.
         let pps = 7644;
         let origin = Instant::now();
-        let mut p = Pacer::new(pps, origin);
+        let mut p = Pacer::new(pps, 1200, PER_SOURCE_BURST_BYTES / 2, origin);
         let mut emitted = 0u32;
         while origin.elapsed() < Duration::from_millis(300) {
             emitted += p.wait_batch();
@@ -557,16 +660,48 @@ mod tests {
     #[test]
     fn pacer_batches_rather_than_spins() {
         // The batch is what makes a high rate affordable: one wakeup must cover many packets.
-        let mut p = Pacer::new(50_000, Instant::now());
+        let mut p = Pacer::new(50_000, 1200, PER_SOURCE_BURST_BYTES / 2, Instant::now());
         std::thread::sleep(Duration::from_millis(5));
         let batch = p.wait_batch();
         assert!(batch > 1, "expected a multi-packet batch, got {batch}");
-        assert!(batch <= MAX_BATCH, "batch {batch} exceeds the burst cap");
+        assert!(batch <= p.max_batch(), "batch {batch} exceeds the burst cap");
+    }
+
+    #[test]
+    fn a_batch_never_exceeds_the_burst_it_shares() {
+        // The property the flat MAX_BATCH=64 violated: 64 x 1200B = 76800B against a 65536B
+        // per-source burst, 1.17x over — so the harness burst past the plane's bucket, ate the
+        // drops, and (because the AVERAGE stayed under the ceiling) reported them as a pump
+        // finding rather than as its own doing.
+        for (packet_bytes, budget) in [
+            (1200u32, PER_SOURCE_BURST_BYTES / 2),
+            (160, PER_SOURCE_BURST_BYTES / 2),
+            (1200, PER_SOURCE_BURST_BYTES),
+            (MAX_DATAGRAM as u32, PER_SOURCE_BURST_BYTES / 2),
+        ] {
+            let p = Pacer::new(100_000, packet_bytes, budget, Instant::now());
+            let burst_bytes = p.max_batch() * packet_bytes;
+            assert!(
+                burst_bytes <= budget,
+                "packet {packet_bytes}B x batch {} = {burst_bytes}B exceeds the {budget}B budget",
+                p.max_batch()
+            );
+            assert!(p.max_batch() >= 1, "a batch of one must always be allowed");
+            assert!(p.max_batch() <= MAX_BATCH);
+        }
+    }
+
+    #[test]
+    fn a_datagram_larger_than_its_budget_still_sends_one() {
+        // Floor-at-1: refusing to send would silently under-offer, and an under-offering generator
+        // reports its own shortfall as plane loss.
+        let p = Pacer::new(1000, 1500, 500, Instant::now());
+        assert_eq!(p.max_batch(), 1);
     }
 
     #[test]
     fn idle_pacer_reports_zero_rather_than_spinning() {
-        let mut p = Pacer::new(0, Instant::now());
+        let mut p = Pacer::new(0, 1200, PER_SOURCE_BURST_BYTES / 2, Instant::now());
         assert!(p.idle());
         assert_eq!(p.wait_batch(), 0);
     }

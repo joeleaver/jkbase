@@ -76,6 +76,7 @@ fn main() {
         "visible-streams",
         "bind-ips",
         "limits-per-source-bps",
+        "limits-per-24-bps",
         "limits-per-project-bps",
         "baseline",
         "json",
@@ -97,7 +98,10 @@ fn main() {
              \x20                      see the README before running 20+ without this.\n\
              --bind-ips A,B,C       source IPs, round-robin per participant\n\
              --limits-per-source-bps N   plane's per-source ceiling, for diagnosis\n\
+             --limits-per-24-bps N       plane's per-/24 ceiling, for diagnosis\n\
              --limits-per-project-bps N  plane's per-project ceiling, for diagnosis\n\
+             \x20                      (pass all three when the project has a limits override,\n\
+             \x20                       or the diagnosis is made against stale defaults)\n\
              --baseline             no plane in the path: skip ceiling diagnosis (control run)\n\
              --json                 emit a machine-readable summary line"
         );
@@ -130,6 +134,7 @@ fn main() {
     let video_bytes: u16 = args.num("video-bytes", 1200);
     let audio_bytes: u16 = args.num("audio-bytes", 160);
     let per_source_bps: f64 = args.num("limits-per-source-bps", DEF_PER_SOURCE_BPS);
+    let per_24_bps: f64 = args.num("limits-per-24-bps", DEF_PER_24_BPS);
     let per_project_bps: f64 = args.num("limits-per-project-bps", DEF_PER_PROJECT_BPS);
     let baseline = args.flag("baseline");
     let json = args.flag("json");
@@ -141,6 +146,15 @@ fn main() {
     if video_bytes as usize > MAX_DATAGRAM || audio_bytes as usize > MAX_DATAGRAM {
         eprintln!("l4-load: packet sizes must stay under {MAX_DATAGRAM}B — above the MTU the\n\
                    transit leg fragments and the loss numbers stop meaning what they say");
+        std::process::exit(2);
+    }
+    // Lower bound: the sequence/stamp fields live in the first HDR_LEN bytes, so a smaller
+    // datagram panics the writer mid-run. Only the upper bound was checked.
+    if (video_bytes as usize) < l4wire::HDR_LEN || (audio_bytes as usize) < l4wire::HDR_LEN {
+        eprintln!(
+            "l4-load: packet sizes must be at least {}B (the wire header); got video={video_bytes} audio={audio_bytes}",
+            l4wire::HDR_LEN
+        );
         std::process::exit(2);
     }
 
@@ -251,7 +265,44 @@ fn main() {
         };
         if let Err(e) = sock.connect(target) {
             eprintln!("l4-load: participant {idx} connect {target} failed: {e}");
+            // The overwhelmingly common cause, and one a bare EINVAL does not explain: the kernel
+            // refuses to route from a loopback source to a non-loopback destination. Following the
+            // README's source-IP setup (127.0.1.x aliases) and then targeting a remote host lands
+            // here at participant 0, before any traffic, and the raw errno reads like a bug in the
+            // plane rather than a setup mistake.
+            if bind_ip.is_loopback() && !target.ip().is_loopback() {
+                eprintln!(
+                    "\n\
+                     l4-load: the source IP {bind_ip} is on loopback but the target {} is not.\n\
+                     Linux will not route a loopback source off-box, so this can never connect.\n\
+                     \n\
+                     Loopback source IPs only work against a loopback target (the --baseline\n\
+                     control run). For a run through the plane on a remote host you need N REAL\n\
+                     addresses on a routable interface:\n\
+                     \n\
+                     \x20   sudo BASE=<your-subnet-prefix> DEV=<your-nic> ./setup-source-ips.sh add {n}\n\
+                     \x20   ./run.sh plane <host> <port>\n\
+                     \n\
+                     Distinct sources matter because the plane's per-source egress bucket is keyed\n\
+                     on the destination IP: without them all {n} participants share ONE bucket and\n\
+                     the run measures that bucket instead of the pump.",
+                    target.ip()
+                );
+            }
             std::process::exit(1);
+        }
+        // Sized so a scheduling hiccup doesn't overflow the kernel queue and get counted as plane
+        // loss. Checked once, on participant 0, since the sysctl ceiling is process-wide.
+        let (rcv, _snd) = l4wire::set_socket_buffers(&sock, l4wire::SOCK_BUF_BYTES);
+        if idx == 0 && rcv < l4wire::SOCK_BUF_BYTES / 2 {
+            eprintln!(
+                "l4-load: warning — asked for {}B of socket receive buffer, kernel granted {rcv}B.\n\
+                 \x20 net.core.rmem_max is clamping it. At conference rates a receive-queue\n\
+                 \x20 overflow is indistinguishable from plane loss, so raise it before trusting\n\
+                 \x20 a loss number:  sudo sysctl -w net.core.rmem_max={}",
+                l4wire::SOCK_BUF_BYTES,
+                l4wire::SOCK_BUF_BYTES
+            );
         }
         // Bounded so the receive loop can observe the stop flag even when the plane goes silent.
         sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
@@ -321,6 +372,7 @@ fn main() {
             offered_total,
             per_source_bps,
             per_project_bps,
+            per_24_bps,
             baseline,
         },
         &bind_ips,
@@ -382,7 +434,15 @@ fn spawn_tx(
     origin: Instant,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut pacer = Pacer::new(pps, Instant::now());
+        // Half the per-source burst each: this participant's video and audio series send to the
+        // same destination, so they share ONE token bucket and coincident batches would otherwise
+        // overshoot it by 2x — manufacturing drops the reporter would then have to explain.
+        let mut pacer = Pacer::new(
+            pps,
+            size as u32,
+            l4wire::PER_SOURCE_BURST_BYTES / 2,
+            Instant::now(),
+        );
         let mut buf = vec![0u8; size];
         let mut seq: u32 = 0;
         while !shared.stop.load(Ordering::Relaxed) {
@@ -454,6 +514,7 @@ struct Ceilings {
     offered_total: f64,
     per_source_bps: f64,
     per_project_bps: f64,
+    per_24_bps: f64,
     /// No plane in the path. The ceilings below belong to the plane, so applying them to a
     /// control run would invent findings the run cannot possibly support.
     baseline: bool,
@@ -472,6 +533,7 @@ fn report(
         offered_total,
         per_source_bps,
         per_project_bps,
+        per_24_bps,
         baseline,
     } = c;
     println!("── per participant ─────────────────────────────────────────");
@@ -562,15 +624,25 @@ fn report(
         );
     }
 
+    // Every ceiling that could explain a shortfall feeds ONE verdict chain. Keeping these as
+    // independent `if`s is how the reporter used to announce a per-project ceiling AND a pump
+    // finding for the same run, and how the README's own 50-way profile — two ceilings deep —
+    // reported "suspect the pump".
+    let mut ceiling_hit = false;
+    // Set when the run's premise is broken, so no verdict at all may be drawn from it.
+    let mut attribution_void = false;
+
     // Source-address sanity first: every other conclusion is void if the participants collapsed
     // onto one egress bucket. Irrelevant without a plane — nothing is keying on the address.
     if !baseline && bind_ips.len() < n {
         let shared_ips = per_ip_bytes.len();
+        attribution_void = true;
         println!(
             "!! {n} participants share {shared_ips} source IP(s). The plane's per-source egress\n\
              \x20  bucket is keyed on the destination IP, so those participants share ONE\n\
              \x20  {} ceiling instead of getting one each. Real clients have distinct\n\
-             \x20  addresses — rerun with --bind-ips (see README) before drawing conclusions.",
+             \x20  addresses — rerun with --bind-ips (see README) before drawing conclusions.\n\
+             \x20  NO verdict is drawn below: this run cannot separate shaping from pump loss.",
             fmt_bps(per_source_bps)
         );
     }
@@ -583,6 +655,7 @@ fn report(
     }
 
     if throttled > 0 {
+        ceiling_hit = true;
         println!(
             "→  {throttled}/{n} participants landed within {:.0}% of the per-source ceiling {}.\n\
              \x20  That is the token bucket shaping conference media, not congestion. A 720p\n\
@@ -596,6 +669,7 @@ fn report(
         && (agg_bps - per_project_bps).abs() < per_project_bps * CEILING_TOLERANCE
         && offered_total > per_project_bps
     {
+        ceiling_hit = true;
         println!(
             "→  aggregate landed within {:.0}% of the per-project ceiling {} — the meeting is\n\
              \x20  capped platform-side, independent of per-participant shaping.",
@@ -604,22 +678,62 @@ fn report(
         );
     }
 
-    if !baseline && offered_total > DEF_PER_24_BPS && bind_ips.len() > 1 {
-        println!(
-            "note: offered aggregate exceeds the per-/24 backstop {}. If the bind IPs share a\n\
-             \x20  /24 they also share that bucket — spread them across /24s to separate the two\n\
-             \x20  effects.",
-            fmt_bps(DEF_PER_24_BPS)
-        );
+    // Per-/24 is a real gate, not a footnote. Every source IP sharing a /24 shares ONE bucket, so
+    // compare each /24's DELIVERED aggregate against the ceiling — the previous code only warned
+    // that the OFFERED total exceeded it and never detected a hit, which is how a run shaped by
+    // this bucket fell through to the pump branch.
+    if !baseline {
+        let mut per_24: HashMap<[u8; 4], u64> = HashMap::new();
+        for (ip, bytes) in &per_ip_bytes {
+            if let IpAddr::V4(v4) = ip {
+                let o = v4.octets();
+                *per_24.entry([o[0], o[1], o[2], 0]).or_default() += bytes;
+            }
+        }
+        let shaped: Vec<_> = per_24
+            .iter()
+            .filter(|(_, &b)| {
+                let bps = b as f64 / measured.as_secs_f64();
+                (bps - per_24_bps).abs() < per_24_bps * CEILING_TOLERANCE
+            })
+            .collect();
+        if !shaped.is_empty() && offered_total > per_24_bps {
+            ceiling_hit = true;
+            println!(
+                "→  {} /24 block(s) landed within {:.0}% of the per-/24 ceiling {}. Source IPs\n\
+                 \x20  sharing a /24 share that bucket — spread them across /24s to separate this\n\
+                 \x20  from per-source shaping.",
+                shaped.len(),
+                CEILING_TOLERANCE * 100.0,
+                fmt_bps(per_24_bps)
+            );
+        }
     }
 
-    if throttled == 0 && silent == 0 && delivered_pct >= 98.0 && worst_loss < 0.5 {
-        println!("✓  clean run: no ceiling reached, loss under 0.5%, full offered rate delivered.");
-    } else if throttled == 0 && silent == 0 && worst_loss >= 0.5 {
+    // The verdict. Gated on EVERY ceiling detector, not just per-source, and suppressed entirely
+    // when the run's premise is void — a pump finding is the one conclusion that would send
+    // someone hunting a bug in production code, so it must be the hardest to reach.
+    if attribution_void {
+        // Already explained above; drawing a verdict here would contradict that warning.
+    } else if ceiling_hit {
         println!(
-            "→  loss {worst_loss:.2}% without a ceiling signature. Suspect the pump itself (CPU\n\
+            "→  config finding: the run met at least one platform ceiling above. Raise the\n\
+             \x20  relevant limit and re-run before concluding anything about the pump."
+        );
+    } else if silent == 0 && delivered_pct >= 98.0 && worst_loss < 0.5 {
+        println!("✓  clean run: no ceiling reached, loss under 0.5%, full offered rate delivered.");
+    } else if silent == 0 && worst_loss >= 0.5 {
+        println!(
+            "→  loss {worst_loss:.2}% with NO ceiling signature{}. Suspect the pump itself (CPU\n\
              \x20  per datagram) or the transit leg — compare against the no-plane baseline run\n\
-             \x20  and check `l4-pump-bench` for the per-datagram cost."
+             \x20  and check the `l4_pump_cpu_cost` probe for the per-datagram cost.\n\
+             \x20  Confirm against the plane's own counters before acting: a drop no\n\
+             \x20  `egress_*` counter explains is the pump finding; one they do explain is not.",
+            if baseline {
+                " (baseline run — no plane in the path, so this is the harness or this box)"
+            } else {
+                ""
+            }
         );
     }
 

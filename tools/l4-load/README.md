@@ -32,9 +32,15 @@ itself. The reporter separates the two and says which it saw.
 
 - **`l4-sfu-sim`** — the guest. Deployed as a jkbase project behind an `[l4.*]` UDP port. Admits
   a flow per `JOIN` and fans an **unsolicited** downstream back at it at the requested rate.
-  Deliberately not an echo: an echo can never trip `egress_per_source`, `egress_per_24`,
-  `egress_per_project` or `RatioCredit`, because those only fire when egress outruns ingress —
-  the defining shape of an SFU and the exact opposite of an echo.
+  Deliberately not an echo — but be precise about why, because the intuitive reason is wrong.
+  `egress_per_source`, `egress_per_24` and `egress_per_project` are **absolute byte-rate token
+  buckets keyed on the reply's destination**; they never read ingress, so an echo trips them at
+  exactly the same *rate*. And `RatioCredit`, the one gate the shape argument does fit, runs only
+  when `amp_k != 0` — it defaults to 0 since the clamp was retired as the default gate, and this
+  manifest leaves it unset, so `RatioCredit`, the C0 path and `EgressAmpClamp` never execute here.
+  What the asymmetry actually buys is **magnitude**: ~1.65 MiB/s down against ~192 KiB/s up puts
+  the reply leg within reach of `per_source_bps`, which an echo bounded by its own request rate
+  never approaches. Set `amp_k = 1` in `jkbase.toml` to bring the clamp back into scope.
 - **`l4-load`** — the client. K virtual participants, each one flow: uplink of one video + one
   audio stream, downlink of the `(K−1)` fan-out. Measures per-class loss (span-based, so
   reordering is not miscounted as loss), RFC 3550 jitter, RTT percentiles and delivered
@@ -61,11 +67,35 @@ client address. K participants from one address share **one** 1 MiB/s bucket ins
 of them, which manufactures catastrophic loss that means nothing. Real clients have distinct
 addresses; the harness must too.
 
+**Which addresses you need depends on where the target is, and the two cases are not
+interchangeable.**
+
+*Local target (the `baseline` control run):* loopback aliases are fine.
+
 ```bash
 sudo ./setup-source-ips.sh add 24      # 127.0.1.1 .. 127.0.1.24
 ./setup-source-ips.sh list 24          # the --bind-ips list
 sudo ./setup-source-ips.sh del 24      # afterwards
 ```
+
+*Remote target (a plane run against a real host):* **loopback aliases cannot be used.** Linux
+will not route a `127.x` source off-box, so `connect(2)` fails with `EINVAL` and the run aborts at
+participant 0. You need real addresses on a routable interface:
+
+```bash
+sudo CONFIRM=1 BASE=192.0.2 DEV=eth0 ./setup-source-ips.sh add 24
+IPS="$(BASE=192.0.2 ./setup-source-ips.sh list 24)" ./run.sh plane <host> <port>
+sudo CONFIRM=1 BASE=192.0.2 DEV=eth0 ./setup-source-ips.sh del 24    # afterwards
+```
+
+`CONFIRM=1` is required for any non-loopback `BASE`: the script would otherwise add up to 250
+addresses to a production NIC on a typo, and they persist until deleted or rebooted. `run.sh`
+will not offer loopback aliases for a remote target, and warns rather than silently producing a
+run whose loss is an artefact of every participant sharing one bucket.
+
+If you cannot get N routable addresses, the run is still worth doing — but read it as "one client
+at K× the rate", not as a conference. The reporter detects the shared-source case and refuses to
+draw a verdict from it.
 
 Those aliases share a /24, so they still share the per-/24 backstop. That is right for isolating
 the per-source cap and wrong for isolating the per-project one — to separate those, spread
@@ -84,13 +114,30 @@ to subtract is uninterpretable.
 
 ### 3. Deploy the guest and run through the plane
 
+> **`jkbase deploy` defaults to `https://api.jkbase.app` — i.e. PRODUCTION.** There is no
+> environment-variable override; the only way off prod is to pass `--api` explicitly. Deploying
+> this simulator to production and then driving it at the profiles below would offer 43.5 MiB/s —
+> 2.7× `egress_per_project_bps` and 68% of the platform-wide `egress_global_bps` — which is a
+> self-inflicted noisy-neighbour event affecting every other tenant on the box. **Always pass
+> `--api`, and tear the project down when the run is over.**
+
 ```bash
 cd tools/l4-load
-jkbase project create l4-load-sim
-jkbase deploy
-jkbase l4 ls --project l4-load-sim     # → the public external_port
+JK_API=http://127.0.0.1:9090          # ← your dev/staging control plane, NOT prod
+jkbase project create l4-load-sim --api "$JK_API"
+jkbase deploy --api "$JK_API"
+jkbase l4 ls --project l4-load-sim --api "$JK_API"   # → the public external_port
 ./run.sh plane <platform-host> <external_port>
+
+# When you are done — this is not optional, the port stays open and publicly reachable:
+jkbase project delete l4-load-sim --api "$JK_API"
 ```
+
+The manifest deliberately leaves `amp_k` unset (the ratio clamp off, matching what a real SFU
+runs under) and pins `idle_timeout` at the 600s ceiling. That is the right configuration for
+*measuring*, and the wrong one to leave sitting on a reachable port: the sim admits any `JOIN`
+from any source and answers with a sustained unsolicited downstream. Delete the project after the
+run.
 
 Or `./run.sh both <host> <port>` to run baseline and plane back to back and print the delta.
 
@@ -107,14 +154,35 @@ A drop the harness sees and no counter explains is the interesting case.
 
 ## Reading a result
 
+The verdict is a **single** line — every ceiling detector feeds one chain, so the tool cannot
+announce a config finding and a pump finding for the same run.
+
 - **`✓ clean run`** — no ceiling reached, <0.5% loss, full offered rate. The pump held at this
   scale. Raise `--participants` until something gives.
-- **`→ N participants landed within 12% of the per-source ceiling`** — a token bucket shaping
-  conference media. Config finding: the SFU needs a per-project limits override.
-- **`→ loss without a ceiling signature`** — the pump or the transit leg. Compare against the
-  baseline and check the CPU probe. This is the finding that would block putting an SFU here.
+- **`→ N participants landed within 12% of the per-source ceiling`** / **`aggregate … per-project
+  ceiling`** / **`N /24 block(s) … per-/24 ceiling`**, followed by **`→ config finding`** — a
+  token bucket is shaping conference media. Raise the relevant limit and re-run *before*
+  concluding anything about the pump.
+- **`→ loss … with NO ceiling signature`** — the pump or the transit leg. This is the finding that
+  would block putting an SFU here, so it is deliberately the hardest to reach: it requires every
+  ceiling detector to be silent. Confirm it against the plane's own counters (below) before
+  acting — a drop no `egress_*` counter explains is the real thing; one they do explain is not.
+- **`!! participants share N source IP(s)`** — the run's premise is broken and **no verdict is
+  drawn**. Fix the addresses (see §1) and re-run.
 - **`!! participants received nothing`** — never admitted. Check `jkbase l4 ls`, the wake gates
   and the health check, not the media path.
+
+If the project has a limits override (`POST /projects/{id}/l4/limits`), pass
+`--limits-per-source-bps` / `--limits-per-24-bps` / `--limits-per-project-bps` to match. The
+harness mirrors the platform *defaults* for diagnosis; against an overridden project those
+defaults are stale and the attribution will be wrong.
+
+> **Expect a reflection-shape alert while a run is in flight.** This workload is asymmetric by
+> construction (~80 MiB egress against ~19 MB ingress over a 10s window), which is exactly the
+> signature `reflection_shape_flagged` exists to catch. The host will log `"clamp-off port shows a
+> reflection shape … review for abuse"` every ~10s for the duration. That is the plane working
+> correctly on a workload that genuinely looks like a reflector in-band — not a fault, and not
+> something to silence. Warn whoever watches those logs before you start.
 
 ## Scale knobs
 
@@ -169,5 +237,8 @@ it never resolves for `cargo build --workspace` or CI.
 
 The harness paces from a fixed origin rather than `now + interval`, so a slow send never lets the
 offered rate drift quietly below target — a load generator that under-offers and then reports the
-shortfall as the plane's fault is worse than no harness at all. Above 2k pps it spins rather than
-sleeps, because `thread::sleep` granularity exceeds the interval there.
+shortfall as the plane's fault is worse than no harness at all. It never spins: each wakeup emits
+every packet that has come due since the last one and sleeps in between, so a 7.6k pps series
+costs one ~1ms-tick thread rather than a whole core. The batch is capped at `burst_budget /
+packet_bytes` so a catch-up burst cannot exceed the plane's per-source bucket — a harness that
+bursts past the bucket eats the drops and then reports them as plane loss.
