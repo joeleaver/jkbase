@@ -403,7 +403,7 @@ async fn serve_http(
     info!(addr = %listener.local_addr()?, domain = %shared.domain, "HTTP proxy listening");
 
     loop {
-        let (stream, _peer) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             biased;
             _ = shutdown.cancelled() => break, // stop accepting → leave the socket for the successor
             accept = listener.accept() => match accept {
@@ -417,7 +417,11 @@ async fn serve_http(
         tokio::spawn(async move {
             let _permit = permit;
             let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| proxy_request(shared.clone(), req));
+            let client = ClientInfo {
+                ip: peer.ip(),
+                proto: "http",
+            };
+            let svc = service_fn(move |req| proxy_request(shared.clone(), client, req));
             // with_upgrades(): keep driving the connection after a 101 so a proxied WebSocket can
             // reclaim the raw stream. header_read_timeout caps slow-header (slowloris) connections.
             let conn = http1::Builder::new()
@@ -477,7 +481,11 @@ async fn serve_https(
                 return;
             }
             let io = TokioIo::new(tls_stream);
-            let svc = service_fn(move |req| proxy_request(shared.clone(), req));
+            let client = ClientInfo {
+                ip: peer.ip(),
+                proto: "https",
+            };
+            let svc = service_fn(move |req| proxy_request(shared.clone(), client, req));
             let conn = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(Duration::from_secs(30))
@@ -597,6 +605,7 @@ async fn serve_http_redirect(
 
 async fn proxy_request(
     shared: Arc<SharedState>,
+    client: ClientInfo,
     req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
     let host = req
@@ -612,7 +621,7 @@ async fn proxy_request(
     if subdomain.as_deref() == Some("api")
         && let Some(ref addr) = *shared.api_addr
     {
-        return match forward_to_api(&shared, addr, req).await {
+        return match forward_to_api(&shared, addr, client, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(error = %e, "API forward failed");
@@ -627,7 +636,7 @@ async fn proxy_request(
     if subdomain.as_deref() == Some("storage")
         && let Some(ref addr) = *shared.storage_addr
     {
-        return match forward_to_api(&shared, addr, req).await {
+        return match forward_to_api(&shared, addr, client, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(error = %e, "object-store forward failed");
@@ -642,7 +651,7 @@ async fn proxy_request(
     if subdomain.as_deref() == Some("auth")
         && let Some(ref addr) = *shared.auth_addr
     {
-        return match forward_to_api(&shared, addr, req).await {
+        return match forward_to_api(&shared, addr, client, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(error = %e, "jkbase-auth forward failed");
@@ -683,7 +692,7 @@ async fn proxy_request(
     };
 
     if let Some(ip) = backend_ip {
-        return match forward_request(&shared, &ip, &project_id, site, req).await {
+        return match forward_request(&shared, &ip, &project_id, site, client, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend request failed");
@@ -699,7 +708,7 @@ async fn proxy_request(
 
     info!(project = %project_id, host = %host_key, "waking hibernated project");
     match (cb)(project_id.clone()).await {
-        Ok(ip) => match forward_request(&shared, &ip, &project_id, site, req).await {
+        Ok(ip) => match forward_request(&shared, &ip, &project_id, site, client, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend failed after wake");
@@ -847,9 +856,96 @@ fn upgrades_overloaded() -> Response<ProxyBody> {
         .unwrap()
 }
 
+/// The verified facts about a client connection that a backend cannot otherwise learn: who
+/// connected, and over what scheme. Sourced from the accepted socket and the listener that
+/// accepted it — never from anything on the wire.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientInfo {
+    pub ip: std::net::IpAddr,
+    /// `"https"` or `"http"` — which listener took the connection, not a client claim.
+    pub proto: &'static str,
+}
+
+/// Headers that name the CLIENT. The proxy is the sole authority for every one of them — a client
+/// can set any of these on the wire, so an inbound copy is unauthenticated and must never reach a
+/// backend (the same discipline [`SITE_HEADER`] already gets).
+const CLIENT_IDENTITY_HEADERS: [&str; 4] = [
+    "x-forwarded-for",
+    "x-real-ip",
+    "forwarded",
+    "x-forwarded-proto",
+];
+
+fn is_client_identity_header(name: &str) -> bool {
+    // Underscores are folded to dashes before comparing, so `X_Forwarded_For` is stripped too.
+    // It is a DIFFERENT header name on the wire — a tenant reading `X-Forwarded-For` would never
+    // see it — but CGI-style environments (WSGI, CGI, nginx with `underscores_in_headers on`)
+    // normalize `-` to `_`, so both names collapse to a single `HTTP_X_FORWARDED_FOR` key and the
+    // attacker's copy can win the collision. jkbase ships a Python buildpack, so that is a real
+    // path, and the classic way this exact defence gets bypassed.
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    CLIENT_IDENTITY_HEADERS.contains(&normalized.as_str())
+}
+
+/// RFC 7239 node identifier: an IPv6 literal must be bracketed AND quoted, because the bare form
+/// contains `:`, the parameter separator. Getting this wrong yields a value parsers silently
+/// truncate at the first colon — every v6 client would be attributed to `2001`.
+fn forwarded_node(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("for={v4}"),
+        std::net::IpAddr::V6(v6) => format!("for=\"[{v6}]\""),
+    }
+}
+
+/// Build the header set for a backend: the client's headers minus everything the proxy is
+/// authoritative for, plus the verified client identity.
+///
+/// **These values REPLACE any inbound ones; they are never appended to.** The conventional proxy
+/// behaviour (append to `X-Forwarded-For`, tell the app to read the last entry) hands the backend
+/// a list whose leading entries are attacker-chosen, and mis-reading it is one of the most common
+/// ways an IP allow/deny list becomes forgeable. jkbase is the only hop in front of a tenant, so
+/// the honest representation is a single verified address — and a tenant that reads
+/// `X-Forwarded-For` naively still gets the right answer.
+///
+/// `drop_host` is for backends addressed by IP (the control API), where the client's `Host` is
+/// meaningless; a tenant VM keeps it, since in-app virtual-host routing depends on it.
+fn build_forward_headers(
+    src: &hyper::HeaderMap,
+    client: ClientInfo,
+    drop_host: bool,
+) -> hyper::HeaderMap {
+    let mut out = hyper::HeaderMap::with_capacity(src.len() + CLIENT_IDENTITY_HEADERS.len());
+    for (key, value) in src {
+        let name = key.as_str();
+        if drop_host && name == "host" {
+            continue;
+        }
+        if name.to_ascii_lowercase() == SITE_HEADER || is_client_identity_header(name) {
+            continue;
+        }
+        out.append(key.clone(), value.clone());
+    }
+
+    // An IP's Display output is always a valid header value, but take the fallible path anyway:
+    // a panic here would be on every request.
+    let ip = client.ip.to_string();
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&ip) {
+        out.insert("x-forwarded-for", v.clone());
+        out.insert("x-real-ip", v);
+    }
+    if let Ok(v) = hyper::header::HeaderValue::from_str(&forwarded_node(client.ip)) {
+        out.insert("forwarded", v);
+    }
+    if let Ok(v) = hyper::header::HeaderValue::from_str(client.proto) {
+        out.insert("x-forwarded-proto", v);
+    }
+    out
+}
+
 async fn forward_to_api(
     shared: &SharedState,
     api_addr: &str,
+    client: ClientInfo,
     mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ProxyBody>> {
     let path = req
@@ -867,12 +963,11 @@ async fn forward_to_api(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     spawn_backend_conn(conn, upgrade);
 
+    // Strips host, the trusted internal site header, and any client-supplied identity headers,
+    // then stamps the verified ones (anti-spoof).
     let mut builder = Request::builder().method(req.method()).uri(&uri);
-    for (key, value) in req.headers() {
-        // Strip host and the trusted internal site header (anti-spoof).
-        if key != "host" && key.as_str().to_ascii_lowercase() != SITE_HEADER {
-            builder = builder.header(key, value);
-        }
+    for (key, value) in &build_forward_headers(req.headers(), client, true) {
+        builder = builder.header(key, value);
     }
     let proxy_req = builder.body(req.into_body()).unwrap();
 
@@ -904,6 +999,7 @@ async fn forward_request(
     backend_ip: &str,
     project_id: &str,
     site: Option<&str>,
+    client: ClientInfo,
     mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ProxyBody>> {
     let port = shared.backend_port;
@@ -923,13 +1019,12 @@ async fn forward_request(
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     spawn_backend_conn(conn, upgrade);
 
+    // Drops any inbound site header (a client must not pick the served site) and any inbound
+    // client-identity headers, then stamps the verified client IP + scheme. The proxy is the sole
+    // authority for all of them.
     let mut builder = Request::builder().method(req.method()).uri(&uri);
-    for (key, value) in req.headers() {
-        // Drop any inbound site header so a client can't pick the served site;
-        // the proxy is the sole authority for it.
-        if key.as_str().to_ascii_lowercase() != SITE_HEADER {
-            builder = builder.header(key, value);
-        }
+    for (key, value) in &build_forward_headers(req.headers(), client, false) {
+        builder = builder.header(key, value);
     }
     if let Some(site) = site {
         builder = builder.header(SITE_HEADER, site);
@@ -985,6 +1080,167 @@ fn extract_subdomain(hostname: &str, platform_domain: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client(ip: &str) -> ClientInfo {
+        ClientInfo {
+            ip: ip.parse().unwrap(),
+            proto: "https",
+        }
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn client_identity_is_stamped_from_the_socket() {
+        let out =
+            build_forward_headers(&headers(&[("accept", "*/*")]), client("203.0.113.7"), false);
+        assert_eq!(out["x-forwarded-for"], "203.0.113.7");
+        assert_eq!(out["x-real-ip"], "203.0.113.7");
+        assert_eq!(out["forwarded"], "for=203.0.113.7");
+        assert_eq!(out["x-forwarded-proto"], "https");
+        // Everything else still rides through.
+        assert_eq!(out["accept"], "*/*");
+    }
+
+    #[test]
+    fn underscore_variants_are_stripped_too() {
+        // `X_Forwarded_For` is a different header name on the wire, so a tenant reading
+        // `X-Forwarded-For` would never see it — but CGI-style environments (WSGI, CGI, nginx with
+        // `underscores_in_headers on`) fold `-` to `_`, so both collapse to one
+        // `HTTP_X_FORWARDED_FOR` key and the attacker's copy can win. This is the classic bypass
+        // of exactly this defence, and jkbase ships a Python buildpack.
+        let src = headers(&[
+            ("X_Forwarded_For", "1.2.3.4"),
+            ("X_Real_IP", "1.2.3.4"),
+            ("X_Forwarded_Proto", "http"),
+        ]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        for name in ["x_forwarded_for", "x_real_ip", "x_forwarded_proto"] {
+            assert!(
+                out.get(name).is_none(),
+                "{name} reached the backend and can collide with the real one under CGI folding"
+            );
+        }
+        assert_eq!(out["x-forwarded-for"], "203.0.113.7");
+    }
+
+    #[test]
+    fn duplicate_and_mixed_case_identity_headers_collapse_to_the_verified_one() {
+        // An appending proxy would leave the attacker's value first; a strip that removed only the
+        // FIRST duplicate would leave a second behind. Exactly one value must survive.
+        let mut src = hyper::HeaderMap::new();
+        for (n, v) in [
+            ("x-forwarded-for", "1.1.1.1"),
+            ("x-forwarded-for", "2.2.2.2"),
+        ] {
+            src.append(
+                hyper::header::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        src.append(
+            hyper::header::HeaderName::from_bytes(b"X-ForWarded-For").unwrap(),
+            hyper::header::HeaderValue::from_static("3.3.3.3"),
+        );
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        let vals: Vec<_> = out.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(vals.len(), 1, "more than one X-Forwarded-For reached the backend");
+        assert_eq!(vals[0], "203.0.113.7");
+    }
+
+    #[test]
+    fn spoofed_client_identity_is_replaced_not_appended() {
+        // The whole point: a tenant reading X-Forwarded-For naively must not be able to be lied
+        // to. An APPENDING proxy would leave "1.2.3.4" as the first entry and hand a naive
+        // `split(',').next()` the attacker's value.
+        let src = headers(&[
+            ("x-forwarded-for", "1.2.3.4"),
+            ("X-Real-IP", "1.2.3.4"),
+            ("Forwarded", "for=1.2.3.4"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+
+        for name in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "x-forwarded-proto",
+        ] {
+            assert_eq!(
+                out.get_all(name).iter().count(),
+                1,
+                "{name} must be a single authoritative value, never a chain"
+            );
+        }
+        assert_eq!(out["x-forwarded-for"], "203.0.113.7");
+        assert_eq!(out["x-real-ip"], "203.0.113.7");
+        assert_eq!(out["forwarded"], "for=203.0.113.7");
+        assert_eq!(out["x-forwarded-proto"], "https");
+    }
+
+    #[test]
+    fn spoofed_site_header_is_still_dropped() {
+        let out = build_forward_headers(
+            &headers(&[(SITE_HEADER, "other")]),
+            client("203.0.113.7"),
+            false,
+        );
+        assert!(out.get(SITE_HEADER).is_none());
+    }
+
+    #[test]
+    fn ipv6_forwarded_node_is_bracketed_and_quoted() {
+        // RFC 7239: a bare v6 literal contains the parameter separator, so parsers truncate it
+        // at the first colon and every v6 client is attributed to "2001".
+        assert_eq!(
+            forwarded_node("2001:db8::1".parse().unwrap()),
+            "for=\"[2001:db8::1]\""
+        );
+        assert_eq!(
+            forwarded_node("203.0.113.7".parse().unwrap()),
+            "for=203.0.113.7"
+        );
+
+        let out = build_forward_headers(&hyper::HeaderMap::new(), client("2001:db8::1"), false);
+        assert_eq!(out["x-forwarded-for"], "2001:db8::1");
+        assert_eq!(out["forwarded"], "for=\"[2001:db8::1]\"");
+    }
+
+    #[test]
+    fn host_is_dropped_only_for_ip_addressed_backends() {
+        let src = headers(&[("host", "app.jkbase.app")]);
+        // Tenant VM: keeps Host (in-app virtual-host routing depends on it).
+        assert!(
+            build_forward_headers(&src, client("203.0.113.7"), false)
+                .get("host")
+                .is_some()
+        );
+        // Control API, addressed by IP: Host is meaningless.
+        assert!(
+            build_forward_headers(&src, client("203.0.113.7"), true)
+                .get("host")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn identity_header_match_is_case_insensitive() {
+        assert!(is_client_identity_header("X-Forwarded-For"));
+        assert!(is_client_identity_header("x-real-ip"));
+        assert!(is_client_identity_header("FORWARDED"));
+        assert!(!is_client_identity_header("x-forwarded-for-real"));
+        assert!(!is_client_identity_header("user-agent"));
+    }
 
     #[test]
     fn subdomain_extraction() {
