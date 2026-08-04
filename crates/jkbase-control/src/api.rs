@@ -376,6 +376,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/logs", get(get_project_logs))
         .route("/projects/{id}/deployments", get(list_deployments))
         .route("/projects/{id}/rollback", post(rollback))
+        .route("/projects/{id}/restart", post(restart))
         .route("/projects/{id}/status", get(get_project_status))
         .route("/projects/{id}/usage", get(get_project_usage))
         .route(
@@ -2881,6 +2882,171 @@ async fn do_rollback(
     Ok(())
 }
 
+/// Why a restart can't proceed, kept as a pure decision separate from the
+/// handler's IO so it can be unit-tested (mirrors [`plan_l4_pin`]).
+#[derive(Debug, PartialEq)]
+enum RestartError {
+    /// The project has never been deployed — there is no live server to restart.
+    NoDeployment,
+}
+
+/// Decide which deployment version a restart relaunches: the project's CURRENT
+/// live version. A restart re-runs the deploy callback against the UNCHANGED
+/// `live` deployment — rebuilding the per-project metadata image so the store's
+/// current secrets/env are re-injected — WITHOUT a source rebuild. It is the
+/// lightweight way to pick up a `jkbase secret set` (a full `deploy` rebuilds
+/// from source; `rollback` moves the live version). Fails closed when nothing is
+/// deployed yet.
+fn plan_restart(project: &Project) -> Result<u64, RestartError> {
+    project.current_version.ok_or(RestartError::NoDeployment)
+}
+
+/// `POST /projects/{id}/restart` — relaunch the current deployment's VM with the
+/// project's current secrets/env re-injected, WITHOUT rebuilding from source. The
+/// metadata image (which bakes secrets) is rebuilt ONLY on deploy/rollback, so
+/// before this a changed secret needed a full `jkbase deploy`; a restart applies
+/// it in seconds. Owner-scoped; serialized against deploy/build/rollback.
+async fn restart(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let project = match state.store.get_project(&id) {
+        Ok(Some(p)) if p.tenant_id.as_deref() == Some(&tenant.id) => p,
+        Ok(Some(_)) | Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("project '{id}' not found"),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let target = match plan_restart(&project) {
+        Ok(v) => v,
+        Err(RestartError::NoDeployment) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "project '{id}' has no deployment to restart — run `jkbase deploy` first"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // A project whose monthly bandwidth cap is exhausted is hibernated and its wake
+    // is blocked (see the metering loop + `wake_project`'s `bandwidth_blocked` gate).
+    // Restart drives the deploy callback DIRECTLY, bypassing that wake gate — so gate
+    // here too, else a `jkbase restart` re-boots the blocked VM back into the routing
+    // table and hands it unmetered egress for the rest of the month (the meter only
+    // ever CLEARS a block, it never re-blocks an already-Running VM). Fail closed (402).
+    if let Ok(Some(status)) = state.store.get_quota_status(&id)
+        && status.bandwidth_blocked
+    {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(ErrorResponse {
+                error: status
+                    .blocked_reason
+                    .unwrap_or_else(|| "monthly bandwidth cap exceeded".to_string()),
+            }),
+        )
+            .into_response();
+    }
+
+    // Defence in depth: the live deployment's on-disk artifacts must still exist
+    // (they're what the deploy callback rebuilds the metadata image from). A
+    // missing dir means a corrupt/half-pruned state — fail closed rather than
+    // restart into nothing.
+    let deploy_path = state
+        .deploy_dir
+        .join(&id)
+        .join("deployments")
+        .join(format!("v{target}"));
+    if !deploy_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("deployment v{target} artifacts not found for project '{id}'"),
+            }),
+        )
+            .into_response();
+    }
+
+    // Reuse the deploy lock so a restart can't race a concurrent deploy/build/
+    // rollback; the guard releases on drop, even if the callback unwinds.
+    let Some(_guard) = DeployLockGuard::try_acquire(&state, &id) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "a deploy or rollback is already in progress".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    // Re-run the deploy callback against the unchanged `live` version: it rebuilds
+    // the metadata image from the store's CURRENT secrets and restarts the VM. No
+    // `live` symlink change (that's rollback) and no source rebuild (that's
+    // deploy). `None` (e.g. tests without an orchestrator) is a no-op success.
+    let result = match &state.deploy_callback {
+        Some(cb) => cb(id.clone(), target).await,
+        None => Ok(()),
+    };
+
+    match result {
+        Ok(()) => {
+            // The callback booted a fresh VM from `live` but — unlike deploy/rollback —
+            // persists no store row and can't move the version. Re-read FRESH under the
+            // still-held guard to (a) heal `state` to Active (restarting an idle-Hibernated
+            // project leaves the row Hibernated while the VM is Running), and (b) report the
+            // TRUE current version: a deploy/rollback that raced the pre-lock read would have
+            // moved `live`, and the callback rebuilt from whatever `live` now points at, so
+            // the fresh `current_version` is what actually booted (not the stale `target`).
+            let version = match state.store.get_project(&id) {
+                Ok(Some(mut p)) => {
+                    if p.state != crate::store::ProjectState::Active {
+                        p.state = crate::store::ProjectState::Active;
+                        let _ = state.store.update_project(&p);
+                    }
+                    p.current_version.unwrap_or(target)
+                }
+                _ => target,
+            };
+            info!(project_id = %id, version, "restarted");
+            (
+                StatusCode::OK,
+                Json(DeployResponse {
+                    version,
+                    project_id: id,
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 fn slug(name: &str) -> String {
     name.to_lowercase()
         .chars()
@@ -5214,6 +5380,31 @@ mod tests {
         let out = resolve_quota(&req, &current, true);
         assert_eq!(out.storage_bytes_max, 100 * GIB, "untouched cap preserved");
         assert_eq!(out.bandwidth_bytes_per_month, 1099511627776);
+    }
+
+    // A restart relaunches the CURRENT live version (to re-inject secrets) and
+    // fails closed when the project has never been deployed.
+    #[test]
+    fn plan_restart_targets_current_version_or_fails_closed() {
+        use super::{plan_restart, RestartError};
+        use crate::store::{Project, ProjectState};
+
+        let mk = |current_version| Project {
+            id: "app".into(),
+            name: "app".into(),
+            tenant_id: Some("t1".into()),
+            current_version,
+            state: ProjectState::Active,
+            vm_ip: None,
+            domains: vec![],
+        };
+
+        // A deployed project restarts its current live version — never a rebuild
+        // or a version change.
+        assert_eq!(plan_restart(&mk(Some(7))), Ok(7));
+
+        // Nothing deployed yet ⇒ there's no server to restart.
+        assert_eq!(plan_restart(&mk(None)), Err(RestartError::NoDeployment));
     }
 
     #[test]

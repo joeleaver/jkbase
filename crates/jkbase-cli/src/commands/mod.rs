@@ -28,6 +28,23 @@ pub enum Command {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
+    /// Restart the running server, re-injecting current secrets/env WITHOUT a
+    /// rebuild (the lightweight way to apply a `jkbase secret set` — a full
+    /// `deploy` rebuilds from source)
+    Restart {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        force: bool,
+        /// Project name (inferred from jkbase.toml if not specified)
+        #[arg(long)]
+        project: Option<String>,
+        /// Platform API URL
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+        /// Output as JSON (implies non-interactive: skips the confirmation prompt)
+        #[arg(long)]
+        json: bool,
+    },
     /// List deployment history
     Deployments {
         /// Project name (inferred from jkbase.toml if not specified)
@@ -452,6 +469,12 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             project,
             api,
         } => run_rollback(version, force, project, api).await,
+        Command::Restart {
+            force,
+            project,
+            api,
+            json,
+        } => run_restart(force, project, api, json).await,
         Command::Deployments { project, api } => run_deployments(project, api).await,
         Command::Usage { project, api } => run_usage(project, api).await,
         Command::Quota {
@@ -762,8 +785,9 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     let rx = v["rx_bytes"].as_u64().unwrap_or(0);
     let tx = v["tx_bytes"].as_u64().unwrap_or(0);
     let storage = v["storage_bytes"].as_u64().unwrap_or(0);
-    // Server-side build-VM time, metered on build exit. Distinct from `cpu_seconds`
-    // (runtime-VM CPU); it's the field the build-minute quota gate counts against.
+    // Server-side build-VM WALL time, metered on build exit — one VM per build target,
+    // so a fan-out build sums its targets. Distinct from `cpu_seconds` (runtime-VM CPU);
+    // it's the field the build-minute quota gate counts against.
     let build_seconds = v["build_seconds"].as_u64().unwrap_or(0);
 
     println!("Usage for '{project_id}' (month-to-date):");
@@ -933,6 +957,73 @@ async fn run_rollback(
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
         let err = body["error"].as_str().unwrap_or("unknown error");
         anyhow::bail!("rollback failed: {err}");
+    }
+}
+
+async fn run_restart(
+    force: bool,
+    project: Option<String>,
+    api: String,
+    json: bool,
+) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+
+    // A restart briefly interrupts the running server, so confirm unless forced
+    // (mirrors `rollback`). `--json` implies non-interactive: never block on a prompt.
+    if !force && !json {
+        print!(
+            "Restart '{project_id}'? This re-injects current secrets and briefly \
+             interrupts the running server. [y/N] "
+        );
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    if !json {
+        println!("Restarting '{project_id}'...");
+    }
+    let resp = client
+        .post(format!("{api}/projects/{project_id}/restart"))
+        .send()
+        .await
+        .context("failed to connect to API")?;
+
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let version = body["version"].as_u64().unwrap_or(0);
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "project_id": project_id, "version": version })
+            );
+        } else {
+            println!("Restarted '{project_id}' (v{version})");
+        }
+        Ok(())
+    } else {
+        // Capture the status BEFORE consuming the body so a non-JSON error (e.g. a bare 502
+        // from an upstream) still surfaces something actionable rather than "unknown error".
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let err = body["error"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        // Keep stdout machine-readable on failure too (mirrors the success branch); the
+        // non-zero exit still comes from the `bail!`, so scripters can detect it either way.
+        if json {
+            println!("{}", serde_json::json!({ "error": err }));
+        }
+        anyhow::bail!("restart failed: {err}");
     }
 }
 

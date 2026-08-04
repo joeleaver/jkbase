@@ -614,8 +614,11 @@ pub struct UsageBucket {
     /// Latest sampled storage gauge (bytes).
     pub storage_bytes_last: u64,
     pub sample_count: u32,
-    /// Build-VM seconds billed this hour, metered on build exit (not the 60 s
-    /// sampler tick). Distinct from `cpu_jiffies` (runtime-VM CPU).
+    /// Build-VM WALL seconds billed this hour, metered on build exit (not the 60 s
+    /// sampler tick). Distinct from `cpu_jiffies` (runtime-VM CPU) — and deliberately
+    /// not the build VM's CPU time either, so a build that uses the 4 vCPUs it was
+    /// given costs the same as one that leaves them idle. One VM per build target, so
+    /// a fan-out build sums its targets.
     #[serde(default)]
     pub build_seconds: u64,
     /// Seconds this hour the runtime VM was held warm by a managed-DB reach-plane
@@ -1537,9 +1540,10 @@ impl Store {
         Ok(())
     }
 
-    /// Add `build_seconds` to a project's hourly bucket. Metered on build-VM exit
-    /// (we own the lifecycle), so a build killed between 60 s sampler ticks is
-    /// still billed — closing the free-compute window (threat-model P1-4).
+    /// Add `build_seconds` (build-VM WALL seconds) to a project's hourly bucket.
+    /// Metered on build-VM exit (we own the lifecycle), so a build killed between
+    /// 60 s sampler ticks is still billed — closing the free-compute window
+    /// (threat-model P1-4).
     pub fn add_build_usage(
         &self,
         project_id: &str,

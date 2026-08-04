@@ -1,0 +1,38 @@
+# The L4 UDP load harness: an SFU-shaped traffic generator + guest simulator for answering
+# "does the datagram pump hold at conference media rates?" — a question the shipped voice/game
+# workloads never ask.
+#
+# STANDALONE workspace (note the empty `[workspace]` table), like `tools/rhypedb-probe`: it never
+# resolves for `cargo build --workspace` or CI. Build it explicitly:
+#   cargo build --manifest-path tools/l4-load/Cargo.toml --release
+#
+# ZERO dependencies, deliberately: `l4-sfu-sim` is deployed AS a jkbase project, so it builds
+# inside a network-fenced build VM. No crates.io fetch, no buildpack detection surprises, and a
+# rebuild is seconds rather than minutes.
+[package]
+name = "l4-load"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "l4wire"
+path = "src/lib.rs"
+
+[[bin]]
+name = "l4-sfu-sim"
+path = "src/bin/sfu_sim.rs"
+
+[[bin]]
+name = "l4-load"
+path = "src/bin/load.rs"
+
+# A load generator that is itself the bottleneck measures nothing. Optimise, and keep debug
+# assertions off so pacing loops aren't paying for bounds checks in the hot path.
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"
+
+# Own workspace root → excluded from the jkbase workspace resolution.
+[workspace]

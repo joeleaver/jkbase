@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
@@ -841,6 +841,52 @@ fn build_quota_state(deps: &BuildDeps, project_id: &str) -> Option<(u64, u64)> {
     Some((used, cap))
 }
 
+/// Fraction of the monthly cap at which a project is warned it is approaching the
+/// build-minute wall. A tenant blocked mid-sprint with no prior signal has no way to
+/// ask for a raise in time; this puts the approach in the operator's log.
+const BUILD_QUOTA_WARN_FRACTION: u64 = 80;
+
+/// Slack above the monthly cap that an ALREADY-RUNNING build may consume before the
+/// mid-fan-out breaker stops it (see [`build_one_target_inner`]).
+///
+/// A deploy that passed the intake gate should finish: cutting it off mid-fan-out
+/// bills the tenant for the targets that already built and then activates nothing, so
+/// they pay for a deploy they never received. The overdraft lets the in-flight deploy
+/// land and leaves the *next* one to the intake 402. It is bounded so it can't be
+/// farmed: `MAX_TARGETS` is 64, so without a ceiling one crafted manifest could ride a
+/// single overrun into 64 x 900 s of compute.
+const BUILD_QUOTA_OVERDRAFT_SECS: u64 = 1800;
+
+/// Whether an in-flight fan-out must stop: month-to-date use has exhausted the cap
+/// AND the overdraft that lets an admitted deploy finish. Pure so the threshold is
+/// unit-testable without a store.
+fn build_quota_tripped(used: u64, cap: u64) -> bool {
+    used >= cap.saturating_add(BUILD_QUOTA_OVERDRAFT_SECS)
+}
+
+/// Whether a project has crossed [`BUILD_QUOTA_WARN_FRACTION`] of its cap. A zero cap
+/// (build disabled) never warns — the intake gate refuses it outright. Pure so the
+/// threshold is unit-testable without a store.
+fn build_quota_low(used: u64, cap: u64) -> bool {
+    cap > 0 && used.saturating_mul(100) >= cap.saturating_mul(BUILD_QUOTA_WARN_FRACTION)
+}
+
+/// Log when a project crosses [`BUILD_QUOTA_WARN_FRACTION`] of its monthly build cap.
+/// Best-effort and non-blocking: a store error just means no warning.
+fn warn_if_build_quota_low(deps: &BuildDeps, project_id: &str, target: &str) {
+    let Some((used, cap)) = build_quota_state(deps, project_id) else {
+        return;
+    };
+    if !build_quota_low(used, cap) {
+        return;
+    }
+    warn!(
+        project = %project_id, target = %target, used, cap,
+        pct = used.saturating_mul(100) / cap,
+        "project approaching its monthly build-minute cap"
+    );
+}
+
 async fn run_ip(args: &[&str]) -> Result<()> {
     let status = tokio::process::Command::new("ip")
         .args(args)
@@ -1177,13 +1223,23 @@ async fn build_one_target_inner(
     build_id: u64,
 ) -> Result<(Option<Vec<u8>>, BuildProvenance)> {
     // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
-    // intake, but a build fans out one metered VM per target — refuse remaining
-    // targets once month-to-date build-seconds reach the cap, so a many-target
-    // manifest can't overrun the cap by the target count (threat-model P1-4).
+    // intake, but a build fans out one metered VM per target, so a many-target
+    // manifest could otherwise overrun the cap by the target count (threat-model
+    // P1-4).
+    //
+    // The breaker trips at cap + BUILD_QUOTA_OVERDRAFT_SECS, not at the cap itself: a
+    // deploy admitted by the intake gate is allowed to FINISH. Tripping at the cap
+    // billed the targets that had already built and then activated nothing — the
+    // tenant paid for a deploy they never got, and the failure looked like a build
+    // error rather than a quota one. The overdraft is bounded, so a crafted 64-target
+    // manifest still can't ride one overrun into hours of compute.
     if let Some((used, cap)) = build_quota_state(deps, project_id)
-        && used >= cap
+        && build_quota_tripped(used, cap)
     {
-        bail!("build-minute quota exhausted ({used}/{cap} build-seconds this month)");
+        bail!(
+            "build-minute quota exhausted ({used}/{cap} build-seconds this month, \
+             including a {BUILD_QUOTA_OVERDRAFT_SECS}s overdraft for the in-flight build)"
+        );
     }
 
     // The CONTEXT dir is what becomes the RO image and is mounted at /src; the build
@@ -1439,10 +1495,22 @@ async fn build_one_target_inner(
     let run = run_res.with_context(|| format!("run build VM for '{}'", spec.name))?;
 
     // Meter on exit BEFORE any outcome bail — even timed-out/crashed builds held
-    // resources (anti-mining, threat-model P1-4). build_seconds = max(cgroup CPU,
-    // wall-clock floor), so a sub-tick build can't escape billing.
-    let cpu_secs = run.cpu_usec.map(|u| u.div_ceil(1_000_000)).unwrap_or(0);
-    let build_secs = cpu_secs.max(run.wall.as_secs());
+    // resources (anti-mining, threat-model P1-4).
+    //
+    // Billed on the VM's WALL time, NOT its CPU time. The cgroup runs at
+    // `cpu.max = 400%` over `vcpu_count: 4`, so CPU-second billing charged up to 4
+    // quota-seconds per wall-second — every parallel build (npm/Vite/cargo/go all
+    // parallelize by default) paid a ~3.5x multiplier against a cap the CLI and the
+    // quota API both call "build-MINUTES". The unit now means what it says.
+    //
+    // Anti-mining is unweakened: a miner has to HOLD the VM for the compute it
+    // steals, and wall-clock bills exactly that. The real containment is the 900 s
+    // per-build wall ceiling, `cpu.max` throttling, and `max_concurrent`. CPU-time
+    // billing never distinguished a miner from a legitimate `cargo build --release`
+    // (both saturate 4 vCPUs) — it only taxed tenants for using the cores we gave
+    // them. `wall` starts before drive staging + boot, so idle/sub-tick builds still
+    // bill ≥1 s and cannot escape the meter.
+    let build_secs = run.wall.as_secs();
     if build_secs > 0 {
         let hour = (now() / 3600) * 3600;
         if let Err(e) = deps.store.add_build_usage(project_id, hour, build_secs) {
@@ -1450,6 +1518,15 @@ async fn build_one_target_inner(
                   "failed to record build-minute usage");
         }
     }
+    // CPU is no longer billed, but keep it observable: a build whose CPU-seconds far
+    // exceed its wall time is a parallelism signal, and one with near-zero CPU over a
+    // long wall is stalled (usually on the fetch phase).
+    debug!(
+        project = %project_id, target = %spec.name, build_secs,
+        cpu_secs = run.cpu_usec.map(|u| u.div_ceil(1_000_000)).unwrap_or(0),
+        "build VM metered"
+    );
+    warn_if_build_quota_low(deps, project_id, &spec.name);
     let outcome = run.outcome;
 
     // Best-effort: the log tail is useful even when the build failed.
@@ -2481,6 +2558,33 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_breaker_lets_an_admitted_build_finish_then_stops_it() {
+        let cap = 12_000; // the 200-build-minute platform default
+        // Admitted at the cap, the fan-out continues into the overdraft: the deploy the
+        // intake gate let in is not billed for targets it then refuses to activate.
+        assert!(!build_quota_tripped(cap, cap));
+        assert!(!build_quota_tripped(cap + BUILD_QUOTA_OVERDRAFT_SECS - 1, cap));
+        // Past the overdraft it stops, so one crafted MAX_TARGETS manifest can't ride a
+        // single overrun into hours of compute.
+        assert!(build_quota_tripped(cap + BUILD_QUOTA_OVERDRAFT_SECS, cap));
+        // A zero cap can't underflow into a free pass.
+        assert!(build_quota_tripped(u64::MAX, 0));
+    }
+
+    #[test]
+    fn quota_warning_fires_at_the_warn_fraction() {
+        let cap = 12_000;
+        assert!(!build_quota_low(9_599, cap)); // 79.9%
+        assert!(build_quota_low(9_600, cap)); // 80.0%
+        assert!(build_quota_low(cap, cap));
+        // A zero cap never warns (the intake gate refuses it outright) and can't divide by zero.
+        assert!(!build_quota_low(0, 0));
+        assert!(!build_quota_low(50, 0));
+        // Near-u64 usage saturates rather than wrapping into a false negative.
+        assert!(build_quota_low(u64::MAX, cap));
+    }
 
     #[test]
     fn enumerate_and_assemble_are_deterministic() {
@@ -3759,6 +3863,11 @@ esac
         /// end-to-end: host edge socket → framed transit → agent land-forward → loopback echo →
         /// back. Offline (no deps, no build network).
         UdpEcho,
+        /// A tenant with long-lived connection endpoints: HTTP :3000 readiness, a `/ws`
+        /// WebSocket echo, and a `/events` Server-Sent-Events tick stream. Drives the
+        /// wake-on-WS activity re-stamp seam end-to-end (edge relay + ActivityBody through
+        /// the real agent hop + a real microVM). Offline (no deps, no build network).
+        WebSocket,
     }
     impl Workload {
         fn networked(self) -> bool {
@@ -3979,6 +4088,48 @@ Bun.udpSocket({
   hostname: "127.0.0.1",
   socket: { data(socket, buf, p, addr) { socket.send(buf, p, addr); } },
 }).then(() => console.log("udp echo on 127.0.0.1:9999")).catch((e) => console.error("udp bind failed", e));
+console.log("listening on " + port);
+"#,
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+            }
+            // Long-lived connections: a `/ws` echo + a `/events` SSE tick stream + HTTP
+            // readiness. `sendPings: false` so an idle-but-open WS emits NO byte traffic — the
+            // e2e relies on that to prove an open socket alone does not keep the VM warm.
+            Workload::WebSocket => {
+                write(
+                    src.join("server/server.ts"),
+                    r#"const port = Number(process.env.PORT) || 3000;
+Bun.serve({
+  port,
+  fetch(req, server) {
+    const url = new URL(req.url);
+    if (url.pathname === "/ws") {
+      if (server.upgrade(req)) return undefined;
+      return new Response("expected websocket", { status: 426 });
+    }
+    if (url.pathname === "/events") {
+      const enc = new TextEncoder();
+      let n = 0;
+      const stream = new ReadableStream({
+        start(controller) {
+          const iv = setInterval(() => {
+            try { controller.enqueue(enc.encode(`data: tick ${n++}\n\n`)); }
+            catch { clearInterval(iv); }
+          }, 200);
+        },
+      });
+      return new Response(stream, {
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+      });
+    }
+    return new Response("ok\n");
+  },
+  websocket: { sendPings: false, message(ws, msg) { ws.send(msg); } },
+});
 console.log("listening on " + port);
 "#,
                 );
@@ -4976,6 +5127,268 @@ console.log("listening on " + port);
         let _ = vm.stop().await;
         let _ = sh("ip", &["link", "del", &tap]).await;
         res
+    }
+
+    /// wake-on-WS activity re-stamp — END TO END through a real microVM. Boots the WebSocket
+    /// tenant (Bun `/ws` echo + `/events` SSE), stands up the REAL edge proxy in front of it, and
+    /// drives real connections, asserting the shared ActivityTracker behaves as wake-on-WS needs:
+    ///   1. an ACTIVE WebSocket (frames flowing) keeps activity fresh — the VM would NOT hibernate
+    ///      mid-session;
+    ///   2. an idle-but-OPEN WebSocket (no frames) lets activity go STALE — an open socket does
+    ///      not pin the VM warm (traffic-driven, not socket-pinned);
+    ///   3. an ACTIVE SSE stream keeps activity fresh via the ActivityBody wrapper.
+    /// Each active phase runs past the 30s re-stamp throttle so a re-stamp must actually re-fire.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=... JKB_FC_RELEASE=... JKB_BASELAYERS=... JKB_AGENT=... JKB_ROOTFS=... \
+    ///       <test-bin> --ignored --nocapture wake_on_ws_restamp_e2e
+    #[tokio::test]
+    #[ignore = "wake-on-WS e2e: needs KVM + root + bun.ext4 + baselayers + JKB_ROOTFS"]
+    async fn wake_on_ws_restamp_e2e() {
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use jkbase_proxy::{DomainTarget, ProxyConfig, new_domain_map, new_routing_table};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio::sync::RwLock;
+        use tokio::time::timeout;
+
+        let Some(fx) = bun_pipeline_build("wsecho", 1, Workload::WebSocket).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let rootfs_img = match std::env::var("JKB_ROOTFS").map(PathBuf::from) {
+            Ok(p) if p.exists() => p,
+            _ => {
+                eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+                return;
+            }
+        };
+
+        // --- Layer plan + metadata image + boot the tenant VM (mirror boot_layered_and_curl). ---
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, true)
+            .expect("compute layer plan");
+        let meta_img = fx.data.join("wsecho-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+            None,
+            &meta_img,
+        )
+        .expect("build metadata image");
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("wsecho", "172.30.0.1", "172.30.0.2", "AA:FC:00:00:30:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh(
+            "ip",
+            &["addr", "add", &format!("{host_ip}/24"), "dev", &tap],
+        )
+        .await
+        .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs_img.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("wsecho-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("ws echo VM should start");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(90))
+                .await
+                .is_some(),
+            "ws echo app never became HTTP-ready"
+        );
+
+        // --- Stand up the real edge proxy in front of the VM. ---
+        let domains = new_domain_map();
+        domains.write().await.insert(
+            "wsecho".to_string(),
+            DomainTarget {
+                project_id: "wsecho".to_string(),
+                site: None,
+            },
+        );
+        let routes = new_routing_table();
+        routes
+            .write()
+            .await
+            .insert("wsecho".to_string(), guest_ip.to_string());
+        let tracker: jkbase_proxy::ActivityTracker = Arc::new(RwLock::new(HashMap::new()));
+        let proxy_port = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let cfg = ProxyConfig {
+            http_port: proxy_port,
+            https_port: None,
+            platform_domain: "test.local".to_string(),
+            cert_manager: None,
+            api_addr: None,
+            storage_addr: None,
+            auth_addr: None,
+            domains: Some(domains),
+            activity_tracker: Some(tracker.clone()),
+            wake_callback: None,
+            backend_port: 80,
+            relay_idle_timeout: Duration::from_secs(600),
+            max_concurrent_upgrades: 64,
+            http_listener: None,
+            https_listener: None,
+            db_auth_callback: None,
+            db_relay_registry: None,
+            db_max_concurrent: 1024,
+            db_preauth_max: 256,
+            db_preauth_per_ip_max: 32,
+            db_max_per_project: 64,
+        };
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let proxy = tokio::spawn(jkbase_proxy::serve(cfg, routes, shutdown.clone()));
+
+        async fn dial(port: u16) -> TcpStream {
+            for _ in 0..100 {
+                if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("proxy never came up on {port}");
+        }
+        // A masked WebSocket text frame — client→server frames MUST be masked (RFC 6455 §5.3).
+        fn ws_frame(payload: &[u8]) -> Vec<u8> {
+            let mask = [0x21u8, 0x9a, 0x37, 0xc5];
+            let mut f = vec![0x81, 0x80 | payload.len() as u8];
+            f.extend_from_slice(&mask);
+            f.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+            f
+        }
+        async fn stamp_age(t: &jkbase_proxy::ActivityTracker) -> Option<Duration> {
+            t.read().await.get("wsecho").map(|i| i.elapsed())
+        }
+
+        // === (1) ACTIVE WS keeps activity fresh: send frames for ~35s (past the 30s throttle). ===
+        let mut ws = dial(proxy_port).await;
+        ws.write_all(
+            b"GET /ws HTTP/1.1\r\n\
+              Host: wsecho.test.local\r\n\
+              Connection: Upgrade\r\n\
+              Upgrade: websocket\r\n\
+              Sec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        {
+            let mut buf = [0u8; 1024];
+            let mut seen = Vec::new();
+            loop {
+                let n = timeout(Duration::from_secs(10), ws.read(&mut buf))
+                    .await
+                    .expect("101 read timeout")
+                    .unwrap();
+                assert!(n > 0, "backend closed before 101");
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                String::from_utf8_lossy(&seen).starts_with("HTTP/1.1 101"),
+                "expected WS 101, got: {:?}",
+                String::from_utf8_lossy(&seen)
+            );
+        }
+        let mut got_echo = false;
+        let active_deadline = Instant::now() + Duration::from_secs(35);
+        while Instant::now() < active_deadline {
+            ws.write_all(&ws_frame(b"tick")).await.unwrap();
+            let mut buf = [0u8; 256];
+            if let Ok(Ok(n)) = timeout(Duration::from_millis(500), ws.read(&mut buf)).await
+                && n > 0
+            {
+                got_echo = true;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        assert!(
+            got_echo,
+            "Bun WS app must echo frames (proves the upgrade relayed correctly)"
+        );
+        let a = stamp_age(&tracker).await;
+        assert!(
+            a.map(|x| x < Duration::from_secs(31)).unwrap_or(false),
+            "an ACTIVE WS must keep activity fresh (age={a:?}) — else it would hibernate mid-session"
+        );
+
+        // === (2) idle-but-OPEN WS lets activity go stale (a socket must not pin the VM warm). ===
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        let a = stamp_age(&tracker).await;
+        assert!(
+            a.map(|x| x > Duration::from_secs(33)).unwrap_or(false),
+            "an idle-but-open WS must let activity go stale (age={a:?}) — a socket must not pin warm"
+        );
+
+        // === (3) ACTIVE SSE keeps activity fresh via ActivityBody: stream ~40s (past the throttle). ===
+        let mut sse = dial(proxy_port).await;
+        sse.write_all(
+            b"GET /events HTTP/1.1\r\n\
+              Host: wsecho.test.local\r\n\
+              Accept: text/event-stream\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut got_tick = false;
+        let sse_deadline = Instant::now() + Duration::from_secs(40);
+        let mut buf = [0u8; 512];
+        while Instant::now() < sse_deadline {
+            if let Ok(Ok(n)) = timeout(Duration::from_secs(2), sse.read(&mut buf)).await
+                && n > 0
+            {
+                got_tick = true;
+            }
+        }
+        assert!(got_tick, "SSE stream must deliver frames");
+        let a = stamp_age(&tracker).await;
+        assert!(
+            a.map(|x| x < Duration::from_secs(31)).unwrap_or(false),
+            "an ACTIVE SSE stream must keep activity fresh via ActivityBody (age={a:?})"
+        );
+
+        // --- teardown ---
+        shutdown.cancel();
+        let _ = timeout(Duration::from_secs(10), proxy).await;
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
     }
 
     /// Function deploy e2e — the runtime DEPLOY + SERVE half end to end. A built

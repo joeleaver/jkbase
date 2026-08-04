@@ -8,7 +8,7 @@ pub mod tls;
 
 use anyhow::Result;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::Bytes;
+use hyper::body::{Body, Bytes, Frame, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -18,6 +18,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -109,6 +110,90 @@ fn full_body(b: impl Into<Bytes>) -> ProxyBody {
     Full::new(b.into())
         .map_err(|e: std::convert::Infallible| match e {})
         .boxed()
+}
+
+/// A throttled activity-stamp closure over the shared [`ActivityTracker`] for `project_id`,
+/// or `None` when no tracker is configured (integration tests). Mirrors the managed-DB reach
+/// plane (`db_ingress::on_activity`): a spliced WebSocket or a long-lived streamed response
+/// never re-enters [`proxy_request`] after its first request, so without a re-stamp the idle
+/// loop would hibernate the VM out from under the live stream (wake-on-WS). The consumer
+/// throttles to [`jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL`], so the spawned map-write is cheap.
+fn activity_stamp(
+    activity: &Option<ActivityTracker>,
+    project_id: &str,
+) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    let act = activity.clone()?;
+    let pid = project_id.to_string();
+    Some(Arc::new(move || {
+        let act = act.clone();
+        let pid = pid.clone();
+        tokio::spawn(async move {
+            act.write().await.insert(pid, Instant::now());
+        });
+    }))
+}
+
+/// Wraps a STREAMED backend response body so that, once the stream OUTLIVES
+/// [`jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL`], each subsequent data frame re-stamps the
+/// project's activity (again throttled to that interval). A long-lived streaming response
+/// (Server-Sent Events, a chunked feed, a slow download) never re-enters [`proxy_request`]
+/// after the opening request, so without this the idle loop would hibernate the VM out from
+/// under the live stream (wake-on-WS, the SSE/streaming half).
+///
+/// `last` is SEEDED at construction, not left empty: the synchronous `proxy_request` stamp
+/// already marks t=0, so a short/normal response — the overwhelmingly common case — completes
+/// within the interval and adds NO extra stamp (no redundant spawn or tracker write on the hot
+/// path). Only a stream still alive past the interval starts re-stamping. Only wraps tenant
+/// responses (never infra api/storage/auth, which aren't hibernatable projects).
+struct ActivityBody<B> {
+    inner: B,
+    stamp: Arc<dyn Fn() + Send + Sync>,
+    /// Instant of the last stamp; seeded to construction time (≈ the `proxy_request` stamp) so
+    /// the first re-stamp can only fire once the stream outlives `ACTIVITY_STAMP_INTERVAL`.
+    last: Instant,
+}
+
+impl<B> ActivityBody<B> {
+    fn new(inner: B, stamp: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            inner,
+            stamp,
+            last: Instant::now(),
+        }
+    }
+}
+
+impl<B> Body for ActivityBody<B>
+where
+    B: Body + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let res = Pin::new(&mut self.inner).poll_frame(cx);
+        // Re-stamp only on a DATA frame (a trailers-only frame carries no traffic), and only
+        // once per ACTIVITY_STAMP_INTERVAL so a chatty stream doesn't spawn a write per frame.
+        if let Poll::Ready(Some(Ok(ref frame))) = res
+            && frame.data_ref().is_some()
+            && self.last.elapsed() >= jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL
+        {
+            self.last = Instant::now();
+            (self.stamp)();
+        }
+        res
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 pub struct ProxyConfig {
@@ -598,7 +683,7 @@ async fn proxy_request(
     };
 
     if let Some(ip) = backend_ip {
-        return match forward_request(&shared, &ip, site, req).await {
+        return match forward_request(&shared, &ip, &project_id, site, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend request failed");
@@ -614,7 +699,7 @@ async fn proxy_request(
 
     info!(project = %project_id, host = %host_key, "waking hibernated project");
     match (cb)(project_id.clone()).await {
-        Ok(ip) => match forward_request(&shared, &ip, site, req).await {
+        Ok(ip) => match forward_request(&shared, &ip, &project_id, site, req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!(project = %project_id, error = %e, "backend failed after wake");
@@ -721,6 +806,7 @@ fn relay_upgrade(
     mut backend_resp: Response<hyper::body::Incoming>,
     shared: &SharedState,
     strip_hsts: bool,
+    on_activity: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Response<ProxyBody> {
     use jkbase_wsproxy::UpgradeOutcome;
     match jkbase_wsproxy::spawn_upgrade_relay(
@@ -728,6 +814,7 @@ fn relay_upgrade(
         &mut backend_resp,
         shared.relay_idle_timeout,
         &shared.relay_permits,
+        on_activity,
     ) {
         UpgradeOutcome::Relayed => {}
         UpgradeOutcome::Unsolicited => {
@@ -791,8 +878,9 @@ async fn forward_to_api(
 
     let resp = sender.send_request(proxy_req).await?;
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
-        // Infra hosts (api/storage): keep their HSTS (`strip_hsts = false`).
-        return Ok(relay_upgrade(client_upgrade, resp, shared, false));
+        // Infra hosts (api/storage/auth): keep their HSTS (`strip_hsts = false`) and never
+        // re-stamp — they are in-process loopback services, not hibernatable tenant VMs.
+        return Ok(relay_upgrade(client_upgrade, resp, shared, false, None));
     }
     let status = resp.status();
     let mut headers = resp.headers().clone();
@@ -814,6 +902,7 @@ async fn forward_to_api(
 async fn forward_request(
     shared: &SharedState,
     backend_ip: &str,
+    project_id: &str,
     site: Option<&str>,
     mut req: Request<hyper::body::Incoming>,
 ) -> Result<Response<ProxyBody>> {
@@ -848,17 +937,32 @@ async fn forward_request(
     let proxy_req = builder.body(req.into_body()).unwrap();
 
     let resp = sender.send_request(proxy_req).await?;
+    // Re-stamp activity on frame flow so a long-lived WS splice or streamed response keeps its
+    // VM warm — the connection never re-enters `proxy_request` after this (wake-on-WS).
+    let on_activity = activity_stamp(&shared.activity, project_id);
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         // Tenant backend (untrusted): strip HSTS too — the platform owns transport
         // policy for `*.{domain}`.
-        return Ok(relay_upgrade(client_upgrade, resp, shared, true));
+        return Ok(relay_upgrade(
+            client_upgrade,
+            resp,
+            shared,
+            true,
+            on_activity,
+        ));
     }
     let status = resp.status();
     let mut headers = resp.headers().clone();
     jkbase_wsproxy::sanitize_response_headers(&mut headers, &shared.domain, true, false);
     // Stream the backend body through instead of buffering it in proxy RAM — an
     // object download (or any large tenant response) must not sit wholly in memory.
-    let body = resp.into_body().map_err(std::io::Error::other).boxed();
+    let raw = resp.into_body().map_err(std::io::Error::other).boxed();
+    // Wrap streamed bodies so an SSE/chunked stream re-stamps activity per frame (throttled);
+    // a short response completes before the throttle re-fires, so this is a no-op for it.
+    let body = match on_activity {
+        Some(stamp) => ActivityBody::new(raw, stamp).boxed(),
+        None => raw,
+    };
 
     let mut builder = Response::builder().status(status);
     for (key, value) in &headers {
@@ -916,5 +1020,97 @@ mod tests {
         assert_eq!(key("www.jkbase.app"), "www");
         assert_eq!(key("docs.jkbase.app"), "docs");
         assert_eq!(key("docs.example.com"), "docs.example.com");
+    }
+
+    /// An inner body that yields each queued buffer as a data frame, then ends.
+    struct FramesBody(Vec<Bytes>);
+    impl Body for FramesBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+            if self.0.is_empty() {
+                Poll::Ready(None)
+            } else {
+                Poll::Ready(Some(Ok(Frame::data(self.0.remove(0)))))
+            }
+        }
+    }
+
+    fn counting_stamp() -> (Arc<std::sync::atomic::AtomicUsize>, Arc<dyn Fn() + Send + Sync>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let cb = {
+            let hits = hits.clone();
+            Arc::new(move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        (hits, cb)
+    }
+
+    // A FRESH stream (last seeded at construction) adds NO extra stamp — the request-start stamp
+    // already covers t=0, so a short/normal response within the interval never re-stamps.
+    #[tokio::test]
+    async fn activity_body_fresh_stream_adds_no_stamp() {
+        use std::sync::atomic::Ordering;
+        let (hits, stamp) = counting_stamp();
+        let inner = FramesBody(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        let mut body = ActivityBody::new(inner, stamp);
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a fresh short stream is covered by the request-start stamp and must add none"
+        );
+    }
+
+    // A stream that has OUTLIVED the interval re-stamps on its next data frame, then throttles:
+    // the second frame (within the reset window) is suppressed.
+    #[tokio::test]
+    async fn activity_body_restamps_once_past_interval() {
+        use std::sync::atomic::Ordering;
+        let (hits, stamp) = counting_stamp();
+        let inner = FramesBody(vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]);
+        // Seed `last` well into the past so the first data frame is due.
+        let aged = Instant::now()
+            .checked_sub(jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL * 2)
+            .expect("monotonic clock older than 60s");
+        let mut body = ActivityBody {
+            inner,
+            stamp,
+            last: aged,
+        };
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a stream past the interval re-stamps once; the next frame is throttled"
+        );
+    }
+
+    // A trailers-only / empty body carries no traffic, so it must NOT stamp even when aged.
+    #[tokio::test]
+    async fn activity_body_ignores_trailers_only_frame() {
+        use std::sync::atomic::Ordering;
+        let (hits, stamp) = counting_stamp();
+        let aged = Instant::now()
+            .checked_sub(jkbase_wsproxy::ACTIVITY_STAMP_INTERVAL * 2)
+            .expect("monotonic clock older than 60s");
+        let mut body = ActivityBody {
+            inner: FramesBody(vec![]),
+            stamp,
+            last: aged,
+        };
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no data frame → no stamp");
     }
 }
