@@ -140,6 +140,19 @@ impl Default for L4PlaneLimits {
             flow_per_project_max: 256,
             flow_global_max: 4096,
             flow_global_fair_share: 512,
+            // UNCHANGED at 16 MiB/s. A raise to 48 was proposed on the grounds that a 50-way
+            // conferencing SFU needs ~43.5 MiB/s and so misses this cap by 2.7x. That figure does
+            // not survive checking: it fans out EVERY participant's audio to everyone (2450
+            // streams — real SFUs forward only the top ~3 loudest) and prices each of 9 gallery
+            // thumbnails at 600 kbps (simulcast exists so thumbnails get a ~150-200 kbps low
+            // layer). Correct both and a 50-way meeting is 8.8-11.4 MiB/s, comfortably inside
+            // this cap; a 20-way is 14.6 MiB/s. The cap was never the blocker.
+            //
+            // It also could not have been raised safely here: global is 64 MiB/s on a 1 Gbps
+            // uplink, so a 48 MiB/s default lets one project take 75% of the plane, and global
+            // refusal is arrival-order with no per-tenant fair share — starvation would be
+            // self-reinforcing toward the heaviest sender. A genuinely oversized tenant takes an
+            // admin grant via `POST /projects/{id}/l4/limits`, which is what that API is for.
             egress_per_project_bps: 16 * 1024 * 1024,
             egress_per_24_bps: 8 * 1024 * 1024,
             egress_global_bps: 64 * 1024 * 1024,
@@ -803,9 +816,10 @@ impl L4Plane {
     /// [`crate::l4_ingress`] before this call, because its rate is per-project and the maps here
     /// are platform-wide. This function is the part a tenant cannot influence.
     ///
-    /// `limits` carries the calling port's resolved per-project numbers. Note the per-project
-    /// bucket keeps whatever rate it was created with until its TTL expires, so a limits change
-    /// takes effect for a live project within [`PER_PROJECT_TTL`] rather than instantly.
+    /// `limits` carries the calling port's resolved per-project numbers, refreshed by the
+    /// reconcile loop, and the per-project bucket is re-pointed whenever that rate changes — so a
+    /// limits change lands within a reconcile tick rather than waiting on [`PER_PROJECT_TTL`]
+    /// (which an actively-sending project never reaches anyway, since every access refreshes it).
     pub(crate) fn try_egress_aggregate(
         &self,
         base: &str,
@@ -816,6 +830,25 @@ impl L4Plane {
     ) -> Result<(), EgressReject> {
         let mut eg = self.egress.lock().unwrap();
         let amount = bytes as f64;
+        // All-or-nothing: every level is CHECKED first, and only then are all four debited.
+        //
+        // Debiting as we went and bailing on the first refusal charged each earlier bucket for a
+        // datagram that was never sent. That is not merely imprecise accounting — the last level
+        // is GLOBAL, shared by every tenant, so a project that lost the shared race still had its
+        // private per-victim, per-/24 and per-project budgets drained by traffic it never emitted.
+        // One heavy tenant saturating global therefore degraded everyone else's *own* allowances,
+        // not just the shared one. It also let a DELIBERATELY CONTAINED tenant do damage: the
+        // port-side gate is per-destination, so a project throttled to a small aggregate could
+        // spray many destinations and drain the shared per-victim and per-/24 budgets with
+        // datagrams its own cap then refused — dropping a well-behaved neighbour's replies into
+        // the same /24.
+        let EgressState {
+            per_victim,
+            per_24,
+            per_project,
+            global,
+            ..
+        } = &mut *eg;
         let (pv_bps, pv_burst) = (
             self.limits.per_victim_bps as f64,
             self.limits.per_victim_burst as f64,
@@ -823,47 +856,51 @@ impl L4Plane {
         // PLATFORM victim backstop (IP /32), across every project — map-full ⇒ fail-closed drop.
         // This is the third-party reflection bound: no per-project override can widen it, which is
         // why it is checked here rather than alongside the tenant's own per-source cap.
-        // (Bind then take: a match *guard* can't hold the `&mut` bucket, so the take is the body.)
-        let ok = match eg
-            .per_victim
-            .get_or_insert_with(dest_ip, now, || TokenBucket::new(pv_bps, pv_burst, now))
-        {
-            Some(b) => b.try_take(amount, now),
-            None => false,
+        let Some(bv) =
+            per_victim.get_or_insert_with(dest_ip, now, || TokenBucket::new(pv_bps, pv_burst, now))
+        else {
+            return Err(EgressReject::PerVictim);
         };
-        if !ok {
+        if !bv.can_take(amount, now) {
             return Err(EgressReject::PerVictim);
         }
         // Per-/24 backstop.
         let n24 = net_key(dest_ip);
         let p24_bps = self.limits.egress_per_24_bps as f64;
-        let ok = match eg
-            .per_24
-            .get_or_insert_with(n24, now, || TokenBucket::new(p24_bps, p24_bps, now))
-        {
-            Some(b) => b.try_take(amount, now),
-            None => false,
+        let Some(b24) =
+            per_24.get_or_insert_with(n24, now, || TokenBucket::new(p24_bps, p24_bps, now))
+        else {
+            return Err(EgressReject::Per24);
         };
-        if !ok {
+        if !b24.can_take(amount, now) {
             return Err(EgressReject::Per24);
         }
         // Per-project — the calling port's resolved rate (platform default unless overridden).
         let pp_bps = limits.per_project_bps as f64;
-        let ok = match eg
-            .per_project
-            .get_or_insert_with(base.to_string(), now, || {
-                TokenBucket::new(pp_bps, pp_bps, now)
-            }) {
-            Some(b) => b.try_take(amount, now),
-            None => false,
+        let Some(bp) = per_project
+            .get_or_insert_with(base.to_string(), now, || TokenBucket::new(pp_bps, pp_bps, now))
+        else {
+            return Err(EgressReject::PerProject);
         };
-        if !ok {
+        // The bucket was created with whatever rate was in force at its first use, and every
+        // access refreshes its TTL — so an ACTIVELY sending project would hold its original rate
+        // indefinitely, which is exactly the project an operator most wants to retune. Re-point it
+        // whenever the caller's resolved rate differs.
+        if bp.rate() != pp_bps {
+            bp.retune(pp_bps, pp_bps);
+        }
+        if !bp.can_take(amount, now) {
             return Err(EgressReject::PerProject);
         }
         // Global.
-        if !eg.global.try_take(amount, now) {
+        if !global.can_take(amount, now) {
             return Err(EgressReject::Global);
         }
+        // Every level allowed it — now debit them together.
+        bv.commit(amount);
+        b24.commit(amount);
+        bp.commit(amount);
+        global.commit(amount);
         Ok(())
     }
 
@@ -1429,6 +1466,138 @@ mod tests {
         assert_eq!(d.per_source_bps, plat.per_victim_bps);
         assert_eq!(d.per_source_burst, plat.per_victim_burst);
         assert_eq!(d.per_project_bps, plat.egress_per_project_bps);
+    }
+
+    /// A datagram refused by a LATER level must not have been charged to the earlier ones.
+    ///
+    /// The last level is `global`, shared by every tenant. Debiting as we went meant a project
+    /// that lost the shared race still had its private per-victim / per-/24 / per-project budgets
+    /// drained by traffic it never emitted — so one heavy tenant degraded everyone else's own
+    /// allowances, not just the shared pool — and a tenant deliberately throttled to a small
+    /// aggregate could still drain shared per-victim / per-/24 budget by spraying destinations,
+    /// since the port-side gate is per-destination and the refusal came only afterwards.
+    #[test]
+    fn a_refusal_at_the_last_level_does_not_charge_the_earlier_ones() {
+        let t = Instant::now();
+        // per-victim is the PRIVATE bucket under test. Its rate and burst are separately
+        // configurable, so it can be given a large capacity and a ~zero refill rate — that is what
+        // makes a phantom debit still visible a second later, once global has refilled.
+        let lim = L4PlaneLimits {
+            per_victim_bps: 1, // ~no refill
+            per_victim_burst: 2_000_000,
+            egress_per_24_bps: 100_000_000,
+            egress_per_project_bps: 100_000_000,
+            egress_global_bps: 1_000_000, // rate == capacity: refills fully in 1s
+            ..Default::default()
+        };
+        let p = L4Plane::new(lim, noop_wake());
+        let generous = L4PortEgressLimits {
+            per_source_bps: 100_000_000,
+            per_source_burst: 100_000_000,
+            per_project_bps: 100_000_000,
+        };
+        let victim: IpAddr = "203.0.113.9".parse().unwrap();
+
+        // Drain global. per-victim: 2_000_000 -> 1_000_000.
+        assert!(p
+            .try_egress_aggregate("proj-a", victim, 1_000_000, generous, t)
+            .is_ok());
+
+        // 100 x 5_000 = 500_000 bytes that GLOBAL refuses. Debit-as-you-go charged every one of
+        // them to per-victim on the way down.
+        for _ in 0..100 {
+            assert_eq!(
+                p.try_egress_aggregate("proj-b", victim, 5_000, generous, t)
+                    .unwrap_err(),
+                EgressReject::Global
+            );
+        }
+
+        // A second later global is full again; per-victim has refilled by ~1 byte. A 750_000B
+        // admission now succeeds only if those 100 refusals cost per-victim nothing:
+        //   all-or-nothing -> per-victim 1_000_000 >= 750_000  => Ok
+        //   debit-as-you-go -> per-victim   500_000 <  750_000  => Err(PerVictim)
+        let later = t + Duration::from_secs(1);
+        assert!(
+            p.try_egress_aggregate("proj-b", victim, 750_000, generous, later)
+                .is_ok(),
+            "the victim bucket was charged for datagrams global refused"
+        );
+    }
+
+    /// A limits change must reach a LIVE project's per-project bucket, not wait for a TTL the
+    /// project's own traffic keeps refreshing.
+    ///
+    /// The bucket is created with whatever rate was in force at first use, and every access
+    /// touches its TTL — so an actively-sending project (exactly the one an operator wants to
+    /// throttle) would hold its original rate forever. The reconcile loop refreshes the caller's
+    /// resolved limits; this asserts the bucket follows them.
+    #[test]
+    fn a_lowered_per_project_rate_binds_without_waiting_for_the_ttl() {
+        let t = Instant::now();
+        let p = L4Plane::new(L4PlaneLimits::default(), noop_wake());
+        let victim: IpAddr = "203.0.113.30".parse().unwrap();
+        let roomy = L4PortEgressLimits {
+            per_source_bps: 100_000_000,
+            per_source_burst: 100_000_000,
+            per_project_bps: 8_000_000,
+        };
+        // Establish the bucket at the roomy rate and keep it hot (TTL refreshed on every access).
+        assert!(p.try_egress_aggregate("proj-x", victim, 1_000, roomy, t).is_ok());
+
+        // Operator tightens the project hard. Same instant, same hot bucket.
+        let tightened = L4PortEgressLimits {
+            per_project_bps: 2_000,
+            ..roomy
+        };
+        // Drain the retuned capacity...
+        let _ = p.try_egress_aggregate("proj-x", victim, 2_000, tightened, t);
+        // ...and the next datagram must now be refused BY THE PROJECT bucket. Under the old
+        // create-once behaviour the bucket kept its 8 MB/s fill and admitted this freely.
+        assert_eq!(
+            p.try_egress_aggregate("proj-x", victim, 2_000, tightened, t)
+                .unwrap_err(),
+            EgressReject::PerProject,
+            "the per-project bucket ignored the lowered rate"
+        );
+    }
+
+    /// Pins the §1.2 residual table to the code, by ABSOLUTE value rather than by relation.
+    ///
+    /// Every one of these is a bound the design doc's residual table quotes. A relative assertion
+    /// cannot catch a drift that moves two of them together, so they are spelled out: changing one
+    /// should require editing this test, reading why it exists, and updating
+    /// `docs/smarter-l4-limiting-design.md` in the same commit.
+    #[test]
+    fn platform_egress_ceilings_match_the_residual_table() {
+        let plat = L4PlaneLimits::default();
+        assert_eq!(plat.per_victim_bps, 1024 * 1024, "victim bound moved");
+        assert_eq!(plat.per_victim_burst, 64 * 1024, "victim burst moved");
+        assert_eq!(plat.egress_per_24_bps, 8 * 1024 * 1024, "per-/24 bound moved");
+        assert_eq!(plat.egress_global_bps, 64 * 1024 * 1024, "global bound moved");
+        assert_eq!(
+            plat.egress_per_project_bps,
+            16 * 1024 * 1024,
+            "per-project bound moved"
+        );
+
+        // A realistic 50-way conferencing SFU — top-3 audio forwarding, thumbnails on a 200 kbps
+        // simulcast low layer — offers ~11.4 MiB/s, and a 20-way ~14.6 MiB/s. Both fit. The
+        // 43.5 MiB/s figure that motivated a proposed raise assumed full audio fan-out to every
+        // participant and 600 kbps per thumbnail, neither of which any SFU ships.
+        let realistic_50_way_bps = 11_960_000u64;
+        assert!(
+            plat.egress_per_project_bps > realistic_50_way_bps,
+            "the shipped default must cover a realistic large meeting without an admin grant"
+        );
+
+        // No single project may reach the platform-wide ceiling on its own; global is the backstop
+        // and it has no per-tenant fair share, so the ratio is what keeps one tenant from
+        // capturing the plane.
+        assert!(
+            plat.egress_global_bps / plat.egress_per_project_bps >= 4,
+            "per-project should stay <= 25% of global while global has no fair share"
+        );
     }
 
     #[test]

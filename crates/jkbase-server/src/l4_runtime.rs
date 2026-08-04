@@ -34,6 +34,11 @@ struct LivePort {
     cancel: CancellationToken,
     external_port: u16,
     proto: String,
+    /// Kept so an admin limits change can be pushed to an ALREADY-BOUND port. `resolve_spec` runs
+    /// only for a port that is not yet live, and `allocate_port` is sticky (a redeploy updates the
+    /// allocation row in place rather than removing it), so without this a port's limits would be
+    /// frozen from first bind until teardown or a host restart.
+    ingress: Arc<L4Ingress>,
 }
 
 /// Reconcile loop entry — spawned once at startup beside the DB gateway. Owns the L4 socket
@@ -102,6 +107,7 @@ pub async fn serve(
                 Ok(ingress) => {
                     // Open the host firewall for this port BEFORE we start pumping (idempotent).
                     fw.allow(external_port).await;
+                    let handle = ingress.clone();
                     tokio::spawn(ingress.run());
                     live.insert(
                         key,
@@ -109,6 +115,7 @@ pub async fn serve(
                             cancel,
                             external_port,
                             proto: alloc.proto.clone(),
+                            ingress: handle,
                         },
                     );
                     info!(
@@ -125,6 +132,25 @@ pub async fn serve(
                         error = %e, "l4 reconcile: edge bind failed (will retry)"
                     );
                 }
+            }
+        }
+
+        // --- Push egress-limit changes to ALREADY-LIVE ports. ---
+        // `resolve_spec` above runs only for a port that is not yet live, and `allocate_port` is
+        // sticky, so without this an admin grant (or, worse, a mid-incident TIGHTENING) would sit
+        // in the store with no effect on the running socket until teardown or a host restart —
+        // the API would return 200 OK and change nothing. Cold path: one control-store read per
+        // live port per tick, never on the datagram path.
+        for (key, lp) in live.iter() {
+            let want = resolve_egress_limits(&store, &plane, &key.0);
+            if lp.ingress.update_egress_limits(want) {
+                info!(
+                    project = %key.0, l4_port = %key.1,
+                    per_source_bps = want.per_source_bps,
+                    per_source_burst = want.per_source_burst,
+                    per_project_bps = want.per_project_bps,
+                    "l4 reconcile: egress limits updated on a live port"
+                );
             }
         }
 
@@ -155,6 +181,34 @@ pub async fn serve(
 
         tokio::time::sleep(RECONCILE_TICK).await;
     }
+}
+
+/// The egress limits in force for `project_id`: an admin override layered over the platform
+/// defaults FIELD BY FIELD. An override that omits a field leaves the default in place rather than
+/// zeroing it — a zero-rate bucket admits nothing, and that failure would present as total packet
+/// loss rather than as the config mistake it is.
+///
+/// Cheap and pure, so the reconcile loop can call it every tick for live ports (see `serve`) as
+/// well as once at bind. It reads the control store, so it must stay on the reconcile path and
+/// never move to the per-datagram path.
+fn resolve_egress_limits(
+    store: &Store,
+    plane: &L4Plane,
+    project_id: &str,
+) -> jkbase_proxy::l4_plane::L4PortEgressLimits {
+    let mut egress = plane.default_port_egress_limits();
+    if let Ok(Some(o)) = store.get_l4_egress_limits(project_id) {
+        if let Some(v) = o.per_source_bps {
+            egress.per_source_bps = v;
+        }
+        if let Some(v) = o.per_source_burst {
+            egress.per_source_burst = v;
+        }
+        if let Some(v) = o.per_project_bps {
+            egress.per_project_bps = v;
+        }
+    }
+    egress
 }
 
 /// Resolve a `PortAllocation` (host-recorded ports) into the full `L4PortSpec` the pump needs:
@@ -194,18 +248,7 @@ fn resolve_spec(
     // override over the platform defaults field-by-field. An override that omits a field leaves
     // the default in place rather than zeroing it — a zero-rate bucket admits nothing, and that
     // failure would present as total packet loss rather than as the config mistake it is.
-    let mut egress = plane.default_port_egress_limits();
-    if let Ok(Some(o)) = store.get_l4_egress_limits(&alloc.project_id) {
-        if let Some(v) = o.per_source_bps {
-            egress.per_source_bps = v;
-        }
-        if let Some(v) = o.per_source_burst {
-            egress.per_source_burst = v;
-        }
-        if let Some(v) = o.per_project_bps {
-            egress.per_project_bps = v;
-        }
-    }
+    let egress = resolve_egress_limits(store, plane, &alloc.project_id);
 
     Some(L4PortSpec {
         base_project: vm_identity::base_project_id(&alloc.project_id).to_string(),

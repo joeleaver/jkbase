@@ -384,7 +384,9 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         )
         .route(
             "/projects/{id}/l4/limits",
-            get(get_project_l4_limits).post(set_project_l4_limits),
+            get(get_project_l4_limits)
+                .post(set_project_l4_limits)
+                .delete(clear_project_l4_limits),
         )
         .route(
             "/tenants/{tenant_id}/quota",
@@ -799,6 +801,9 @@ async fn create_project(
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
     let _ = state.store.delete_deployed_tier(&id);
+    // An admin-granted L4 egress override is per-slug, so an interrupted teardown would hand the
+    // grant to the new owner of the name.
+    let _ = state.store.remove_l4_egress_limits(&id);
     // Managed-DB backups ([RB11]): drop the admin token + catalog rows, and reap the backup
     // blobs, so a recreated same-slug project can't inherit a prior tenant's snapshots.
     let _ = state.store.delete_db_admin_token(&id);
@@ -955,6 +960,11 @@ async fn delete_project(
                     let _ = state.store.purge_usage(&id);
                     let _ = state.store.remove_quota(&id);
                     let _ = state.store.remove_quota_status(&id);
+                    // ...including any admin-granted L4 egress override. Project ids are a GLOBAL
+                    // first-come slug namespace, so leaving this row behind lets the next tenant to
+                    // claim the slug inherit a raised aggregate they were never vetted for — with
+                    // no admin action and nothing in the log.
+                    let _ = state.store.remove_l4_egress_limits(&id);
                     // Purge the project's secrets so a recreated project of the same
                     // slug can't inherit them — the deploy path injects secrets into the
                     // container env, so a stale secret would leak to a new tenant.
@@ -2461,6 +2471,46 @@ async fn get_project_l4_limits(
     }
 }
 
+/// `DELETE /projects/{id}/l4/limits` — PLATFORM-ADMIN revoke of a project's L4 egress override,
+/// returning it to the platform defaults.
+///
+/// Needed because every field of the override is `Option` with "absent = leave alone", so `POST`
+/// can raise or change a grant but can never UNSET one — without this a grant was permanent for
+/// the lifetime of the project id, and the only way back to defaults was deleting the project.
+/// Revoking a grant is the action an operator most needs to be able to take quickly.
+async fn clear_project_l4_limits(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !state.is_admin_request(&headers) {
+        // 404, not 403 — same reasoning as the setter: reveal nothing about which projects exist.
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("project '{id}' not found"),
+            }),
+        )
+            .into_response();
+    }
+    match state.store.remove_l4_egress_limits(&id) {
+        Ok(existed) => {
+            if existed {
+                info!(project = %id, "l4 egress override revoked (back to platform defaults)");
+            }
+            // Takes effect on any live port within a reconcile tick, like a POST.
+            Json(serde_json::json!({ "cleared": existed })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("could not clear L4 limits: {e}"),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /projects/{id}/l4/limits` — PLATFORM-ADMIN set of a project's L4 egress limits.
 ///
 /// Admin-only with no owner-scoped path at all, unlike the quota routes: these numbers govern how
@@ -2468,9 +2518,13 @@ async fn get_project_l4_limits(
 /// still cannot widen what a third party receives — every reply passes the platform victim
 /// backstop afterwards (see `L4EgressLimits`).
 ///
-/// Takes effect for a running project when its ports are next reconciled (redeploy), and for the
-/// per-project aggregate bucket within its TTL. Not instant, deliberately: the alternative is a
-/// control-store read on the per-datagram path.
+/// Takes effect on a RUNNING port within one reconcile tick — the loop re-resolves each live
+/// port's limits every pass and pushes any change into the pump. Not instant, deliberately: the
+/// alternative is a control-store read on the per-datagram path.
+///
+/// A LOWERED limit binds from the next token refill rather than clawing back tokens already
+/// granted, so at most one burst of over-send survives a tightening. For an immediate stop the
+/// lever is still port teardown + quarantine (L4 design §8), not this endpoint.
 async fn set_project_l4_limits(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2507,14 +2561,61 @@ async fn set_project_l4_limits(
         )
             .into_response();
     }
+    // Reject values that would silently blackhole the project. The resolve path is careful that an
+    // OMITTED field falls back to the platform default — but an explicitly supplied `0` sailed
+    // straight through to `TokenBucket::new(0.0, 0.0, _)`, which admits nothing. The tenant would
+    // see total packet loss and every counter would read "the platform refused it", i.e. the
+    // config mistake would present as a pump fault. A burst below one MTU-sized datagram is the
+    // same bug in slower motion: the bucket can never accumulate enough for a full packet.
+    const MIN_BURST_BYTES: u64 = 1500;
+    const MAX_BPS: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB/s — a typo guard, not a policy bound.
+    let mut bad: Vec<String> = Vec::new();
+    for (name, v) in [
+        ("per_source_bps", req.per_source_bps),
+        ("per_project_bps", req.per_project_bps),
+    ] {
+        match v {
+            Some(0) => bad.push(format!("{name} must be > 0 (0 admits nothing)")),
+            Some(x) if x > MAX_BPS => bad.push(format!("{name} exceeds {MAX_BPS} bytes/sec")),
+            _ => {}
+        }
+    }
+    if let Some(b) = req.per_source_burst {
+        if b < MIN_BURST_BYTES {
+            bad.push(format!(
+                "per_source_burst must be >= {MIN_BURST_BYTES} (a burst below one datagram never admits a full packet)"
+            ));
+        } else if b > MAX_BPS {
+            bad.push(format!("per_source_burst exceeds {MAX_BPS} bytes"));
+        }
+    }
+    if !bad.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: bad.join("; "),
+            }),
+        )
+            .into_response();
+    }
     // Merge onto the CURRENT override so a partial set preserves fields it didn't mention. A
     // field left unset stays unset, and the platform default applies to it at resolve time.
-    let mut limits = state
-        .store
-        .get_l4_egress_limits(&id)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    //
+    // FAIL CLOSED on a read error rather than merging onto an empty override: swallowing it would
+    // silently REVOKE previously granted fields while reporting success, which is the same class
+    // of bug as a silent grant. Mirrors `set_project_quota`.
+    let mut limits = match state.store.get_l4_egress_limits(&id) {
+        Ok(existing) => existing.unwrap_or_default(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("could not read existing L4 limits: {e}"),
+                }),
+            )
+                .into_response();
+        }
+    };
     if let Some(v) = req.per_source_bps {
         limits.per_source_bps = Some(v);
     }

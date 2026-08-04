@@ -197,14 +197,18 @@ shelf; do not build unless the clamp is retained as the default.
 
 ## 5. Reflection bound — what changes, what never does
 
-**Invariant: no absolute cap changes.** Every per-source(IP)/-24/global ceiling is byte-for-byte
+**Invariant: no THIRD-PARTY cap changes.** Every per-source(IP)/-24/global ceiling is byte-for-byte
 unchanged, so no victim, network, or the platform can be made to receive more than today —
-independent of workload.
+independent of workload. Note what this invariant does and does not cover: it is about what a third
+party RECEIVES. The **per-project** aggregate is not in it, because it bounds how much one tenant
+may EMIT in total, across all destinations — raising it cannot concentrate any more traffic on a
+victim, a /24, or the platform, since those three still bind afterwards.
 
 | Lever | Sustained ratio / victim | Absolute rate / victim IP | Per-/24 | Per-project | Global |
 |---|---|---|---|---|---|
 | **Today (ratio clamp on)** | ≤ 1× (attacker pays 1× bandwidth) | ≤ 1 MB/s | ≤ 8 MB/s | ≤ 16 MB/s | ≤ 64 MB/s |
 | **Re-centered (clamp retired)** | unbounded *ratio* (any asymmetric app works) | ≤ 1 MB/s (**unchanged**) | ≤ 8 MB/s (**unchanged**) | ≤ 16 MB/s (**unchanged**) | ≤ 64 MB/s (**unchanged**) |
+| **+ per-project limits (W-admin)** | unbounded *ratio* | ≤ 1 MB/s (**unchanged**) | ≤ 8 MB/s (**unchanged**) | ≤ 16 MB/s default (**unchanged**); an admin grant may raise a NAMED project | ≤ 64 MB/s (**unchanged**) |
 
 The honest trade: retiring the ratio clamp raises the reflection **factor** (an attacker no longer
 spends 1× bandwidth) but **not** the reflection **ceiling** at any victim/network/project/platform —
@@ -218,9 +222,23 @@ of workload or account count.
 port has no ~60 s auto-hibernate, so a victim can be held at the ≤1 MB/s ceiling for the attack's
 duration; mitigated by the `reflection_shape_flagged` alert → human/terminate, not by auto-kill
 (which would strangle legit broadcasters). (ii) **per-tenant real-time** — aggregate caps stop at
-per-project (16 MB/s), so an identified tenant with ≥4 clamp-off projects can source the full global
-64 MB/s until the monthly cap trips (hours). A per-tenant real-time egress dimension (≤ global) is a
-follow-on; for now the bound is per-project + global + monthly cap + attribution.
+per-project (16 MB/s), so an identified tenant with ≥4 clamp-off projects can source the full
+global 64 MB/s until the monthly cap trips (hours). **Each admin grant that raises a project's
+aggregate lowers that project count**, which is the cost an operator accepts when issuing one.
+Compounding it, global is a single first-come-first-served bucket with **no per-tenant fair
+share** (unlike `flow_global_fair_share` / `wake_fair_share`) — and because refusal is
+arrival-order, a heavier sender issues proportionally more attempts and wins the refill race, so
+starvation is self-reinforcing toward the largest tenant. A per-tenant real-time egress dimension
+(≤ global) and a global fair share are the follow-on; for now the bound is per-project + global +
+monthly cap + attribution.
+
+**Open, deliberately not changed here:** `egress_global_bps` is a hardcoded 64 MB/s with **no
+configuration path at all** — production constructs the plane with `L4PlaneLimits::default()`
+(`main.rs`), and outside `l4_plane.rs` every reference is a test. It is neither derived from the
+host's link (prod's uplink is 1000 Mbps, so 64 MB/s ≈ 54% of it) nor validated against one, and it
+has never fired in production. Deriving it from the real uplink would be more honest than either
+constant, but it IS one of the three third-party ceilings above, so it gets its own change and its
+own residual argument rather than riding along with this one.
 
 **The residual that the accountability model governs (§7 — RESOLVED):** jkbase has **no anonymous
 accounts** (every tenant is identified; "unlimited" = a trusted super-user class only), so an

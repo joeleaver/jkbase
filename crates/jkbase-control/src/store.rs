@@ -626,10 +626,20 @@ pub struct UsageBucket {
     pub warm_seconds: u64,
 }
 
-/// A per-project override of the L4 egress ceilings, for a workload the platform defaults were
-/// not sized for — the motivating case is a conferencing SFU, whose *egress* leg carries
-/// `participants x (participants - 1)` media streams and meets `per_source_bps` long before
-/// anything else.
+/// A per-project override of the L4 egress ceilings, for a workload the platform defaults were not
+/// sized for.
+///
+/// **Which field can actually help, and which cannot.** Effective egress toward one destination is
+/// `min(per_source_bps, per_victim_bps)`, and `per_victim_bps` is the platform-wide third-party
+/// bound (1 MiB/s). So `per_source_bps` is **restriction-only**: setting it ABOVE the platform
+/// victim bound changes nothing observable, because the backstop binds first. That is not a defect
+/// — it is exactly why a grant cannot widen third-party exposure — but an operator who expects it
+/// to raise per-client throughput will grant it, see no change, and reach for `per_victim_bps`,
+/// which is the one number that widens exposure for every victim on the platform. Don't.
+///
+/// The field a grant can meaningfully raise is `per_project_bps`: the project's TOTAL egress
+/// across all destinations. That is breadth, not concentration — how many clients a tenant can
+/// serve at the per-victim ceiling, never how hard any one of them can be hit.
 ///
 /// Every field is optional and layered over the platform default individually: a partial override
 /// must not silently zero a field it didn't mention, because a zero-rate bucket admits nothing and
