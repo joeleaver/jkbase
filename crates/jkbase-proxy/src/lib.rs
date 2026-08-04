@@ -790,8 +790,14 @@ const CLIENT_IDENTITY_HEADERS: [&str; 4] = [
 ];
 
 fn is_client_identity_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    CLIENT_IDENTITY_HEADERS.contains(&lower.as_str())
+    // Underscores are folded to dashes before comparing, so `X_Forwarded_For` is stripped too.
+    // It is a DIFFERENT header name on the wire — a tenant reading `X-Forwarded-For` would never
+    // see it — but CGI-style environments (WSGI, CGI, nginx with `underscores_in_headers on`)
+    // normalize `-` to `_`, so both names collapse to a single `HTTP_X_FORWARDED_FOR` key and the
+    // attacker's copy can win the collision. jkbase ships a Python buildpack, so that is a real
+    // path, and the classic way this exact defence gets bypassed.
+    let normalized = name.to_ascii_lowercase().replace('_', "-");
+    CLIENT_IDENTITY_HEADERS.contains(&normalized.as_str())
 }
 
 /// RFC 7239 node identifier: an IPv6 literal must be bracketed AND quoted, because the bare form
@@ -999,6 +1005,52 @@ mod tests {
         assert_eq!(out["x-forwarded-proto"], "https");
         // Everything else still rides through.
         assert_eq!(out["accept"], "*/*");
+    }
+
+    #[test]
+    fn underscore_variants_are_stripped_too() {
+        // `X_Forwarded_For` is a different header name on the wire, so a tenant reading
+        // `X-Forwarded-For` would never see it — but CGI-style environments (WSGI, CGI, nginx with
+        // `underscores_in_headers on`) fold `-` to `_`, so both collapse to one
+        // `HTTP_X_FORWARDED_FOR` key and the attacker's copy can win. This is the classic bypass
+        // of exactly this defence, and jkbase ships a Python buildpack.
+        let src = headers(&[
+            ("X_Forwarded_For", "1.2.3.4"),
+            ("X_Real_IP", "1.2.3.4"),
+            ("X_Forwarded_Proto", "http"),
+        ]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        for name in ["x_forwarded_for", "x_real_ip", "x_forwarded_proto"] {
+            assert!(
+                out.get(name).is_none(),
+                "{name} reached the backend and can collide with the real one under CGI folding"
+            );
+        }
+        assert_eq!(out["x-forwarded-for"], "203.0.113.7");
+    }
+
+    #[test]
+    fn duplicate_and_mixed_case_identity_headers_collapse_to_the_verified_one() {
+        // An appending proxy would leave the attacker's value first; a strip that removed only the
+        // FIRST duplicate would leave a second behind. Exactly one value must survive.
+        let mut src = hyper::HeaderMap::new();
+        for (n, v) in [
+            ("x-forwarded-for", "1.1.1.1"),
+            ("x-forwarded-for", "2.2.2.2"),
+        ] {
+            src.append(
+                hyper::header::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        src.append(
+            hyper::header::HeaderName::from_bytes(b"X-ForWarded-For").unwrap(),
+            hyper::header::HeaderValue::from_static("3.3.3.3"),
+        );
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        let vals: Vec<_> = out.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(vals.len(), 1, "more than one X-Forwarded-For reached the backend");
+        assert_eq!(vals[0], "203.0.113.7");
     }
 
     #[test]
