@@ -859,6 +859,19 @@ fn upgrades_overloaded() -> Response<ProxyBody> {
 /// The verified facts about a client connection that a backend cannot otherwise learn: who
 /// connected, and over what scheme. Sourced from the accepted socket and the listener that
 /// accepted it — never from anything on the wire.
+///
+/// **"Verified" means unforgeable, NOT "external" — the address can be RFC1918.** A tenant VM may
+/// reach the proxy on the public IP (that is how a guest talks to `storage.`/`api.`/its own site;
+/// `tools/setup-bridge.sh` ACCEPTs guest→`$PUB_IP`:80,443 from the runtime bridge). That traffic
+/// is delivered locally via INPUT, so nat POSTROUTING's `-o $PUB_IFACE` MASQUERADE never matches
+/// and `peer.ip()` is the guest's `172.16.0.N`.
+///
+/// So one tenant can make another tenant's app observe a private source address, simply by curling
+/// it from inside its own VM. The L2 source guard pins the octet, so tenant A cannot impersonate
+/// B's specific address or `127.0.0.1` — but it can always present *a* private one. Any app that
+/// treats RFC1918 as "internal, therefore trusted" (the usual way `/metrics`, `/admin` and debug
+/// routes get gated) is exposed cross-tenant. **Tenant-facing docs must say: do not use
+/// private-range as a trust signal; this header authenticates WHO, never WHERE-FROM.**
 #[derive(Debug, Clone, Copy)]
 pub struct ClientInfo {
     pub ip: std::net::IpAddr,
@@ -869,22 +882,65 @@ pub struct ClientInfo {
 /// Headers that name the CLIENT. The proxy is the sole authority for every one of them — a client
 /// can set any of these on the wire, so an inbound copy is unauthenticated and must never reach a
 /// backend (the same discipline [`SITE_HEADER`] already gets).
-const CLIENT_IDENTITY_HEADERS: [&str; 4] = [
+const CLIENT_IDENTITY_HEADERS: [&str; 14] = [
+    // The four the proxy STAMPS.
     "x-forwarded-for",
     "x-real-ip",
     "forwarded",
     "x-forwarded-proto",
+    // Stripped but NOT stamped — the rest of the `X-Forwarded-*` family. Leaving these
+    // attacker-controlled while stamping the scheme is worse than stamping none of the family,
+    // because a framework in trusted-proxy mode (Laravel TrustProxies, Symfony setTrustedProxies,
+    // Django USE_X_FORWARDED_HOST) builds absolute URLs from host + scheme: a forged
+    // `X-Forwarded-Host` plus our authoritative `X-Forwarded-Proto` is a password-reset link
+    // pointed at the attacker's domain, carrying the victim's token.
+    "x-forwarded-host",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "via",
+    // Stripped but not stamped — CDN/vendor names that MEAN "the client's IP". The near-universal
+    // "get the real IP" snippet is an ordered fallback (`CF-Connecting-IP ?? True-Client-IP ??
+    // X-Forwarded-For ?? REMOTE_ADDR`), so a tenant using it reads one of these FIRST and is fully
+    // spoofable — precisely the outcome this whole mechanism exists to prevent. jkbase is not
+    // behind any of these CDNs, so an inbound copy is always a forgery.
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "x-original-forwarded-for",
+    "x-envoy-external-address",
 ];
 
+/// Lowercase and fold `_` to `-`. CGI-style environments (WSGI, CGI, nginx with
+/// `underscores_in_headers on`) fold the other way, so `X_Forwarded_For` and `X-Forwarded-For`
+/// collapse to one `HTTP_X_FORWARDED_FOR` key and the attacker's copy can win the collision.
+fn fold_underscores(name: &str) -> String {
+    name.to_ascii_lowercase().replace('_', "-")
+}
+
+/// Drop any `Connection` token that names a header the PROXY is authoritative for, keeping the
+/// rest (notably `upgrade`, which the WebSocket handshake needs). Returns `None` when nothing
+/// legitimate remains, so the header is omitted entirely rather than sent empty.
+fn sanitize_connection(value: &hyper::header::HeaderValue) -> Option<hyper::header::HeaderValue> {
+    let raw = value.to_str().ok()?;
+    let kept: Vec<&str> = raw
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| {
+            !t.is_empty() && {
+                let f = fold_underscores(t);
+                f != SITE_HEADER && !CLIENT_IDENTITY_HEADERS.contains(&f.as_str())
+            }
+        })
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    hyper::header::HeaderValue::from_str(&kept.join(", ")).ok()
+}
+
 fn is_client_identity_header(name: &str) -> bool {
-    // Underscores are folded to dashes before comparing, so `X_Forwarded_For` is stripped too.
-    // It is a DIFFERENT header name on the wire — a tenant reading `X-Forwarded-For` would never
-    // see it — but CGI-style environments (WSGI, CGI, nginx with `underscores_in_headers on`)
-    // normalize `-` to `_`, so both names collapse to a single `HTTP_X_FORWARDED_FOR` key and the
-    // attacker's copy can win the collision. jkbase ships a Python buildpack, so that is a real
-    // path, and the classic way this exact defence gets bypassed.
-    let normalized = name.to_ascii_lowercase().replace('_', "-");
-    CLIENT_IDENTITY_HEADERS.contains(&normalized.as_str())
+    CLIENT_IDENTITY_HEADERS.contains(&fold_underscores(name).as_str())
 }
 
 /// RFC 7239 node identifier: an IPv6 literal must be bracketed AND quoted, because the bare form
@@ -920,7 +976,25 @@ fn build_forward_headers(
         if drop_host && name == "host" {
             continue;
         }
-        if name.to_ascii_lowercase() == SITE_HEADER || is_client_identity_header(name) {
+        // SITE_HEADER goes through the SAME underscore folding as the identity headers — it is
+        // the identical CGI-folding class, and the proxy is equally the sole authority for it.
+        if fold_underscores(name) == SITE_HEADER || is_client_identity_header(name) {
+            continue;
+        }
+        // `Connection` names the headers that are hop-by-hop FOR THIS HOP, and RFC 7230 §6.1 says
+        // a recipient must remove them. Forwarded verbatim, it hands the client a switch that
+        // DELETES our stamped headers at a conforming backend (Go's httputil.ReverseProxy and much
+        // middleware honour it): `Connection: keep-alive, x-real-ip, x-forwarded-for` and the
+        // identity never arrives. Not a forged value — full client control over whether identity
+        // arrives at all, which collapses every attacker into one "unknown IP" bucket and breaks
+        // the same rate-limiters and blocklists the stamping exists to enable.
+        //
+        // Sanitized rather than dropped: `Connection: upgrade` is load-bearing for the WebSocket
+        // handshake, so only tokens naming a header we are authoritative for are removed.
+        if name == "connection" {
+            if let Some(v) = sanitize_connection(value) {
+                out.append(key.clone(), v);
+            }
             continue;
         }
         out.append(key.clone(), value.clone());
@@ -1109,6 +1183,92 @@ mod tests {
         assert_eq!(out["x-forwarded-proto"], "https");
         // Everything else still rides through.
         assert_eq!(out["accept"], "*/*");
+    }
+
+    #[test]
+    fn sibling_client_ip_headers_do_not_reach_the_backend() {
+        // The near-universal "get the real IP" snippet is an ordered fallback:
+        //   CF-Connecting-IP ?? True-Client-IP ?? X-Forwarded-For ?? REMOTE_ADDR
+        // A tenant using it reads one of these BEFORE the header we stamp, so leaving them
+        // attacker-controlled defeats the entire mechanism for that tenant.
+        let src = headers(&[
+            ("CF-Connecting-IP", "1.2.3.4"),
+            ("True-Client-IP", "1.2.3.4"),
+            ("X-Client-IP", "1.2.3.4"),
+            ("X-Cluster-Client-IP", "1.2.3.4"),
+            ("X-Original-Forwarded-For", "1.2.3.4"),
+            ("X-Envoy-External-Address", "1.2.3.4"),
+        ]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        for n in [
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "x-cluster-client-ip",
+            "x-original-forwarded-for",
+            "x-envoy-external-address",
+        ] {
+            assert!(out.get(n).is_none(), "{n} reached the backend forgeable");
+        }
+        assert_eq!(out["x-forwarded-for"], "203.0.113.7");
+    }
+
+    #[test]
+    fn forwarded_host_family_cannot_be_forged_alongside_an_authoritative_proto() {
+        // X-Forwarded-Proto is authoritative after this change. A framework in trusted-proxy mode
+        // builds absolute URLs from host + scheme, so a forgeable X-Forwarded-Host turns a
+        // password-reset mail into a token delivered to the attacker's domain.
+        let src = headers(&[
+            ("X-Forwarded-Host", "evil.example"),
+            ("X-Forwarded-Port", "8443"),
+            ("X-Forwarded-Server", "evil.example"),
+            ("Via", "1.1 evil"),
+        ]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        for n in ["x-forwarded-host", "x-forwarded-port", "x-forwarded-server", "via"] {
+            assert!(out.get(n).is_none(), "{n} reached the backend forgeable");
+        }
+        assert_eq!(out["x-forwarded-proto"], "https");
+    }
+
+    #[test]
+    fn connection_cannot_be_used_to_delete_the_stamped_identity() {
+        // RFC 7230 §6.1: a recipient removes the headers `Connection` names. Forwarded verbatim it
+        // is a client-controlled switch that deletes our stamping at any conforming backend.
+        let src = headers(&[(
+            "Connection",
+            "keep-alive, x-real-ip, X_Forwarded_For, x-jkbase-site",
+        )]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        let conn = out["connection"].to_str().unwrap();
+        assert_eq!(conn, "keep-alive", "Connection still names a header we stamp: {conn}");
+        assert_eq!(out["x-forwarded-for"], "203.0.113.7");
+        assert_eq!(out["x-real-ip"], "203.0.113.7");
+    }
+
+    #[test]
+    fn connection_upgrade_survives_for_websockets() {
+        // The sanitizer must not break the WS handshake, which needs `Connection: upgrade`.
+        let src = headers(&[("Connection", "Upgrade"), ("Upgrade", "websocket")]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        assert_eq!(out["connection"], "Upgrade");
+        assert_eq!(out["upgrade"], "websocket");
+    }
+
+    #[test]
+    fn a_connection_naming_only_our_headers_is_dropped_entirely() {
+        let src = headers(&[("Connection", "x-real-ip")]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        assert!(out.get("connection").is_none(), "empty Connection was forwarded");
+    }
+
+    #[test]
+    fn site_header_underscore_variant_is_stripped() {
+        // Same CGI-folding class as the identity headers; the proxy is equally sole authority.
+        let src = headers(&[("X_JKbase_Site", "other")]);
+        let out = build_forward_headers(&src, client("203.0.113.7"), false);
+        assert!(out.get("x_jkbase_site").is_none());
+        assert!(out.get("x-jkbase-site").is_none());
     }
 
     #[test]
