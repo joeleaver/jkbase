@@ -369,13 +369,27 @@ mod tests {
     /// egress leg is tens of *thousands* of pps — `K` participants each receiving `K-1` fan-out
     /// streams — and "free by inspection" stops being an argument.
     ///
-    /// Scope, stated honestly: this is the **pure-CPU** portion only — seal, open, ratio credit,
-    /// four token buckets and their bounded-map lookups. The real pump adds two syscalls per
-    /// datagram (edge `recv_from` + guest-facing `send`) plus the TAP/virtio crossing, and on most
-    /// hosts *those* dominate. So the pps ceiling printed here is an upper bound on the crypto and
-    /// accounting, and the end-to-end harness (`tools/l4-load`) is what measures reality. If this
-    /// probe alone can't clear the conference requirement, the end-to-end run cannot either — that
-    /// is the only inference it supports.
+    /// Scope, stated honestly — and the honesty matters, because a security limit gets argued from
+    /// these numbers:
+    ///
+    /// - **Pure CPU only.** The real pump adds two syscalls per datagram (edge `recv_from` +
+    ///   guest-facing `send`) plus the TAP/virtio crossing, and on most hosts *those* dominate.
+    /// - **It UNDERSTATES the host's real per-datagram accounting by roughly 6x.** `return_decide`
+    ///   also takes the port mutex, does two flow-table lookups, runs `is_reflection_suspected`
+    ///   (mutex + `HashSet<String>` probe) and `note_egress` (another mutex, two `String` allocs,
+    ///   two bounded-map lookups, a `HashSet<IpAddr>` insert). None of that is here.
+    /// - **It OVERSTATES the crypto by ~2x**, charging both `seal` and `open` to one datagram. The
+    ///   host pays exactly one; the guest agent pays the other, on a different vCPU in a different
+    ///   VM. Those two errors partially cancel, which is why the printed figure stays a *safe*
+    ///   underestimate rather than a flattering one.
+    /// - **Not "per core".** `L4Plane::egress` and `::activity` are process-global mutexes, so this
+    ///   accounting does not scale with cores — it degrades under contention. The printed number is
+    ///   a host-wide ceiling with one thread and no contention.
+    ///
+    /// So the pps ceiling here is an upper bound on crypto+accounting under ideal conditions, and
+    /// the end-to-end harness (`tools/l4-load`) is what measures reality. If this probe alone
+    /// can't clear the conference requirement, the end-to-end run certainly cannot — that is the
+    /// only inference it supports.
     #[test]
     #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
     fn l4_pump_cpu_cost() {
@@ -408,6 +422,9 @@ mod tests {
             // Leg 2: the egress accounting chain a reply runs before it may be sent — ratio
             // credit, then per-source, per-/24, per-project and global buckets, each behind its
             // bounded TTL map (the map lookup is part of the cost, not an aside).
+            // Buckets are sized so they never refuse: this measures the COST of the chain, not
+            // its policy, and a refusal short-circuits the very work being timed.
+            const RATE: f64 = 1e15;
             let now = Instant::now();
             let mut ratio = RatioCredit::new();
             let mut per_source: BoundedTtlMap<IpAddr, TokenBucket> =
@@ -422,28 +439,33 @@ mod tests {
 
             let t = Instant::now();
             for _ in 0..ITERS {
-                let now = Instant::now();
                 // Ingress accrues credit exactly as the reach loop would before a reply.
                 ratio.on_ingress(size, 1);
                 let verdict = ratio.try_egress(size, 1500);
                 let b = size as f64;
+                // NOT `&&`: short-circuiting is what the real path does, but it made this
+                // measurement a lie. At the shipped 1 MiB/s per-source rate the first bucket
+                // drains after ~55 iterations and every later iteration returns at stage 1, so
+                // ~99.97% of the loop measured ONE bucket, not four — and never paid
+                // `project.clone()` (a String alloc + hash), the per-/24 lookup or the global
+                // bucket. The tell was that 1200B and 160B both printed an identical 43ns, which
+                // a byte-denominated four-level chain cannot do. `&` forces all four every time,
+                // which is what "the cost of the chain" has to mean.
                 let ok = per_source
-                    .get_or_insert_with(dest, now, || TokenBucket::new(1048576.0, 65536.0, now))
+                    .get_or_insert_with(dest, now, || TokenBucket::new(RATE, RATE, now))
                     .map(|tb| tb.try_take(b, now))
                     .unwrap_or(false)
-                    && per_24
-                        .get_or_insert_with(0xCB00_7100, now, || {
-                            TokenBucket::new(8.0 * 1048576.0, 8.0 * 1048576.0, now)
-                        })
+                    & per_24
+                        .get_or_insert_with(0xCB00_7100, now, || TokenBucket::new(RATE, RATE, now))
                         .map(|tb| tb.try_take(b, now))
                         .unwrap_or(false)
-                    && per_project
+                    & per_project
                         .get_or_insert_with(project.clone(), now, || {
-                            TokenBucket::new(16.0 * 1048576.0, 16.0 * 1048576.0, now)
+                            TokenBucket::new(RATE, RATE, now)
                         })
                         .map(|tb| tb.try_take(b, now))
                         .unwrap_or(false)
-                    && global.try_take(b, now);
+                    & global.try_take(b, now);
                 black_box((verdict, ok));
             }
             let limiter_ns = t.elapsed().as_nanos() as f64 / ITERS as f64;
@@ -452,7 +474,8 @@ mod tests {
             let pps_ceiling = 1e9 / total_ns;
             println!(
                 "{label}: transit seal+open {crypto_ns:.0}ns  egress chain {limiter_ns:.0}ns  \
-                 total {total_ns:.0}ns/datagram  ⇒ {:.0}k pps/core (CPU only, no syscalls)",
+                 total {total_ns:.0}ns/datagram  ⇒ {:.0}k pps (CPU only; no syscalls, no \
+                 contention)",
                 pps_ceiling / 1000.0
             );
         }
@@ -467,17 +490,29 @@ mod tests {
         //
         // Rates: 600kbps video (a simulcast mid layer) in 1200B packets ≈ 62 pps; 40kbps audio in
         // 160B ≈ 31 pps.
+        //
+        // NOTE the audio packetization, because an egress ceiling gets argued from these numbers.
+        // 40kbps in 160B implies a **32ms ptime**; standard Opus/WebRTC is **20ms** (~50 pps at
+        // ~100B), which at k=50 raises the requirement from 103,850 pps to ~150,400 — about 45%
+        // more. Packet RATE is the axis the per-datagram cost multiplies against, so this is the
+        // load-bearing parameter and 20ms is the conservative reading. Both are printed rather
+        // than one being chosen silently: the CPU conclusion survives either, but a limit should
+        // be sized against the larger.
         const VISIBLE: u64 = 9;
         for k in [10u64, 20, 50] {
             let v_streams = (k - 1).min(VISIBLE) * k;
             let a_streams = (k - 1) * k;
-            let pps = v_streams * 62 + a_streams * 31;
-            let bps = v_streams as f64 * 62.0 * 1200.0 + a_streams as f64 * 31.0 * 160.0;
-            println!(
-                "requirement: {k} participants ({VISIBLE} visible) ⇒ {v_streams} video + \
-                 {a_streams} audio egress streams ⇒ {pps} pps ({:.1} MiB/s)",
-                bps / 1048576.0
-            );
+            for (ptime, a_pps, a_bytes) in [(32u64, 31u64, 160.0f64), (20, 50, 100.0)] {
+                let pps = v_streams * 62 + a_streams * a_pps;
+                let bps =
+                    v_streams as f64 * 62.0 * 1200.0 + a_streams as f64 * a_pps as f64 * a_bytes;
+                println!(
+                    "requirement: {k} participants ({VISIBLE} visible, {ptime}ms audio) ⇒ \
+                     {v_streams} video + {a_streams} audio egress streams ⇒ {pps} pps \
+                     ({:.1} MiB/s)",
+                    bps / 1048576.0
+                );
+            }
         }
     }
 }

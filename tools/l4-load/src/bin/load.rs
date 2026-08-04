@@ -12,8 +12,11 @@
 //! all K downstreams share **one** `per_source_bps` bucket (1 MiB/s by default) instead of K of
 //! them. The result looks like catastrophic plane loss and means nothing. Give each participant
 //! its own address (`--bind-ips`, see the README's alias setup) or the run is not modelling a
-//! conference — it is modelling one very unlucky client. The reporter refuses to draw conclusions
-//! when it detects this.
+//! conference — it is modelling one very unlucky client.
+//!
+//! The reporter detects this from the addresses actually bound (not from the length of the list
+//! the operator typed — a list with a duplicate is still one bucket) and, when it fires, draws NO
+//! verdict at all rather than warning and then printing one anyway.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -355,6 +358,19 @@ fn main() {
 
     std::thread::sleep(warmup);
     shared.measuring.store(true, Ordering::Relaxed);
+    // Clear every participant's accumulators HERE, in one place, rather than lazily on each
+    // participant's next arrival. The lazy reset only ran when a datagram showed up after the
+    // boundary, so a participant that received NOTHING in the measured window never reset and
+    // reported its WARM-UP bytes as measurement-window results: a total delivery blackout printed
+    // as `0.00% loss`, `silent = 0`, and — because delivered% was below the clean bar while loss
+    // was below the pump bar — no diagnosis line at all. That is the one failure mode a load
+    // harness must never have.
+    for p in &participants {
+        *p.stats.lock().unwrap() = RxStats {
+            reset_done: true,
+            ..Default::default()
+        };
+    }
     let measure_start = Instant::now();
     std::thread::sleep(duration);
     shared.stop.store(true, Ordering::Relaxed);
@@ -375,7 +391,6 @@ fn main() {
             per_24_bps,
             baseline,
         },
-        &bind_ips,
         n,
         json,
     );
@@ -524,7 +539,6 @@ fn report(
     participants: &[Participant],
     measured: Duration,
     c: Ceilings,
-    bind_ips: &[IpAddr],
     n: usize,
     json: bool,
 ) {
@@ -539,7 +553,7 @@ fn report(
     println!("── per participant ─────────────────────────────────────────");
     println!(
         "{:>4}  {:>20}  {:>8}  {:>8}  {:>9}  {:>9}  {:>9}",
-        "#", "downstream", "v-loss", "a-loss", "jitter", "rtt p50", "rtt p95"
+        "#", "downstream", "v-loss", "a-loss", "jitter pk", "rtt p50", "rtt p95"
     );
 
     let mut total_bytes = 0u64;
@@ -566,7 +580,9 @@ fn report(
         let mut rtt = s.rtt_nanos.clone();
         rtt.sort_unstable();
         all_rtt.extend_from_slice(&rtt);
-        let jitter = (s.video.jitter_nanos.max(s.audio.jitter_nanos)) as u64;
+        // PEAK, not the terminal EWMA sample: at conference packet rates the 1/16 gain has
+        // ~5ms of memory, so the final reading describes the end of the run rather than the run.
+        let jitter = (s.video.jitter_peak_nanos.max(s.audio.jitter_peak_nanos)) as u64;
 
         // "Throttled" = delivered materially less than offered while the plane's per-source
         // ceiling sits right about where delivery landed. That coincidence is the signature of a
@@ -634,8 +650,14 @@ fn report(
 
     // Source-address sanity first: every other conclusion is void if the participants collapsed
     // onto one egress bucket. Irrelevant without a plane — nothing is keying on the address.
-    if !baseline && bind_ips.len() < n {
-        let shared_ips = per_ip_bytes.len();
+    //
+    // Gate on the addresses actually BOUND, not on how many strings the operator typed. The old
+    // `bind_ips.len() < n` test was satisfied by `--bind-ips 127.0.0.1,127.0.0.1,127.0.0.1`, which
+    // is three entries and one bucket — any list containing a duplicate silently disabled the
+    // whole check while the run's own JSON reported `distinct_source_ips: 1`.
+    let distinct_sources = per_ip_bytes.len();
+    if !baseline && distinct_sources < n {
+        let shared_ips = distinct_sources;
         attribution_void = true;
         println!(
             "!! {n} participants share {shared_ips} source IP(s). The plane's per-source egress\n\
@@ -722,6 +744,20 @@ fn report(
         );
     } else if silent == 0 && delivered_pct >= 98.0 && worst_loss < 0.5 {
         println!("✓  clean run: no ceiling reached, loss under 0.5%, full offered rate delivered.");
+    } else if silent == 0 && worst_loss < 0.5 && delivered_pct < 98.0 {
+        // The arm that was missing, and the reason a blackout could pass silently: delivery well
+        // under what was offered, yet almost no LOSS. Loss is derived from the sequence span of
+        // what arrived, so a stream that is simply slower — or absent — is internally consistent
+        // and scores ~0%. Both plausible causes are the harness's own, not the plane's, so this
+        // must never be read as a pump finding.
+        println!(
+            "!! delivered only {delivered_pct:.1}% of the offered rate, but per-class loss is\n\
+             \x20  {worst_loss:.2}% — the sequence stream is intact, just short. Loss cannot see\n\
+             \x20  this: a generator that never sent, or a sim whose emitter was starved, produces\n\
+             \x20  a CONTIGUOUS stream at a lower rate and scores 0%.\n\
+             \x20  Check the sim's /stats (down_packets, send_errors) against what arrived before\n\
+             \x20  concluding anything about the plane. NO verdict is drawn from this run."
+        );
     } else if silent == 0 && worst_loss >= 0.5 {
         println!(
             "→  loss {worst_loss:.2}% with NO ceiling signature{}. Suspect the pump itself (CPU\n\

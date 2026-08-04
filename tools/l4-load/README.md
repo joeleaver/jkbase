@@ -6,8 +6,9 @@ media rates?**
 Every workload the plane was designed and tested against — a voice server, a game server — is
 tens of packets per second across a handful of flows. A conference SFU behind mediasoup's
 `WebRtcServer` is a different animal: one UDP port, one flow per participant, and an *egress* leg
-carrying `K × (K−1)` fan-out streams. At 10 participants that is roughly **17k packets/s and
-19 MiB/s outbound**; at 20, **71k pps and 79 MiB/s**. Everything the pump does per datagram — the
+carrying `K × (K−1)` fan-out streams. At 10 participants that is **16.8k packets/s and
+16.5 MiB/s outbound**; at 20, **71k pps and 69.6 MiB/s** (the harness prints both before it sends
+a packet, so these are checkable rather than asserted). Everything the pump does per datagram — the
 transit HMAC seal/open, the flow-table lookup, the four-level egress token-bucket chain — runs at
 that rate, and the plane's shipped ceilings sit *below* it.
 
@@ -221,13 +222,22 @@ platform-wide budget, while each participant sits just under the per-source cap 
 layout or a bitrate bump puts them over it too. Raising those limits is a prerequisite for this
 workload, not a tuning exercise.
 
-The CPU side is comfortable at that scale: ~104k pps against 738k pps/core (video) means the
-transit crypto costs well under a tenth of a core. Syscalls and the TAP crossing are what the
-end-to-end run is actually there to measure.
+The CPU side is comfortable at that scale, though state the margin honestly: ~104k pps against
+the ~660k pps the probe prints for video-sized datagrams is about **16% of one thread**, not "well
+under a tenth". That figure is the combined crypto + bucket-chain cost, it is box-specific (this
+box measures ~660k where another measured ~710k), and it is *not* per-core — the plane's egress
+accounting sits behind process-global mutexes, so it degrades under contention rather than
+scaling. Even so, CPU is not what will break first here: syscalls and the TAP crossing are what
+the end-to-end run exists to measure.
 
-The harness itself has been verified to 50 participants at 449 MiB/s (3.8 Gbps) on loopback with
-zero loss, so it will not be the bottleneck — but always confirm the baseline reaches your target
-rate before believing a plane run at the same settings.
+**On the harness's own headroom:** `--participants 50` at the defaults *offers* 449 MiB/s
+(3.8 Gbps), and that number is printed from arithmetic before a single packet flies — it is not
+evidence the generator achieved it. The only figure that would establish that is `delivered_pct`
+on a baseline run. So run `./run.sh baseline` at your intended settings first and check it
+reaches your target rate; a generator that silently under-offers produces a *contiguous* stream at
+a lower rate, which scores 0% loss and looks like success. The reporter now flags that case
+explicitly ("delivered only N% … but per-class loss is 0.00%"), but confirming the baseline is
+still the discipline.
 
 ## Design notes
 

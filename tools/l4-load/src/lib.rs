@@ -393,8 +393,16 @@ pub struct SeriesStats {
     pub first_seq: Option<u32>,
     pub highest_seq: u32,
     pub reordered: u64,
-    /// RFC 3550 interarrival jitter estimate, in nanoseconds.
+    /// RFC 3550 interarrival jitter estimate, in nanoseconds — the LIVE EWMA.
+    ///
+    /// Report [`Self::jitter_peak_nanos`] alongside it, never this alone: RFC 3550's 1/16 gain has
+    /// a ~10.7-packet half-life, which at the ~2,077 pps a 50-way participant receives is about
+    /// **5 ms of memory**. Read once at end of run it describes the last few milliseconds, not the
+    /// run — any excursion earlier in a 60s measurement has fully decayed before it is read.
     pub jitter_nanos: f64,
+    /// Highest value the EWMA reached during the run. This is the number that survives a long run;
+    /// the terminal sample does not.
+    pub jitter_peak_nanos: f64,
     last_transit: Option<i128>,
 }
 
@@ -417,6 +425,7 @@ impl SeriesStats {
         if let Some(prev) = self.last_transit {
             let d = (transit - prev).unsigned_abs() as f64;
             self.jitter_nanos += (d - self.jitter_nanos) / 16.0;
+            self.jitter_peak_nanos = self.jitter_peak_nanos.max(self.jitter_nanos);
         }
         self.last_transit = Some(transit);
     }
