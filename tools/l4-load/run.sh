@@ -7,11 +7,11 @@
 #   ./run.sh both <host> <port>       # baseline, then plane, then the comparison
 #
 # Env: PARTICIPANTS (10) DURATION (60) WARMUP (5) VIDEO_KBPS (1500) AUDIO_KBPS (40)
-#      VISIBLE (0 = every camera) IPS (auto)
+#      VISIBLE (0 = every camera) AUDIO_STREAMS (3) SPEAKER_KBPS (0) IPS (auto)
 #
-# At 20+ participants set VISIBLE (and drop VIDEO_KBPS to a simulcast layer). Every camera at
-# full rate is not a workload any SFU ships — 50 x 49 x 1500kbps is 3.8 Gbps, which measures the
-# NIC, not the plane.
+# At 20+ participants cap BOTH fan-outs and price the tiles as a simulcast low layer. Real SFUs
+# forward only the loudest ~3 audio streams and send thumbnails at ~180kbps; leaving either at
+# "everyone at full rate" measures a workload no conference product generates.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -22,6 +22,8 @@ WARMUP="${WARMUP:-5}"
 VIDEO_KBPS="${VIDEO_KBPS:-1500}"
 AUDIO_KBPS="${AUDIO_KBPS:-40}"
 VISIBLE="${VISIBLE:-0}"
+AUDIO_STREAMS="${AUDIO_STREAMS:-3}"
+SPEAKER_KBPS="${SPEAKER_KBPS:-0}"
 OUT="${OUT:-$HERE/results}"
 
 build() {
@@ -105,6 +107,8 @@ run_load() {
     --video-kbps "$VIDEO_KBPS" \
     --audio-kbps "$AUDIO_KBPS" \
     --visible-streams "$VISIBLE" \
+    --audio-streams "$AUDIO_STREAMS" \
+    --speaker-kbps "$SPEAKER_KBPS" \
     --json \
     "${extra[@]}" | tee "$OUT/$label.txt"
 }

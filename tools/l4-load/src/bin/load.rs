@@ -77,6 +77,8 @@ fn main() {
         "video-bytes",
         "audio-bytes",
         "visible-streams",
+        "audio-streams",
+        "speaker-kbps",
         "bind-ips",
         "limits-per-source-bps",
         "limits-per-24-bps",
@@ -96,7 +98,12 @@ fn main() {
              --audio-kbps K         per-stream audio rate (default 40)\n\
              --video-bytes B        video packet size (default 1200)\n\
              --audio-bytes B        audio packet size (default 160)\n\
-             --visible-streams N    cap video fan-out per participant (0 = all N-1).\n\
+             --visible-streams N    video tiles received per participant (0 = all N-1)\n\
+             --audio-streams N      audio streams forwarded per participant (0 = all N-1).\n\
+             \x20                      Default 3: real SFUs forward only the loudest few.\n\
+             --speaker-kbps K       rate for ONE active-speaker tile (0 = all tiles equal).\n\
+             \x20                      With simulcast the rest take the low layer, which is\n\
+             \x20                      what --video-kbps should then be (~180).\n\
              \x20                      Large meetings do NOT send every camera at full rate;\n\
              \x20                      see the README before running 20+ without this.\n\
              --bind-ips A,B,C       source IPs, round-robin per participant\n\
@@ -182,20 +189,37 @@ fn main() {
     let v_pps_stream = (video_kbps as u64 * 1000 / 8 / video_bytes.max(1) as u64).max(1) as u32;
     let a_pps_stream = (audio_kbps as u64 * 1000 / 8 / audio_bytes.max(1) as u64).max(1) as u32;
 
-    // Video fan-out is capped separately from audio because that is what SFUs actually do: a
-    // 50-way meeting decodes a handful of visible videos, not 49, while audio stays mixed or
-    // forwarded for everyone. Modelling video as N-1 full-rate streams at that size doesn't
-    // stress-test the plane — it invents a workload no conference product ships.
+    // BOTH fan-outs are capped, because a real SFU caps both.
+    //
+    // AUDIO is the one a naive model gets most wrong. mediasoup, Janus and Jitsi forward only the
+    // loudest few streams (Jitsi calls it "last-N") and pause the rest server-side — ~3 streams at
+    // any size, not N-1. At 50 participants the naive model is 16x too many, and because audio is
+    // high-rate/small-packet it then dominates the packet count.
+    //
+    // VIDEO: simulcast exists so a gallery of thumbnails takes the LOW layer (~150-200kbps), with
+    // one active-speaker tile at a higher one. Full quality to a postage stamp is precisely what
+    // the encoder ladder avoids.
     let visible: u32 = args.num("visible-streams", 0);
-    let audio_fanout = (n - 1) as u32;
-    let video_fanout = if visible == 0 {
-        audio_fanout
+    let audio_streams: u32 = args.num("audio-streams", 3);
+    let speaker_kbps: u32 = args.num("speaker-kbps", 0);
+    let peers = (n - 1) as u32;
+    let video_fanout = if visible == 0 { peers } else { visible.min(peers) };
+    let audio_fanout = if audio_streams == 0 {
+        peers
     } else {
-        visible.min(audio_fanout)
+        audio_streams.min(peers)
     };
 
+    // One tile at the speaker rate, the remainder at the (low-layer) tile rate.
+    let speaker_pps = if speaker_kbps == 0 || video_fanout == 0 {
+        0
+    } else {
+        (speaker_kbps as u64 * 1000 / 8 / video_bytes.max(1) as u64).max(1) as u32
+    };
+    let thumb_count = if speaker_pps > 0 { video_fanout - 1 } else { video_fanout };
+
     let down_profile = JoinProfile {
-        v_pps: v_pps_stream * video_fanout,
+        v_pps: v_pps_stream * thumb_count + speaker_pps,
         v_bytes: video_bytes,
         a_pps: a_pps_stream * audio_fanout,
         a_bytes: audio_bytes,
@@ -207,8 +231,13 @@ fn main() {
     println!("── L4 load harness ─────────────────────────────────────────");
     println!("target                {target}");
     println!(
-        "participants          {n} (fan-out: {video_fanout} video, {audio_fanout} audio per participant)"
+        "participants          {n} (fan-out per participant: {video_fanout} video, {audio_fanout} audio of {peers} peers)"
     );
+    if speaker_pps > 0 {
+        println!(
+            "video layers          1 speaker tile @ {speaker_kbps}kbps + {thumb_count} tiles @ {video_kbps}kbps"
+        );
+    }
     println!("per-stream            video {video_kbps}kbps/{video_bytes}B  audio {audio_kbps}kbps/{audio_bytes}B");
     println!(
         "offered downstream    {} per participant, {} aggregate",
@@ -219,7 +248,7 @@ fn main() {
         "offered uplink        {} per participant",
         fmt_bps((v_pps_stream * video_bytes as u32 + a_pps_stream * audio_bytes as u32) as f64)
     );
-    if audio_fanout == 0 {
+    if peers == 0 {
         println!("note                  1 participant ⇒ zero fan-out; downstream is idle by construction");
     }
 
@@ -227,10 +256,24 @@ fn main() {
     // broken" and neither is.
     if visible == 0 && n >= 20 {
         println!(
-            "!! every participant is receiving all {audio_fanout} videos at {video_kbps}kbps. No SFU\n\
-             \x20  ships that at this size — real ones send a few visible streams plus simulcast\n\
-             \x20  low layers. Pass --visible-streams (and/or a lower --video-kbps) or this run\n\
-             \x20  measures a workload unrambler will never generate."
+            "!! every participant is receiving all {peers} videos at {video_kbps}kbps. No SFU ships\n\
+             \x20  that at this size — real ones send a few tiles at the simulcast LOW layer\n\
+             \x20  (~150-200kbps). Pass --visible-streams with a low --video-kbps, or this run\n\
+             \x20  measures a workload no conference product generates."
+        );
+    }
+    if audio_streams == 0 && n >= 20 {
+        println!(
+            "!! forwarding all {peers} audio streams to every participant. Real SFUs forward only\n\
+             \x20  the loudest few (typically 3) and pause the rest server-side — at this size\n\
+             \x20  that difference alone is most of the packet count."
+        );
+    }
+    if video_kbps >= 500 && video_fanout > 4 {
+        println!(
+            "note: {video_kbps}kbps per tile across {video_fanout} tiles is full-quality video for\n\
+             \x20  thumbnails. With simulcast a gallery takes the low layer: --video-kbps 180 plus\n\
+             \x20  --speaker-kbps for the one tile that is actually large."
         );
     }
     let nic_mbps = offered_total * 8.0 / 1e6;
