@@ -93,12 +93,27 @@ fi
 # See docs/managed-rhypedb-design.md.
 if [ "${RHYPEDB:-0}" = "1" ]; then
     RHYPEDB_SRC="${RHYPEDB_SRC:-$REPO_ROOT/../rhypedb}"
-    [ -d "$RHYPEDB_SRC" ] || { echo "[install] rhypedb source not found at $RHYPEDB_SRC (set RHYPEDB_SRC)" >&2; exit 1; }
+    [ -d "$RHYPEDB_SRC" ] || {
+        echo "[install] rhypedb source not found at $RHYPEDB_SRC" >&2
+        echo "[install]   The managed-DB runtime layer is baked from a sibling rhypedb checkout." >&2
+        echo "[install]   Clone it next to jkbase, or set RHYPEDB_SRC=/path/to/rhypedb." >&2
+        echo "[install]   (tools/dev asks for it via RHYPEDB=1; baselayers requires the result.)" >&2
+        exit 1
+    }
     command -v cargo >/dev/null || { echo "[install] cargo required to build rhypedb-server" >&2; exit 1; }
     echo "[install] building rhypedb-server (musl-static, --no-default-features) from $RHYPEDB_SRC"
-    rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
-    ( cd "$RHYPEDB_SRC" && cargo build -p rhypedb-server --release --no-default-features \
-        --target x86_64-unknown-linux-musl )
+    (
+        cd "$RHYPEDB_SRC"
+        # Add the musl target for the toolchain that will ACTUALLY do this build. rhypedb pins its
+        # own toolchain (or none, falling back to the default) — NOT jkbase's rust-toolchain.toml,
+        # which stops applying the moment we leave the jkbase tree. Running `rustup target add`
+        # before the `cd` added it to jkbase's pinned toolchain, where it was already present, so
+        # the build then failed with "can't find crate for `std`" while `tools/dev preflight`
+        # cheerfully reported the musl target ✓ (it checks the pinned one too).
+        rustup target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
+        cargo build -p rhypedb-server --release --no-default-features \
+            --target x86_64-unknown-linux-musl
+    )
     install -m755 "$RHYPEDB_SRC/target/x86_64-unknown-linux-musl/release/rhypedb-server" \
         "$ASSET_DIR/rhypedb-server"
     echo "[install] rhypedb-server staged: $("$ASSET_DIR/rhypedb-server" --version 2>/dev/null | head -1 || echo '(staged)')"

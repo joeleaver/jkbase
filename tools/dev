@@ -199,12 +199,35 @@ cmd_preflight() {
     need 'test -f /sys/fs/cgroup/cgroup.controllers' "cgroup v2 present"
     need 'command -v cargo' "rust/cargo on PATH"
     need "rustup target list --installed 2>/dev/null | grep -qx $MUSL_TARGET" "rust musl target ($MUSL_TARGET)"
-    need 'command -v apko' "apko on PATH (run: tools/dev assets)"
+    # apko is installed BY the `assets` stage, which in `all` runs AFTER preflight — so a hard
+    # fail here makes `tools/dev all` unable to bootstrap a fresh box, the exact case this script
+    # exists for. (The old text said "run: tools/dev assets", a stage `all` could never reach.)
+    # Warn instead; `toolchains`, the first stage that actually needs apko, fails clearly on its own.
+    if command -v apko >/dev/null 2>&1; then
+        ok "apko on PATH"
+    else
+        warn "apko missing — installed by \`tools/dev assets\` (runs later in \`all\`)"
+    fi
     # Bake/runtime binaries the stages + wrapped scripts assume present:
     for b in flex bison bc unzip file python3 iptables debugfs mkfs.erofs mkfs.ext4; do
         CHK_MSG="$b present"; chk command -v "$b"
     done
     need 'pkg-config --exists libelf || test -e /usr/include/libelf.h' "libelf dev headers (kernel build)"
+    # wasm-tools has no apt package — it is cargo-installed, so `deps` handles it rather than
+    # APT_PKGS. `toolchains` hard-requires it for the function image's WIT generation; before this
+    # check that surfaced as a bake failure two stages later with no hint of the cause.
+    if command -v wasm-tools >/dev/null 2>&1; then
+        ok "wasm-tools present (function image WIT gen)"
+    else
+        warn "wasm-tools missing — installed by \`tools/dev deps\`; \`toolchains\` needs it"
+    fi
+    # The managed-DB layer is baked from a SIBLING rhypedb checkout. Absent, `assets` and
+    # `baselayers` both fail — surface it here rather than mid-bake.
+    if [ -d "${RHYPEDB_SRC:-$REPO_ROOT/../rhypedb}" ]; then
+        ok "rhypedb checkout present (managed-DB layer)"
+    else
+        warn "rhypedb checkout not found at ${RHYPEDB_SRC:-$REPO_ROOT/../rhypedb} — \`assets\` + \`baselayers\` need it (set RHYPEDB_SRC)"
+    fi
     # busybox-static for default.ext4:
     need 'command -v busybox' "busybox present (default.ext4 bake)"
     # ~/.local/bin on PATH (apko lives there):
@@ -239,6 +262,12 @@ cmd_deps() {
     run_or_capture sudo apt-get install -q "${yflag[@]}" "${APT_PKGS[@]}" || die "apt install failed"
     command -v rustup >/dev/null || die "rustup not found — install it (https://rustup.rs) then re-run \`tools/dev deps\`"
     rustup target add "$MUSL_TARGET" wasm32-wasip1 >/dev/null 2>&1 || true
+    # wasm-tools: no apt package (hence not in APT_PKGS), but `toolchains` requires it on the
+    # HOST to generate the function image's WIT bindings. cargo-installed, like the targets above.
+    if ! command -v wasm-tools >/dev/null 2>&1; then
+        say "installing wasm-tools (cargo; required by the function toolchain bake)"
+        run_or_capture cargo install wasm-tools --locked || warn "cargo install wasm-tools failed — \`toolchains\` will fail on the function image"
+    fi
     sudo usermod -aG kvm "$USER" 2>/dev/null || true
     ok "deps installed (relogin if you were just added to the kvm group)"
     RAN[deps]=OK
@@ -268,7 +297,7 @@ cmd_assets() {
         # runtime layer) from the sibling rhypedb checkout (RHYPEDB_SRC default
         # ../rhypedb). The managed-DB offering needs it baked into baselayers.
         run_or_capture env APKO_VER="$APKO_VER" BUN_VER="$BUN_VER" BUN_SHA256="$BUN_SHA256" \
-            TRUNK=1 TRUNK_VER="$TRUNK_VER" TRUNK_SHA256="$TRUNK_SHA256" RHYPEDB=1 \
+            TRUNK=1 TRUNK_VER="$TRUNK_VER" TRUNK_SHA256="$TRUNK_SHA256" RHYPEDB="${RHYPEDB:-1}" \
             "$REPO_ROOT/tools/install-image-tools.sh" || die "install-image-tools failed"
         # A prior root run may have left bun/trunk root-owned; normalize so non-root bakes work.
         for a in bun trunk rhypedb-server; do
