@@ -230,6 +230,28 @@ cmd_preflight() {
     fi
     # busybox-static for default.ext4:
     need 'command -v busybox' "busybox present (default.ext4 bake)"
+    # Jailer socket budget (SUN_LEN). Firecracker's API socket lives at
+    #   <chroot_base>/<exec_basename>/<vm_id>/root/run/firecracker.socket
+    # and a Unix socket path is capped at 108 bytes. chroot_base is "$JKB_DATA/bj", exec_basename
+    # is the pinned Firecracker filename, and vm_id is "b<build_id>-<kind>-<name[..16]>". A deep
+    # checkout blows the budget for EVERY build VM — the orchestrator then fails each target with
+    # "shorten the data dir or the target name", which reads like a per-target problem and is
+    # really one path-length problem. Worked example: a 38-char repo root leaves 109 bytes before
+    # the vm_id, so nothing can build. Remedy is JKB_DATA pointing somewhere short.
+    local jkb_data="${JKB_DATA:-$FC_DIR}"
+    local chroot_len=$(( ${#jkb_data} + 3 ))                       # + "/bj"
+    local exec_len=${#FC_VERSION}; exec_len=$(( exec_len + ${#FC_ARCH} + 14 ))  # firecracker-v<ver>-<arch>
+    local vm_id_worst=24                                           # b<build_id>-<kind>-<16-char name>
+    local sock_len=$(( chroot_len + 1 + exec_len + 1 + vm_id_worst + 28 ))
+    if [ "$sock_len" -lt 108 ]; then
+        ok "jailer socket budget: ${sock_len}/108 bytes worst case"
+    else
+        err "✗ jailer socket path needs ${sock_len} bytes (limit 108) — every build VM will fail."
+        err "  chroot base is '$jkb_data/bj'. Point JKB_DATA at a shorter path, e.g.:"
+        err "    mv '$FC_DIR' ~/jk && ln -s ~/jk '$FC_DIR'"
+        err "    JKB_DATA=\$HOME/jk tools/dev test"
+        PREFLIGHT_FAILS=$((PREFLIGHT_FAILS+1))
+    fi
     # ~/.local/bin on PATH (apko lives there):
     case ":$PATH:" in *":$HOME/.local/bin:"*) ok "~/.local/bin on PATH" ;; *) warn "~/.local/bin not on PATH — add: export PATH=\$HOME/.local/bin:\$PATH" ;; esac
     # Disk headroom (kernel build tree ~2.2 GB):
@@ -560,7 +582,7 @@ for l in sys.stdin:
     say "Running on-box acceptance tests under sudo (needs \`tools/dev net\` for networked variants)…"
     sudo_warmup
     sudo env \
-        JKB_DATA="$FC_DIR" \
+        JKB_DATA="${JKB_DATA:-$FC_DIR}" \
         JKB_FC_RELEASE="$RELEASE_DIR" \
         JKB_BASELAYERS="$BASELAYERS_DIR" \
         JKB_AGENT="$AGENT_BIN" \
