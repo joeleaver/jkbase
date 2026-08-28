@@ -240,6 +240,21 @@ impl<K: Eq + Hash + Clone, V> BoundedTtlMap<K, V> {
         self.map.get(key).map(|(v, _)| v)
     }
 
+    /// Read an entry ONLY if it is still within its TTL, without touching it. Unlike
+    /// [`Self::get`] this never hands back a stale entry — for callers where acting on an expired
+    /// one is unsafe rather than merely imprecise.
+    pub fn get_fresh(&self, key: &K, now: Instant) -> Option<&V> {
+        self.map
+            .get(key)
+            .filter(|(_, t)| now.saturating_duration_since(*t) < self.ttl)
+            .map(|(v, _)| v)
+    }
+
+    /// Drop an entry that has been consumed, so it cannot be read a second time.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        self.map.remove(key).map(|(v, _)| v)
+    }
+
     /// Whether `key` currently has a (possibly stale) entry.
     pub fn contains(&self, key: &K) -> bool {
         self.map.contains_key(key)
