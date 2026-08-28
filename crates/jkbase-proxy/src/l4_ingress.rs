@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 // ---- host constants (design §6; NOT tenant-tunable) -------------------------------------------
 
@@ -506,6 +507,57 @@ impl L4Ingress {
             ..
         } = &mut *st;
 
+        // DEFENSIVE, and deliberately unreachable today. `reach_loop` is a single sequential task
+        // (`recv_from` -> `reach_decide` -> `.await resolve_vm_ip` -> `reach_admit`) and its only
+        // caller, so it cannot hold two datagrams inside the decide->admit window however long the
+        // resolve takes -- measured at 860ns uncontended, 92us under a routing writer. The `.await`
+        // does release the port lock; there is simply no second thread of control to take it.
+        // Parallelising this loop is a live temptation (every warm flow is head-of-line blocked
+        // behind that inline resolve), and the day someone does, an unconditional mint here
+        // corrupts flow identity: the agent opens a loopback socket PER `flow_id`, so one peer
+        // acquires two source ports -- two remote tuples -- toward the guest app while `flows[src]`
+        // keeps only the last. Both agent reply pumps then seal against the single host
+        // `in_nonce_hw`, and a fresh id carries the shared `epoch_base` so the epoch check cannot
+        // separate them: the laggard's replies all drop as `NonceReplay`. The overwritten flow's id
+        // leaks too -- `sweep` reclaims ids only for flows it evicts from `flows`.
+        //
+        // NOT the cause of #87, which stays open. That was this change's original claim and it is
+        // disproven: the window is sub-microsecond against ~50ms ICE pacing, and in that ordering
+        // the orphan holds only the in-window datagrams while USE-CANDIDATE lands on the winner, so
+        // the app pins the LIVE tuple.
+        if let Some(flow) = flows.get_mut(&src) {
+            // Not load-bearing — `reservation` is never moved on this path, so it would drop at
+            // end of scope anyway. Explicit so the release is visible next to the fold it pairs
+            // with, and so a later edit that DOES move it fails loudly rather than silently leaking
+            // a `flow_per_project_max` slot.
+            #[allow(clippy::drop_non_drop)]
+            drop(reservation);
+            flow.last_seen = now;
+            flow.bytes_in = flow.bytes_in.saturating_add(n as u64);
+            flow.pkts = flow.pkts.saturating_add(1);
+            flow.egress.on_ingress(n, amp_k);
+            self.plane.note_ingress(base, n, amp_k, now);
+            // Read the port's `vm_dst` cache, exactly as the HIT path does — never this datagram's
+            // own `live`. The winner may still be mid-boot, and forwarding past it would land ahead
+            // of its buffered first packets.
+            return match *vm_dst {
+                Some(dst) => {
+                    self.maybe_promote(flow, base, tenant, now);
+                    flow.out_nonce += 1;
+                    ReachOutcome::Forward {
+                        flow_id: flow.flow_id,
+                        epoch: flow.epoch,
+                        nonce: flow.out_nonce,
+                        dst,
+                    }
+                }
+                None => {
+                    self.buffer_push(flow, payload);
+                    ReachOutcome::Buffered
+                }
+            };
+        }
+
         let (flow_id, epoch) = alloc_flow_id(next_flow_id, epoch_for, *epoch_base);
         let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
         flow.bytes_in = n as u64;
@@ -628,9 +680,27 @@ impl L4Ingress {
         } = &mut *st;
         let port_egress = *port_egress;
 
-        // Demux by flow_id → client src. An unknown id is a late reply for an evicted flow — drop.
-        let src = *by_flow_id.get(&hdr.flow_id)?;
-        let flow = flows.get_mut(&src)?;
+        // Demux by flow_id → client src. An unknown id is a late reply for a flow the host has
+        // evicted — drop, but COUNT it: the frame is authenticated, so a sustained rate here means
+        // an agent is still pumping a tuple whose return leg is dead, a silent blackhole for any
+        // app that pinned it (#87). Expect a low background rate: any eviction with a reply in
+        // flight produces one, and the agent holds its map entry for `host_idle + 60s`. It is the
+        // RATE that is diagnostic, not a nonzero value.
+        let Some(&src) = by_flow_id.get(&hdr.flow_id) else {
+            self.plane.count(DropReason::UnknownFlow);
+            return None;
+        };
+        // `by_flow_id` hit + `flows` miss = the two maps have DESYNCED. That is a host invariant
+        // break, not an agent-side symptom: `sweep` removes from both under one lock, so this
+        // should be unreachable. Keep it out of `UnknownFlow` — an operator reading that counter as
+        // "the agent is pumping a dead tuple" must not have a host bug folded into it.
+        let Some(flow) = flows.get_mut(&src) else {
+            warn!(
+                port = %self.spec.name, flow_id = hdr.flow_id,
+                "l4 return: by_flow_id/flows desync — host invariant break, dropping"
+            );
+            return None;
+        };
         if flow.epoch != hdr.epoch {
             self.plane.count(DropReason::StaleEpoch);
             return None;
@@ -944,6 +1014,206 @@ fn bind_edge_socket(port: u16) -> io::Result<UdpSocket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::l4_plane::{L4PlaneLimits, L4PortEgressLimits};
+    use crate::{WakeCallback, WakeError};
+
+    fn noop_wake() -> WakeCallback {
+        Arc::new(|_p: String| {
+            Box::pin(async { Err(WakeError::Unavailable("test".into())) })
+                as Pin<Box<dyn Future<Output = _> + Send>>
+        })
+    }
+
+    /// A port whose backend always resolves WARM.
+    async fn warm_port() -> Arc<L4Ingress> {
+        port_with(Arc::new(|_p: String| {
+            Box::pin(async { Some("10.0.0.2".to_string()) }) as _
+        }))
+        .await
+    }
+
+    /// A port whose backend never resolves — every admit takes the cold/wake path.
+    async fn cold_port() -> Arc<L4Ingress> {
+        port_with(Arc::new(|_p: String| Box::pin(async { None }) as _)).await
+    }
+
+    async fn port_with(resolve: ResolveVmIp) -> Arc<L4Ingress> {
+        let spec = L4PortSpec {
+            project_id: "p".into(),
+            base_project: "p".into(),
+            tenant_id: Some("t".into()),
+            name: "media".into(),
+            proto: "udp".into(),
+            external_port: 0, // ephemeral: the test never sends on the edge
+            agent_udp_port: 4000,
+            guest_port: 21093,
+            idle_timeout: Duration::from_secs(120),
+            amp_k: 0,
+            transit_secret: "secret".into(),
+            egress: L4PortEgressLimits {
+                per_source_bps: 1024 * 1024,
+                per_source_burst: 64 * 1024,
+                per_project_bps: 16 * 1024 * 1024,
+            },
+        };
+        let plane = L4Plane::new(
+            L4PlaneLimits {
+                host_ram_reserve_mib: 0,
+                ..Default::default()
+            },
+            noop_wake(),
+        );
+        L4Ingress::bind(spec, plane, resolve, CancellationToken::new())
+            .await
+            .expect("bind")
+    }
+
+    /// `reach_admit` must fold a second MISS for one `src` into the existing flow rather than mint
+    /// a second `flow_id`. `reach_loop` is single-task and CANNOT produce this interleaving, so the
+    /// test calls `reach_decide`/`reach_admit` directly to manufacture it: it guards the invariant
+    /// for a future parallelised reach loop. It is not a reproduction of #87.
+    #[tokio::test]
+    async fn concurrent_miss_for_one_src_folds_into_a_single_flow() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+        let now = Instant::now();
+        let payload = b"stun-binding-request";
+
+        // Two MISSes race: neither has been admitted yet, so both reserve a slot.
+        let first = port.reach_decide(src, payload, now);
+        let second = port.reach_decide(src, payload, now);
+        let (ReachOutcome::CheckLiveness { reservation: r1, .. }, 
+             ReachOutcome::CheckLiveness { reservation: r2, .. }) = (first, second)
+        else {
+            panic!("both datagrams should MISS while nothing is inserted");
+        };
+
+        // Both resolves come back WARM and admit, in order.
+        let a = port.reach_admit(src, payload, now, r1, "p".into(), Some("10.0.0.2".into()));
+        let b = port.reach_admit(src, payload, now, r2, "p".into(), Some("10.0.0.2".into()));
+
+        let (ReachOutcome::Forward { flow_id: fa, epoch: ea, nonce: na, .. }, 
+             ReachOutcome::Forward { flow_id: fb, epoch: eb, nonce: nb, .. }) = (a, b)
+        else {
+            panic!("a warm admit forwards");
+        };
+
+        // One flow, one agent loopback socket, one tuple toward the guest app.
+        assert_eq!(fa, fb, "the racing datagram must not mint a second flow_id");
+        assert_eq!(ea, eb);
+        // ...and the host→agent nonce stays strictly monotonic on it.
+        assert_eq!((na, nb), (1, 2));
+
+        // The duplicate slot must be RELEASED, not leaked — no public gauge shows this, since
+        // `conn_count` counts only ESTABLISHED flows.
+        assert_eq!(
+            port.plane.flow_count_for_test("p"),
+            1,
+            "the folded datagram's reservation must be released"
+        );
+
+        let st = port.state.lock().unwrap();
+        assert_eq!(st.flows.len(), 1, "one client src ⇒ one flow");
+        assert_eq!(
+            st.by_flow_id.len(),
+            1,
+            "an orphaned by_flow_id entry is the leak that strands the agent's socket"
+        );
+        assert_eq!(st.by_flow_id.get(&fa), Some(&src));
+        // The folded datagram was accounted, not dropped.
+        assert_eq!(st.flows[&src].pkts, 2);
+        assert_eq!(st.flows[&src].bytes_in, 2 * payload.len() as u64);
+    }
+
+    /// First coverage of the return leg. An authenticated reply whose `flow_id` the host no longer
+    /// holds must drop AND count — before this it bailed on a bare `?`, incrementing nothing, which
+    /// is why the counters could neither confirm nor kill #87's hypothesis.
+    #[tokio::test]
+    async fn return_leg_counts_a_reply_for_an_unknown_flow() {
+        let port = warm_port().await;
+        let now = Instant::now();
+
+        // A live flow, so the miss below is about the id and not an empty table.
+        let src: SocketAddr = "203.0.113.10:40002".parse().unwrap();
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", now)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            port.reach_admit(src, b"x", now, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+        let _ = port.plane.drain_counters(); // zero the window
+
+        // A reply for an id the host never issued: the shape a stranded agent socket produces.
+        let hdr = L4TransitHeader { flow_id: flow_id.wrapping_add(9_999), epoch, nonce: 1 };
+        assert!(port.return_decide(hdr, b"reply", now).is_none());
+        assert_eq!(port.plane.drain_counters().unknown_flow, 1);
+
+        // The live flow's own reply still passes, and comes back addressed to its client.
+        let hdr = L4TransitHeader { flow_id, epoch, nonce: 1 };
+        assert_eq!(port.return_decide(hdr, b"reply", now), Some(src));
+        let c = port.plane.drain_counters();
+        assert_eq!((c.unknown_flow, c.stale_epoch, c.nonce_replay), (0, 0, 0));
+    }
+
+    /// The return leg's two anti-replay gates, which had no coverage either.
+    #[tokio::test]
+    async fn return_leg_rejects_a_stale_epoch_and_a_replayed_nonce() {
+        let port = warm_port().await;
+        let now = Instant::now();
+        let src: SocketAddr = "203.0.113.11:40003".parse().unwrap();
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", now)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            port.reach_admit(src, b"x", now, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        // Right id, wrong epoch — a reply for a PRIOR owner of this id.
+        let stale = L4TransitHeader { flow_id, epoch: epoch.wrapping_sub(1), nonce: 1 };
+        assert!(port.return_decide(stale, b"reply", now).is_none());
+        assert_eq!(port.plane.drain_counters().stale_epoch, 1);
+
+        // Nonce must strictly exceed the high-water: 5 admits, then 5 and 4 are replays.
+        let hdr = L4TransitHeader { flow_id, epoch, nonce: 5 };
+        assert!(port.return_decide(hdr, b"reply", now).is_some());
+        for n in [5u64, 4] {
+            let h = L4TransitHeader { flow_id, epoch, nonce: n };
+            assert!(port.return_decide(h, b"reply", now).is_none());
+        }
+        assert_eq!(port.plane.drain_counters().nonce_replay, 2);
+    }
+
+    /// The fold reads the PORT's `vm_dst`, never the racing datagram's own `live`. A winner still
+    /// mid-boot has `vm_dst = None` and buffered first packets; forwarding the racer on its own
+    /// freshly-resolved ip would land it AHEAD of them, reordering the flow's opening bytes.
+    #[tokio::test]
+    async fn fold_buffers_behind_a_winner_that_is_still_booting() {
+        let port = cold_port().await;
+        let src: SocketAddr = "203.0.113.8:40001".parse().unwrap();
+        let now = Instant::now();
+        let payload = b"first";
+
+        let (
+            ReachOutcome::CheckLiveness { reservation: r1, .. },
+            ReachOutcome::CheckLiveness { reservation: r2, .. },
+        ) = (
+            port.reach_decide(src, payload, now),
+            port.reach_decide(src, payload, now),
+        ) else {
+            panic!("both MISS")
+        };
+
+        // Winner resolves COLD: takes the wake gate, buffers, leaves `vm_dst = None`.
+        let a = port.reach_admit(src, payload, now, r1, "p".into(), None);
+        assert!(matches!(a, ReachOutcome::BootSpawn { .. }), "winner drives the boot");
+
+        // The racer's OWN resolve came back warm — it must still buffer behind the winner.
+        let b = port.reach_admit(src, payload, now, r2, "p".into(), Some("10.0.0.2".into()));
+        assert!(
+            matches!(b, ReachOutcome::Buffered),
+            "the fold must honour the port's vm_dst, not the racer's own live resolve"
+        );
+        assert_eq!(port.state.lock().unwrap().flows.len(), 1);
+    }
 
     #[test]
     fn fresh_flow_id_takes_epoch_base_and_bumps_on_reuse() {

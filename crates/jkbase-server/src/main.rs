@@ -6605,6 +6605,7 @@ async fn metering_loop(
                 | c.header_auth_fail
                 | c.nonce_replay
                 | c.stale_epoch
+                | c.unknown_flow
                 | c.egress_amp_clamp
                 | c.egress_per_source
                 | c.egress_per_victim
@@ -6622,6 +6623,9 @@ async fn metering_loop(
                     rate_cap = c.rate_cap, budget_full = c.budget_full, warm_full_global = c.warm_full_global,
                     flow_full_project = c.flow_full_project, flow_full_global = c.flow_full_global,
                     header_auth_fail = c.header_auth_fail, nonce_replay = c.nonce_replay, stale_epoch = c.stale_epoch,
+                    // unknown_flow = an authenticated return frame for a flow_id the host no
+                    // longer holds: the agent is pumping a tuple whose return leg is dead.
+                    unknown_flow = c.unknown_flow,
                     egress_amp_clamp = c.egress_amp_clamp,
                     // egress_per_source = the TENANT's own per-(port,destination) cap refused it.
                     // egress_per_victim = the PLATFORM third-party backstop refused it. These are
