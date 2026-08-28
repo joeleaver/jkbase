@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 // ---- host constants (design §6; NOT tenant-tunable) -------------------------------------------
 
@@ -525,7 +526,11 @@ impl L4Ingress {
         // the orphan holds only the in-window datagrams while USE-CANDIDATE lands on the winner, so
         // the app pins the LIVE tuple.
         if let Some(flow) = flows.get_mut(&src) {
-            // Releases the duplicate slot this datagram reserved in `reach_decide`.
+            // Not load-bearing — `reservation` is never moved on this path, so it would drop at
+            // end of scope anyway. Explicit so the release is visible next to the fold it pairs
+            // with, and so a later edit that DOES move it fails loudly rather than silently leaking
+            // a `flow_per_project_max` slot.
+            #[allow(clippy::drop_non_drop)]
             drop(reservation);
             flow.last_seen = now;
             flow.bytes_in = flow.bytes_in.saturating_add(n as u64);
@@ -677,14 +682,23 @@ impl L4Ingress {
 
         // Demux by flow_id → client src. An unknown id is a late reply for a flow the host has
         // evicted — drop, but COUNT it: the frame is authenticated, so a sustained rate here means
-        // an agent is still pumping a tuple whose return leg is dead, which is a silent blackhole
-        // for any app that pinned it (#87).
+        // an agent is still pumping a tuple whose return leg is dead, a silent blackhole for any
+        // app that pinned it (#87). Expect a low background rate: any eviction with a reply in
+        // flight produces one, and the agent holds its map entry for `host_idle + 60s`. It is the
+        // RATE that is diagnostic, not a nonzero value.
         let Some(&src) = by_flow_id.get(&hdr.flow_id) else {
             self.plane.count(DropReason::UnknownFlow);
             return None;
         };
+        // `by_flow_id` hit + `flows` miss = the two maps have DESYNCED. That is a host invariant
+        // break, not an agent-side symptom: `sweep` removes from both under one lock, so this
+        // should be unreachable. Keep it out of `UnknownFlow` — an operator reading that counter as
+        // "the agent is pumping a dead tuple" must not have a host bug folded into it.
         let Some(flow) = flows.get_mut(&src) else {
-            self.plane.count(DropReason::UnknownFlow);
+            warn!(
+                port = %self.spec.name, flow_id = hdr.flow_id,
+                "l4 return: by_flow_id/flows desync — host invariant break, dropping"
+            );
             return None;
         };
         if flow.epoch != hdr.epoch {
@@ -1110,6 +1124,62 @@ mod tests {
         // The folded datagram was accounted, not dropped.
         assert_eq!(st.flows[&src].pkts, 2);
         assert_eq!(st.flows[&src].bytes_in, 2 * payload.len() as u64);
+    }
+
+    /// First coverage of the return leg. An authenticated reply whose `flow_id` the host no longer
+    /// holds must drop AND count — before this it bailed on a bare `?`, incrementing nothing, which
+    /// is why the counters could neither confirm nor kill #87's hypothesis.
+    #[tokio::test]
+    async fn return_leg_counts_a_reply_for_an_unknown_flow() {
+        let port = warm_port().await;
+        let now = Instant::now();
+
+        // A live flow, so the miss below is about the id and not an empty table.
+        let src: SocketAddr = "203.0.113.10:40002".parse().unwrap();
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", now)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            port.reach_admit(src, b"x", now, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+        let _ = port.plane.drain_counters(); // zero the window
+
+        // A reply for an id the host never issued: the shape a stranded agent socket produces.
+        let hdr = L4TransitHeader { flow_id: flow_id.wrapping_add(9_999), epoch, nonce: 1 };
+        assert!(port.return_decide(hdr, b"reply", now).is_none());
+        assert_eq!(port.plane.drain_counters().unknown_flow, 1);
+
+        // The live flow's own reply still passes, and comes back addressed to its client.
+        let hdr = L4TransitHeader { flow_id, epoch, nonce: 1 };
+        assert_eq!(port.return_decide(hdr, b"reply", now), Some(src));
+        let c = port.plane.drain_counters();
+        assert_eq!((c.unknown_flow, c.stale_epoch, c.nonce_replay), (0, 0, 0));
+    }
+
+    /// The return leg's two anti-replay gates, which had no coverage either.
+    #[tokio::test]
+    async fn return_leg_rejects_a_stale_epoch_and_a_replayed_nonce() {
+        let port = warm_port().await;
+        let now = Instant::now();
+        let src: SocketAddr = "203.0.113.11:40003".parse().unwrap();
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", now)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            port.reach_admit(src, b"x", now, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        // Right id, wrong epoch — a reply for a PRIOR owner of this id.
+        let stale = L4TransitHeader { flow_id, epoch: epoch.wrapping_sub(1), nonce: 1 };
+        assert!(port.return_decide(stale, b"reply", now).is_none());
+        assert_eq!(port.plane.drain_counters().stale_epoch, 1);
+
+        // Nonce must strictly exceed the high-water: 5 admits, then 5 and 4 are replays.
+        let hdr = L4TransitHeader { flow_id, epoch, nonce: 5 };
+        assert!(port.return_decide(hdr, b"reply", now).is_some());
+        for n in [5u64, 4] {
+            let h = L4TransitHeader { flow_id, epoch, nonce: n };
+            assert!(port.return_decide(h, b"reply", now).is_none());
+        }
+        assert_eq!(port.plane.drain_counters().nonce_replay, 2);
     }
 
     /// The fold reads the PORT's `vm_dst`, never the racing datagram's own `live`. A winner still
