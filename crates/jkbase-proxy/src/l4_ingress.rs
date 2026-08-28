@@ -55,6 +55,38 @@ const PORT_SOURCE_MAP_MAX: usize = 16_384;
 /// Idle TTL for a per-port destination bucket. Matches the plane's per-source TTL so a client that
 /// pauses and resumes is treated the same by both levels.
 const PORT_SOURCE_TTL: Duration = Duration::from_secs(120);
+/// How long an evicted flow's identity is remembered so the SAME client 5-tuple gets it BACK on
+/// its next datagram instead of a fresh one. The app-visible tuple is derived from `flow_id` (the
+/// agent opens one loopback socket per id), so re-minting hands a live app a brand-new remote
+/// tuple — and an app that pinned the old one blackholes. mediasoup does exactly this: once ICE is
+/// COMPLETED, a binding request from a new tuple WITHOUT use-candidate is stored for receive but
+/// never selected (`IceServer::HandleTuple`), while STUN replies still go to the arrival tuple and
+/// everything else goes to `GetSelectedTuple()`. So ICE keeps looking healthy while DTLS is posted
+/// forever to a socket the host no longer maps (#87).
+///
+/// MUST stay strictly BELOW the agent's `FLOW_IDLE_HEADROOM` (60s), so a memo hit implies the agent
+/// still holds the flow and will take its existing-flow path. If the memo could outlive the agent's
+/// entry we would restore an identity the agent has forgotten: it would open a FRESH loopback
+/// socket whose pump restarts `out_nonce` at 1 into our restored high-water, and the return leg
+/// would blank entirely — strictly worse than the churn this fixes.
+const IDENTITY_MEMO_TTL: Duration = Duration::from_secs(45);
+/// WHAT THIS DOES NOT COVER, so "resume" is never read as "tuple churn is solved". It keeps the
+/// tuple across a HOST-side eviction while the agent still holds the flow. It cannot help when the
+/// AGENT loses its own entry, because the tuple is that agent's loopback socket and only the agent
+/// could preserve it:
+/// - agent LRU eviction at `AGENT_L4_MAX_FLOWS` (256) on a busy port — `create_flow` binds a fresh
+///   `127.0.0.1:0` regardless, so the app sees a new tuple exactly as it did before;
+/// - any wake or redeploy that REPLACES the VM — every socket is new;
+/// - a host process restart — `epoch_base` is reseeded, so every id changes and the memo, being
+///   in-process, is gone anyway.
+///
+/// Fixing those means keying the agent's loopback socket on something that survives the agent's
+/// own eviction, which is a guest-side change.
+///
+/// Cardinality bound on remembered identities. Overflow degrades to today's behaviour (mint a
+/// fresh id), never to an unbounded map — same posture as every other aux map (P0-L4-5/-9).
+const IDENTITY_MEMO_MAX: usize = 16_384;
+
 /// Idle-sweep tick — well under [`PROVISIONAL_IDLE`] so provisional flows don't overstay (L3).
 const SWEEP_TICK: Duration = Duration::from_secs(1);
 /// Poll cadence while a coalesced flow waits for a sibling's boot to resolve `vm_ip`.
@@ -117,6 +149,44 @@ enum FlowKind {
 /// Pure per-flow bookkeeping — NO socket, NO task (P0-L4-5). The guards are declared with
 /// `established_guard` BEFORE `reservation` so on eviction the `conn_count` gauge drops before the
 /// flow-table slot (`established ≤ total` holds throughout teardown).
+/// The part of a flow that must SURVIVE eviction for the app-visible tuple to stay put.
+///
+/// The two nonce counters are NOT symmetric, which is why only one is here.
+///
+/// `out_nonce` (host→agent) is safe to resume either way, and is REQUIRED: if the agent still
+/// holds the flow, continuing above its high-water is the only thing that forwards at all; if it
+/// has forgotten, `create_flow` simply seeds its high-water from whatever we send.
+///
+/// `in_nonce_hw` (agent→host) is deliberately ABSENT. It would only be safe while the agent still
+/// holds the flow, and nothing can establish that: `resolve_vm_ip` reports whether a VM is in the
+/// routing table, not whether the agent PROCESS survived, and the agent also drops entries by LRU
+/// at `AGENT_L4_MAX_FLOWS` on a perfectly warm VM. Resuming a high high-water into an agent that
+/// has moved on hands a fresh pump — which always restarts `out_nonce` at 1 — a wall it must climb
+/// datagram by datagram, blanking the return leg for thousands of packets. So a resumed flow's
+/// return leg starts at 0, exactly like a fresh one, which is the state the agent's pump is built
+/// for.
+///
+/// The priced cost: a resumed flow's high-water starts at 0, so a captured pre-eviction reply for
+/// this `(flow_id, epoch)` would be admitted, and a captured SEQUENCE could then be walked up
+/// monotonically until the first genuine reply jumps the bar past it — and on a QUIET flow, which
+/// is exactly the shape that idles out and gets resumed, no genuine reply arrives to close it, so
+/// the window lasts the life of the resumed incarnation. That is not merely duplicate
+/// media — every replayed frame runs the egress chain and is charged to the victim's metered
+/// egress and reflection window. It is contained by REACHABILITY, not by the payload being
+/// harmless: the frame must clear `l4_transit::open(secret, AgentToHost, …)`, so a forged one dies
+/// at `HeaderAuthFail`, and delivering a CAPTURED one to the host's guest-facing socket needs a
+/// source address a runtime VM cannot emit — the per-TAP ebtables guard
+/// (`-i <tap> -p IPv4 ! --ip-src <ip> -j DROP`) is hooked into INPUT as well as FORWARD, and
+/// `JKRUNFW` admits guest→host only for DNS, the public proxy and the DB gateway. So the replay
+/// needs host-level access, which is already total compromise. Weighed against the alternative,
+/// which blanks the return leg for thousands of datagrams whenever the agent has moved on.
+#[derive(Clone, Copy)]
+struct FlowIdentity {
+    flow_id: u32,
+    epoch: u32,
+    out_nonce: u64,
+}
+
 struct Flow {
     flow_id: u32,
     epoch: u32,
@@ -180,6 +250,9 @@ struct PortState {
     epoch_for: HashMap<u32, u32>,
     /// `(flow_id, epoch, drain_until)` reuse quarantine.
     quarantine: Vec<(u32, u32, Instant)>,
+    /// Recently-evicted clients' [`FlowIdentity`], so a returning 5-tuple resumes rather than
+    /// churns. Bounded + TTL'd; see [`IDENTITY_MEMO_TTL`].
+    identity: BoundedTtlMap<SocketAddr, FlowIdentity>,
     /// The resolved `vm_ip:agent_udp_port`; `None` until a boot proves readiness.
     vm_dst: Option<SocketAddr>,
     /// A boot task is running for this port (single-flight of the boot/flush per port).
@@ -292,6 +365,7 @@ impl L4Ingress {
             epoch_base,
             epoch_for: HashMap::new(),
             quarantine: Vec::new(),
+            identity: BoundedTtlMap::new(IDENTITY_MEMO_MAX, IDENTITY_MEMO_TTL),
             vm_dst: None,
             booting: false,
             c0_rate: TokenBucket::new(C0_PER_PORT_RATE, C0_PER_PORT_BURST, now),
@@ -504,6 +578,7 @@ impl L4Ingress {
             epoch_for,
             vm_dst,
             booting,
+            identity,
             ..
         } = &mut *st;
 
@@ -558,17 +633,55 @@ impl L4Ingress {
             };
         }
 
-        let (flow_id, epoch) = alloc_flow_id(next_flow_id, epoch_for, *epoch_base);
-        let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
-        flow.bytes_in = n as u64;
-        flow.pkts = 1;
-
+        // Resume this client's PREVIOUS identity if we still remember it. The `(flow_id, epoch)`
+        // pair is what the agent keys its loopback socket on, so restoring BOTH makes the agent
+        // take its existing-flow path (`Decision::Forward`) — same socket, same source port, the
+        // app's pinned tuple untouched. A bumped epoch would not do: that is `Decision::Supersede`,
+        // which drops the old socket and opens a new one, i.e. exactly the churn we are removing.
+        //
+        // Restoring an id that may still sit in `quarantine` is deliberate and safe: quarantine
+        // guards against a LATE REPLY aliasing an id reused by a DIFFERENT client, and this is the
+        // same client resuming — the restored `in_nonce_hw` still rejects anything the old pump
+        // already sent. (Keying on `src` inherits the existing assumption that a client is its
+        // 5-tuple; a NAT recycling a port onto a different client already attaches to a live flow
+        // the same way, and ICE/DTLS reject the mismatch on their own credentials.)
         // A parseable live IP ⇒ warm forward; otherwise (cold, or an unparseable backend) wake.
         let live_dst = live.and_then(|ip| {
             format!("{}:{}", ip, self.spec.agent_udp_port)
                 .parse::<SocketAddr>()
                 .ok()
         });
+
+        // Warm path only — BOOKKEEPING, not safety. Since no high-water is carried, resuming into
+        // a fresh agent is harmless (it would simply mint a new socket anyway), so this guard
+        // prevents nothing. What it avoids is reusing an id when the agent is known to be new,
+        // which would open the resumed-incarnation replay window (see `FlowIdentity`) for no
+        // benefit whatsoever. Do not mistake it for a protection.
+        let restored = if live_dst.is_some() {
+            identity.get_fresh(&src, now).copied()
+        } else {
+            None
+        };
+        let (flow_id, epoch) = match restored {
+            Some(id) => (id.flow_id, id.epoch),
+            None => alloc_flow_id(next_flow_id, epoch_for, *epoch_base),
+        };
+        let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
+        if let Some(id) = restored {
+            flow.out_nonce = id.out_nonce;
+            // Re-assert the id's epoch. `alloc_flow_id` is `epoch_for`'s only other writer and the
+            // resume path skips it, while `sweep` can only prune — so a flow resumed after its
+            // quarantine lapsed would be LIVE with no `epoch_for` entry. Should `next_flow_id`
+            // then wrap onto it, `alloc_flow_id` would see `None` and hand out `epoch_base`: the
+            // epoch this flow already holds. Two live flows would share one `(flow_id, epoch)`,
+            // `by_flow_id` would collide, and the older client's replies would demux to the newer
+            // client's `src` with aliased nonce windows — precisely the collision P0-L4-13 exists
+            // to make impossible.
+            epoch_for.insert(flow_id, epoch);
+            identity.remove(&src); // consumed — the identity now lives in `flows` again
+        }
+        flow.bytes_in = n as u64;
+        flow.pkts = 1;
 
         let outcome = match live_dst {
             Some(dst) => {
@@ -705,7 +818,8 @@ impl L4Ingress {
             self.plane.count(DropReason::StaleEpoch);
             return None;
         }
-        // Per-(flow_id,epoch) monotonic-nonce anti-replay (P0-L4-13).
+        // Per-(flow_id,epoch) monotonic-nonce anti-replay (P0-L4-13). Unconditional: a resumed
+        // flow carries no high-water forward (see `FlowIdentity`), so this rule needs no exception.
         if hdr.nonce <= flow.in_nonce_hw {
             self.plane.count(DropReason::NonceReplay);
             return None;
@@ -814,14 +928,16 @@ impl L4Ingress {
                 quarantine,
                 epoch_for,
                 per_source,
+                identity,
                 ..
             } = &mut *st;
             // Reclaim expired destination buckets. Without this the map only fills, and a full map
             // is fail-closed — a long-lived port would eventually refuse egress to every client it
             // hadn't already seen.
             per_source.sweep(now);
+            identity.sweep(now);
             let mut removed: Vec<(u32, u32)> = Vec::new();
-            flows.retain(|_src, flow| {
+            flows.retain(|src, flow| {
                 let timeout = match flow.kind {
                     FlowKind::Provisional => PROVISIONAL_IDLE,
                     FlowKind::Established => self.spec.idle_timeout,
@@ -830,6 +946,20 @@ impl L4Ingress {
                 if !keep {
                     if matches!(flow.kind, FlowKind::Provisional) {
                         self.plane.event(L4Event::ProvisionalExpired);
+                    }
+                    // Remember who this was, so the client's next datagram RESUMES this flow
+                    // instead of minting a new `flow_id` and handing the app a new tuple (#87).
+                    // The slot is released either way — this memo holds no reservation, no buffer
+                    // and no egress state, so eviction still does its job: a spoof flood cannot
+                    // pin a VM warm past its idle window. Overflow (`None`) simply skips the memo
+                    // and degrades to the old churn.
+                    let ident = FlowIdentity {
+                        flow_id: flow.flow_id,
+                        epoch: flow.epoch,
+                        out_nonce: flow.out_nonce,
+                    };
+                    if let Some(slot) = identity.get_or_insert_with(*src, now, || ident) {
+                        *slot = ident;
                     }
                     removed.push((flow.flow_id, flow.epoch));
                     // `flow` drops here → established_guard then reservation drop → plane decrements.
@@ -899,6 +1029,12 @@ impl L4Ingress {
             let mut st = self.state.lock().unwrap();
             st.vm_dst = Some(dst);
             st.booting = false;
+            // Same bookkeeping as the warm-path guard: this VM's agent is new, so every
+            // remembered identity is stale and resuming one would reuse an id for nothing.
+            // Note this only catches wakes THIS port drove — a wake by anything else (an HTTP
+            // request, a sibling port, a redeploy) leaves the memo intact, which is safe because
+            // no high-water is carried, but does mean stale ids can still be reused.
+            st.identity.clear();
             let mut jobs = Vec::new();
             for flow in st.flows.values_mut() {
                 if flow.buffer.is_empty() {
@@ -1124,6 +1260,222 @@ mod tests {
         // The folded datagram was accounted, not dropped.
         assert_eq!(st.flows[&src].pkts, 2);
         assert_eq!(st.flows[&src].bytes_in, 2 * payload.len() as u64);
+    }
+
+    /// An evicted client that comes back inside [`IDENTITY_MEMO_TTL`] must RESUME its flow, not
+    /// mint a new one: the agent opens a loopback socket per `flow_id`, so a new id hands a live
+    /// app a new remote tuple. mediasoup, once ICE is COMPLETED, stores such a tuple for receive
+    /// but never selects it, so DTLS keeps going to the dead one forever (#87).
+    #[tokio::test]
+    async fn an_evicted_client_resumes_its_flow_identity() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.20:41010".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id: first, epoch: e1, nonce: n1, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        // A reply lands, so the return-leg high-water is non-zero and must survive too.
+        let hdr = L4TransitHeader { flow_id: first, epoch: e1, nonce: 7 };
+        assert_eq!(port.return_decide(hdr, b"reply", t0), Some(src));
+
+        // Idle past PROVISIONAL_IDLE (the flow never promoted — far under 1024 B / 3 pkts).
+        let later = t0 + Duration::from_secs(6);
+        port.sweep(later);
+        assert_eq!(port.state.lock().unwrap().flows.len(), 0, "swept");
+
+        // The client returns.
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"y", later)
+        else { panic!("re-MISS") };
+        let ReachOutcome::Forward { flow_id: second, epoch: e2, nonce: n2, .. } =
+            port.reach_admit(src, b"y", later, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        assert_eq!((second, e2), (first, e1), "identity must be RESUMED, not re-minted");
+        assert!(n2 > n1, "forward nonce must keep climbing for the agent's high-water: {n1} -> {n2}");
+
+        // The return-leg high-water is deliberately NOT carried across (see `FlowIdentity`), so a
+        // pre-eviction nonce is admitted once into the resumed incarnation. That is the priced
+        // trade: replaying it needs bridge capture and delivers a duplicate the app discards,
+        // whereas carrying the high-water forward would blank the return leg outright whenever the
+        // agent has moved on — which the host cannot detect.
+        let stale = L4TransitHeader { flow_id: first, epoch: e1, nonce: 7 };
+        assert_eq!(port.return_decide(stale, b"reply", later), Some(src));
+        // Monotonicity is enforced from there.
+        let stale = L4TransitHeader { flow_id: first, epoch: e1, nonce: 7 };
+        assert!(port.return_decide(stale, b"reply", later).is_none());
+        assert_eq!(port.plane.drain_counters().nonce_replay, 1);
+    }
+
+    /// The safety property the whole design rests on: a resumed flow carries NO return-leg
+    /// high-water, so it behaves exactly like a fresh flow toward whatever agent it lands on.
+    /// That is what makes resuming safe when the agent has moved on beneath us — a wake this port
+    /// did not drive, an agent LRU eviction on a warm VM, a host restart — none of which the host
+    /// can detect.
+    #[tokio::test]
+    async fn a_resumed_flow_carries_no_return_leg_high_water() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.24:41014".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, nonce: fwd, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+        // Drive the high-water up, as a live media flow would.
+        for n in 1..=40 {
+            let h = L4TransitHeader { flow_id, epoch, nonce: n };
+            assert_eq!(port.return_decide(h, b"r", t0), Some(src));
+        }
+
+        let later = t0 + Duration::from_secs(6);
+        port.sweep(later);
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"y", later)
+        else { panic!("re-MISS") };
+        let ReachOutcome::Forward { flow_id: f2, epoch: e2, nonce: fwd2, .. } =
+            port.reach_admit(src, b"y", later, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+        assert_eq!((f2, e2), (flow_id, epoch), "identity resumed");
+        // The FORWARD counter must keep climbing — a live agent's high-water is still up there.
+        assert!(fwd2 > fwd, "forward nonce must resume: {fwd} -> {fwd2}");
+        let _ = port.plane.drain_counters();
+
+        // A brand-new agent pump, restarting at 1, is admitted immediately — no wall to climb.
+        let h = L4TransitHeader { flow_id, epoch, nonce: 1 };
+        assert_eq!(
+            port.return_decide(h, b"r", later),
+            Some(src),
+            "a resumed flow must accept a fresh pump's first datagram"
+        );
+        // ...and monotonicity is enforced again from there.
+        let h = L4TransitHeader { flow_id, epoch, nonce: 1 };
+        assert!(port.return_decide(h, b"r", later).is_none());
+        assert_eq!(port.plane.drain_counters().nonce_replay, 1);
+    }
+
+    /// A COLD admit must never resume: the boot brings up a fresh agent whose reply pumps restart
+    /// `out_nonce` at 1, so resuming our high `in_nonce_hw` would blank the return leg. Scale-to-
+    /// zero makes evict -> hibernate -> client-returns the common path, so this is load-bearing.
+    #[tokio::test]
+    async fn a_cold_admit_never_resumes_a_remembered_identity() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.22:41012".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id: first, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        let later = t0 + Duration::from_secs(6);
+        port.sweep(later);
+
+        // The client returns while the VM is COLD (`live = None`) — the wake path.
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"y", later)
+        else { panic!("re-MISS") };
+        let out = port.reach_admit(src, b"y", later, reservation, "p".into(), None);
+        assert!(matches!(out, ReachOutcome::BootSpawn { .. }), "cold ⇒ wake");
+        let st = port.state.lock().unwrap();
+        assert_ne!(
+            st.flows[&src].flow_id, first,
+            "a cold admit must mint a FRESH identity — the agent it will reach is new"
+        );
+    }
+
+    /// A completed boot invalidates every remembered identity on the port: the agent is a new
+    /// process with an empty flow map, so nothing may be resumed into it.
+    #[tokio::test]
+    async fn a_completed_boot_clears_every_remembered_identity() {
+        let port = cold_port().await;
+        let src: SocketAddr = "203.0.113.23:41013".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let _ = port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()));
+        let later = t0 + Duration::from_secs(6);
+        port.sweep(later);
+        assert!(
+            port.state.lock().unwrap().identity.contains(&src),
+            "eviction should have remembered it"
+        );
+
+        port.on_ready("10.0.0.2".into()).await;
+        assert!(
+            !port.state.lock().unwrap().identity.contains(&src),
+            "a fresh agent invalidates every memo"
+        );
+    }
+
+    /// A resumed id must be re-asserted in `epoch_for`, or a later `flow_id` wrap could mint a
+    /// SECOND live flow with the same `(flow_id, epoch)` — the collision P0-L4-13 forbids.
+    #[tokio::test]
+    async fn a_resumed_id_is_re_asserted_in_epoch_for() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.26:41016".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        // Evict, then let the reuse quarantine lapse so `sweep` prunes `epoch_for`.
+        port.sweep(t0 + Duration::from_secs(6));
+        let after_quarantine = t0 + Duration::from_secs(6) + REUSE_QUARANTINE + Duration::from_secs(1);
+        port.sweep(after_quarantine);
+        assert!(
+            !port.state.lock().unwrap().epoch_for.contains_key(&flow_id),
+            "precondition: the quarantine has lapsed and the epoch was pruned"
+        );
+
+        // Resume — this must put the epoch back.
+        let ReachOutcome::CheckLiveness { reservation, .. } =
+            port.reach_decide(src, b"y", after_quarantine)
+        else { panic!("re-MISS") };
+        let ReachOutcome::Forward { flow_id: f2, .. } = port.reach_admit(
+            src, b"y", after_quarantine, reservation, "p".into(), Some("10.0.0.2".into()),
+        ) else { panic!("warm forward") };
+        assert_eq!(f2, flow_id, "identity resumed");
+        assert_eq!(
+            port.state.lock().unwrap().epoch_for.get(&flow_id),
+            Some(&epoch),
+            "a live resumed id must carry its epoch, so a wrap onto it bumps rather than collides"
+        );
+    }
+
+    /// The memo must not outlive the AGENT's flow entry. Past its TTL the client gets a fresh
+    /// identity, because the agent will have opened a fresh socket too — resuming a nonce
+    /// high-water the agent has forgotten would blank the return leg instead of fixing it.
+    #[tokio::test]
+    async fn a_long_gone_client_gets_a_fresh_identity() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.21:41011".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id: first, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        port.sweep(t0 + Duration::from_secs(6));
+        let way_later = t0 + IDENTITY_MEMO_TTL + Duration::from_secs(30);
+        let ReachOutcome::CheckLiveness { reservation, .. } =
+            port.reach_decide(src, b"y", way_later)
+        else { panic!("re-MISS") };
+        let ReachOutcome::Forward { flow_id: second, nonce, .. } =
+            port.reach_admit(src, b"y", way_later, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        assert_ne!(second, first, "past the TTL the identity must NOT be resumed");
+        assert_eq!(nonce, 1, "a fresh identity restarts the forward nonce");
     }
 
     /// First coverage of the return leg. An authenticated reply whose `flow_id` the host no longer
