@@ -194,10 +194,17 @@ pub fn stage_ro(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::hard_link(src, dst).with_context(|| {
+    // Resolve symlinks FIRST. `hard_link` does not dereference on Linux, so a symlinked source
+    // lands a link to the *symlink inode* in the chroot, and its relative target does not exist
+    // inside the jail — Firecracker then fails with "The kernel file cannot be opened: No such
+    // file or directory". `tools/dev kernel` publishes exactly such a symlink
+    // (`vmlinux.bin -> vmlinux-<ver>.bin`), so the bootstrap's own layout tripped this.
+    let real = std::fs::canonicalize(src)
+        .with_context(|| format!("resolve {} (staging into the jail)", src.display()))?;
+    std::fs::hard_link(&real, dst).with_context(|| {
         format!(
             "hard-link {} -> {} (must be same filesystem)",
-            src.display(),
+            real.display(),
             dst.display()
         )
     })?;
