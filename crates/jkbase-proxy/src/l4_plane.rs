@@ -182,6 +182,7 @@ pub struct L4Counters {
     pub header_auth_fail: u64,
     pub nonce_replay: u64,
     pub stale_epoch: u64,
+    pub unknown_flow: u64,
     pub egress_amp_clamp: u64,
     pub egress_per_source: u64,
     pub egress_per_victim: u64,
@@ -204,6 +205,44 @@ pub struct L4Counters {
     pub reflection_shape_flagged: u64,
 }
 
+impl L4Counters {
+    /// Every drop reason as `(label, value)`. The ONE place drop reasons are enumerated for
+    /// aggregation: callers that sum or display them (the pump harness's pass/fail signal, the
+    /// metering log, a dashboard) must read this rather than hand-listing fields. The harness once
+    /// hand-listed and silently omitted three reasons — including the one #87 is about — so a run
+    /// that blackholed return frames still reported `drops=0`.
+    pub fn drop_reasons(&self) -> [(&'static str, u64); 20] {
+        [
+            ("rate_cap", self.rate_cap),
+            ("budget_full", self.budget_full),
+            ("warm_full_global", self.warm_full_global),
+            ("flow_full_project", self.flow_full_project),
+            ("flow_full_global", self.flow_full_global),
+            ("agent_map_full", self.agent_map_full),
+            ("unknown_port", self.unknown_port),
+            ("header_auth_fail", self.header_auth_fail),
+            ("nonce_replay", self.nonce_replay),
+            ("stale_epoch", self.stale_epoch),
+            ("unknown_flow", self.unknown_flow),
+            ("egress_amp_clamp", self.egress_amp_clamp),
+            ("egress_per_source", self.egress_per_source),
+            ("egress_per_victim", self.egress_per_victim),
+            ("egress_per_project", self.egress_per_project),
+            ("egress_per_24", self.egress_per_24),
+            ("egress_global", self.egress_global),
+            ("c0_grant_rejected", self.c0_grant_rejected),
+            ("replay_buffer_overflow", self.replay_buffer_overflow),
+            ("udp_readiness_timeout", self.udp_readiness_timeout),
+        ]
+    }
+
+    /// Total dropped datagrams across EVERY reason. `edge_bind_eaddrinuse` is deliberately excluded
+    /// — it counts a failed port bind, not a dropped datagram.
+    pub fn total_drops(&self) -> u64 {
+        self.drop_reasons().iter().map(|(_, v)| v).sum()
+    }
+}
+
 /// The proxy-side counters the pump increments. Agent-side reasons (`agent_map_full`,
 /// `udp_readiness_timeout`) are in [`L4Counters`] for the server's unified view but are not set here.
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +255,11 @@ pub(crate) enum DropReason {
     HeaderAuthFail,
     NonceReplay,
     StaleEpoch,
+    /// A return-leg frame whose `flow_id` no longer maps to a live flow. Authenticated (it cleared
+    /// the transit MAC), so it is the AGENT still pumping a flow the host has let go — the return
+    /// leg of that tuple is dead while the app keeps using it. Was an uncounted `?` bail, which
+    /// made exactly this shape invisible in the only diagnostic the plane offers (#87).
+    UnknownFlow,
     EgressAmpClamp,
     EgressPerSource,
     EgressPerVictim,
@@ -247,6 +291,7 @@ struct AtomicCounters {
     header_auth_fail: AtomicU64,
     nonce_replay: AtomicU64,
     stale_epoch: AtomicU64,
+    unknown_flow: AtomicU64,
     egress_amp_clamp: AtomicU64,
     egress_per_source: AtomicU64,
     egress_per_victim: AtomicU64,
@@ -277,6 +322,7 @@ impl AtomicCounters {
             header_auth_fail: self.header_auth_fail.swap(0, Ordering::Relaxed),
             nonce_replay: self.nonce_replay.swap(0, Ordering::Relaxed),
             stale_epoch: self.stale_epoch.swap(0, Ordering::Relaxed),
+            unknown_flow: self.unknown_flow.swap(0, Ordering::Relaxed),
             egress_amp_clamp: self.egress_amp_clamp.swap(0, Ordering::Relaxed),
             egress_per_source: self.egress_per_source.swap(0, Ordering::Relaxed),
             egress_per_victim: self.egress_per_victim.swap(0, Ordering::Relaxed),
@@ -531,6 +577,20 @@ impl L4Plane {
     // ============================ server-facing reads (§1.2) ============================
 
     /// ESTABLISHED L4 flow count for a base project — the idle-loop keep-warm gate (mirrors
+    /// Total flow-table slots (provisional + established) reserved for `base`. Test-only: lets a
+    /// test prove a released [`FlowReservation`] actually decremented, which no public gauge shows
+    /// (`conn_count` counts only ESTABLISHED flows).
+    #[cfg(test)]
+    pub(crate) fn flow_count_for_test(&self, base: &str) -> usize {
+        self.flow_state
+            .lock()
+            .unwrap()
+            .by_base
+            .get(base)
+            .map(|b| b.total)
+            .unwrap_or(0)
+    }
+
     /// `db_relay::conn_count`; provisional flows DO NOT count).
     pub fn conn_count(&self, base_project: &str) -> usize {
         self.flow_state
@@ -619,6 +679,7 @@ impl L4Plane {
             DropReason::HeaderAuthFail => &c.header_auth_fail,
             DropReason::NonceReplay => &c.nonce_replay,
             DropReason::StaleEpoch => &c.stale_epoch,
+            DropReason::UnknownFlow => &c.unknown_flow,
             DropReason::EgressAmpClamp => &c.egress_amp_clamp,
             DropReason::EgressPerSource => &c.egress_per_source,
             DropReason::EgressPerVictim => &c.egress_per_victim,
@@ -1262,6 +1323,41 @@ mod tests {
             p.try_reserve_flow("c", Some("t"), t),
             Err(ReserveReject::Global)
         ));
+    }
+
+    /// A `DropReason` missing from [`L4Counters::drop_reasons`] is invisible to every aggregator —
+    /// the pass/fail signal of the pump harness included. Counting one of each must show up.
+    #[test]
+    fn every_drop_reason_reaches_the_aggregate() {
+        let p = plane();
+        let all = [
+            DropReason::RateCap,
+            DropReason::BudgetFull,
+            DropReason::WarmFullGlobal,
+            DropReason::FlowFullProject,
+            DropReason::FlowFullGlobal,
+            DropReason::HeaderAuthFail,
+            DropReason::NonceReplay,
+            DropReason::StaleEpoch,
+            DropReason::UnknownFlow,
+            DropReason::EgressAmpClamp,
+            DropReason::EgressPerSource,
+            DropReason::EgressPerVictim,
+            DropReason::EgressPerProject,
+            DropReason::EgressPer24,
+            DropReason::EgressGlobal,
+            DropReason::C0GrantRejected,
+            DropReason::ReplayBufferOverflow,
+        ];
+        for r in all {
+            p.count(r);
+        }
+        let c = p.drain_counters();
+        assert_eq!(
+            c.total_drops(),
+            all.len() as u64,
+            "a counted DropReason is missing from L4Counters::drop_reasons"
+        );
     }
 
     #[test]

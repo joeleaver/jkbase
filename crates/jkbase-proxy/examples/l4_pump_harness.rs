@@ -153,41 +153,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::time::sleep(Duration::from_secs(report_secs as u64)).await;
         let c = plane.drain_counters();
-        let drops = c.rate_cap
-            + c.budget_full
-            + c.warm_full_global
-            + c.flow_full_project
-            + c.flow_full_global
-            + c.header_auth_fail
-            + c.nonce_replay
-            + c.stale_epoch
-            + c.egress_amp_clamp
-            + c.egress_per_source
-            + c.egress_per_victim
-            + c.egress_per_24
-            + c.egress_per_project
-            + c.egress_global
-            + c.replay_buffer_overflow;
+        // Read the counters' own enumeration — hand-listing here once omitted three reasons
+        // (`unknown_flow`, `c0_grant_rejected`, `edge_bind_eaddrinuse`), so a run that blackholed
+        // return frames still printed `drops=0` and passed.
+        let drops = c.total_drops();
         print!("[{:>5.0}s] drops={drops}", started.elapsed().as_secs_f64());
         if drops > 0 {
             // Name only what actually fired: a line of twenty zeroes hides the one that matters.
-            for (label, v) in [
-                ("rate_cap", c.rate_cap),
-                ("budget_full", c.budget_full),
-                ("warm_full_global", c.warm_full_global),
-                ("flow_full_project", c.flow_full_project),
-                ("flow_full_global", c.flow_full_global),
-                ("header_auth_fail", c.header_auth_fail),
-                ("nonce_replay", c.nonce_replay),
-                ("stale_epoch", c.stale_epoch),
-                ("egress_amp_clamp", c.egress_amp_clamp),
-                ("egress_per_source", c.egress_per_source),
-                ("egress_per_victim", c.egress_per_victim),
-                ("egress_per_24", c.egress_per_24),
-                ("egress_per_project", c.egress_per_project),
-                ("egress_global", c.egress_global),
-                ("replay_buffer_overflow", c.replay_buffer_overflow),
-            ] {
+            for (label, v) in c.drop_reasons() {
                 if v > 0 {
                     print!(" {label}={v}");
                 }
