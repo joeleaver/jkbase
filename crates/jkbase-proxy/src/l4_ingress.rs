@@ -669,6 +669,15 @@ impl L4Ingress {
         let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
         if let Some(id) = restored {
             flow.out_nonce = id.out_nonce;
+            // Re-assert the id's epoch. `alloc_flow_id` is `epoch_for`'s only other writer and the
+            // resume path skips it, while `sweep` can only prune — so a flow resumed after its
+            // quarantine lapsed would be LIVE with no `epoch_for` entry. Should `next_flow_id`
+            // then wrap onto it, `alloc_flow_id` would see `None` and hand out `epoch_base`: the
+            // epoch this flow already holds. Two live flows would share one `(flow_id, epoch)`,
+            // `by_flow_id` would collide, and the older client's replies would demux to the newer
+            // client's `src` with aliased nonce windows — precisely the collision P0-L4-13 exists
+            // to make impossible.
+            epoch_for.insert(flow_id, epoch);
             identity.remove(&src); // consumed — the identity now lives in `flows` again
         }
         flow.bytes_in = n as u64;
@@ -1400,6 +1409,44 @@ mod tests {
         assert!(
             !port.state.lock().unwrap().identity.contains(&src),
             "a fresh agent invalidates every memo"
+        );
+    }
+
+    /// A resumed id must be re-asserted in `epoch_for`, or a later `flow_id` wrap could mint a
+    /// SECOND live flow with the same `(flow_id, epoch)` — the collision P0-L4-13 forbids.
+    #[tokio::test]
+    async fn a_resumed_id_is_re_asserted_in_epoch_for() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.26:41016".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        // Evict, then let the reuse quarantine lapse so `sweep` prunes `epoch_for`.
+        port.sweep(t0 + Duration::from_secs(6));
+        let after_quarantine = t0 + Duration::from_secs(6) + REUSE_QUARANTINE + Duration::from_secs(1);
+        port.sweep(after_quarantine);
+        assert!(
+            !port.state.lock().unwrap().epoch_for.contains_key(&flow_id),
+            "precondition: the quarantine has lapsed and the epoch was pruned"
+        );
+
+        // Resume — this must put the epoch back.
+        let ReachOutcome::CheckLiveness { reservation, .. } =
+            port.reach_decide(src, b"y", after_quarantine)
+        else { panic!("re-MISS") };
+        let ReachOutcome::Forward { flow_id: f2, .. } = port.reach_admit(
+            src, b"y", after_quarantine, reservation, "p".into(), Some("10.0.0.2".into()),
+        ) else { panic!("warm forward") };
+        assert_eq!(f2, flow_id, "identity resumed");
+        assert_eq!(
+            port.state.lock().unwrap().epoch_for.get(&flow_id),
+            Some(&epoch),
+            "a live resumed id must carry its epoch, so a wrap onto it bumps rather than collides"
         );
     }
 
