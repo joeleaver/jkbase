@@ -70,6 +70,19 @@ const PORT_SOURCE_TTL: Duration = Duration::from_secs(120);
 /// socket whose pump restarts `out_nonce` at 1 into our restored high-water, and the return leg
 /// would blank entirely — strictly worse than the churn this fixes.
 const IDENTITY_MEMO_TTL: Duration = Duration::from_secs(45);
+/// WHAT THIS DOES NOT COVER, so "resume" is never read as "tuple churn is solved". It keeps the
+/// tuple across a HOST-side eviction while the agent still holds the flow. It cannot help when the
+/// AGENT loses its own entry, because the tuple is that agent's loopback socket and only the agent
+/// could preserve it:
+/// - agent LRU eviction at `AGENT_L4_MAX_FLOWS` (256) on a busy port — `create_flow` binds a fresh
+///   `127.0.0.1:0` regardless, so the app sees a new tuple exactly as it did before;
+/// - any wake or redeploy that REPLACES the VM — every socket is new;
+/// - a host process restart — `epoch_base` is reseeded, so every id changes and the memo, being
+///   in-process, is gone anyway.
+///
+/// Fixing those means keying the agent's loopback socket on something that survives the agent's
+/// own eviction, which is a guest-side change.
+///
 /// Cardinality bound on remembered identities. Overflow degrades to today's behaviour (mint a
 /// fresh id), never to an unbounded map — same posture as every other aux map (P0-L4-5/-9).
 const IDENTITY_MEMO_MAX: usize = 16_384;
@@ -639,14 +652,11 @@ impl L4Ingress {
                 .ok()
         });
 
-        // ONLY on the warm path. A cold boot brings up a NEW agent process with an empty flow map
-        // (the agent is the VM's init, so it cannot restart without the VM restarting), and
-        // resuming into that would be worse than churn: the agent's fresh pump restarts
-        // `out_nonce` at 1 while we hold a high `in_nonce_hw`, blanking the return leg until it
-        // climbs back. Scale-to-zero makes that the COMMON path, not a corner — evict, hibernate,
-        // client returns — so this guard is load-bearing, not defensive. Snapshot-resume does
-        // preserve the agent's state and could safely resume, but the wake path cannot tell a
-        // restore from a cold boot here, so it fails safe to a fresh identity.
+        // Warm path only — BOOKKEEPING, not safety. Since no high-water is carried, resuming into
+        // a fresh agent is harmless (it would simply mint a new socket anyway), so this guard
+        // prevents nothing. What it avoids is reusing an id when the agent is known to be new,
+        // which would open the resumed-incarnation replay window (see `FlowIdentity`) for no
+        // benefit whatsoever. Do not mistake it for a protection.
         let restored = if live_dst.is_some() {
             identity.get_fresh(&src, now).copied()
         } else {
@@ -1010,10 +1020,11 @@ impl L4Ingress {
             let mut st = self.state.lock().unwrap();
             st.vm_dst = Some(dst);
             st.booting = false;
-            // The VM just booted, so the agent is a FRESH process with an empty flow map and reply
-            // pumps whose `out_nonce` starts at 1. Every remembered identity is now stale, and
-            // resuming one would strand the return leg behind our high `in_nonce_hw`. Drop them
-            // all: minting fresh ids is the correct behaviour against a new agent.
+            // Same bookkeeping as the warm-path guard: this VM's agent is new, so every
+            // remembered identity is stale and resuming one would reuse an id for nothing.
+            // Note this only catches wakes THIS port drove — a wake by anything else (an HTTP
+            // request, a sibling port, a redeploy) leaves the memo intact, which is safe because
+            // no high-water is carried, but does mean stale ids can still be reused.
             st.identity.clear();
             let mut jobs = Vec::new();
             for flow in st.flows.values_mut() {
