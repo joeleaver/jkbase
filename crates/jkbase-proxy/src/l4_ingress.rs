@@ -151,9 +151,22 @@ enum FlowKind {
 /// has moved on hands a fresh pump — which always restarts `out_nonce` at 1 — a wall it must climb
 /// datagram by datagram, blanking the return leg for thousands of packets. So a resumed flow's
 /// return leg starts at 0, exactly like a fresh one, which is the state the agent's pump is built
-/// for. The cost is that a pre-eviction reply can be replayed into the resumed incarnation; that
-/// needs host↔guest bridge capture, and delivers a duplicate the app's own DTLS/SRTP/QUIC replay
-/// window discards.
+/// for.
+///
+/// The priced cost: a resumed flow's high-water starts at 0, so a captured pre-eviction reply for
+/// this `(flow_id, epoch)` would be admitted, and a captured SEQUENCE could then be walked up
+/// monotonically until the first genuine reply jumps the bar past it — and on a QUIET flow, which
+/// is exactly the shape that idles out and gets resumed, no genuine reply arrives to close it, so
+/// the window lasts the life of the resumed incarnation. That is not merely duplicate
+/// media — every replayed frame runs the egress chain and is charged to the victim's metered
+/// egress and reflection window. It is contained by REACHABILITY, not by the payload being
+/// harmless: the frame must clear `l4_transit::open(secret, AgentToHost, …)`, so a forged one dies
+/// at `HeaderAuthFail`, and delivering a CAPTURED one to the host's guest-facing socket needs a
+/// source address a runtime VM cannot emit — the per-TAP ebtables guard
+/// (`-i <tap> -p IPv4 ! --ip-src <ip> -j DROP`) is hooked into INPUT as well as FORWARD, and
+/// `JKRUNFW` admits guest→host only for DNS, the public proxy and the DB gateway. So the replay
+/// needs host-level access, which is already total compromise. Weighed against the alternative,
+/// which blanks the return leg for thousands of datagrams whenever the agent has moved on.
 #[derive(Clone, Copy)]
 struct FlowIdentity {
     flow_id: u32,
