@@ -3863,6 +3863,7 @@ esac
         /// end-to-end: host edge socket → framed transit → agent land-forward → loopback echo →
         /// back. Offline (no deps, no build network).
         UdpEcho,
+        UdpTuplePin,
         /// A tenant with long-lived connection endpoints: HTTP :3000 readiness, a `/ws`
         /// WebSocket echo, and a `/events` Server-Sent-Events tick stream. Drives the
         /// wake-on-WS activity re-stamp seam end-to-end (edge relay + ActivityBody through
@@ -4094,6 +4095,48 @@ console.log("listening on " + port);
                 write(
                     src.join("server/package.json"),
                     "{\n  \"name\": \"bunfix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+                );
+            }
+            // #87 repro: a faithful minimal model of mediasoup's `WebRtcServer` topology — ONE
+            // shared loopback socket for every peer, so flows are distinguished ONLY by their
+            // remote tuple, and a two-class protocol that splits the way STUN and DTLS split:
+            //   PROBE -> answer on the tuple it ARRIVED on   (RFC 5389 binding response)
+            //   PIN   -> remember that tuple as SELECTED     (USE-CANDIDATE nomination)
+            //   DATA  -> answer on the SELECTED tuple        (DTLS, which never re-reads arrival)
+            // If anything decouples "selected tuple" from "the tuple the host still maps", DATA
+            // blackholes while PROBE keeps working — issue #87's exact signature.
+            Workload::UdpTuplePin => {
+                write(
+                    src.join("server/server.ts"),
+                    r#"const port = Number(process.env.PORT) || 3000;
+Bun.serve({ port, fetch() { return new Response("ok\n"); } });
+const pinned = new Map();
+Bun.udpSocket({
+  port: 9999,
+  hostname: "127.0.0.1",
+  socket: {
+    data(socket, buf, p, addr) {
+      const [verb, id] = buf.toString().trim().split(" ");
+      if (verb === "PROBE") {
+        socket.send(`PROBED ${id}`, p, addr);
+      } else if (verb === "PIN") {
+        pinned.set(id, { p, addr });
+        console.log(`pinned ${id} -> ${addr}:${p}`);
+        socket.send(`PINNED ${id}`, p, addr);
+      } else if (verb === "DATA") {
+        const t = pinned.get(id);
+        if (t) { socket.send(`REPLY ${id}`, t.p, t.addr); }
+        else { console.log(`DATA for unpinned ${id}`); }
+      }
+    },
+  },
+}).then(() => console.log("udp tuple-pin on 127.0.0.1:9999")).catch((e) => console.error("udp bind failed", e));
+console.log("listening on " + port);
+"#,
+                );
+                write(
+                    src.join("server/package.json"),
+                    "{\n  \"name\": \"tuplepin\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
                 );
             }
             // Long-lived connections: a `/ws` echo + a `/events` SSE tick stream + HTTP
@@ -6625,6 +6668,427 @@ console.log("listening on " + port);
             "L4 UDP echo did not round-trip through the seam; got {echo:?}"
         );
         println!("PASS: L4 UDP echo round-tripped the full seam (edge → transit → agent → loopback → back)");
+    }
+
+    /// **#87 reproduction attempt.** Two "participants", two flows each (send + recv), all
+    /// landing on ONE shared guest socket — the mediasoup `WebRtcServer` topology. Each flow
+    /// PROBEs (answered on the arrival tuple, like a STUN binding response), PINs (the app
+    /// records that tuple as selected, like USE-CANDIDATE), then sends DATA (answered on the
+    /// SELECTED tuple only, like DTLS). P1 completes and keeps sending; P2 then joins against
+    /// an already-warm VM, exactly as in the report.
+    ///
+    /// If P2's DATA never returns while its PROBE does, #87 is reproduced with no WebRTC in the
+    /// picture and the fault is in the plane or the agent. If both participants complete, the
+    /// seam handles tuple pinning correctly and the fault is above it, in mediasoup's own demux.
+    /// Either outcome localises the bug, which is the point.
+    #[tokio::test]
+    #[ignore = "L4 #87 repro: needs KVM + root + bun.ext4 + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn l4_tuple_pin_two_participants_e2e() {
+        use jkbase_common::config::{L4Facts, L4PortFact};
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use jkbase_proxy::l4_ingress::{L4Ingress, L4PortSpec, ResolveVmIp};
+        use jkbase_proxy::l4_plane::L4Plane;
+        use std::net::UdpSocket as StdUdp;
+        use std::sync::Arc;
+
+        let Some(fx) = bun_pipeline_build("tuplepin", 1, Workload::UdpTuplePin).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS to the verity-capable agent rootfs");
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+
+        const AGENT_UDP_PORT: u16 = 40001;
+        const GUEST_PORT: u16 = 9999;
+        const TRANSIT_SECRET: &str = "jkbl_e2e_transit_secret_0123456789abcdef";
+        let l4_facts = L4Facts {
+            ports: vec![L4PortFact {
+                name: "media".into(),
+                proto: "udp".into(),
+                agent_udp_port: AGENT_UDP_PORT,
+                guest_port: GUEST_PORT,
+                idle_timeout_secs: 60,
+            }],
+            transit_secret: TRANSIT_SECRET.into(),
+        };
+
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, false)
+            .expect("compute layer plan");
+        let meta_img = fx.data.join("tuplepin-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+            Some(&l4_facts),
+            &meta_img,
+        )
+        .expect("build metadata image with _l4.json");
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("tuplepin", "172.31.0.1", "172.31.0.2", "AA:FC:00:00:31:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("tuplepin-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("tuple-pin VM should start");
+
+        let ready = poll_http_200(guest_ip, 80, Duration::from_secs(90)).await;
+        eprintln!("[87-repro] http ready = {ready:?}");
+        assert!(ready.is_some(), "tuple-pin app never became HTTP-ready");
+
+        let ip = guest_ip.to_string();
+        let wake: jkbase_proxy::WakeCallback = Arc::new(move |_pid: String| {
+            let ip = ip.clone();
+            Box::pin(async move { Ok(ip) })
+        });
+        let plane = L4Plane::new(Default::default(), wake);
+        let ip2 = guest_ip.to_string();
+        let resolve_vm_ip: ResolveVmIp = Arc::new(move |_pid: String| {
+            let ip = ip2.clone();
+            Box::pin(async move { Some(ip) })
+        });
+        const EXTERNAL_PORT: u16 = 21998;
+        let spec = L4PortSpec {
+            project_id: "tuplepin".into(),
+            base_project: "tuplepin".into(),
+            tenant_id: None,
+            name: "media".into(),
+            proto: "udp".into(),
+            external_port: EXTERNAL_PORT,
+            agent_udp_port: AGENT_UDP_PORT,
+            guest_port: GUEST_PORT,
+            idle_timeout: Duration::from_secs(60),
+            // The reported deployment's default: the ratio clamp is OFF.
+            amp_k: 0,
+            transit_secret: TRANSIT_SECRET.into(),
+            egress: plane.default_port_egress_limits(),
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ingress = L4Ingress::bind(spec, plane.clone(), resolve_vm_ip, cancel.clone())
+            .await
+            .expect("edge socket binds");
+        tokio::spawn(ingress.run());
+
+        // One "transport": its own client source port, so its own host flow — as a browser's
+        // send and recv PeerConnections each get their own 5-tuple.
+        fn transport(id: &str) -> Option<(String, String)> {
+            transport_idle(id, Duration::ZERO)
+        }
+
+        /// `idle_before_data` models the gap between nomination and the handshake flight. Past
+        /// `PROVISIONAL_IDLE` the host sweeps an unpromoted flow, so the client's next datagram
+        /// mints a NEW flow_id — a NEW agent loopback socket, a NEW remote tuple — while the app
+        /// is still pinned to the old one and the old agent socket lives on for `host_idle + 60s`.
+        fn transport_idle(id: &str, idle_before_data: Duration) -> Option<(String, String)> {
+            let dst = format!("127.0.0.1:{EXTERNAL_PORT}");
+            let sock = StdUdp::bind("0.0.0.0:0").ok()?;
+            sock.set_read_timeout(Some(Duration::from_secs(6))).ok()?;
+            let mut buf = [0u8; 256];
+
+            // PROBE, retried: the first datagram cold-admits the flow.
+            let mut probed = None;
+            for _ in 0..10 {
+                let _ = sock.send_to(format!("PROBE {id}").as_bytes(), &dst);
+                if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                    probed = Some(String::from_utf8_lossy(&buf[..n]).to_string());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            probed.as_ref()?;
+
+            // PIN: the app now treats THIS tuple as selected.
+            let _ = sock.send_to(format!("PIN {id}").as_bytes(), &dst);
+            let _ = sock.recv_from(&mut buf);
+
+            // The gap. Silence in BOTH directions, which is what the sweep measures.
+            std::thread::sleep(idle_before_data);
+
+            // DATA: answered only on the selected tuple. This is the DTLS-shaped leg.
+            let mut data = None;
+            for _ in 0..8 {
+                let _ = sock.send_to(format!("DATA {id}").as_bytes(), &dst);
+                if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                    data = Some(String::from_utf8_lossy(&buf[..n]).to_string());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            Some((probed.unwrap(), data.unwrap_or_else(|| "<NONE>".into())))
+        }
+
+        // P1 joins first and completes (this is the participant that works in the report).
+        let p1 = tokio::task::spawn_blocking(|| (transport("p1send"), transport("p1recv")))
+            .await
+            .unwrap();
+        eprintln!("[87-repro] P1 send={:?} recv={:?}", p1.0, p1.1);
+
+        // P2 joins against an already-warm VM while P1 is established — the failing case.
+        let p2 = tokio::task::spawn_blocking(|| (transport("p2send"), transport("p2recv")))
+            .await
+            .unwrap();
+        eprintln!("[87-repro] P2 send={:?} recv={:?}", p2.0, p2.1);
+
+        let c = plane.drain_counters();
+        eprintln!("[87-repro] counters: total_drops={}", c.total_drops());
+        for (label, v) in c.drop_reasons() {
+            if v > 0 {
+                eprintln!("[87-repro]   {label}={v}");
+            }
+        }
+        eprintln!(
+            "[87-repro] promotions={} provisional_expired={}",
+            c.promotions, c.provisional_expired
+        );
+
+        cancel.cancel();
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+
+        let got = |t: &Option<(String, String)>, want: &str| {
+            t.as_ref().map(|(_, d)| d.contains(want)).unwrap_or(false)
+        };
+        assert!(got(&p1.0, "REPLY p1send"), "P1 send DATA failed: {:?}", p1.0);
+        assert!(got(&p1.1, "REPLY p1recv"), "P1 recv DATA failed: {:?}", p1.1);
+        assert!(
+            got(&p2.0, "REPLY p2send") && got(&p2.1, "REPLY p2recv"),
+            "#87 REPRODUCED: the second participant's pinned-tuple replies never arrived. \
+             send={:?} recv={:?}",
+            p2.0,
+            p2.1
+        );
+        println!(
+            "PASS: both participants completed the pinned-tuple leg — the seam handles \
+             mediasoup's tuple topology, so #87 is NOT in the plane or the agent"
+        );
+    }
+
+    /// Does a host-side idle eviction actually break a tuple-pinning app? The mechanism is
+    /// confirmed in unit tests (a swept provisional flow re-mints a `flow_id`), but nothing
+    /// showed it is USER-VISIBLE end to end. This holds one transport silent past
+    /// `PROVISIONAL_IDLE` between nomination and the handshake flight, then sends it.
+    ///
+    /// If the pinned reply never arrives, the re-mint is a demonstrated blackhole for any app
+    /// that pins a tuple — WebRTC, QUIC, anything — and worth fixing regardless of #87.
+    #[tokio::test]
+    #[ignore = "L4 idle-eviction repro: needs KVM + root + bun.ext4 + baselayers + JKB_ROOTFS"]
+    async fn l4_tuple_pin_survives_idle_eviction_e2e() {
+        use jkbase_common::config::{L4Facts, L4PortFact};
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use jkbase_proxy::l4_ingress::{L4Ingress, L4PortSpec, ResolveVmIp};
+        use jkbase_proxy::l4_plane::L4Plane;
+        use std::net::UdpSocket as StdUdp;
+        use std::sync::Arc;
+
+        let Some(fx) = bun_pipeline_build("tuplepinidle", 1, Workload::UdpTuplePin).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS");
+            return;
+        };
+
+        const AGENT_UDP_PORT: u16 = 40002;
+        const GUEST_PORT: u16 = 9999;
+        const TRANSIT_SECRET: &str = "jkbl_e2e_transit_secret_0123456789abcdef";
+        let l4_facts = L4Facts {
+            ports: vec![L4PortFact {
+                name: "media".into(),
+                proto: "udp".into(),
+                agent_udp_port: AGENT_UDP_PORT,
+                guest_port: GUEST_PORT,
+                idle_timeout_secs: 60,
+            }],
+            transit_secret: TRANSIT_SECRET.into(),
+        };
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, false)
+            .expect("layer plan");
+        let meta_img = fx.data.join("tuplepinidle-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged,
+            &plan,
+            &Default::default(),
+            &Default::default(),
+            None,
+            None,
+            Some(&l4_facts),
+            &meta_img,
+        )
+        .expect("metadata image");
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("tpidle", "172.31.1.1", "172.31.1.2", "AA:FC:00:01:31:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .await
+            .unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap])
+            .await
+            .unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("tpidle-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("VM starts");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(90))
+                .await
+                .is_some(),
+            "app never became HTTP-ready"
+        );
+
+        let ip = guest_ip.to_string();
+        let wake: jkbase_proxy::WakeCallback = Arc::new(move |_p: String| {
+            let ip = ip.clone();
+            Box::pin(async move { Ok(ip) })
+        });
+        let plane = L4Plane::new(Default::default(), wake);
+        let ip2 = guest_ip.to_string();
+        let resolve_vm_ip: ResolveVmIp = Arc::new(move |_p: String| {
+            let ip = ip2.clone();
+            Box::pin(async move { Some(ip) })
+        });
+        const EXTERNAL_PORT: u16 = 21997;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ingress = L4Ingress::bind(
+            L4PortSpec {
+                project_id: "tpidle".into(),
+                base_project: "tpidle".into(),
+                tenant_id: None,
+                name: "media".into(),
+                proto: "udp".into(),
+                external_port: EXTERNAL_PORT,
+                agent_udp_port: AGENT_UDP_PORT,
+                guest_port: GUEST_PORT,
+                idle_timeout: Duration::from_secs(60),
+                amp_k: 0,
+                transit_secret: TRANSIT_SECRET.into(),
+                egress: plane.default_port_egress_limits(),
+            },
+            plane.clone(),
+            resolve_vm_ip,
+            cancel.clone(),
+        )
+        .await
+        .expect("edge binds");
+        tokio::spawn(ingress.run());
+
+        // PROBE + PIN, then 7s of silence (PROVISIONAL_IDLE is 5s), then the pinned leg.
+        let out = tokio::task::spawn_blocking(move || {
+            let dst = format!("127.0.0.1:{EXTERNAL_PORT}");
+            let sock = StdUdp::bind("0.0.0.0:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+            let mut buf = [0u8; 256];
+            let mut probed = None;
+            for _ in 0..10 {
+                let _ = sock.send_to(b"PROBE idle", &dst);
+                if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                    probed = Some(String::from_utf8_lossy(&buf[..n]).to_string());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            let _ = sock.send_to(b"PIN idle", &dst);
+            let _ = sock.recv_from(&mut buf);
+
+            std::thread::sleep(Duration::from_secs(7));
+
+            let mut data = None;
+            for _ in 0..6 {
+                let _ = sock.send_to(b"DATA idle", &dst);
+                if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                    data = Some(String::from_utf8_lossy(&buf[..n]).to_string());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            (probed, data)
+        })
+        .await
+        .unwrap();
+        eprintln!("[idle-repro] probed={:?} data={:?}", out.0, out.1);
+
+        let c = plane.drain_counters();
+        eprintln!(
+            "[idle-repro] total_drops={} promotions={} provisional_expired={}",
+            c.total_drops(),
+            c.promotions,
+            c.provisional_expired
+        );
+        for (label, v) in c.drop_reasons() {
+            if v > 0 {
+                eprintln!("[idle-repro]   {label}={v}");
+            }
+        }
+
+        cancel.cancel();
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+
+        assert!(out.0.is_some(), "PROBE never answered — setup failed");
+        assert!(
+            out.1.as_deref().map(|d| d.contains("REPLY")).unwrap_or(false),
+            "IDLE EVICTION IS USER-VISIBLE: after {}s of silence the app's pinned-tuple reply \
+             never arrived (provisional_expired={}). got {:?}",
+            7,
+            c.provisional_expired,
+            out.1
+        );
+        println!("PASS: a pinned tuple survived an idle gap past PROVISIONAL_IDLE");
     }
 
     /// The managed-DB REACH-PLANE end-to-end proof: a genuine `@rhypedb/client` round-trip
