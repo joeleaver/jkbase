@@ -199,6 +199,7 @@ pub struct L4Counters {
     pub promotions: u64,
     pub provisional_expired: u64,
     pub c0_grants: u64,
+    pub nonce_reanchors: u64,
     /// Clamp-off (`amp_k==0`) ports whose reflection window closed with a shape signal (high
     /// egress:ingress or destination spray) that was NOT auto-hibernated — the operator/abuse
     /// signal for the retired kill-switch (W-econ/W4). NOT a drop.
@@ -278,6 +279,9 @@ pub(crate) enum L4Event {
     Promotion,
     ProvisionalExpired,
     C0Grant,
+    /// A resumed flow re-anchored its return-leg nonce: the agent had been replaced under it.
+    /// A sustained rate means VMs are being replaced beneath live L4 flows.
+    NonceReanchor,
 }
 
 /// Atomic mirror of [`L4Counters`], incremented lock-free on the hot path.
@@ -306,6 +310,7 @@ struct AtomicCounters {
     promotions: AtomicU64,
     provisional_expired: AtomicU64,
     c0_grants: AtomicU64,
+    nonce_reanchors: AtomicU64,
     reflection_shape_flagged: AtomicU64,
 }
 
@@ -338,6 +343,7 @@ impl AtomicCounters {
             promotions: self.promotions.swap(0, Ordering::Relaxed),
             provisional_expired: self.provisional_expired.swap(0, Ordering::Relaxed),
             c0_grants: self.c0_grants.swap(0, Ordering::Relaxed),
+            nonce_reanchors: self.nonce_reanchors.swap(0, Ordering::Relaxed),
             reflection_shape_flagged: self.reflection_shape_flagged.swap(0, Ordering::Relaxed),
         }
     }
@@ -701,6 +707,7 @@ impl L4Plane {
             L4Event::Promotion => &c.promotions,
             L4Event::ProvisionalExpired => &c.provisional_expired,
             L4Event::C0Grant => &c.c0_grants,
+            L4Event::NonceReanchor => &c.nonce_reanchors,
         };
         field.fetch_add(1, Ordering::Relaxed);
     }
