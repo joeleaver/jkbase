@@ -606,7 +606,26 @@ impl L4Ingress {
         // already sent. (Keying on `src` inherits the existing assumption that a client is its
         // 5-tuple; a NAT recycling a port onto a different client already attaches to a live flow
         // the same way, and ICE/DTLS reject the mismatch on their own credentials.)
-        let restored = identity.get_fresh(&src, now).copied();
+        // A parseable live IP ⇒ warm forward; otherwise (cold, or an unparseable backend) wake.
+        let live_dst = live.and_then(|ip| {
+            format!("{}:{}", ip, self.spec.agent_udp_port)
+                .parse::<SocketAddr>()
+                .ok()
+        });
+
+        // ONLY on the warm path. A cold boot brings up a NEW agent process with an empty flow map
+        // (the agent is the VM's init, so it cannot restart without the VM restarting), and
+        // resuming into that would be worse than churn: the agent's fresh pump restarts
+        // `out_nonce` at 1 while we hold a high `in_nonce_hw`, blanking the return leg until it
+        // climbs back. Scale-to-zero makes that the COMMON path, not a corner — evict, hibernate,
+        // client returns — so this guard is load-bearing, not defensive. Snapshot-resume does
+        // preserve the agent's state and could safely resume, but the wake path cannot tell a
+        // restore from a cold boot here, so it fails safe to a fresh identity.
+        let restored = if live_dst.is_some() {
+            identity.get_fresh(&src, now).copied()
+        } else {
+            None
+        };
         let (flow_id, epoch) = match restored {
             Some(id) => (id.flow_id, id.epoch),
             None => alloc_flow_id(next_flow_id, epoch_for, *epoch_base),
@@ -619,13 +638,6 @@ impl L4Ingress {
         }
         flow.bytes_in = n as u64;
         flow.pkts = 1;
-
-        // A parseable live IP ⇒ warm forward; otherwise (cold, or an unparseable backend) wake.
-        let live_dst = live.and_then(|ip| {
-            format!("{}:{}", ip, self.spec.agent_udp_port)
-                .parse::<SocketAddr>()
-                .ok()
-        });
 
         let outcome = match live_dst {
             Some(dst) => {
@@ -973,6 +985,11 @@ impl L4Ingress {
             let mut st = self.state.lock().unwrap();
             st.vm_dst = Some(dst);
             st.booting = false;
+            // The VM just booted, so the agent is a FRESH process with an empty flow map and reply
+            // pumps whose `out_nonce` starts at 1. Every remembered identity is now stale, and
+            // resuming one would strand the return leg behind our high `in_nonce_hw`. Drop them
+            // all: minting fresh ids is the correct behaviour against a new agent.
+            st.identity.clear();
             let mut jobs = Vec::new();
             for flow in st.flows.values_mut() {
                 if flow.buffer.is_empty() {
@@ -1239,6 +1256,61 @@ mod tests {
         let stale = L4TransitHeader { flow_id: first, epoch: e1, nonce: 7 };
         assert!(port.return_decide(stale, b"reply", later).is_none());
         assert_eq!(port.plane.drain_counters().nonce_replay, 1);
+    }
+
+    /// A COLD admit must never resume: the boot brings up a fresh agent whose reply pumps restart
+    /// `out_nonce` at 1, so resuming our high `in_nonce_hw` would blank the return leg. Scale-to-
+    /// zero makes evict -> hibernate -> client-returns the common path, so this is load-bearing.
+    #[tokio::test]
+    async fn a_cold_admit_never_resumes_a_remembered_identity() {
+        let port = warm_port().await;
+        let src: SocketAddr = "203.0.113.22:41012".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id: first, .. } =
+            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        let later = t0 + Duration::from_secs(6);
+        port.sweep(later);
+
+        // The client returns while the VM is COLD (`live = None`) — the wake path.
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"y", later)
+        else { panic!("re-MISS") };
+        let out = port.reach_admit(src, b"y", later, reservation, "p".into(), None);
+        assert!(matches!(out, ReachOutcome::BootSpawn { .. }), "cold ⇒ wake");
+        let st = port.state.lock().unwrap();
+        assert_ne!(
+            st.flows[&src].flow_id, first,
+            "a cold admit must mint a FRESH identity — the agent it will reach is new"
+        );
+    }
+
+    /// A completed boot invalidates every remembered identity on the port: the agent is a new
+    /// process with an empty flow map, so nothing may be resumed into it.
+    #[tokio::test]
+    async fn a_completed_boot_clears_every_remembered_identity() {
+        let port = cold_port().await;
+        let src: SocketAddr = "203.0.113.23:41013".parse().unwrap();
+        let t0 = Instant::now();
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let _ = port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()));
+        let later = t0 + Duration::from_secs(6);
+        port.sweep(later);
+        assert!(
+            port.state.lock().unwrap().identity.contains(&src),
+            "eviction should have remembered it"
+        );
+
+        port.on_ready("10.0.0.2".into()).await;
+        assert!(
+            !port.state.lock().unwrap().identity.contains(&src),
+            "a fresh agent invalidates every memo"
+        );
     }
 
     /// The memo must not outlive the AGENT's flow entry. Past its TTL the client gets a fresh

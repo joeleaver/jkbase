@@ -250,6 +250,11 @@ impl<K: Eq + Hash + Clone, V> BoundedTtlMap<K, V> {
             .map(|(v, _)| v)
     }
 
+    /// Drop every entry. For a caller whose whole premise has been invalidated at once.
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     /// Drop an entry that has been consumed, so it cannot be read a second time.
     pub fn remove(&mut self, key: &K) -> Option<V> {
         self.map.remove(key).map(|(v, _)| v)
