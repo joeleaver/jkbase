@@ -136,16 +136,29 @@ enum FlowKind {
 /// Pure per-flow bookkeeping — NO socket, NO task (P0-L4-5). The guards are declared with
 /// `established_guard` BEFORE `reservation` so on eviction the `conn_count` gauge drops before the
 /// flow-table slot (`established ≤ total` holds throughout teardown).
-/// The part of a flow that must SURVIVE eviction for the app-visible tuple to stay put. Both nonce
-/// counters travel with it: `out_nonce` resumes so the agent's `in_nonce_hw` still sees strict
-/// monotonicity on the forward leg, and `in_nonce_hw` resumes so a reply the old pump sent before
-/// the eviction is still rejected as a replay rather than re-admitted (P0-L4-13).
+/// The part of a flow that must SURVIVE eviction for the app-visible tuple to stay put.
+///
+/// The two nonce counters are NOT symmetric, which is why only one is here.
+///
+/// `out_nonce` (host→agent) is safe to resume either way, and is REQUIRED: if the agent still
+/// holds the flow, continuing above its high-water is the only thing that forwards at all; if it
+/// has forgotten, `create_flow` simply seeds its high-water from whatever we send.
+///
+/// `in_nonce_hw` (agent→host) is deliberately ABSENT. It would only be safe while the agent still
+/// holds the flow, and nothing can establish that: `resolve_vm_ip` reports whether a VM is in the
+/// routing table, not whether the agent PROCESS survived, and the agent also drops entries by LRU
+/// at `AGENT_L4_MAX_FLOWS` on a perfectly warm VM. Resuming a high high-water into an agent that
+/// has moved on hands a fresh pump — which always restarts `out_nonce` at 1 — a wall it must climb
+/// datagram by datagram, blanking the return leg for thousands of packets. So a resumed flow's
+/// return leg starts at 0, exactly like a fresh one, which is the state the agent's pump is built
+/// for. The cost is that a pre-eviction reply can be replayed into the resumed incarnation; that
+/// needs host↔guest bridge capture, and delivers a duplicate the app's own DTLS/SRTP/QUIC replay
+/// window discards.
 #[derive(Clone, Copy)]
 struct FlowIdentity {
     flow_id: u32,
     epoch: u32,
     out_nonce: u64,
-    in_nonce_hw: u64,
 }
 
 struct Flow {
@@ -157,11 +170,6 @@ struct Flow {
     last_seen: Instant,
     /// Agent→host anti-replay high-water for `(flow_id, epoch)` (P0-L4-13).
     in_nonce_hw: u64,
-    /// Set ONLY on a resumed identity: allows the return leg exactly ONE nonce re-anchor, because
-    /// we cannot know whether the agent still holds this flow. Consumed by the first admitted
-    /// reply. A flow that was never resumed has `in_nonce_hw = 0`, so the exception is unreachable
-    /// for it — this cannot weaken anti-replay for any flow that exists today (P0-L4-13).
-    resume_reanchor: bool,
     /// Host→agent monotonic nonce counter (first sent nonce is 1, so the agent's `hw=0` accepts it).
     out_nonce: u64,
     bytes_in: u64,
@@ -185,7 +193,6 @@ impl Flow {
             kind: FlowKind::Provisional,
             created: now,
             last_seen: now,
-            resume_reanchor: false,
             in_nonce_hw: 0,
             out_nonce: 0,
             bytes_in: 0,
@@ -639,8 +646,6 @@ impl L4Ingress {
         let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
         if let Some(id) = restored {
             flow.out_nonce = id.out_nonce;
-            flow.in_nonce_hw = id.in_nonce_hw;
-            flow.resume_reanchor = true;
             identity.remove(&src); // consumed — the identity now lives in `flows` again
         }
         flow.bytes_in = n as u64;
@@ -781,22 +786,12 @@ impl L4Ingress {
             self.plane.count(DropReason::StaleEpoch);
             return None;
         }
-        // Per-(flow_id,epoch) monotonic-nonce anti-replay (P0-L4-13), with ONE re-anchor allowed
-        // on a RESUMED identity. Liveness is not identity: `resolve_vm_ip` only says a VM is in the
-        // routing table, and `on_ready` fires only for wakes THIS port drove — so anything else
-        // that replaced the VM (an HTTP request, a DB relay, a redeploy, `jkbase restart`) leaves
-        // us resuming a high `in_nonce_hw` into a FRESH agent whose pump restarts `out_nonce` at 1.
-        // Without this the return leg would blank until the pump climbed back, which is worse than
-        // the churn the memo removes. One frame, once, only on a resumed flow, only before its
-        // first admitted reply; a never-resumed flow has `hw = 0` so it can never reach this.
+        // Per-(flow_id,epoch) monotonic-nonce anti-replay (P0-L4-13). Unconditional: a resumed
+        // flow carries no high-water forward (see `FlowIdentity`), so this rule needs no exception.
         if hdr.nonce <= flow.in_nonce_hw {
-            if !flow.resume_reanchor {
-                self.plane.count(DropReason::NonceReplay);
-                return None;
-            }
-            self.plane.event(L4Event::NonceReanchor);
+            self.plane.count(DropReason::NonceReplay);
+            return None;
         }
-        flow.resume_reanchor = false;
         flow.in_nonce_hw = hdr.nonce;
         flow.last_seen = now;
 
@@ -930,7 +925,6 @@ impl L4Ingress {
                         flow_id: flow.flow_id,
                         epoch: flow.epoch,
                         out_nonce: flow.out_nonce,
-                        in_nonce_hw: flow.in_nonce_hw,
                     };
                     if let Some(slot) = identity.get_or_insert_with(*src, now, || ident) {
                         *slot = ident;
@@ -1270,31 +1264,33 @@ mod tests {
         assert_eq!((second, e2), (first, e1), "identity must be RESUMED, not re-minted");
         assert!(n2 > n1, "forward nonce must keep climbing for the agent's high-water: {n1} -> {n2}");
 
-        // The high-water survived the resume, but a resumed flow is owed exactly ONE re-anchor —
-        // we cannot know the agent still holds this flow — so the first frame is admitted and
-        // SPENDS the exception. That is the deliberate trade this buys.
+        // The return-leg high-water is deliberately NOT carried across (see `FlowIdentity`), so a
+        // pre-eviction nonce is admitted once into the resumed incarnation. That is the priced
+        // trade: replaying it needs bridge capture and delivers a duplicate the app discards,
+        // whereas carrying the high-water forward would blank the return leg outright whenever the
+        // agent has moved on — which the host cannot detect.
         let stale = L4TransitHeader { flow_id: first, epoch: e1, nonce: 7 };
         assert_eq!(port.return_decide(stale, b"reply", later), Some(src));
-        assert_eq!(port.plane.drain_counters().nonce_reanchors, 1);
-        // Once spent, the high-water rule is back in force.
+        // Monotonicity is enforced from there.
         let stale = L4TransitHeader { flow_id: first, epoch: e1, nonce: 7 };
         assert!(port.return_decide(stale, b"reply", later).is_none());
         assert_eq!(port.plane.drain_counters().nonce_replay, 1);
     }
 
-    /// Liveness is not identity. If something OTHER than this port replaced the VM — an HTTP
-    /// request, a DB relay, a redeploy — `resolve_vm_ip` still says warm and `on_ready` never
-    /// fires, so we resume a high `in_nonce_hw` into a fresh agent whose pump restarts at 1.
-    /// Exactly one re-anchor rescues the return leg; a second low nonce is still a replay.
+    /// The safety property the whole design rests on: a resumed flow carries NO return-leg
+    /// high-water, so it behaves exactly like a fresh flow toward whatever agent it lands on.
+    /// That is what makes resuming safe when the agent has moved on beneath us — a wake this port
+    /// did not drive, an agent LRU eviction on a warm VM, a host restart — none of which the host
+    /// can detect.
     #[tokio::test]
-    async fn a_resumed_flow_re_anchors_once_for_a_replaced_agent() {
+    async fn a_resumed_flow_carries_no_return_leg_high_water() {
         let port = warm_port().await;
         let src: SocketAddr = "203.0.113.24:41014".parse().unwrap();
         let t0 = Instant::now();
 
         let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
         else { panic!("MISS") };
-        let ReachOutcome::Forward { flow_id, epoch, .. } =
+        let ReachOutcome::Forward { flow_id, epoch, nonce: fwd, .. } =
             port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
         else { panic!("warm forward") };
         // Drive the high-water up, as a live media flow would.
@@ -1307,53 +1303,25 @@ mod tests {
         port.sweep(later);
         let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"y", later)
         else { panic!("re-MISS") };
-        let ReachOutcome::Forward { flow_id: f2, epoch: e2, .. } =
+        let ReachOutcome::Forward { flow_id: f2, epoch: e2, nonce: fwd2, .. } =
             port.reach_admit(src, b"y", later, reservation, "p".into(), Some("10.0.0.2".into()))
         else { panic!("warm forward") };
         assert_eq!((f2, e2), (flow_id, epoch), "identity resumed");
+        // The FORWARD counter must keep climbing — a live agent's high-water is still up there.
+        assert!(fwd2 > fwd, "forward nonce must resume: {fwd} -> {fwd2}");
         let _ = port.plane.drain_counters();
 
-        // The VM was replaced beneath us: a BRAND NEW pump, restarting at nonce 1.
+        // A brand-new agent pump, restarting at 1, is admitted immediately — no wall to climb.
         let h = L4TransitHeader { flow_id, epoch, nonce: 1 };
         assert_eq!(
             port.return_decide(h, b"r", later),
             Some(src),
-            "the one-shot re-anchor must rescue the return leg"
+            "a resumed flow must accept a fresh pump's first datagram"
         );
-        let c = port.plane.drain_counters();
-        assert_eq!((c.nonce_reanchors, c.nonce_replay), (1, 0));
-
-        // The pump then climbs normally...
-        let h = L4TransitHeader { flow_id, epoch, nonce: 2 };
-        assert_eq!(port.return_decide(h, b"r", later), Some(src));
-        // ...and the exception is SPENT: a replay is a replay again.
-        let h = L4TransitHeader { flow_id, epoch, nonce: 2 };
+        // ...and monotonicity is enforced again from there.
+        let h = L4TransitHeader { flow_id, epoch, nonce: 1 };
         assert!(port.return_decide(h, b"r", later).is_none());
-        let c = port.plane.drain_counters();
-        assert_eq!((c.nonce_reanchors, c.nonce_replay), (0, 1));
-    }
-
-    /// The exception is reachable ONLY on a resumed flow, so it cannot weaken anti-replay for any
-    /// flow that exists today.
-    #[tokio::test]
-    async fn a_never_resumed_flow_gets_no_re_anchor() {
-        let port = warm_port().await;
-        let src: SocketAddr = "203.0.113.25:41015".parse().unwrap();
-        let t0 = Instant::now();
-        let ReachOutcome::CheckLiveness { reservation, .. } = port.reach_decide(src, b"x", t0)
-        else { panic!("MISS") };
-        let ReachOutcome::Forward { flow_id, epoch, .. } =
-            port.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
-        else { panic!("warm forward") };
-
-        let h = L4TransitHeader { flow_id, epoch, nonce: 9 };
-        assert_eq!(port.return_decide(h, b"r", t0), Some(src));
-        let _ = port.plane.drain_counters();
-        // A replay against a flow that was never resumed is refused outright.
-        let h = L4TransitHeader { flow_id, epoch, nonce: 9 };
-        assert!(port.return_decide(h, b"r", t0).is_none());
-        let c = port.plane.drain_counters();
-        assert_eq!((c.nonce_replay, c.nonce_reanchors), (1, 0));
+        assert_eq!(port.plane.drain_counters().nonce_replay, 1);
     }
 
     /// A COLD admit must never resume: the boot brings up a fresh agent whose reply pumps restart

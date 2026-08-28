@@ -6636,7 +6636,6 @@ async fn metering_loop(
                     c0_grant_rejected = c.c0_grant_rejected, c0_grants = c.c0_grants,
                     wakes_admitted = c.wakes_admitted, wakes_coalesced = c.wakes_coalesced,
                     promotions = c.promotions, provisional_expired = c.provisional_expired,
-                    nonce_reanchors = c.nonce_reanchors,
                     reflection_shape_flagged = c.reflection_shape_flagged,
                     "l4 plane counters (tick)"
                 );
