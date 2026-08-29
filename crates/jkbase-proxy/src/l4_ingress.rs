@@ -438,7 +438,15 @@ impl L4Ingress {
     /// Deliberately carries no return-leg high-water, exactly as [`FlowIdentity`] explains — the
     /// successor starts at 0 and the surviving pump's next reply is admitted whatever it is.
     pub fn export_identities(&self) -> Vec<(SocketAddr, FlowIdentity)> {
-        let st = self.state.lock().unwrap();
+        // NEVER `unwrap` here. This is called from `shutdown_signal`'s upgrade branch, whose whole
+        // purpose is to exit via `process::exit` WITHOUT running destructors — because
+        // `VmInstance::Drop` `start_kill()`s the Firecracker it holds. A panic on a poisoned mutex
+        // would unwind through `block_on` into `main` instead, run those destructors, and SIGKILL
+        // every surviving tenant VM: the exact catastrophe the upgrade path exists to avoid, on
+        // the exact deploy that was meant to be invisible. A poisoned lock means some pump task
+        // panicked, which today kills only that task — it must not escalate to killing the host's
+        // tenants. Take the data anyway; a torn map costs one upgrade's tuple continuity.
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<(SocketAddr, FlowIdentity)> = st
             .flows
             .iter()
@@ -722,7 +730,9 @@ impl L4Ingress {
         };
         let (flow_id, epoch) = match restored {
             Some(id) => (id.flow_id, id.epoch),
-            None => alloc_flow_id(next_flow_id, epoch_for, *epoch_base),
+            None => alloc_flow_id(next_flow_id, epoch_for, *epoch_base, &|id| {
+                by_flow_id.contains_key(&id) || identity.iter().any(|(_, v)| v.flow_id == id)
+            }),
         };
         let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
         if let Some(id) = restored {
@@ -1170,7 +1180,24 @@ fn alloc_flow_id(
     next_flow_id: &mut u32,
     epoch_for: &mut HashMap<u32, u32>,
     epoch_base: u32,
+    in_use: &dyn Fn(u32) -> bool,
 ) -> (u32, u32) {
+    // Skip an id that is already spoken for. Within one process the monotonic counter made this
+    // impossible, but a hand-off seeds ids minted by the PREVIOUS process while our counter starts
+    // from our own `process_epoch_seed()` — and both seeds are `subsec_nanos()`, uniform in
+    // [0, 1e9), i.e. the low ~23% of the u32 space, so the two ranges genuinely overlap. Walking
+    // onto a seeded id would have `by_flow_id.insert` steal the other client's demux entry and
+    // blackhole its return leg — the very failure this arc exists to remove. Epoch distinctness
+    // would stop it becoming a cross-client DISCLOSURE (the misdirected frame dies at
+    // `StaleEpoch`), but not the blackhole. Bounded probe: after this many attempts take what we
+    // have rather than spin — a collision then is no worse than the pre-hand-off behaviour.
+    const MAX_PROBE: u8 = 8;
+    for _ in 0..MAX_PROBE {
+        if !in_use(*next_flow_id) {
+            break;
+        }
+        *next_flow_id = next_flow_id.wrapping_add(1);
+    }
     let fid = *next_flow_id;
     *next_flow_id = next_flow_id.wrapping_add(1);
     let epoch = match epoch_for.get(&fid) {
@@ -1704,23 +1731,23 @@ mod tests {
         // "Prior process": flow_ids 0,1 allocated at a LOW epoch base.
         let mut next = 0u32;
         let mut epoch_for = HashMap::new();
-        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100), (0, 100));
-        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100), (1, 100));
+        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100, &|_| false), (0, 100));
+        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100, &|_| false), (1, 100));
 
         // A reused flow_id (only after a 2^32 wrap in one run) bumps strictly ABOVE the run's
         // fresh epoch — never colliding with a live entry for the same id.
         let mut reuse_next = 0u32; // points back at flow_id 0, which is already in `epoch_for`
-        let (fid, epoch) = alloc_flow_id(&mut reuse_next, &mut epoch_for, 100);
+        let (fid, epoch) = alloc_flow_id(&mut reuse_next, &mut epoch_for, 100, &|_| false);
         assert_eq!((fid, epoch), (0, 101));
     }
 
     #[test]
     fn post_restart_higher_epoch_base_supersedes_same_flow_id() {
         // A re-adopted VM's agent still holds (flow_id=0, epoch=100) after a host-process restart.
-        let (_f_old, epoch_old) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 100);
+        let (_f_old, epoch_old) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 100, &|_| false);
         // The restarted process re-seeds a STRICTLY GREATER epoch base (wall-clock advanced) and
         // its flow_id counter reset to 0 → it reuses flow_id 0.
-        let (f_new, epoch_new) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 200);
+        let (f_new, epoch_new) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 200, &|_| false);
         assert_eq!(f_new, 0);
         // The agent's `epoch > stored ⇒ supersede` path fires (fresh loopback socket + hw reset),
         // so the reconnecting client is NOT dropped until the stale entry idle-evicts.
@@ -1728,6 +1755,22 @@ mod tests {
             epoch_new > epoch_old,
             "post-restart epoch must exceed the prior epoch for the same flow_id"
         );
+    }
+
+    /// A hand-off seeds ids from the PREVIOUS process's counter while ours starts elsewhere, and
+    /// both seeds are `subsec_nanos()` — the low ~23% of the u32 space — so the ranges overlap.
+    /// Allocating onto a seeded id would steal its `by_flow_id` entry and blackhole that client.
+    #[test]
+    fn alloc_skips_ids_already_spoken_for() {
+        let mut next = 40u32;
+        let mut epoch_for = HashMap::new();
+        // 40, 41 and 42 are taken (live or seeded); 43 is the first free one.
+        let taken = |id: u32| (40..=42).contains(&id);
+        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 7, &taken), (43, 7));
+        // The probe is BOUNDED — a pathological table must not spin the datagram path.
+        let mut next = 0u32;
+        let (fid, _) = alloc_flow_id(&mut next, &mut epoch_for, 7, &|_| true);
+        assert_eq!(fid, 8, "gives up after MAX_PROBE rather than looping");
     }
 
     #[test]

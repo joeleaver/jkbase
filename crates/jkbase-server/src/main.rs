@@ -2329,7 +2329,17 @@ async fn shutdown_signal(
         // hibernates the VMs, so there is no surviving agent to resume against and a hand-off
         // would be a lie. Best-effort — a failure costs tuple continuity for one upgrade, never
         // correctness.
-        l4_runtime::snapshot_handover(&l4_registry, &data_dir).await;
+        // Best-effort AND panic-proof: this runs upstream of `upgrade_kind`, the drain and the
+        // DRAIN_GRACE watchdog, so an unwind here would escape into `main`, run `PlatformState`'s
+        // destructors and SIGKILL every survivor. Catch it and carry on with the upgrade.
+        use futures_util::FutureExt as _;
+        if std::panic::AssertUnwindSafe(l4_runtime::snapshot_handover(&l4_registry, &data_dir))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            tracing::error!("l4 handover: snapshot panicked — continuing the upgrade without it");
+        }
         proxy_shutdown.cancel();
         storage_shutdown.cancel();
         auth_shutdown.cancel();

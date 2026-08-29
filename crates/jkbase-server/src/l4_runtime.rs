@@ -97,15 +97,26 @@ pub mod handover {
         let Ok(json) = serde_json::to_vec(h) else {
             return;
         };
-        if let Err(e) = std::fs::write(&p, json) {
+        // `data_dir` is owned by the DEPLOY USER (`provision.sh` chowns /var/jkbase), while we run
+        // as root — so this path is attacker-influenceable and must be created, not written into.
+        // Unlink first (which removes a planted symlink), then `create_new` so we fail rather than
+        // follow anything that reappears in between. Mode 0600 at creation, never after: these are
+        // the client addresses of every live UDP session.
+        let _ = std::fs::remove_file(&p);
+        let opened = {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
+            }
+            o.open(&p)
+        };
+        let res = opened.and_then(|mut f| std::io::Write::write_all(&mut f, &json));
+        if let Err(e) = res {
             warn!(error = %e, path = %p.display(), "l4 handover: write failed (sessions will churn)");
-            return;
-        }
-        // Client addresses of every live UDP session — readable only by the service user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::remove_file(&p);
         }
     }
 
@@ -113,10 +124,44 @@ pub mod handover {
     /// one can never be applied twice or linger into an unrelated restart.
     pub fn take(data_dir: &Path) -> Vec<PortIdentities> {
         let p = path(data_dir);
-        let Ok(bytes) = std::fs::read(&p) else {
+        // Open BEFORE the ownership check and stat the handle, so the thing we validate is the
+        // thing we read — a path re-pointed between check and open would otherwise slip through.
+        let Ok(f) = std::fs::File::open(&p) else {
             return Vec::new();
         };
-        let _ = std::fs::remove_file(&p);
+        // Only a file ROOT wrote is ours. `data_dir` is deploy-user-owned, so anyone with write
+        // access there can plant one — and its contents choose which `(flow_id, epoch, out_nonce)`
+        // a given client resumes, i.e. which agent socket a chosen `src` attaches to. Chowning to
+        // root needs root, so this check is what makes the file trustworthy rather than merely
+        // present. A rejected file is still removed below so it cannot wedge every future upgrade.
+        #[cfg(unix)]
+        let ok = {
+            use std::os::unix::fs::MetadataExt;
+            match f.metadata() {
+                Ok(m) => {
+                    let good = m.uid() == 0 && m.mode() & 0o177 == 0;
+                    if !good {
+                        warn!(
+                            uid = m.uid(), mode = format!("{:o}", m.mode() & 0o777),
+                            "l4 handover: not root-owned 0600 — ignoring (planted?)"
+                        );
+                    }
+                    good
+                }
+                Err(_) => false,
+            }
+        };
+        #[cfg(not(unix))]
+        let ok = true;
+        let bytes = if ok {
+            std::io::read_to_string(f).map(String::into_bytes).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        drop(std::fs::remove_file(&p));
+        if bytes.is_empty() {
+            return Vec::new();
+        }
         let Ok(h) = serde_json::from_slice::<Handover>(&bytes) else {
             warn!("l4 handover: unparseable, ignoring");
             return Vec::new();
