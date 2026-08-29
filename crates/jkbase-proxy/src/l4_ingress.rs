@@ -187,11 +187,11 @@ enum FlowKind {
 /// dies at `JKRUNFW`, whose UDP conntrack match is exact-5-tuple. So the replay needs host-level
 /// injection, which is already total compromise. Weighed against the alternative,
 /// which blanks the return leg for thousands of datagrams whenever the agent has moved on.
-#[derive(Clone, Copy)]
-struct FlowIdentity {
-    flow_id: u32,
-    epoch: u32,
-    out_nonce: u64,
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct FlowIdentity {
+    pub flow_id: u32,
+    pub epoch: u32,
+    pub out_nonce: u64,
 }
 
 struct Flow {
@@ -420,6 +420,73 @@ impl L4Ingress {
             _ = s2.return_loop() => {},
             _ = s3.sweep_loop() => {},
             _ = self.cancel.cancelled() => {},
+        }
+    }
+
+    /// Every client identity this port would want back after a HOST RESTART: the live flows plus
+    /// anything already remembered. Snapshotted on an upgrade shutdown and handed to the successor.
+    ///
+    /// Why this closes the zero-bounce hole for L4. The upgrade path deliberately leaves tenant VMs
+    /// RUNNING for re-adoption, so the app and its agent survive — but `epoch_base` is reseeded per
+    /// process, so without this every client gets a fresh `(flow_id, epoch)`, the agent takes
+    /// `Decision::New`/`Supersede`, `create_flow` binds a fresh loopback socket, and every
+    /// tuple-pinning session dies at the moment the upgrade was supposed to be invisible.
+    /// Re-seeding the memo makes the successor's first datagram resume the SAME `(flow_id, epoch)`
+    /// above the agent's existing high-water, so the agent takes `Decision::Forward` on the socket
+    /// it already holds and the app never sees a new tuple.
+    ///
+    /// Deliberately carries no return-leg high-water, exactly as [`FlowIdentity`] explains — the
+    /// successor starts at 0 and the surviving pump's next reply is admitted whatever it is.
+    pub fn export_identities(&self) -> Vec<(SocketAddr, FlowIdentity)> {
+        // NEVER `unwrap` here. This is called from `shutdown_signal`'s upgrade branch, whose whole
+        // purpose is to exit via `process::exit` WITHOUT running destructors — because
+        // `VmInstance::Drop` `start_kill()`s the Firecracker it holds. A panic on a poisoned mutex
+        // would unwind through `block_on` into `main` instead, run those destructors, and SIGKILL
+        // every surviving tenant VM: the exact catastrophe the upgrade path exists to avoid, on
+        // the exact deploy that was meant to be invisible. A poisoned lock means some pump task
+        // panicked, which today kills only that task — it must not escalate to killing the host's
+        // tenants. Take the data anyway; a torn map costs one upgrade's tuple continuity.
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(SocketAddr, FlowIdentity)> = st
+            .flows
+            .iter()
+            .map(|(src, f)| {
+                (
+                    *src,
+                    FlowIdentity {
+                        flow_id: f.flow_id,
+                        epoch: f.epoch,
+                        out_nonce: f.out_nonce,
+                    },
+                )
+            })
+            .collect();
+        // A live flow always wins over a remembered one for the same `src` (it is the newer truth).
+        for (src, id) in st.identity.iter() {
+            if !st.flows.contains_key(src) {
+                out.push((*src, *id));
+            }
+        }
+        out
+    }
+
+    /// Seed identities handed over by the previous process. Entries land in the ordinary memo, so
+    /// they expire on the ordinary [`IDENTITY_MEMO_TTL`] and are subject to every rule a
+    /// locally-remembered identity is — there is no privileged "restored" state to reason about.
+    pub fn seed_identities(&self, entries: Vec<(SocketAddr, FlowIdentity)>, now: Instant) {
+        /// A real `out_nonce` counts datagrams sent on ONE flow, so it cannot plausibly exceed
+        /// this in any host's lifetime. Anything past it came from a forged hand-off, and would
+        /// wrap `flow.out_nonce += 1` to 0 in release (killing that flow's forward leg against the
+        /// agent's high-water) or panic in debug UNDER THE PORT LOCK, poisoning it.
+        const MAX_PLAUSIBLE_OUT_NONCE: u64 = 1 << 40;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (src, id) in entries {
+            if id.out_nonce >= MAX_PLAUSIBLE_OUT_NONCE {
+                continue;
+            }
+            if let Some(slot) = st.identity.get_or_insert_with(src, now, || id) {
+                *slot = id;
+            }
         }
     }
 
@@ -671,7 +738,9 @@ impl L4Ingress {
         };
         let (flow_id, epoch) = match restored {
             Some(id) => (id.flow_id, id.epoch),
-            None => alloc_flow_id(next_flow_id, epoch_for, *epoch_base),
+            None => alloc_flow_id(next_flow_id, epoch_for, *epoch_base, &|id| {
+                by_flow_id.contains_key(&id) || identity.iter().any(|(_, v)| v.flow_id == id)
+            }),
         };
         let mut flow = Flow::provisional(flow_id, epoch, reservation, now);
         if let Some(id) = restored {
@@ -1119,7 +1188,24 @@ fn alloc_flow_id(
     next_flow_id: &mut u32,
     epoch_for: &mut HashMap<u32, u32>,
     epoch_base: u32,
+    in_use: &dyn Fn(u32) -> bool,
 ) -> (u32, u32) {
+    // Skip an id that is already spoken for. Within one process the monotonic counter made this
+    // impossible, but a hand-off seeds ids minted by the PREVIOUS process while our counter starts
+    // from our own `process_epoch_seed()` — and both seeds are `subsec_nanos()`, uniform in
+    // [0, 1e9), i.e. the low ~23% of the u32 space, so the two ranges genuinely overlap. Walking
+    // onto a seeded id would have `by_flow_id.insert` steal the other client's demux entry and
+    // blackhole its return leg — the very failure this arc exists to remove. Epoch distinctness
+    // would stop it becoming a cross-client DISCLOSURE (the misdirected frame dies at
+    // `StaleEpoch`), but not the blackhole. Bounded probe: after this many attempts take what we
+    // have rather than spin — a collision then is no worse than the pre-hand-off behaviour.
+    const MAX_PROBE: u8 = 8;
+    for _ in 0..MAX_PROBE {
+        if !in_use(*next_flow_id) {
+            break;
+        }
+        *next_flow_id = next_flow_id.wrapping_add(1);
+    }
     let fid = *next_flow_id;
     *next_flow_id = next_flow_id.wrapping_add(1);
     let epoch = match epoch_for.get(&fid) {
@@ -1457,6 +1543,102 @@ mod tests {
         );
     }
 
+    /// The zero-bounce hole for L4, end to end at the seam. A host restart reseeds `epoch_base`, so
+    /// without a hand-off every client gets a fresh `(flow_id, epoch)` — the agent opens a new
+    /// loopback socket and every tuple-pinning session dies at the exact moment the upgrade was
+    /// meant to be invisible. Exporting into the successor's memo must reproduce the identity
+    /// EXACTLY, epoch included: a matching epoch is what makes the agent take `Decision::Forward`
+    /// on the socket it already holds, whereas a bumped one is `Decision::Supersede` — which
+    /// re-opens the socket and moves the tuple anyway.
+    #[tokio::test]
+    async fn flow_identity_survives_a_host_restart_via_the_handover() {
+        let src: SocketAddr = "203.0.113.30:41020".parse().unwrap();
+        let t0 = Instant::now();
+
+        // --- process A ---
+        let a = warm_port().await;
+        let ReachOutcome::CheckLiveness { reservation, .. } = a.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, epoch, .. } =
+            a.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+        // Drive the forward counter so the resumed one must continue ABOVE the agent's high-water.
+        for _ in 0..5 {
+            let _ = a.reach_decide(src, b"x", t0);
+        }
+        let exported = a.export_identities();
+        assert_eq!(exported.len(), 1, "a live flow must be exported, not just remembered ones");
+        let sent = a.state.lock().unwrap().flows[&src].out_nonce;
+
+        // --- process B: a fresh port, so a fresh `epoch_base`, exactly as a restart gives ---
+        let b = warm_port().await;
+        b.seed_identities(exported, t0);
+
+        let ReachOutcome::CheckLiveness { reservation, .. } = b.reach_decide(src, b"y", t0)
+        else { panic!("MISS on the successor") };
+        let ReachOutcome::Forward { flow_id: f2, epoch: e2, nonce, .. } =
+            b.reach_admit(src, b"y", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        assert_eq!(
+            (f2, e2), (flow_id, epoch),
+            "the successor must reproduce the identity exactly — a bumped epoch supersedes and \
+             re-opens the agent's socket, moving the very tuple this exists to keep"
+        );
+        assert!(
+            nonce > sent,
+            "the forward nonce must continue above the agent's existing high-water: {sent} -> {nonce}"
+        );
+    }
+
+    /// Without the hand-off the successor mints a fresh identity — i.e. the test above is measuring
+    /// the hand-off and not something that would hold anyway.
+    #[tokio::test]
+    async fn without_a_handover_a_restart_churns_the_identity() {
+        let src: SocketAddr = "203.0.113.31:41021".parse().unwrap();
+        let t0 = Instant::now();
+
+        let a = warm_port().await;
+        let ReachOutcome::CheckLiveness { reservation, .. } = a.reach_decide(src, b"x", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id, .. } =
+            a.reach_admit(src, b"x", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+
+        let b = warm_port().await; // no seeding
+        let ReachOutcome::CheckLiveness { reservation, .. } = b.reach_decide(src, b"y", t0)
+        else { panic!("MISS") };
+        let ReachOutcome::Forward { flow_id: f2, .. } =
+            b.reach_admit(src, b"y", t0, reservation, "p".into(), Some("10.0.0.2".into()))
+        else { panic!("warm forward") };
+        // `next_flow_id` is seeded from `subsec_nanos()`, so a fresh process starts elsewhere.
+        // (`epoch_base` is wall-clock SECONDS, so two ports built inside one test tick share it —
+        // a real restart takes >=1s and bumps it, which is the P0-L4-13 supersede property.)
+        assert_ne!(f2, flow_id, "without a hand-off the successor mints a fresh identity");
+    }
+
+    /// A forged hand-off must not be able to wedge a flow's forward leg. Only root can plant one,
+    /// so this is insurance rather than a hole — but an absurd `out_nonce` would wrap
+    /// `flow.out_nonce += 1` to 0 in release, or panic in debug while holding the port lock.
+    #[tokio::test]
+    async fn an_absurd_seeded_out_nonce_is_refused() {
+        let port = warm_port().await;
+        let good: SocketAddr = "203.0.113.40:41030".parse().unwrap();
+        let bad: SocketAddr = "203.0.113.41:41031".parse().unwrap();
+        let t0 = Instant::now();
+
+        port.seed_identities(
+            vec![
+                (good, FlowIdentity { flow_id: 11, epoch: 5, out_nonce: 100 }),
+                (bad, FlowIdentity { flow_id: 12, epoch: 5, out_nonce: u64::MAX }),
+            ],
+            t0,
+        );
+        let st = port.state.lock().unwrap();
+        assert!(st.identity.contains(&good), "a plausible identity is seeded");
+        assert!(!st.identity.contains(&bad), "an absurd out_nonce is refused outright");
+    }
+
     /// The memo must not outlive the AGENT's flow entry. Past its TTL the client gets a fresh
     /// identity, because the agent will have opened a fresh socket too — resuming a nonce
     /// high-water the agent has forgotten would blank the return leg instead of fixing it.
@@ -1579,23 +1761,23 @@ mod tests {
         // "Prior process": flow_ids 0,1 allocated at a LOW epoch base.
         let mut next = 0u32;
         let mut epoch_for = HashMap::new();
-        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100), (0, 100));
-        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100), (1, 100));
+        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100, &|_| false), (0, 100));
+        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 100, &|_| false), (1, 100));
 
         // A reused flow_id (only after a 2^32 wrap in one run) bumps strictly ABOVE the run's
         // fresh epoch — never colliding with a live entry for the same id.
         let mut reuse_next = 0u32; // points back at flow_id 0, which is already in `epoch_for`
-        let (fid, epoch) = alloc_flow_id(&mut reuse_next, &mut epoch_for, 100);
+        let (fid, epoch) = alloc_flow_id(&mut reuse_next, &mut epoch_for, 100, &|_| false);
         assert_eq!((fid, epoch), (0, 101));
     }
 
     #[test]
     fn post_restart_higher_epoch_base_supersedes_same_flow_id() {
         // A re-adopted VM's agent still holds (flow_id=0, epoch=100) after a host-process restart.
-        let (_f_old, epoch_old) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 100);
+        let (_f_old, epoch_old) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 100, &|_| false);
         // The restarted process re-seeds a STRICTLY GREATER epoch base (wall-clock advanced) and
         // its flow_id counter reset to 0 → it reuses flow_id 0.
-        let (f_new, epoch_new) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 200);
+        let (f_new, epoch_new) = alloc_flow_id(&mut 0u32, &mut HashMap::new(), 200, &|_| false);
         assert_eq!(f_new, 0);
         // The agent's `epoch > stored ⇒ supersede` path fires (fresh loopback socket + hw reset),
         // so the reconnecting client is NOT dropped until the stale entry idle-evicts.
@@ -1603,6 +1785,22 @@ mod tests {
             epoch_new > epoch_old,
             "post-restart epoch must exceed the prior epoch for the same flow_id"
         );
+    }
+
+    /// A hand-off seeds ids from the PREVIOUS process's counter while ours starts elsewhere, and
+    /// both seeds are `subsec_nanos()` — the low ~23% of the u32 space — so the ranges overlap.
+    /// Allocating onto a seeded id would steal its `by_flow_id` entry and blackhole that client.
+    #[test]
+    fn alloc_skips_ids_already_spoken_for() {
+        let mut next = 40u32;
+        let mut epoch_for = HashMap::new();
+        // 40, 41 and 42 are taken (live or seeded); 43 is the first free one.
+        let taken = |id: u32| (40..=42).contains(&id);
+        assert_eq!(alloc_flow_id(&mut next, &mut epoch_for, 7, &taken), (43, 7));
+        // The probe is BOUNDED — a pathological table must not spin the datagram path.
+        let mut next = 0u32;
+        let (fid, _) = alloc_flow_id(&mut next, &mut epoch_for, 7, &|_| true);
+        assert_eq!(fid, 8, "gives up after MAX_PROBE rather than looping");
     }
 
     #[test]
