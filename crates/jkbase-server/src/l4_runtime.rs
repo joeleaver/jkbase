@@ -97,28 +97,43 @@ pub mod handover {
         pub ports: Vec<PortIdentities>,
     }
 
+    /// How old a hand-off stamped `written_at` is, or `None` if that cannot be answered safely.
+    ///
+    /// The single place the question is asked, so the file-level gate and the per-seed anchor
+    /// cannot disagree about what "old" means. `written_at` is wall-clock while the memo TTL is
+    /// monotonic, and only ONE direction of skew is dangerous: a BACKWARDS step makes the hand-off
+    /// look younger and over-extends the TTL past the agent's own flow entry, which is exactly what
+    /// the bound exists to prevent. A `saturating_sub` would answer that unanswerable case with 0 —
+    /// the most permissive possible answer — so a future stamp returns `None` and the seeds are
+    /// dropped instead. A forwards step only ages us out early, which is the safe failure.
+    fn age(written_at: u64) -> Option<Duration> {
+        if written_at == 0 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.checked_sub(written_at).map(Duration::from_secs)
+    }
+
     /// The `Instant` a hand-off written `written_at` corresponds to, or `None` once it has aged
     /// past [`MAX_AGE`]. Seeding anchors the memo TTL to this rather than to bind time: a port can
     /// bind minutes after startup (its transit secret may not resolve on the first tick), and a
     /// stale identity given a fresh TTL would outlive the agent's own flow entry — resuming into
     /// `Decision::New`, a fresh socket, a moved tuple, and an id burned for nothing.
     pub fn anchor(written_at: u64) -> Option<std::time::Instant> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // `written_at` is wall-clock while the memo TTL is monotonic, so a clock step between
-        // write and read skews this. Only ONE direction is dangerous: a BACKWARDS step makes the
-        // hand-off look younger, over-extending the TTL past the agent's own entry — the thing the
-        // bound exists to prevent. `now < written_at` is exactly that, so treat it as stale rather
-        // than trust it. A forwards step only ages us out early, which is the safe failure.
-        if written_at == 0 || now < written_at {
-            return None;
-        }
-        let age = Duration::from_secs(now - written_at);
+        let age = age(written_at)?;
         if age >= MAX_AGE {
             return None;
         }
+        // `checked_sub` here is load-bearing, not defensive tidiness: `Instant` is CLOCK_MONOTONIC,
+        // which starts at BOOT, so this returns `None` exactly when uptime < age — i.e. the host
+        // booted after the hand-off was written. A reboot means every tenant VM and every agent is
+        // gone, so dropping the seeds is precisely right. Together with `MAX_AGE` it covers reboot
+        // with no gap: a fast reboot has age > uptime and fails here, a slow one trips `MAX_AGE`.
+        // Do NOT "simplify" this to `unwrap_or(Instant::now())` — that silently removes reboot
+        // detection and resurrects identities against agents that no longer exist.
         std::time::Instant::now().checked_sub(age)
     }
 
@@ -239,15 +254,14 @@ pub mod handover {
             warn!("l4 handover: unparseable, ignoring");
             return None;
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let age = now.saturating_sub(h.written_at);
-        if age > MAX_AGE.as_secs() {
-            warn!(age_secs = age, "l4 handover: stale, ignoring");
+        let Some(age) = age(h.written_at).filter(|a| *a <= MAX_AGE) else {
+            warn!(
+                written_at = h.written_at,
+                "l4 handover: stale or stamped in the future — ignoring"
+            );
             return None;
-        }
+        };
+        let age = age.as_secs();
         let flows: usize = h.ports.iter().map(|(_, _, v)| v.len()).sum();
         info!(ports = h.ports.len(), flows, age_secs = age, "l4 handover: resuming flow identities");
         Some(h)
