@@ -474,8 +474,16 @@ impl L4Ingress {
     /// they expire on the ordinary [`IDENTITY_MEMO_TTL`] and are subject to every rule a
     /// locally-remembered identity is — there is no privileged "restored" state to reason about.
     pub fn seed_identities(&self, entries: Vec<(SocketAddr, FlowIdentity)>, now: Instant) {
-        let mut st = self.state.lock().unwrap();
+        /// A real `out_nonce` counts datagrams sent on ONE flow, so it cannot plausibly exceed
+        /// this in any host's lifetime. Anything past it came from a forged hand-off, and would
+        /// wrap `flow.out_nonce += 1` to 0 in release (killing that flow's forward leg against the
+        /// agent's high-water) or panic in debug UNDER THE PORT LOCK, poisoning it.
+        const MAX_PLAUSIBLE_OUT_NONCE: u64 = 1 << 40;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         for (src, id) in entries {
+            if id.out_nonce >= MAX_PLAUSIBLE_OUT_NONCE {
+                continue;
+            }
             if let Some(slot) = st.identity.get_or_insert_with(src, now, || id) {
                 *slot = id;
             }
@@ -1607,6 +1615,28 @@ mod tests {
         // (`epoch_base` is wall-clock SECONDS, so two ports built inside one test tick share it —
         // a real restart takes >=1s and bumps it, which is the P0-L4-13 supersede property.)
         assert_ne!(f2, flow_id, "without a hand-off the successor mints a fresh identity");
+    }
+
+    /// A forged hand-off must not be able to wedge a flow's forward leg. Only root can plant one,
+    /// so this is insurance rather than a hole — but an absurd `out_nonce` would wrap
+    /// `flow.out_nonce += 1` to 0 in release, or panic in debug while holding the port lock.
+    #[tokio::test]
+    async fn an_absurd_seeded_out_nonce_is_refused() {
+        let port = warm_port().await;
+        let good: SocketAddr = "203.0.113.40:41030".parse().unwrap();
+        let bad: SocketAddr = "203.0.113.41:41031".parse().unwrap();
+        let t0 = Instant::now();
+
+        port.seed_identities(
+            vec![
+                (good, FlowIdentity { flow_id: 11, epoch: 5, out_nonce: 100 }),
+                (bad, FlowIdentity { flow_id: 12, epoch: 5, out_nonce: u64::MAX }),
+            ],
+            t0,
+        );
+        let st = port.state.lock().unwrap();
+        assert!(st.identity.contains(&good), "a plausible identity is seeded");
+        assert!(!st.identity.contains(&bad), "an absurd out_nonce is refused outright");
     }
 
     /// The memo must not outlive the AGENT's flow entry. Past its TTL the client gets a fresh

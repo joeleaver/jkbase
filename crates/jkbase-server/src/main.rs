@@ -2357,6 +2357,9 @@ async fn shutdown_signal(
         return;
     }
 
+    // Normal shutdown: the VMs hibernate, so no agent survives to resume against. Drop any
+    // hand-off rather than leaving the client 5-tuples of every live session on disk.
+    l4_runtime::handover::discard(&data_dir);
     info!("shutdown signal received, hibernating running VMs...");
 
     let running_projects: Vec<String> = {

@@ -107,11 +107,52 @@ pub mod handover {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let age = Duration::from_secs(now.saturating_sub(written_at));
-        if written_at == 0 || age >= MAX_AGE {
+        // `written_at` is wall-clock while the memo TTL is monotonic, so a clock step between
+        // write and read skews this. Only ONE direction is dangerous: a BACKWARDS step makes the
+        // hand-off look younger, over-extending the TTL past the agent's own entry — the thing the
+        // bound exists to prevent. `now < written_at` is exactly that, so treat it as stale rather
+        // than trust it. A forwards step only ages us out early, which is the safe failure.
+        if written_at == 0 || now < written_at {
+            return None;
+        }
+        let age = Duration::from_secs(now - written_at);
+        if age >= MAX_AGE {
             return None;
         }
         std::time::Instant::now().checked_sub(age)
+    }
+
+    /// Largest hand-off we will read. Bounds the read even though only root can write the file:
+    /// ~37k identities is the host-wide ceiling and each is well under 100 bytes.
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// Remove whatever is at `p`, INCLUDING a directory. `remove_file` cannot remove one, so a
+    /// single planted `mkdir` would otherwise fail `create_new` on every upgrade forever while
+    /// `File::open` succeeds on the read side and the read fails `EISDIR` — a permanent, quiet
+    /// disabling of the feature with only a warn per deploy. Rare and root-adjacent, but it is the
+    /// one plant that persists, so say so loudly and clear it.
+    fn clear_path(p: &Path) {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => {
+                error!(path = %p.display(), "l4 handover: a DIRECTORY is planted at the hand-off path — removing");
+                let _ = std::fs::remove_dir_all(p);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(p);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Remove any hand-off left behind. Called on the NORMAL shutdown branch: that path hibernates
+    /// the VMs, so nothing could be resumed against them anyway, and a file left lying around holds
+    /// the client 5-tuples of every session that was live when the host went down.
+    pub fn discard(data_dir: &Path) {
+        let p = path(data_dir);
+        if p.exists() {
+            info!("l4 handover: discarding (normal shutdown — VMs hibernate, nothing to resume)");
+            clear_path(&p);
+        }
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -130,7 +171,7 @@ pub mod handover {
         // Unlink first (which removes a planted symlink), then `create_new` so we fail rather than
         // follow anything that reappears in between. Mode 0600 at creation, never after: these are
         // the client addresses of every live UDP session.
-        let _ = std::fs::remove_file(&p);
+        clear_path(&p);
         let opened = {
             let mut o = std::fs::OpenOptions::new();
             o.write(true).create_new(true);
@@ -182,11 +223,15 @@ pub mod handover {
         #[cfg(not(unix))]
         let ok = true;
         let bytes = if ok {
-            std::io::read_to_string(f).map(String::into_bytes).unwrap_or_default()
+            let mut buf = Vec::new();
+            match std::io::Read::read_to_end(&mut std::io::Read::take(f, MAX_BYTES), &mut buf) {
+                Ok(_) => buf,
+                Err(_) => Vec::new(),
+            }
         } else {
             Vec::new()
         };
-        drop(std::fs::remove_file(&p));
+        clear_path(&p);
         if bytes.is_empty() {
             return None;
         }
