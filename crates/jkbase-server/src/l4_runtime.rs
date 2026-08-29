@@ -64,6 +64,17 @@ pub async fn snapshot_handover(registry: &L4PortRegistry, data_dir: &Path) {
 /// is no surviving agent to resume against) and consumed exactly once at startup. A plain file
 /// beside `.upgrading` rather than control-plane state: it is host-local, worthless after seconds,
 /// and must not outlive the process pair that shares it.
+///
+/// SCOPE, so the claim is not overread. This preserves flow IDENTITY across an upgrade, not
+/// packets: the L4 edge sockets are NOT socket-activated the way `:80`/`:443` are, so datagrams
+/// arriving during the restart are still lost. What survives is the app-visible tuple, which is
+/// what a pinning protocol cannot re-negotiate — a UDP app already tolerates loss and will
+/// retransmit, but it cannot recover from its peer's address changing underneath it.
+///
+/// DEPENDS ON `systemctl restart` BEING STOP-THEN-START (`tools/deploy-server.sh`), so the
+/// predecessor's write strictly precedes the successor's read. If the service ever gains
+/// socket-activated overlap the way the public listeners did, the two would run concurrently, the
+/// read would race the write, and this would degrade to a silent no-op rather than a loud failure.
 pub mod handover {
     use super::*;
     use jkbase_proxy::l4_ingress::FlowIdentity;
@@ -84,6 +95,23 @@ pub mod handover {
         pub written_at: u64,
         /// `(project_id, port_name) -> [(client 5-tuple, identity)]`.
         pub ports: Vec<PortIdentities>,
+    }
+
+    /// The `Instant` a hand-off written `written_at` corresponds to, or `None` once it has aged
+    /// past [`MAX_AGE`]. Seeding anchors the memo TTL to this rather than to bind time: a port can
+    /// bind minutes after startup (its transit secret may not resolve on the first tick), and a
+    /// stale identity given a fresh TTL would outlive the agent's own flow entry — resuming into
+    /// `Decision::New`, a fresh socket, a moved tuple, and an id burned for nothing.
+    pub fn anchor(written_at: u64) -> Option<std::time::Instant> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let age = Duration::from_secs(now.saturating_sub(written_at));
+        if written_at == 0 || age >= MAX_AGE {
+            return None;
+        }
+        std::time::Instant::now().checked_sub(age)
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -122,12 +150,12 @@ pub mod handover {
 
     /// Read and CONSUME the hand-off: the file is removed whether or not it was usable, so a stale
     /// one can never be applied twice or linger into an unrelated restart.
-    pub fn take(data_dir: &Path) -> Vec<PortIdentities> {
+    pub fn take(data_dir: &Path) -> Option<Handover> {
         let p = path(data_dir);
         // Open BEFORE the ownership check and stat the handle, so the thing we validate is the
         // thing we read — a path re-pointed between check and open would otherwise slip through.
         let Ok(f) = std::fs::File::open(&p) else {
-            return Vec::new();
+            return None;
         };
         // Only a file ROOT wrote is ours. `data_dir` is deploy-user-owned, so anyone with write
         // access there can plant one — and its contents choose which `(flow_id, epoch, out_nonce)`
@@ -160,11 +188,11 @@ pub mod handover {
         };
         drop(std::fs::remove_file(&p));
         if bytes.is_empty() {
-            return Vec::new();
+            return None;
         }
         let Ok(h) = serde_json::from_slice::<Handover>(&bytes) else {
             warn!("l4 handover: unparseable, ignoring");
-            return Vec::new();
+            return None;
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -173,11 +201,11 @@ pub mod handover {
         let age = now.saturating_sub(h.written_at);
         if age > MAX_AGE.as_secs() {
             warn!(age_secs = age, "l4 handover: stale, ignoring");
-            return Vec::new();
+            return None;
         }
         let flows: usize = h.ports.iter().map(|(_, _, v)| v.len()).sum();
         info!(ports = h.ports.len(), flows, age_secs = age, "l4 handover: resuming flow identities");
-        h.ports
+        Some(h)
     }
 }
 
@@ -206,12 +234,21 @@ pub async fn serve(
     // `registry` is shared with `main` so an upgrade shutdown can snapshot live flow identities.
     registry: L4PortRegistry,
 ) {
-    // Consume the previous process's hand-off ONCE, before any port binds.
-    let mut seeds: HashMap<(String, String), Vec<(std::net::SocketAddr, jkbase_proxy::l4_ingress::FlowIdentity)>> =
-        handover::take(&data_dir)
-            .into_iter()
-            .map(|(p, n, v)| ((p, n), v))
-            .collect();
+    // Consume the previous process's hand-off ONCE, before any port binds. `written_at` travels
+    // with it: a port can bind minutes later (its transit secret may not resolve on the first
+    // tick), and seeding a stale identity with a FRESH memo TTL would silently defeat the
+    // "expire while the agent still holds the flow" property the whole design leans on.
+    let (mut seeds, handover_written_at) = {
+        let h = handover::take(&data_dir);
+        let at = h.as_ref().map(|h| h.written_at).unwrap_or(0);
+        let map: HashMap<(String, String), Vec<(std::net::SocketAddr, jkbase_proxy::l4_ingress::FlowIdentity)>> =
+            h.map(|h| h.ports)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(p, n, v)| ((p, n), v))
+                .collect();
+        (map, at)
+    };
     // The current backend IP for an already-woken project (the pump's `BootWait` path polls this
     // while a sibling port's boot is in flight). L4 targets the tenant's APP VM, which is in the
     // routing table once running; `None` until then.
@@ -276,11 +313,25 @@ pub async fn serve(
                     if let Some(entries) = seeds.remove(&key)
                         && !entries.is_empty()
                     {
-                        info!(
-                            project = %key.0, port = %key.1, flows = entries.len(),
-                            "l4 handover: seeding resumed flow identities"
-                        );
-                        handle.seed_identities(entries, std::time::Instant::now());
+                        match handover::anchor(handover_written_at) {
+                            Some(anchored) => {
+                                info!(
+                                    project = %key.0, port = %key.1, flows = entries.len(),
+                                    "l4 handover: seeding resumed flow identities"
+                                );
+                                // Anchored at WRITE time, so the memo expires on schedule rather
+                                // than getting a fresh 45s from a late bind.
+                                handle.seed_identities(entries, anchored);
+                            }
+                            None => {
+                                warn!(
+                                    project = %key.0, port = %key.1,
+                                    "l4 handover: identities aged out before this port bound — \
+                                     dropping (the agent's own entries are likely gone too)"
+                                );
+                                seeds.clear();
+                            }
+                        }
                     }
                     registry.lock().await.insert(key.clone(), handle.clone());
                     tokio::spawn(ingress.run());
@@ -334,10 +385,6 @@ pub async fn serve(
             .iter()
             .map(|a| (a.project_id.clone(), a.name.clone()))
             .collect();
-        {
-            let mut reg = registry.lock().await;
-            reg.retain(|k, _| live.contains_key(k));
-        }
         live.retain(|key, lp| {
             if allocated.contains(key) {
                 return true;
@@ -357,6 +404,14 @@ pub async fn serve(
             info!(project = %key.0, l4_port = %key.1, external_port = port, "l4 reconcile: port torn down");
             false
         });
+        // AFTER the teardown, so a port removed on this tick drops its registry `Arc` now rather
+        // than a tick later. That `Arc` is the last owner of the edge + guest sockets once the pump
+        // is cancelled, so holding it would keep them bound for ~5s — which the teardown comment
+        // above says does not happen — and would also export identities for a dead allocation.
+        {
+            let mut reg = registry.lock().await;
+            reg.retain(|k, _| live.contains_key(k));
+        }
 
         tokio::time::sleep(RECONCILE_TICK).await;
     }
