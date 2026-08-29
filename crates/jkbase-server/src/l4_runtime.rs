@@ -18,7 +18,7 @@ use jkbase_control::store::{PortAllocation, Store};
 use jkbase_proxy::l4_ingress::{L4Ingress, L4PortSpec, ResolveVmIp};
 use jkbase_proxy::l4_plane::L4Plane;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,113 @@ use tracing::{debug, error, info, warn};
 /// is fine; the freed-port quarantine covers the ≤tick window before a torn-down port's socket
 /// closes (a stale datagram in that window hits a project with no VM → wake fails → drop).
 const RECONCILE_TICK: Duration = Duration::from_secs(5);
+
+/// Live L4 ports, shared with `main` so an upgrade shutdown can snapshot their flow identities.
+pub type L4PortRegistry = Arc<tokio::sync::Mutex<HashMap<(String, String), Arc<L4Ingress>>>>;
+
+/// Snapshot every live port's flow identities into a hand-off for the upgrade successor.
+pub async fn snapshot_handover(registry: &L4PortRegistry, data_dir: &Path) {
+    let ports: Vec<_> = {
+        let reg = registry.lock().await;
+        reg.iter()
+            .map(|((proj, name), ing)| (proj.clone(), name.clone(), ing.export_identities()))
+            .filter(|(_, _, v)| !v.is_empty())
+            .collect()
+    };
+    if ports.is_empty() {
+        return;
+    }
+    let flows: usize = ports.iter().map(|(_, _, v)| v.len()).sum();
+    info!(ports = ports.len(), flows, "l4 handover: snapshotting flow identities for the successor");
+    handover::write(
+        data_dir,
+        &handover::Handover {
+            written_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            ports,
+        },
+    );
+}
+
+/// Flow identities handed from one host process to its upgrade successor.
+///
+/// Written on an UPGRADE shutdown (never a real one — a real shutdown hibernates the VMs, so there
+/// is no surviving agent to resume against) and consumed exactly once at startup. A plain file
+/// beside `.upgrading` rather than control-plane state: it is host-local, worthless after seconds,
+/// and must not outlive the process pair that shares it.
+pub mod handover {
+    use super::*;
+    use jkbase_proxy::l4_ingress::FlowIdentity;
+    use std::net::SocketAddr;
+
+    /// Discard a hand-off older than this. Matches the identity memo's own TTL — an identity the
+    /// memo would have dropped is not one to resurrect, and an upgrade restart takes seconds, so a
+    /// file this old means the successor did not come up promptly and the agent's own flow entries
+    /// may be gone too.
+    const MAX_AGE: Duration = Duration::from_secs(45);
+
+    /// One port's worth of hand-off: `(project_id, port_name, [(client 5-tuple, identity)])`.
+    pub type PortIdentities = (String, String, Vec<(SocketAddr, FlowIdentity)>);
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub struct Handover {
+        /// UNIX seconds at write, for the staleness check.
+        pub written_at: u64,
+        /// `(project_id, port_name) -> [(client 5-tuple, identity)]`.
+        pub ports: Vec<PortIdentities>,
+    }
+
+    pub fn path(data_dir: &Path) -> PathBuf {
+        data_dir.join("l4-identity-handover.json")
+    }
+
+    /// Write the hand-off. Best-effort by design: a failure costs tuple continuity across this one
+    /// upgrade, never correctness, and must never delay or fail the shutdown.
+    pub fn write(data_dir: &Path, h: &Handover) {
+        let p = path(data_dir);
+        let Ok(json) = serde_json::to_vec(h) else {
+            return;
+        };
+        if let Err(e) = std::fs::write(&p, json) {
+            warn!(error = %e, path = %p.display(), "l4 handover: write failed (sessions will churn)");
+            return;
+        }
+        // Client addresses of every live UDP session — readable only by the service user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    /// Read and CONSUME the hand-off: the file is removed whether or not it was usable, so a stale
+    /// one can never be applied twice or linger into an unrelated restart.
+    pub fn take(data_dir: &Path) -> Vec<PortIdentities> {
+        let p = path(data_dir);
+        let Ok(bytes) = std::fs::read(&p) else {
+            return Vec::new();
+        };
+        let _ = std::fs::remove_file(&p);
+        let Ok(h) = serde_json::from_slice::<Handover>(&bytes) else {
+            warn!("l4 handover: unparseable, ignoring");
+            return Vec::new();
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let age = now.saturating_sub(h.written_at);
+        if age > MAX_AGE.as_secs() {
+            warn!(age_secs = age, "l4 handover: stale, ignoring");
+            return Vec::new();
+        }
+        let flows: usize = h.ports.iter().map(|(_, _, v)| v.len()).sum();
+        info!(ports = h.ports.len(), flows, age_secs = age, "l4 handover: resuming flow identities");
+        h.ports
+    }
+}
 
 /// One live L4 port this host is currently serving.
 struct LivePort {
@@ -51,7 +158,15 @@ pub async fn serve(
     plane: Arc<L4Plane>,
     host_id: String,
     data_dir: PathBuf,
+    // `registry` is shared with `main` so an upgrade shutdown can snapshot live flow identities.
+    registry: L4PortRegistry,
 ) {
+    // Consume the previous process's hand-off ONCE, before any port binds.
+    let mut seeds: HashMap<(String, String), Vec<(std::net::SocketAddr, jkbase_proxy::l4_ingress::FlowIdentity)>> =
+        handover::take(&data_dir)
+            .into_iter()
+            .map(|(p, n, v)| ((p, n), v))
+            .collect();
     // The current backend IP for an already-woken project (the pump's `BootWait` path polls this
     // while a sibling port's boot is in flight). L4 targets the tenant's APP VM, which is in the
     // routing table once running; `None` until then.
@@ -108,6 +223,21 @@ pub async fn serve(
                     // Open the host firewall for this port BEFORE we start pumping (idempotent).
                     fw.allow(external_port).await;
                     let handle = ingress.clone();
+                    // Seed BEFORE the pump starts: a datagram processed ahead of the memo would
+                    // mint a fresh id and move the very tuple this exists to keep still.
+                    // The agent is still running and still holds its loopback sockets, so a
+                    // resumed `(flow_id, epoch)` lands on `Decision::Forward` and the app sees
+                    // nothing at all.
+                    if let Some(entries) = seeds.remove(&key)
+                        && !entries.is_empty()
+                    {
+                        info!(
+                            project = %key.0, port = %key.1, flows = entries.len(),
+                            "l4 handover: seeding resumed flow identities"
+                        );
+                        handle.seed_identities(entries, std::time::Instant::now());
+                    }
+                    registry.lock().await.insert(key.clone(), handle.clone());
                     tokio::spawn(ingress.run());
                     live.insert(
                         key,
@@ -159,6 +289,10 @@ pub async fn serve(
             .iter()
             .map(|a| (a.project_id.clone(), a.name.clone()))
             .collect();
+        {
+            let mut reg = registry.lock().await;
+            reg.retain(|k, _| live.contains_key(k));
+        }
         live.retain(|key, lp| {
             if allocated.contains(key) {
                 return true;

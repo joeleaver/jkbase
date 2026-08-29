@@ -2049,6 +2049,10 @@ async fn async_main() -> Result<()> {
     // closure mirrors the proxy/DB gateway (all call `wake_db_reach`, resolving the app VM);
     // Axis-1/Axis-2 abuse bounds live inside the plane + pump, keyed on base-project/tenant/dest-IP
     // — never the spoofable source (design §3(c)).
+    // Live L4 ports, so an UPGRADE shutdown can hand its flow identities to the successor: the
+    // tenant VM survives a zero-bounce restart, so its agent still holds every loopback socket, and
+    // resuming the identities is what keeps the app-visible tuples from moving underneath it.
+    let l4_registry: l4_runtime::L4PortRegistry = Default::default();
     let l4_plane: Arc<jkbase_proxy::l4_plane::L4Plane> = {
         let platform_for_l4 = platform.clone();
         let routing_for_l4 = routing_table.clone();
@@ -2071,7 +2075,8 @@ async fn async_main() -> Result<()> {
             routing_table.clone(),
             plane.clone(),
             l4_host_id,
-            l4_data_dir,
+            l4_data_dir.clone(),
+            l4_registry.clone(),
         ));
         plane
     };
@@ -2229,6 +2234,7 @@ async fn async_main() -> Result<()> {
             storage_shutdown.clone(),
             auth_shutdown.clone(),
             upgrade_kind.clone(),
+            l4_registry.clone(),
         ))
         .await;
 
@@ -2279,6 +2285,7 @@ fn upgrade_in_progress(data_dir: &Path) -> bool {
     now.saturating_sub(ts) < UPGRADE_FLAG_FRESHNESS_SECS
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn shutdown_signal(
     platform: Arc<Mutex<PlatformState>>,
     routing: jkbase_proxy::RoutingTable,
@@ -2287,6 +2294,7 @@ async fn shutdown_signal(
     storage_shutdown: tokio_util::sync::CancellationToken,
     auth_shutdown: tokio_util::sync::CancellationToken,
     upgrade_kind: Arc<std::sync::atomic::AtomicBool>,
+    l4_registry: l4_runtime::L4PortRegistry,
 ) {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -2316,6 +2324,12 @@ async fn shutdown_signal(
         // graceful shutdown once we RETURN (NOT process::exit inline — that would skip the api
         // drain). Draining touches only connection-level state, never a VmInstance (the proxy's
         // SharedState is disjoint from PlatformState.vms), so no survivor is dropped.
+        // Hand our L4 flow identities to the successor BEFORE draining, so a slow drain or the
+        // DRAIN_GRACE watchdog can never exit past it. Only on THIS branch: a real shutdown
+        // hibernates the VMs, so there is no surviving agent to resume against and a hand-off
+        // would be a lie. Best-effort — a failure costs tuple continuity for one upgrade, never
+        // correctness.
+        l4_runtime::snapshot_handover(&l4_registry, &data_dir).await;
         proxy_shutdown.cancel();
         storage_shutdown.cancel();
         auth_shutdown.cancel();
