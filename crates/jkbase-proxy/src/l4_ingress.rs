@@ -64,12 +64,15 @@ const PORT_SOURCE_TTL: Duration = Duration::from_secs(120);
 /// everything else goes to `GetSelectedTuple()`. So ICE keeps looking healthy while DTLS is posted
 /// forever to a socket the host no longer maps (#87).
 ///
-/// MUST stay strictly BELOW the agent's `FLOW_IDLE_HEADROOM` (60s), so a memo hit implies the agent
-/// still holds the flow and will take its existing-flow path. If the memo could outlive the agent's
-/// entry we would restore an identity the agent has forgotten: it would open a FRESH loopback
-/// socket whose pump restarts `out_nonce` at 1 into our restored high-water, and the return leg
-/// would blank entirely — strictly worse than the churn this fixes.
-const IDENTITY_MEMO_TTL: Duration = Duration::from_secs(45);
+/// The bound is for STALENESS, not safety. Resuming is safe whatever the agent has done — no
+/// return-leg high-water is carried (see [`FlowIdentity`]), so a fresh pump's nonce 1 is admitted
+/// either way. Do NOT read this as "45s keeps us inside the agent's `FLOW_IDLE_HEADROOM`, so
+/// restoring a high-water would be safe again": that ordering cannot be relied on. It assumes
+/// `agent_last_seen ≈ host_last_seen`, and the agent's can lag by boot-buffered datagrams,
+/// `ReplayBufferOverflow`, `agent_map_full`/oversize drops and ordinary transit loss — on an
+/// established flow the slack is only 15s. The bound is here so a remembered identity is dropped
+/// while it is still plausibly useful, and so the map stays small.
+///
 /// WHAT THIS DOES NOT COVER, so "resume" is never read as "tuple churn is solved". It keeps the
 /// tuple across a HOST-side eviction while the agent still holds the flow. It cannot help when the
 /// AGENT loses its own entry, because the tuple is that agent's loopback socket and only the agent
@@ -82,9 +85,11 @@ const IDENTITY_MEMO_TTL: Duration = Duration::from_secs(45);
 ///
 /// Fixing those means keying the agent's loopback socket on something that survives the agent's
 /// own eviction, which is a guest-side change.
-///
+const IDENTITY_MEMO_TTL: Duration = Duration::from_secs(45);
 /// Cardinality bound on remembered identities. Overflow degrades to today's behaviour (mint a
 /// fresh id), never to an unbounded map — same posture as every other aux map (P0-L4-5/-9).
+/// Unreachable at the defaults: a memo needs an eviction and `flow_per_project_max` caps flow
+/// creation, so a port tops out around 2.3k entries and the host around 37k (~3-4 MB).
 const IDENTITY_MEMO_MAX: usize = 16_384;
 
 /// Idle-sweep tick — well under [`PROVISIONAL_IDLE`] so provisional flows don't overstay (L3).
@@ -175,10 +180,12 @@ enum FlowKind {
 /// egress and reflection window. It is contained by REACHABILITY, not by the payload being
 /// harmless: the frame must clear `l4_transit::open(secret, AgentToHost, …)`, so a forged one dies
 /// at `HeaderAuthFail`, and delivering a CAPTURED one to the host's guest-facing socket needs a
-/// source address a runtime VM cannot emit — the per-TAP ebtables guard
-/// (`-i <tap> -p IPv4 ! --ip-src <ip> -j DROP`) is hooked into INPUT as well as FORWARD, and
-/// `JKRUNFW` admits guest→host only for DNS, the public proxy and the DB gateway. So the replay
-/// needs host-level access, which is already total compromise. Weighed against the alternative,
+/// source a runtime VM cannot emit. `install_tap_source_guard` pins four things on INPUT and
+/// FORWARD — source MAC, IPv4 source, ARP source, and a `802_1Q` drop — fail-closed, so a VM
+/// cannot even boot unguarded. That also keeps capture PASSIVE-only: MAC pinning blocks poisoning
+/// the bridge FDB to pull a victim's unicast to your port. Sending from your own address instead
+/// dies at `JKRUNFW`, whose UDP conntrack match is exact-5-tuple. So the replay needs host-level
+/// injection, which is already total compromise. Weighed against the alternative,
 /// which blanks the return leg for thousands of datagrams whenever the agent has moved on.
 #[derive(Clone, Copy)]
 struct FlowIdentity {
@@ -641,8 +648,8 @@ impl L4Ingress {
         //
         // Restoring an id that may still sit in `quarantine` is deliberate and safe: quarantine
         // guards against a LATE REPLY aliasing an id reused by a DIFFERENT client, and this is the
-        // same client resuming — the restored `in_nonce_hw` still rejects anything the old pump
-        // already sent. (Keying on `src` inherits the existing assumption that a client is its
+        // same client resuming onto the same 5-tuple, so there is no cross-owner aliasing to guard
+        // against. (Keying on `src` inherits the existing assumption that a client is its
         // 5-tuple; a NAT recycling a port onto a different client already attaches to a live flow
         // the same way, and ICE/DTLS reject the mismatch on their own credentials.)
         // A parseable live IP ⇒ warm forward; otherwise (cold, or an unparseable backend) wake.
