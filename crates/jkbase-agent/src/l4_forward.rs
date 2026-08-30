@@ -297,7 +297,7 @@ impl LandForward {
                     }
                 },
                 _ = probe.tick() => self.poll_readiness().await,
-                _ = sweep.tick() => self.sweep(),
+                _ = sweep.tick() => self.sweep().await,
             }
         }
     }
@@ -446,7 +446,7 @@ impl LandForward {
                         // filled. On timeout we simply DON'T reuse: the old socket is still bound,
                         // so the derived bind fails, we take the ephemeral fallback, and this one
                         // flow's tuple moves. A bounded loss of the feature, not of the port.
-                        match tokio::time::timeout(SUPERSEDE_JOIN_MAX, old.pump).await {
+                        match tokio::time::timeout(PUMP_JOIN_MAX, old.pump).await {
                             Ok(_) => Some(old.sock),
                             Err(_) => {
                                 warn!(
@@ -499,6 +499,10 @@ impl LandForward {
                 Some(victim) => {
                     if let Some(old) = self.flows.remove(&victim) {
                         old.cancel.notify_one();
+                        // Join before proceeding: the victim's socket stays bound until its pump
+                        // exits, and the flow about to be created may derive that very port —
+                        // or the victim itself may return next and want it back.
+                        let _ = tokio::time::timeout(PUMP_JOIN_MAX, old.pump).await;
                     }
                     self.drops.map_full_evicted += 1;
                 }
@@ -557,17 +561,32 @@ impl LandForward {
     }
 
     /// Idle-evict abandoned flows (leak backstop) + flush the rate-limited drop summary.
-    fn sweep(&mut self) {
+    async fn sweep(&mut self) {
         let now = elapsed_ms(self.base);
         let ttl_ms = self.flow_idle_ttl.as_millis() as u64;
-        self.flows.retain(|_, f| {
+        // `retain` cannot await, so collect the retired pumps and join them after.
+        let mut retired = Vec::new();
+        let mut keep = HashMap::with_capacity(self.flows.len());
+        for (id, f) in self.flows.drain() {
             if now.saturating_sub(f.last_seen.load(Ordering::Relaxed)) > ttl_ms {
                 f.cancel.notify_one();
-                false
+                retired.push(f.pump);
             } else {
-                true
+                keep.insert(id, f);
             }
-        });
+        }
+        self.flows = keep;
+        // ONE bounded wait for the whole batch, not per flow: a reap can retire many at once and
+        // this runs in the land-forward loop. Joining frees each flow's derived port while nothing
+        // is competing for it, so the port is available again if that client comes back.
+        if !retired.is_empty() {
+            let _ = tokio::time::timeout(PUMP_JOIN_MAX, async {
+                for h in retired {
+                    let _ = h.await;
+                }
+            })
+            .await;
+        }
         self.drops.flush(&self.name);
     }
 }
@@ -689,11 +708,21 @@ async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpS
     Ok(sock)
 }
 
-/// Ceiling on waiting for a superseded reply pump to stop. Bounds a self-inflicted head-of-line
-/// block: `deliver` runs in the single land-forward loop, and a supersede needs an authenticated
-/// frame, so only the host or the tenant's own code can drive one — but a tenant CAN, since the
-/// transit secret lives in its VM. Blast radius is that VM's own forwarding loop either way.
-const SUPERSEDE_JOIN_MAX: Duration = Duration::from_millis(50);
+/// Ceiling on waiting for a cancelled reply pump to stop, on every path that retires a flow.
+///
+/// Waiting at all is what makes the derived source port actually reproducible. Cancelling a pump
+/// does not close its socket — the task holds an `Arc<UdpSocket>` clone until it exits, and
+/// dropping its `JoinHandle` DETACHES rather than joins. So a flow retired without a join leaves
+/// its own derived port bound; if the host's next datagram for that `flow_id` arrives first, the
+/// flow collides with its own dying pump and silently takes an ephemeral port. The probe sequence
+/// does not save it: linear probing resolves collisions against OTHER flows, not against yourself,
+/// so the tuple merely oscillates between candidates instead of falling to a kernel port.
+///
+/// The ceiling bounds the cost. Every join runs in the single land-forward loop, so an unbounded
+/// one would head-of-line block every other flow on the port — and a pump can sit in a `send_to`
+/// on a transit socket whose TAP queue the tenant has filled. On timeout we give up the port
+/// (that flow's tuple moves) rather than the loop.
+const PUMP_JOIN_MAX: Duration = Duration::from_millis(50);
 
 /// How many deterministic candidates a flow tries before giving up on a stable port.
 const PORT_PROBES: u32 = 8;
@@ -991,6 +1020,38 @@ mod tests {
             .filter_map(|a| derived_source_port(4242, 9999, a))
             .collect();
         assert_eq!(seq, again, "the sequence must reproduce exactly");
+    }
+
+    /// The failure the eviction joins exist to prevent, at the level `connect_loopback` sees it:
+    /// a flow re-created while its OWN previous socket is still bound cannot get its derived port
+    /// back, so the tuple moves. Cancelling a pump does not close its socket — the task holds an
+    /// `Arc` until it exits, and dropping a `JoinHandle` detaches rather than joins — which is why
+    /// LRU and the idle sweep now join before letting the port go.
+    #[tokio::test]
+    async fn a_flow_reclaims_its_derived_port_only_once_the_old_socket_closes() {
+        // Stand in for the guest app so `connect` succeeds.
+        let app = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let guest_port = app.local_addr().unwrap().port();
+        let flow_id = 4242u32;
+
+        let first = connect_loopback(guest_port, flow_id).await.unwrap();
+        let p1 = first.local_addr().unwrap().port();
+
+        // Re-create while the old socket is STILL OPEN — the lingering-pump case.
+        let second = connect_loopback(guest_port, flow_id).await.unwrap();
+        let p2 = second.local_addr().unwrap().port();
+        assert_ne!(p2, p1, "the old socket still holds p1, so this must land elsewhere");
+
+        // Once both are closed, the flow reclaims its original port — the property that makes the
+        // joins worth doing.
+        drop(first);
+        drop(second);
+        let third = connect_loopback(guest_port, flow_id).await.unwrap();
+        assert_eq!(
+            third.local_addr().unwrap().port(),
+            p1,
+            "with its own port free, a flow must derive the SAME tuple again"
+        );
     }
 
     /// The app's own listening port is never derived — that bind could only ever fail.
