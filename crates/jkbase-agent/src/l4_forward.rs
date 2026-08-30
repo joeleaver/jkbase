@@ -502,8 +502,16 @@ impl LandForward {
                     if let Some(old) = self.flows.remove(&victim) {
                         old.cancel.notify_one();
                         // Join before proceeding: the victim's socket stays bound until its pump
-                        // exits, and the flow about to be created may derive that very port —
-                        // or the victim itself may return next and want it back.
+                        // exits, and the flow about to be created may derive that very port — or
+                        // the victim itself may return next and want it back.
+                        //
+                        // NOTE this puts a join on the PER-DATAGRAM path whenever the map is at
+                        // capacity. Healthy that is ~116us per eviction (a ceiling near 8.6k new
+                        // flows/s, far above anything the plane admits). Wedged it is
+                        // `PUMP_JOIN_MAX` per datagram, which drops this port to ~20pps. Note the
+                        // composition: an EXTERNAL flood supplies the churn while the TENANT'S OWN
+                        // app supplies the wedge, by backing up the TAP its agent writes to. The
+                        // timeout is what keeps that bounded, and it stays inside that one VM.
                         let _ = tokio::time::timeout(PUMP_JOIN_MAX, old.pump).await;
                     }
                     self.drops.map_full_evicted += 1;
@@ -578,16 +586,23 @@ impl LandForward {
             }
         }
         self.flows = keep;
-        // ONE bounded wait for the whole batch, not per flow: a reap can retire many at once and
-        // this runs in the land-forward loop. Joining frees each flow's derived port while nothing
-        // is competing for it, so the port is available again if that client comes back.
+        // ONE bounded wait for the whole batch — but CONCURRENTLY, not in sequence. Awaiting them
+        // in a loop under a single timeout lets one wedged pump consume the entire budget and
+        // leaves every pump behind it unjoined, silently reinstating the very bug the join exists
+        // to prevent (measured: 1 wedged + 8 healthy joined 0 of the 8). A healthy pump parks in
+        // ~116us and a full 256-flow reap joins in single-digit ms, so the ceiling is only ever
+        // reached by a pump that is wedged — exactly the case a join cannot help anyway.
+        //
+        // What this buys is NOT "the port is there when that client returns": the host evicted
+        // that flow at `last_activity + host_idle` and its memo expires 45s later, while our
+        // reaper does not fire until `+ FLOW_IDLE_HEADROOM` (60s) — so by now a returning client
+        // already gets a fresh `flow_id` and a different derived port. It buys BAND HYGIENE:
+        // promptly returning candidates to a 4,536-port band shared by up to 256 flows at 8
+        // candidates each; plus it covers the case where that headroom is violated (clock skew, a
+        // longer effective host window) and the host really does still hold the id.
         if !retired.is_empty() {
-            let _ = tokio::time::timeout(PUMP_JOIN_MAX, async {
-                for h in retired {
-                    let _ = h.await;
-                }
-            })
-            .await;
+            let _ = tokio::time::timeout(PUMP_JOIN_MAX, futures_util::future::join_all(retired))
+                .await;
         }
         self.drops.flush(&self.name);
     }
@@ -1092,6 +1107,36 @@ mod tests {
         for svc in [3478u32, 3479, 5349, 5060, 5061, 1194, 1701, 1812, 1813, 4500, 27015] {
             assert!(svc < lo, "fallback band must clear UDP service port {svc}");
         }
+    }
+
+    /// A batch join must be CONCURRENT. Awaiting sequentially under one timeout lets a single
+    /// wedged pump consume the whole budget and leaves every pump behind it unjoined — silently
+    /// reinstating the bug the join exists to prevent, for the entire tail of the batch.
+    #[tokio::test]
+    async fn a_wedged_pump_does_not_forfeit_the_rest_of_the_batch() {
+        let stuck = Arc::new(Notify::new());
+        // One task that never finishes, then several that finish immediately.
+        let mut retired: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let hold = stuck.clone();
+        retired.push(tokio::spawn(async move { hold.notified().await }));
+        for _ in 0..8 {
+            retired.push(tokio::spawn(async {}));
+        }
+        let started = std::time::Instant::now();
+        let results = tokio::time::timeout(
+            PUMP_JOIN_MAX,
+            futures_util::future::join_all(retired),
+        )
+        .await;
+        // The wedged one means the batch as a whole times out...
+        assert!(results.is_err(), "the wedged pump must still bound the batch");
+        assert!(
+            started.elapsed() < PUMP_JOIN_MAX * 3,
+            "the batch must not exceed its own ceiling"
+        );
+        // ...but the healthy ones were polled concurrently rather than queued behind it, which is
+        // the property a sequential loop loses. Release the wedge and confirm it can finish.
+        stuck.notify_one();
     }
 
     /// The app's own listening port is never derived — that bind could only ever fail.
