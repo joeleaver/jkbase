@@ -18,7 +18,7 @@ From `L4PlaneLimits::default()` in `crates/jkbase-proxy/src/l4_plane.rs`:
 
 | Ceiling | Default | What a conference offers |
 |---|---|---|
-| `per_source_bps` (per **destination IP**, i.e. per participant) | 1 MiB/s | ~1.7 MiB/s for 9 × 720p fan-out |
+| `per_source_bps` (per **destination IP**, i.e. per participant) | 1 MiB/s | 280 KiB/s for a 50-way gallery — 27% |
 | `egress_per_24_bps` | 8 MiB/s | exceeded by ~5 participants in one /24 |
 | `egress_per_project_bps` | 16 MiB/s | exceeded by ~10 participants |
 | `egress_global_bps` | 64 MiB/s | ~1 medium meeting, platform-wide |
@@ -117,9 +117,9 @@ to subtract is uninterpretable.
 
 > **`jkbase deploy` defaults to `https://api.jkbase.app` — i.e. PRODUCTION.** There is no
 > environment-variable override; the only way off prod is to pass `--api` explicitly. Deploying
-> this simulator to production and then driving it at the profiles below would offer 43.5 MiB/s —
-> 2.7× `egress_per_project_bps` and 68% of the platform-wide `egress_global_bps` — which is a
-> self-inflicted noisy-neighbour event affecting every other tenant on the box. **Always pass
+> this simulator to production and driving it at the profiles below would offer ~13.7 MiB/s —
+> 86% of `egress_per_project_bps` and a fifth of the platform-wide `egress_global_bps` — which is
+> a self-inflicted noisy-neighbour event affecting every other tenant on the box. **Always pass
 > `--api`, and tear the project down when the run is over.**
 
 ```bash
@@ -197,34 +197,40 @@ the guest loopback MTU for exactly this reason).
 
 ### Running 40–50 participants
 
-Set `VISIBLE`. Video fan-out defaults to *every* camera, which is right at 10 and fiction at 50:
-50 × 49 × 1500kbps is **3.8 Gbps**, a number that measures your NIC and nothing else. Real SFUs
-send a few visible videos plus simulcast low layers, while forwarding everyone's audio — so
-video fan-out is capped and audio fan-out is not.
+Cap **both** fan-outs, because a real SFU caps both. Leave either at "everyone" and the harness
+measures a workload no conference product generates:
+
+- **Audio.** mediasoup, Janus and Jitsi forward only the loudest few streams (Jitsi calls it
+  "last-N") and pause the rest server-side. That is ~3 streams at any size, not `K−1`. At 50
+  participants the uncapped model is **16× too many**, and since audio is the high-pps class it
+  then dominates the packet count.
+- **Video.** Simulcast exists so a gallery of thumbnails takes the **low layer** (~150–200kbps),
+  with one active-speaker tile higher. 600kbps to a postage stamp is exactly what the encoder
+  ladder avoids.
 
 ```bash
 sudo ./setup-source-ips.sh add 50
-PARTICIPANTS=50 VISIBLE=9 VIDEO_KBPS=600 DURATION=120 ./run.sh both <host> <port>
+PARTICIPANTS=50 VISIBLE=9 AUDIO_STREAMS=3 VIDEO_KBPS=180 SPEAKER_KBPS=800 \
+  DURATION=120 ./run.sh both <host> <port>
 ```
 
-That profile (9 visible at a 600kbps simulcast layer, 49 audio) is what a 50-way meeting really
-offers, and it lands here:
+That profile — 8 thumbnails at the 180kbps low layer, one speaker tile at 800kbps, 3 audio —
+lands here (measured, not estimated):
 
 | | Per participant | Aggregate |
 |---|---|---|
-| Offered | 891 KiB/s | 43.5 MiB/s, ~104k pps |
-| vs `per_source_bps` (1 MiB/s) | **87% of the cap** | — |
-| vs `egress_per_project_bps` (16 MiB/s) | — | **2.7× over** |
-| vs `egress_global_bps` (64 MiB/s) | — | **68% of the whole platform** |
+| Offered | 280 KiB/s (2.3 Mbps) | 13.7 MiB/s (115 Mbps), ~16k pps |
+| vs `per_source_bps` (1 MiB/s) | 27% | — |
+| vs `egress_per_project_bps` (16 MiB/s) | — | **86%, for ONE meeting** |
+| vs `egress_global_bps` (64 MiB/s) | — | 21% |
 
-So a single 50-way meeting is over the per-project ceiling by 2.7× and eats two thirds of the
-platform-wide budget, while each participant sits just under the per-source cap — one bad tile
-layout or a bitrate bump puts them over it too. Raising those limits is a prerequisite for this
-workload, not a tuning exercise.
+A single well-behaved meeting **fits** inside the shipped defaults. The pressure is
+**concurrency**, not size: `egress_per_project_bps` is keyed on the project — the whole
+deployment — so every simultaneous meeting draws on the same 16 MiB/s bucket. Two concurrent
+50-way meetings exceed it.
 
-The CPU side is comfortable at that scale, though state the margin honestly: ~104k pps against
-the ~660k pps the probe prints for video-sized datagrams is about **16% of one thread**, not "well
-under a tenth". That figure is the combined crypto + bucket-chain cost, it is box-specific (this
+The CPU side, stated honestly: ~16k pps (19k at a 20ms Opus ptime) against the ~700k pps the probe
+prints for video-sized datagrams is about **2–3% of one thread**. That figure is the combined crypto + bucket-chain cost, it is box-specific (this
 box measures ~660k where another measured ~710k), and it is *not* per-core — the plane's egress
 accounting sits behind process-global mutexes, so it degrades under contention rather than
 scaling. Even so, CPU is not what will break first here: syscalls and the TAP crossing are what

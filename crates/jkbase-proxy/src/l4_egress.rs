@@ -545,32 +545,41 @@ mod tests {
         // What a conference actually asks for, so the numbers above land against a requirement
         // instead of floating free.
         //
-        // Video fan-out is capped at the visible tiles, audio is not: a 50-way meeting decodes a
-        // handful of videos while forwarding everyone's audio. Modelling video as (K-1) full-rate
-        // streams at that size describes a workload no SFU ships (50 participants would be
-        // 3.8 Gbps) and would make this probe's requirement line fiction.
+        // BOTH fan-outs are capped, because a real SFU caps both. Leaving either at "everyone"
+        // describes a workload no conference product ships and makes this requirement line
+        // fiction:
         //
-        // Rates: 600kbps video (a simulcast mid layer) in 1200B packets ≈ 62 pps; 40kbps audio in
-        // 160B ≈ 31 pps.
+        // - AUDIO: mediasoup, Janus and Jitsi forward only the loudest few streams (Jitsi's
+        //   "last-N") and pause the rest server-side — ~3 streams at any size, not (K-1). At k=50
+        //   the uncapped model is 16x too many, and since audio is the high-pps class it then
+        //   dominates the total.
+        // - VIDEO: simulcast means a gallery of thumbnails takes the LOW layer (~180kbps), with
+        //   one active-speaker tile higher (~800kbps). Full quality to a postage stamp is exactly
+        //   what the encoder ladder exists to avoid.
+        //
+        // Rates: 180kbps thumbnail ≈ 18 pps and 800kbps speaker ≈ 83 pps in 1200B packets.
         //
         // NOTE the audio packetization, because an egress ceiling gets argued from these numbers.
         // 40kbps in 160B implies a **32ms ptime**; standard Opus/WebRTC is **20ms** (~50 pps at
-        // ~100B), which at k=50 raises the requirement from 103,850 pps to ~150,400 — about 45%
-        // more. Packet RATE is the axis the per-datagram cost multiplies against, so this is the
-        // load-bearing parameter and 20ms is the conservative reading. Both are printed rather
-        // than one being chosen silently: the CPU conclusion survives either, but a limit should
-        // be sized against the larger.
-        const VISIBLE: u64 = 9;
+        // ~100B), which is ~60% more packets for the same bitrate. Packet RATE is the axis the
+        // per-datagram cost multiplies against, so this is the load-bearing parameter and 20ms is
+        // the conservative reading. Both are printed rather than one chosen silently: the CPU
+        // conclusion survives either, but a limit should be sized against the larger.
+        const TILES: u64 = 9;
+        const AUDIO_N: u64 = 3;
         for k in [10u64, 20, 50] {
-            let v_streams = (k - 1).min(VISIBLE) * k;
-            let a_streams = (k - 1) * k;
+            let tiles = (k - 1).min(TILES);
+            // One tile per participant is the active speaker; the rest are thumbnails.
+            let thumbs = tiles.saturating_sub(1) * k;
+            let speakers = if tiles > 0 { k } else { 0 };
+            let a_streams = (k - 1).min(AUDIO_N) * k;
+            let v_pps = thumbs * 18 + speakers * 83;
             for (ptime, a_pps, a_bytes) in [(32u64, 31u64, 160.0f64), (20, 50, 100.0)] {
-                let pps = v_streams * 62 + a_streams * a_pps;
-                let bps =
-                    v_streams as f64 * 62.0 * 1200.0 + a_streams as f64 * a_pps as f64 * a_bytes;
+                let pps = v_pps + a_streams * a_pps;
+                let bps = v_pps as f64 * 1200.0 + a_streams as f64 * a_pps as f64 * a_bytes;
                 println!(
-                    "requirement: {k} participants ({VISIBLE} visible, {ptime}ms audio) ⇒ \
-                     {v_streams} video + {a_streams} audio egress streams ⇒ {pps} pps \
+                    "requirement: {k} participants ({tiles} tiles, {AUDIO_N} audio, {ptime}ms) ⇒ \
+                     {thumbs} thumb + {speakers} speaker + {a_streams} audio streams ⇒ {pps} pps \
                      ({:.1} MiB/s)",
                     bps / 1048576.0
                 );
