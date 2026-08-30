@@ -142,6 +142,10 @@ struct LoopbackFlow {
     /// Fired on eviction/supersession to stop this flow's reply pump (which then drops its socket
     /// handle, closing the loopback socket).
     cancel: Arc<Notify>,
+    /// The reply pump task. A supersede AWAITS it after cancelling, so the old and new pumps never
+    /// read the same socket concurrently — otherwise a reply could be sealed with the superseded
+    /// epoch and dropped host-side as `StaleEpoch`.
+    pump: tokio::task::JoinHandle<()>,
 }
 
 /// Per-drop / rare-event counters, flushed as one rate-limited summary each sweep so a spoof or
@@ -423,10 +427,22 @@ impl LandForward {
                 }
             }
             Decision::Supersede => {
-                if let Some(old) = self.flows.remove(&hdr.flow_id) {
-                    old.cancel.notify_one();
-                }
-                self.create_flow(hdr, payload, src).await;
+                // The host rebound this `flow_id` at a higher epoch — which is what a HOST RESTART
+                // looks like from in here, since `epoch_base` is reseeded per process. Keep the
+                // loopback socket: it is the tuple the guest app has pinned, and re-opening it
+                // would move that tuple at exactly the moment the upgrade was meant to be
+                // invisible. Only the epoch and nonce state are superseded.
+                let reuse = match self.flows.remove(&hdr.flow_id) {
+                    Some(old) => {
+                        old.cancel.notify_one();
+                        // Wait for it to actually stop before the replacement reads the same
+                        // socket, or a reply could be sealed with the superseded epoch.
+                        let _ = old.pump.await;
+                        Some(old.sock)
+                    }
+                    None => None,
+                };
+                self.create_flow_on(hdr, payload, src, reuse).await;
             }
             Decision::New => self.create_flow(hdr, payload, src).await,
         }
@@ -436,6 +452,18 @@ impl LandForward {
     /// first payload, and spawn the reply pump. `in_nonce_hw` starts at the first accepted nonce so
     /// the host may start its counter at 0 or 1; every later datagram must strictly exceed it.
     async fn create_flow(&mut self, hdr: L4TransitHeader, payload: &[u8], src: SocketAddr) {
+        self.create_flow_on(hdr, payload, src, None).await
+    }
+
+    /// As [`Self::create_flow`], but adopts `reuse` if given rather than opening a new loopback
+    /// socket — so a supersede keeps the app-visible tuple.
+    async fn create_flow_on(
+        &mut self,
+        hdr: L4TransitHeader,
+        payload: &[u8],
+        src: SocketAddr,
+        reuse: Option<Arc<UdpSocket>>,
+    ) {
         // Map full: LRU-evict the least-recently-active entry to make room rather than DROP this
         // (authenticated) new flow. Dropping would let a churn flood of short-lived flows wedge the
         // port once the map fills with dead entries the host already evicted but sent no teardown
@@ -464,13 +492,16 @@ impl LandForward {
                 }
             }
         }
-        let sock = match connect_loopback(self.guest_port).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                warn!(error = %e, port = %self.name, guest_port = self.guest_port, "l4 land-forward: failed to open loopback socket");
-                self.drops.loopback_bind_fail += 1;
-                return;
-            }
+        let sock = match reuse {
+            Some(s) => s,
+            None => match connect_loopback(self.guest_port, hdr.flow_id).await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    warn!(error = %e, port = %self.name, guest_port = self.guest_port, "l4 land-forward: failed to open loopback socket");
+                    self.drops.loopback_bind_fail += 1;
+                    return;
+                }
+            },
         };
         if let Err(e) = sock.send(payload).await {
             debug!(error = %e, port = %self.name, "l4 land-forward: loopback send failed");
@@ -479,7 +510,7 @@ impl LandForward {
         // Shared either-direction activity clock: the reply pump stamps it on every server→client
         // datagram so a client-silent, app-streaming flow is not idle-reaped (W0.1 bug a).
         let last_seen = Arc::new(AtomicU64::new(elapsed_ms(self.base)));
-        tokio::spawn(
+        let pump = tokio::spawn(
             ReplyPump {
                 flow_id: hdr.flow_id,
                 epoch: hdr.epoch,
@@ -502,6 +533,7 @@ impl LandForward {
                 in_nonce_hw: hdr.nonce,
                 last_seen,
                 cancel,
+                pump,
             },
         );
     }
@@ -606,10 +638,72 @@ impl ReplyPump {
 /// Open a loopback UDP socket bound to an ephemeral `127.0.0.1` source and connected to
 /// `127.0.0.1:guest_port`, so `send`/`recv` reach the guest app and receive its replies. Connecting
 /// pins the peer, so a reply from any other source is ignored by the kernel.
-async fn connect_loopback(guest_port: u16) -> std::io::Result<UdpSocket> {
+async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpSocket> {
+    // Bind a source port DERIVED FROM `flow_id` rather than letting the kernel pick, so the tuple
+    // the guest app sees is a pure function of the flow — reproduced identically whenever this
+    // socket has to be re-created. That is what carries a pinning app (WebRTC/DTLS, QUIC) through
+    // the two cases the host cannot reach from its side: our own LRU eviction at
+    // `AGENT_L4_MAX_FLOWS`, and a fresh agent after a crash restart. The host keeps `flow_id`
+    // stable across its evictions and across an upgrade; this makes the SOCKET stable across ours.
+    //
+    // mediasoup is the worked example: once ICE is COMPLETED it stores a tuple arriving without
+    // use-candidate but never SELECTS it, while answering STUN on the arrival tuple — so a moved
+    // tuple leaves ICE looking healthy while DTLS is posted forever to a socket nobody holds.
+    if let Some(preferred) = derived_source_port(flow_id, guest_port)
+        && let Ok(sock) = UdpSocket::bind(("127.0.0.1", preferred)).await
+        && sock.connect(("127.0.0.1", guest_port)).await.is_ok()
+    {
+        return Ok(sock);
+    }
+    // Fall back to an ephemeral port: the derived one is taken (a collision with another flow, or
+    // with a port the tenant's own app bound). Correct but not reproducible — this flow's tuple
+    // will move if the socket is ever re-created. Strictly no worse than the old behaviour.
     let sock = UdpSocket::bind(("127.0.0.1", 0)).await?;
     sock.connect(("127.0.0.1", guest_port)).await?;
     Ok(sock)
+}
+
+/// A stable source port for `flow_id`, or `None` if no usable band exists.
+///
+/// Must avoid the guest's EPHEMERAL range, or we would collide with ports the kernel hands out to
+/// the tenant's own outbound sockets — intermittently, and worse for being intermittent. Read from
+/// the guest's own sysctl rather than assumed, since the tenant can change it. The band below it
+/// (1024..low) is what remains; a port the app has already bound simply fails to bind and takes
+/// the ephemeral fallback.
+fn derived_source_port(flow_id: u32, guest_port: u16) -> Option<u16> {
+    let (eph_lo, _eph_hi) = ephemeral_range();
+    let band_lo: u32 = 1024;
+    let band_hi: u32 = u32::from(eph_lo).saturating_sub(1);
+    if band_hi <= band_lo {
+        return None;
+    }
+    let span = band_hi - band_lo + 1;
+    // Mix so adjacent flow_ids do not land on adjacent ports; the host allocates them from a
+    // monotonic counter, so an unmixed modulo would pack every live flow into one contiguous run.
+    let mut h = u64::from(flow_id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    let port = band_lo + (h % u64::from(span)) as u32;
+    let port = u16::try_from(port).ok()?;
+    // Never the app's own listening port — that bind would always fail, wasting the derivation.
+    if port == guest_port { None } else { Some(port) }
+}
+
+/// The guest's `ip_local_port_range`, or the kernel default if it cannot be read.
+fn ephemeral_range() -> (u16, u16) {
+    const DEFAULT: (u16, u16) = (32768, 60999);
+    let Ok(s) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") else {
+        return DEFAULT;
+    };
+    let mut it = s.split_whitespace();
+    match (
+        it.next().and_then(|v| v.parse::<u16>().ok()),
+        it.next().and_then(|v| v.parse::<u16>().ok()),
+    ) {
+        (Some(lo), Some(hi)) if lo < hi => (lo, hi),
+        _ => DEFAULT,
+    }
 }
 
 /// True if the guest has a UDP socket bound on `guest_port` at `127.0.0.1` or `0.0.0.0`. Reads
@@ -782,5 +876,56 @@ mod tests {
         assert!(!addr_is_loopback_or_wildcard("0200000A")); // eth0 v4
         assert!(!addr_is_loopback_or_wildcard("")); // empty
         assert!(!addr_is_loopback_or_wildcard("0100007")); // wrong length
+    }
+
+    /// The property the whole guest-side fix rests on: the same `flow_id` must always derive the
+    /// same source port, because that port IS the tuple a pinning app holds. If this ever became
+    /// order- or state-dependent, an LRU eviction or a fresh agent would move the tuple again.
+    #[test]
+    fn derived_source_port_is_stable_and_outside_the_ephemeral_range() {
+        let (eph_lo, eph_hi) = ephemeral_range();
+        for flow_id in [0u32, 1, 2, 7, 4242, 1_000_003, u32::MAX] {
+            let a = derived_source_port(flow_id, 9999);
+            assert_eq!(a, derived_source_port(flow_id, 9999), "must be a pure function of flow_id");
+            if let Some(p) = a {
+                assert!(p >= 1024, "never a privileged port: {p}");
+                assert!(
+                    p < eph_lo || p > eph_hi,
+                    "must avoid the guest's ephemeral range {eph_lo}..={eph_hi}, got {p}"
+                );
+            }
+        }
+    }
+
+    /// Adjacent ids must not land on adjacent ports: the host allocates from a monotonic counter,
+    /// so an unmixed modulo would pack every live flow into one contiguous run and turn a single
+    /// app-bound port into a cluster of collisions.
+    #[test]
+    fn derived_source_port_spreads_adjacent_flow_ids() {
+        let ports: Vec<u16> = (1000..1064)
+            .filter_map(|id| derived_source_port(id, 9999))
+            .collect();
+        assert!(ports.len() > 32, "expected most ids to derive a port");
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert!(
+            sorted.len() * 100 >= ports.len() * 95,
+            "derived ports collide far more than chance: {} distinct of {}",
+            sorted.len(),
+            ports.len()
+        );
+        let contiguous = ports.windows(2).filter(|w| w[1] == w[0] + 1).count();
+        assert!(contiguous < 4, "adjacent flow_ids are landing on adjacent ports");
+    }
+
+    /// The app's own listening port is never derived — that bind could only ever fail.
+    #[test]
+    fn derived_source_port_never_collides_with_the_apps_own_port() {
+        for id in 0u32..5000 {
+            if let Some(p) = derived_source_port(id, 21093) {
+                assert_ne!(p, 21093);
+            }
+        }
     }
 }

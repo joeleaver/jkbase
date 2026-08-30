@@ -4123,6 +4123,10 @@ Bun.udpSocket({
         pinned.set(id, { p, addr });
         console.log(`pinned ${id} -> ${addr}:${p}`);
         socket.send(`PINNED ${id}`, p, addr);
+      } else if (verb === "WHO") {
+        // Report the remote tuple's port as the app sees it — the thing a pinning app latches
+        // onto, and the thing that must not move when the agent re-creates its socket.
+        socket.send(`WHO ${p}`, p, addr);
       } else if (verb === "DATA") {
         const t = pinned.get(id);
         if (t) { socket.send(`REPLY ${id}`, t.p, t.addr); }
@@ -6893,6 +6897,180 @@ console.log("listening on " + port);
         println!(
             "PASS: both participants completed the pinned-tuple leg — the seam handles \
              mediasoup's tuple topology, so #87 is NOT in the plane or the agent"
+        );
+    }
+
+    /// The guest-side half: the app-visible tuple must survive the AGENT re-creating its own flow
+    /// entry. Talks the transit wire DIRECTLY to the agent — no `L4Ingress` — so the test controls
+    /// `(flow_id, epoch)` and can force the two cases the host cannot reach:
+    ///   1. a SUPERSEDE (higher epoch for the same id), which is what a host restart looks like
+    ///      from inside the guest, since `epoch_base` is reseeded per process;
+    ///   2. a fresh flow for the same id, which is what an agent LRU eviction or a crashed-and-
+    ///      restarted agent produces.
+    /// Both must report the same source port, or a pinning app blackholes.
+    #[tokio::test]
+    #[ignore = "L4 guest-side tuple stability: needs KVM + root + bun.ext4 + baselayers + JKB_ROOTFS"]
+    async fn l4_agent_keeps_the_app_visible_tuple_e2e() {
+        use jkbase_common::config::{L4Facts, L4PortFact};
+        use jkbase_common::l4_transit::{self, L4Dir, L4TransitHeader};
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+        use std::net::{SocketAddr, UdpSocket as StdUdp};
+
+        let Some(fx) = bun_pipeline_build("tuplekeep", 1, Workload::UdpTuplePin).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_ROOTFS");
+            return;
+        };
+
+        const AGENT_UDP_PORT: u16 = 40003;
+        const GUEST_PORT: u16 = 9999;
+        const SECRET: &str = "jkbl_e2e_transit_secret_0123456789abcdef";
+        let l4_facts = L4Facts {
+            ports: vec![L4PortFact {
+                name: "media".into(),
+                proto: "udp".into(),
+                agent_udp_port: AGENT_UDP_PORT,
+                guest_port: GUEST_PORT,
+                idle_timeout_secs: 60,
+            }],
+            transit_secret: SECRET.into(),
+        };
+        let plan = crate::layer_plan::compute_layer_plan(&fx.staged, &store_dir, false, false)
+            .expect("layer plan");
+        let meta_img = fx.data.join("tuplekeep-metadata.ext4");
+        crate::layer_plan::build_metadata_image(
+            &fx.staged, &plan, &Default::default(), &Default::default(),
+            None, None, Some(&l4_facts), &meta_img,
+        )
+        .expect("metadata image");
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("tkeep", "172.31.2.1", "172.31.2.2", "AA:FC:00:02:31:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+
+        let config = VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(meta_img.clone()),
+            layer_paths: plan.layer_paths.clone(),
+            data_disk_path: None,
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+        let runtime_dir = fx.data.join("tkeep-run");
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir).await.expect("VM starts");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(90)).await.is_some(),
+            "app never became HTTP-ready"
+        );
+
+        // Ask the app which source port it sees, over a transit frame we seal ourselves.
+        let agent: SocketAddr = format!("{guest_ip}:{AGENT_UDP_PORT}").parse().unwrap();
+        let guest_ip_owned = guest_ip.to_string();
+        let who = tokio::task::spawn_blocking(move || {
+            let sock = StdUdp::bind("0.0.0.0:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+            let mut seal = Vec::new();
+            let mut buf = [0u8; 2048];
+            let ask = |sock: &StdUdp, seal: &mut Vec<u8>, buf: &mut [u8; 2048],
+                       flow_id: u32, epoch: u32, nonce: u64| -> Option<String> {
+                l4_transit::seal(
+                    SECRET.as_bytes(), L4Dir::HostToAgent,
+                    L4TransitHeader { flow_id, epoch, nonce }, b"WHO k", seal,
+                );
+                let _ = sock.send_to(seal, agent);
+                for _ in 0..6 {
+                    let (n, _) = sock.recv_from(buf).ok()?;
+                    if let Some((_h, payload)) =
+                        l4_transit::open(SECRET.as_bytes(), L4Dir::AgentToHost, &buf[..n])
+                    {
+                        return Some(String::from_utf8_lossy(payload).to_string());
+                    }
+                }
+                None
+            };
+            let _ = &guest_ip_owned;
+            // 1. establish flow F at epoch 100
+            let first = ask(&sock, &mut seal, &mut buf, 77, 100, 1);
+            // 2. SUPERSEDE: same id, higher epoch — a host restart, seen from the guest
+            let after_supersede = ask(&sock, &mut seal, &mut buf, 77, 101, 1);
+            // 3. a DIFFERENT id must get a DIFFERENT port (the derivation is per-flow)
+            let other = ask(&sock, &mut seal, &mut buf, 78, 100, 1);
+            (first, after_supersede, other)
+        })
+        .await
+        .unwrap();
+        eprintln!("[tuple-keep] first={:?} after_supersede={:?} other={:?}", who.0, who.1, who.2);
+
+        // Now the case socket-reuse CANNOT cover: a genuinely fresh agent, as after a crash
+        // restart or an LRU eviction. Nothing is carried over — the port must be re-derived to the
+        // same value from `flow_id` alone.
+        let _ = vm.stop().await;
+        let mut vm = VmInstance::start(tag, &config, &runtime_dir)
+            .await
+            .expect("VM restarts");
+        assert!(
+            poll_http_200(guest_ip, 80, Duration::from_secs(90)).await.is_some(),
+            "app never became HTTP-ready after the restart"
+        );
+        let after_restart = tokio::task::spawn_blocking(move || {
+            let sock = StdUdp::bind("0.0.0.0:0").unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(6))).unwrap();
+            let mut seal = Vec::new();
+            let mut buf = [0u8; 2048];
+            l4_transit::seal(
+                SECRET.as_bytes(), L4Dir::HostToAgent,
+                L4TransitHeader { flow_id: 77, epoch: 200, nonce: 1 }, b"WHO k", &mut seal,
+            );
+            let _ = sock.send_to(&seal, agent);
+            for _ in 0..6 {
+                let (n, _) = sock.recv_from(&mut buf).ok()?;
+                if let Some((_h, payload)) =
+                    l4_transit::open(SECRET.as_bytes(), L4Dir::AgentToHost, &buf[..n])
+                {
+                    return Some(String::from_utf8_lossy(payload).to_string());
+                }
+            }
+            None
+        })
+        .await
+        .unwrap();
+        eprintln!("[tuple-keep] after_agent_restart={after_restart:?}");
+
+        let _ = vm.stop().await;
+        let _ = sh("ip", &["link", "del", &tap]).await;
+
+        let first = who.0.expect("app must answer WHO on a fresh flow");
+        let after = who.1.expect("app must answer WHO after a supersede");
+        assert_eq!(
+            first, after,
+            "SUPERSEDE MOVED THE TUPLE: a host restart would strand every pinning session"
+        );
+        assert_ne!(who.2.as_deref(), Some(first.as_str()), "distinct flows need distinct ports");
+        assert_eq!(
+            after_restart.as_deref(),
+            Some(first.as_str()),
+            "A FRESH AGENT MOVED THE TUPLE: a crash restart or an LRU eviction would strand every \
+             pinning session, which is the case socket reuse cannot cover"
+        );
+        println!(
+            "PASS: the app-visible tuple survived BOTH a supersede and a fresh agent ({first})"
         );
     }
 
