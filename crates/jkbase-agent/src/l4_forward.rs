@@ -437,8 +437,26 @@ impl LandForward {
                         old.cancel.notify_one();
                         // Wait for it to actually stop before the replacement reads the same
                         // socket, or a reply could be sealed with the superseded epoch.
-                        let _ = old.pump.await;
-                        Some(old.sock)
+                        //
+                        // BOUNDED, because this runs in the single land-forward loop: an unbounded
+                        // join would head-of-line block every other flow on this port. Cancellation
+                        // is prompt in the normal case (`notify_one` leaves a permit, so there is
+                        // no lost wakeup even if the pump is not yet parked), but the pump can be
+                        // sitting in a `send_to` on a transit socket the tenant's own TAP queue has
+                        // filled. On timeout we simply DON'T reuse: the old socket is still bound,
+                        // so the derived bind fails, we take the ephemeral fallback, and this one
+                        // flow's tuple moves. A bounded loss of the feature, not of the port.
+                        match tokio::time::timeout(SUPERSEDE_JOIN_MAX, old.pump).await {
+                            Ok(_) => Some(old.sock),
+                            Err(_) => {
+                                warn!(
+                                    port = %self.name, flow_id = hdr.flow_id,
+                                    "l4 land-forward: reply pump did not stop in time; \
+                                     re-opening the loopback socket (this flow's tuple moves)"
+                                );
+                                None
+                            }
+                        }
                     }
                     None => None,
                 };
@@ -649,34 +667,64 @@ async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpS
     // mediasoup is the worked example: once ICE is COMPLETED it stores a tuple arriving without
     // use-candidate but never SELECTS it, while answering STUN on the arrival tuple — so a moved
     // tuple leaves ICE looking healthy while DTLS is posted forever to a socket nobody holds.
-    if let Some(preferred) = derived_source_port(flow_id, guest_port)
-        && let Ok(sock) = UdpSocket::bind(("127.0.0.1", preferred)).await
-        && sock.connect(("127.0.0.1", guest_port)).await.is_ok()
-    {
-        return Ok(sock);
+    // Try the flow's deterministic probe sequence. A single candidate is not enough: the agent
+    // holds up to `AGENT_L4_MAX_FLOWS` flows, so birthday collisions are likely at capacity, and
+    // they land in exactly the churn case this exists for — A holds P, A is LRU-evicted, B takes
+    // P, A returns and finds P gone. A reproducible SECOND choice means A's tuple survives as long
+    // as the occupancy around it is stable, instead of falling off a cliff to a kernel port.
+    for attempt in 0..PORT_PROBES {
+        let Some(candidate) = derived_source_port(flow_id, guest_port, attempt) else {
+            break;
+        };
+        if let Ok(sock) = UdpSocket::bind(("127.0.0.1", candidate)).await
+            && sock.connect(("127.0.0.1", guest_port)).await.is_ok()
+        {
+            return Ok(sock);
+        }
     }
-    // Fall back to an ephemeral port: the derived one is taken (a collision with another flow, or
-    // with a port the tenant's own app bound). Correct but not reproducible — this flow's tuple
-    // will move if the socket is ever re-created. Strictly no worse than the old behaviour.
+    // Fall back to an ephemeral port: every candidate was taken. Correct but not reproducible —
+    // this flow's tuple will move if the socket is ever re-created. No worse than before this.
     let sock = UdpSocket::bind(("127.0.0.1", 0)).await?;
     sock.connect(("127.0.0.1", guest_port)).await?;
     Ok(sock)
 }
 
-/// A stable source port for `flow_id`, or `None` if no usable band exists.
+/// Ceiling on waiting for a superseded reply pump to stop. Bounds a self-inflicted head-of-line
+/// block: `deliver` runs in the single land-forward loop, and a supersede needs an authenticated
+/// frame, so only the host or the tenant's own code can drive one — but a tenant CAN, since the
+/// transit secret lives in its VM. Blast radius is that VM's own forwarding loop either way.
+const SUPERSEDE_JOIN_MAX: Duration = Duration::from_millis(50);
+
+/// How many deterministic candidates a flow tries before giving up on a stable port.
+const PORT_PROBES: u32 = 8;
+
+/// The `attempt`-th stable source-port candidate for `flow_id`, or `None` if no usable band exists.
 ///
-/// Must avoid the guest's EPHEMERAL range, or we would collide with ports the kernel hands out to
-/// the tenant's own outbound sockets — intermittently, and worse for being intermittent. Read from
-/// the guest's own sysctl rather than assumed, since the tenant can change it. The band below it
-/// (1024..low) is what remains; a port the app has already bound simply fails to bind and takes
-/// the ephemeral fallback.
-fn derived_source_port(flow_id: u32, guest_port: u16) -> Option<u16> {
-    let (eph_lo, _eph_hi) = ephemeral_range();
-    let band_lo: u32 = 1024;
-    let band_hi: u32 = u32::from(eph_lo).saturating_sub(1);
-    if band_hi <= band_lo {
-        return None;
-    }
+/// Band choice is a TENANT-AVAILABILITY decision, not just a correctness one. Above the ephemeral
+/// range (61000-65535 by default) is conventionally unused; BELOW it is the whole registered
+/// services range, and squatting there would intermittently break a UDP service the tenant starts
+/// later in its own VM — STUN/TURN 3478, SIP 5060, RADIUS, OpenVPN — which are precisely the
+/// workloads this plane exists to carry. It would surface as "my TURN server sometimes won't
+/// start", with no diagnostic. So prefer above, and only fall back below if the tenant has
+/// widened its ephemeral range to swallow the top of the space.
+///
+/// The ephemeral range itself is always excluded and is read from the guest's own sysctl rather
+/// than assumed, since the tenant can change it: colliding with ports the kernel hands to the
+/// tenant's outbound sockets would be intermittent, and worse for being intermittent.
+fn derived_source_port(flow_id: u32, guest_port: u16, attempt: u32) -> Option<u16> {
+    let (eph_lo, eph_hi) = ephemeral_range();
+    // Prefer above the ephemeral range; fall back below it.
+    let (band_lo, band_hi) = {
+        let above = (u32::from(eph_hi).saturating_add(1), 65535u32);
+        let below = (1024u32, u32::from(eph_lo).saturating_sub(1));
+        if above.0 <= above.1 && above.1 - above.0 >= 255 {
+            above
+        } else if below.0 <= below.1 && below.1 - below.0 >= 255 {
+            below
+        } else {
+            return None;
+        }
+    };
     let span = band_hi - band_lo + 1;
     // Mix so adjacent flow_ids do not land on adjacent ports; the host allocates them from a
     // monotonic counter, so an unmixed modulo would pack every live flow into one contiguous run.
@@ -684,10 +732,17 @@ fn derived_source_port(flow_id: u32, guest_port: u16) -> Option<u16> {
     h ^= h >> 29;
     h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h ^= h >> 32;
-    let port = band_lo + (h % u64::from(span)) as u32;
-    let port = u16::try_from(port).ok()?;
-    // Never the app's own listening port — that bind would always fail, wasting the derivation.
-    if port == guest_port { None } else { Some(port) }
+    // Linear probe from the flow's own anchor: deterministic, so the sequence is identical every
+    // time this flow's socket is re-created.
+    let idx = (h % u64::from(span)) as u32;
+    let mut port = band_lo + (idx + attempt) % span;
+    // Never the app's own listening port — that bind could only ever fail. SKIP it (deterministic,
+    // so the sequence still reproduces) rather than returning `None`, which the caller reads as
+    // "no usable band" and would abandon the remaining probes over one unlucky candidate.
+    if u32::from(guest_port) == port {
+        port = band_lo + (idx + attempt + 1) % span;
+    }
+    u16::try_from(port).ok()
 }
 
 /// The guest's `ip_local_port_range`, or the kernel default if it cannot be read.
@@ -879,52 +934,73 @@ mod tests {
     }
 
     /// The property the whole guest-side fix rests on: the same `flow_id` must always derive the
-    /// same source port, because that port IS the tuple a pinning app holds. If this ever became
-    /// order- or state-dependent, an LRU eviction or a fresh agent would move the tuple again.
+    /// same sequence, because that port IS the tuple a pinning app holds. If it ever became order-
+    /// or state-dependent, an LRU eviction or a fresh agent would move the tuple again.
     #[test]
     fn derived_source_port_is_stable_and_outside_the_ephemeral_range() {
         let (eph_lo, eph_hi) = ephemeral_range();
         for flow_id in [0u32, 1, 2, 7, 4242, 1_000_003, u32::MAX] {
-            let a = derived_source_port(flow_id, 9999);
-            assert_eq!(a, derived_source_port(flow_id, 9999), "must be a pure function of flow_id");
-            if let Some(p) = a {
-                assert!(p >= 1024, "never a privileged port: {p}");
+            for attempt in 0..PORT_PROBES {
+                let a = derived_source_port(flow_id, 9999, attempt);
+                assert_eq!(
+                    a,
+                    derived_source_port(flow_id, 9999, attempt),
+                    "must be a pure function of (flow_id, attempt)"
+                );
+                if let Some(p) = a {
+                    assert!(p >= 1024, "never a privileged port: {p}");
+                    assert!(
+                        p < eph_lo || p > eph_hi,
+                        "must avoid the guest's ephemeral range {eph_lo}..={eph_hi}, got {p}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The band must sit ABOVE the ephemeral range on a default guest, so we never squat the
+    /// registered-services range inside the tenant's own VM — STUN/TURN 3478 and SIP 5060 live
+    /// there, and they are exactly the workloads this plane carries.
+    #[test]
+    fn derived_source_port_avoids_the_registered_services_range() {
+        let (_eph_lo, eph_hi) = ephemeral_range();
+        for flow_id in 0u32..2000 {
+            if let Some(p) = derived_source_port(flow_id, 9999, 0) {
                 assert!(
-                    p < eph_lo || p > eph_hi,
-                    "must avoid the guest's ephemeral range {eph_lo}..={eph_hi}, got {p}"
+                    p > eph_hi,
+                    "port {p} is below the ephemeral range — that is the services range"
                 );
             }
         }
     }
 
-    /// Adjacent ids must not land on adjacent ports: the host allocates from a monotonic counter,
-    /// so an unmixed modulo would pack every live flow into one contiguous run and turn a single
-    /// app-bound port into a cluster of collisions.
+    /// A collision must have a reproducible SECOND choice. Without it, birthday collisions at
+    /// `AGENT_L4_MAX_FLOWS` drop ~one flow at a time onto a kernel-assigned port with no
+    /// stability — and they land in exactly the churn case this exists for.
     #[test]
-    fn derived_source_port_spreads_adjacent_flow_ids() {
-        let ports: Vec<u16> = (1000..1064)
-            .filter_map(|id| derived_source_port(id, 9999))
+    fn derived_source_port_probes_a_deterministic_sequence() {
+        let seq: Vec<u16> = (0..PORT_PROBES)
+            .filter_map(|a| derived_source_port(4242, 9999, a))
             .collect();
-        assert!(ports.len() > 32, "expected most ids to derive a port");
-        let mut sorted = ports.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert!(
-            sorted.len() * 100 >= ports.len() * 95,
-            "derived ports collide far more than chance: {} distinct of {}",
-            sorted.len(),
-            ports.len()
-        );
-        let contiguous = ports.windows(2).filter(|w| w[1] == w[0] + 1).count();
-        assert!(contiguous < 4, "adjacent flow_ids are landing on adjacent ports");
+        assert_eq!(seq.len() as u32, PORT_PROBES, "every attempt yields a candidate");
+        let mut dedup = seq.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), seq.len(), "the sequence must not repeat a port");
+        let again: Vec<u16> = (0..PORT_PROBES)
+            .filter_map(|a| derived_source_port(4242, 9999, a))
+            .collect();
+        assert_eq!(seq, again, "the sequence must reproduce exactly");
     }
 
     /// The app's own listening port is never derived — that bind could only ever fail.
     #[test]
     fn derived_source_port_never_collides_with_the_apps_own_port() {
         for id in 0u32..5000 {
-            if let Some(p) = derived_source_port(id, 21093) {
-                assert_ne!(p, 21093);
+            for attempt in 0..PORT_PROBES {
+                if let Some(p) = derived_source_port(id, 21093, attempt) {
+                    assert_ne!(p, 21093);
+                }
             }
         }
     }
