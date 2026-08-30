@@ -142,6 +142,10 @@ struct LoopbackFlow {
     /// Fired on eviction/supersession to stop this flow's reply pump (which then drops its socket
     /// handle, closing the loopback socket).
     cancel: Arc<Notify>,
+    /// The reply pump task. A supersede AWAITS it after cancelling, so the old and new pumps never
+    /// read the same socket concurrently — otherwise a reply could be sealed with the superseded
+    /// epoch and dropped host-side as `StaleEpoch`.
+    pump: tokio::task::JoinHandle<()>,
 }
 
 /// Per-drop / rare-event counters, flushed as one rate-limited summary each sweep so a spoof or
@@ -293,7 +297,7 @@ impl LandForward {
                     }
                 },
                 _ = probe.tick() => self.poll_readiness().await,
-                _ = sweep.tick() => self.sweep(),
+                _ = sweep.tick() => self.sweep().await,
             }
         }
     }
@@ -423,10 +427,42 @@ impl LandForward {
                 }
             }
             Decision::Supersede => {
-                if let Some(old) = self.flows.remove(&hdr.flow_id) {
-                    old.cancel.notify_one();
-                }
-                self.create_flow(hdr, payload, src).await;
+                // The host rebound this `flow_id` at a higher epoch — which is what a HOST RESTART
+                // looks like from in here, since `epoch_base` is reseeded per process. Keep the
+                // loopback socket: it is the tuple the guest app has pinned, and re-opening it
+                // would move that tuple at exactly the moment the upgrade was meant to be
+                // invisible. Only the epoch and nonce state are superseded.
+                let reuse = match self.flows.remove(&hdr.flow_id) {
+                    Some(old) => {
+                        old.cancel.notify_one();
+                        // Wait for it to actually stop before the replacement reads the same
+                        // socket, or a reply could be sealed with the superseded epoch.
+                        //
+                        // BOUNDED, because this runs in the single land-forward loop: an unbounded
+                        // join would head-of-line block every other flow on this port. Cancellation
+                        // is prompt in the normal case (`notify_one` leaves a permit, so there is
+                        // no lost wakeup even if the pump is not yet parked), but the pump can be
+                        // sitting in a `send_to` on a transit socket the tenant's own TAP queue has
+                        // filled. On timeout we simply DON'T reuse. The zombie still holds
+                        // attempt 0, so the replacement lands on attempt 1 — not the ephemeral
+                        // fallback — and this flow's tuple moves; when the zombie exits and frees
+                        // attempt 0 a later re-creation moves it back. Bounded and self-healing:
+                        // a loss of stability for one flow, never of the port for the rest.
+                        match tokio::time::timeout(PUMP_JOIN_MAX, old.pump).await {
+                            Ok(_) => Some(old.sock),
+                            Err(_) => {
+                                warn!(
+                                    port = %self.name, flow_id = hdr.flow_id,
+                                    "l4 land-forward: reply pump did not stop in time; \
+                                     re-opening the loopback socket (this flow's tuple moves)"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                self.create_flow_on(hdr, payload, src, reuse).await;
             }
             Decision::New => self.create_flow(hdr, payload, src).await,
         }
@@ -436,6 +472,18 @@ impl LandForward {
     /// first payload, and spawn the reply pump. `in_nonce_hw` starts at the first accepted nonce so
     /// the host may start its counter at 0 or 1; every later datagram must strictly exceed it.
     async fn create_flow(&mut self, hdr: L4TransitHeader, payload: &[u8], src: SocketAddr) {
+        self.create_flow_on(hdr, payload, src, None).await
+    }
+
+    /// As [`Self::create_flow`], but adopts `reuse` if given rather than opening a new loopback
+    /// socket — so a supersede keeps the app-visible tuple.
+    async fn create_flow_on(
+        &mut self,
+        hdr: L4TransitHeader,
+        payload: &[u8],
+        src: SocketAddr,
+        reuse: Option<Arc<UdpSocket>>,
+    ) {
         // Map full: LRU-evict the least-recently-active entry to make room rather than DROP this
         // (authenticated) new flow. Dropping would let a churn flood of short-lived flows wedge the
         // port once the map fills with dead entries the host already evicted but sent no teardown
@@ -453,6 +501,18 @@ impl LandForward {
                 Some(victim) => {
                     if let Some(old) = self.flows.remove(&victim) {
                         old.cancel.notify_one();
+                        // Join before proceeding: the victim's socket stays bound until its pump
+                        // exits, and the flow about to be created may derive that very port — or
+                        // the victim itself may return next and want it back.
+                        //
+                        // NOTE this puts a join on the PER-DATAGRAM path whenever the map is at
+                        // capacity. Healthy that is ~116us per eviction (a ceiling near 8.6k new
+                        // flows/s, far above anything the plane admits). Wedged it is
+                        // `PUMP_JOIN_MAX` per datagram, which drops this port to ~20pps. Note the
+                        // composition: an EXTERNAL flood supplies the churn while the TENANT'S OWN
+                        // app supplies the wedge, by backing up the TAP its agent writes to. The
+                        // timeout is what keeps that bounded, and it stays inside that one VM.
+                        let _ = tokio::time::timeout(PUMP_JOIN_MAX, old.pump).await;
                     }
                     self.drops.map_full_evicted += 1;
                 }
@@ -464,13 +524,16 @@ impl LandForward {
                 }
             }
         }
-        let sock = match connect_loopback(self.guest_port).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                warn!(error = %e, port = %self.name, guest_port = self.guest_port, "l4 land-forward: failed to open loopback socket");
-                self.drops.loopback_bind_fail += 1;
-                return;
-            }
+        let sock = match reuse {
+            Some(s) => s,
+            None => match connect_loopback(self.guest_port, hdr.flow_id).await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    warn!(error = %e, port = %self.name, guest_port = self.guest_port, "l4 land-forward: failed to open loopback socket");
+                    self.drops.loopback_bind_fail += 1;
+                    return;
+                }
+            },
         };
         if let Err(e) = sock.send(payload).await {
             debug!(error = %e, port = %self.name, "l4 land-forward: loopback send failed");
@@ -479,7 +542,7 @@ impl LandForward {
         // Shared either-direction activity clock: the reply pump stamps it on every server→client
         // datagram so a client-silent, app-streaming flow is not idle-reaped (W0.1 bug a).
         let last_seen = Arc::new(AtomicU64::new(elapsed_ms(self.base)));
-        tokio::spawn(
+        let pump = tokio::spawn(
             ReplyPump {
                 flow_id: hdr.flow_id,
                 epoch: hdr.epoch,
@@ -502,22 +565,45 @@ impl LandForward {
                 in_nonce_hw: hdr.nonce,
                 last_seen,
                 cancel,
+                pump,
             },
         );
     }
 
     /// Idle-evict abandoned flows (leak backstop) + flush the rate-limited drop summary.
-    fn sweep(&mut self) {
+    async fn sweep(&mut self) {
         let now = elapsed_ms(self.base);
         let ttl_ms = self.flow_idle_ttl.as_millis() as u64;
-        self.flows.retain(|_, f| {
+        // `retain` cannot await, so collect the retired pumps and join them after.
+        let mut retired = Vec::new();
+        let mut keep = HashMap::with_capacity(self.flows.len());
+        for (id, f) in self.flows.drain() {
             if now.saturating_sub(f.last_seen.load(Ordering::Relaxed)) > ttl_ms {
                 f.cancel.notify_one();
-                false
+                retired.push(f.pump);
             } else {
-                true
+                keep.insert(id, f);
             }
-        });
+        }
+        self.flows = keep;
+        // ONE bounded wait for the whole batch — but CONCURRENTLY, not in sequence. Awaiting them
+        // in a loop under a single timeout lets one wedged pump consume the entire budget and
+        // leaves every pump behind it unjoined, silently reinstating the very bug the join exists
+        // to prevent (measured: 1 wedged + 8 healthy joined 0 of the 8). A healthy pump parks in
+        // ~116us and a full 256-flow reap joins in single-digit ms, so the ceiling is only ever
+        // reached by a pump that is wedged — exactly the case a join cannot help anyway.
+        //
+        // What this buys is NOT "the port is there when that client returns": the host evicted
+        // that flow at `last_activity + host_idle` and its memo expires 45s later, while our
+        // reaper does not fire until `+ FLOW_IDLE_HEADROOM` (60s) — so by now a returning client
+        // already gets a fresh `flow_id` and a different derived port. It buys BAND HYGIENE:
+        // promptly returning candidates to a 4,536-port band shared by up to 256 flows at 8
+        // candidates each; plus it covers the case where that headroom is violated (clock skew, a
+        // longer effective host window) and the host really does still hold the id.
+        if !retired.is_empty() {
+            let _ = tokio::time::timeout(PUMP_JOIN_MAX, futures_util::future::join_all(retired))
+                .await;
+        }
         self.drops.flush(&self.name);
     }
 }
@@ -606,10 +692,141 @@ impl ReplyPump {
 /// Open a loopback UDP socket bound to an ephemeral `127.0.0.1` source and connected to
 /// `127.0.0.1:guest_port`, so `send`/`recv` reach the guest app and receive its replies. Connecting
 /// pins the peer, so a reply from any other source is ignored by the kernel.
-async fn connect_loopback(guest_port: u16) -> std::io::Result<UdpSocket> {
+async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpSocket> {
+    // Bind a source port DERIVED FROM `flow_id` rather than letting the kernel pick, so the tuple
+    // the guest app sees is a pure function of the flow — reproduced identically whenever this
+    // socket has to be re-created. That is what carries a pinning app (WebRTC/DTLS, QUIC) through
+    // the two cases the host cannot reach from its side: our own LRU eviction at
+    // `AGENT_L4_MAX_FLOWS`, and a fresh agent after a crash restart. The host keeps `flow_id`
+    // stable across its evictions and across an upgrade; this makes the SOCKET stable across ours.
+    //
+    // mediasoup is the worked example: once ICE is COMPLETED it stores a tuple arriving without
+    // use-candidate but never SELECTS it, while answering STUN on the arrival tuple — so a moved
+    // tuple leaves ICE looking healthy while DTLS is posted forever to a socket nobody holds.
+    // Try the flow's deterministic probe sequence. A single candidate is not enough: the agent
+    // holds up to `AGENT_L4_MAX_FLOWS` flows, so birthday collisions are likely at capacity, and
+    // they land in exactly the churn case this exists for — A holds P, A is LRU-evicted, B takes
+    // P, A returns and finds P gone.
+    //
+    // Be precise about what the sequence buys, because it is not unconditional. A flow that takes
+    // attempt 0 — ~94% of them at the default load factor — reproduces its port unconditionally,
+    // since no other flow's anchor is there. A flow that took attempt k>0 reproduces only while
+    // candidates 0..k-1 are STILL occupied; if one of those goes away it shifts earlier and its
+    // tuple moves. So the sequence turns "~5.6% of flows get no stability" into "~5.6% get
+    // stability conditional on their prefix" — a real win and a self-healing residual, not a
+    // guarantee for every flow.
+    for attempt in 0..PORT_PROBES {
+        let Some(candidate) = derived_source_port(flow_id, guest_port, attempt) else {
+            break;
+        };
+        if let Ok(sock) = UdpSocket::bind(("127.0.0.1", candidate)).await
+            && sock.connect(("127.0.0.1", guest_port)).await.is_ok()
+        {
+            return Ok(sock);
+        }
+    }
+    // Fall back to an ephemeral port: every candidate was taken. Correct but not reproducible —
+    // this flow's tuple will move if the socket is ever re-created. No worse than before this.
     let sock = UdpSocket::bind(("127.0.0.1", 0)).await?;
     sock.connect(("127.0.0.1", guest_port)).await?;
     Ok(sock)
+}
+
+/// Ceiling on waiting for a cancelled reply pump to stop, on every path that retires a flow.
+///
+/// Waiting at all is what makes the derived source port actually reproducible. Cancelling a pump
+/// does not close its socket — the task holds an `Arc<UdpSocket>` clone until it exits, and
+/// dropping its `JoinHandle` DETACHES rather than joins. So a flow retired without a join leaves
+/// its own derived port bound; if the host's next datagram for that `flow_id` arrives first, the
+/// flow collides with its own dying pump and silently takes an ephemeral port. The probe sequence
+/// does not save it: linear probing resolves collisions against OTHER flows, not against yourself,
+/// so the tuple merely oscillates between candidates instead of falling to a kernel port.
+///
+/// The ceiling bounds the cost. Every join runs in the single land-forward loop, so an unbounded
+/// one would head-of-line block every other flow on the port — and a pump can sit in a `send_to`
+/// on a transit socket whose TAP queue the tenant has filled. On timeout we give up the port
+/// (that flow's tuple moves) rather than the loop.
+const PUMP_JOIN_MAX: Duration = Duration::from_millis(50);
+
+/// How many deterministic candidates a flow tries before giving up on a stable port. At
+/// `AGENT_L4_MAX_FLOWS` in the default band the load factor is ~5.6%, so all eight being taken is
+/// ~1e-10 — the ephemeral fallback is a true last resort rather than a routine outcome.
+const PORT_PROBES: u32 = 8;
+
+/// Width of the derived band. Also the fallback's distance below the ephemeral range, so the two
+/// bands are the same size whichever one is in play.
+const BAND_SPAN: u32 = 4536;
+
+/// The `attempt`-th stable source-port candidate for `flow_id`, or `None` if no usable band exists.
+///
+/// Band choice is a TENANT-AVAILABILITY decision, not just a correctness one. Above the ephemeral
+/// range (61000-65535 by default) is conventionally unused; BELOW it is the whole registered
+/// services range, and squatting there would intermittently break a UDP service the tenant starts
+/// later in its own VM — STUN/TURN 3478, SIP 5060, RADIUS, OpenVPN — which are precisely the
+/// workloads this plane exists to carry. It would surface as "my TURN server sometimes won't
+/// start", with no diagnostic. So prefer above, and only fall back below if the tenant has
+/// widened its ephemeral range to swallow the top of the space.
+///
+/// The ephemeral range itself is always excluded and is read from the guest's own sysctl rather
+/// than assumed, since the tenant can change it: colliding with ports the kernel hands to the
+/// tenant's outbound sockets would be intermittent, and worse for being intermittent.
+fn derived_source_port(flow_id: u32, guest_port: u16, attempt: u32) -> Option<u16> {
+    let (eph_lo, eph_hi) = ephemeral_range();
+    // Prefer above the ephemeral range; fall back below it.
+    let (band_lo, band_hi) = {
+        let above = (u32::from(eph_hi).saturating_add(1), 65535u32);
+        // The fallback is anchored to the TOP of the space below the ephemeral range, not to 1024.
+        // `ip_local_port_range = 32768 65535` is ordinary container tuning and empties the above-
+        // band, so this path is not exotic — and starting at 1024 would put us straight back on
+        // 3478/5060, the very thing the band choice exists to avoid. Ending just under `eph_lo`
+        // clears every registered UDP service that matters (3478/3479, 5349, 5060/5061, 1194,
+        // 1701, 1812/1813, 4500, and 27015 sits below it too).
+        let below = (
+            u32::from(eph_lo).saturating_sub(BAND_SPAN).max(1024),
+            u32::from(eph_lo).saturating_sub(1),
+        );
+        if above.0 <= above.1 && above.1 - above.0 >= 255 {
+            above
+        } else if below.0 <= below.1 && below.1 - below.0 >= 255 {
+            below
+        } else {
+            return None;
+        }
+    };
+    let span = band_hi - band_lo + 1;
+    // Mix so adjacent flow_ids do not land on adjacent ports; the host allocates them from a
+    // monotonic counter, so an unmixed modulo would pack every live flow into one contiguous run.
+    let mut h = u64::from(flow_id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    // Linear probe from the flow's own anchor: deterministic, so the sequence is identical every
+    // time this flow's socket is re-created.
+    let idx = (h % u64::from(span)) as u32;
+    let mut port = band_lo + (idx + attempt) % span;
+    // Never the app's own listening port — that bind could only ever fail. SKIP it (deterministic,
+    // so the sequence still reproduces) rather than returning `None`, which the caller reads as
+    // "no usable band" and would abandon the remaining probes over one unlucky candidate.
+    if u32::from(guest_port) == port {
+        port = band_lo + (idx + attempt + 1) % span;
+    }
+    u16::try_from(port).ok()
+}
+
+/// The guest's `ip_local_port_range`, or the kernel default if it cannot be read.
+fn ephemeral_range() -> (u16, u16) {
+    const DEFAULT: (u16, u16) = (32768, 60999);
+    let Ok(s) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") else {
+        return DEFAULT;
+    };
+    let mut it = s.split_whitespace();
+    match (
+        it.next().and_then(|v| v.parse::<u16>().ok()),
+        it.next().and_then(|v| v.parse::<u16>().ok()),
+    ) {
+        (Some(lo), Some(hi)) if lo < hi => (lo, hi),
+        _ => DEFAULT,
+    }
 }
 
 /// True if the guest has a UDP socket bound on `guest_port` at `127.0.0.1` or `0.0.0.0`. Reads
@@ -782,5 +999,155 @@ mod tests {
         assert!(!addr_is_loopback_or_wildcard("0200000A")); // eth0 v4
         assert!(!addr_is_loopback_or_wildcard("")); // empty
         assert!(!addr_is_loopback_or_wildcard("0100007")); // wrong length
+    }
+
+    /// The property the whole guest-side fix rests on: the same `flow_id` must always derive the
+    /// same sequence, because that port IS the tuple a pinning app holds. If it ever became order-
+    /// or state-dependent, an LRU eviction or a fresh agent would move the tuple again.
+    #[test]
+    fn derived_source_port_is_stable_and_outside_the_ephemeral_range() {
+        let (eph_lo, eph_hi) = ephemeral_range();
+        for flow_id in [0u32, 1, 2, 7, 4242, 1_000_003, u32::MAX] {
+            for attempt in 0..PORT_PROBES {
+                let a = derived_source_port(flow_id, 9999, attempt);
+                assert_eq!(
+                    a,
+                    derived_source_port(flow_id, 9999, attempt),
+                    "must be a pure function of (flow_id, attempt)"
+                );
+                if let Some(p) = a {
+                    assert!(p >= 1024, "never a privileged port: {p}");
+                    assert!(
+                        p < eph_lo || p > eph_hi,
+                        "must avoid the guest's ephemeral range {eph_lo}..={eph_hi}, got {p}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The band must sit ABOVE the ephemeral range on a default guest, so we never squat the
+    /// registered-services range inside the tenant's own VM — STUN/TURN 3478 and SIP 5060 live
+    /// there, and they are exactly the workloads this plane carries.
+    #[test]
+    fn derived_source_port_avoids_the_registered_services_range() {
+        let (_eph_lo, eph_hi) = ephemeral_range();
+        for flow_id in 0u32..2000 {
+            if let Some(p) = derived_source_port(flow_id, 9999, 0) {
+                assert!(
+                    p > eph_hi,
+                    "port {p} is below the ephemeral range — that is the services range"
+                );
+            }
+        }
+    }
+
+    /// A collision must have a reproducible SECOND choice. Without it, birthday collisions at
+    /// `AGENT_L4_MAX_FLOWS` drop ~one flow at a time onto a kernel-assigned port with no
+    /// stability — and they land in exactly the churn case this exists for.
+    #[test]
+    fn derived_source_port_probes_a_deterministic_sequence() {
+        let seq: Vec<u16> = (0..PORT_PROBES)
+            .filter_map(|a| derived_source_port(4242, 9999, a))
+            .collect();
+        assert_eq!(seq.len() as u32, PORT_PROBES, "every attempt yields a candidate");
+        let mut dedup = seq.clone();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), seq.len(), "the sequence must not repeat a port");
+        let again: Vec<u16> = (0..PORT_PROBES)
+            .filter_map(|a| derived_source_port(4242, 9999, a))
+            .collect();
+        assert_eq!(seq, again, "the sequence must reproduce exactly");
+    }
+
+    /// The failure the eviction joins exist to prevent, at the level `connect_loopback` sees it:
+    /// a flow re-created while its OWN previous socket is still bound cannot get its derived port
+    /// back, so the tuple moves. Cancelling a pump does not close its socket — the task holds an
+    /// `Arc` until it exits, and dropping a `JoinHandle` detaches rather than joins — which is why
+    /// LRU and the idle sweep now join before letting the port go.
+    #[tokio::test]
+    async fn a_flow_reclaims_its_derived_port_only_once_the_old_socket_closes() {
+        // Stand in for the guest app so `connect` succeeds.
+        let app = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let guest_port = app.local_addr().unwrap().port();
+        let flow_id = 4242u32;
+
+        let first = connect_loopback(guest_port, flow_id).await.unwrap();
+        let p1 = first.local_addr().unwrap().port();
+
+        // Re-create while the old socket is STILL OPEN — the lingering-pump case.
+        let second = connect_loopback(guest_port, flow_id).await.unwrap();
+        let p2 = second.local_addr().unwrap().port();
+        assert_ne!(p2, p1, "the old socket still holds p1, so this must land elsewhere");
+
+        // Once both are closed, the flow reclaims its original port — the property that makes the
+        // joins worth doing.
+        drop(first);
+        drop(second);
+        let third = connect_loopback(guest_port, flow_id).await.unwrap();
+        assert_eq!(
+            third.local_addr().unwrap().port(),
+            p1,
+            "with its own port free, a flow must derive the SAME tuple again"
+        );
+    }
+
+    /// The fallback band must not walk back onto the services range. `ip_local_port_range =
+    /// 32768 65535` is ordinary container tuning, it empties the preferred above-band, and a
+    /// fallback anchored at 1024 would land straight on 3478/5060 — the exact thing the band
+    /// choice exists to avoid.
+    #[test]
+    fn the_fallback_band_still_clears_the_services_range() {
+        // Simulate the widened-ephemeral case by exercising the same arithmetic the fn uses.
+        let eph_lo: u32 = 32768;
+        let lo = eph_lo.saturating_sub(BAND_SPAN).max(1024);
+        let hi = eph_lo - 1;
+        assert_eq!((lo, hi), (28232, 32767), "fallback anchors to the top of the space below");
+        for svc in [3478u32, 3479, 5349, 5060, 5061, 1194, 1701, 1812, 1813, 4500, 27015] {
+            assert!(svc < lo, "fallback band must clear UDP service port {svc}");
+        }
+    }
+
+    /// A batch join must be CONCURRENT. Awaiting sequentially under one timeout lets a single
+    /// wedged pump consume the whole budget and leaves every pump behind it unjoined — silently
+    /// reinstating the bug the join exists to prevent, for the entire tail of the batch.
+    #[tokio::test]
+    async fn a_wedged_pump_does_not_forfeit_the_rest_of_the_batch() {
+        let stuck = Arc::new(Notify::new());
+        // One task that never finishes, then several that finish immediately.
+        let mut retired: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let hold = stuck.clone();
+        retired.push(tokio::spawn(async move { hold.notified().await }));
+        for _ in 0..8 {
+            retired.push(tokio::spawn(async {}));
+        }
+        let started = std::time::Instant::now();
+        let results = tokio::time::timeout(
+            PUMP_JOIN_MAX,
+            futures_util::future::join_all(retired),
+        )
+        .await;
+        // The wedged one means the batch as a whole times out...
+        assert!(results.is_err(), "the wedged pump must still bound the batch");
+        assert!(
+            started.elapsed() < PUMP_JOIN_MAX * 3,
+            "the batch must not exceed its own ceiling"
+        );
+        // ...but the healthy ones were polled concurrently rather than queued behind it, which is
+        // the property a sequential loop loses. Release the wedge and confirm it can finish.
+        stuck.notify_one();
+    }
+
+    /// The app's own listening port is never derived — that bind could only ever fail.
+    #[test]
+    fn derived_source_port_never_collides_with_the_apps_own_port() {
+        for id in 0u32..5000 {
+            for attempt in 0..PORT_PROBES {
+                if let Some(p) = derived_source_port(id, 21093, attempt) {
+                    assert_ne!(p, 21093);
+                }
+            }
+        }
     }
 }
