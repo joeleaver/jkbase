@@ -3572,7 +3572,7 @@ esac
     ///       <test-bin> --ignored --nocapture bun_server_build_through_orchestrator
     ///
     /// Expects `$JKB_DATA/toolchains/bun.ext4`, a guest kernel at
-    /// `$JKB_DATA/vmlinux-6.12.92.bin` (or `vmlinux.bin`), all on one filesystem,
+    /// `$JKB_DATA/vmlinux.bin` (the adopted symlink; see `fixture_kernel`), all on one filesystem,
     /// and the parent build cgroup provisioned. Skips cleanly if `bun.ext4` is
     /// absent (toolchain not baked).
     #[tokio::test]
@@ -3902,14 +3902,7 @@ esac
             return None;
         }
         // Layered runtime needs the 6.12 LTS kernel (erofs/overlay/pivot_root).
-        let kernel = {
-            let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() {
-                lts
-            } else {
-                data.join("vmlinux.bin")
-            }
-        };
+        let kernel = fixture_kernel(&data);
 
         // Fixture: a single Bun server, no Dockerfile, no deps. `language="bun"`
         // is the authoritative detect hint (forwarded as `jkbase.lang=bun`).
@@ -4344,14 +4337,7 @@ console.log("listening on " + port);
             eprintln!("skip: {}/{toolchain} not baked", toolchain_dir.display());
             return None;
         }
-        let kernel = {
-            let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() {
-                lts
-            } else {
-                data.join("vmlinux.bin")
-            }
-        };
+        let kernel = fixture_kernel(&data);
 
         let mut tarbuf = Vec::new();
         {
@@ -5041,6 +5027,22 @@ console.log("listening on " + port);
 
     /// Resolve the runtime-boot env (baselayers store + musl agent) shared by the
     /// pipeline acceptance tests, or `None` (with a skip note) if unset.
+    /// The guest kernel these on-box fixtures boot.
+    ///
+    /// `vmlinux.bin` — the symlink `adopt_kernel_symlink` maintains — WINS. It used to lose to a
+    /// hardcoded `vmlinux-6.12.92.bin`, copy-pasted into five call sites, which meant adopting a
+    /// different kernel silently had no effect on any of these tests while the old versioned file
+    /// was still on disk. That turned a kernel bisect into a null result and cost a contributor
+    /// real time (#85): the panic still named the old version, so the swap looked like it had been
+    /// applied. The versioned name stays only as a fallback for a box that has never adopted.
+    fn fixture_kernel(data: &Path) -> PathBuf {
+        let adopted = data.join("vmlinux.bin");
+        if adopted.exists() {
+            return adopted;
+        }
+        data.join("vmlinux-6.12.92.bin")
+    }
+
     fn resolve_runtime_env(fx: &BuildFixture) -> Option<(PathBuf, PathBuf)> {
         let store_dir = std::env::var("JKB_BASELAYERS")
             .map(PathBuf::from)
@@ -5470,14 +5472,7 @@ console.log("listening on " + port);
             eprintln!("skip: agent binary {} missing", agent_bin.display());
             return;
         }
-        let kernel = {
-            let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() {
-                lts
-            } else {
-                data.join("vmlinux.bin")
-            }
-        };
+        let kernel = fixture_kernel(&data);
         if !kernel.exists() {
             eprintln!("skip: no kernel at {}", kernel.display());
             return;
@@ -5706,14 +5701,7 @@ console.log("listening on " + port);
             eprintln!("skip: agent binary {} missing", agent_bin.display());
             return;
         }
-        let kernel = {
-            let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() {
-                lts
-            } else {
-                data.join("vmlinux.bin")
-            }
-        };
+        let kernel = fixture_kernel(&data);
         if !kernel.exists() {
             eprintln!("skip: no kernel at {}", kernel.display());
             return;
@@ -8354,14 +8342,7 @@ console.log("listening on " + port);
             );
             return None;
         }
-        let kernel = {
-            let lts = data.join("vmlinux-6.12.92.bin");
-            if lts.exists() {
-                lts
-            } else {
-                data.join("vmlinux.bin")
-            }
-        };
+        let kernel = fixture_kernel(&data);
 
         // Fixture: ONE server built from a user Dockerfile. The image serves "ok" on
         // $PORT (the platform routing contract). builder="dockerfile" → image/self.
