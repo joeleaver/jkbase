@@ -54,3 +54,12 @@ CONFIG_FUSE_FS=y
 # resume); the guest stays on the auto-selected tsc and the agent disciplines it. ---
 CONFIG_PTP_1588_CLOCK=y
 CONFIG_PTP_1588_CLOCK_KVM=y
+
+# --- ACPI operation regions need the PCI handler on >=6.12 (issue #85) ---
+# Firecracker's baseline leaves `# CONFIG_PCI is not set` — correct for 6.1, and it still boots
+# there. On 6.12 the ACPI core cannot initialise the operation regions Firecracker's DSDT declares
+# without the PCI config-space region handler (`acpi_ex_pci_config_space_handler`), so table load
+# aborts with `AE_BAD_PARAMETER, During Region initialization`. ACPI then never enumerates the
+# virtio-MMIO devices, there is no /dev/vda, and the guest panics on `Unable to mount root fs`.
+# The guest still runs `pci=off`; this enables the handler, not a PCI bus.
+CONFIG_PCI=y
