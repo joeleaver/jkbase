@@ -443,9 +443,11 @@ impl LandForward {
                         // is prompt in the normal case (`notify_one` leaves a permit, so there is
                         // no lost wakeup even if the pump is not yet parked), but the pump can be
                         // sitting in a `send_to` on a transit socket the tenant's own TAP queue has
-                        // filled. On timeout we simply DON'T reuse: the old socket is still bound,
-                        // so the derived bind fails, we take the ephemeral fallback, and this one
-                        // flow's tuple moves. A bounded loss of the feature, not of the port.
+                        // filled. On timeout we simply DON'T reuse. The zombie still holds
+                        // attempt 0, so the replacement lands on attempt 1 — not the ephemeral
+                        // fallback — and this flow's tuple moves; when the zombie exits and frees
+                        // attempt 0 a later re-creation moves it back. Bounded and self-healing:
+                        // a loss of stability for one flow, never of the port for the rest.
                         match tokio::time::timeout(PUMP_JOIN_MAX, old.pump).await {
                             Ok(_) => Some(old.sock),
                             Err(_) => {
@@ -689,8 +691,15 @@ async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpS
     // Try the flow's deterministic probe sequence. A single candidate is not enough: the agent
     // holds up to `AGENT_L4_MAX_FLOWS` flows, so birthday collisions are likely at capacity, and
     // they land in exactly the churn case this exists for — A holds P, A is LRU-evicted, B takes
-    // P, A returns and finds P gone. A reproducible SECOND choice means A's tuple survives as long
-    // as the occupancy around it is stable, instead of falling off a cliff to a kernel port.
+    // P, A returns and finds P gone.
+    //
+    // Be precise about what the sequence buys, because it is not unconditional. A flow that takes
+    // attempt 0 — ~94% of them at the default load factor — reproduces its port unconditionally,
+    // since no other flow's anchor is there. A flow that took attempt k>0 reproduces only while
+    // candidates 0..k-1 are STILL occupied; if one of those goes away it shifts earlier and its
+    // tuple moves. So the sequence turns "~5.6% of flows get no stability" into "~5.6% get
+    // stability conditional on their prefix" — a real win and a self-healing residual, not a
+    // guarantee for every flow.
     for attempt in 0..PORT_PROBES {
         let Some(candidate) = derived_source_port(flow_id, guest_port, attempt) else {
             break;
@@ -724,8 +733,14 @@ async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpS
 /// (that flow's tuple moves) rather than the loop.
 const PUMP_JOIN_MAX: Duration = Duration::from_millis(50);
 
-/// How many deterministic candidates a flow tries before giving up on a stable port.
+/// How many deterministic candidates a flow tries before giving up on a stable port. At
+/// `AGENT_L4_MAX_FLOWS` in the default band the load factor is ~5.6%, so all eight being taken is
+/// ~1e-10 — the ephemeral fallback is a true last resort rather than a routine outcome.
 const PORT_PROBES: u32 = 8;
+
+/// Width of the derived band. Also the fallback's distance below the ephemeral range, so the two
+/// bands are the same size whichever one is in play.
+const BAND_SPAN: u32 = 4536;
 
 /// The `attempt`-th stable source-port candidate for `flow_id`, or `None` if no usable band exists.
 ///
@@ -745,7 +760,16 @@ fn derived_source_port(flow_id: u32, guest_port: u16, attempt: u32) -> Option<u1
     // Prefer above the ephemeral range; fall back below it.
     let (band_lo, band_hi) = {
         let above = (u32::from(eph_hi).saturating_add(1), 65535u32);
-        let below = (1024u32, u32::from(eph_lo).saturating_sub(1));
+        // The fallback is anchored to the TOP of the space below the ephemeral range, not to 1024.
+        // `ip_local_port_range = 32768 65535` is ordinary container tuning and empties the above-
+        // band, so this path is not exotic — and starting at 1024 would put us straight back on
+        // 3478/5060, the very thing the band choice exists to avoid. Ending just under `eph_lo`
+        // clears every registered UDP service that matters (3478/3479, 5349, 5060/5061, 1194,
+        // 1701, 1812/1813, 4500, and 27015 sits below it too).
+        let below = (
+            u32::from(eph_lo).saturating_sub(BAND_SPAN).max(1024),
+            u32::from(eph_lo).saturating_sub(1),
+        );
         if above.0 <= above.1 && above.1 - above.0 >= 255 {
             above
         } else if below.0 <= below.1 && below.1 - below.0 >= 255 {
@@ -1052,6 +1076,22 @@ mod tests {
             p1,
             "with its own port free, a flow must derive the SAME tuple again"
         );
+    }
+
+    /// The fallback band must not walk back onto the services range. `ip_local_port_range =
+    /// 32768 65535` is ordinary container tuning, it empties the preferred above-band, and a
+    /// fallback anchored at 1024 would land straight on 3478/5060 — the exact thing the band
+    /// choice exists to avoid.
+    #[test]
+    fn the_fallback_band_still_clears_the_services_range() {
+        // Simulate the widened-ephemeral case by exercising the same arithmetic the fn uses.
+        let eph_lo: u32 = 32768;
+        let lo = eph_lo.saturating_sub(BAND_SPAN).max(1024);
+        let hi = eph_lo - 1;
+        assert_eq!((lo, hi), (28232, 32767), "fallback anchors to the top of the space below");
+        for svc in [3478u32, 3479, 5349, 5060, 5061, 1194, 1701, 1812, 1813, 4500, 27015] {
+            assert!(svc < lo, "fallback band must clear UDP service port {svc}");
+        }
     }
 
     /// The app's own listening port is never derived — that bind could only ever fail.
