@@ -1,5 +1,6 @@
 mod auth_service;
 mod build_ca;
+mod build_cache;
 mod build_orchestrator;
 mod db_backup_store;
 mod db_gateway;
@@ -2701,9 +2702,11 @@ async fn reconcile_orphans_on_boot(platform: &Arc<Mutex<PlatformState>>) {
         }
     }
     // `objectstore/{id}` + `db-backups/{id}`: a deleted project's bucket tree / managed-DB
-    // backup blobs ([RB11]). Delete purges them, but a crash-interrupted teardown can leave them
-    // — reap so a recreated slug starts clean and a deleted tenant's DB data doesn't linger.
-    for sub in ["hosting", "run", "snapshots", "objectstore", "db-backups"] {
+    // backup blobs ([RB11]). `buildcache/{id}`: its warm build caches + per-target artifact
+    // cache. Delete purges them, but a crash-interrupted teardown can leave them — reap so a
+    // recreated slug starts clean (it must never inherit the previous tenant's build
+    // artifacts) and a deleted tenant's DB data doesn't linger.
+    for sub in ["hosting", "run", "snapshots", "objectstore", "db-backups", "buildcache"] {
         let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else {
             continue;
         };

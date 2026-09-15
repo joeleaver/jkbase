@@ -207,6 +207,39 @@ Rules: `context` defaults to `source`, so **omitting it changes nothing**. `sour
 `context` no wider than the path-deps require — a wide context mounts more of your repo into the
 build (bigger build, weaker reproducibility), so prefer `apps/` over `.` when that's enough.
 
+### Only what changed gets rebuilt
+
+Each target is keyed by exactly what goes into it: the tree mounted in its build VM, its
+build-affecting settings, and the toolchain image. Deploy again and a target whose key is unchanged
+**reuses the artifact its last build produced** — no build VM, no build-minutes. The CLI marks it:
+
+```
+  [server] api — succeeded (reused — inputs unchanged)
+  [static] app — succeeded
+```
+
+On a wide `context` that means unrelated edits still rebuild — your marketing site, your docs,
+your `jkbase.toml` — because they're inside the mounted tree. Name them with **`exclude`**: globs
+relative to the context, Docker-context style (`*` stays inside one path segment, `**` crosses
+them). A deploy tells you which paths are worth excluding.
+
+```toml
+[servers.api]
+source  = "crates/api"
+context = "."
+exclude = ["site", "docs", "*.md", "jkbase.toml"]   # not mounted, not part of the key
+port    = 8080
+```
+
+Excluded paths leave the build mount *and* the key together, so a reuse can never be stale — but
+they really are gone from the build, so exclude only what this target doesn't use. (Careful with a
+server that serves files from its own tree: on the Bun/Node buildpacks the app layer is the whole
+context, so excluding a directory your server reads at runtime makes it 404 in production.)
+
+Nothing is excluded for you. `jkbase deploy --rebuild` builds every target from scratch, and a
+cached artifact is never reused for longer than a week — so an unpinned dependency or a Dockerfile
+`FROM` still gets re-resolved regularly.
+
 ---
 
 ## Functions (WASI components)
@@ -642,6 +675,7 @@ spa     = true
 [servers.api]
 source       = "crates/api"      # build subdir (default ".")
 context      = "."               # monorepo: mount a wider tree; source must be INSIDE context
+# exclude    = ["docs", "*.md"]  # globs left OUT of the build input (and so out of its build key)
 # language   = "rust"            # optional hint (bun|node|rust|python|go); auto-detected
 port         = 8080              # REQUIRED — authoritative for routing (no default)
 # command    = ["/opt/bun/bin/bun", "run", "start"]   # optional argv override; argv[0] absolute

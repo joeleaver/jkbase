@@ -75,6 +75,17 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
         }
     }
 
+    // Build-reuse cache (`buildcache/{id}/targets/…`): a cached artifact is usually a hard
+    // link to the same file in the billed deployment. Bill each distinct inode ONCE, skipping
+    // the ones that deployment already paid for — link count alone would let two cache entries
+    // sharing an inode (or one shared with a retained, unbilled version) bill nothing.
+    let mut seen = std::collections::HashSet::new();
+    collect_inodes(deployment_dir, &mut seen);
+    total = total.saturating_add(unshared_file_bytes(
+        &data_dir.join("buildcache").join(project_id).join("targets"),
+        &mut seen,
+    ));
+
     // Tenant object store: per-project root `objectstore/{id}` holding S3 buckets
     // (object bytes + .meta sidecars + in-flight multipart staging). Counted here so
     // it bills against the SAME storage cap and shows in the SAME metering rollup as
@@ -85,6 +96,45 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
     // deployed). Excludes other retained versions; never follows symlinks.
     total = total.saturating_add(dir_bytes(deployment_dir));
 
+    total
+}
+
+/// Record every `(dev, ino)` of the regular files under `dir` (never following symlinks), so
+/// a file hard-linked elsewhere is billed once, where it is already counted.
+fn collect_inodes(dir: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(md) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if md.is_dir() {
+            collect_inodes(&entry.path(), seen);
+        } else if md.is_file() {
+            seen.insert((md.dev(), md.ino()));
+        }
+    }
+}
+
+/// Recursively sum the allocated blocks of regular files under `dir`, counting each distinct
+/// inode once and skipping the ones in `seen` (already billed elsewhere). Never follows
+/// symlinks. Missing dir -> 0.
+pub fn unshared_file_bytes(dir: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(md) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if md.is_dir() {
+            total = total.saturating_add(unshared_file_bytes(&entry.path(), seen));
+        } else if md.is_file() && seen.insert((md.dev(), md.ino())) {
+            total = total.saturating_add(md.blocks().saturating_mul(512));
+        }
+    }
     total
 }
 
@@ -148,6 +198,31 @@ mod tests {
         // Deploy-time check bills a specific version dir (content + that dir).
         assert_eq!(project_storage_bytes_for(&dd, pid, &dep.join("v1")), 1100);
         assert_eq!(project_storage_bytes_for(&dd, pid, &dep.join("v2")), 150);
+        let _ = fs::remove_dir_all(&dd);
+    }
+
+    #[test]
+    fn bills_build_cache_files_no_deployment_still_shares() {
+        let dd = tmp("buildcache");
+        let pid = "proj";
+        let dep = dd.join("hosting").join(pid).join("deployments").join("v1");
+        write(&dep.join("_layers").join("blob"), &[7u8; 8192]);
+        std::os::unix::fs::symlink(&dep, dd.join("hosting").join(pid).join("live")).unwrap();
+        let entries = dd.join("buildcache").join(pid).join("targets").join("server-api");
+        // Shared with the live deployment (a hard link): billed once, via the deployment.
+        fs::create_dir_all(entries.join("k1")).unwrap();
+        fs::hard_link(dep.join("_layers").join("blob"), entries.join("k1").join("app.erofs")).unwrap();
+        let with_shared = project_storage_bytes(&dd, pid);
+        assert_eq!(with_shared, 8192, "a shared cache file is not billed twice");
+        // An entry whose deployment is gone: its own blocks are billed…
+        write(&entries.join("k0").join("app.erofs"), &[1u8; 8192]);
+        assert_eq!(project_storage_bytes(&dd, pid), with_shared + 8192);
+        // …and a second entry sharing THAT inode adds nothing, but doesn't hide it either
+        // (link count > 1 with no billed deployment behind it).
+        let other = dd.join("buildcache").join(pid).join("targets").join("server-web");
+        fs::create_dir_all(&other).unwrap();
+        fs::hard_link(entries.join("k0").join("app.erofs"), other.join("app.erofs")).unwrap();
+        assert_eq!(project_storage_bytes(&dd, pid), with_shared + 8192);
         let _ = fs::remove_dir_all(&dd);
     }
 

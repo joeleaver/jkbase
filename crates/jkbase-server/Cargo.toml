@@ -38,6 +38,8 @@ cron = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
+# `exclude` build-input globs (Docker-context style) for per-target build keys.
+globset = "0.4"
 tower = { workspace = true, features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = { workspace = true }

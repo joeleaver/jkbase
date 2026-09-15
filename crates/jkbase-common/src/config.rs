@@ -89,6 +89,15 @@ pub struct FunctionConfig {
     ///   false         => sandbox (deny public egress; OWN stuff still reachable)
     #[serde(default)]
     pub egress: Option<EgressPolicy>,
+    /// Paths to leave OUT of this target's build input, as globs relative to the build
+    /// context (Docker-context style: anchored at the context root, `*` stays within one
+    /// path segment, `**` crosses them — `docs`, `*.pimble`, `**/fixtures`). A match
+    /// removes the entry (a directory with its whole subtree) from BOTH the mounted build
+    /// source and the target's build key, so a change there never forces a rebuild and a
+    /// build can never depend on it. Added to the automatic exclusions (other sites'
+    /// committed `public` dirs and `jkbase.toml`).
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// A declared per-function (or project-default) PUBLIC-egress policy. TOML has no native
@@ -454,6 +463,15 @@ pub struct ServerConfig {
     /// clears the environment, so it can't rely on `PATH`.
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Paths to leave OUT of this target's build input, as globs relative to the build
+    /// context (Docker-context style: anchored at the context root, `*` stays within one
+    /// path segment, `**` crosses them — `docs`, `*.pimble`, `**/fixtures`). A match
+    /// removes the entry (a directory with its whole subtree) from BOTH the mounted build
+    /// source and the target's build key, so a change there never forces a rebuild and a
+    /// build can never depend on it. Added to the automatic exclusions (other sites'
+    /// committed `public` dirs and `jkbase.toml`).
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// Resolved build strategy for a `[servers.*]` target. `Auto` runs zero-config
@@ -600,6 +618,15 @@ pub struct SiteConfig {
     /// (the default) → a committed static site served from `public`, unchanged.
     #[serde(default)]
     pub build: Option<String>,
+    /// Paths to leave OUT of this site's build input (built sites only; ignored for a committed site), as globs relative to the build
+    /// context (Docker-context style: anchored at the context root, `*` stays within one
+    /// path segment, `**` crosses them — `docs`, `*.pimble`, `**/fixtures`). A match
+    /// removes the entry (a directory with its whole subtree) from BOTH the mounted build
+    /// source and the target's build key, so a change there never forces a rebuild and a
+    /// build can never depend on it. Added to the automatic exclusions (other sites'
+    /// committed `public` dirs and `jkbase.toml`).
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// Resolved build strategy for a `[sites.*]` target. `None` (committed content) is
