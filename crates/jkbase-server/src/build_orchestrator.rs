@@ -1212,6 +1212,7 @@ async fn build_one_target(
                 |t| {
                     t.finished_at = Some(now());
                     t.cache_hit = provenance.cache_hit;
+                    t.detail = provenance.note.clone();
                     t.cache_key = provenance.cache_key.clone();
                     t.duration_breakdown_ms = provenance.duration_breakdown_ms.clone();
                     t.builder_digest = provenance.builder_digest.clone();
@@ -1276,23 +1277,17 @@ async fn build_one_target_inner(
     // image is built from AND what the build key hashes — so an excluded change can neither
     // be missed by the key nor seen by the build (see `build_cache`).
     let input_dir = workspace.join(format!("{tag}.input"));
+    // Paths inside the context this target probably doesn't build from (a sibling site's
+    // committed content, jkbase.toml). Advisory only — but if a REBUILD turns out to be
+    // caused by nothing else, the tenant is told to `exclude` them (see below).
+    let hints = crate::build_cache::exclusion_hints(
+        config,
+        &spec.context_subdir,
+        &spec.build_subdir_in_project(),
+        &crate::build_cache::Exclusions::new(&spec.exclude)?,
+    );
     {
         let ex = crate::build_cache::Exclusions::new(&spec.exclude)?;
-        // Advisory: a wide context usually carries files this target doesn't build from, and
-        // every one of them rebuilds it when it changes.
-        let hints = crate::build_cache::exclusion_hints(
-            config,
-            &spec.context_subdir,
-            &spec.build_subdir_in_project(),
-            &ex,
-        );
-        if !hints.is_empty() {
-            info!(
-                project = %project_id, target = %spec.name, paths = %hints.join(", "),
-                "build context carries paths this target may not build from; \
-                 `exclude` them to stop them triggering a rebuild"
-            );
-        }
         let (ctx, dst) = (context_path.clone(), input_dir.clone());
         let dropped = tokio::task::spawn_blocking(move || {
             crate::build_cache::materialize_input(&ctx, &ex, &dst)
@@ -1397,6 +1392,7 @@ async fn build_one_target_inner(
                     Some(note.into_bytes()),
                     BuildProvenance {
                         cache_hit: true,
+                        note: None,
                         cache_key: Some(key.to_string()),
                         duration_breakdown_ms: [("reuse".to_string(), reuse_start.elapsed().as_millis() as u64)]
                             .into_iter()
@@ -1411,6 +1407,37 @@ async fn build_one_target_inner(
                             "build cache entry unusable; building"),
         }
     }
+
+    // This target is going to build. If the ONLY difference from an earlier build is in the
+    // hinted paths, say so — with the exact `exclude` line that would have made it a reuse.
+    // (Computed only when there is something to hint; the digest memo means no file is re-read.)
+    let hint_free_tree = if hints.is_empty() {
+        None
+    } else {
+        let skip = crate::build_cache::Exclusions::new(
+            &spec.exclude.iter().cloned().chain(hints.iter().cloned()).collect::<Vec<_>>(),
+        )?;
+        let (dir, memo) = (input_dir.clone(), digests.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::build_cache::tree_digest_skipping(&dir, Some(&skip), &memo)
+        })
+        .await
+        .context("hint digest task")?
+        .ok()
+    };
+    let note = hint_free_tree
+        .as_deref()
+        .filter(|hf| build_key.is_some() && cache.would_have_reused(hf))
+        .map(|_| {
+            format!(
+                "this rebuild came only from paths this target may not build from ({}) — add \
+                 `exclude = [{}]` under [{}.{}] to reuse the build when only those change",
+                hints.join(", "),
+                hints.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", "),
+                config_section(spec.kind),
+                spec.name,
+            )
+        });
 
     // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
     // intake, but a build fans out one metered VM per target, so a many-target
@@ -1767,7 +1794,7 @@ async fn build_one_target_inner(
     // write failure never fails a build that succeeded.
     if let (Some(key), Some((artifact, files))) = (build_key.as_deref(), cached) {
         let files: Vec<(&str, &Path)> = files.iter().map(|(n, p)| (*n, p.as_path())).collect();
-        if let Err(e) = cache.store(key, artifact, &files, build_id) {
+        if let Err(e) = cache.store(key, artifact, &files, build_id, hint_free_tree.clone()) {
             warn!(project = %project_id, target = %spec.name, error = %format!("{e:#}"),
                   "could not record build in the build cache");
         }
@@ -1781,6 +1808,7 @@ async fn build_one_target_inner(
     let provenance = BuildProvenance {
         // A VM build is never a reuse; the key is the host's (what the next deploy matches).
         cache_hit: false,
+        note,
         cache_key: build_key.or(meta.cache_key),
         duration_breakdown_ms: meta.phases_ms,
         builder_digest: toolchain_digest,
@@ -2195,6 +2223,8 @@ fn read_built_manifest(
 #[derive(Debug, Default)]
 struct BuildProvenance {
     cache_hit: bool,
+    /// A tenant-visible note about this target's build (today: the `exclude` advice).
+    note: Option<String>,
     cache_key: Option<String>,
     duration_breakdown_ms: std::collections::BTreeMap<String, u64>,
     builder_digest: Option<String>,
@@ -2861,6 +2891,15 @@ fn append_log_tail(tail: &mut String, name: &str, log: &[u8]) {
             idx += 1;
         }
         *tail = tail.split_off(idx);
+    }
+}
+
+/// The jkbase.toml table a target's settings live under, for advice the tenant can paste.
+fn config_section(kind: TargetKind) -> &'static str {
+    match kind {
+        TargetKind::Function => "functions",
+        TargetKind::Server => "servers",
+        TargetKind::Static => "sites",
     }
 }
 
@@ -9429,11 +9468,12 @@ console.log("listening on " + port);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(data.join("buildcache").join("reuse"));
         let _ = std::fs::remove_file(data.join("onbox-reuse.redb"));
-        let manifest = |comment: &str| {
+        let manifest_with = |comment: &str, exclude: &str| {
             format!(
-                "# {comment}\n[project]\nname = \"reusefix\"\n\n[sites.site]\npublic = \"site\"\nprefix = \"/site\"\n\n[servers.api]\nsource = \"server\"\ncontext = \".\"\nexclude = [\"site\", \"jkbase.toml\"]\nlanguage = \"bun\"\nport = 3000\ncommand = [\"/opt/bun/bin/bun\", \"run\", \"/app/server/server.ts\"]\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
+                "# {comment}\n[project]\nname = \"reusefix\"\n\n[sites.site]\npublic = \"site\"\nprefix = \"/site\"\n\n[servers.api]\nsource = \"server\"\ncontext = \".\"\n{exclude}language = \"bun\"\nport = 3000\ncommand = [\"/opt/bun/bin/bun\", \"run\", \"/app/server/server.ts\"]\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
             )
         };
+        let manifest = |comment: &str| manifest_with(comment, "exclude = [\"site\", \"jkbase.toml\"]\n");
         let server = |body: &str| {
             format!("Bun.serve({{ port: Number(process.env.PORT) || 3000, fetch() {{ return new Response(\"{body}\"); }} }});\n")
         };
@@ -9460,7 +9500,7 @@ console.log("listening on " + port);
             fetch_deadline_secs: 120,
         };
         // Build `id`, returning (api target cache_hit, api app layer file, staged dir, fixture).
-        async fn build(src: &Path, id: u64, rebuild: bool, tuning: BuildTuning) -> Option<(bool, String, BuildFixture)> {
+        async fn build_noted(src: &Path, id: u64, rebuild: bool, tuning: BuildTuning) -> Option<(bool, String, Option<String>, BuildFixture)> {
             let fx = networked_lang_build_opts("reuse", "onbox-reuse.redb", "bun.ext4", src, tuning, id, rebuild)
                 .await?
                 .expect("build should succeed");
@@ -9470,8 +9510,13 @@ console.log("listening on " + port);
                 serde_json::from_slice(&std::fs::read(fx.staged.join("_servers/api.json")).unwrap()).unwrap();
             let layer = manifest["app_layer"].as_str().unwrap().to_string();
             assert!(fx.staged.join("_layers").join(&layer).is_file(), "build {id}: app layer staged");
-            eprintln!("[reuse-e2e] build {id} rebuild={rebuild} cache_hit={} key={:?} layer={layer}", api.cache_hit, api.cache_key);
-            Some((api.cache_hit, layer, fx))
+            eprintln!("[reuse-e2e] build {id} rebuild={rebuild} cache_hit={} key={:?} layer={layer} note={:?}", api.cache_hit, api.cache_key, api.detail);
+            Some((api.cache_hit, layer, api.detail.clone(), fx))
+        }
+
+        /// The common case: ignore the note.
+        async fn build(src: &Path, id: u64, rebuild: bool, tuning: BuildTuning) -> Option<(bool, String, BuildFixture)> {
+            build_noted(src, id, rebuild, tuning).await.map(|(hit, layer, _, fx)| (hit, layer, fx))
         }
 
         let Some((hit1, layer1, fx1)) = build(&src, 1, false, tuning()).await else { return };
@@ -9510,7 +9555,25 @@ console.log("listening on " + port);
         assert!(hit5, "unchanged inputs reuse again");
         assert_eq!(layer5, layer4);
         let _ = std::fs::remove_dir_all(&fx5.staged);
-        println!("PASS: per-target build reuse — site/manifest edits reuse the server (and it serves), source edits and --rebuild build");
+        drop(fx5);
+
+        // Discoverability: with NO `exclude`, the site is part of the server's input, so a
+        // site-only edit rebuilds — and the build must tell the tenant exactly what to add.
+        write(src.join("jkbase.toml"), &manifest_with("no exclude", ""));
+        let (_, _, note6, fx6) = build_noted(&src, 6, false, tuning()).await.unwrap();
+        assert!(note6.is_none(), "the manifest itself changed, so the advice can't claim otherwise: {note6:?}");
+        let _ = std::fs::remove_dir_all(&fx6.staged);
+        drop(fx6);
+        write(src.join("site/index.html"), "<h1>three</h1>");
+        let (hit7, _, note7, fx7) = build_noted(&src, 7, false, tuning()).await.unwrap();
+        let _ = std::fs::remove_dir_all(&fx7.staged);
+        assert!(!hit7, "without `exclude` the site is part of the server's input");
+        let note7 = note7.expect("a rebuild caused only by hinted paths must advise excluding them");
+        assert!(
+            note7.contains("only from paths") && note7.contains("site") && note7.contains("[servers.api]"),
+            "{note7}"
+        );
+        println!("PASS: per-target build reuse — excluded edits reuse the server (and it serves), source edits and --rebuild build, and an avoidable rebuild says how to avoid it:\n  {note7}");
     }
 
     /// On-box validation of the VM re-adoption kernel-touching primitives (zero-bounce continuity

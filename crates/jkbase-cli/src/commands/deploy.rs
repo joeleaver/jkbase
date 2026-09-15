@@ -153,13 +153,20 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         let fingerprint = status
             .targets
             .iter()
-            .map(|t| format!("{}:{}:{}:{}", t.kind, t.name, t.phase, t.cache_hit))
+            .map(|t| format!("{}:{}:{}:{}:{}", t.kind, t.name, t.phase, t.cache_hit, t.detail.is_some()))
             .collect::<Vec<_>>()
             .join(",");
         if fingerprint != last_fingerprint {
             for t in &status.targets {
                 let reused = if t.cache_hit { " (reused — inputs unchanged)" } else { "" };
                 println!("  [{}] {} — {}{reused}", t.kind, t.name, t.phase);
+                // A succeeded target's detail is advice (how to make the next deploy reuse it);
+                // on a failure it's the error, printed with the failure block below.
+                if t.phase == "succeeded"
+                    && let Some(note) = t.detail.as_deref()
+                {
+                    println!("      note: {note}");
+                }
             }
             last_fingerprint = fingerprint;
         }
