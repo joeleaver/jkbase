@@ -1,5 +1,6 @@
 mod auth_service;
 mod build_ca;
+mod build_cache;
 mod build_orchestrator;
 mod db_backup_store;
 mod db_gateway;
