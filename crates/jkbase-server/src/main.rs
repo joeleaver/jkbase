@@ -2766,64 +2766,11 @@ async fn reconcile_baselayers_on_boot(platform: &Arc<Mutex<PlatformState>>) {
     if !baselayers.is_dir() {
         return;
     }
-
-    // The LIVE set of baselayers blob filenames a deletion must never touch.
-    let mut live: HashSet<String> = HashSet::new();
-
-    // (1) Current platform.json base + every runtime are ALWAYS live (the next deploy
-    //     and any project mid-deploy use them). baselayers/ existing implies platform.json
-    //     should too — the platform-layer build installs the blobs THEN writes the
-    //     manifest — so treat absent/unreadable/unparseable IDENTICALLY: abort the sweep
-    //     rather than risk reaping the current (or a freshly-baked, not-yet-deployed-onto)
-    //     base/runtime when the manifest momentarily isn't there.
-    let platform_json = baselayers.join("platform.json");
-    let parsed = std::fs::read(&platform_json)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-    let Some(v) = parsed else {
-        warn!("baselayers GC: platform.json missing/unreadable/unparseable; skipping sweep");
+    let Some(live) =
+        baselayers_live_set(&data_dir, &registered, layer_plan::try_read_layer_paths)
+    else {
         return;
     };
-    if let Some(f) = v
-        .get("base")
-        .and_then(|b| b.get("file"))
-        .and_then(|f| f.as_str())
-    {
-        live.insert(f.to_string());
-    }
-    if let Some(rts) = v.get("runtimes").and_then(|r| r.as_object()) {
-        for desc in rts.values() {
-            if let Some(f) = desc.get("file").and_then(|f| f.as_str()) {
-                live.insert(f.to_string());
-            }
-        }
-    }
-
-    // (2) Each registered project's CURRENT metadata image pins the exact base/runtime
-    //     blobs it attaches. If a project's layer map can't be read, abort the whole
-    //     sweep (treating it as "references nothing" could reap a blob it still needs).
-    let content_images = data_dir.join("content-images");
-    for id in &registered {
-        let img = content_images.join(format!("{id}.ext4"));
-        let paths = match layer_plan::try_read_layer_paths(&img) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(project = %id, error = %e, "baselayers GC: cannot read layer paths; skipping sweep");
-                return;
-            }
-        };
-        for p in paths {
-            // Match by content-addressed FILENAME, not parent path: the baked paths carry
-            // the data_dir spelling AS OF deploy time, so a relocated/re-spelled data_dir
-            // would make a live base/runtime's parent lexically != the boot-time baselayers
-            // dir and silently drop it from the set. A `sha256-<hex>.erofs` name uniquely
-            // identifies its blob regardless of directory; adding app-layer names too is
-            // harmless (they never collide with a baselayers blob's content address).
-            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                live.insert(name.to_string());
-            }
-        }
-    }
 
     // Sweep: reap content-addressed blobs (`sha256-<hex>.erofs`) not in the live set.
     // Anything else in baselayers/ (platform.json, verity sidecars) is left untouched.
@@ -2840,6 +2787,83 @@ async fn reconcile_baselayers_on_boot(platform: &Arc<Mutex<PlatformState>>) {
             Err(e) => warn!(blob = %name, error = %e, "failed to reap unreferenced baselayer blob"),
         }
     }
+}
+
+/// The LIVE set of `baselayers/` blob filenames the boot GC must never touch, or `None` ⇒ abort
+/// the sweep (a manifest or layer map we can't read). `read_paths` is
+/// [`layer_plan::try_read_layer_paths`] in production (`Ok(empty)` for an absent image).
+///
+/// Every VM a project can boot pins its own blobs, so BOTH metadata images count: the app VM's
+/// `{id}.ext4` and a dedicated project's sibling DB VM's `{id}.db.ext4`. The DB image is the ONLY
+/// referrer of the `rhypedb` runtime layer for a dedicated project (its app VM is built `AppNoDb`),
+/// so skipping it reaped the old engine blob on the first host restart after a rhypedb layer swap
+/// — and the DB VM's next cold boot / restore then had no engine layer to attach.
+fn baselayers_live_set(
+    data_dir: &Path,
+    registered: &[String],
+    read_paths: impl Fn(&Path) -> Result<Vec<PathBuf>>,
+) -> Option<HashSet<String>> {
+    let baselayers = data_dir.join("baselayers");
+    let mut live: HashSet<String> = HashSet::new();
+
+    // (1) Current platform.json base + every runtime are ALWAYS live (the next deploy
+    //     and any project mid-deploy use them). baselayers/ existing implies platform.json
+    //     should too — the platform-layer build installs the blobs THEN writes the
+    //     manifest — so treat absent/unreadable/unparseable IDENTICALLY: abort the sweep
+    //     rather than risk reaping the current (or a freshly-baked, not-yet-deployed-onto)
+    //     base/runtime when the manifest momentarily isn't there.
+    let platform_json = baselayers.join("platform.json");
+    let parsed = std::fs::read(&platform_json)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let Some(v) = parsed else {
+        warn!("baselayers GC: platform.json missing/unreadable/unparseable; skipping sweep");
+        return None;
+    };
+    if let Some(f) = v
+        .get("base")
+        .and_then(|b| b.get("file"))
+        .and_then(|f| f.as_str())
+    {
+        live.insert(f.to_string());
+    }
+    if let Some(rts) = v.get("runtimes").and_then(|r| r.as_object()) {
+        for desc in rts.values() {
+            if let Some(f) = desc.get("file").and_then(|f| f.as_str()) {
+                live.insert(f.to_string());
+            }
+        }
+    }
+
+    // (2) Each registered project's CURRENT metadata images (app VM + dedicated DB VM) pin
+    //     the exact base/runtime blobs they attach. If a layer map can't be read, abort the
+    //     whole sweep (treating it as "references nothing" could reap a blob it still needs).
+    let content_images = data_dir.join("content-images");
+    let images = registered.iter().flat_map(|id| {
+        [vm_identity::VmRole::App, vm_identity::VmRole::Db]
+            .map(|role| content_images.join(format!("{}.ext4", vm_identity::vm_id(id, role))))
+    });
+    for img in images {
+        let paths = match read_paths(&img) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(image = %img.display(), error = %e, "baselayers GC: cannot read layer paths; skipping sweep");
+                return None;
+            }
+        };
+        for p in paths {
+            // Match by content-addressed FILENAME, not parent path: the baked paths carry
+            // the data_dir spelling AS OF deploy time, so a relocated/re-spelled data_dir
+            // would make a live base/runtime's parent lexically != the boot-time baselayers
+            // dir and silently drop it from the set. A `sha256-<hex>.erofs` name uniquely
+            // identifies its blob regardless of directory; adding app-layer names too is
+            // harmless (they never collide with a baselayers blob's content address).
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                live.insert(name.to_string());
+            }
+        }
+    }
+    Some(live)
 }
 
 /// Reconcile persisted state into the in-memory domain map at startup. Grandfathers
@@ -7635,6 +7659,54 @@ mod tests {
         assert!(!project_can_wake(&data, &store, "r"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A rhypedb layer swap repoints `platform.json` at the new engine; the OLD engine blob is
+    /// then pinned only by a dedicated project's DB VM image (`{id}.db.ext4`). The boot GC must
+    /// keep it live, and an unreadable DB image must abort the sweep like an app image does.
+    #[test]
+    fn baselayers_live_set_keeps_blobs_pinned_by_dedicated_db_vm_images() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!("jkbase-blgc-{nanos}"));
+        let blob = |c: char| format!("sha256-{}.erofs", c.to_string().repeat(64));
+        let (base, new_db, old_db, app) = (blob('a'), blob('b'), blob('c'), blob('d'));
+        std::fs::create_dir_all(data.join("baselayers")).unwrap();
+        std::fs::write(
+            data.join("baselayers/platform.json"),
+            format!(r#"{{"base":{{"file":"{base}"}},"runtimes":{{"rhypedb":{{"file":"{new_db}"}}}}}}"#),
+        )
+        .unwrap();
+        let images = data.join("content-images");
+        let pins: HashMap<PathBuf, Vec<PathBuf>> = HashMap::from([
+            (images.join("p.ext4"), vec![PathBuf::from(&base), PathBuf::from(&app)]),
+            (images.join("p.db.ext4"), vec![PathBuf::from(&base), PathBuf::from(&old_db)]),
+        ]);
+        let registered = vec!["p".to_string(), "q".to_string()];
+
+        let live = baselayers_live_set(&data, &registered, |img| {
+            Ok(pins.get(img).cloned().unwrap_or_default())
+        })
+        .expect("readable manifest + layer maps ⇒ a live set");
+        for f in [&base, &new_db, &old_db, &app] {
+            assert!(live.contains(f), "{f} must be live: {live:?}");
+        }
+
+        // An unreadable DB VM layer map aborts the sweep (never "references nothing").
+        let unreadable = images.join("p.db.ext4");
+        assert!(
+            baselayers_live_set(&data, &registered, |img| {
+                if img == unreadable {
+                    anyhow::bail!("corrupt")
+                }
+                Ok(Vec::new())
+            })
+            .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
