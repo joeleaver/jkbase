@@ -1246,14 +1246,17 @@ async fn build_one_target_inner(
     // The CONTEXT dir is what becomes the RO image and is mounted at /src; the build
     // runs in `build_subdir` WITHIN it. With `context` unset, `context_subdir` is the
     // source and `build_subdir` is "." — identical to the historical single-subdir mount.
-    let context_path = src_dir.join(&spec.context_subdir);
-    if !context_path.is_dir() {
-        bail!(
-            "build context dir '{}' not found for target '{}'",
-            spec.context_subdir,
-            spec.name
-        );
-    }
+    // Resolved (and confined) so a symlinked context can't mount host files into the build.
+    let context_path = resolve_in_source(src_dir, &spec.context_subdir, "build context")
+        .with_context(|| format!("target '{}'", spec.name))?
+        .filter(|p| p.is_dir())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "build context dir '{}' not found for target '{}'",
+                spec.context_subdir,
+                spec.name
+            )
+        })?;
     let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
     // The build INPUT: the context minus this target's exclusions (other sites' committed
     // content, jkbase.toml, its `exclude` globs), hard-linked. It is BOTH what the RO source
@@ -1271,8 +1274,11 @@ async fn build_one_target_inner(
         .with_context(|| format!("materialize build input for '{}'", spec.name))?;
         debug!(project = %project_id, target = %spec.name, dropped, "build input materialized");
     }
-    // Where the build actually runs inside the context (detect + buildpack app_dir).
-    let build_path = input_dir.join(&spec.build_subdir);
+    // Where the build actually runs inside the context (detect + buildpack app_dir). The
+    // input tree is host-built (symlinks recreated verbatim), so confine this too.
+    let build_path = resolve_in_source(&input_dir, &spec.build_subdir, "source dir")
+        .with_context(|| format!("target '{}'", spec.name))?
+        .unwrap_or_else(|| input_dir.join(&spec.build_subdir));
     if !build_path.is_dir() {
         bail!(
             "source dir '{}' (within build context '{}') not found for target '{}'",
@@ -2232,6 +2238,30 @@ const MAX_TARGETS: usize = 64;
 /// this closes the symlink hole by canonicalizing the resolved source and requiring it to
 /// stay inside the project tree (and be a regular file). Mirrors the symlink-skipping
 /// discipline `assemble_sites`/`copy_filtered_inner` already use for committed site content.
+/// Resolve a tenant-named directory (`source`, `context`, a site's `public`) inside the
+/// unpacked source tree, REFUSING one that resolves outside it.
+///
+/// `path_ok` rejects `..`/absolute STRINGS, but the uploaded tar is tenant-controlled and
+/// `unpack_tar_gz` recreates symlinks verbatim — so `app -> /var/jkbase` passes every string
+/// check and then `is_dir()`, `read_dir`, `mkfs.ext4 -d` and the site copy all FOLLOW it,
+/// pulling host files into the build image, the shipped app layer, or served site content.
+/// Same discipline as [`stage_db_file`], which closed this for `[database]` files.
+/// `Ok(None)` when it simply isn't there (the caller's own "not found" handling applies);
+/// `Err` when it resolves OUTSIDE the tree.
+fn resolve_in_source(src_dir: &Path, rel: &str, what: &str) -> Result<Option<PathBuf>> {
+    let base = src_dir
+        .canonicalize()
+        .context("canonicalize project source dir")?;
+    let Ok(dir) = base.join(rel).canonicalize() else {
+        return Ok(None);
+    };
+    ensure!(
+        dir.starts_with(&base),
+        "{what} {rel:?} resolves outside the project tree (symlink?) — refusing"
+    );
+    Ok(Some(dir))
+}
+
 fn stage_db_file(src_dir: &Path, rel: &str, dest: &Path) -> Result<()> {
     let base = src_dir
         .canonicalize()
@@ -2640,9 +2670,10 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
             if site.built {
                 continue;
             }
-            let site_dir = src_dir.join(&site.public);
-            if site_dir.is_dir() {
-                copy_filtered(&site_dir, &staged.join(format!("_site_{}", site.name)))?;
+            let site_dir = resolve_in_source(src_dir, &site.public, "site public dir")
+                .with_context(|| format!("site '{}'", site.name))?;
+            if let Some(dir) = site_dir.filter(|d| d.is_dir()) {
+                copy_filtered(&dir, &staged.join(format!("_site_{}", site.name)))?;
             }
         }
     } else if let Some(site) = sites.first() {
@@ -2651,8 +2682,9 @@ fn assemble_sites(config: &ProjectConfig, src_dir: &Path, staged: &Path) -> Resu
         if site.built {
             return Ok(());
         }
-        let site_dir = src_dir.join(&site.public);
-        if site_dir.is_dir() {
+        let site_dir = resolve_in_source(src_dir, &site.public, "site public dir")
+            .with_context(|| format!("site '{}'", site.name))?;
+        if let Some(site_dir) = site_dir.filter(|d| d.is_dir()) {
             // Single-site content lands in the staged ROOT alongside the host's `_`-prefixed
             // control artifacts — guard against a tenant clobbering them (review B-1).
             copy_filtered_guarded(&site_dir, staged)?;
@@ -3292,6 +3324,46 @@ mod tests {
         assert_eq!(detect_language(&dir, None).as_deref(), Some("python"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The uploaded tar is tenant-controlled and `unpack_tar_gz` recreates symlinks verbatim,
+    /// so a `source`/`context`/`public` that is a symlink OUT of the project tree would have
+    /// the host follow it — into the build image, the shipped app layer, or served site
+    /// content. Every tenant-named directory resolves inside the tree or the deploy fails.
+    #[test]
+    fn tenant_dirs_that_symlink_out_of_the_source_tree_are_refused() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkb-symlink-{nanos}"));
+        let src = root.join("src");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(src.join("app")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"host").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("escape")).unwrap();
+        std::os::unix::fs::symlink("app", src.join("inner")).unwrap();
+
+        assert!(resolve_in_source(&src, "app", "x").unwrap().is_some());
+        assert!(resolve_in_source(&src, "inner", "x").unwrap().is_some(), "an inner symlink is fine");
+        assert!(resolve_in_source(&src, "nope", "x").unwrap().is_none(), "missing is not an escape");
+        let err = resolve_in_source(&src, "escape", "site public dir").unwrap_err().to_string();
+        assert!(err.contains("outside the project tree"), "{err}");
+
+        // A committed site whose `public` escapes must fail the deploy, not publish /etc.
+        let staged = root.join("staged");
+        std::fs::create_dir_all(&staged).unwrap();
+        for toml in [
+            "[project]\nname = \"x\"\n[hosting]\npublic = \"escape\"\n",
+            "[project]\nname = \"x\"\n[sites.a]\npublic = \"escape\"\n[sites.b]\npublic = \"app\"\n",
+        ] {
+            let cfg: ProjectConfig = toml::from_str(toml).unwrap();
+            let err = format!("{:#}", assemble_sites(&cfg, &src, &staged).unwrap_err());
+            assert!(err.contains("outside the project tree"), "{toml}: {err}");
+        }
+        assert!(!staged.join("secret").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
