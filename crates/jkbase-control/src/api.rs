@@ -94,6 +94,9 @@ pub struct BuildContext {
     /// The uploaded source tree as a gzipped tar (jkbase.toml + per-target source
     /// dirs + site content; `.git`/`node_modules`/`target` excluded by the CLI).
     pub source_tar_gz: Vec<u8>,
+    /// Build every target in a VM even when an identical earlier build could be reused
+    /// (`jkbase deploy --rebuild`). Fresh artifacts still refresh the reuse cache.
+    pub rebuild: bool,
 }
 
 /// Drives the per-target build fan-out (design §12) and returns a fully-assembled
@@ -1524,7 +1527,7 @@ fn spawn_git_push_build(state: Arc<AppState>, id: String, repo: PathBuf, commit:
                 return;
             }
         };
-        match start_build_job(&state, &id, targz) {
+        match start_build_job(&state, &id, targz, false) {
             Ok(build_id) => {
                 tracing::info!(project = %id, build_id, commit = %commit, "git-push triggered build")
             }
@@ -1578,12 +1581,13 @@ async fn build(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
     Path(id): Path<String>,
+    Query(q): Query<BuildQuery>,
     body: Bytes,
 ) -> impl IntoResponse {
     if let Err(e) = require_project_owner(&state, &tenant, &id) {
         return e.into_response();
     }
-    match start_build_job(&state, &id, body.to_vec()) {
+    match start_build_job(&state, &id, body.to_vec(), q.rebuild) {
         Ok(build_id) => (
             StatusCode::ACCEPTED,
             Json(BuildStartedResponse {
@@ -1594,6 +1598,13 @@ async fn build(
             .into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// `POST /projects/{id}/build?rebuild=true` — skip per-target build reuse for this build.
+#[derive(Deserialize, Default)]
+struct BuildQuery {
+    #[serde(default)]
+    rebuild: bool,
 }
 
 /// Why the shared build funnel refused to start a job.
@@ -1646,6 +1657,7 @@ fn start_build_job(
     state: &Arc<AppState>,
     id: &str,
     source_tar_gz: Vec<u8>,
+    rebuild: bool,
 ) -> Result<u64, StartBuildError> {
     if state.build_callback.is_none() {
         return Err(StartBuildError::NotEnabled);
@@ -1705,7 +1717,7 @@ fn start_build_job(
         {
             // Released on completion OR panic-unwind of the build task.
             let _guard = guard;
-            run_build_job(state_bg.clone(), &id_bg, build_id, source_tar_gz).await;
+            run_build_job(state_bg.clone(), &id_bg, build_id, source_tar_gz, rebuild).await;
         }
         // Lock is free now: rebuild the latest tip if a git push was deferred
         // while this build held the lock (coalesced; no-op otherwise).
@@ -1746,6 +1758,7 @@ async fn run_build_job(
     project_id: &str,
     build_id: u64,
     source_tar_gz: Vec<u8>,
+    rebuild: bool,
 ) {
     update_build(&state, project_id, build_id, |r| {
         r.phase = BuildPhase::Building
@@ -1764,6 +1777,7 @@ async fn run_build_job(
         project_id: project_id.to_string(),
         build_id,
         source_tar_gz,
+        rebuild,
     };
     let staged = match cb(ctx).await {
         Ok(p) => p,

@@ -199,7 +199,8 @@ pub fn build_callback(deps: Arc<BuildDeps>) -> jkbase_control::api::BuildCallbac
     Arc::new(move |ctx: jkbase_control::api::BuildContext| {
         let deps = deps.clone();
         Box::pin(async move {
-            run_project_build(ctx.project_id, ctx.build_id, ctx.source_tar_gz, deps).await
+            run_project_build(ctx.project_id, ctx.build_id, ctx.source_tar_gz, ctx.rebuild, deps)
+                .await
         })
     })
 }
@@ -964,6 +965,11 @@ struct TargetSpec {
     /// app_dir, `<context>/<build_subdir>` in the VM), for `builder = "dockerfile"`.
     /// `None` otherwise.
     dockerfile: Option<String>,
+    /// Literal paths (relative to the context) left out of the build input automatically:
+    /// other sites' committed `public` dirs and `jkbase.toml` (see `build_cache::auto_excludes`).
+    exclude_paths: Vec<String>,
+    /// The target's own `exclude` globs (relative to the context).
+    exclude_globs: Vec<String>,
 }
 
 /// Build-derived server manifest fields (the `cmd`/`env`/`working_dir` half of a
@@ -996,10 +1002,14 @@ impl Default for BuiltServerManifest {
 /// The `build_callback` body: run one project build to a fully-assembled artifact
 /// directory (or fail atomically). Always cleans its scratch workspace; on
 /// failure also cleans the staged artifact dir so a failed build leaves no orphan.
+///
+/// `rebuild` bypasses per-target build reuse (every target builds in a VM; the fresh
+/// artifacts still refresh the cache) — see `build_cache`.
 pub async fn run_project_build(
     project_id: String,
     build_id: u64,
     source_tar_gz: Vec<u8>,
+    rebuild: bool,
     deps: Arc<BuildDeps>,
 ) -> Result<PathBuf> {
     let workspace = deps
@@ -1011,7 +1021,7 @@ pub async fn run_project_build(
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("create build workspace {}", workspace.display()))?;
 
-    let result = run_inner(&project_id, build_id, &source_tar_gz, &deps, &workspace).await;
+    let result = run_inner(&project_id, build_id, &source_tar_gz, rebuild, &deps, &workspace).await;
 
     // The workspace only holds throwaway source/output images — always reclaim it.
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1022,6 +1032,7 @@ async fn run_inner(
     project_id: &str,
     build_id: u64,
     source_tar_gz: &[u8],
+    rebuild: bool,
     deps: &Arc<BuildDeps>,
     workspace: &Path,
 ) -> Result<PathBuf> {
@@ -1084,12 +1095,16 @@ async fn run_inner(
         //    every result; any failure fails the whole build (atomic).
         let sem = Arc::new(Semaphore::new(deps.max_concurrent.max(1)));
         let record_lock = Arc::new(Mutex::new(()));
+        // Every target's build input hard-links the same unpacked source, so a file shared
+        // by several targets is hashed once for the build keys.
+        let digests = Arc::new(crate::build_cache::DigestMemo::default());
         let mut set = tokio::task::JoinSet::new();
         for spec in specs {
             let deps = deps.clone();
             let config = config.clone();
             let sem = sem.clone();
             let record_lock = record_lock.clone();
+            let digests = digests.clone();
             let staged = staged.clone();
             let src_dir = src_dir.clone();
             let workspace = workspace.to_path_buf();
@@ -1106,6 +1121,8 @@ async fn run_inner(
                     &project_id,
                     build_id,
                     &record_lock,
+                    rebuild,
+                    &digests,
                 )
                 .await;
                 (spec.name.clone(), r)
@@ -1150,6 +1167,8 @@ async fn build_one_target(
     project_id: &str,
     build_id: u64,
     record_lock: &Mutex<()>,
+    rebuild: bool,
+    digests: &Arc<crate::build_cache::DigestMemo>,
 ) -> Result<()> {
     update_target(
         deps,
@@ -1164,7 +1183,7 @@ async fn build_one_target(
     .await;
 
     let outcome = build_one_target_inner(
-        spec, config, deps, src_dir, workspace, staged, project_id, build_id,
+        spec, config, deps, src_dir, workspace, staged, project_id, build_id, rebuild, digests,
     )
     .await;
 
@@ -1221,27 +1240,9 @@ async fn build_one_target_inner(
     staged: &Path,
     project_id: &str,
     build_id: u64,
+    rebuild: bool,
+    digests: &Arc<crate::build_cache::DigestMemo>,
 ) -> Result<(Option<Vec<u8>>, BuildProvenance)> {
-    // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
-    // intake, but a build fans out one metered VM per target, so a many-target
-    // manifest could otherwise overrun the cap by the target count (threat-model
-    // P1-4).
-    //
-    // The breaker trips at cap + BUILD_QUOTA_OVERDRAFT_SECS, not at the cap itself: a
-    // deploy admitted by the intake gate is allowed to FINISH. Tripping at the cap
-    // billed the targets that had already built and then activated nothing — the
-    // tenant paid for a deploy they never got, and the failure looked like a build
-    // error rather than a quota one. The overdraft is bounded, so a crafted 64-target
-    // manifest still can't ride one overrun into hours of compute.
-    if let Some((used, cap)) = build_quota_state(deps, project_id)
-        && build_quota_tripped(used, cap)
-    {
-        bail!(
-            "build-minute quota exhausted ({used}/{cap} build-seconds this month, \
-             including a {BUILD_QUOTA_OVERDRAFT_SECS}s overdraft for the in-flight build)"
-        );
-    }
-
     // The CONTEXT dir is what becomes the RO image and is mounted at /src; the build
     // runs in `build_subdir` WITHIN it. With `context` unset, `context_subdir` is the
     // source and `build_subdir` is "." — identical to the historical single-subdir mount.
@@ -1253,8 +1254,25 @@ async fn build_one_target_inner(
             spec.name
         );
     }
+    let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
+    // The build INPUT: the context minus this target's exclusions (other sites' committed
+    // content, jkbase.toml, its `exclude` globs), hard-linked. It is BOTH what the RO source
+    // image is built from AND what the build key hashes — so an excluded change can neither
+    // be missed by the key nor seen by the build (see `build_cache`).
+    let input_dir = workspace.join(format!("{tag}.input"));
+    {
+        let ex = crate::build_cache::Exclusions::new(&spec.exclude_paths, &spec.exclude_globs)?;
+        let (ctx, dst) = (context_path.clone(), input_dir.clone());
+        let dropped = tokio::task::spawn_blocking(move || {
+            crate::build_cache::materialize_input(&ctx, &ex, &dst)
+        })
+        .await
+        .context("build input task")?
+        .with_context(|| format!("materialize build input for '{}'", spec.name))?;
+        debug!(project = %project_id, target = %spec.name, dropped, "build input materialized");
+    }
     // Where the build actually runs inside the context (detect + buildpack app_dir).
-    let build_path = context_path.join(&spec.build_subdir);
+    let build_path = input_dir.join(&spec.build_subdir);
     if !build_path.is_dir() {
         bail!(
             "source dir '{}' (within build context '{}') not found for target '{}'",
@@ -1306,7 +1324,71 @@ async fn build_one_target_inner(
         );
     }
 
-    let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
+    // Per-target build key → reuse an identical earlier build instead of booting a VM.
+    let reuse_start = std::time::Instant::now();
+    let toolchain_digest = toolchain_builder_digest(&toolchain).await;
+    let build_key = compute_build_key(
+        spec,
+        &toolchain,
+        toolchain_digest.as_deref(),
+        deps,
+        &input_dir,
+        digests,
+        toolchain_lang.as_deref(),
+    )
+    .await;
+    let cache = crate::build_cache::TargetCache::new(&deps.data_dir, project_id, &tag);
+    if let Some(key) = build_key.as_deref()
+        && !rebuild
+        && let Some((entry, entry_dir)) = cache.lookup(key)
+    {
+        match reuse_artifact(&entry, &entry_dir, staged, workspace, &tag, config, spec) {
+            Ok(()) => {
+                info!(project = %project_id, target = %spec.name, key, "reused build (inputs unchanged)");
+                let note = format!(
+                    "{}: inputs unchanged since an earlier build (key {}…); reused its artifact, no build VM\n",
+                    spec.name,
+                    &key[..12]
+                );
+                return Ok((
+                    Some(note.into_bytes()),
+                    BuildProvenance {
+                        cache_hit: true,
+                        cache_key: Some(key.to_string()),
+                        duration_breakdown_ms: [("reuse".to_string(), reuse_start.elapsed().as_millis() as u64)]
+                            .into_iter()
+                            .collect(),
+                        builder_digest: toolchain_digest.clone(),
+                    },
+                ));
+            }
+            // A reuse that can't be applied (e.g. an artifact kind that no longer matches)
+            // falls through to a normal build.
+            Err(e) => warn!(project = %project_id, target = %spec.name, error = %format!("{e:#}"),
+                            "build cache entry unusable; building"),
+        }
+    }
+
+    // Mid-fan-out quota circuit breaker: the pre-build 402 gate checks only at
+    // intake, but a build fans out one metered VM per target, so a many-target
+    // manifest could otherwise overrun the cap by the target count (threat-model
+    // P1-4).
+    //
+    // The breaker trips at cap + BUILD_QUOTA_OVERDRAFT_SECS, not at the cap itself: a
+    // deploy admitted by the intake gate is allowed to FINISH. Tripping at the cap
+    // billed the targets that had already built and then activated nothing — the
+    // tenant paid for a deploy they never got, and the failure looked like a build
+    // error rather than a quota one. The overdraft is bounded, so a crafted 64-target
+    // manifest still can't ride one overrun into hours of compute.
+    if let Some((used, cap)) = build_quota_state(deps, project_id)
+        && build_quota_tripped(used, cap)
+    {
+        bail!(
+            "build-minute quota exhausted ({used}/{cap} build-seconds this month, \
+             including a {BUILD_QUOTA_OVERDRAFT_SECS}s overdraft for the in-flight build)"
+        );
+    }
+
     let source_img = workspace.join(format!("{tag}.source.img"));
     let output_img = workspace.join(format!("{tag}.output.img"));
 
@@ -1324,7 +1406,7 @@ async fn build_one_target_inner(
     // RO source drive built from the CONTEXT subdir in userspace — no mount (P0-3).
     // With a wider context this mounts the whole context (e.g. a workspace root) so
     // sibling path-deps are present; the build still runs in `build_subdir` within it.
-    build_ro_ext4_from_dir(&context_path, &source_img, 16)
+    build_ro_ext4_from_dir(&input_dir, &source_img, 16)
         .with_context(|| format!("build source image for '{}'", spec.name))?;
 
     // Keep the VM id short: it becomes the jailer chroot path, and the Firecracker
@@ -1582,7 +1664,7 @@ async fn build_one_target_inner(
         bail!("build script exited with status {status:?}\n{}", log_str());
     }
 
-    match spec.kind {
+    let cached: Option<(crate::build_cache::CachedArtifact, Vec<(&str, PathBuf)>)> = match spec.kind {
         TargetKind::Function => {
             let dest = staged
                 .join("_functions")
@@ -1602,9 +1684,15 @@ async fn build_one_target_inner(
                 })
                 .await;
             }
+            let mut files = vec![("function.wasm", dest.clone())];
+            let cwasm = dest.with_extension("cwasm");
+            if cwasm.is_file() {
+                files.push(("function.cwasm", cwasm));
+            }
+            Some((crate::build_cache::CachedArtifact::Function, files))
         }
         TargetKind::Server => {
-            collect_layered_server(
+            let built = collect_layered_server(
                 &output_img,
                 staged,
                 workspace,
@@ -1613,9 +1701,32 @@ async fn build_one_target_inner(
                 spec,
                 toolchain_lang.as_deref(),
             )?;
+            let blob = staged.join("_layers").join(&built.app_file);
+            Some((
+                crate::build_cache::CachedArtifact::Server {
+                    app_file: built.app_file,
+                    app_digest: built.app_digest,
+                    cmd: built.manifest.cmd,
+                    env: built.manifest.env,
+                    working_dir: built.manifest.working_dir,
+                    resolved_language: toolchain_lang.clone(),
+                },
+                vec![("app.erofs", blob)],
+            ))
         }
         TargetKind::Static => {
-            collect_static_site(&output_img, staged, workspace, &tag, config, spec)?;
+            let tarball = collect_static_site(&output_img, staged, workspace, &tag, config, spec)?;
+            Some((crate::build_cache::CachedArtifact::Static, vec![("static.tar.gz", tarball)]))
+        }
+    };
+
+    // Record the artifact under its build key for the next deploy. Best-effort: a cache
+    // write failure never fails a build that succeeded.
+    if let (Some(key), Some((artifact, files))) = (build_key.as_deref(), cached) {
+        let files: Vec<(&str, &Path)> = files.iter().map(|(n, p)| (*n, p.as_path())).collect();
+        if let Err(e) = cache.store(key, artifact, &files, build_id) {
+            warn!(project = %project_id, target = %spec.name, error = %format!("{e:#}"),
+                  "could not record build in the build cache");
         }
     }
 
@@ -1623,15 +1734,122 @@ async fn build_one_target_inner(
     // (best-effort — defaults until the in-VM cache keying lands) and the sha256 of
     // the toolchain image this target built with. Provenance must never fail a build
     // that otherwise succeeded, so a digest error degrades to None.
-    let cache = read_cache_meta(&output_img, workspace, &tag);
+    let meta = read_cache_meta(&output_img, workspace, &tag);
     let provenance = BuildProvenance {
-        cache_hit: cache.cache_hit,
-        cache_key: cache.cache_key,
-        duration_breakdown_ms: cache.phases_ms,
-        builder_digest: toolchain_builder_digest(&toolchain).await,
+        // A VM build is never a reuse; the key is the host's (what the next deploy matches).
+        cache_hit: false,
+        cache_key: build_key.or(meta.cache_key),
+        duration_breakdown_ms: meta.phases_ms,
+        builder_digest: toolchain_digest,
     };
 
     Ok((log_tail, provenance))
+}
+
+/// The target's build key (see `build_cache`), or `None` when one can't be computed — the
+/// toolchain digest is unavailable, or hashing the input failed — in which case the target
+/// simply builds and nothing is cached (never a wrong reuse).
+async fn compute_build_key(
+    spec: &TargetSpec,
+    toolchain: &Path,
+    toolchain_digest: Option<&str>,
+    deps: &BuildDeps,
+    input_dir: &Path,
+    digests: &Arc<crate::build_cache::DigestMemo>,
+    resolved_language: Option<&str>,
+) -> Option<String> {
+    let toolchain_digest = toolchain_digest?;
+    // A function's `.cwasm` is compiled by the agent binary, so a new agent is a new artifact.
+    let agent_digest = match (spec.kind, deps.agent_bin.as_deref()) {
+        (TargetKind::Function, Some(agent)) => Some(toolchain_builder_digest(agent).await?),
+        _ => None,
+    };
+    let (dir, memo) = (input_dir.to_path_buf(), digests.clone());
+    let hashed = tokio::task::spawn_blocking(move || crate::build_cache::tree_digest(&dir, &memo))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|r| r);
+    let tree = match hashed {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(target = %spec.name, error = %format!("{e:#}"), "could not hash build input; building without reuse");
+            return None;
+        }
+    };
+    let toolchain_file = toolchain.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+    Some(crate::build_cache::build_key(&crate::build_cache::KeyInputs {
+        version: crate::build_cache::BUILD_KEY_VERSION,
+        kind: kind_name(spec.kind),
+        name: &spec.name,
+        context_subdir: &spec.context_subdir,
+        build_subdir: &spec.build_subdir,
+        // The RESOLVED language: it picks the toolchain and stamps a server's runtime layer.
+        language: resolved_language,
+        builder: match spec.builder {
+            Builder::Auto => "auto",
+            Builder::Dockerfile => "dockerfile",
+        },
+        dockerfile: spec.dockerfile.as_deref(),
+        exclude_paths: &spec.exclude_paths,
+        exclude_globs: &spec.exclude_globs,
+        toolchain: (toolchain_file, toolchain_digest),
+        agent: agent_digest.as_deref(),
+        tree: &tree,
+    }))
+}
+
+/// Recreate a target's staged output from a verified build-cache entry, exactly as its build's
+/// collection did — under the CURRENT jkbase.toml (a server's port/health/volumes/command, a
+/// site's placement). The entry's files were sha256-verified by `TargetCache::lookup`.
+fn reuse_artifact(
+    entry: &crate::build_cache::CacheEntry,
+    entry_dir: &Path,
+    staged: &Path,
+    workspace: &Path,
+    tag: &str,
+    config: &ProjectConfig,
+    spec: &TargetSpec,
+) -> Result<()> {
+    use crate::build_cache::CachedArtifact;
+    let link = |src: &Path, dst: &Path| -> Result<()> {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(dst);
+        if std::fs::hard_link(src, dst).is_err() {
+            std::fs::copy(src, dst).with_context(|| format!("copy cached {}", src.display()))?;
+        }
+        Ok(())
+    };
+    match (&entry.artifact, spec.kind) {
+        (
+            CachedArtifact::Server { app_file, app_digest, cmd, env, working_dir, resolved_language },
+            TargetKind::Server,
+        ) => {
+            ensure!(is_safe_blob_filename(app_file), "unsafe cached app layer filename {app_file:?}");
+            // The blob's name is its content address: the verified file must match it.
+            let want = app_digest.strip_prefix("sha256:").unwrap_or(app_digest);
+            ensure!(
+                app_file == &format!("sha256-{want}.erofs") && entry.files.get("app.erofs").map(String::as_str) == Some(want),
+                "cached app layer {app_file:?} does not match its digest"
+            );
+            link(&entry_dir.join("app.erofs"), &staged.join("_layers").join(app_file))?;
+            let built = BuiltServerManifest { cmd: cmd.clone(), env: env.clone(), working_dir: working_dir.clone() };
+            write_server_manifest(staged, config, spec, app_file, app_digest, &built, resolved_language.as_deref())
+        }
+        (CachedArtifact::Static, TargetKind::Static) => {
+            install_static_tarball(&entry_dir.join("static.tar.gz"), staged, workspace, tag, config, spec)
+        }
+        (CachedArtifact::Function, TargetKind::Function) => {
+            let dest = staged.join("_functions").join(format!("{}.wasm", spec.name));
+            link(&entry_dir.join("function.wasm"), &dest)?;
+            if entry.files.contains_key("function.cwasm") {
+                link(&entry_dir.join("function.cwasm"), &dest.with_extension("cwasm"))?;
+            }
+            Ok(())
+        }
+        _ => bail!("cached artifact kind does not match target kind"),
+    }
 }
 
 /// Collect a layered server build: read `/layers/index.json`, dump + sha256-verify
@@ -1677,7 +1895,7 @@ fn collect_layered_server(
     // The language the host resolved for this target (explicit jkbase.toml hint or
     // the cheap source sniff) — keys the shared runtime layer the app stacks on.
     resolved_language: Option<&str>,
-) -> Result<()> {
+) -> Result<CollectedServer> {
     // Read the layered index the in-VM exporter wrote.
     let index_tmp = workspace.join(format!("{tag}.index.json"));
     if !build_output::dump_file(output_img, jkbuild_types::out::INDEX, &index_tmp)? {
@@ -1725,9 +1943,35 @@ fn collect_layered_server(
         "app layer digest mismatch: index {want}, dumped blob {got}"
     );
 
-    // Server manifest: build-derived cmd/env/working_dir overlaid with the
-    // jkbase.toml port/health_check/volumes, augmented with the layer refs.
     let built = read_built_manifest(output_img, workspace, tag)?;
+    write_server_manifest(staged, config, spec, &file, &app.digest, &built, resolved_language)?;
+    Ok(CollectedServer {
+        app_file: file,
+        app_digest: app.digest.clone(),
+        manifest: built,
+    })
+}
+
+/// A collected layered server's build-derived half — what a build-cache reuse replays.
+struct CollectedServer {
+    app_file: String,
+    app_digest: String,
+    manifest: BuiltServerManifest,
+}
+
+/// Write `_servers/<name>.json`: the build-derived cmd/env/working_dir overlaid with the
+/// CURRENT jkbase.toml port/health_check/volumes/command, augmented with the app layer refs
+/// and the runtime. Shared by a fresh build's collection and a build-cache reuse, so a reused
+/// server gets exactly the manifest its build would have produced under today's config.
+fn write_server_manifest(
+    staged: &Path,
+    config: &ProjectConfig,
+    spec: &TargetSpec,
+    file: &str,
+    app_digest: &str,
+    built: &BuiltServerManifest,
+    resolved_language: Option<&str>,
+) -> Result<()> {
     let server_cfg = config
         .servers
         .get(&spec.name)
@@ -1736,7 +1980,7 @@ fn collect_layered_server(
     // override also covers apps where no start is auto-derivable (the buildpack now
     // leaves an empty cmd rather than failing). If there is NO command from either
     // source, fail here — clearly — rather than ship a server that can't launch.
-    let cmd = server_cfg.command.clone().unwrap_or(built.cmd);
+    let cmd = server_cfg.command.clone().unwrap_or_else(|| built.cmd.clone());
     if cmd.is_empty() {
         bail!(
             "server '{0}' has no start command: add a `start` script to its package.json, \
@@ -1744,12 +1988,12 @@ fn collect_layered_server(
             spec.name
         );
     }
-    let mut manifest = server_cfg.manifest_value(cmd, built.env, &built.working_dir);
+    let mut manifest = server_cfg.manifest_value(cmd, built.env.clone(), &built.working_dir);
     if let Some(obj) = manifest.as_object_mut() {
-        obj.insert("app_layer".to_string(), serde_json::Value::String(file));
+        obj.insert("app_layer".to_string(), serde_json::Value::String(file.to_string()));
         obj.insert(
             "app_digest".to_string(),
-            serde_json::Value::String(app.digest.clone()),
+            serde_json::Value::String(app_digest.to_string()),
         );
         // A dockerfile build is a single self-contained image layer — mark it so the
         // host layer plan runs it standalone (no base/runtime stack) and the agent
@@ -1809,8 +2053,9 @@ fn collect_static_site(
     tag: &str,
     config: &ProjectConfig,
     spec: &TargetSpec,
-) -> Result<()> {
-    // 1. Dump the plain tarball the lifecycle's static path wrote.
+) -> Result<PathBuf> {
+    // 1. Dump the plain tarball the lifecycle's static path wrote. It stays in the (throwaway)
+    //    workspace so the build cache can record it.
     let tar_tmp = workspace.join(format!("{tag}.static.tar.gz"));
     if !build_output::dump_file(output_img, jkbuild_types::out::STATIC_TARBALL, &tar_tmp)? {
         bail!(
@@ -1818,16 +2063,29 @@ fn collect_static_site(
             jkbuild_types::out::STATIC_TARBALL
         );
     }
+    install_static_tarball(&tar_tmp, staged, workspace, tag, config, spec)?;
+    Ok(tar_tmp)
+}
+
+/// Unpack a built site's flat tarball into its staged site slot (a fresh build's dump, or a
+/// build-cache reuse).
+fn install_static_tarball(
+    tar_tmp: &Path,
+    staged: &Path,
+    workspace: &Path,
+    tag: &str,
+    config: &ProjectConfig,
+    spec: &TargetSpec,
+) -> Result<()> {
 
     // 2. Untar into a scratch dir (tar-rs refuses `..`/absolute escapes; the
     //    hostile-code boundary remains the build VM, this is defense-in-depth).
     let extract = workspace.join(format!("{tag}.static-tree"));
     let _ = std::fs::remove_dir_all(&extract);
     std::fs::create_dir_all(&extract)?;
-    let bytes = std::fs::read(&tar_tmp)
+    let bytes = std::fs::read(tar_tmp)
         .with_context(|| format!("read dumped static tarball {}", tar_tmp.display()))?;
     unpack_tar_gz(&bytes, &extract).context("unpack built static tarball")?;
-    let _ = std::fs::remove_file(&tar_tmp);
 
     // 3. Resolve the staged site destination, mirroring assemble_sites' placement.
     //    A built site is named after its `[sites.<name>]` (the Static target name); a
@@ -2038,6 +2296,7 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
                 f.source
             );
         }
+        crate::build_cache::validate_exclude(&format!("function '{name}'"), &f.exclude, ".")?;
         // `egress = []` is ambiguous: [] and `false` are identical for the PUBLIC zone, but
         // an author writing [] to mean "deny everything incl. own-stuff" would be surprised
         // that own-stuff still works. Make it un-writable rather than silently alias it to
@@ -2093,6 +2352,7 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
                 "server '{name}' source {sd:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]"
             );
         }
+        crate::build_cache::validate_exclude(&format!("server '{name}'"), &s.exclude, &bs)?;
         // builder = auto|dockerfile, and (for dockerfile) language/dockerfile coherence.
         s.validate(name)?;
         // The Dockerfile must live inside the project tree (it becomes a /src path).
@@ -2138,6 +2398,7 @@ fn validate_manifest(config: &ProjectConfig) -> Result<()> {
                     "site '{name}' source {src:?} within context {ctx:?} yields a build subdir {bs:?} with characters that can't be passed to the build VM — use only [A-Za-z0-9._/-]"
                 );
             }
+            crate::build_cache::validate_exclude(&format!("site '{name}'"), &site.exclude, &bs)?;
         } else {
             // A COMMITTED site: `public` is REQUIRED. Omitting it must NOT silently
             // default to the project root — that would package the entire source tree
@@ -2236,6 +2497,8 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language: f.language.clone(),
             builder: Builder::Auto, // functions take the wasm path, never a Dockerfile
             dockerfile: None,
+            exclude_paths: crate::build_cache::auto_excludes(config, &f.source, &f.source),
+            exclude_globs: f.exclude.clone(),
         });
     }
     for (name, s) in &config.servers {
@@ -2254,6 +2517,8 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language: s.language.clone(),
             builder,
             dockerfile,
+            exclude_paths: crate::build_cache::auto_excludes(config, s.context_dir(), s.source_dir()),
+            exclude_globs: s.exclude.clone(),
         });
     }
     // Built sites ([sites.<name>] with `build = "..."`): one static build target each,
@@ -2277,6 +2542,12 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language,
             builder: Builder::Auto, // built sites take the buildpack path, never a Dockerfile
             dockerfile: None,
+            exclude_paths: crate::build_cache::auto_excludes(
+                config,
+                site.context_dir(),
+                site.build_source(),
+            ),
+            exclude_globs: site.exclude.clone(),
         });
     }
     // Deterministic order regardless of HashMap iteration.
@@ -3356,7 +3627,7 @@ public = "./public"
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
-        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, false, deps.clone())
             .await
             .expect("fan-out build should succeed");
 
@@ -4275,7 +4546,7 @@ console.log("listening on " + port);
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
-        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, false, deps.clone())
             .await
             .expect("bun server build should succeed");
 
@@ -4328,6 +4599,19 @@ console.log("listening on " + port);
         src: &Path,
         t: BuildTuning,
         build_id: u64,
+    ) -> Option<Result<BuildFixture>> {
+        networked_lang_build_opts(project_id, redb, toolchain, src, t, build_id, false).await
+    }
+
+    /// [`networked_lang_build_try`] with the `rebuild` flag exposed (per-target build reuse).
+    async fn networked_lang_build_opts(
+        project_id: &str,
+        redb: &str,
+        toolchain: &str,
+        src: &Path,
+        t: BuildTuning,
+        build_id: u64,
+        rebuild: bool,
     ) -> Option<Result<BuildFixture>> {
         let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
             eprintln!("skip: set JKB_DATA");
@@ -4384,6 +4668,15 @@ console.log("listening on " + port);
                     8,
                 )))
             }
+            // A multi-build test's earlier build already bound (and still serves) the proxy.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Some(Arc::new(BuildNet::new(
+                "jkbuild0".into(),
+                "172.31.0.1".into(),
+                3128,
+                None,
+                100_000,
+                8,
+            ))),
             Err(e) => {
                 eprintln!(
                     "skip: cannot bind egress proxy 172.31.0.1:3128 ({e}); run `sudo tools/setup-build-net.sh`"
@@ -4423,7 +4716,7 @@ console.log("listening on " + port);
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
-        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone()).await;
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, rebuild, deps.clone()).await;
         Some(staged.map(|staged| BuildFixture {
             data,
             fc_release,
@@ -8744,7 +9037,7 @@ console.log("listening on " + port);
         });
         std::fs::create_dir_all(&deps.chroot_base).unwrap();
 
-        let staged = run_project_build(project_id.into(), build_id, tarbuf, deps.clone())
+        let staged = run_project_build(project_id.into(), build_id, tarbuf, false, deps.clone())
             .await
             .expect("dockerfile server build should succeed");
         Some(BuildFixture {
@@ -8993,6 +9286,112 @@ console.log("listening on " + port);
         println!(
             "PASS (negative): no `context` -> ../common absent -> build fails as expected\n  error: {err}"
         );
+    }
+
+    /// E2E for per-target build reuse (`build_cache`) on the monorepo shape it exists for: a
+    /// `context = "."` server beside a committed static site. Five real builds over one data dir:
+    ///   1. first build → the server builds in a VM (a miss) and is recorded;
+    ///   2. edit ONLY the site + jkbase.toml (both auto-excluded from the server's input) → the
+    ///      server is REUSED (no VM), with the identical app layer — and the reused deployment
+    ///      boots and serves;
+    ///   3. edit the server's source → a miss, a new layer;
+    ///   4. no change but `rebuild` → a VM build anyway;
+    ///   5. no change → reused again (from build 4's record).
+    ///
+    ///   same env as `monorepo_context_resolves_sibling_path_dep` (bun.ext4 instead of rust.ext4)
+    #[tokio::test]
+    #[ignore = "build reuse e2e: KVM + root + bun.ext4 + build bridge + baselayers + agent"]
+    async fn per_target_build_reuse_skips_unchanged_server() {
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let src = data.join("reuse-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(data.join("buildcache").join("reuse"));
+        let _ = std::fs::remove_file(data.join("onbox-reuse.redb"));
+        let manifest = |comment: &str| {
+            format!(
+                "# {comment}\n[project]\nname = \"reusefix\"\n\n[sites.site]\npublic = \"site\"\nprefix = \"/site\"\n\n[servers.api]\nsource = \"server\"\ncontext = \".\"\nlanguage = \"bun\"\nport = 3000\ncommand = [\"/opt/bun/bin/bun\", \"run\", \"/app/server/server.ts\"]\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
+            )
+        };
+        let server = |body: &str| {
+            format!("Bun.serve({{ port: Number(process.env.PORT) || 3000, fetch() {{ return new Response(\"{body}\"); }} }});\n")
+        };
+        write(src.join("jkbase.toml"), &manifest("v1"));
+        write(src.join("site/index.html"), "<h1>one</h1>");
+        // `context = "."` makes the root the bun workspace root (the buildpack installs there).
+        write(
+            src.join("package.json"),
+            "{\n  \"name\": \"reuse-root\",\n  \"private\": true,\n  \"workspaces\": [\"server\"]\n}\n",
+        );
+        write(src.join("server/server.ts"), &server("v1"));
+        write(
+            src.join("server/package.json"),
+            "{\n  \"name\": \"reusefix\",\n  \"module\": \"server.ts\",\n  \"packageManager\": \"bun@1.3.14\",\n  \"scripts\": { \"start\": \"bun run server.ts\" }\n}\n",
+        );
+        let tuning = || BuildTuning {
+            vcpu: 2,
+            guest_mem_mib: 1024,
+            cgroup_mem_mib: 1536,
+            cgroup_cpu_max: "200000 100000",
+            scratch_mib: 512,
+            output_mib: 128,
+            timeout_secs: 300,
+            fetch_deadline_secs: 120,
+        };
+        // Build `id`, returning (api target cache_hit, api app layer file, staged dir, fixture).
+        async fn build(src: &Path, id: u64, rebuild: bool, tuning: BuildTuning) -> Option<(bool, String, BuildFixture)> {
+            let fx = networked_lang_build_opts("reuse", "onbox-reuse.redb", "bun.ext4", src, tuning, id, rebuild)
+                .await?
+                .expect("build should succeed");
+            let rec = fx.store.get_build("reuse", id).unwrap().unwrap();
+            let api = rec.targets.iter().find(|t| t.name == "api").expect("api target recorded");
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(fx.staged.join("_servers/api.json")).unwrap()).unwrap();
+            let layer = manifest["app_layer"].as_str().unwrap().to_string();
+            assert!(fx.staged.join("_layers").join(&layer).is_file(), "build {id}: app layer staged");
+            eprintln!("[reuse-e2e] build {id} rebuild={rebuild} cache_hit={} key={:?} layer={layer}", api.cache_hit, api.cache_key);
+            Some((api.cache_hit, layer, fx))
+        }
+
+        let Some((hit1, layer1, fx1)) = build(&src, 1, false, tuning()).await else { return };
+        let _ = std::fs::remove_dir_all(&fx1.staged);
+        drop(fx1);
+
+        write(src.join("site/index.html"), "<h1>two</h1>");
+        write(src.join("jkbase.toml"), &manifest("v2 — routes/comments change often"));
+        let (hit2, layer2, fx2) = build(&src, 2, false, tuning()).await.unwrap();
+        assert!(!hit1, "the first build is a VM build");
+        assert!(hit2, "a site + manifest edit must not rebuild the context=\".\" server");
+        assert_eq!(layer2, layer1, "the reused server ships the identical app layer");
+        // The reused deployment is a real, bootable deployment.
+        if let Some((store_dir, agent_bin)) = resolve_runtime_env(&fx2) {
+            let body = boot_layered_and_curl(&fx2, &store_dir, &agent_bin, "reuse", "172.21.0.1", "172.21.0.2", "AA:FC:00:00:21:02")
+                .await
+                .expect("the reused deployment should serve HTTP 200");
+            assert_eq!(body, "v1");
+        }
+        let _ = std::fs::remove_dir_all(&fx2.staged);
+        drop(fx2);
+
+        write(src.join("server/server.ts"), &server("v2"));
+        let (hit3, layer3, fx3) = build(&src, 3, false, tuning()).await.unwrap();
+        assert!(!hit3, "a server source edit must rebuild");
+        assert_ne!(layer3, layer1, "…producing a new app layer");
+        let _ = std::fs::remove_dir_all(&fx3.staged);
+        drop(fx3);
+
+        let (hit4, layer4, fx4) = build(&src, 4, true, tuning()).await.unwrap();
+        assert!(!hit4, "rebuild forces a VM build even with unchanged inputs");
+        let _ = std::fs::remove_dir_all(&fx4.staged);
+        drop(fx4);
+
+        let (hit5, layer5, fx5) = build(&src, 5, false, tuning()).await.unwrap();
+        assert!(hit5, "unchanged inputs reuse again");
+        assert_eq!(layer5, layer4);
+        let _ = std::fs::remove_dir_all(&fx5.staged);
+        println!("PASS: per-target build reuse — site/manifest edits reuse the server (and it serves), source edits and --rebuild build");
     }
 
     /// On-box validation of the VM re-adoption kernel-touching primitives (zero-bounce continuity

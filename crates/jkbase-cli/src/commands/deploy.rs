@@ -27,6 +27,11 @@ pub struct DeployArgs {
     /// Output as JSON
     #[arg(long)]
     json: bool,
+
+    /// Build every target from scratch, even ones whose inputs are unchanged since an
+    /// earlier build (by default those reuse that build's artifact)
+    #[arg(long)]
+    rebuild: bool,
 }
 
 #[derive(Deserialize)]
@@ -54,6 +59,8 @@ struct TargetStatus {
     phase: String,
     #[serde(default)]
     detail: Option<String>,
+    #[serde(default)]
+    cache_hit: bool,
 }
 
 #[derive(Deserialize)]
@@ -88,7 +95,12 @@ pub async fn run(args: DeployArgs) -> Result<()> {
     let client = crate::credentials::authenticated_client(&token);
 
     // Kick off the server-side build.
-    let url = format!("{}/projects/{}/build", args.api, project_id);
+    let url = format!(
+        "{}/projects/{}/build{}",
+        args.api,
+        project_id,
+        if args.rebuild { "?rebuild=true" } else { "" }
+    );
     println!("Building '{project_name}' on the platform...");
     let resp = client
         .post(&url)
@@ -141,12 +153,13 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         let fingerprint = status
             .targets
             .iter()
-            .map(|t| format!("{}:{}:{}", t.kind, t.name, t.phase))
+            .map(|t| format!("{}:{}:{}:{}", t.kind, t.name, t.phase, t.cache_hit))
             .collect::<Vec<_>>()
             .join(",");
         if fingerprint != last_fingerprint {
             for t in &status.targets {
-                println!("  [{}] {} — {}", t.kind, t.name, t.phase);
+                let reused = if t.cache_hit { " (reused — inputs unchanged)" } else { "" };
+                println!("  [{}] {} — {}{reused}", t.kind, t.name, t.phase);
             }
             last_fingerprint = fingerprint;
         }
