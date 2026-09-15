@@ -217,12 +217,29 @@ const MAX_MEMO_ENTRIES: usize = 200_000;
 /// type — directories with their mode, files with mode + size + content sha256, symlinks with
 /// their target. Mtimes and ownership are ignored (they don't change what a build produces).
 pub(crate) fn tree_digest(dir: &Path, memo: &DigestMemo) -> Result<String> {
+    tree_digest_skipping(dir, None, memo)
+}
+
+/// [`tree_digest`] ignoring the paths `skip` matches (relative to `dir`). Used for the
+/// "would excluding these have reused the last build?" comparison — the memo makes the
+/// second walk read no file twice.
+pub(crate) fn tree_digest_skipping(
+    dir: &Path,
+    skip: Option<&Exclusions>,
+    memo: &DigestMemo,
+) -> Result<String> {
     let mut h = Sha256::new();
     fn frame(h: &mut Sha256, bytes: &[u8]) {
         h.update((bytes.len() as u64).to_le_bytes());
         h.update(bytes);
     }
-    fn walk(h: &mut Sha256, dir: &Path, rel: &[u8], memo: &DigestMemo) -> Result<()> {
+    fn walk(
+        h: &mut Sha256,
+        dir: &Path,
+        rel: &[u8],
+        skip: Option<&Exclusions>,
+        memo: &DigestMemo,
+    ) -> Result<()> {
         for entry in sorted_entries(dir)? {
             let name = entry.file_name();
             // Raw name bytes, so two non-UTF-8 names can never frame identically.
@@ -231,6 +248,11 @@ pub(crate) fn tree_digest(dir: &Path, memo: &DigestMemo) -> Result<String> {
                 child_rel.push(b'/');
             }
             child_rel.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()));
+            if let Some(skip) = skip
+                && skip.excluded(&String::from_utf8_lossy(&child_rel))
+            {
+                continue;
+            }
             let path = entry.path();
             let md = std::fs::symlink_metadata(&path)?;
             let ft = md.file_type();
@@ -242,7 +264,7 @@ pub(crate) fn tree_digest(dir: &Path, memo: &DigestMemo) -> Result<String> {
                 h.update(b"D");
                 frame(h, &child_rel);
                 h.update((md.mode() & 0o7777).to_le_bytes());
-                walk(h, &path, &child_rel, memo)?;
+                walk(h, &path, &child_rel, skip, memo)?;
             } else if ft.is_file() {
                 h.update(b"F");
                 frame(h, &child_rel);
@@ -253,7 +275,7 @@ pub(crate) fn tree_digest(dir: &Path, memo: &DigestMemo) -> Result<String> {
         }
         Ok(())
     }
-    walk(&mut h, dir, b"", memo)?;
+    walk(&mut h, dir, b"", skip, memo)?;
     Ok(hex(&h.finalize()))
 }
 
@@ -318,6 +340,11 @@ pub(crate) struct CacheEntry {
     pub artifact: CachedArtifact,
     /// `file name in the entry dir → sha256 hex`, verified before reuse.
     pub files: BTreeMap<String, String>,
+    /// Tree digest with the hinted paths (a sibling site's committed content, jkbase.toml)
+    /// ignored. Never part of the key — it exists so a MISS can tell the tenant whether
+    /// excluding those paths would have made this deploy a reuse. See `would_have_reused`.
+    #[serde(default)]
+    pub hint_free_tree: Option<String>,
 }
 
 /// What a reuse needs to re-create the target's staged output exactly as its build did,
@@ -389,7 +416,28 @@ impl TargetCache {
 
     /// Record `artifact` under `key`, linking (or copying) `files` (`name → source path`) into
     /// the entry. Written to a temp dir and renamed into place, then older entries are pruned.
-    pub(crate) fn store(&self, key: &str, artifact: CachedArtifact, files: &[(&str, &Path)], build_id: u64) -> Result<()> {
+    /// Whether some entry of this target was built from the same input EXCEPT for the hinted
+    /// paths — i.e. those paths are the only reason this build isn't a reuse.
+    pub(crate) fn would_have_reused(&self, hint_free_tree: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            std::fs::read(e.path().join("entry.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<CacheEntry>(&b).ok())
+                .is_some_and(|entry| entry.hint_free_tree.as_deref() == Some(hint_free_tree))
+        })
+    }
+
+    pub(crate) fn store(
+        &self,
+        key: &str,
+        artifact: CachedArtifact,
+        files: &[(&str, &Path)],
+        build_id: u64,
+        hint_free_tree: Option<String>,
+    ) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let tmp = self.dir.join(format!(".tmp-{key}-{build_id}"));
         let _ = std::fs::remove_dir_all(&tmp);
@@ -404,7 +452,13 @@ impl TargetCache {
             let md = std::fs::metadata(&dst)?;
             hashes.insert(name.to_string(), hex(&file_sha256(&dst, &md, &DigestMemo::default())?));
         }
-        let entry = CacheEntry { version: BUILD_KEY_VERSION, key: key.to_string(), artifact, files: hashes };
+        let entry = CacheEntry {
+            version: BUILD_KEY_VERSION,
+            key: key.to_string(),
+            artifact,
+            files: hashes,
+            hint_free_tree,
+        };
         std::fs::write(tmp.join("entry.json"), serde_json::to_vec_pretty(&entry)?)?;
         let final_dir = self.dir.join(key);
         let _ = std::fs::remove_dir_all(&final_dir);
@@ -644,7 +698,7 @@ port = 8080
             resolved_language: Some("rust".into()),
         };
         assert!(cache.lookup("k1").is_none());
-        cache.store("k1", artifact.clone(), &[("app.erofs", &art.join("layer"))], 1).unwrap();
+        cache.store("k1", artifact.clone(), &[("app.erofs", &art.join("layer"))], 1, None).unwrap();
         let (entry, dir) = cache.lookup("k1").unwrap();
         assert_eq!(entry.artifact, artifact);
         assert_eq!(std::fs::read_to_string(dir.join("app.erofs")).unwrap(), "erofs bytes");
@@ -656,7 +710,7 @@ port = 8080
         std::fs::write(dir.join("app.erofs"), "evil").unwrap();
         assert!(cache.lookup("k1").is_none());
         // A forged file name in the entry → miss.
-        cache.store("k1", artifact.clone(), &[("app.erofs", &art.join("layer"))], 2).unwrap();
+        cache.store("k1", artifact.clone(), &[("app.erofs", &art.join("layer"))], 2, Some("hf".into())).unwrap();
         let mut forged = cache.lookup("k1").unwrap().0;
         forged.files.insert("../../escape".into(), "00".into());
         std::fs::write(cache.dir.join("k1/entry.json"), serde_json::to_vec(&forged).unwrap()).unwrap();
@@ -665,7 +719,7 @@ port = 8080
         // Pruning keeps the newest two entries.
         for (i, k) in ["k3", "k4", "k5"].iter().enumerate() {
             std::thread::sleep(std::time::Duration::from_millis(15));
-            cache.store(k, artifact.clone(), &[("app.erofs", &art.join("layer"))], 10 + i as u64).unwrap();
+            cache.store(k, artifact.clone(), &[("app.erofs", &art.join("layer"))], 10 + i as u64, None).unwrap();
         }
         let mut left: Vec<String> = std::fs::read_dir(&cache.dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
         left.sort();
