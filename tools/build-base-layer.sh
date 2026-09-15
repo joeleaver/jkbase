@@ -24,7 +24,16 @@
 #   tools/install-image-tools.sh installs them.
 #
 # Usage: tools/build-base-layer.sh   (override via env: STORE, BASE_CONFIG, BUN_BIN, BUN_VER)
+#
+# ONLY=rhypedb tools/build-base-layer.sh — re-bake JUST the managed-DB engine layer from
+# $RHYPEDB_BIN and swap ONLY `runtimes.rhypedb` in the EXISTING platform.json. A rhypedb
+# upgrade must not re-run apko: a full bake drifts every base/runtime digest, and a store
+# carrying that drift re-plans every tenant onto new blobs. The old engine blob is left in
+# the store (deployed metadata images pin it by name until they redeploy; the host's boot
+# GC reaps it once nothing does). tools/ship-rhypedb-layer.sh ships the result to a host.
 set -euo pipefail
+ONLY="${ONLY:-}"
+case "$ONLY" in ""|rhypedb) ;; *) echo "ONLY must be empty or 'rhypedb' (got '$ONLY')" >&2; exit 1 ;; esac
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_CONFIG="${BASE_CONFIG:-$REPO_ROOT/images/apko/run-base.apko.yaml}"
@@ -42,12 +51,15 @@ RHYPEDB_BIN="${RHYPEDB_BIN:-$REPO_ROOT/.firecracker/assets/rhypedb-server}"
 WORK="${WORK:-$REPO_ROOT/.firecracker/work/base-layer}"
 export PATH="$HOME/.local/bin:$PATH"
 
-command -v apko >/dev/null || { echo "apko not found — run tools/install-image-tools.sh" >&2; exit 1; }
 command -v mkfs.erofs >/dev/null || { echo "mkfs.erofs not found — apt-get install erofs-utils" >&2; exit 1; }
-command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync (runtime-layer delta)" >&2; exit 1; }
 command -v veritysetup >/dev/null || { echo "veritysetup not found — apt-get install cryptsetup-bin (dm-verity hash tree)" >&2; exit 1; }
-[ -f "$BUN_BIN" ] || { echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2; exit 1; }
 [ -f "$RHYPEDB_BIN" ] || { echo "rhypedb-server binary missing at $RHYPEDB_BIN — run RHYPEDB=1 tools/install-image-tools.sh" >&2; exit 1; }
+if [ "$ONLY" = rhypedb ]; then
+    [ -f "$STORE/platform.json" ] || { echo "ONLY=rhypedb swaps one entry of an existing $STORE/platform.json — none found (run a full bake first)" >&2; exit 1; }
+else
+command -v apko >/dev/null || { echo "apko not found — run tools/install-image-tools.sh" >&2; exit 1; }
+command -v rsync >/dev/null || { echo "rsync not found — apt-get install rsync (runtime-layer delta)" >&2; exit 1; }
+[ -f "$BUN_BIN" ] || { echo "bun binary missing at $BUN_BIN — run tools/install-image-tools.sh" >&2; exit 1; }
 
 # The delta + overlay scheme's load-bearing assumption: base and every per-language
 # runtime closure must link the SAME glibc/ld-linux/libgcc. Base's libs are what is
@@ -74,6 +86,7 @@ for name, path in (("node", sys.argv[2]), ("rust", sys.argv[3]), ("python", sys.
             bad = True
 sys.exit(1 if bad else 0)
 PY
+fi
 
 rm -rf "$WORK"
 mkdir -p "$WORK" "$STORE"
@@ -93,7 +106,8 @@ pack_layer() {
     uuid="$(printf '%s' "jkbase-layer-$name" | sha256sum | cut -c1-32 \
         | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/')"
     # -zlz4hc matches crates/jkbuild/src/export.rs::pack_layer_erofs; --all-root
-    # normalizes ownership; -T 0 (mtimes pinned) + --mkfs-time + -U (UUID pinned) for a
+    # normalizes ownership; -T 0 + --mkfs-time pins the image BUILD time only (file mtimes
+    # still come from the stage — see pin_stage_mtimes) + -U (UUID pinned) for a
     # reproducible, content-stable blob. Run as root: the trusted base preserves Wolfi's
     # intended perms (some dirs are non-readable to a non-owner), which root can still read.
     sudo mkfs.erofs -zlz4hc --all-root -T 0 --mkfs-time -U "$uuid" "$tmp" "$stage" >/dev/null
@@ -192,6 +206,50 @@ build_runtime_layer() {
     pack_layer "$delta" "$name"
 }
 
+# pin_stage_mtimes <stage_dir> — a layer staged with `install` (bun, rhypedb) carries the
+# bake's wall-clock mtimes, and erofs records them per inode (`-T 0 --mkfs-time` doesn't
+# override file times), so the SAME binary baked twice got two content addresses. Pin every
+# entry to the epoch. apko-built layers already carry deterministic (SOURCE_DATE_EPOCH)
+# mtimes and are left alone, so their digests don't move.
+pin_stage_mtimes() {
+    find "$1" -exec touch -h -d @0 {} +
+}
+
+# --- rhypedb runtime layer (the managed-DB server binary) ---
+# A single musl-static rhypedb-server staged at /opt/rhypedb/bin/rhypedb-server, shared
+# across every project that declares [database]. Like the rust/go layers it carries no
+# libc closure (statically linked → runs on base alone); the layer exists to satisfy
+# compute_layer_plan's per-language runtime lookup (key "rhypedb"). The DB overlay is
+# rhypedb:base with no per-tenant app layer. See docs/managed-rhypedb-design.md.
+bake_rhypedb_layer() {
+    echo "[rhypedb] staging /opt/rhypedb/bin/rhypedb-server"
+    local stage="$WORK/rhypedb-stage"
+    install -Dm0755 "$RHYPEDB_BIN" "$stage/opt/rhypedb/bin/rhypedb-server"
+    pin_stage_mtimes "$stage"
+    pack_layer "$stage" "rhypedb"
+    RHYPEDB_DIGEST="$PACK_DIGEST"; RHYPEDB_FILE="$PACK_FILE"; RHYPEDB_SIZE="$PACK_SIZE"; RHYPEDB_VERITY="$PACK_VERITY"
+    RHYPEDB_RH="$PACK_ROOT_HASH"; RHYPEDB_SALT="$PACK_SALT"; RHYPEDB_DS="$PACK_DATA_SIZE"
+}
+
+# The platform.json `runtimes.rhypedb` entry for the layer bake_rhypedb_layer just packed.
+rhypedb_entry_json() {
+    cat <<JSON
+{
+      "name": "rhypedb", "role": "runtime", "media": "erofs",
+      "digest": "$RHYPEDB_DIGEST", "file": "$RHYPEDB_FILE", "size": $RHYPEDB_SIZE, "fs_verity": $RHYPEDB_VERITY,
+      "verity": { "root_hash": "$RHYPEDB_RH", "salt": "$RHYPEDB_SALT", "data_size": $RHYPEDB_DS }
+    }
+JSON
+}
+
+if [ "$ONLY" = rhypedb ]; then
+    bake_rhypedb_layer
+    rhypedb_entry_json > "$WORK/rhypedb-entry.json"
+    python3 "$REPO_ROOT/tools/platform-json-swap.py" "$STORE/platform.json" rhypedb "$WORK/rhypedb-entry.json"
+    echo "[done] rhypedb $RHYPEDB_DIGEST ($RHYPEDB_SIZE bytes) — engine binary sha256:$(sha256sum "$RHYPEDB_BIN" | cut -d' ' -f1)"
+    exit 0
+fi
+
 # --- base layer (apko run-base → Wolfi rootfs) ---
 echo "[base] apko build $BASE_CONFIG"
 # Reproducible package set via the committed lockfile when present (rolling Wolfi
@@ -221,6 +279,7 @@ BASE_RH="$PACK_ROOT_HASH"; BASE_SALT="$PACK_SALT"; BASE_DS="$PACK_DATA_SIZE"
 echo "[bun] staging /opt/bun/bin/bun (bun $BUN_VER)"
 BUN_STAGE="$WORK/bun-stage"
 install -Dm0755 "$BUN_BIN" "$BUN_STAGE/opt/bun/bin/bun"
+pin_stage_mtimes "$BUN_STAGE"
 pack_layer "$BUN_STAGE" "bun-$BUN_VER"
 BUN_DIGEST="$PACK_DIGEST"; BUN_FILE="$PACK_FILE"; BUN_SIZE="$PACK_SIZE"; BUN_VERITY="$PACK_VERITY"
 BUN_RH="$PACK_ROOT_HASH"; BUN_SALT="$PACK_SALT"; BUN_DS="$PACK_DATA_SIZE"
@@ -248,18 +307,8 @@ build_runtime_layer "$GO_CONFIG" "go"
 GO_DIGEST="$PACK_DIGEST"; GO_FILE="$PACK_FILE"; GO_SIZE="$PACK_SIZE"; GO_VERITY="$PACK_VERITY"
 GO_RH="$PACK_ROOT_HASH"; GO_SALT="$PACK_SALT"; GO_DS="$PACK_DATA_SIZE"
 
-# --- rhypedb runtime layer (the managed-DB server binary) ---
-# A single musl-static rhypedb-server staged at /opt/rhypedb/bin/rhypedb-server, shared
-# across every project that declares [database]. Like the rust/go layers it carries no
-# libc closure (statically linked → runs on base alone); the layer exists to satisfy
-# compute_layer_plan's per-language runtime lookup (key "rhypedb"). The DB overlay is
-# rhypedb:base with no per-tenant app layer. See docs/managed-rhypedb-design.md.
-echo "[rhypedb] staging /opt/rhypedb/bin/rhypedb-server"
-RHYPEDB_STAGE="$WORK/rhypedb-stage"
-install -Dm0755 "$RHYPEDB_BIN" "$RHYPEDB_STAGE/opt/rhypedb/bin/rhypedb-server"
-pack_layer "$RHYPEDB_STAGE" "rhypedb"
-RHYPEDB_DIGEST="$PACK_DIGEST"; RHYPEDB_FILE="$PACK_FILE"; RHYPEDB_SIZE="$PACK_SIZE"; RHYPEDB_VERITY="$PACK_VERITY"
-RHYPEDB_RH="$PACK_ROOT_HASH"; RHYPEDB_SALT="$PACK_SALT"; RHYPEDB_DS="$PACK_DATA_SIZE"
+# --- rhypedb runtime layer (see bake_rhypedb_layer) ---
+bake_rhypedb_layer
 
 # --- platform manifest (host reads this to inject base + runtime ahead of the app) ---
 # `runtimes` is keyed by the server manifest's stamped `runtime` (= the resolved
@@ -298,11 +347,7 @@ cat > "$STORE/platform.json" <<JSON
       "digest": "$GO_DIGEST", "file": "$GO_FILE", "size": $GO_SIZE, "fs_verity": $GO_VERITY,
       "verity": { "root_hash": "$GO_RH", "salt": "$GO_SALT", "data_size": $GO_DS }
     },
-    "rhypedb": {
-      "name": "rhypedb", "role": "runtime", "media": "erofs",
-      "digest": "$RHYPEDB_DIGEST", "file": "$RHYPEDB_FILE", "size": $RHYPEDB_SIZE, "fs_verity": $RHYPEDB_VERITY,
-      "verity": { "root_hash": "$RHYPEDB_RH", "salt": "$RHYPEDB_SALT", "data_size": $RHYPEDB_DS }
-    }
+    "rhypedb": $(rhypedb_entry_json)
   }
 }
 JSON

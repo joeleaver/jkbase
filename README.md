@@ -311,6 +311,27 @@ Point RhypeDB's client — the `@rhypedb/client` package — at `127.0.0.1:4201`
 `POST http://127.0.0.1:4200/query` directly). The database is **loopback-only and never routable**
 from the internet.
 
+### Search
+
+Mark a `String` field `@fulltext` and query it with `.matches` — BM25-ranked keyword search with
+required terms (`+draft`), phrases (`"due date"`), prefix terms (`camera*`), and an optional English
+stemmer (`@fulltext(analyzer: "english")`). The index is kept in step with every write; adding
+`@fulltext` to a populated type backfills in the background (`.matches` on that field reports
+progress until it's built).
+
+```
+type Post {
+    title: String @fulltext(analyzer: "english")
+}
+```
+```
+Post.matches(.title, "+invoice \"due date\"", k: 20)   # objects in rank order, each with a "score"
+```
+
+Vector search (`Vector<N>` fields with `@index`, queried by `.similar`) works with vectors your app
+supplies. The managed engine ships without an embedding model, so `@vectorize` (server-side
+text-to-vector) isn't available.
+
 ### Reach it from your laptop or CI
 
 RhypeDB's native wire is plaintext, so external access rides a TLS edge at `<project>.db.<domain>`

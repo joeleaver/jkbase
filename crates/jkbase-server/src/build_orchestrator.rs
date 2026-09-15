@@ -4003,6 +4003,11 @@ Bun.serve({ port, async fetch(req) {
       const c = await q('User.create({ name: "alpha" })', auth);
       return new Response("seed status=" + c.status + "\n");
     }
+    if (path === "/q") {
+      // Generic relay: the POST body is the query; reply "<status>\n<engine body>".
+      const r = await q(await req.text(), auth);
+      return new Response(r.status + "\n" + r.text);
+    }
     const r = await q("User", auth);
     let n = 0;
     try { n = (JSON.parse(r.text).objects || []).length; } catch {}
@@ -6483,6 +6488,289 @@ console.log("listening on " + port);
         println!(
             "PASS: P4 rules enforced in-VM — authenticated create/read ALLOWED, anonymous read \
              filtered + write refused (baked rules.rhype + reserved-channel JWKS)"
+        );
+    }
+
+    /// The managed-DB ENGINE-UPGRADE proof, shaped like the prod rollout: a rhypedb layer swap
+    /// leaves tenant data disks written by the previous engine, and a tenant then redeploys with
+    /// `@fulltext` added. Rules are ON, so ranked results must obey them like any other read.
+    ///   1. (only with `JKB_BASELAYERS_PREV` — a store whose platform.json names the PREVIOUS
+    ///      rhypedb blob) boot the OLD engine with a `@fulltext`-free schema and seed rows as two
+    ///      users, then hard-kill it;
+    ///   2. boot the CURRENT engine (`JKB_BASELAYERS`) over the SAME data disk with `@fulltext`
+    ///      added: pre-existing rows backfill in the background (`.matches` refuses with progress
+    ///      until built), a new write indexes synchronously; `.matches` returns only the caller's
+    ///      rows (rules), rank-ordered with non-increasing BM25 `score`; stemming holds; anonymous
+    ///      gets a filtered empty 200; `.contains` + plain reads still serve the old rows;
+    ///   3. hard-kill + cold reboot: the persisted index serves the same ranking immediately.
+    /// Without `JKB_BASELAYERS_PREV` step 1 is skipped and every row is written by the current
+    /// engine (still proves fulltext + rules + persistence in a real DB VM).
+    ///
+    ///   same env as `managed_db_rules_enforced_e2e`, plus optionally
+    ///   JKB_BASELAYERS_PREV=/abs/.firecracker/baselayers-prev
+    #[tokio::test]
+    #[ignore = "engine-upgrade + fulltext e2e: needs KVM + root + bun.ext4 + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn managed_db_engine_upgrade_fulltext_e2e() {
+        use jkbase_common::config::DbReachFacts;
+        use jkbase_control::jose::{Claims, Jwks, SigningKeypair};
+        use jkbase_orch::vm::{VmConfig, VmInstance};
+
+        let Some(fx) = bun_pipeline_build("ftdb", 1, Workload::AuthDatabase).await else {
+            return;
+        };
+        let Some((store_dir, _agent_bin)) = resolve_runtime_env(&fx) else {
+            return;
+        };
+        let Ok(rootfs) = std::env::var("JKB_ROOTFS").map(PathBuf::from) else {
+            eprintln!(
+                "skip: set JKB_ROOTFS to the verity-capable agent rootfs (tools/build-runtime-rootfs.sh)"
+            );
+            return;
+        };
+        assert!(rootfs.exists(), "JKB_ROOTFS {} missing", rootfs.display());
+        let prev_store = std::env::var("JKB_BASELAYERS_PREV").ok().map(PathBuf::from);
+        if let Some(p) = &prev_store {
+            assert!(p.join("platform.json").exists(), "JKB_BASELAYERS_PREV {} has no platform.json", p.display());
+        }
+
+        let kp = SigningKeypair::from_seed("ftproj.0", [9u8; 32]);
+        let jwks_json = serde_json::to_string(&Jwks::new(vec![kp.jwk()])).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bearer = |sub: &str| {
+            let t = kp
+                .sign(&Claims {
+                    iss: "https://auth.jkbase.app".into(),
+                    sub: sub.into(),
+                    aud: "ftproj".into(),
+                    iat: now,
+                    exp: now + 3600,
+                    jti: format!("ft-{sub}"),
+                    claims: None,
+                })
+                .unwrap();
+            format!("Bearer {t}")
+        };
+        let (u1, u2) = (bearer("user-1"), bearer("user-2"));
+
+        std::fs::write(
+            fx.staged.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":"rules.rhype"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fx.staged.join("_database")).unwrap();
+        std::fs::write(
+            fx.staged.join("_database/rules.rhype"),
+            "match Post {\n  allow create: if request.auth != null;\n  allow read: if request.auth != null && resource.owner == request.auth.uid;\n}\n",
+        )
+        .unwrap();
+        let db_reach = DbReachFacts {
+            splice_secret: "e2e-splice".into(),
+            admin_token: "e2e-admin".into(),
+            dedicated: false,
+            jwks: Some(jwks_json),
+        };
+        // One metadata image per (engine store, schema): the agent seeds the image's schema into
+        // the meta volume at boot, so booting the second image over the same disk IS the redeploy.
+        let bake = |store: &Path, schema: &str, name: &str| {
+            std::fs::write(fx.staged.join("_database/schema.rhype"), schema).unwrap();
+            let plan = crate::layer_plan::compute_layer_plan(&fx.staged, store, true, true)
+                .expect("compute layer plan with a managed DB + data disk");
+            let img = fx.data.join(format!("ftdb-{name}-metadata.ext4"));
+            crate::layer_plan::build_metadata_image(
+                &fx.staged,
+                &plan,
+                &Default::default(),
+                &Default::default(),
+                None,
+                Some(&db_reach),
+                None, /* l4_facts */
+                &img,
+            )
+            .expect("build the metadata image");
+            (img, plan.layer_paths)
+        };
+
+        let data_disk = fx.data.join("ftdb-data.ext4");
+        let _ = std::fs::remove_file(&data_disk);
+        sh("truncate", &["-s", "1G", data_disk.to_str().unwrap()]).await.unwrap();
+        sh("mkfs.ext4", &["-F", "-q", data_disk.to_str().unwrap()]).await.unwrap();
+
+        let (tag, host_ip, guest_ip, guest_mac) =
+            ("ftdb", "172.22.0.1", "172.22.0.2", "AA:FC:00:00:22:02");
+        let tap = format!("jk{tag}");
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        sh("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"]).await.unwrap();
+        sh("ip", &["addr", "add", &format!("{host_ip}/24"), "dev", &tap]).await.unwrap();
+        sh("ip", &["link", "set", &tap, "up"]).await.unwrap();
+        let config_for = |img: PathBuf, layer_paths: Vec<PathBuf>| VmConfig {
+            firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: fx.kernel.clone(),
+            rootfs_path: rootfs.clone(),
+            metadata_image_path: Some(img),
+            layer_paths,
+            data_disk_path: Some(data_disk.clone()),
+            vcpu_count: 2,
+            mem_size_mib: 1024,
+            tap_device: Some(tap.clone()),
+            guest_mac: Some(guest_mac.to_string()),
+            guest_ip: Some(guest_ip.to_string()),
+            gateway_ip: Some(host_ip.to_string()),
+            vsock_cid: None,
+            runtime_cgroup_parent: None,
+        };
+
+        // No connection pooling: the VM is killed + rebooted at the same IP between phases, and a
+        // pooled keep-alive socket to the dead incarnation fails the first request after a boot.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
+        // POST a query through the app's `/q` relay → (engine status, engine JSON).
+        async fn query(
+            client: &reqwest::Client,
+            ip: &str,
+            q: &str,
+            bearer: Option<&str>,
+        ) -> Option<(u16, serde_json::Value)> {
+            let mut rb = client.post(format!("http://{ip}:80/q")).body(q.to_string());
+            if let Some(b) = bearer {
+                rb = rb.header("authorization", b);
+            }
+            let text = rb.send().await.ok()?.text().await.ok()?;
+            let (status, body) = text.split_once('\n')?;
+            Some((status.parse().ok()?, serde_json::from_str(body).unwrap_or(serde_json::Value::Null)))
+        }
+        let titles = |v: &serde_json::Value| -> Vec<String> {
+            v["objects"]
+                .as_array()
+                .map(|a| a.iter().map(|o| o["fields"]["title"].as_str().unwrap_or("").to_string()).collect())
+                .unwrap_or_default()
+        };
+        let create = |title: &str, owner: &str| {
+            format!(r#"Post.create({{ title: "{title}", owner: "{owner}" }})"#)
+        };
+        const PLAIN: &str = "type Post {\n    title: String\n    owner: String @indexed\n}\n";
+        const FULLTEXT: &str =
+            "type Post {\n    title: String @fulltext(analyzer: \"english\")\n    owner: String @indexed\n}\n";
+        const MATCHES: &str = r#"Post.matches(.title, "invoices", k: 10)"#;
+
+        // --- 1. previous engine writes the pre-upgrade rows.
+        let mut seeded_by_prev = false;
+        if let Some(prev) = &prev_store {
+            let (img, layers) = bake(prev, PLAIN, "prev");
+            let mut vm = VmInstance::start(tag, &config_for(img, layers), &fx.data.join("ftdb-run0"))
+                .await
+                .expect("previous-engine DB VM should start");
+            let ready = poll_http_200(guest_ip, 80, Duration::from_secs(90)).await;
+            let mut statuses = Vec::new();
+            for (t, who) in [("Invoice due Friday", &u1), ("Overdue invoices and invoice reminders", &u1)] {
+                statuses.push(query(&client, guest_ip, &create(t, "user-1"), Some(who)).await.map(|r| r.0));
+            }
+            statuses.push(query(&client, guest_ip, &create("Invoice for someone else", "user-2"), Some(&u2)).await.map(|r| r.0));
+            let _ = vm.stop().await; // hard kill: the new engine must also replay the old WAL
+            eprintln!("[ft-e2e] prev engine ready={ready:?} seed statuses={statuses:?}");
+            assert!(ready.is_some(), "the previous engine must boot");
+            assert!(statuses.iter().all(|s| *s == Some(200)), "previous-engine seeds must succeed: {statuses:?}");
+            seeded_by_prev = true;
+        }
+
+        // --- 2. current engine over the same disk, @fulltext added.
+        let (img, layers) = bake(&store_dir, FULLTEXT, "cur");
+        let config = config_for(img, layers);
+        let mut vm = VmInstance::start(tag, &config, &fx.data.join("ftdb-run1"))
+            .await
+            .expect("current-engine DB VM should start over the upgraded data disk");
+        let ready = poll_http_200(guest_ip, 80, Duration::from_secs(90)).await;
+        if !seeded_by_prev {
+            for (t, owner, who) in [
+                ("Invoice due Friday", "user-1", &u1),
+                ("Overdue invoices and invoice reminders", "user-1", &u1),
+                ("Invoice for someone else", "user-2", &u2),
+            ] {
+                let s = query(&client, guest_ip, &create(t, owner), Some(who)).await.map(|r| r.0);
+                assert_eq!(s, Some(200), "seed {t:?} on the current engine");
+            }
+        }
+        // Background backfill of pre-existing rows: `.matches` errors with progress until built.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut first = query(&client, guest_ip, MATCHES, Some(&u1)).await;
+        while first.as_ref().is_none_or(|r| r.0 != 200) && std::time::Instant::now() < deadline {
+            eprintln!("[ft-e2e] waiting for the fulltext build: {first:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            first = query(&client, guest_ip, MATCHES, Some(&u1)).await;
+        }
+        let new_write = query(&client, guest_ip, &create("Invoicing runbook", "user-1"), Some(&u1))
+            .await
+            .map(|r| r.0);
+        let ranked = query(&client, guest_ip, MATCHES, Some(&u1)).await;
+        let ranked_u2 = query(&client, guest_ip, MATCHES, Some(&u2)).await;
+        let ranked_anon = query(&client, guest_ip, MATCHES, None).await;
+        let contains = query(&client, guest_ip, r#"Post.filter(.title.contains("Friday"))"#, Some(&u1)).await;
+        let all_u1 = query(&client, guest_ip, "Post", Some(&u1)).await;
+        let _ = vm.stop().await;
+
+        // --- 3. cold reboot: the persisted index answers without a rebuild.
+        let mut vm2 = VmInstance::start(tag, &config, &fx.data.join("ftdb-run2"))
+            .await
+            .expect("current-engine DB VM should cold-reboot over the same disk");
+        let _ = poll_http_200(guest_ip, 80, Duration::from_secs(90)).await;
+        let rebooted = query(&client, guest_ip, MATCHES, Some(&u1)).await;
+        let _ = vm2.stop().await;
+
+        let _ = sh("ip", &["link", "del", &tap]).await;
+        let _ = std::fs::remove_dir_all(&fx.staged);
+
+        eprintln!("[ft-e2e] ready={ready:?} new_write={new_write:?}\n  ranked={ranked:?}\n  u2={ranked_u2:?}\n  anon={ranked_anon:?}\n  contains={contains:?}\n  all_u1={all_u1:?}\n  rebooted={rebooted:?}");
+        assert!(ready.is_some(), "the current engine must boot over the previous engine's data");
+        assert_eq!(new_write, Some(200), "a post-upgrade write must succeed");
+        let (status, body) = ranked.expect("ranked query must return");
+        assert_eq!(status, 200, "ranked query: {body}");
+        let got = titles(&body);
+        let mut sorted = got.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["Invoice due Friday", "Invoicing runbook", "Overdue invoices and invoice reminders"],
+            "english stemming matches invoice/invoices/invoicing across old AND new rows; rules hide user-2's post"
+        );
+        let scores: Vec<f64> = body["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["score"].as_f64().expect("every ranked row carries a score"))
+            .collect();
+        assert!(
+            scores.windows(2).all(|w| w[0] >= w[1]) && scores.iter().all(|s| *s > 0.0),
+            "rows come back in rank order: {scores:?}"
+        );
+        assert_eq!(
+            ranked_u2.map(|(s, b)| (s, titles(&b))),
+            Some((200, vec!["Invoice for someone else".to_string()])),
+            "user-2 sees only their own match"
+        );
+        assert_eq!(
+            ranked_anon.map(|(s, b)| (s, titles(&b))),
+            Some((200, vec![])),
+            "anonymous ranked search is default-denied (filtered, not an error)"
+        );
+        assert_eq!(
+            contains.map(|(s, b)| (s, titles(&b))),
+            Some((200, vec!["Invoice due Friday".to_string()])),
+            ".contains serves the upgraded rows"
+        );
+        assert_eq!(all_u1.map(|(s, b)| (s, titles(&b).len())), Some((200, 3)), "plain reads serve every user-1 row");
+        assert_eq!(
+            rebooted.map(|(s, b)| (s, titles(&b))),
+            Some((200, got)),
+            "after a cold reboot the persisted index returns the same ranking at once"
+        );
+        println!(
+            "PASS: managed-DB engine upgrade (prev engine data: {seeded_by_prev}) → @fulltext backfill + \
+             rules-filtered ranked search + persisted index across reboot"
         );
     }
 
