@@ -8,11 +8,16 @@
 //! artifact is reused from the host-owned cache instead of booting a build VM.
 //!
 //! **Input = mount, by construction.** The key hashes the materialized input directory, and
-//! that same directory is what becomes the RO source image. Anything excluded — other sites'
-//! committed `public` dirs and `jkbase.toml` automatically, plus the target's own `exclude`
-//! globs — is absent from BOTH, so a change there can't be missed by the key AND can't
-//! influence the build. That is what lets a `context = "."` monorepo edit its static site
-//! without rebuilding its Rust servers, with no way for a reuse to be stale.
+//! that same directory is what becomes the RO source image. A target's `exclude` globs are
+//! absent from BOTH, so an excluded change can't be missed by the key AND can't influence the
+//! build. That is what lets a `context = "."` monorepo edit its static site without rebuilding
+//! its Rust servers, with no way for a reuse to be stale.
+//!
+//! Nothing is excluded by default. Dropping a sibling site's `public` dir automatically would
+//! be wrong: with a wide context the app layer IS the context root for the node/bun buildpacks,
+//! so those files are part of what the server serves at runtime — removing them would 404 in
+//! production rather than fail the build. [`exclusion_hints`] points the tenant at the knob
+//! instead.
 //!
 //! **Trust.** The cache lives on the host (`buildcache/<project>/targets/`), is written only
 //! by the host after the artifact passed the same collection checks as a fresh build, is
@@ -37,6 +42,12 @@ pub(crate) const BUILD_KEY_VERSION: u32 = 1;
 
 /// Cache entries kept per target (the live build plus the one before it).
 const KEEP_ENTRIES_PER_TARGET: usize = 2;
+
+/// How long an entry may be reused. Some inputs aren't in the key because they aren't in the
+/// tree: an unpinned Dockerfile `FROM`, a floating dependency range resolved at fetch time. A
+/// max age means a project that keeps deploying still re-resolves them regularly, instead of
+/// riding one artifact indefinitely.
+const MAX_ENTRY_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 /// Bounds on a target's `exclude` list (tenant input).
 pub(crate) const MAX_EXCLUDE_PATTERNS: usize = 64;
@@ -100,45 +111,49 @@ pub(crate) fn validate_exclude(what: &str, patterns: &[String], build_subdir: &s
     Ok(())
 }
 
-/// The automatic exclusions for a target building from `context` with source `source` (both
-/// relative to the project root), as literal paths relative to the context:
-/// - `jkbase.toml` when the context is the project root — the platform's manifest, never a
-///   build input (the target's build-affecting config is keyed separately);
-/// - every COMMITTED site's `public` dir inside the context — unless the target's source lives
-///   inside it, or it is the context itself. Served as-is; not what a server or a built site
-///   compiles. (A build that reads it anyway fails loudly, since the dir isn't mounted.)
-pub(crate) fn auto_excludes(config: &ProjectConfig, context: &str, source: &str) -> Vec<String> {
+/// Paths inside `context` that a target probably doesn't build from — a sibling site's
+/// committed `public` dir, and the project manifest — and that its `exclude` doesn't cover
+/// yet. Purely advisory: excluding them is the tenant's call (a server on a wide context may
+/// legitimately serve a sibling site's files from its own app layer), so this only reports
+/// what a deploy could stop rebuilding for.
+pub(crate) fn exclusion_hints(
+    config: &ProjectConfig,
+    context: &str,
+    source: &str,
+    excluded: &Exclusions,
+) -> Vec<String> {
     let (c, s) = (norm(context), norm(source));
     let mut out = BTreeSet::new();
-    if c == "." {
-        out.insert("jkbase.toml".to_string());
+    let mut consider = |p: String| {
+        if !excluded.excluded(&p) {
+            out.insert(p);
+        }
+    };
+    if c == "." && s != "." {
+        consider("jkbase.toml".to_string());
     }
     for site in config.resolved_sites().iter().filter(|site| !site.built) {
         let p = norm(&site.public);
         if p == "." || p == c || !inside(&p, &c) || inside(&s, &p) {
             continue;
         }
-        out.insert(jkbase_common::config::rel_within(&c, &p));
+        consider(jkbase_common::config::rel_within(&c, &p));
     }
     out.into_iter().collect()
 }
 
 /// What to leave out of one target's build input.
 pub(crate) struct Exclusions {
-    paths: BTreeSet<String>,
     globs: GlobSet,
 }
 
 impl Exclusions {
-    pub(crate) fn new(paths: &[String], patterns: &[String]) -> Result<Self> {
-        Ok(Self {
-            paths: paths.iter().map(|p| norm(p)).collect(),
-            globs: compile_globs(patterns)?,
-        })
+    pub(crate) fn new(patterns: &[String]) -> Result<Self> {
+        Ok(Self { globs: compile_globs(patterns)? })
     }
 
     fn excluded(&self, rel: &str) -> bool {
-        self.paths.contains(rel) || self.globs.is_match(rel)
+        self.globs.is_match(rel)
     }
 }
 
@@ -191,8 +206,12 @@ fn sorted_entries(dir: &Path) -> Result<Vec<std::fs::DirEntry>> {
 
 /// File content digests memoized by `(dev, ino)` for one build: every target's input is
 /// hard-linked from the same unpacked source, so a file shared by several targets is read once.
+/// Bounded, so a tree of many small files can't turn the memo into the memory pressure.
 #[derive(Default)]
 pub(crate) struct DigestMemo(std::sync::Mutex<HashMap<(u64, u64), [u8; 32]>>);
+
+/// Entries the memo keeps (~70 B each): past this, files are simply re-hashed.
+const MAX_MEMO_ENTRIES: usize = 200_000;
 
 /// Canonical digest of a tree: every entry in byte order of its relative path, framed with its
 /// type — directories with their mode, files with mode + size + content sha256, symlinks with
@@ -254,7 +273,10 @@ fn file_sha256(path: &Path, md: &std::fs::Metadata, memo: &DigestMemo) -> Result
         h.update(&buf[..n]);
     }
     let d: [u8; 32] = h.finalize().into();
-    memo.0.lock().unwrap_or_else(|p| p.into_inner()).insert(id, d);
+    let mut memo = memo.0.lock().unwrap_or_else(|p| p.into_inner());
+    if memo.len() < MAX_MEMO_ENTRIES {
+        memo.insert(id, d);
+    }
     Ok(d)
 }
 
@@ -274,8 +296,7 @@ pub(crate) struct KeyInputs<'a> {
     pub language: Option<&'a str>,
     pub builder: &'a str,
     pub dockerfile: Option<&'a str>,
-    pub exclude_paths: &'a [String],
-    pub exclude_globs: &'a [String],
+    pub exclude: &'a [String],
     /// The resolved toolchain image's file name and `sha256:` digest.
     pub toolchain: (&'a str, &'a str),
     /// The agent binary digest (functions only: it AOT-compiles the `.cwasm`).
@@ -336,6 +357,10 @@ impl TargetCache {
     /// or any file failing its recorded sha256 — a miss, never an error).
     pub(crate) fn lookup(&self, key: &str) -> Option<(CacheEntry, PathBuf)> {
         let dir = self.dir.join(key);
+        let meta = std::fs::metadata(dir.join("entry.json")).ok()?;
+        if meta.modified().ok()?.elapsed().is_ok_and(|age| age > MAX_ENTRY_AGE) {
+            return None; // too old to still stand in for a build
+        }
         let entry: CacheEntry = serde_json::from_slice(&std::fs::read(dir.join("entry.json")).ok()?).ok()?;
         if entry.version != BUILD_KEY_VERSION || entry.key != key {
             return None;
@@ -354,6 +379,11 @@ impl TargetCache {
                 return None;
             }
         }
+        // Mark it used: prune keeps the most recently written entries, and an entry that is
+        // still being reused must not be evicted by two newer keys.
+        let _ = std::fs::File::open(dir.join("entry.json")).and_then(|f| f.set_times(
+            std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()),
+        ));
         Some((entry, dir))
     }
 
@@ -410,6 +440,21 @@ impl TargetCache {
     }
 }
 
+/// Drop cache dirs for targets this project no longer has (renamed or removed): nothing will
+/// ever look them up again, and once their deployments are pruned they are pure storage.
+pub(crate) fn prune_orphan_targets(data_dir: &Path, project_id: &str, live_tags: &[String]) {
+    let root = data_dir.join("buildcache").join(project_id).join("targets");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !live_tags.contains(&name) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// Entry file names are fixed by the host; refuse anything else a corrupted entry might name.
 fn safe_entry_file(name: &str) -> bool {
     matches!(name, "app.erofs" | "static.tar.gz" | "function.wasm" | "function.cwasm")
@@ -457,22 +502,24 @@ port = 8080
 "#;
 
     #[test]
-    fn auto_excludes_drop_committed_sites_and_the_manifest_from_wide_contexts() {
+    fn exclusion_hints_point_at_what_a_wide_context_could_drop() {
         let cfg = config(PIMBLE);
-        assert_eq!(auto_excludes(&cfg, ".", "crates/pimble-cloud"), vec!["jkbase.toml", "site"]);
-        assert_eq!(auto_excludes(&cfg, "./", "web"), vec!["jkbase.toml", "site"]);
+        let none = Exclusions::new(&[]).unwrap();
+        assert_eq!(exclusion_hints(&cfg, ".", "crates/pimble-cloud", &none), vec!["jkbase.toml", "site"]);
+        assert_eq!(exclusion_hints(&cfg, "./", "web", &none), vec!["jkbase.toml", "site"]);
+        // Already excluded → not hinted again.
+        let some = Exclusions::new(&["site".into()]).unwrap();
+        assert_eq!(exclusion_hints(&cfg, ".", "web", &some), vec!["jkbase.toml"]);
         // A narrow context contains neither.
-        assert!(auto_excludes(&cfg, "crates/pimble-cloud", "crates/pimble-cloud").is_empty());
-        // A target whose source lives inside the site dir keeps it.
-        assert_eq!(auto_excludes(&cfg, ".", "site/tool"), vec!["jkbase.toml"]);
-        // A root-served site (`public = "."`) is never excluded, and a context under the site
-        // dir keeps it too.
+        assert!(exclusion_hints(&cfg, "crates/pimble-cloud", "crates/pimble-cloud", &none).is_empty());
+        // A target whose source lives inside the site dir, or IS the whole root, keeps it.
+        assert_eq!(exclusion_hints(&cfg, ".", "site/tool", &none), vec!["jkbase.toml"]);
         let root_site = config("[project]\nname = \"x\"\n[hosting]\npublic = \".\"\n[servers.api]\nsource = \".\"\nport = 3000\n");
-        assert_eq!(auto_excludes(&root_site, ".", "."), vec!["jkbase.toml"]);
-        assert!(auto_excludes(&cfg, "site", "site").is_empty());
+        assert!(exclusion_hints(&root_site, ".", ".", &none).is_empty());
+        assert!(exclusion_hints(&cfg, "site", "site", &none).is_empty());
         // Relative to a context that isn't the root.
         let nested = config("[project]\nname = \"x\"\n[sites.docs]\npublic = \"mono/docs\"\n[servers.api]\nsource = \"mono/api\"\ncontext = \"mono\"\nport = 3000\n");
-        assert_eq!(auto_excludes(&nested, "mono", "mono/api"), vec!["docs"]);
+        assert_eq!(exclusion_hints(&nested, "mono", "mono/api", &none), vec!["docs"]);
     }
 
     #[test]
@@ -502,7 +549,7 @@ port = 8080
         write(&src.join("store.pimble"), "blob");
         write(&src.join("jkbase.toml"), "[project]");
         std::os::unix::fs::symlink("crates/app", src.join("app-link")).unwrap();
-        let ex = Exclusions::new(&["jkbase.toml".into(), "site".into()], &["docs".into(), "*.pimble".into()]).unwrap();
+        let ex = Exclusions::new(&["jkbase.toml".into(), "site".into(), "docs".into(), "*.pimble".into()]).unwrap();
         let out = tmp("out");
         let dest = out.join("input");
         assert_eq!(materialize_input(&src, &ex, &dest).unwrap(), 4);
@@ -545,7 +592,6 @@ port = 8080
 
     #[test]
     fn every_key_input_moves_the_key() {
-        let paths = vec!["site".to_string()];
         let globs = vec!["docs".to_string()];
         let base = KeyInputs {
             version: BUILD_KEY_VERSION,
@@ -556,15 +602,14 @@ port = 8080
             language: Some("rust"),
             builder: "auto",
             dockerfile: None,
-            exclude_paths: &paths,
-            exclude_globs: &globs,
+            exclude: &globs,
             toolchain: ("rust.ext4", "sha256:aa"),
             agent: None,
             tree: "t0",
         };
         let k = build_key(&base);
         assert_eq!(k, build_key(&KeyInputs { ..base }), "deterministic");
-        let other_paths = vec!["site2".to_string()];
+        let other = vec!["site2".to_string()];
         let variants = [
             KeyInputs { version: BUILD_KEY_VERSION + 1, ..base },
             KeyInputs { kind: "static", ..base },
@@ -574,8 +619,7 @@ port = 8080
             KeyInputs { language: None, ..base },
             KeyInputs { builder: "dockerfile", ..base },
             KeyInputs { dockerfile: Some("Dockerfile"), ..base },
-            KeyInputs { exclude_paths: &other_paths, ..base },
-            KeyInputs { exclude_globs: &other_paths, ..base },
+            KeyInputs { exclude: &other, ..base },
             KeyInputs { toolchain: ("rust.ext4", "sha256:bb"), ..base },
             KeyInputs { agent: Some("sha256:cc"), ..base },
             KeyInputs { tree: "t1", ..base },

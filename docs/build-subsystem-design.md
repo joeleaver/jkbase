@@ -174,6 +174,32 @@ For pure JS/TS we borrow the Deno/Val Town pattern: a light server-side bundle �
 
 **Build-minute metering reuses `metering.rs` — with a correction for short bursts (threat-model P1-4, feasibility P2-6).** The build VM has a pid + TAP, so `read_cpu_jiffies`/`read_tap_bytes`/`SamplerState` apply. But the 60 s `metering_loop` tick would let a build killed at 59 s escape metering entirely (free crypto-mining via sub-tick resubmits). **Fix:** meter build VMs **on exit** — read final cgroup `cpu.stat`/accumulated jiffies at teardown (we own the lifecycle) — and bill the floor of wall-clock too, not only on the periodic tick. The **pre-build 402 gate debits an estimated minimum *before* launch**, so a tenant already at quota can't trigger launch-storms.
 
+**Per-target artifact reuse (as built).** The two tiers above are about a build's *inputs*. On top
+of them the host keeps a third, host-owned tier: a **per-target artifact cache**
+(`{data_dir}/buildcache/{project_id}/targets/<kind-name-digest>/<key>/`) that lets a deploy skip
+rebuilding a target whose inputs didn't change — so one target's edit doesn't rebuild a monorepo's
+other targets. It respects the cross-tenant rule the same way the writable cache does: it is
+per-project, written **only by the host** after the artifact passed the same collection checks as
+a fresh build (erofs layer digest verified against the in-VM index), never mounted into any build
+VM, and re-verified (sha256 of every cached file against the entry) before reuse. Nothing a tenant
+writes can become another tenant's cache entry, and nothing the tenant controls reaches a cache
+path (project ids and target names are charset-validated, then sanitized and suffixed with a digest
+of the real name so two names can't share a directory).
+
+The reuse decision is a **build key**: a format version, the target's build-affecting config, the
+resolved toolchain image digest (so a rebake invalidates every entry), the agent digest for a
+function (it compiles the `.cwasm`), and a canonical tree digest of the materialized build input.
+That input is the `context` minus the target's `exclude` globs, hard-link-materialized — and it is
+**both** what the RO source image is built from and what the key hashes, so an excluded path can
+neither be missed by the key nor seen by the build. Nothing is excluded implicitly: with a wide
+context the app layer often IS the context root, so silently dropping a sibling site's `public/`
+would remove files the server serves at runtime; the orchestrator only *hints* which paths a target
+could exclude. Inputs that aren't in the tree (an unpinned Dockerfile `FROM`, a floating dependency
+range) are covered by a max entry age (one week) plus `jkbase deploy --rebuild`. A reuse bills the
+host work it still costs (unpack + materialize + hash + verify, ≥1 build-second) so the
+build-minute gate still bounds a deploy loop, and cache files no deployment shares count against
+the project's storage quota.
+
 **Provenance & observability.** `DeploymentMeta` records `{builder_digest, cache_key, source_commit, cache_hit, build_duration_breakdown}` (per-phase timings — feasibility/completeness P2-9). Add `build_seconds` to `UsageBucket` + `add_usage` (or sibling `add_build_usage`); surface in `UsageResponse`/`QuotaResponse`; add `build_seconds_per_month` to `QuotaLimits`. Expose the cap and per-phase cost up front in the console — explicitly avoiding Vercel's surprise-bill reputation.
 
 ## 9. Security model (hostile tenants, no trusted tier)

@@ -1587,7 +1587,7 @@ async fn build(
     if let Err(e) = require_project_owner(&state, &tenant, &id) {
         return e.into_response();
     }
-    match start_build_job(&state, &id, body.to_vec(), q.rebuild) {
+    match start_build_job(&state, &id, body.to_vec(), q.rebuild()) {
         Ok(build_id) => (
             StatusCode::ACCEPTED,
             Json(BuildStartedResponse {
@@ -1601,10 +1601,21 @@ async fn build(
 }
 
 /// `POST /projects/{id}/build?rebuild=true` — skip per-target build reuse for this build.
+/// Accepts the usual spellings (`true`/`1`/`yes`/`on`); anything else is false rather than a
+/// 400, so a rebuild request can never fail the deploy over its syntax.
 #[derive(Deserialize, Default)]
 struct BuildQuery {
     #[serde(default)]
-    rebuild: bool,
+    rebuild: Option<String>,
+}
+
+impl BuildQuery {
+    fn rebuild(&self) -> bool {
+        matches!(
+            self.rebuild.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+            Some("true" | "1" | "yes" | "on" | "")
+        )
+    }
 }
 
 /// Why the shared build funnel refused to start a job.

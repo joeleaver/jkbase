@@ -965,11 +965,8 @@ struct TargetSpec {
     /// app_dir, `<context>/<build_subdir>` in the VM), for `builder = "dockerfile"`.
     /// `None` otherwise.
     dockerfile: Option<String>,
-    /// Literal paths (relative to the context) left out of the build input automatically:
-    /// other sites' committed `public` dirs and `jkbase.toml` (see `build_cache::auto_excludes`).
-    exclude_paths: Vec<String>,
-    /// The target's own `exclude` globs (relative to the context).
-    exclude_globs: Vec<String>,
+    /// The target's `exclude` globs (relative to the context): what its build input leaves out.
+    exclude: Vec<String>,
 }
 
 /// Build-derived server manifest fields (the `cmd`/`env`/`working_dir` half of a
@@ -987,6 +984,18 @@ struct BuiltServerManifest {
 
 fn root_dir() -> String {
     "/".to_string()
+}
+
+impl TargetSpec {
+    /// The target's source dir relative to the PROJECT root (context + build subdir), which is
+    /// what `exclusion_hints` compares site dirs against.
+    fn build_subdir_in_project(&self) -> String {
+        match (self.context_subdir.trim_end_matches('/'), self.build_subdir.as_str()) {
+            (_, ".") => self.context_subdir.clone(),
+            (".", sub) | ("", sub) => sub.to_string(),
+            (ctx, sub) => format!("{ctx}/{sub}"),
+        }
+    }
 }
 
 impl Default for BuiltServerManifest {
@@ -1090,6 +1099,7 @@ async fn run_inner(
             return Ok(());
         }
         seed_targets(&deps.store, project_id, build_id, &specs);
+        let live_tags: Vec<String> = specs.iter().map(target_tag).collect();
 
         // 6. Fan out one build VM per target, bounded by a semaphore. Collect
         //    every result; any failure fails the whole build (atomic).
@@ -1144,6 +1154,9 @@ async fn run_inner(
                 failures.join("; ")
             );
         }
+        // Every target built or was reused: reclaim the build cache of targets this project
+        // no longer declares (renamed or removed).
+        crate::build_cache::prune_orphan_targets(&deps.data_dir, project_id, &live_tags);
         Ok(())
     };
 
@@ -1257,14 +1270,29 @@ async fn build_one_target_inner(
                 spec.name
             )
         })?;
-    let tag = format!("{}-{}", kind_name(spec.kind), sanitize(&spec.name));
+    let tag = target_tag(spec);
     // The build INPUT: the context minus this target's exclusions (other sites' committed
     // content, jkbase.toml, its `exclude` globs), hard-linked. It is BOTH what the RO source
     // image is built from AND what the build key hashes — so an excluded change can neither
     // be missed by the key nor seen by the build (see `build_cache`).
     let input_dir = workspace.join(format!("{tag}.input"));
     {
-        let ex = crate::build_cache::Exclusions::new(&spec.exclude_paths, &spec.exclude_globs)?;
+        let ex = crate::build_cache::Exclusions::new(&spec.exclude)?;
+        // Advisory: a wide context usually carries files this target doesn't build from, and
+        // every one of them rebuilds it when it changes.
+        let hints = crate::build_cache::exclusion_hints(
+            config,
+            &spec.context_subdir,
+            &spec.build_subdir_in_project(),
+            &ex,
+        );
+        if !hints.is_empty() {
+            info!(
+                project = %project_id, target = %spec.name, paths = %hints.join(", "),
+                "build context carries paths this target may not build from; \
+                 `exclude` them to stop them triggering a rebuild"
+            );
+        }
         let (ctx, dst) = (context_path.clone(), input_dir.clone());
         let dropped = tokio::task::spawn_blocking(move || {
             crate::build_cache::materialize_input(&ctx, &ex, &dst)
@@ -1350,6 +1378,15 @@ async fn build_one_target_inner(
     {
         match reuse_artifact(&entry, &entry_dir, staged, workspace, &tag, config, spec) {
             Ok(()) => {
+                // Bill the host work a reuse still costs (unpack + materialize + hash + verify),
+                // at least a second: a deploy loop that hits the cache every time must still
+                // converge on the build-minute gate rather than being free.
+                let secs = reuse_start.elapsed().as_secs().max(1);
+                let hour = (now() / 3600) * 3600;
+                if let Err(e) = deps.store.add_build_usage(project_id, hour, secs) {
+                    warn!(project = %project_id, target = %spec.name, error = %e,
+                          "failed to record reuse usage");
+                }
                 info!(project = %project_id, target = %spec.name, key, "reused build (inputs unchanged)");
                 let note = format!(
                     "{}: inputs unchanged since an earlier build (key {}…); reused its artifact, no build VM\n",
@@ -1796,8 +1833,7 @@ async fn compute_build_key(
             Builder::Dockerfile => "dockerfile",
         },
         dockerfile: spec.dockerfile.as_deref(),
-        exclude_paths: &spec.exclude_paths,
-        exclude_globs: &spec.exclude_globs,
+        exclude: &spec.exclude,
         toolchain: (toolchain_file, toolchain_digest),
         agent: agent_digest.as_deref(),
         tree: &tree,
@@ -2188,19 +2224,26 @@ fn read_cache_meta(output_img: &Path, workspace: &Path, tag: &str) -> jkbuild_ty
 /// multi-second hash must not stall a tokio worker). `None` if the image is gone or
 /// the hash fails — provenance must never fail a build that otherwise succeeded.
 async fn toolchain_builder_digest(toolchain: &Path) -> Option<String> {
-    // (size, mtime) → digest, so a re-baked toolchain image (new size/mtime) re-hashes.
-    type DigestCache = std::sync::Mutex<HashMap<PathBuf, (u64, std::time::SystemTime, String)>>;
+    // (inode, ctime, size, mtime) → digest, so any re-baked or swapped-in image re-hashes.
+    // The digest is correctness-bearing (it keys build reuse), and a rebake that preserved
+    // size+mtime alone — a restored backup, `cp -a`, `touch -r` — would otherwise be missed;
+    // the inode and ctime move whichever way the file was replaced.
+    type Identity = (u64, i64, u64, std::time::SystemTime);
+    type DigestCache = std::sync::Mutex<HashMap<PathBuf, (Identity, String)>>;
     static CACHE: std::sync::LazyLock<DigestCache> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
     let meta = std::fs::metadata(toolchain).ok()?;
-    let size = meta.len();
-    let mtime = meta.modified().ok()?;
+    let identity: Identity = (
+        std::os::unix::fs::MetadataExt::ino(&meta),
+        std::os::unix::fs::MetadataExt::ctime(&meta),
+        meta.len(),
+        meta.modified().ok()?,
+    );
     {
         let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((s, m, d)) = cache.get(toolchain)
-            && *s == size
-            && *m == mtime
+        if let Some((id, d)) = cache.get(toolchain)
+            && *id == identity
         {
             return Some(d.clone());
         }
@@ -2214,7 +2257,7 @@ async fn toolchain_builder_digest(toolchain: &Path) -> Option<String> {
     CACHE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(toolchain.to_path_buf(), (size, mtime, digest.clone()));
+        .insert(toolchain.to_path_buf(), (identity, digest.clone()));
     Some(digest)
 }
 
@@ -2527,8 +2570,7 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language: f.language.clone(),
             builder: Builder::Auto, // functions take the wasm path, never a Dockerfile
             dockerfile: None,
-            exclude_paths: crate::build_cache::auto_excludes(config, &f.source, &f.source),
-            exclude_globs: f.exclude.clone(),
+            exclude: f.exclude.clone(),
         });
     }
     for (name, s) in &config.servers {
@@ -2547,8 +2589,7 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language: s.language.clone(),
             builder,
             dockerfile,
-            exclude_paths: crate::build_cache::auto_excludes(config, s.context_dir(), s.source_dir()),
-            exclude_globs: s.exclude.clone(),
+            exclude: s.exclude.clone(),
         });
     }
     // Built sites ([sites.<name>] with `build = "..."`): one static build target each,
@@ -2572,12 +2613,7 @@ fn enumerate_targets(config: &ProjectConfig) -> Vec<TargetSpec> {
             language,
             builder: Builder::Auto, // built sites take the buildpack path, never a Dockerfile
             dockerfile: None,
-            exclude_paths: crate::build_cache::auto_excludes(
-                config,
-                site.context_dir(),
-                site.build_source(),
-            ),
-            exclude_globs: site.exclude.clone(),
+            exclude: site.exclude.clone(),
         });
     }
     // Deterministic order regardless of HashMap iteration.
@@ -2837,6 +2873,17 @@ fn kind_name(kind: TargetKind) -> &'static str {
 }
 
 /// Sanitize a name into `[a-z0-9-]` for use in VM ids and file tags.
+/// The per-target namespace for this build's scratch files and its build-cache entries.
+/// `sanitize` maps `_` and `-` alike, so two legal target names (`api_v1`, `api-v1`) would
+/// otherwise share a tag — and with a concurrent fan-out, each other's input/output files.
+/// A short digest of the real name makes it injective.
+fn target_tag(spec: &TargetSpec) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(spec.name.as_bytes());
+    let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}", kind_name(spec.kind), sanitize(&spec.name), short)
+}
+
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -9363,7 +9410,7 @@ console.log("listening on " + port);
     /// E2E for per-target build reuse (`build_cache`) on the monorepo shape it exists for: a
     /// `context = "."` server beside a committed static site. Five real builds over one data dir:
     ///   1. first build → the server builds in a VM (a miss) and is recorded;
-    ///   2. edit ONLY the site + jkbase.toml (both auto-excluded from the server's input) → the
+    ///   2. edit ONLY the site + jkbase.toml (both `exclude`d from the server's input) → the
     ///      server is REUSED (no VM), with the identical app layer — and the reused deployment
     ///      boots and serves;
     ///   3. edit the server's source → a miss, a new layer;
@@ -9384,7 +9431,7 @@ console.log("listening on " + port);
         let _ = std::fs::remove_file(data.join("onbox-reuse.redb"));
         let manifest = |comment: &str| {
             format!(
-                "# {comment}\n[project]\nname = \"reusefix\"\n\n[sites.site]\npublic = \"site\"\nprefix = \"/site\"\n\n[servers.api]\nsource = \"server\"\ncontext = \".\"\nlanguage = \"bun\"\nport = 3000\ncommand = [\"/opt/bun/bin/bun\", \"run\", \"/app/server/server.ts\"]\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
+                "# {comment}\n[project]\nname = \"reusefix\"\n\n[sites.site]\npublic = \"site\"\nprefix = \"/site\"\n\n[servers.api]\nsource = \"server\"\ncontext = \".\"\nexclude = [\"site\", \"jkbase.toml\"]\nlanguage = \"bun\"\nport = 3000\ncommand = [\"/opt/bun/bin/bun\", \"run\", \"/app/server/server.ts\"]\n\n[routes.\"/\"]\nservice = \"server\"\nname = \"api\"\n"
             )
         };
         let server = |body: &str| {

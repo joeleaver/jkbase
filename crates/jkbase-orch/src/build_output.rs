@@ -45,17 +45,28 @@ pub fn dump_file(image: &Path, guest_path: &str, dest: &Path) -> Result<bool> {
     if guest_path.contains(char::is_whitespace) || dest_str.contains(char::is_whitespace) {
         bail!("debugfs dump paths must be whitespace-free: {guest_path:?} -> {dest_str:?}");
     }
-    if dest.exists() {
-        std::fs::remove_file(dest)
-            .with_context(|| format!("clear stale dump dest {}", dest.display()))?;
-    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Dump to a sibling temp path and rename into place: `debugfs` creates its destination
+    // with O_CREAT|O_TRUNC, so dumping straight onto `dest` would write THROUGH an existing
+    // hard link (a build-cache entry, or a live deployment's app layer sharing that inode).
+    let tmp = dest.with_file_name(format!(
+        ".dump-{}-{}.tmp",
+        std::process::id(),
+        dest.file_name().and_then(|s| s.to_str()).unwrap_or("out")
+    ));
+    let tmp_str = tmp
+        .to_str()
+        .with_context(|| format!("non-UTF-8 temp path {}", tmp.display()))?;
+    if tmp_str.contains(char::is_whitespace) {
+        bail!("debugfs dump paths must be whitespace-free: {tmp_str:?}");
+    }
+    let _ = std::fs::remove_file(&tmp);
 
     let out = std::process::Command::new("debugfs")
         .arg("-R")
-        .arg(format!("dump {guest_path} {dest_str}"))
+        .arg(format!("dump {guest_path} {tmp_str}"))
         .arg(image)
         .output()
         .with_context(|| {
@@ -70,7 +81,10 @@ pub fn dump_file(image: &Path, guest_path: &str, dest: &Path) -> Result<bool> {
     // ext2_lookup`; anything else (bad superblock, short read, …) means debugfs could
     // not open/parse the image — surface that as an error so fail-safe callers don't
     // treat a corrupt image as "file absent".
-    if dest.exists() {
+    if tmp.exists() {
+        let _ = std::fs::remove_file(dest);
+        std::fs::rename(&tmp, dest)
+            .with_context(|| format!("move dumped {guest_path} into {}", dest.display()))?;
         return Ok(true);
     }
     let stderr = String::from_utf8_lossy(&out.stderr);

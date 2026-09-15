@@ -218,23 +218,27 @@ build-affecting settings, and the toolchain image. Deploy again and a target who
   [static] app — succeeded
 ```
 
-Two things are always left out of a target's build input, so editing them never rebuilds anything:
-your **`jkbase.toml`** and other sites' **committed `public` directories** (a marketing site beside
-a Rust workspace on `context = "."`). Drop anything else with **`exclude`** — globs relative to the
-context, Docker-context style (`*` stays inside one path segment, `**` crosses them):
+On a wide `context` that means unrelated edits still rebuild — your marketing site, your docs,
+your `jkbase.toml` — because they're inside the mounted tree. Name them with **`exclude`**: globs
+relative to the context, Docker-context style (`*` stays inside one path segment, `**` crosses
+them). A deploy tells you which paths are worth excluding.
 
 ```toml
 [servers.api]
 source  = "crates/api"
 context = "."
-exclude = ["docs", "*.md", "**/fixtures"]   # not mounted, not part of the key
+exclude = ["site", "docs", "*.md", "jkbase.toml"]   # not mounted, not part of the key
 port    = 8080
 ```
 
-Excluded paths are removed from the build mount *and* the key together, so a reuse can never be
-stale: if a build actually needs a file, excluding it fails the build rather than silently serving
-an old artifact. `jkbase deploy --rebuild` builds every target from scratch (useful for an
-unpinned dependency or a Dockerfile `FROM` you want re-resolved).
+Excluded paths leave the build mount *and* the key together, so a reuse can never be stale — but
+they really are gone from the build, so exclude only what this target doesn't use. (Careful with a
+server that serves files from its own tree: on the Bun/Node buildpacks the app layer is the whole
+context, so excluding a directory your server reads at runtime makes it 404 in production.)
+
+Nothing is excluded for you. `jkbase deploy --rebuild` builds every target from scratch, and a
+cached artifact is never reused for longer than a week — so an unpinned dependency or a Dockerfile
+`FROM` still gets re-resolved regularly.
 
 ---
 
