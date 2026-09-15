@@ -207,6 +207,35 @@ Rules: `context` defaults to `source`, so **omitting it changes nothing**. `sour
 `context` no wider than the path-deps require — a wide context mounts more of your repo into the
 build (bigger build, weaker reproducibility), so prefer `apps/` over `.` when that's enough.
 
+### Only what changed gets rebuilt
+
+Each target is keyed by exactly what goes into it: the tree mounted in its build VM, its
+build-affecting settings, and the toolchain image. Deploy again and a target whose key is unchanged
+**reuses the artifact its last build produced** — no build VM, no build-minutes. The CLI marks it:
+
+```
+  [server] api — succeeded (reused — inputs unchanged)
+  [static] app — succeeded
+```
+
+Two things are always left out of a target's build input, so editing them never rebuilds anything:
+your **`jkbase.toml`** and other sites' **committed `public` directories** (a marketing site beside
+a Rust workspace on `context = "."`). Drop anything else with **`exclude`** — globs relative to the
+context, Docker-context style (`*` stays inside one path segment, `**` crosses them):
+
+```toml
+[servers.api]
+source  = "crates/api"
+context = "."
+exclude = ["docs", "*.md", "**/fixtures"]   # not mounted, not part of the key
+port    = 8080
+```
+
+Excluded paths are removed from the build mount *and* the key together, so a reuse can never be
+stale: if a build actually needs a file, excluding it fails the build rather than silently serving
+an old artifact. `jkbase deploy --rebuild` builds every target from scratch (useful for an
+unpinned dependency or a Dockerfile `FROM` you want re-resolved).
+
 ---
 
 ## Functions (WASI components)
