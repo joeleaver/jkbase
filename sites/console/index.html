@@ -1760,6 +1760,7 @@ body {
 .db-kind-badge.idx { background: var(--accent-dim); color: var(--accent); }
 .db-kind-badge.uniq { background: var(--success-dim); color: var(--success); }
 .db-kind-badge.rel { background: var(--accent-dim); color: var(--accent); }
+.db-kind-badge.ft { background: var(--success-dim); color: var(--success); }
 
 .db-rel-list { display: flex; flex-direction: column; gap: 8px; }
 .db-rel {
@@ -4900,10 +4901,11 @@ body {
       h("div", { className: "card" },
         h("div", { className: "card-static" },
           h("div", { className: "section-desc", style: "margin-bottom: 8px" },
-            "Run a RhypeDB query — reads, relationship traversals, vector search, and writes. Examples: ",
+            "Run a RhypeDB query — reads, relationship traversals, full-text and vector search, and writes. Examples: ",
             h("code", { className: "db-inline" }, "User.filter(.age >= 18).limit(20)"), " · ",
             h("code", { className: "db-inline" }, 'User.create({ name: "Ada" })'), " · ",
-            h("code", { className: "db-inline" }, "User.get(1).posts")
+            h("code", { className: "db-inline" }, "User.get(1).posts"), " · ",
+            h("code", { className: "db-inline" }, 'Post.matches(.body, "invoice", k: 20)')
           ),
           h("textarea", {
             className: "db-query-editor",
@@ -4936,7 +4938,9 @@ body {
     );
   }
 
-  // Render an engine query result ({objects}|{object}|{ok}) as a table.
+  // Render an engine query result ({objects}|{object}|{ok}) as a table. A ranked result
+  // (`.matches` / `.similar`) arrives in rank order with a per-row `score` (+ `rerank_score`
+  // when the cross-encoder scored it) beside `fields` — shown as leading columns.
   function renderDbResultTable(result) {
     if (result && result.ok !== undefined && result.objects === undefined && result.object === undefined) {
       return h("div", { className: "section-desc" }, "OK — the write succeeded.");
@@ -4946,11 +4950,17 @@ body {
     var fieldSet = {};
     rows.forEach(function(r) { if (r.fields) Object.keys(r.fields).forEach(function(k) { fieldSet[k] = 1; }); });
     var cols = Object.keys(fieldSet);
-    var header = h("tr", null, [h("th", null, "id")].concat(cols.map(function(c) { return h("th", null, c); })));
+    var rankCols = ["score", "rerank_score"].filter(function(k) {
+      return rows.some(function(r) { return typeof r[k] === "number"; });
+    });
+    var scoreText = function(v) { return typeof v === "number" ? v.toFixed(4) : ""; };
+    var header = h("tr", null, [h("th", null, "id")]
+      .concat(rankCols.map(function(k) { return h("th", null, k); }))
+      .concat(cols.map(function(c) { return h("th", null, c); })));
     var trs = rows.map(function(r) {
-      return h("tr", null, [h("td", { className: "db-id" }, dbCellText(r.id))].concat(
-        cols.map(function(c) { return h("td", null, dbCellText(r.fields ? r.fields[c] : undefined)); })
-      ));
+      return h("tr", null, [h("td", { className: "db-id" }, dbCellText(r.id))]
+        .concat(rankCols.map(function(k) { return h("td", { className: "db-id" }, scoreText(r[k])); }))
+        .concat(cols.map(function(c) { return h("td", null, dbCellText(r.fields ? r.fields[c] : undefined)); })));
     });
     return h("div", null,
       h("div", { className: "section-desc", style: "margin-bottom: 6px" },
@@ -5020,6 +5030,10 @@ body {
       var badges = [];
       if (f.unique) badges.push(h("span", { className: "db-kind-badge uniq" }, "unique"));
       if (f.indexed) badges.push(h("span", { className: "db-kind-badge idx" }, "indexed"));
+      if (f.fulltext) badges.push(h("span", {
+        className: "db-kind-badge ft",
+        title: "@fulltext — analyzer: " + (f.fulltext.analyzer || "simple") + (f.fulltext.positions === false ? ", no positions (no phrase queries)" : ""),
+      }, "full-text"));
       return h("div", { className: "db-field-row" },
         h("span", { className: "db-field-name" }, f.name),
         meta,
