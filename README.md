@@ -671,6 +671,7 @@ spa     = true
 [servers.api]
 source       = "crates/api"      # build subdir (default ".")
 context      = "."               # monorepo: mount a wider tree; source must be INSIDE context
+# exclude    = ["docs", "*.md"]  # globs left OUT of the build input (and so out of its build key)
 # language   = "rust"            # optional hint (bun|node|rust|python|go); auto-detected
 port         = 8080              # REQUIRED — authoritative for routing (no default)
 # command    = ["/opt/bun/bin/bun", "run", "start"]   # optional argv override; argv[0] absolute
