@@ -75,6 +75,14 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
         }
     }
 
+    // Build-reuse cache (`buildcache/{id}/targets/…`): a cached artifact is usually a hard
+    // link to the same file in a deployment (billed above). Only a file no deployment still
+    // shares (link count 1 — an artifact whose version was pruned) is extra storage, so bill
+    // exactly those, by actual blocks.
+    total = total.saturating_add(unshared_file_bytes(
+        &data_dir.join("buildcache").join(project_id).join("targets"),
+    ));
+
     // Tenant object store: per-project root `objectstore/{id}` holding S3 buckets
     // (object bytes + .meta sidecars + in-flight multipart staging). Counted here so
     // it bills against the SAME storage cap and shows in the SAME metering rollup as
@@ -85,6 +93,26 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
     // deployed). Excludes other retained versions; never follows symlinks.
     total = total.saturating_add(dir_bytes(deployment_dir));
 
+    total
+}
+
+/// Recursively sum the allocated blocks of regular files under `dir` that have no other hard
+/// link, never following symlinks. Missing dir -> 0.
+pub fn unshared_file_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(md) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if md.is_dir() {
+            total = total.saturating_add(unshared_file_bytes(&entry.path()));
+        } else if md.is_file() && md.nlink() == 1 {
+            total = total.saturating_add(md.blocks().saturating_mul(512));
+        }
+    }
     total
 }
 
@@ -148,6 +176,25 @@ mod tests {
         // Deploy-time check bills a specific version dir (content + that dir).
         assert_eq!(project_storage_bytes_for(&dd, pid, &dep.join("v1")), 1100);
         assert_eq!(project_storage_bytes_for(&dd, pid, &dep.join("v2")), 150);
+        let _ = fs::remove_dir_all(&dd);
+    }
+
+    #[test]
+    fn bills_build_cache_files_no_deployment_still_shares() {
+        let dd = tmp("buildcache");
+        let pid = "proj";
+        let dep = dd.join("hosting").join(pid).join("deployments").join("v1");
+        write(&dep.join("_layers").join("blob"), &[7u8; 8192]);
+        std::os::unix::fs::symlink(&dep, dd.join("hosting").join(pid).join("live")).unwrap();
+        let entries = dd.join("buildcache").join(pid).join("targets").join("server-api");
+        // Shared with the live deployment (a hard link): billed once, via the deployment.
+        fs::create_dir_all(entries.join("k1")).unwrap();
+        fs::hard_link(dep.join("_layers").join("blob"), entries.join("k1").join("app.erofs")).unwrap();
+        let with_shared = project_storage_bytes(&dd, pid);
+        assert_eq!(with_shared, 8192, "a shared cache file is not billed twice");
+        // An entry whose deployment is gone: its own blocks are billed.
+        write(&entries.join("k0").join("app.erofs"), &[1u8; 8192]);
+        assert_eq!(project_storage_bytes(&dd, pid), with_shared + 8192);
         let _ = fs::remove_dir_all(&dd);
     }
 
