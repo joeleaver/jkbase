@@ -38,6 +38,7 @@ async fn main() -> anyhow::Result<()> {
         output_drive: data.join("output.ext4"),
         output_size_bytes: 16 * 1024 * 1024,
         cache_drive: None,
+        persist_cache_from_seal: false,
         vcpu_count: env_or("VCPUS", 1),
         mem_size_mib: env_or("MEM_MIB", 256),
         vsock_cid: None,

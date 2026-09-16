@@ -64,23 +64,32 @@ run_phase() {
     return 127
 }
 
-# Block until the host has sealed the network (deleted the TAP), or a timeout, by
-# probing the proxy endpoint until it is unreachable. The host owns the TAP, so
-# this is observation only — we cannot bring the network back.
+# Block until the host has sealed the network (deleted the TAP): the proxy must be
+# unreachable on 3 CONSECUTIVE probes. Fails closed — never "compiling anyway": the
+# compile phase runs dependency code that must not have the network (design §9 P2-7).
+# Returns 1 if the seal isn't confirmed within 300s (the host is gone, e.g. restarted
+# mid-build): the build then fails without compiling and the VM powers off. The host
+# owns the TAP; we cannot bring the network back.
 wait_for_seal() {
     seal_host=$(echo "$PROXY" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||')
     seal_port=$(echo "$PROXY" | sed 's|^[a-z]*://[^:/]*:||; s|/.*||')
     [ -z "$seal_port" ] && seal_port=80
-    i=0
-    while [ "$i" -lt 30 ]; do
-        if ! nc -w 1 "$seal_host" "$seal_port" </dev/null >/dev/null 2>&1; then
-            echo "[seal] network sealed (proxy $seal_host:$seal_port unreachable); compiling offline"
-            return 0
+    down=0
+    waited=0
+    while [ "$down" -lt 3 ]; do
+        if [ "$waited" -ge 300 ]; then
+            echo "[seal] ERROR: network not sealed within 300s; refusing to compile"
+            return 1
+        fi
+        if nc -w 1 "$seal_host" "$seal_port" </dev/null >/dev/null 2>&1; then
+            down=0
+        else
+            down=$((down + 1))
         fi
         sleep 1
-        i=$((i + 1))
+        waited=$((waited + 2))
     done
-    echo "[seal] WARN: proxy still reachable after wait; compiling anyway"
+    echo "[seal] network sealed (proxy $seal_host:$seal_port unreachable); compiling offline"
 }
 
 # Run the build under root prefix $1, one-shot (offline) or two-phase (networked).
@@ -90,11 +99,18 @@ do_build() {
         echo "[build-runner] networked build via proxy $PROXY (fetch-then-seal)"
         run_phase "$root" fetch "$PROXY"
         rc=$?
+        # Flush fetch's writes BEFORE announcing it: the host may copy the cache drive
+        # at the seal, and only does so after seeing CACHE-SYNCED (crates/jkbase-orch
+        # build_vm::CACHE_SYNCED_MARKER). Keep the two lines in this order.
+        # Only the real cache drive: a /cache that failed to mount must not report synced.
+        grep -q "^/dev/vde /cache " /proc/mounts && sync && echo "[seal] CACHE-SYNCED"
         echo "[seal] FETCH-COMPLETE"
+        # Wait for the seal even after a failed fetch, so the host still captures the
+        # cache instead of dropping it.
+        wait_for_seal || return 1
         if [ "$rc" -ne 0 ]; then
             return "$rc"
         fi
-        wait_for_seal
         run_phase "$root" compile ""
         return $?
     fi

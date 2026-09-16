@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         output_drive: output_img.clone(),
         output_size_bytes: 64 * 1024 * 1024,
         cache_drive: None,
+        persist_cache_from_seal: false,
         vcpu_count: 1,
         mem_size_mib: 512,
         vsock_cid: None,

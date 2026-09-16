@@ -16,7 +16,7 @@ use crate::buildpack::{BuildContext, BuildOutput, DetectContext};
 use crate::env::BuildEnv;
 use crate::{buildpacks, export, function_build};
 use anyhow::{Context, Result};
-use jkbuild_types::{CacheMeta, FETCH_COMPLETE_MARKER, Index};
+use jkbuild_types::{CACHE_SYNCED_MARKER, CacheMeta, FETCH_COMPLETE_MARKER, Index};
 use std::ffi::CString;
 use std::io::Write;
 use std::net::TcpStream;
@@ -252,11 +252,12 @@ fn run_buildpack_pipeline(
 
     // 3. fetch (network up) → seal → compile (offline). Mirrors build-runner.sh.
     if proxy.is_some() {
-        chosen.fetch(&mut ctx).context("fetch phase")?;
-        // Tell the host it may seal the network now.
-        println!("{FETCH_COMPLETE_MARKER}");
-        let _ = std::io::stdout().flush();
-        wait_for_seal(proxy.as_deref());
+        // Seal even when fetch failed: the host keeps the cache only as captured at the
+        // seal, and a failed fetch (a stale lockfile, a flaky download) ran no dependency
+        // code — without the seal the whole warm cache would be dropped.
+        let fetched = chosen.fetch(&mut ctx).context("fetch phase");
+        seal_network(proxy.as_deref())?;
+        fetched?;
         ctx.proxy = None; // network is gone; compile must be offline
     } else {
         // Offline build: no separate fetch window.
@@ -287,11 +288,10 @@ fn drive_function(proxy: Option<String>, lang: Option<&str>, subdir: &str) -> Re
     };
 
     if proxy.is_some() {
-        chosen.fetch(&mut ctx).context("function fetch phase")?;
-        // Tell the host it may seal the network now, then compile offline.
-        println!("{FETCH_COMPLETE_MARKER}");
-        let _ = std::io::stdout().flush();
-        wait_for_seal(proxy.as_deref());
+        // Seal even when fetch failed (see `run_buildpack_pipeline`), then compile offline.
+        let fetched = chosen.fetch(&mut ctx).context("function fetch phase");
+        seal_network(proxy.as_deref())?;
+        fetched?;
         ctx.proxy = None;
     } else {
         chosen
@@ -461,23 +461,81 @@ fn reboot() -> ! {
     }
 }
 
-/// Observe the host sealing the network (the proxy becoming unreachable) via TCP
-/// connect probes. The host owns the TAP; we cannot bring the network back.
-fn wait_for_seal(proxy: Option<&str>) {
-    let Some(proxy) = proxy else { return };
+/// Report fetch-complete and block until the host has sealed the network. `Err` — the
+/// build fails WITHOUT compiling — if the seal isn't confirmed within [`SEAL_WAIT_MAX`].
+fn seal_network(proxy: Option<&str>) -> Result<()> {
+    signal_fetch_complete();
+    wait_for_seal(proxy)
+}
+
+/// Flush fetch's writes to the cache drive, report it, then report fetch-complete. The
+/// host may copy the cache drive at the seal (with this VM paused) and keep only that
+/// copy, and the cache ext4 has no journal, so the copy must not catch it mid-writeback:
+/// flush first, and only then print the synced marker the host requires before it
+/// copies. The order of the lines matters. No synced marker (a failed flush, no cache
+/// drive) → nothing persists.
+fn signal_fetch_complete() {
+    if sync_cache_drive() {
+        println!("{CACHE_SYNCED_MARKER}");
+    }
+    println!("{FETCH_COMPLETE_MARKER}");
+    let _ = std::io::stdout().flush();
+}
+
+/// `syncfs(2)` the cache drive — the host's copy needs nothing else flushed. `false`
+/// unless `/cache` really is that drive: if it failed to mount (a corrupt image), the
+/// tmpfs fallback would "sync" fine and the host would re-capture the broken image on
+/// every build instead of dropping it.
+fn sync_cache_drive() -> bool {
+    use std::os::fd::AsRawFd;
+    let mounted = std::fs::read_to_string("/proc/self/mounts")
+        .is_ok_and(|m| m.lines().any(|l| l.starts_with("/dev/vde /cache ext4 ")));
+    if !mounted {
+        return false;
+    }
+    let Ok(dir) = std::fs::File::open(CACHE) else {
+        return false;
+    };
+    unsafe { libc::syncfs(dir.as_raw_fd()) == 0 }
+}
+
+/// Consecutive unreachable probes that confirm the seal. One is not enough: a single
+/// dropped connect to a live proxy would start COMPILE online.
+const SEAL_CONFIRM_PROBES: u32 = 3;
+
+/// Longest the guest waits for the seal. A healthy host seals within seconds of
+/// fetch-complete (plus a bounded cache copy while this VM is paused); past this the
+/// host is gone — e.g. restarted mid-build, orphaning this VM — so fail the build and
+/// power off rather than wait forever or compile with the network possibly up.
+const SEAL_WAIT_MAX: Duration = Duration::from_secs(300);
+
+/// Block until the host has sealed the network (the proxy unreachable on
+/// [`SEAL_CONFIRM_PROBES`] consecutive TCP probes). Fails CLOSED: COMPILE runs dependency
+/// code that must never have the network (design §9 P2-7), so a seal that isn't
+/// confirmed within [`SEAL_WAIT_MAX`] is an error, never "compile anyway". The host owns
+/// the TAP; we cannot bring it back.
+fn wait_for_seal(proxy: Option<&str>) -> Result<()> {
+    let Some(proxy) = proxy else { return Ok(()) };
     let (host, port) = split_proxy(proxy);
     let authority = format!("{host}:{port}");
-    for _ in 0..30 {
+    let started = std::time::Instant::now();
+    let mut unreachable = 0;
+    while unreachable < SEAL_CONFIRM_PROBES {
+        if started.elapsed() > SEAL_WAIT_MAX {
+            anyhow::bail!(
+                "the build network was not sealed within {}s; refusing to compile",
+                SEAL_WAIT_MAX.as_secs()
+            );
+        }
         let reachable = std::net::ToSocketAddrs::to_socket_addrs(&authority)
             .ok()
             .and_then(|mut addrs| addrs.next())
-            .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(1)).is_ok())
+            .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
             .unwrap_or(false);
-        if !reachable {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(1));
+        unreachable = if reachable { 0 } else { unreachable + 1 };
+        std::thread::sleep(Duration::from_millis(200));
     }
+    Ok(())
 }
 
 fn split_proxy(proxy: &str) -> (String, String) {

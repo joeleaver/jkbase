@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
@@ -53,6 +53,32 @@ const DOCKERFILE_MIN_SCRATCH_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 const DOCKERFILE_MIN_OUTPUT_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
 /// Per-target log slice pulled from the output drive into the record.
 const TARGET_LOG_CAP: usize = 16 * 1024;
+
+/// Toolchain images (by file stem) whose builds keep their persistent cache only as
+/// captured AT THE SEAL (`BuildVmConfig::persist_cache_from_seal`, design §9 P2-7):
+/// every image that carries cargo. Their FETCH (`cargo fetch`) runs no dependency
+/// code and unpacks every crate, so the post-seal writes dropped are only cargo
+/// bookkeeping — and dropping them is what stops a dependency's offline `build.rs`
+/// from planting a `$CARGO_HOME` config or git-db hook that runs in the next build's
+/// network-up fetch. Keyed on the IMAGE, not the tenant's `language` string: a
+/// function always boots `jkbuild-function` whatever it declares. NOT `go` (GOCACHE is
+/// written in compile, so its warm cache would be lost); node/bun/python fetches
+/// already run dependency code online, so this buys them nothing yet.
+const SEAL_CAPTURED_TOOLCHAINS: &[&str] = &["rust", "trunk", "jkbuild-function"];
+
+/// Cache keys whose pre-seal-capture image (`{key}.img`) is retired. Those images were
+/// persisted LIVE, so any of them may already carry a compile-time plant that would run
+/// in the next fetch and then be captured forever; seal-captured builds start a fresh
+/// `{key}.sealcap.img` and delete the old one. Only keys no uncaptured toolchain builds
+/// with — a JS function's `node` key is shared with node servers, whose `node.img` stays.
+const RETIRED_LIVE_CACHE_KEYS: &[&str] = &["rust", "trunk"];
+
+fn is_seal_captured_toolchain(toolchain: &Path) -> bool {
+    toolchain
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| SEAL_CAPTURED_TOOLCHAINS.contains(&s))
+}
 
 /// Immutable per-server build configuration, built once at startup and shared by
 /// every build job. Paths hard-linked into the jail (kernel, toolchain images,
@@ -928,7 +954,9 @@ async fn ebtables_ok(args: &[&str]) -> bool {
 }
 
 /// The host seal action: delete the build VM's TAP so its COMPILE phase is
-/// offline. Host-enforced — the guest can't recreate a host TAP.
+/// offline, then VERIFY it is gone. Host-enforced — the guest can't recreate a host
+/// TAP. A TAP that survives fails the seal, and with it the build (the VM is killed),
+/// rather than letting COMPILE run online.
 fn make_seal(tap: String) -> SealFn {
     Box::new(move || {
         let tap = tap.clone();
@@ -937,6 +965,13 @@ fn make_seal(tap: String) -> SealFn {
                 .args(["link", "delete", &tap])
                 .status()
                 .await;
+            if Path::new("/sys/class/net").join(&tap).exists() {
+                // The TAP name stays in the host log; the build error the tenant sees
+                // doesn't name host interfaces.
+                error!(tap = %tap, "build TAP still exists after `ip link delete`");
+                bail!("the build network could not be sealed");
+            }
+            Ok(())
         })
     })
 }
@@ -1543,15 +1578,20 @@ async fn build_one_target_inner(
         .flatten()
         .map(sanitize)
         .filter(|l| !l.is_empty());
+    let seal_captured = is_seal_captured_toolchain(&toolchain);
     let mut _cache_guard = None;
     let cache_drive = if let Some(lang) = &cache_target {
         let lock = cache_lock(deps, &format!("{project_id}/{lang}")).await;
         _cache_guard = Some(lock.lock_owned().await);
-        let path = deps
-            .data_dir
-            .join("buildcache")
-            .join(project_id)
-            .join(format!("{lang}.img"));
+        let dir = deps.data_dir.join("buildcache").join(project_id);
+        let path = if seal_captured {
+            if RETIRED_LIVE_CACHE_KEYS.contains(&lang.as_str()) {
+                let _ = std::fs::remove_file(dir.join(format!("{lang}.img")));
+            }
+            dir.join(format!("{lang}.sealcap.img"))
+        } else {
+            dir.join(format!("{lang}.img"))
+        };
         // create-once under the lock (no concurrent creation).
         match jkbase_orch::build_image::build_empty_ext4(
             &path,
@@ -1582,6 +1622,7 @@ async fn build_one_target_inner(
         output_drive: output_img.clone(),
         output_size_bytes,
         cache_drive: cache_drive.clone(),
+        persist_cache_from_seal: seal_captured,
         vcpu_count: deps.vcpu_count,
         mem_size_mib: deps.mem_size_mib,
         vsock_cid: None,
@@ -3313,6 +3354,22 @@ mod tests {
     }
 
     #[test]
+    fn seal_capture_follows_the_cargo_toolchain_image_not_the_language() {
+        for stem in ["rust", "trunk", "jkbuild-function"] {
+            assert!(is_seal_captured_toolchain(Path::new(&format!("/tc/{stem}.ext4"))));
+        }
+        for stem in ["go", "node", "bun", "python", "dockerfile", "default"] {
+            assert!(!is_seal_captured_toolchain(Path::new(&format!("/tc/{stem}.ext4"))));
+        }
+        // A function boots jkbuild-function whatever `language` it declares, so an odd
+        // language string can't dodge the capture.
+        assert_eq!(
+            toolchain_candidates("function", Some("rust 1.95"))[0],
+            "jkbuild-function.ext4"
+        );
+    }
+
+    #[test]
     fn toolchain_candidates_prefer_language_then_jkbuild_then_default() {
         assert_eq!(
             toolchain_candidates("server", Some("bun")),
@@ -3913,6 +3970,7 @@ esac
             output_drive: output_img.clone(),
             output_size_bytes: 64 * 1024 * 1024,
             cache_drive: None,
+            persist_cache_from_seal: false,
             vcpu_count: 1,
             mem_size_mib: 512,
             vsock_cid: None,
@@ -3984,6 +4042,327 @@ esac
         );
         assert_eq!(sealed, "down", "compile phase must be sealed (offline)");
         println!("PASS: networked build — proxy allowlist + firewall + fetch-then-seal");
+    }
+
+    /// On-box: a crate's OFFLINE `build.rs` must not be able to plant code that runs in a
+    /// later build's network-up FETCH through the persistent cache (design §9 P2-7). The
+    /// fixture's build.rs writes `$CARGO_HOME/config.toml` naming a `rustc-wrapper` that
+    /// logs whether the egress proxy is in its env; `cargo fetch` runs that wrapper (it
+    /// asks rustc for target info). Two builds share one cache, in both modes:
+    /// - `persist_cache_from_seal = false` (the old behaviour): build 2's fetch runs the
+    ///   planted wrapper ONLINE — the hole, reproduced in a real VM, which is what makes
+    ///   the second half meaningful;
+    /// - `true`: the cache persists as captured at the seal, so build 2's fetch never sees
+    ///   the plant, while the crate build 1 fetched is still cached (warm) and unpacked.
+    ///
+    /// Plus the fail-closed path: a fetch force-sealed at the deadline, before the guest
+    /// reports a synced cache, persists NOTHING.
+    ///
+    /// Needs a rust.ext4 baked with the current jkbuild-init (it must print
+    /// `[seal] CACHE-SYNCED`) and the build net (`tools/dev net`).
+    #[tokio::test]
+    #[ignore = "needs KVM + root + internet + build bridge + a current rust.ext4"]
+    async fn rust_build_cannot_plant_fetch_code_through_the_cache() {
+        let Ok(data) = std::env::var("JKB_DATA").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let Ok(fc_release) = std::env::var("JKB_FC_RELEASE").map(PathBuf::from) else {
+            eprintln!("skip: set JKB_FC_RELEASE");
+            return;
+        };
+
+        let listener = tokio::net::TcpListener::bind("172.31.0.1:3128")
+            .await
+            .unwrap();
+        tokio::spawn(crate::egress::serve(
+            listener,
+            Arc::new(crate::egress::EgressConfig::with_default_allowlist()),
+        ));
+        let net = Arc::new(BuildNet::new(
+            "jkbuild0".into(),
+            "172.31.0.1".into(),
+            3128,
+            None,
+            100_000,
+            8,
+        ));
+
+        // Fixture: one real crates.io dep (proves the fetch survives the capture) and a
+        // build.rs that plants a rustc-wrapper into CARGO_HOME.
+        let src = data.join("sealcap-src");
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::write(
+            src.join("Cargo.toml"),
+            "[package]\nname = \"sealcap\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nitoa = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("src/main.rs"),
+            "fn main() { println!(\"{}\", itoa::Buffer::new().format(7)); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("build.rs"),
+            r##"use std::os::unix::fs::PermissionsExt;
+fn main() {
+    let home = std::env::var("CARGO_HOME").unwrap_or_else(|_| "/cache/cargo".into());
+    let wrapper = format!("{home}/wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\necho \"ran proxy=${HTTPS_PROXY:-none}\" >> /out/planted\nexec \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        format!("{home}/config.toml"),
+        format!("[build]\nrustc-wrapper = \"{wrapper}\"\n"),
+    )
+    .unwrap();
+}
+"##,
+        )
+        .unwrap();
+        let workspace = data.join("sealcap-ws");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source_img = workspace.join("source.img");
+        build_ro_ext4_from_dir(&src, &source_img, 16).unwrap();
+        std::fs::create_dir_all(data.join("bj")).unwrap();
+
+        // (build 2 planted log, persisted cache after build 1) per mode.
+        let mut results = Vec::new();
+        for persist in [false, true] {
+            let mode = if persist { "seal" } else { "live" };
+            let cache = workspace.join(mode).join("rust.img");
+            jkbase_orch::build_image::build_empty_ext4(&cache, 1 << 30, 100_000, 100_000)
+                .unwrap();
+            let mut planted = None;
+            let mut cache_after_first = None;
+            for n in 1..=2 {
+                let tag = format!("scap-{mode}-{n}");
+                let output = workspace.join(format!("{tag}.out.img"));
+                let status = sealcap_build(
+                    &data,
+                    &fc_release,
+                    &net,
+                    &source_img,
+                    &output,
+                    &cache,
+                    persist,
+                    Duration::from_secs(300),
+                    &tag,
+                )
+                .await;
+                assert_eq!(status, Some(0), "{tag}: build must succeed (see its build.log)");
+                if n == 1 {
+                    // Snapshot what build 1 persisted, before build 2 moves it into a jail.
+                    let copy = workspace.join(format!("{mode}-after-1.img"));
+                    std::fs::copy(&cache, &copy)
+                        .unwrap_or_else(|e| panic!("{tag}: cache must persist ({e})"));
+                    cache_after_first = Some(copy);
+                } else {
+                    planted = jkbase_orch::build_output::read_capped(&output, "/planted", 4096)
+                        .unwrap()
+                        .map(|b| String::from_utf8_lossy(&b).into_owned());
+                }
+            }
+            results.push((persist, planted, cache_after_first.unwrap()));
+        }
+
+        // Force-sealed before fetch can finish (no CACHE-SYNCED): nothing may persist.
+        let cache = workspace.join("deadline").join("rust.img");
+        jkbase_orch::build_image::build_empty_ext4(&cache, 1 << 30, 100_000, 100_000).unwrap();
+        let output = workspace.join("scap-deadline.out.img");
+        let status = sealcap_build(
+            &data,
+            &fc_release,
+            &net,
+            &source_img,
+            &output,
+            &cache,
+            true,
+            Duration::from_millis(1),
+            "scap-deadline",
+        )
+        .await;
+        println!("deadline: status={status:?} cache_persisted={}", cache.exists());
+        assert_ne!(status, Some(0), "a fetch sealed at once cannot succeed");
+        assert!(!cache.exists(), "no synced cache at the seal → nothing persists");
+
+        // A fetch that FAILS (unresolvable dependency) still seals, so its cache is kept:
+        // one bad target must not make the whole project's Rust cache cold.
+        let bad_src = data.join("sealcap-bad-src");
+        let _ = std::fs::remove_dir_all(&bad_src);
+        std::fs::create_dir_all(bad_src.join("src")).unwrap();
+        std::fs::write(
+            bad_src.join("Cargo.toml"),
+            "[package]\nname = \"sealcap-bad\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nitoa = \"=999.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(bad_src.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let bad_img = workspace.join("bad-source.img");
+        build_ro_ext4_from_dir(&bad_src, &bad_img, 16).unwrap();
+        let cache = workspace.join("fetchfail").join("rust.img");
+        jkbase_orch::build_image::build_empty_ext4(&cache, 1 << 30, 100_000, 100_000).unwrap();
+        let output = workspace.join("scap-fetchfail.out.img");
+        let status = sealcap_build(
+            &data,
+            &fc_release,
+            &net,
+            &bad_img,
+            &output,
+            &cache,
+            true,
+            Duration::from_secs(300),
+            "scap-fetchfail",
+        )
+        .await;
+        println!("fetch-fail: status={status:?} cache_persisted={}", cache.exists());
+        assert_ne!(status, Some(0), "an unresolvable dependency fails the build");
+        assert!(cache.exists(), "a failed fetch still seals, so its cache persists");
+
+        for (persist, planted, cache1) in &results {
+            let config = jkbase_orch::build_output::read_capped(cache1, "/cargo/config.toml", 4096)
+                .unwrap();
+            let crates = debugfs_ls(cache1, "/cargo/registry/cache")
+                .into_iter()
+                .filter(|d| d.starts_with("index.crates.io-"))
+                .flat_map(|d| debugfs_ls(cache1, &format!("/cargo/registry/cache/{d}")))
+                .collect::<Vec<_>>();
+            println!(
+                "persist_cache_from_seal={persist}: planted={planted:?} config_persisted={} crates={crates:?}",
+                config.is_some()
+            );
+            assert!(
+                crates.iter().any(|c| c.starts_with("itoa-")),
+                "the fetched crate must be in the persisted cache (warm) — got {crates:?}"
+            );
+            // Unpacked and flushed, not just downloaded: cargo's stamp AND real source
+            // bytes (an unflushed copy can keep the stamp over empty files).
+            let src_dir = debugfs_ls(cache1, "/cargo/registry/src")
+                .into_iter()
+                .find(|d| d.starts_with("index.crates.io-"))
+                .expect("registry/src index dir");
+            let itoa = debugfs_ls(cache1, &format!("/cargo/registry/src/{src_dir}"))
+                .into_iter()
+                .find(|d| d.starts_with("itoa-"))
+                .expect("unpacked itoa");
+            let base = format!("/cargo/registry/src/{src_dir}/{itoa}");
+            let read = |f: &str| {
+                jkbase_orch::build_output::read_capped(cache1, &format!("{base}/{f}"), 1 << 20)
+                    .unwrap()
+            };
+            assert!(read(".cargo-ok").is_some(), "cargo's unpacked stamp persisted");
+            assert!(
+                read("src/lib.rs").is_some_and(|b| b.len() > 1000),
+                "unpacked sources persisted non-empty"
+            );
+            if *persist {
+                assert!(config.is_none(), "the compile-time plant must not persist");
+                assert_eq!(planted, &None, "nothing planted may run in build 2");
+            } else {
+                assert!(config.is_some(), "legacy mode persists the plant (fixture sanity)");
+                let online = planted.as_deref().unwrap_or_default();
+                assert!(
+                    online.contains("proxy=http"),
+                    "legacy mode must reproduce the hole: the plant runs during the \
+                     network-up fetch — got {planted:?}"
+                );
+            }
+        }
+        println!("PASS: an offline build.rs cannot reach a later fetch through the cache");
+    }
+
+    /// One networked rust build VM for [`rust_build_cannot_plant_fetch_code_through_the_cache`].
+    /// Returns the guest's `/status`.
+    #[allow(clippy::too_many_arguments)]
+    async fn sealcap_build(
+        data: &Path,
+        fc_release: &Path,
+        net: &Arc<BuildNet>,
+        source_img: &Path,
+        output_img: &Path,
+        cache: &Path,
+        persist: bool,
+        fetch_deadline: Duration,
+        tag: &str,
+    ) -> Option<i32> {
+        use jkbase_orch::build_vm::{BuildOutcome, BuildVm, BuildVmConfig};
+        let _ = std::fs::remove_file(output_img);
+        let lease = net.acquire(false).await.expect("acquire build net");
+        let (scratch, out, cache_size) = (2u64 << 30, 256u64 << 20, 1u64 << 30);
+        let cfg = BuildVmConfig {
+            jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: data.join("vmlinux.bin"),
+            toolchain_rootfs: data.join("toolchains").join("rust.ext4"),
+            source_drive: source_img.to_path_buf(),
+            scratch_size_bytes: scratch,
+            output_drive: output_img.to_path_buf(),
+            output_size_bytes: out,
+            cache_drive: Some(cache.to_path_buf()),
+            persist_cache_from_seal: persist,
+            vcpu_count: 2,
+            mem_size_mib: 2048,
+            vsock_cid: None,
+            timeout: Duration::from_secs(600),
+            chroot_base: data.join("bj"),
+            cgroup_mount: PathBuf::from("/sys/fs/cgroup"),
+            uid: 100_000,
+            gid: 100_000,
+            parent_cgroup: "jkbase-build".into(),
+            cgroup_pids_max: 1024,
+            cgroup_mem_max_bytes: 2 << 30,
+            cgroup_cpu_max: "200000 100000".into(),
+            fsize_limit_bytes: Some(scratch.max(out).max(cache_size)),
+            console_log_max_bytes: 1024 * 1024,
+            seccomp_filter: None,
+            netns: None,
+            tap_device: Some(lease.tap.clone()),
+            guest_mac: Some(lease.mac.clone()),
+            guest_ip: Some(lease.guest_ip.clone()),
+            gateway_ip: Some(net.gateway.clone()),
+            egress_proxy: Some(net.proxy_url()),
+            lang_hint: Some("rust".into()),
+            export_layered: true,
+            build_function: false,
+            build_static: false,
+            builder_hint: None,
+            dockerfile: None,
+            build_subdir: None,
+            fetch_deadline,
+            seal: Some(make_seal(lease.tap.clone())),
+        };
+        let run = BuildVm::run(tag, &cfg, &data.join("run")).await;
+        net.release(lease).await;
+        let run = run.expect("build VM run");
+        let log = jkbase_orch::build_output::read_capped(output_img, "/build.log", 8192)
+            .ok()
+            .flatten()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        println!("--- {tag}: {:?} wall={:?}\n{log}", run.outcome, run.wall);
+        assert_eq!(run.outcome, BuildOutcome::Completed, "{tag}: VM must complete");
+        jkbase_orch::build_output::read_status(output_img).ok().flatten()
+    }
+
+    /// Entry names in `dir` of a TEST-owned ext4 image (debugfs, never mounted).
+    fn debugfs_ls(image: &Path, dir: &str) -> Vec<String> {
+        let out = std::process::Command::new("debugfs")
+            .arg("-R")
+            .arg(format!("ls -p {dir}"))
+            .arg(image)
+            .output()
+            .expect("run debugfs");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split('/').nth(5).map(str::to_string))
+            .filter(|n| !n.is_empty() && n != "." && n != "..")
+            .collect()
     }
 
     /// On-box: a real Bun server is built **through the orchestrator control
