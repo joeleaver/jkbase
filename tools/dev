@@ -452,7 +452,7 @@ cmd_toolchains() {
     if [ "$CHECK" != 1 ]; then rustup target add wasm32-wasip2 >/dev/null 2>&1 || true; fi
     local rust_ver; rust_ver="$(rustc --version 2>/dev/null || echo unknown)"
     bake_image jkbuild-function "$TOOLCHAIN_DIR/jkbuild-function.ext4" \
-        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.lock.json"):init:$init_sha:rust:$rust_ver")" \
+        "$(sha_str "cfg:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.yaml"):lk:$(sha_file "$REPO_ROOT/images/apko/build-function.apko.lock.json"):init:$init_sha:rust:$rust_ver:js:$(sha_file "$REPO_ROOT/images/js-tools/package-lock.json")")" \
         env INJECT_BUN=0 INJECT_RUST_WASIP2=1 INJECT_JS=1 CONFIG="$REPO_ROOT/images/apko/build-function.apko.yaml" OUT="$TOOLCHAIN_DIR/jkbuild-function.ext4" "$REPO_ROOT/tools/build-image.sh"
     # trunk.ext4 (apko + jkbuild-init + a pinned official Rust toolchain WITH the
     # wasm32-unknown-unknown std injected at /opt/rust + the trunk CLI). Built sites
