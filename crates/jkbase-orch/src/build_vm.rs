@@ -43,20 +43,22 @@ use tokio::sync::{Mutex, Notify};
 /// Host action that **seals** a build: tears down the network (deletes the TAP /
 /// drops the route) so the COMPILE phase runs offline. Called once, on the
 /// guest's fetch-complete console marker or at the fetch deadline — whichever is
-/// first. Host-enforced: the guest has no API to bring the network back.
-pub type SealFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+/// first. Host-enforced: the guest has no API to bring the network back. MUST return
+/// `Err` unless the network is verifiably gone — the build VM is then killed rather
+/// than left to compile online.
+pub type SealFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
 
 /// Console marker the in-guest build-runner prints once dependency fetching is
 /// done, signalling the host it may seal the network early (design §9).
 pub const FETCH_COMPLETE_MARKER: &[u8] = b"[seal] FETCH-COMPLETE";
 
 /// Console marker the in-guest build-runner prints just BEFORE
-/// [`FETCH_COMPLETE_MARKER`], once it has flushed the cache drive (`sync`). The
+/// [`FETCH_COMPLETE_MARKER`], once it has flushed the cache drive (`syncfs`). The
 /// seal-time cache capture ([`BuildVmConfig::persist_cache_from_seal`]) is only as
-/// consistent as the image on disk: unflushed, ext4 delayed allocation can leave
-/// extracted files empty behind a committed "unpacked" stamp, poisoning every later
-/// build. No marker (an old toolchain, a force-sealed fetch) → no capture. A guest
-/// that lies only corrupts its own project's cache.
+/// consistent as the image on disk, and the cache ext4 has NO journal: an unflushed
+/// copy can be torn, or hold extracted files empty behind a committed "unpacked"
+/// stamp, poisoning every later build. No marker (an old toolchain, a force-sealed
+/// fetch) → no capture. A guest that lies only corrupts its own project's cache.
 pub const CACHE_SYNCED_MARKER: &[u8] = b"[seal] CACHE-SYNCED";
 use tracing::{error, info, warn};
 
@@ -85,14 +87,15 @@ pub struct BuildVmConfig {
     /// build and moved back out afterwards (see `persist_cache_from_seal`).
     pub cache_drive: Option<PathBuf>,
     /// Persist the cache only as it stood AT THE SEAL (design §9 P2-7). The host
-    /// pauses the VM at the seal, copies the cache image (raw sparse bytes, never
-    /// parsed — P0-3), then seals and resumes; after the run that copy, never the
-    /// live image, becomes the persistent cache. So nothing written while the build
-    /// was offline — a dependency's `build.rs`, a proc-macro — can plant state (a
+    /// pauses the VM at the seal, seals, copies the cache image (raw sparse bytes,
+    /// never parsed — P0-3), and resumes; after the run that copy, never the live
+    /// image, becomes the persistent cache. So nothing written while the build was
+    /// offline — a dependency's `build.rs`, a proc-macro — can plant state (a
     /// `$CARGO_HOME` config, a git-db hook) that runs in a later build's network-up
-    /// FETCH. A run that never sealed keeps its live image only if it was online the
-    /// whole time. `false` → the live image always persists. Ignored without
-    /// `cache_drive`.
+    /// FETCH. Anything short of a completed capture persists NOTHING: a run that never
+    /// sealed (including every build on a host without a build network), a failed
+    /// pause/seal/copy, a guest that never reported `CACHE_SYNCED_MARKER`. `false` →
+    /// the live image always persists. Ignored without `cache_drive`.
     pub persist_cache_from_seal: bool,
 
     pub vcpu_count: u32,
@@ -595,7 +598,7 @@ impl BuildVm {
                         )
                         .await?;
                     } else {
-                        seal().await;
+                        seal().await.context("seal the build network")?;
                     }
                     info!(id, "build network sealed (compile runs offline)");
                 }
@@ -640,12 +643,13 @@ impl BuildVm {
         }
     }
 
-    /// Seal, capturing the cache first (see [`BuildVmConfig::persist_cache_from_seal`]):
-    /// pause → copy the cache image → seal → resume. The pause is what makes the
-    /// copy exact rather than best-effort: no guest write lands mid-copy, and the
-    /// guest can't observe the seal (so can't start COMPILE) until it resumes. The
-    /// network is sealed on EVERY path — a failed or skipped capture only means
-    /// nothing persists ([`SealCapture::Started`] → dropped at teardown).
+    /// Seal, capturing the cache (see [`BuildVmConfig::persist_cache_from_seal`]):
+    /// pause → seal → copy the cache image → resume. The pause makes the copy exact:
+    /// no guest write lands mid-copy, and the guest can't observe the seal (so can't
+    /// start COMPILE) until it resumes. Sealing before copying keeps the network drop
+    /// independent of a multi-GiB copy. The guest's own seal wait fails closed, so it
+    /// can't have started COMPILE before the pause either. A failed seal fails the build
+    /// (the VM is killed); a skipped or failed capture only means nothing persists.
     async fn seal_capturing_cache(
         id: &str,
         config: &BuildVmConfig,
@@ -656,14 +660,25 @@ impl BuildVm {
         capture: &std::sync::Mutex<SealCapture>,
     ) -> Result<()> {
         set_capture(capture, SealCapture::Started);
-        let paused = match client.pause_vm().await {
-            Ok(()) => true,
-            Err(e) => {
+        let paused = match tokio::time::timeout(SEAL_PAUSE_TIMEOUT, client.pause_vm()).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
                 warn!(id, error = %e, "could not pause build VM at the seal; its cache will not persist");
                 false
             }
+            Err(_) => {
+                warn!(
+                    id,
+                    "pausing build VM at the seal timed out; its cache will not persist"
+                );
+                false
+            }
         };
-        if paused && let Some(cache) = &config.cache_drive {
+        let sealed = seal().await;
+        if paused
+            && sealed.is_ok()
+            && let Some(cache) = &config.cache_drive
+        {
             if !synced.load(Ordering::SeqCst) {
                 // An old toolchain, or a fetch force-sealed at the deadline: the image
                 // may hold unflushed (torn) state, so persisting it could break every
@@ -673,21 +688,32 @@ impl BuildVm {
                     "guest never reported a synced cache before the seal; it will not persist"
                 );
             } else {
-                let sealed = sealed_cache_path(cache);
-                match copy_image_sparse(&layout.drives_dir.join("cache.img"), &sealed).await {
-                    Ok(()) => set_capture(capture, SealCapture::Captured),
-                    Err(e) => {
-                        warn!(id, error = %e, "could not capture the build cache at the seal; it will not persist")
+                let (from, to) = (layout.drives_dir.join("cache.img"), capture_path(cache));
+                let copy = copy_image_sparse(&from, &to);
+                match tokio::time::timeout(CACHE_CAPTURE_TIMEOUT, copy).await {
+                    Ok(Ok(())) => set_capture(capture, SealCapture::Captured(to)),
+                    Ok(Err(e)) => {
+                        warn!(id, error = %e, "could not capture the build cache at the seal; it will not persist");
+                        let _ = std::fs::remove_file(&to);
+                    }
+                    Err(_) => {
+                        // The timed-out `cp` was killed on drop.
+                        warn!(
+                            id,
+                            timeout_secs = CACHE_CAPTURE_TIMEOUT.as_secs(),
+                            "capturing the build cache at the seal timed out; it will not persist"
+                        );
+                        let _ = std::fs::remove_file(&to);
                     }
                 }
             }
         }
-        seal().await;
+        // Resume even when the pause call reported failure: it may have landed anyway,
+        // and a VM left paused would sit out the whole wall-clock timeout.
+        let resumed = client.resume_vm().await;
+        sealed.context("seal the build network")?;
         if paused {
-            client
-                .resume_vm()
-                .await
-                .context("resume build VM after sealing")?;
+            resumed.context("resume build VM after sealing")?;
         }
         Ok(())
     }
@@ -716,30 +742,27 @@ impl BuildVm {
         }
         if let Some(cache) = &config.cache_drive {
             let in_jail_cache = layout.drives_dir.join("cache.img");
-            let sealed = sealed_cache_path(cache);
-            let keep = match cache_disposition(
-                config.persist_cache_from_seal,
-                config.tap_device.is_some(),
-                capture,
-            ) {
-                CacheDisposition::KeepLive => Some(&in_jail_cache),
-                CacheDisposition::KeepSealed => Some(&sealed),
+            let keep = match cache_disposition(config.persist_cache_from_seal, &capture) {
+                CacheDisposition::KeepLive => Some(in_jail_cache),
+                CacheDisposition::KeepSealed(copy) => Some(copy),
                 CacheDisposition::Drop => {
                     info!(cache = %cache.display(), ?capture,
                           "build cache not persisted (nothing captured at the seal); next build starts cold");
                     None
                 }
             };
-            if let Some(from) = keep
-                && from.exists()
-                && let Err(e) = std::fs::rename(from, cache)
-            {
-                warn!(error = %e, cache = %cache.display(), from = %from.display(),
-                      "failed to persist the build cache image");
+            if let Some(from) = keep {
+                // Only ever promote a regular file (never follow a planted symlink).
+                let regular = std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file());
+                if regular && let Err(e) = std::fs::rename(&from, cache) {
+                    warn!(error = %e, cache = %cache.display(), from = %from.display(),
+                          "failed to persist the build cache image");
+                }
             }
-            // Never leave a capture lying around for a later run to promote. (A
-            // dropped live image goes with the jail below.)
-            let _ = std::fs::remove_file(&sealed);
+            // Never leave a capture behind — this run's (dropped or unpromoted) or one
+            // stranded by a crashed or cancelled earlier run. (A dropped live image goes
+            // with the jail below.)
+            remove_stale_captures(cache);
         }
 
         // Read the build cgroup's cumulative CPU (cpu.stat `usage_usec`) before it
@@ -907,8 +930,10 @@ struct MarkerScan {
 
 impl MarkerScan {
     /// Feed one read; returns `(newly saw CACHE_SYNCED, newly saw FETCH_COMPLETE)`.
-    /// Scanning stops after FETCH_COMPLETE — a synced marker printed after the seal
-    /// has already fired is too late to matter and is ignored.
+    /// Scanning stops after the read that carries FETCH_COMPLETE. A synced marker in
+    /// that same read still counts, whatever its position: the host acts on the read
+    /// only after receiving all of it, so the flush it reports has finished. One in a
+    /// later read is ignored.
     fn feed(&mut self, chunk: &[u8]) -> (bool, bool) {
         if self.fired {
             return (false, false);
@@ -927,46 +952,47 @@ impl MarkerScan {
     }
 }
 
+/// Max wait for Firecracker to pause a build VM at the seal. Past it the seal goes
+/// ahead without a capture.
+const SEAL_PAUSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max time the VM stays paused while its cache image is copied. The image is sparse
+/// and capped (4 GiB on prod), so a healthy disk copies it in seconds; past this the
+/// capture is abandoned (nothing persists) rather than billing a stalled copy.
+const CACHE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Progress of the seal-time cache capture ([`BuildVmConfig::persist_cache_from_seal`]),
 /// written by the seal and read at teardown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SealCapture {
-    /// The seal never began: the VM was online for its whole life.
+    /// The seal never began.
     NotReached,
-    /// The seal began but no usable copy exists (pause/copy failed, the guest never
-    /// reported a synced cache, or the run died mid-capture).
+    /// The seal began but no usable copy exists (pause/seal/copy failed or timed out,
+    /// the guest never reported a synced cache, or the run died mid-capture).
     Started,
-    /// The cache image as of the seal was copied beside the persistent path.
-    Captured,
+    /// The cache image as of the seal was copied to this path, beside the cache.
+    Captured(PathBuf),
 }
 
 /// What teardown does with the cache image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CacheDisposition {
     /// Move the live (in-jail) image back.
     KeepLive,
-    /// Promote the copy taken at the seal; the live image goes with the jail.
-    KeepSealed,
+    /// Promote this copy taken at the seal; the live image goes with the jail.
+    KeepSealed(PathBuf),
     /// Persist nothing; the next build starts from an empty cache.
     Drop,
 }
 
 /// The persistence rule, as a pure function so the table is testable. With
-/// `persist_from_seal`, only state written while the VM was ONLINE may persist.
-fn cache_disposition(
-    persist_from_seal: bool,
-    networked: bool,
-    capture: SealCapture,
-) -> CacheDisposition {
+/// `persist_from_seal`, ONLY a completed seal-time capture persists — never the live
+/// image, whose post-seal writes are exactly what must not survive.
+fn cache_disposition(persist_from_seal: bool, capture: &SealCapture) -> CacheDisposition {
     match (persist_from_seal, capture) {
         (false, _) => CacheDisposition::KeepLive,
-        (true, SealCapture::Captured) => CacheDisposition::KeepSealed,
-        (true, SealCapture::Started) => CacheDisposition::Drop,
-        // Never sealed: a networked VM was online until it exited, so everything in
-        // the live image was written online. An offline VM never was — nothing
-        // qualifies.
-        (true, SealCapture::NotReached) if networked => CacheDisposition::KeepLive,
-        (true, SealCapture::NotReached) => CacheDisposition::Drop,
+        (true, SealCapture::Captured(copy)) => CacheDisposition::KeepSealed(copy.clone()),
+        (true, SealCapture::NotReached | SealCapture::Started) => CacheDisposition::Drop,
     }
 }
 
@@ -976,20 +1002,59 @@ fn set_capture(capture: &std::sync::Mutex<SealCapture>, to: SealCapture) {
     }
 }
 
-/// Where the seal-time copy of `cache` is written: beside it, on the same fs as the
-/// jail but outside it, so the jailed VMM can't reach it.
-fn sealed_cache_path(cache: &Path) -> PathBuf {
-    let mut name = cache.file_name().unwrap_or_default().to_os_string();
-    name.push(".sealed");
+/// A fresh path for this run's seal-time copy of `cache`: beside it (same fs as the
+/// jail, outside it, so the jailed VMM can't reach it) and unique per run, so a
+/// cancelled earlier run's `cp` can never write into this run's capture.
+fn capture_path(cache: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut name = capture_prefix(cache);
+    name.push(format!("{}-{nanos}", std::process::id()));
     cache.with_file_name(name)
+}
+
+/// `<cache file name>.sealed-` — every capture of `cache` starts with this.
+fn capture_prefix(cache: &Path) -> std::ffi::OsString {
+    let mut name = cache.file_name().unwrap_or_default().to_os_string();
+    name.push(".sealed-");
+    name
+}
+
+/// Remove every capture file of `cache` (regular files only; never recurses).
+fn remove_stale_captures(cache: &Path) {
+    let (Some(dir), prefix) = (cache.parent(), capture_prefix(cache)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if e.file_name()
+            .as_encoded_bytes()
+            .starts_with(prefix.as_encoded_bytes())
+            && e.file_type().is_ok_and(|t| t.is_file())
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Copy a guest-written image as raw bytes, keeping it sparse. `cp` never interprets
 /// the contents, so this stays inside threat-model P0-3 (the host never parses a
-/// guest filesystem). Killed if the caller is dropped (e.g. the build timed out).
+/// guest filesystem). The source must be a regular file (not a planted symlink), and
+/// `-T` stops `cp` copying INTO a directory at the destination. Killed if the caller
+/// is dropped (e.g. the capture timed out).
 async fn copy_image_sparse(from: &Path, to: &Path) -> Result<()> {
+    let meta =
+        std::fs::symlink_metadata(from).with_context(|| format!("stat {}", from.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", from.display());
+    }
     let status = Command::new("cp")
         .arg("--sparse=always")
+        .arg("-T")
         .arg("--")
         .arg(from)
         .arg(to)
@@ -1053,20 +1118,25 @@ mod tests {
     }
 
     #[test]
-    fn cache_disposition_persists_only_state_written_online() {
+    fn cache_disposition_persists_only_a_completed_capture() {
         use CacheDisposition::*;
-        use SealCapture::*;
+        let copy = PathBuf::from("/c/rust.img.sealed-1-2");
+        let all = [
+            SealCapture::NotReached,
+            SealCapture::Started,
+            SealCapture::Captured(copy.clone()),
+        ];
         // Legacy mode: the live image always goes back.
-        for c in [NotReached, Started, Captured] {
-            assert_eq!(cache_disposition(false, true, c), KeepLive);
-            assert_eq!(cache_disposition(false, false, c), KeepLive);
+        for c in &all {
+            assert_eq!(cache_disposition(false, c), KeepLive);
         }
-        // Seal mode: only the seal-time copy, or a VM that was online throughout.
-        assert_eq!(cache_disposition(true, true, Captured), KeepSealed);
-        assert_eq!(cache_disposition(true, true, Started), Drop);
-        assert_eq!(cache_disposition(true, true, NotReached), KeepLive);
-        assert_eq!(cache_disposition(true, false, NotReached), Drop);
-        assert_eq!(cache_disposition(true, false, Started), Drop);
+        // Seal mode: the completed capture, or nothing — never the live image.
+        assert_eq!(
+            cache_disposition(true, &SealCapture::Captured(copy.clone())),
+            KeepSealed(copy)
+        );
+        assert_eq!(cache_disposition(true, &SealCapture::Started), Drop);
+        assert_eq!(cache_disposition(true, &SealCapture::NotReached), Drop);
     }
 
     #[test]
@@ -1102,11 +1172,37 @@ mod tests {
     }
 
     #[test]
-    fn sealed_cache_path_sits_beside_the_cache() {
-        assert_eq!(
-            sealed_cache_path(Path::new("/var/jkbase/buildcache/p/rust.img")),
-            PathBuf::from("/var/jkbase/buildcache/p/rust.img.sealed")
+    fn captures_are_unique_siblings_and_swept() {
+        let dir = std::env::temp_dir().join(format!("jkb-cache-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = dir.join("rust.img");
+        let (a, b) = (capture_path(&cache), capture_path(&cache));
+        assert_ne!(a, b, "each run gets its own capture path");
+        assert_eq!(a.parent(), Some(dir.as_path()));
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rust.img.sealed-")
         );
+
+        std::fs::write(&cache, b"live").unwrap();
+        std::fs::write(&a, b"stale").unwrap();
+        std::fs::write(dir.join("trunk.img.sealed-9-9"), b"other cache").unwrap();
+        std::fs::create_dir_all(dir.join("rust.img.sealed-dir")).unwrap();
+        remove_stale_captures(&cache);
+        assert!(!a.exists(), "stale capture swept");
+        assert!(cache.exists(), "the cache itself untouched");
+        assert!(
+            dir.join("trunk.img.sealed-9-9").exists(),
+            "another cache's capture untouched"
+        );
+        assert!(
+            dir.join("rust.img.sealed-dir").is_dir(),
+            "never removes directories"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1116,7 +1212,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("jkb-cache-copy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (from, to) = (dir.join("cache.img"), dir.join("cache.img.sealed"));
+        let (from, to) = (dir.join("cache.img"), dir.join("cache.img.sealed-1"));
 
         // 64 MiB sparse image with data at the start and deep inside.
         let mut f = std::fs::File::create(&from).unwrap();
@@ -1141,6 +1237,16 @@ mod tests {
                 .await
                 .is_err()
         );
+        // Never through a symlink, never into a directory.
+        let link = dir.join("link.img");
+        std::os::unix::fs::symlink(&from, &link).unwrap();
+        assert!(
+            copy_image_sparse(&link, &dir.join("via-link"))
+                .await
+                .is_err()
+        );
+        std::fs::create_dir_all(dir.join("adir")).unwrap();
+        assert!(copy_image_sparse(&from, &dir.join("adir")).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -64,23 +64,25 @@ run_phase() {
     return 127
 }
 
-# Block until the host has sealed the network (deleted the TAP), or a timeout, by
-# probing the proxy endpoint until it is unreachable. The host owns the TAP, so
-# this is observation only — we cannot bring the network back.
+# Block until the host has sealed the network (deleted the TAP): the proxy must be
+# unreachable on 3 CONSECUTIVE probes. Fails closed — never "compiling anyway": the
+# compile phase runs dependency code that must not have the network (design §9 P2-7),
+# and the host force-seals at its fetch deadline and kills the VM at its timeout, so
+# the wait is bounded. The host owns the TAP; we cannot bring the network back.
 wait_for_seal() {
     seal_host=$(echo "$PROXY" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||')
     seal_port=$(echo "$PROXY" | sed 's|^[a-z]*://[^:/]*:||; s|/.*||')
     [ -z "$seal_port" ] && seal_port=80
-    i=0
-    while [ "$i" -lt 30 ]; do
-        if ! nc -w 1 "$seal_host" "$seal_port" </dev/null >/dev/null 2>&1; then
-            echo "[seal] network sealed (proxy $seal_host:$seal_port unreachable); compiling offline"
-            return 0
+    down=0
+    while [ "$down" -lt 3 ]; do
+        if nc -w 1 "$seal_host" "$seal_port" </dev/null >/dev/null 2>&1; then
+            down=0
+        else
+            down=$((down + 1))
         fi
         sleep 1
-        i=$((i + 1))
     done
-    echo "[seal] WARN: proxy still reachable after wait; compiling anyway"
+    echo "[seal] network sealed (proxy $seal_host:$seal_port unreachable); compiling offline"
 }
 
 # Run the build under root prefix $1, one-shot (offline) or two-phase (networked).
@@ -93,8 +95,7 @@ do_build() {
         # Flush fetch's writes BEFORE announcing it: the host may copy the cache drive
         # at the seal, and only does so after seeing CACHE-SYNCED (crates/jkbase-orch
         # build_vm::CACHE_SYNCED_MARKER). Keep the two lines in this order.
-        sync
-        echo "[seal] CACHE-SYNCED"
+        sync && echo "[seal] CACHE-SYNCED"
         echo "[seal] FETCH-COMPLETE"
         if [ "$rc" -ne 0 ]; then
             return "$rc"

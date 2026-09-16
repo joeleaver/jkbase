@@ -84,6 +84,11 @@ esac
                 .args(["link", "delete", &tap])
                 .status()
                 .await;
+            anyhow::ensure!(
+                !std::path::Path::new("/sys/class/net").join(&tap).exists(),
+                "TAP {tap} survived the seal"
+            );
+            Ok(())
         })
     });
 

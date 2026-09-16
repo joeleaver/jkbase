@@ -459,33 +459,51 @@ fn reboot() -> ! {
     }
 }
 
-/// Flush everything fetch wrote, report it, then report fetch-complete. The host may
-/// copy the cache drive at the seal (with this VM paused) and keep only that copy, so
-/// the copy must not catch ext4 mid-writeback: `sync` first, and only then the synced
-/// marker the host requires before it copies. The order of the two lines matters.
+/// Flush fetch's writes to the cache drive, report it, then report fetch-complete. The
+/// host may copy the cache drive at the seal (with this VM paused) and keep only that
+/// copy, and the cache ext4 has no journal, so the copy must not catch it mid-writeback:
+/// flush first, and only then print the synced marker the host requires before it
+/// copies. The order of the lines matters. A failed flush prints no synced marker, so
+/// nothing persists.
 fn signal_fetch_complete() {
-    unsafe { libc::sync() };
-    println!("{CACHE_SYNCED_MARKER}");
+    if sync_cache_drive() {
+        println!("{CACHE_SYNCED_MARKER}");
+    }
     println!("{FETCH_COMPLETE_MARKER}");
     let _ = std::io::stdout().flush();
 }
 
-/// Observe the host sealing the network (the proxy becoming unreachable) via TCP
-/// connect probes. The host owns the TAP; we cannot bring the network back.
+/// `syncfs(2)` just the cache drive — the host's copy needs nothing else flushed.
+fn sync_cache_drive() -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(dir) = std::fs::File::open(CACHE) else {
+        return false;
+    };
+    unsafe { libc::syncfs(dir.as_raw_fd()) == 0 }
+}
+
+/// Consecutive unreachable probes that confirm the seal. One is not enough: a single
+/// dropped connect to a live proxy would start COMPILE online.
+const SEAL_CONFIRM_PROBES: u32 = 3;
+
+/// Block until the host has sealed the network (the proxy unreachable on
+/// [`SEAL_CONFIRM_PROBES`] consecutive TCP probes). Fails CLOSED — there is no give-up:
+/// COMPILE runs dependency code that must never have the network (design §9 P2-7), and
+/// the host force-seals at its fetch deadline and kills the VM at its wall-clock timeout,
+/// so the wait is always bounded. The host owns the TAP; we cannot bring it back.
 fn wait_for_seal(proxy: Option<&str>) {
     let Some(proxy) = proxy else { return };
     let (host, port) = split_proxy(proxy);
     let authority = format!("{host}:{port}");
-    for _ in 0..30 {
+    let mut unreachable = 0;
+    while unreachable < SEAL_CONFIRM_PROBES {
         let reachable = std::net::ToSocketAddrs::to_socket_addrs(&authority)
             .ok()
             .and_then(|mut addrs| addrs.next())
-            .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(1)).is_ok())
+            .map(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
             .unwrap_or(false);
-        if !reachable {
-            return;
-        }
-        std::thread::sleep(Duration::from_secs(1));
+        unreachable = if reachable { 0 } else { unreachable + 1 };
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
