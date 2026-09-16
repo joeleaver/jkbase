@@ -196,9 +196,13 @@ if [ "$INJECT_JS" = "1" ]; then
     echo "[build-image] injecting JS componentizer (jco + componentize-js + esbuild) → /opt/js-tools"
     jsdir="$STAGE/opt/js-tools"
     mkdir -p "$jsdir"
-    ( cd "$jsdir" && npm install --no-audit --no-fund --silent \
-        @bytecodealliance/jco @bytecodealliance/componentize-js esbuild ) \
-        || { echo "[build-image] ERROR: npm install of JS componentizer failed" >&2; exit 1; }
+    # Locked install: images/js-tools/package-lock.json pins every package, so a rebake
+    # (e.g. for a jkbuild-init change) can't silently move JS function builds onto new
+    # componentizer releases. Bump deliberately: edit package.json, `npm install` there,
+    # commit the lock, rebake, and re-run the JS function e2e.
+    cp "$REPO_ROOT/images/js-tools/package.json" "$REPO_ROOT/images/js-tools/package-lock.json" "$jsdir/"
+    ( cd "$jsdir" && npm ci --no-audit --no-fund --silent ) \
+        || { echo "[build-image] ERROR: npm ci of JS componentizer failed" >&2; exit 1; }
     # /bin/sh wrappers on the build PATH (avoid #!/usr/bin/env node shebang assumptions).
     mkdir -p "$STAGE/usr/local/bin"
     cat > "$STAGE/usr/local/bin/jco" <<'SH'
