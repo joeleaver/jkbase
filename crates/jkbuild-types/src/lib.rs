@@ -17,6 +17,13 @@ use std::collections::BTreeMap;
 /// changing both sides (that is the whole reason this lives in a shared crate).
 pub const FETCH_COMPLETE_MARKER: &str = "[seal] FETCH-COMPLETE";
 
+/// Console marker the in-VM runner prints just BEFORE [`FETCH_COMPLETE_MARKER`],
+/// once it has flushed the cache drive to disk. The host copies the cache image at
+/// the seal and persists only that copy (for languages that opt in); it copies
+/// ONLY when it has seen this marker, since an unflushed image can hold torn state.
+/// Same byte-for-byte contract as the fetch-complete marker.
+pub const CACHE_SYNCED_MARKER: &str = "[seal] CACHE-SYNCED";
+
 /// Fixed `/out` filenames the in-VM lifecycle writes and the host reads by name
 /// (the host never lists the untrusted guest fs — it dumps known paths only).
 pub mod out {
@@ -135,6 +142,7 @@ mod tests {
         // The host (jkbase-orch::build_vm) hard-codes the same bytes; if this
         // ever changes, both sides must change together.
         assert_eq!(FETCH_COMPLETE_MARKER, "[seal] FETCH-COMPLETE");
+        assert_eq!(CACHE_SYNCED_MARKER, "[seal] CACHE-SYNCED");
     }
 
     #[test]

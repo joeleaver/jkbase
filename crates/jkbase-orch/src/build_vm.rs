@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -48,6 +49,15 @@ pub type SealFn = Box<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Sen
 /// Console marker the in-guest build-runner prints once dependency fetching is
 /// done, signalling the host it may seal the network early (design §9).
 pub const FETCH_COMPLETE_MARKER: &[u8] = b"[seal] FETCH-COMPLETE";
+
+/// Console marker the in-guest build-runner prints just BEFORE
+/// [`FETCH_COMPLETE_MARKER`], once it has flushed the cache drive (`sync`). The
+/// seal-time cache capture ([`BuildVmConfig::persist_cache_from_seal`]) is only as
+/// consistent as the image on disk: unflushed, ext4 delayed allocation can leave
+/// extracted files empty behind a committed "unpacked" stamp, poisoning every later
+/// build. No marker (an old toolchain, a force-sealed fetch) → no capture. A guest
+/// that lies only corrupts its own project's cache.
+pub const CACHE_SYNCED_MARKER: &[u8] = b"[seal] CACHE-SYNCED";
 use tracing::{error, info, warn};
 
 /// Inputs for one ephemeral build VM. Read-only images (`toolchain_rootfs`,
@@ -72,8 +82,18 @@ pub struct BuildVmConfig {
     /// Size of the (preallocated) read-write output drive.
     pub output_size_bytes: u64,
     /// Optional persistent per-project cache image. Moved into the jail for the
-    /// build and moved back out afterwards.
+    /// build and moved back out afterwards (see `persist_cache_from_seal`).
     pub cache_drive: Option<PathBuf>,
+    /// Persist the cache only as it stood AT THE SEAL (design §9 P2-7). The host
+    /// pauses the VM at the seal, copies the cache image (raw sparse bytes, never
+    /// parsed — P0-3), then seals and resumes; after the run that copy, never the
+    /// live image, becomes the persistent cache. So nothing written while the build
+    /// was offline — a dependency's `build.rs`, a proc-macro — can plant state (a
+    /// `$CARGO_HOME` config, a git-db hook) that runs in a later build's network-up
+    /// FETCH. A run that never sealed keeps its live image only if it was online the
+    /// whole time. `false` → the live image always persists. Ignored without
+    /// `cache_drive`.
+    pub persist_cache_from_seal: bool,
 
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
@@ -222,12 +242,15 @@ impl BuildVm {
         );
 
         let started = std::time::Instant::now();
-        let result = Self::run_inner(&id, config, runtime_dir, &layout).await;
+        let capture = std::sync::Mutex::new(SealCapture::NotReached);
+        let result = Self::run_inner(&id, config, runtime_dir, &layout, &capture).await;
         let wall = started.elapsed();
         // Teardown runs whether the build succeeded, errored, or timed out — and
         // is the real containment guarantee (see [`Self::teardown`]). It also
         // reads the cgroup's total CPU before reaping it, for build metering.
-        let cpu_usec = Self::teardown(config, &layout).await;
+        // A poisoned lock means a capture was in flight: fail closed.
+        let capture = capture.into_inner().unwrap_or(SealCapture::Started);
+        let cpu_usec = Self::teardown(config, &layout, capture).await;
         result.map(|outcome| BuildRun {
             outcome,
             cpu_usec,
@@ -240,6 +263,7 @@ impl BuildVm {
         config: &BuildVmConfig,
         runtime_dir: &Path,
         layout: &JailerLayout,
+        capture: &std::sync::Mutex<SealCapture>,
     ) -> Result<BuildOutcome> {
         // Hard-linking RO images into the jail requires same-fs.
         jailer::assert_same_fs(&config.chroot_base, &config.toolchain_rootfs)?;
@@ -323,14 +347,17 @@ impl BuildVm {
             config.console_log_max_bytes,
         )));
         // Notified when a console drain spots the fetch-complete marker, so the
-        // host can seal the network early (see [`configure_and_wait`]).
+        // host can seal the network early (see [`configure_and_wait`]). `synced`
+        // records the cache-synced marker that gates the seal-time cache capture.
         let seal_notify = Arc::new(Notify::new());
+        let synced = Arc::new(AtomicBool::new(false));
         let mut drains = Vec::new();
         if let Some(out) = process.stdout.take() {
             drains.push(tokio::spawn(drain_into(
                 out,
                 log.clone(),
                 seal_notify.clone(),
+                synced.clone(),
             )));
         }
         if let Some(err) = process.stderr.take() {
@@ -338,10 +365,20 @@ impl BuildVm {
                 err,
                 log.clone(),
                 seal_notify.clone(),
+                synced.clone(),
             )));
         }
 
-        let outcome = Self::configure_and_wait(id, config, layout, &mut process, seal_notify).await;
+        let outcome = Self::configure_and_wait(
+            id,
+            config,
+            layout,
+            &mut process,
+            seal_notify,
+            &synced,
+            capture,
+        )
+        .await;
 
         // Explicit reap of the jailer/firecracker child; the cgroup liveness
         // check in teardown is what actually guarantees no escapee survives.
@@ -389,6 +426,8 @@ impl BuildVm {
         layout: &JailerLayout,
         process: &mut Child,
         seal_notify: Arc<Notify>,
+        synced: &AtomicBool,
+        capture: &std::sync::Mutex<SealCapture>,
     ) -> Result<BuildOutcome> {
         wait_for_socket(&layout.host_socket, process).await?;
         // Host connects at the absolute socket path; firecracker's --api-sock
@@ -550,12 +589,20 @@ impl BuildVm {
                     }
                 }
                 if let Some(seal) = &config.seal {
-                    seal().await;
+                    if config.persist_cache_from_seal && config.cache_drive.is_some() {
+                        Self::seal_capturing_cache(
+                            id, config, layout, &client, seal, synced, capture,
+                        )
+                        .await?;
+                    } else {
+                        seal().await;
+                    }
                     info!(id, "build network sealed (compile runs offline)");
                 }
             } else {
                 std::future::pending::<()>().await;
             }
+            anyhow::Ok(())
         };
         tokio::pin!(seal_fut);
         let exit = process.wait();
@@ -566,8 +613,9 @@ impl BuildVm {
 
         loop {
             tokio::select! {
-                _ = &mut seal_fut, if !sealed => {
+                res = &mut seal_fut, if !sealed => {
                     sealed = true;
+                    res?;
                 }
                 status = &mut exit => {
                     let status = status.context("failed waiting on build VM process")?;
@@ -592,10 +640,66 @@ impl BuildVm {
         }
     }
 
+    /// Seal, capturing the cache first (see [`BuildVmConfig::persist_cache_from_seal`]):
+    /// pause → copy the cache image → seal → resume. The pause is what makes the
+    /// copy exact rather than best-effort: no guest write lands mid-copy, and the
+    /// guest can't observe the seal (so can't start COMPILE) until it resumes. The
+    /// network is sealed on EVERY path — a failed or skipped capture only means
+    /// nothing persists ([`SealCapture::Started`] → dropped at teardown).
+    async fn seal_capturing_cache(
+        id: &str,
+        config: &BuildVmConfig,
+        layout: &JailerLayout,
+        client: &FirecrackerClient,
+        seal: &SealFn,
+        synced: &AtomicBool,
+        capture: &std::sync::Mutex<SealCapture>,
+    ) -> Result<()> {
+        set_capture(capture, SealCapture::Started);
+        let paused = match client.pause_vm().await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(id, error = %e, "could not pause build VM at the seal; its cache will not persist");
+                false
+            }
+        };
+        if paused && let Some(cache) = &config.cache_drive {
+            if !synced.load(Ordering::SeqCst) {
+                // An old toolchain, or a fetch force-sealed at the deadline: the image
+                // may hold unflushed (torn) state, so persisting it could break every
+                // later build of this project. Start cold instead.
+                warn!(
+                    id,
+                    "guest never reported a synced cache before the seal; it will not persist"
+                );
+            } else {
+                let sealed = sealed_cache_path(cache);
+                match copy_image_sparse(&layout.drives_dir.join("cache.img"), &sealed).await {
+                    Ok(()) => set_capture(capture, SealCapture::Captured),
+                    Err(e) => {
+                        warn!(id, error = %e, "could not capture the build cache at the seal; it will not persist")
+                    }
+                }
+            }
+        }
+        seal().await;
+        if paused {
+            client
+                .resume_vm()
+                .await
+                .context("resume build VM after sealing")?;
+        }
+        Ok(())
+    }
+
     /// Move artifacts out (raw bytes, never mounted), assert the cgroup is empty
     /// (force-killing any escapee), delete the jail, and alarm if anything —
     /// especially a `mknod`'d device node — survives. Best-effort but loud.
-    async fn teardown(config: &BuildVmConfig, layout: &JailerLayout) -> Option<u64> {
+    async fn teardown(
+        config: &BuildVmConfig,
+        layout: &JailerLayout,
+        capture: SealCapture,
+    ) -> Option<u64> {
         // Move the output image out as RAW BYTES before deleting the jail. It is
         // attacker-controlled ext4, so the extractor MUST NOT mount it or run
         // any ext4 userspace tool (mount/losetup/blkid/file/e2fsck) — threat
@@ -612,12 +716,30 @@ impl BuildVm {
         }
         if let Some(cache) = &config.cache_drive {
             let in_jail_cache = layout.drives_dir.join("cache.img");
-            if in_jail_cache.exists()
-                && let Err(e) = std::fs::rename(&in_jail_cache, cache)
+            let sealed = sealed_cache_path(cache);
+            let keep = match cache_disposition(
+                config.persist_cache_from_seal,
+                config.tap_device.is_some(),
+                capture,
+            ) {
+                CacheDisposition::KeepLive => Some(&in_jail_cache),
+                CacheDisposition::KeepSealed => Some(&sealed),
+                CacheDisposition::Drop => {
+                    info!(cache = %cache.display(), ?capture,
+                          "build cache not persisted (nothing captured at the seal); next build starts cold");
+                    None
+                }
+            };
+            if let Some(from) = keep
+                && from.exists()
+                && let Err(e) = std::fs::rename(from, cache)
             {
-                warn!(error = %e, cache = %cache.display(),
-                      "failed to move build cache image back out of the jail");
+                warn!(error = %e, cache = %cache.display(), from = %from.display(),
+                      "failed to persist the build cache image");
             }
+            // Never leave a capture lying around for a later run to promote. (A
+            // dropped live image goes with the jail below.)
+            let _ = std::fs::remove_file(&sealed);
         }
 
         // Read the build cgroup's cumulative CPU (cpu.stat `usage_usec`) before it
@@ -737,16 +859,17 @@ impl<W: Write> BoundedLog<W> {
 
 /// Drain a child stdout/stderr stream into the shared, byte-capped console log,
 /// and notify `seal` the first time the [`FETCH_COMPLETE_MARKER`] appears (so the
-/// host can seal the network early). A small rolling window catches the marker
-/// even when it straddles two reads.
+/// host can seal the network early). A [`CACHE_SYNCED_MARKER`] seen before it sets
+/// `synced`. A small rolling window catches a marker even when it straddles two
+/// reads.
 async fn drain_into<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     log: Arc<Mutex<BoundedLog<std::fs::File>>>,
     seal: Arc<Notify>,
+    synced: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 8192];
-    let mut tail: Vec<u8> = Vec::new();
-    let mut fired = false;
+    let mut scan = MarkerScan::default();
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -755,25 +878,129 @@ async fn drain_into<R: tokio::io::AsyncRead + Unpin>(
                     let mut guard = log.lock().await;
                     let _ = guard.write_chunk(&buf[..n]);
                 }
-                if !fired {
-                    tail.extend_from_slice(&buf[..n]);
-                    let keep = FETCH_COMPLETE_MARKER.len() * 2;
-                    if tail.len() > keep {
-                        tail.drain(..tail.len() - keep);
-                    }
-                    if tail
-                        .windows(FETCH_COMPLETE_MARKER.len())
-                        .any(|w| w == FETCH_COMPLETE_MARKER)
-                    {
-                        fired = true;
-                        // notify_one stores a permit if the seal task isn't yet
-                        // waiting, so the wakeup is never lost.
-                        seal.notify_one();
-                    }
+                let (saw_synced, saw_complete) = scan.feed(&buf[..n]);
+                // `synced` is stored BEFORE the seal is notified: the guest prints the
+                // two markers back to back, often in one read, and the seal task reads
+                // the flag as soon as it wakes.
+                if saw_synced {
+                    synced.store(true, Ordering::SeqCst);
+                }
+                if saw_complete {
+                    // notify_one stores a permit if the seal task isn't yet
+                    // waiting, so the wakeup is never lost.
+                    seal.notify_one();
                 }
             }
         }
     }
+}
+
+/// Rolling scan of the guest console for the seal markers. Each chunk is searched
+/// together with the tail of the previous one BEFORE trimming, so a marker is found
+/// whether it straddles two reads or sits anywhere inside one large read.
+#[derive(Default)]
+struct MarkerScan {
+    tail: Vec<u8>,
+    synced: bool,
+    fired: bool,
+}
+
+impl MarkerScan {
+    /// Feed one read; returns `(newly saw CACHE_SYNCED, newly saw FETCH_COMPLETE)`.
+    /// Scanning stops after FETCH_COMPLETE — a synced marker printed after the seal
+    /// has already fired is too late to matter and is ignored.
+    fn feed(&mut self, chunk: &[u8]) -> (bool, bool) {
+        if self.fired {
+            return (false, false);
+        }
+        self.tail.extend_from_slice(chunk);
+        let has = |hay: &[u8], m: &[u8]| hay.windows(m.len()).any(|w| w == m);
+        let saw_synced = !self.synced && has(&self.tail, CACHE_SYNCED_MARKER);
+        self.synced |= saw_synced;
+        let saw_complete = has(&self.tail, FETCH_COMPLETE_MARKER);
+        self.fired = saw_complete;
+        let keep = FETCH_COMPLETE_MARKER.len().max(CACHE_SYNCED_MARKER.len());
+        if self.tail.len() > keep {
+            self.tail.drain(..self.tail.len() - keep);
+        }
+        (saw_synced, saw_complete)
+    }
+}
+
+/// Progress of the seal-time cache capture ([`BuildVmConfig::persist_cache_from_seal`]),
+/// written by the seal and read at teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealCapture {
+    /// The seal never began: the VM was online for its whole life.
+    NotReached,
+    /// The seal began but no usable copy exists (pause/copy failed, the guest never
+    /// reported a synced cache, or the run died mid-capture).
+    Started,
+    /// The cache image as of the seal was copied beside the persistent path.
+    Captured,
+}
+
+/// What teardown does with the cache image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheDisposition {
+    /// Move the live (in-jail) image back.
+    KeepLive,
+    /// Promote the copy taken at the seal; the live image goes with the jail.
+    KeepSealed,
+    /// Persist nothing; the next build starts from an empty cache.
+    Drop,
+}
+
+/// The persistence rule, as a pure function so the table is testable. With
+/// `persist_from_seal`, only state written while the VM was ONLINE may persist.
+fn cache_disposition(
+    persist_from_seal: bool,
+    networked: bool,
+    capture: SealCapture,
+) -> CacheDisposition {
+    match (persist_from_seal, capture) {
+        (false, _) => CacheDisposition::KeepLive,
+        (true, SealCapture::Captured) => CacheDisposition::KeepSealed,
+        (true, SealCapture::Started) => CacheDisposition::Drop,
+        // Never sealed: a networked VM was online until it exited, so everything in
+        // the live image was written online. An offline VM never was — nothing
+        // qualifies.
+        (true, SealCapture::NotReached) if networked => CacheDisposition::KeepLive,
+        (true, SealCapture::NotReached) => CacheDisposition::Drop,
+    }
+}
+
+fn set_capture(capture: &std::sync::Mutex<SealCapture>, to: SealCapture) {
+    if let Ok(mut c) = capture.lock() {
+        *c = to;
+    }
+}
+
+/// Where the seal-time copy of `cache` is written: beside it, on the same fs as the
+/// jail but outside it, so the jailed VMM can't reach it.
+fn sealed_cache_path(cache: &Path) -> PathBuf {
+    let mut name = cache.file_name().unwrap_or_default().to_os_string();
+    name.push(".sealed");
+    cache.with_file_name(name)
+}
+
+/// Copy a guest-written image as raw bytes, keeping it sparse. `cp` never interprets
+/// the contents, so this stays inside threat-model P0-3 (the host never parses a
+/// guest filesystem). Killed if the caller is dropped (e.g. the build timed out).
+async fn copy_image_sparse(from: &Path, to: &Path) -> Result<()> {
+    let status = Command::new("cp")
+        .arg("--sparse=always")
+        .arg("--")
+        .arg(from)
+        .arg(to)
+        .kill_on_drop(true)
+        .status()
+        .await
+        .context("spawn cp")?;
+    if !status.success() {
+        bail!("cp {} -> {}: {status}", from.display(), to.display());
+    }
+    Ok(())
 }
 
 /// A path is safe to land verbatim on the kernel cmdline (as `jkbase.dockerfile=`
@@ -823,5 +1050,97 @@ mod tests {
         assert!(s.contains("truncated"));
         assert!(!s.contains("discarded"));
         assert_eq!(s.matches("truncated").count(), 1, "marker written once");
+    }
+
+    #[test]
+    fn cache_disposition_persists_only_state_written_online() {
+        use CacheDisposition::*;
+        use SealCapture::*;
+        // Legacy mode: the live image always goes back.
+        for c in [NotReached, Started, Captured] {
+            assert_eq!(cache_disposition(false, true, c), KeepLive);
+            assert_eq!(cache_disposition(false, false, c), KeepLive);
+        }
+        // Seal mode: only the seal-time copy, or a VM that was online throughout.
+        assert_eq!(cache_disposition(true, true, Captured), KeepSealed);
+        assert_eq!(cache_disposition(true, true, Started), Drop);
+        assert_eq!(cache_disposition(true, true, NotReached), KeepLive);
+        assert_eq!(cache_disposition(true, false, NotReached), Drop);
+        assert_eq!(cache_disposition(true, false, Started), Drop);
+    }
+
+    #[test]
+    fn marker_scan_finds_markers_within_and_across_reads() {
+        // Both markers in one large read, with plenty of output after them — the
+        // window must not trim them away before scanning.
+        let mut s = MarkerScan::default();
+        let mut chunk = b"noise\n".repeat(10);
+        chunk.extend_from_slice(b"[seal] CACHE-SYNCED\n[seal] FETCH-COMPLETE\n");
+        chunk.extend(b"after\n".repeat(200));
+        assert_eq!(s.feed(&chunk), (true, true));
+        assert_eq!(
+            s.feed(b"[seal] FETCH-COMPLETE"),
+            (false, false),
+            "fires once"
+        );
+
+        // Each marker split across two reads.
+        let mut s = MarkerScan::default();
+        assert_eq!(s.feed(b"xx[seal] CACHE-SY"), (false, false));
+        assert_eq!(s.feed(b"NCED\n[seal] FETCH-"), (true, false));
+        assert_eq!(s.feed(b"COMPLETE\n"), (false, true));
+
+        // Old guest: fetch-complete with no synced marker.
+        let mut s = MarkerScan::default();
+        assert_eq!(s.feed(b"[seal] FETCH-COMPLETE\n"), (false, true));
+        assert!(!s.synced);
+
+        // Synced reported once even if repeated.
+        let mut s = MarkerScan::default();
+        assert_eq!(s.feed(b"[seal] CACHE-SYNCED\n"), (true, false));
+        assert_eq!(s.feed(b"[seal] CACHE-SYNCED\n"), (false, false));
+    }
+
+    #[test]
+    fn sealed_cache_path_sits_beside_the_cache() {
+        assert_eq!(
+            sealed_cache_path(Path::new("/var/jkbase/buildcache/p/rust.img")),
+            PathBuf::from("/var/jkbase/buildcache/p/rust.img.sealed")
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_image_sparse_keeps_bytes_and_holes() {
+        use std::io::{Seek, SeekFrom};
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("jkb-cache-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (from, to) = (dir.join("cache.img"), dir.join("cache.img.sealed"));
+
+        // 64 MiB sparse image with data at the start and deep inside.
+        let mut f = std::fs::File::create(&from).unwrap();
+        f.set_len(64 << 20).unwrap();
+        f.write_all(b"head").unwrap();
+        f.seek(SeekFrom::Start(40 << 20)).unwrap();
+        f.write_all(b"deep").unwrap();
+        drop(f);
+        std::fs::write(&to, b"stale capture").unwrap(); // overwritten, not appended
+
+        copy_image_sparse(&from, &to).await.unwrap();
+        let (a, b) = (std::fs::read(&from).unwrap(), std::fs::read(&to).unwrap());
+        assert_eq!(a, b, "byte-identical copy");
+        let allocated = std::fs::metadata(&to).unwrap().blocks() * 512;
+        assert!(
+            allocated < 1 << 20,
+            "copy stayed sparse ({allocated} bytes allocated)"
+        );
+
+        assert!(
+            copy_image_sparse(&dir.join("missing.img"), &to)
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

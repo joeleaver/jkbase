@@ -54,6 +54,17 @@ const DOCKERFILE_MIN_OUTPUT_BYTES: u64 = 6 * 1024 * 1024 * 1024; // 6 GiB
 /// Per-target log slice pulled from the output drive into the record.
 const TARGET_LOG_CAP: usize = 16 * 1024;
 
+/// Toolchains whose persistent cache is kept only as captured AT THE SEAL
+/// (`BuildVmConfig::persist_cache_from_seal`, design §9 P2-7). Their FETCH
+/// (`cargo fetch`) runs no dependency code and unpacks every crate, so the post-seal
+/// writes dropped are only cargo bookkeeping — and dropping them is what stops a
+/// dependency's offline `build.rs` from planting a `$CARGO_HOME` config or git-db
+/// hook that runs in the next build's network-up fetch. `rust` covers Rust function
+/// builds too (same cache key). NOT `go`: GOCACHE is written in compile, so its warm
+/// cache would be lost. Node/bun/python fetches already run dependency code online,
+/// so this buys them nothing until they stop doing that.
+const SEAL_CAPTURED_CACHE_LANGS: &[&str] = &["rust", "trunk"];
+
 /// Immutable per-server build configuration, built once at startup and shared by
 /// every build job. Paths hard-linked into the jail (kernel, toolchain images,
 /// source images) MUST live on the same filesystem as `data_dir` and be
@@ -1582,6 +1593,9 @@ async fn build_one_target_inner(
         output_drive: output_img.clone(),
         output_size_bytes,
         cache_drive: cache_drive.clone(),
+        persist_cache_from_seal: cache_target
+            .as_deref()
+            .is_some_and(|l| SEAL_CAPTURED_CACHE_LANGS.contains(&l)),
         vcpu_count: deps.vcpu_count,
         mem_size_mib: deps.mem_size_mib,
         vsock_cid: None,
@@ -3913,6 +3927,7 @@ esac
             output_drive: output_img.clone(),
             output_size_bytes: 64 * 1024 * 1024,
             cache_drive: None,
+            persist_cache_from_seal: false,
             vcpu_count: 1,
             mem_size_mib: 512,
             vsock_cid: None,

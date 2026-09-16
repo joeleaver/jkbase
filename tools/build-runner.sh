@@ -90,6 +90,11 @@ do_build() {
         echo "[build-runner] networked build via proxy $PROXY (fetch-then-seal)"
         run_phase "$root" fetch "$PROXY"
         rc=$?
+        # Flush fetch's writes BEFORE announcing it: the host may copy the cache drive
+        # at the seal, and only does so after seeing CACHE-SYNCED (crates/jkbase-orch
+        # build_vm::CACHE_SYNCED_MARKER). Keep the two lines in this order.
+        sync
+        echo "[seal] CACHE-SYNCED"
         echo "[seal] FETCH-COMPLETE"
         if [ "$rc" -ne 0 ]; then
             return "$rc"

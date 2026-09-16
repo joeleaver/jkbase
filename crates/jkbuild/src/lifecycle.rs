@@ -16,7 +16,7 @@ use crate::buildpack::{BuildContext, BuildOutput, DetectContext};
 use crate::env::BuildEnv;
 use crate::{buildpacks, export, function_build};
 use anyhow::{Context, Result};
-use jkbuild_types::{CacheMeta, FETCH_COMPLETE_MARKER, Index};
+use jkbuild_types::{CACHE_SYNCED_MARKER, CacheMeta, FETCH_COMPLETE_MARKER, Index};
 use std::ffi::CString;
 use std::io::Write;
 use std::net::TcpStream;
@@ -254,8 +254,7 @@ fn run_buildpack_pipeline(
     if proxy.is_some() {
         chosen.fetch(&mut ctx).context("fetch phase")?;
         // Tell the host it may seal the network now.
-        println!("{FETCH_COMPLETE_MARKER}");
-        let _ = std::io::stdout().flush();
+        signal_fetch_complete();
         wait_for_seal(proxy.as_deref());
         ctx.proxy = None; // network is gone; compile must be offline
     } else {
@@ -289,8 +288,7 @@ fn drive_function(proxy: Option<String>, lang: Option<&str>, subdir: &str) -> Re
     if proxy.is_some() {
         chosen.fetch(&mut ctx).context("function fetch phase")?;
         // Tell the host it may seal the network now, then compile offline.
-        println!("{FETCH_COMPLETE_MARKER}");
-        let _ = std::io::stdout().flush();
+        signal_fetch_complete();
         wait_for_seal(proxy.as_deref());
         ctx.proxy = None;
     } else {
@@ -459,6 +457,17 @@ fn reboot() -> ! {
     loop {
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Flush everything fetch wrote, report it, then report fetch-complete. The host may
+/// copy the cache drive at the seal (with this VM paused) and keep only that copy, so
+/// the copy must not catch ext4 mid-writeback: `sync` first, and only then the synced
+/// marker the host requires before it copies. The order of the two lines matters.
+fn signal_fetch_complete() {
+    unsafe { libc::sync() };
+    println!("{CACHE_SYNCED_MARKER}");
+    println!("{FETCH_COMPLETE_MARKER}");
+    let _ = std::io::stdout().flush();
 }
 
 /// Observe the host sealing the network (the proxy becoming unreachable) via TCP
