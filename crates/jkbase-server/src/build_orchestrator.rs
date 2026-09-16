@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const EXCLUDED_FILES: &[&str] = &["jkbase.toml", "Dockerfile"];
 const EXCLUDED_DIRS: &[&str] = &["node_modules", ".git", "target"];
@@ -966,7 +966,10 @@ fn make_seal(tap: String) -> SealFn {
                 .status()
                 .await;
             if Path::new("/sys/class/net").join(&tap).exists() {
-                bail!("build TAP {tap} still exists after `ip link delete`");
+                // The TAP name stays in the host log; the build error the tenant sees
+                // doesn't name host interfaces.
+                error!(tap = %tap, "build TAP still exists after `ip link delete`");
+                bail!("the build network could not be sealed");
             }
             Ok(())
         })
@@ -4188,6 +4191,39 @@ fn main() {
         println!("deadline: status={status:?} cache_persisted={}", cache.exists());
         assert_ne!(status, Some(0), "a fetch sealed at once cannot succeed");
         assert!(!cache.exists(), "no synced cache at the seal → nothing persists");
+
+        // A fetch that FAILS (unresolvable dependency) still seals, so its cache is kept:
+        // one bad target must not make the whole project's Rust cache cold.
+        let bad_src = data.join("sealcap-bad-src");
+        let _ = std::fs::remove_dir_all(&bad_src);
+        std::fs::create_dir_all(bad_src.join("src")).unwrap();
+        std::fs::write(
+            bad_src.join("Cargo.toml"),
+            "[package]\nname = \"sealcap-bad\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nitoa = \"=999.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(bad_src.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let bad_img = workspace.join("bad-source.img");
+        build_ro_ext4_from_dir(&bad_src, &bad_img, 16).unwrap();
+        let cache = workspace.join("fetchfail").join("rust.img");
+        jkbase_orch::build_image::build_empty_ext4(&cache, 1 << 30, 100_000, 100_000).unwrap();
+        let output = workspace.join("scap-fetchfail.out.img");
+        let status = sealcap_build(
+            &data,
+            &fc_release,
+            &net,
+            &bad_img,
+            &output,
+            &cache,
+            true,
+            Duration::from_secs(300),
+            "scap-fetchfail",
+        )
+        .await;
+        println!("fetch-fail: status={status:?} cache_persisted={}", cache.exists());
+        assert_ne!(status, Some(0), "an unresolvable dependency fails the build");
+        assert!(cache.exists(), "a failed fetch still seals, so its cache persists");
 
         for (persist, planted, cache1) in &results {
             let config = jkbase_orch::build_output::read_capped(cache1, "/cargo/config.toml", 4096)

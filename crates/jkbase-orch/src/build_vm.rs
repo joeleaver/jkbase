@@ -660,22 +660,18 @@ impl BuildVm {
         capture: &std::sync::Mutex<SealCapture>,
     ) -> Result<()> {
         set_capture(capture, SealCapture::Started);
+        // `None` = the pause call timed out: it may still land after any resume we send,
+        // stranding the VM paused, so that run is failed (killed) once sealed.
         let paused = match tokio::time::timeout(SEAL_PAUSE_TIMEOUT, client.pause_vm()).await {
-            Ok(Ok(())) => true,
+            Ok(Ok(())) => Some(true),
             Ok(Err(e)) => {
                 warn!(id, error = %e, "could not pause build VM at the seal; its cache will not persist");
-                false
+                Some(false)
             }
-            Err(_) => {
-                warn!(
-                    id,
-                    "pausing build VM at the seal timed out; its cache will not persist"
-                );
-                false
-            }
+            Err(_) => None,
         };
         let sealed = seal().await;
-        if paused
+        if paused == Some(true)
             && sealed.is_ok()
             && let Some(cache) = &config.cache_drive
         {
@@ -708,14 +704,20 @@ impl BuildVm {
                 }
             }
         }
-        // Resume even when the pause call reported failure: it may have landed anyway,
-        // and a VM left paused would sit out the whole wall-clock timeout.
-        let resumed = client.resume_vm().await;
+        // A failed seal leaves the network up: fail (the caller kills the VM) WITHOUT
+        // resuming, so the guest never runs again.
         sealed.context("seal the build network")?;
-        if paused {
-            resumed.context("resume build VM after sealing")?;
+        match paused {
+            Some(true) => client
+                .resume_vm()
+                .await
+                .context("resume build VM after sealing"),
+            Some(false) => Ok(()),
+            None => bail!(
+                "pausing the build VM at the seal timed out after {}s",
+                SEAL_PAUSE_TIMEOUT.as_secs()
+            ),
         }
-        Ok(())
     }
 
     /// Move artifacts out (raw bytes, never mounted), assert the cgroup is empty
@@ -752,9 +754,12 @@ impl BuildVm {
                 }
             };
             if let Some(from) = keep {
-                // Only ever promote a regular file (never follow a planted symlink).
+                // Only ever promote a regular file (never follow a planted symlink), and
+                // only once it's on disk: `cp` doesn't fsync, and an image torn by a host
+                // crash would be re-captured on every build.
                 let regular = std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file());
-                if regular && let Err(e) = std::fs::rename(&from, cache) {
+                let durable = regular && fsync_file(&from).await;
+                if durable && let Err(e) = std::fs::rename(&from, cache) {
                     warn!(error = %e, cache = %cache.display(), from = %from.display(),
                           "failed to persist the build cache image");
                 }
@@ -1020,6 +1025,14 @@ fn capture_prefix(cache: &Path) -> std::ffi::OsString {
     let mut name = cache.file_name().unwrap_or_default().to_os_string();
     name.push(".sealed-");
     name
+}
+
+/// fsync a (regular, host-written) file off the async workers. `false` on any error.
+async fn fsync_file(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::File::open(path).and_then(|f| f.sync_all()))
+        .await
+        .is_ok_and(|r| r.is_ok())
 }
 
 /// Remove every capture file of `cache` (regular files only; never recurses).

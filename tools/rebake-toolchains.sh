@@ -17,7 +17,8 @@
 # Run as the deploy user (cargo + apko on PATH); privileged steps use sudo:
 #   tools/rebake-toolchains.sh [--data-dir DIR] [--ca PATH] [LANG ...]
 #     LANG ∈ {rust node go python dockerfile bun trunk jkbuild-function}
-#     default = the toolchains already present in {data-dir}/toolchains (except `default`)
+#     default = the toolchains already present in {data-dir}/toolchains, except `default`
+#     and `jkbuild-function` (explicit only: it installs its JS tools unpinned)
 #     bun/trunk/jkbuild-function need staged assets (BUN_BIN / TRUNK_BIN +
 #     RUST_TOOLCHAIN_DIR / RUST_TOOLCHAIN_DIR with wasm32-wasip2 + node, npm, wasm-tools);
 #     a missing asset skips that image with a clear note rather than baking a broken one.
@@ -55,14 +56,18 @@ BUN_BIN="${BUN_BIN:-$REPO_ROOT/.firecracker/assets/bun}"
 TRUNK_BIN="${TRUNK_BIN:-$REPO_ROOT/.firecracker/assets/trunk}"
 
 # Default set: the toolchains already present (refresh what's deployed, never silently
-# mint a new one). `default` (busybox passthrough, no jkbuild-init) is excluded.
-# `jkbuild-function` is INCLUDED: it shares the protected `rust` build cache with Rust
-# servers, and until it carries the current jkbuild-init (which reports CACHE-SYNCED at
-# the seal) every Rust function build discards that cache.
+# mint a new one). `default` (busybox passthrough, no jkbuild-init) is excluded, and so
+# is `jkbuild-function`: its bake installs jco/componentize-js/esbuild unpinned, so an
+# unrelated sweep must not silently change JS function builds. Rebake it explicitly —
+# and do so whenever jkbuild-init's seal contract changes: it shares the protected
+# `rust` build cache with Rust servers, and a stale image discards that cache.
 if [ "${#LANGS[@]}" -eq 0 ]; then
     for f in "$TC"/*.ext4; do
         n="$(basename "$f" .ext4)"
-        case "$n" in default) continue ;; esac
+        case "$n" in default|jkbuild-function)
+            [ "$n" = jkbuild-function ] && echo "NOTE: jkbuild-function is not in the default sweep; rebake it explicitly if jkbuild-init changed." >&2
+            continue ;;
+        esac
         LANGS+=("$n")
     done
 fi

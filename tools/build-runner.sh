@@ -66,21 +66,28 @@ run_phase() {
 
 # Block until the host has sealed the network (deleted the TAP): the proxy must be
 # unreachable on 3 CONSECUTIVE probes. Fails closed — never "compiling anyway": the
-# compile phase runs dependency code that must not have the network (design §9 P2-7),
-# and the host force-seals at its fetch deadline and kills the VM at its timeout, so
-# the wait is bounded. The host owns the TAP; we cannot bring the network back.
+# compile phase runs dependency code that must not have the network (design §9 P2-7).
+# Returns 1 if the seal isn't confirmed within 300s (the host is gone, e.g. restarted
+# mid-build): the build then fails without compiling and the VM powers off. The host
+# owns the TAP; we cannot bring the network back.
 wait_for_seal() {
     seal_host=$(echo "$PROXY" | sed 's|^[a-z]*://||; s|/.*||; s|:.*||')
     seal_port=$(echo "$PROXY" | sed 's|^[a-z]*://[^:/]*:||; s|/.*||')
     [ -z "$seal_port" ] && seal_port=80
     down=0
+    waited=0
     while [ "$down" -lt 3 ]; do
+        if [ "$waited" -ge 300 ]; then
+            echo "[seal] ERROR: network not sealed within 300s; refusing to compile"
+            return 1
+        fi
         if nc -w 1 "$seal_host" "$seal_port" </dev/null >/dev/null 2>&1; then
             down=0
         else
             down=$((down + 1))
         fi
         sleep 1
+        waited=$((waited + 2))
     done
     echo "[seal] network sealed (proxy $seal_host:$seal_port unreachable); compiling offline"
 }
@@ -95,12 +102,15 @@ do_build() {
         # Flush fetch's writes BEFORE announcing it: the host may copy the cache drive
         # at the seal, and only does so after seeing CACHE-SYNCED (crates/jkbase-orch
         # build_vm::CACHE_SYNCED_MARKER). Keep the two lines in this order.
-        sync && echo "[seal] CACHE-SYNCED"
+        # Only the real cache drive: a /cache that failed to mount must not report synced.
+        grep -q "^/dev/vde /cache " /proc/mounts && sync && echo "[seal] CACHE-SYNCED"
         echo "[seal] FETCH-COMPLETE"
+        # Wait for the seal even after a failed fetch, so the host still captures the
+        # cache instead of dropping it.
+        wait_for_seal || return 1
         if [ "$rc" -ne 0 ]; then
             return "$rc"
         fi
-        wait_for_seal
         run_phase "$root" compile ""
         return $?
     fi
