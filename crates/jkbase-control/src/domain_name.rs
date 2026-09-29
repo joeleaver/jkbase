@@ -70,6 +70,7 @@ pub fn derive_host_key(input: &str, platform_domain: &str) -> Result<(String, Do
             return Err("only flat subdomains (<label>.{platform}) are supported"
                 .replace("{platform}", platform_domain));
         }
+        validate_platform_label(label)?;
         return Ok((label.to_string(), DomainKind::Subdomain));
     }
     if d.contains('.') {
@@ -77,7 +78,26 @@ pub fn derive_host_key(input: &str, platform_domain: &str) -> Result<(String, Do
         Ok((d, DomainKind::Custom))
     } else {
         // bare label → platform subdomain
+        validate_platform_label(&d)?;
         Ok((d, DomainKind::Subdomain))
+    }
+}
+
+/// A platform subdomain label: the same `[a-z0-9-]{1,63}` alphabet project ids are held
+/// to, so no tenant label can land in an `_`-prefixed platform zone (the ACME
+/// delegation zone) or carry anything that isn't a hostname.
+fn validate_platform_label(label: &str) -> Result<(), String> {
+    let ok = !label.is_empty()
+        && label.len() <= 63
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "'{label}' is not a valid subdomain label (use a-z, 0-9 and '-')"
+        ))
     }
 }
 
@@ -176,6 +196,22 @@ mod tests {
         );
         assert!(key("jkbase.app").is_err());
         assert!(key("a.b.jkbase.app").is_err());
+    }
+
+    #[test]
+    fn platform_labels_are_ldh_only() {
+        // `_acme-delegation` is the platform's delegation zone label: never claimable.
+        for bad in [
+            "_acme-delegation",
+            "_acme-delegation.jkbase.app",
+            "my_site",
+            "a b",
+            "a/b",
+        ] {
+            assert!(key(bad).is_err(), "{bad} must be rejected");
+        }
+        assert!(key(&"a".repeat(64)).is_err());
+        assert!(key("my-site-2").is_ok());
     }
 
     #[test]
