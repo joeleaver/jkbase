@@ -4,10 +4,16 @@
 //! - the `*.jkbase.app` + apex **wildcard** is provisioned via ACME DNS-01
 //!   (Cloudflare) and held in memory so it can be renewed in place;
 //! - **per-custom-domain** certs are issued on demand via ACME HTTP-01 (the
-//!   proxy already owns port 80) and cached on disk under `certs/custom/<host>/`.
+//!   proxy already owns port 80) and cached on disk under `certs/custom/<host>/`;
+//! - **tenant wildcard** (`*.<base>`) certs are issued via ACME DNS-01 through CNAME
+//!   delegation: the tenant points `_acme-challenge.<base>` at
+//!   `<random-label>.<acme_delegation_zone>` and we publish the TXT there with the SAME
+//!   platform DNS-01 backend. Cached under `certs/wildcard/<base>/`.
 //!
-//! Issuance for a custom host only happens when that host is an Active entry in
-//! the shared domain map (i.e. ownership was verified) — never for arbitrary SNI.
+//! Issuance for a custom host or wildcard only happens when it is an Active entry in
+//! the shared domain map (i.e. ownership was verified) — never for arbitrary SNI — and
+//! a wildcard's TXT goes ONLY to the label control minted for it (carried on its
+//! `DomainTarget`), never to a tenant-chosen name.
 
 use crate::DomainMap;
 use anyhow::{Context, Result};
@@ -24,6 +30,7 @@ use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
     RetryPolicy,
 };
+use jkbase_common::routing::{WILDCARD_PREFIX, is_wildcard_key, normalize_host, wildcard_key};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,6 +62,15 @@ pub struct TlsConfig {
     /// vendor choice is made once at startup.
     pub dns_provider: Arc<dyn DnsProvider>,
     pub acme_email: String,
+    /// Zone (under `domain`, writable by `dns_provider`) holding the TXT answers for
+    /// tenant wildcards' delegated `_acme-challenge` CNAMEs.
+    pub acme_delegation_zone: String,
+}
+
+/// Default ACME delegation zone for a platform domain. The leading underscore keeps it
+/// out of the tenant namespace: no project/subdomain label can contain `_`.
+pub fn default_acme_delegation_zone(platform_domain: &str) -> String {
+    format!("_acme-delegation.{platform_domain}")
 }
 
 /// rustls cert resolver: picks a cert by SNI. Lives behind `Arc` and is shared
@@ -79,14 +95,31 @@ impl ResolvesServerCert for Resolver {
             // else before it can wake a VM ([R6]/[R7]), so serving the apex here is safe.
             return self.wildcard.read().unwrap().clone();
         };
-        if let Some(ck) = self.hosts.read().unwrap().get(sni).cloned() {
+        self.select(&normalize_host(sni))
+    }
+}
+
+impl Resolver {
+    /// Cert for a normalized SNI, mirroring routing precedence: an exact per-host cert,
+    /// then the platform wildcards, then — off-platform only — the ONE tenant wildcard
+    /// covering exactly one label (`*.sub.example.com` for `abc.sub.example.com`).
+    /// Every key is platform-held, so serving a tenant wildcard's cert for a host a
+    /// different tenant registered exactly (before its own cert lands) discloses nothing;
+    /// routing still sends that host to its exact owner.
+    fn select(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+        if sni.contains('*') {
+            return None;
+        }
+        let hosts = self.hosts.read().unwrap();
+        if let Some(ck) = hosts.get(sni).cloned() {
             return Some(ck);
         }
         match classify_wildcard(sni, &self.platform_domain) {
             WildcardKind::Db => self.db_wildcard.read().unwrap().clone(),
             WildcardKind::Apex => self.wildcard.read().unwrap().clone(),
-            // Known-but-not-yet-issued custom domain (or unknown SNI): fail cleanly.
-            WildcardKind::None => None,
+            // A tenant wildcard, else a known-but-not-yet-issued custom domain (or an
+            // unknown SNI): fail cleanly.
+            WildcardKind::None => wildcard_key(sni).and_then(|k| hosts.get(&k).cloned()),
         }
     }
 }
@@ -246,12 +279,19 @@ impl CertManager {
     }
 
     fn load_cached_hosts(&self) {
-        let dir = self.cfg.cert_dir.join("custom");
+        self.load_cached_dir("custom", "");
+        self.load_cached_dir("wildcard", WILDCARD_PREFIX);
+    }
+
+    /// Load every `<dir>/<name>/{fullchain,privkey}.pem` into the resolver under
+    /// `<key_prefix><name>` (wildcards live on disk by base, keyed `*.<base>`).
+    fn load_cached_dir(&self, dir: &str, key_prefix: &str) {
+        let dir = self.cfg.cert_dir.join(dir);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
         };
         for entry in entries.flatten() {
-            let host = entry.file_name().to_string_lossy().to_string();
+            let host = format!("{key_prefix}{}", entry.file_name().to_string_lossy());
             let cert = entry.path().join("fullchain.pem");
             let key = entry.path().join("privkey.pem");
             match read_certified_key(&cert, &key) {
@@ -277,41 +317,72 @@ impl CertManager {
         if !host.contains('.') {
             return false; // bare label = platform subdomain
         }
+        if host.contains('*') {
+            return false; // wildcards are DNS-01 only — see ensure_wildcard_cert
+        }
         self.domains.read().await.contains_key(host)
+    }
+
+    fn host_cert_dir(&self, host: &str) -> Option<PathBuf> {
+        cert_cache_dir(&self.cfg.cert_dir, host)
+    }
+
+    /// Stop serving + renewing a released host's cert and delete its cache. Called when
+    /// a custom/wildcard domain is removed (or its project deleted).
+    pub fn forget_cert(&self, host: &str) {
+        let host = normalize_host(host);
+        self.resolver.hosts.write().unwrap().remove(&host);
+        self.inflight.lock().unwrap().remove(&host);
+        if let Some(dir) = self.host_cert_dir(&host)
+            && dir.exists()
+        {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => info!(host = %host, "removed certificate for released domain"),
+                Err(e) => warn!(host = %host, error = %e, "failed to remove released certificate"),
+            }
+        }
     }
 
     fn host_cert_fresh(&self, host: &str) -> bool {
         if !self.resolver.hosts.read().unwrap().contains_key(host) {
             return false;
         }
-        let cert = self
-            .cfg
-            .cert_dir
-            .join("custom")
-            .join(host)
-            .join("fullchain.pem");
+        let Some(dir) = self.host_cert_dir(host) else {
+            return false;
+        };
+        let cert = dir.join("fullchain.pem");
         cert.exists() && !needs_renewal(&cert)
     }
 
-    /// Ensure a valid cert exists for a verified custom `host`, issuing via
-    /// HTTP-01 if needed. Best-effort, deduped, and backed off on failure.
+    /// Claim the per-host issuance slot: `false` while a recent attempt (in flight or
+    /// failed within [`ISSUE_BACKOFF`]) holds it.
+    fn claim_issue_slot(&self, host: &str) -> bool {
+        let mut inflight = self.inflight.lock().unwrap();
+        if inflight
+            .get(host)
+            .is_some_and(|last| last.elapsed() < ISSUE_BACKOFF)
+        {
+            return false;
+        }
+        inflight.insert(host.to_string(), Instant::now());
+        true
+    }
+
+    /// Ensure a valid cert exists for a verified custom `host` (HTTP-01) or tenant
+    /// wildcard `*.<base>` (DNS-01 via delegation), issuing if needed. Best-effort,
+    /// deduped, and backed off on failure.
     pub async fn ensure_cert(&self, host: &str) {
+        if is_wildcard_key(host) {
+            return self.ensure_wildcard_cert(host).await;
+        }
         if !self.is_issuable(host).await {
             return;
         }
         if self.host_cert_fresh(host) {
             return;
         }
-        // Dedupe / backoff.
-        {
-            let mut inflight = self.inflight.lock().unwrap();
-            if inflight
-                .get(host)
-                .is_some_and(|last| last.elapsed() < ISSUE_BACKOFF)
-            {
-                return;
-            }
-            inflight.insert(host.to_string(), Instant::now());
+        if !self.claim_issue_slot(host) {
+            return;
         }
 
         info!(host = %host, "issuing custom-domain certificate via ACME HTTP-01");
@@ -325,6 +396,68 @@ impl CertManager {
                 info!(host = %host, "custom-domain certificate issued");
             }
             Err(e) => warn!(host = %host, error = %e, "custom-domain issuance failed (will retry)"),
+        }
+    }
+
+    /// Issue/renew a tenant wildcard's cert. Gated EXACTLY like a custom host: `host`
+    /// must be an Active domain-map entry — and it must carry the delegation label
+    /// control minted, which is the only place its DNS-01 TXT is ever published.
+    async fn ensure_wildcard_cert(&self, host: &str) {
+        let label = match self.domains.read().await.get(host) {
+            Some(t) => t.acme_delegation.clone(),
+            None => return, // not (or no longer) an Active wildcard
+        };
+        let Some(order) = wildcard_order(host, label.as_deref(), &self.cfg) else {
+            warn!(host = %host, "wildcard has no usable ACME delegation; not issuing");
+            return;
+        };
+        if self.host_cert_fresh(host) || !self.claim_issue_slot(host) {
+            return;
+        }
+        let Some(dir) = self.host_cert_dir(host) else {
+            return;
+        };
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            warn!(host = %host, error = %e, "cannot create wildcard cert dir");
+            return;
+        }
+        let (cert_path, key_path) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+        info!(host = %host, challenge = %order.challenge_name,
+            "issuing wildcard certificate via ACME DNS-01 (CNAME delegation)");
+        if let Err(e) = self
+            .provision_cert(
+                &order.identifiers,
+                &order.challenge_name,
+                &cert_path,
+                &key_path,
+            )
+            .await
+        {
+            warn!(host = %host, error = %e, "wildcard issuance failed (will retry)");
+            return;
+        }
+        // Removed (or re-registered under a new label) while the order ran: don't
+        // resurrect a released name's cert.
+        let still_ours = self
+            .domains
+            .read()
+            .await
+            .get(host)
+            .is_some_and(|t| t.acme_delegation == label);
+        if !still_ours {
+            self.forget_cert(host);
+            return;
+        }
+        match read_certified_key(&cert_path, &key_path) {
+            Ok(ck) => {
+                self.resolver
+                    .hosts
+                    .write()
+                    .unwrap()
+                    .insert(host.to_string(), Arc::new(ck));
+                info!(host = %host, "wildcard certificate issued");
+            }
+            Err(e) => warn!(host = %host, error = %e, "failed to load issued wildcard cert"),
         }
     }
 
@@ -502,7 +635,8 @@ impl CertManager {
     }
 
     /// Background loop: renew the wildcard near expiry and ensure/renew certs for
-    /// every Active custom domain (covers proactive misses + DNS-pointed-late).
+    /// every Active custom domain and tenant wildcard (covers proactive misses +
+    /// DNS-pointed-late). A removed domain leaves the map, so it stops renewing.
     pub fn spawn_reconcile(self: &Arc<Self>) {
         let mgr = self.clone();
         tokio::spawn(async move {
@@ -540,6 +674,50 @@ impl CertManager {
             }
         });
     }
+}
+
+/// On-disk cache dir for a per-host (`custom/<host>`) or wildcard (`wildcard/<base>`)
+/// cert. `None` for anything that isn't a plain LDH name — the name becomes a path we
+/// write and `remove_dir_all`, so it must never be able to climb out of `cert_dir`
+/// (control validates names too; this is the last line).
+fn cert_cache_dir(cert_dir: &Path, host: &str) -> Option<PathBuf> {
+    let (sub, name) = match host.strip_prefix(WILDCARD_PREFIX) {
+        Some(base) => ("wildcard", base),
+        None => ("custom", host),
+    };
+    let safe = !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
+    safe.then(|| cert_dir.join(sub).join(name))
+}
+
+/// A tenant wildcard's ACME DNS-01 order: the single `*.<base>` identifier, validated at
+/// `_acme-challenge.<base>`, which the tenant CNAMEs to `<label>.<delegation zone>` —
+/// so THAT is where we publish (the CA follows the CNAME). `None` without a sane label
+/// (1–63 lowercase alnum; minted by control) — never publish under anything else.
+struct WildcardOrder {
+    identifiers: Vec<Identifier>,
+    challenge_name: String,
+}
+
+fn wildcard_order(host: &str, label: Option<&str>, cfg: &TlsConfig) -> Option<WildcardOrder> {
+    let base = host.strip_prefix(WILDCARD_PREFIX)?;
+    let label = label?;
+    let label_ok = !label.is_empty()
+        && label.len() <= 63
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    if base.is_empty() || !label_ok {
+        return None;
+    }
+    Some(WildcardOrder {
+        identifiers: vec![Identifier::Dns(host.to_string())],
+        challenge_name: format!("{label}.{}", cfg.acme_delegation_zone),
+    })
 }
 
 async fn obtain_account(cfg: &TlsConfig, staging: bool) -> Result<Account> {
@@ -882,6 +1060,176 @@ mod tests {
         assert_eq!(classify_wildcard("db.jkbase.app", d), WildcardKind::Apex);
         // Off-platform SNI → no platform cert.
         assert_eq!(classify_wildcard("evil.com", d), WildcardKind::None);
+    }
+
+    /// A self-signed cert for `names`, as a resolver entry.
+    fn ck(names: &[&str]) -> Arc<CertifiedKey> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = KeyPair::generate().unwrap();
+        let params =
+            CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        Arc::new(
+            certified_key_from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap(),
+        )
+    }
+
+    /// A resolver holding the platform certs; returns it + the apex wildcard.
+    fn resolver() -> (Resolver, Arc<CertifiedKey>) {
+        let (apex, db) = (ck(&["*.jkbase.app"]), ck(&["*.db.jkbase.app"]));
+        let r = Resolver {
+            platform_domain: "jkbase.app".into(),
+            wildcard: RwLock::new(Some(apex.clone())),
+            db_wildcard: RwLock::new(Some(db)),
+            hosts: RwLock::new(HashMap::new()),
+        };
+        (r, apex)
+    }
+
+    #[test]
+    fn sni_prefers_exact_then_platform_then_single_label_tenant_wildcard() {
+        let (r, apex) = resolver();
+        let wild = ck(&["*.sub.example.com"]);
+        let exact = ck(&["special.sub.example.com"]);
+        r.hosts
+            .write()
+            .unwrap()
+            .insert("*.sub.example.com".into(), wild.clone());
+        r.hosts
+            .write()
+            .unwrap()
+            .insert("special.sub.example.com".into(), exact.clone());
+        let pick = |sni: &str| r.select(&normalize_host(sni));
+
+        // Any one label → the tenant wildcard (case- and root-dot-insensitive).
+        assert!(Arc::ptr_eq(&pick("abc.sub.example.com").unwrap(), &wild));
+        assert!(Arc::ptr_eq(&pick("ABC.Sub.Example.com.").unwrap(), &wild));
+        // An exact per-host cert wins over the wildcard that also covers it.
+        assert!(Arc::ptr_eq(
+            &pick("special.sub.example.com").unwrap(),
+            &exact
+        ));
+        // Single-level only (RFC 6125): neither the base nor a deeper name is covered.
+        assert!(pick("a.b.sub.example.com").is_none());
+        assert!(pick("sub.example.com").is_none());
+        // A literal `*` SNI never selects a wildcard slot.
+        assert!(pick("*.sub.example.com").is_none());
+        // Platform names keep the platform wildcard.
+        assert!(Arc::ptr_eq(&pick("app.jkbase.app").unwrap(), &apex));
+    }
+
+    #[test]
+    fn a_tenant_wildcard_can_never_shadow_platform_names() {
+        let (r, apex) = resolver();
+        // Control never admits these, but even if a key slipped in, platform SNIs are
+        // classified BEFORE the tenant-wildcard fallback.
+        let rogue = ck(&["*.jkbase.app"]);
+        r.hosts
+            .write()
+            .unwrap()
+            .insert("*.jkbase.app".into(), rogue.clone());
+        let got = r.select("api.jkbase.app").unwrap();
+        assert!(Arc::ptr_eq(&got, &apex));
+        assert!(!Arc::ptr_eq(&got, &rogue));
+    }
+
+    fn cfg_with_zone(zone: &str) -> TlsConfig {
+        struct NoDns;
+        #[async_trait]
+        impl DnsProvider for NoDns {
+            async fn create_txt(&self, _: &str, _: &str) -> Result<String> {
+                unreachable!()
+            }
+            async fn delete_txt(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+        }
+        TlsConfig {
+            domain: "jkbase.app".into(),
+            cert_dir: PathBuf::from("/nonexistent"),
+            dns_provider: Arc::new(NoDns),
+            acme_email: "ops@example.com".into(),
+            acme_delegation_zone: zone.into(),
+        }
+    }
+
+    #[test]
+    fn wildcard_order_publishes_only_at_the_minted_delegation_name() {
+        let cfg = cfg_with_zone(&default_acme_delegation_zone("jkbase.app"));
+        let label = "0123456789abcdef0123456789abcdef";
+        let o = wildcard_order("*.play.develup.win", Some(label), &cfg).unwrap();
+        // One wildcard identifier (the base apex is not part of a wildcard route) …
+        assert_eq!(o.identifiers.len(), 1);
+        assert!(matches!(&o.identifiers[0], Identifier::Dns(d) if d == "*.play.develup.win"));
+        // … validated at `_acme-challenge.play.develup.win`, which the tenant CNAMEs here.
+        assert_eq!(
+            o.challenge_name,
+            format!("{label}._acme-delegation.jkbase.app")
+        );
+        // No/garbled label → no order at all (never publish under a tenant-shaped name).
+        for bad in [
+            None,
+            Some(""),
+            Some("../x"),
+            Some("ABC"),
+            Some("a.b"),
+            Some("_x"),
+        ] {
+            assert!(
+                wildcard_order("*.play.develup.win", bad, &cfg).is_none(),
+                "{bad:?}"
+            );
+        }
+        assert!(wildcard_order("play.develup.win", Some(label), &cfg).is_none());
+    }
+
+    #[test]
+    fn rfc2136_backend_can_write_the_delegated_challenge_name() {
+        // RFC2136_ZONE defaults to --domain; the delegation zone sits under it, so the
+        // existing backend writes wildcard challenges with no extra config.
+        let p = Rfc2136Provider::new(
+            "192.0.2.1:53",
+            "jkbase.app",
+            "acme-key",
+            "c2VjcmV0",
+            "hmac-sha256",
+        )
+        .unwrap();
+        let cfg = cfg_with_zone(&default_acme_delegation_zone("jkbase.app"));
+        let o = wildcard_order("*.play.develup.win", Some("ab12"), &cfg).unwrap();
+        assert!(p.record_and_zone(&o.challenge_name, "v").is_ok());
+        // …and it can NEVER be pointed at the tenant's own zone.
+        assert!(
+            p.record_and_zone("_acme-challenge.play.develup.win", "v")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cert_cache_dir_is_confined_to_the_cert_dir() {
+        let root = Path::new("/var/jkbase/certs");
+        assert_eq!(
+            cert_cache_dir(root, "*.play.develup.win").unwrap(),
+            root.join("wildcard").join("play.develup.win")
+        );
+        assert_eq!(
+            cert_cache_dir(root, "docs.example.com").unwrap(),
+            root.join("custom").join("docs.example.com")
+        );
+        for bad in [
+            "",
+            "..",
+            "../etc",
+            "a/../../b",
+            "*.",
+            "*..x",
+            "a/b",
+            "*.*.x.com",
+            ".x",
+        ] {
+            assert!(cert_cache_dir(root, bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

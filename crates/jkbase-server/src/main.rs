@@ -117,6 +117,12 @@ struct Args {
     #[arg(long, env = "RFC2136_TSIG_ALGORITHM", default_value = "hmac-sha256")]
     rfc2136_tsig_algorithm: String,
 
+    /// Zone under --domain holding the DNS-01 TXT answers for tenant wildcard domains
+    /// (their `_acme-challenge.<base>` CNAMEs to `<random>.<this zone>`). Must be
+    /// writable by the ACME DNS-01 backend. Defaults to `_acme-delegation.<domain>`.
+    #[arg(long, env = "ACME_DELEGATION_ZONE")]
+    acme_delegation_zone: Option<String>,
+
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
@@ -1573,6 +1579,21 @@ async fn async_main() -> Result<()> {
     // each tick and surfaces drift (placement applies it, next card). Inert single-node.
     tokio::spawn(reconcile_loop(platform.clone(), is_leader_for_reconcile));
 
+    // Tenant wildcard certs are DNS-01 through CNAME delegation into this zone. It must sit
+    // under the platform domain: that's the zone the DNS-01 backend can write, and the
+    // tenant-facing CNAME target must be a platform-owned name.
+    let acme_delegation_zone = args
+        .acme_delegation_zone
+        .clone()
+        .map(|z| z.trim().trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| jkbase_proxy::tls::default_acme_delegation_zone(&args.domain));
+    if !acme_delegation_zone.ends_with(&format!(".{}", args.domain)) {
+        anyhow::bail!(
+            "ACME_DELEGATION_ZONE '{acme_delegation_zone}' must be a zone under --domain ({})",
+            args.domain
+        );
+    }
+
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
     let cert_manager: Option<Arc<CertManager>> = if args.tls {
@@ -1625,6 +1646,7 @@ async fn async_main() -> Result<()> {
             cert_dir: data_dir.join("certs"),
             dns_provider,
             acme_email,
+            acme_delegation_zone: acme_delegation_zone.clone(),
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
     } else {
@@ -1647,7 +1669,18 @@ async fn async_main() -> Result<()> {
         }));
         let cm_status = cm.clone();
         state.cert_status = Some(Arc::new(move |host: &str| cm_status.has_cert(host)));
+        let cm_remove = cm.clone();
+        state.cert_remove = Some(Arc::new(move |host: String| cm_remove.forget_cert(&host)));
     }
+    // Every TLS config carries a DNS-01 backend (it's how the platform wildcard issues),
+    // so wildcards are always issuable with TLS on; without TLS they route on plain HTTP.
+    state.wildcard_support = if cert_manager.is_some() {
+        jkbase_control::api::WildcardSupport::Dns01 {
+            zone: acme_delegation_zone.clone(),
+        }
+    } else {
+        jkbase_control::api::WildcardSupport::PlainHttp
+    };
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();
