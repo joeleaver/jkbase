@@ -402,7 +402,8 @@ pub enum AuthKeyCommand {
 
 #[derive(Subcommand)]
 pub enum DomainCommand {
-    /// Attach a subdomain (`docs`) or custom domain (`docs.example.com`)
+    /// Attach a subdomain (`docs`), custom domain (`docs.example.com`) or wildcard
+    /// (`'*.play.example.com'` — quote it so the shell doesn't glob)
     Add {
         domain: String,
         /// Bind this domain to a specific site within the project
@@ -413,7 +414,7 @@ pub enum DomainCommand {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
-    /// Verify ownership of a custom domain (after adding its DNS TXT record)
+    /// Verify ownership of a custom/wildcard domain (after adding its DNS records)
     Verify {
         domain: String,
         #[arg(long)]
@@ -1048,6 +1049,31 @@ fn human_age(ts: u64) -> String {
     }
 }
 
+/// The DNS records a wildcard needs: the ownership TXT on the base, the traffic record
+/// for `*.<base>`, and (TLS servers) the `_acme-challenge` CNAME that lets the platform
+/// answer DNS-01 for the wildcard cert — which must stay in place for renewals.
+fn print_wildcard_records(host: &str, verification: &serde_json::Value, acme: &serde_json::Value) {
+    println!("Create these DNS records, then run `jkbase domain verify '{host}'`:");
+    println!(
+        "  {}  TXT    {}",
+        verification["record"].as_str().unwrap_or(""),
+        verification["value"].as_str().unwrap_or("")
+    );
+    if !acme.is_null() {
+        println!(
+            "  {}  CNAME  {}   (keep it: renewals use it)",
+            acme["record"].as_str().unwrap_or(""),
+            acme["cname"].as_str().unwrap_or("")
+        );
+    }
+    println!(
+        "  {host}  A/AAAA the jkbase server's IP (or CNAME to your <project> host on the platform)"
+    );
+    println!(
+        "A wildcard covers exactly one label (a.<base>, not a.b.<base>); exact domains win over it."
+    );
+}
+
 async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
     match cmd {
         DomainCommand::Add {
@@ -1069,12 +1095,16 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
             let status = body["status"].as_str().unwrap_or("");
             if let Some(v) = body.get("verification").filter(|v| !v.is_null()) {
                 println!("Domain '{host}' added (pending verification).");
-                println!("Add this DNS record, then run `jkbase domain verify {host}`:");
-                println!(
-                    "  {}  TXT  {}",
-                    v["record"].as_str().unwrap_or(""),
-                    v["value"].as_str().unwrap_or("")
-                );
+                if body["kind"] == "wildcard" {
+                    print_wildcard_records(host, v, &body["acme_challenge"]);
+                } else {
+                    println!("Add this DNS record, then run `jkbase domain verify {host}`:");
+                    println!(
+                        "  {}  TXT  {}",
+                        v["record"].as_str().unwrap_or(""),
+                        v["value"].as_str().unwrap_or("")
+                    );
+                }
             } else {
                 println!("Domain '{host}' added ({status}).");
             }
@@ -1095,11 +1125,18 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
                 .await
                 .context("failed to connect to API")?;
             let body: serde_json::Value = api_json(resp).await?;
-            println!(
-                "Domain '{}' is now {}.",
-                body["host"].as_str().unwrap_or(&domain),
-                body["status"].as_str().unwrap_or("active")
-            );
+            let host = body["host"].as_str().unwrap_or(&domain);
+            if body["kind"] == "wildcard" && body["tls"] == "provisioning" {
+                println!(
+                    "Domain '{host}' verified; its HTTPS certificate is being issued \
+                     (status stays pending until it is — check `jkbase domain list`)."
+                );
+            } else {
+                println!(
+                    "Domain '{host}' is now {}.",
+                    body["status"].as_str().unwrap_or("active")
+                );
+            }
             Ok(())
         }
         DomainCommand::List { project, api } => {
@@ -1120,12 +1157,17 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
                     .as_str()
                     .map(|s| format!(" -> site {s}"))
                     .unwrap_or_default();
+                let tls = d["tls"]
+                    .as_str()
+                    .map(|t| format!(" (https {t})"))
+                    .unwrap_or_default();
                 println!(
-                    "  {:<28} {:<8} {}{}",
+                    "  {:<28} {:<8} {}{}{}",
                     d["host"].as_str().unwrap_or(""),
                     d["status"].as_str().unwrap_or(""),
                     d["kind"].as_str().unwrap_or(""),
-                    site
+                    site,
+                    tls
                 );
             }
             Ok(())
