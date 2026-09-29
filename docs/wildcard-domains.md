@@ -1,6 +1,6 @@
 # Wildcard custom domains (`*.sub.example.com`)
 
-**Status:** implemented. User-facing docs: README → "Wildcard domains".
+**Status:** implemented; revised after adversarial review. User-facing docs: README → "Wildcard domains".
 
 ## Why
 
@@ -11,48 +11,88 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
 
 ## Design as built
 
-- **Registry.** A new `DomainKind::Wildcard`; the record's key is the literal `*.<base>`, in the same
-  DOMAINS table and the same global-uniqueness claim as every other host. `DomainRecord` gains
-  `acme_delegation: Option<String>` (`#[serde(default)]`, skipped when `None`): pre-wildcard rows load
-  unchanged and exact rows re-serialize byte-identically.
+- **Registry.** A new `DomainKind::Wildcard`, keyed by the literal `*.<base>` in its **own redb table**
+  (`wildcard_domains`), which a pre-wildcard binary never opens (see Rollback). Exact keys never
+  contain `*`, so the two tables' key spaces are disjoint and uniqueness needs no cross-table check.
+  `DomainRecord` gains `acme_delegation: Option<String>` (`#[serde(default)]`, skipped when `None`), so
+  pre-change rows load unchanged and exact rows re-serialize byte-identically. `DomainKind` gains
+  `#[serde(other)] Unknown`, so a kind added by a *future* binary decodes (and is not routed) instead
+  of failing the listing after a rollback.
 - **Names** (`jkbase-control/src/domain_name.rs`). `*.` must be the entire leftmost label; the base
   must be an LDH name with ≥2 labels and an alphabetic TLD, not on/under the platform domain, not an
   ancestor of it, not a two-label `<generic-SLD>.<ccTLD>` (`co.uk`, `com.au`, …) and not a listed
-  shared-hosting suffix (`github.io`, …). Exact custom names are now LDH-validated too, which is what
-  keeps `*` out of the exact key space. There is **no Public Suffix List** in the workspace; the
-  suffix check is deliberately conservative and not exhaustive — the DNS-TXT proof is the boundary.
+  shared-hosting suffix (`github.io`, …). Exact custom names and platform labels are LDH-validated too
+  (platform labels use the project-id alphabet `[a-z0-9-]{1,63}`), which keeps `*` out of the exact
+  key space and `_` (the delegation zone's label) out of the tenant namespace. There is **no Public
+  Suffix List** in the workspace; the suffix check is deliberately conservative and not exhaustive —
+  the DNS-TXT proof is the boundary.
 - **Ownership.** Same mechanism as custom domains: TXT `_jkbase-challenge.<base>` = the record's
   token. On a TLS server `verify` *also* requires `_acme-challenge.<base>` to already CNAME to the
-  record's delegation target, so activation never leads to ACME orders that must fail.
-- **Cross-kind conflicts.** `*.B` and exact `B` both prove ownership through `_jkbase-challenge.B`, so
-  they may not be split across tenants: a claim (and, re-checked atomically in one write txn,
-  `activate_domain_exclusive`, a verify) is refused if a *different* tenant holds an **Active** record
-  under the other key. Pending records never block — a squatted Pending claim proves nothing. An exact
-  `x.B` under someone's `*.B` is allowed (see precedence). The wildcard key itself is first-come unique,
-  exactly like exact hosts (same Pending-squat behaviour as today).
+  record's delegation target.
+- **Claims** (`Store::claim_wildcard`, one write txn). Per tenant: at most 5 pending wildcards and
+  `MAX_WILDCARD_DOMAINS_PER_TENANT` (default 20) in total; each wildcard is an order stream on the shared
+  ACME account. Another tenant's **pending** claim older than 15 minutes is *replaced* by a fresh
+  claim; whoever proves DNS first wins. The 15-minute grace means a bot re-claiming in a loop can't
+  bump an owner who is mid-DNS-setup, while a squat can't lock the owner out for longer than that.
+  Active rows are never replaceable. (Exact hosts keep today's first-come behaviour; see Open.)
+- **Activation** (`Store::activate_domain_exclusive`, one write txn over both tables). Verify reads
+  the claim, awaits DNS, then flips it Active only if the row is **still that same pending claim**
+  (tenant, project, token): a removal, project delete or takeover during the DNS wait yields `Stale`
+  (409) and writes nothing. In the same txn it refuses if a *different* tenant holds `B` or `*.B`
+  Active — both prove ownership through `_jkbase-challenge.B`, so they can't be split across tenants.
+  Pending rows never block. An exact `x.B` under someone's `*.B` is allowed (see precedence).
 - **Routing** (`jkbase-proxy::resolve_domain`). The `Host` is port-stripped, lowercased and root-dot
   trimmed. (1) exact domain-map lookup — platform labels and exact hosts always win; (2) only for
   off-platform hosts, strip exactly one label and look up `*.<rest>`. Two hash lookups, no scan. A host
-  containing `*` resolves to nothing. The matched key (not the host) keys the fast-path route table, so
-  wake/hibernate need no change. Exact-after-wildcard needs no invalidation: nothing is cached per host.
+  containing `*` resolves to nothing. The matched key keys the fast-path route table, so wake /
+  hibernate need no change. Exact-after-wildcard needs no invalidation: nothing is cached per host.
 - **TLS.** `CertManager::ensure_cert` dispatches `*.` keys to `ensure_wildcard_cert`: a DNS-01 order for
   the single identifier `*.<base>`, publishing the TXT at `<label>.<ACME_DELEGATION_ZONE>` through the
-  platform's existing `DnsProvider` (Cloudflare / RFC2136 — the zone defaults to
+  platform's existing `DnsProvider` (Cloudflare / RFC2136; the zone defaults to
   `_acme-delegation.<domain>`, inside the zone those already write). The CA follows the tenant's CNAME.
-  Certs cache under `certs/wildcard/<base>/` and reuse the existing freshness/backoff/reconcile loop.
-  SNI: exact per-host cert → platform wildcards → the one tenant wildcard covering the SNI.
+  Certs cache under `certs/wildcard/<base>/`. SNI: exact per-host cert → platform wildcards → the one
+  tenant wildcard covering the SNI.
+- **ACME budget.** Before **every** wildcard order (issuance and renewal) the proxy re-checks that
+  `_acme-challenge.<base>` still CNAMEs to the delegated name, using the same DoH resolver `verify`
+  uses; if not, no order is placed. Failures (including a missing CNAME) back off per wildcard,
+  exponentially from 5 min doubling to a 24 h cap; after 8 consecutive failures (~10.5 h of retries) the manager
+  **gives up** and the API reports `tls: failed` (or `renewal-failed` while an older cert still serves)
+  until the owner re-verifies, which re-checks DNS and re-arms issuance. The reconcile loop runs at most
+  4 due wildcard orders per tick, concurrently, alongside the serial custom-domain pass, so the
+  15 s DNS-01 propagation sleep can't starve it.
 - **Status.** The stored record goes Active at verification (that gates routing + issuance, exactly as
-  for custom domains). The API reports a wildcard as `pending` / `tls: provisioning` until its cert is
-  loaded, then `active` — so "Pending until verification and issuance succeed" holds for the tenant,
-  and in TLS mode it isn't reachable before then anyway (no cert; port 80 only redirects).
+  for custom domains). The API reports a wildcard as `pending` while `tls` is `provisioning` or
+  `failed`, and `active` once a cert serves — so it reads Pending until verification *and* issuance
+  succeed. In TLS mode it isn't reachable before then anyway (no cert; port 80 only redirects).
 - **Capability gate.** `AppState.wildcard_support`: `Dns01{zone}` with TLS, `PlainHttp` without (local
   dev: routes on the HTTP port, TXT alone activates, no CNAME asked), `Unsupported` (the fail-closed
-  default) → `add`/`verify` answer 501. Today every TLS config carries a DNS-01 backend, so
-  `Unsupported` is only reachable by an embedder that doesn't set it.
+  default) → `add`/`verify` answer 501.
 - **Removal.** `deactivate_host` (domain rm and project delete) also calls `cert_remove` →
-  `CertManager::forget_cert`: drops the resolver entry, the backoff slot and `certs/wildcard/<base>/`.
-  The reconcile loop iterates the domain map, so renewal stops. An issuance that finishes after removal
-  re-checks the map and discards its cert.
+  `CertManager::forget_cert`: drops the resolver entry, backoff state and cache dir. The reconcile loop
+  iterates the domain map, so renewal stops. An order (DNS-01 *or* HTTP-01) that finishes after removal
+  re-checks the map and deletes what it wrote.
+- **`project.domains` cache.** Holds only *verified exact* hosts. Wildcards and pending hosts are kept
+  out (see Rollback for why).
+
+## Rollback
+
+A pre-wildcard binary never opens `wildcard_domains`, so on rollback **only wildcard hosts stop
+routing**; every exact host and platform subdomain keeps working, and project deletes clean up their
+exact rows as before. Nothing needs deleting first.
+
+What the old binary *can* do is grandfather: at boot it recreates every `project.domains` entry that
+has no DOMAINS row as an **Active custom domain with no token**. That's why the cache never holds
+wildcard (or pending) hosts. And on roll-forward, before building the domain map, the new binary runs
+`Store::purge_invalid_domain_rows`, which:
+- deletes any DOMAINS row whose key contains `*` (the only writer is that grandfathering);
+- deletes any wildcard row whose project is gone or now belongs to another tenant (a project the
+  old binary deleted, possibly re-created under the same id);
+- strips `*` hosts from every `project.domains` cache.
+
+Surviving wildcard rows resume routing and renewal as they were.
+
+Rollback **procedure:** deploy the old binary as usual; tell wildcard owners that their hosts are down
+until roll-forward. Don't hand-edit DOMAINS.
 
 ## Threat notes (tenants are hostile)
 
@@ -60,27 +100,32 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
 |---|---|
 | Wildcard over the platform (`*.jkbase.app`, `*.db.jkbase.app`, `*.api.jkbase.app`, the delegation zone) to capture reserved/tenant hosts | Refused by name validation; the proxy also never wildcard-routes a platform host and the SNI resolver classifies platform names before any tenant wildcard (both unit-tested with a planted rogue key). |
 | Wildcard *above* the platform (`*.example.com` when the platform is `jkbase.example.com`) | Refused: it would match the platform apex. |
-| `*.co.uk`, `*.github.io`, `*.com` | Refused (conservative suffix check); independently unprovable — the registry controls `_jkbase-challenge.<suffix>`. |
+| `*.co.uk`, `*.github.io`, `*.com` | Refused (conservative suffix check); independently unprovable, since the registry controls `_jkbase-challenge.<suffix>`. |
+| Claim the `_acme-delegation` label as a platform subdomain | Platform labels are `[a-z0-9-]` only. |
 | Capture another tenant's exact host with a covering wildcard | Exact lookup always runs first, per request; a later exact registration takes over immediately. |
 | Capture `a.b.sub.example.com` with `*.sub.example.com` | One label is stripped, so it looks up `*.b.sub.example.com`. |
 | Make the platform publish a DNS-01 answer at a name the tenant chooses | The TXT name is `<label>.<zone>`; the label is 128-bit CSPRNG hex minted by control, validated again in the proxy, and never tenant-supplied. |
-| Answer ACME for another tenant's wildcard | Each domain has its own label; a tenant pointing its own `_acme-challenge` at a victim's label gains nothing — the TXT value is the key authorization of the *victim's* order on the platform account. |
+| Answer ACME for another tenant's wildcard | Each domain has its own label; pointing your own `_acme-challenge` at a victim's label gains nothing, because the TXT value is the key authorization of the *victim's* order on the platform account. |
 | Split one DNS node between tenants (`B` exact vs `*.B`) | Refused against Active records of another tenant, atomically at verify. |
-| Resurrect a removed wildcard without proof (stale `project.domains` cache → boot-time grandfathering) | `grandfather_domain` skips any host containing `*`. |
+| Squat a victim's wildcard with an unverifiable claim | Replaceable after 15 min; capped at 5 pending per tenant. |
+| Undo a removal / clobber a new claim by verifying across it | Activation re-reads the row in its txn and refuses a stale claim. |
+| Rollback residue: proof-less `*` rows, orphaned wildcards | The cache never holds them; boot purge removes what an old binary left. |
+| Burn the shared ACME account's limits | CNAME re-checked before every order; per-wildcard exponential backoff; give-up after 8 failures; ≤4 orders/tick; ≤20 wildcards per tenant. |
 | Path traversal through the cert cache | Names are LDH-validated in control; `cert_cache_dir` re-checks before any write/`remove_dir_all`. |
-| Burn the platform ACME account's rate limits with never-completing wildcards | `verify` requires the CNAME before activation; failures back off per host (`ISSUE_BACKOFF`). A tenant can still verify, then delete the CNAME: that costs one failed order per 5 min per wildcard — the same exposure custom domains (HTTP-01) already have. |
 
 Tenant-side caveat (README): a wildcard **CNAME** for `*.<base>` also answers TXT lookups for every
-unset name under `<base>`, including `_jkbase-challenge.<x>.<base>`; point it only at a name whose TXT
-you control, or use A/AAAA.
+unset name under `<base>`, including `_jkbase-challenge.<x>.<base>`. Point it only at a name nobody
+else can publish TXT under, or use A/AAAA.
 
-## Known limits / open
+## Open / follow-ups
 
-- Rollback: a binary from before this change cannot parse `"kind":"wildcard"`. The old
-  `list_all_domains` fails the whole listing on one bad row, so rolling back with any wildcard stored
-  would boot with an **empty domain map** (every tenant 404s). This change makes the new binary skip
-  undecodable rows, but that can't be retrofitted into old binaries — delete wildcard rows first.
+- **Separate ACME account for tenant wildcards** (recommended): today tenant wildcard orders share the
+  platform account's rate limits with the platform certs and custom domains. The mitigations above
+  bound the damage but don't isolate it.
+- Exact custom domains keep first-come Pending claims (no takeover, no caps). The same approach
+  would work there but changes long-standing behaviour, so it's left for a separate change.
 - The ACME flow has no test double (`instant_acme::Account` talks to a real CA), so DNS-01 issuance is
-  covered in pieces: order/challenge-name construction, delegation-label validation, and that the
-  RFC2136 backend accepts the delegated name. Not exercised against Pebble/LE staging.
-- No per-tenant cap on wildcard count (none exists for custom domains either).
+  covered in pieces: order/challenge-name construction, label validation, the pre-order CNAME check,
+  the backoff/give-up state machine, and that the RFC2136 backend accepts the delegated name. Not
+  exercised against Pebble or LE staging.
+- A replaced pending claimant has to `add` again and publish a new TXT token.

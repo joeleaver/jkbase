@@ -589,11 +589,20 @@ It prints the three DNS records to create (at your DNS provider, in `example.com
 |---|---|---|---|
 | `_jkbase-challenge.play.example.com` | TXT | `jkb_…` (printed) | Proves you own the **base** `play.example.com` — the same check as a custom domain |
 | `_acme-challenge.play.example.com` | CNAME | `<random>._acme-delegation.<platform>` (printed) | Lets the platform answer the ACME DNS-01 challenge for the `*.play.example.com` certificate. **Keep it** — renewals use it |
-| `*.play.example.com` | A / AAAA | the jkbase server's IP | The traffic. A CNAME works too, but only to a name whose TXT records you control (e.g. your `<project>.<platform>` host) — a wildcard CNAME also answers TXT lookups under the base |
+| `*.play.example.com` | A / AAAA | the jkbase server's IP | The traffic. Prefer A/AAAA (see the CNAME caveat below) |
+
+**CNAME caveat.** A *wildcard CNAME* for `*.play.example.com` also answers every other lookup under
+the base that has no explicit record — including the TXT at `_jkbase-challenge.<anything>.play.example.com`
+that proves ownership of an exact host there. Whoever can publish TXT at the CNAME's target can
+therefore claim hosts under your wildcard. So: use A/AAAA; or CNAME only to a name in a zone you
+control; or to your `<project>.<platform>` host — tenants can't publish TXT there (the platform
+publishes none).
 
 Then `jkbase domain verify '*.play.example.com'`. Verification checks the TXT **and** the CNAME; the
 domain then reads `pending` (`https provisioning`) until its certificate is issued (a minute or two),
-then `active`. Or declare it in `jkbase.toml` (`domain = "*.play.example.com"` on a site, or in
+then `active`. If issuance keeps failing (typically: the `_acme-challenge` CNAME was removed or
+changed), the platform backs off and eventually stops trying, and the domain shows `https failed`;
+fix the CNAME and run `verify` again to retry. Or declare it in `jkbase.toml` (`domain = "*.play.example.com"` on a site, or in
 `domains = [...]`) and run `verify` after the deploy.
 
 Rules:
@@ -607,6 +616,10 @@ Rules:
   registry suffix (`*.co.uk`, `*.github.io`); nested or partial wildcards (`*.*.example.com`,
   `a.*.example.com`, `ab*.example.com`); and a wildcard whose base another account has verified as an
   exact domain (or vice versa). A wildcard itself is unique, like any domain.
+- **Claims and limits.** An account may hold up to 5 *unverified* wildcards and 20 in total (the
+  operator can change the total with `MAX_WILDCARD_DOMAINS_PER_TENANT`). An unverified claim by
+  another account blocks a name only for 15 minutes; after that, adding it takes the claim over, and
+  whoever verifies DNS first owns it.
 - **Removing it** (`jkbase domain rm '*.play.example.com'`) unroutes every host under it and deletes
   its certificate; nothing renews afterwards. You can drop the DNS records.
 - **Self-hosted without TLS** (local dev): no certificate is involved — the CNAME isn't needed, the
