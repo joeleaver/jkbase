@@ -783,6 +783,12 @@ pub enum DomainKind {
     Subdomain,
     /// An external domain (e.g. `docs.example.com`) the tenant must prove they own.
     Custom,
+    /// `*.<base>` under an external domain: routes any ONE label under `<base>` to the
+    /// project (exact hosts always win). Ownership is proven on `<base>` with the same
+    /// DNS-TXT challenge as [`DomainKind::Custom`]; the cert is DNS-01 via CNAME
+    /// delegation ([`DomainRecord::acme_delegation`]). Host key is the literal `*.<base>`.
+    /// NB: an older binary can't parse this variant — see `list_all_domains`.
+    Wildcard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -806,9 +812,36 @@ pub struct DomainRecord {
     pub site: Option<String>,
     pub kind: DomainKind,
     pub status: DomainStatus,
-    /// DNS-TXT verification token (relevant for custom domains).
+    /// DNS-TXT verification token (relevant for custom + wildcard domains).
     pub token: String,
     pub created_at: u64,
+    /// [`DomainKind::Wildcard`] only: random DNS label (128 bits, lowercase hex) the
+    /// tenant's `_acme-challenge.<base>` must CNAME to under the platform's ACME
+    /// delegation zone. Per-domain and minted server-side, so no tenant can steer where
+    /// the platform publishes a DNS-01 answer, nor answer for another tenant's name.
+    /// `#[serde(default)]` + skipped when `None`: pre-wildcard records load unchanged
+    /// and exact records serialize byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_delegation: Option<String>,
+}
+
+impl DomainRecord {
+    /// The proxy-side routing target for this (Active) record.
+    pub fn target(&self) -> jkbase_common::routing::DomainTarget {
+        jkbase_common::routing::DomainTarget {
+            project_id: self.project_id.clone(),
+            site: self.site.clone(),
+            acme_delegation: self.acme_delegation.clone(),
+        }
+    }
+
+    /// The name whose DNS proves ownership: the host itself, or `<base>` for a
+    /// wildcard (`*.<base>`). The TXT challenge lives at `_jkbase-challenge.<this>`.
+    pub fn ownership_name(&self) -> &str {
+        self.host
+            .strip_prefix(jkbase_common::routing::WILDCARD_PREFIX)
+            .unwrap_or(&self.host)
+    }
 }
 
 /// Whether `host` is a reserved platform label.
@@ -1915,15 +1948,57 @@ impl Store {
         Ok(existed)
     }
 
+    /// Every parseable domain record. A record this binary can't decode (e.g. a
+    /// [`DomainKind`] variant written by a NEWER binary before a rollback) is skipped
+    /// with a warning rather than failing the whole listing: boot builds the proxy's
+    /// domain map from this, and one unreadable row must not 404 every tenant.
     pub fn list_all_domains(&self) -> Result<Vec<DomainRecord>> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DOMAINS)?;
         let mut out = Vec::new();
         for entry in table.iter()? {
-            let (_key, value) = entry?;
-            out.push(serde_json::from_slice::<DomainRecord>(value.value())?);
+            let (key, value) = entry?;
+            match serde_json::from_slice::<DomainRecord>(value.value()) {
+                Ok(r) => out.push(r),
+                Err(e) => tracing::warn!(host = %key.value(), error = %e,
+                    "skipping undecodable domain record"),
+            }
         }
         Ok(out)
+    }
+
+    /// Flip `record` to Active iff no DIFFERENT tenant holds an Active record under any
+    /// of `conflicts` — checked and written in ONE write txn, so two tenants verifying
+    /// overlapping ownership (`sub.example.com` vs `*.sub.example.com`) can't both win a
+    /// check-then-save race. Returns `false` (nothing written) on conflict.
+    pub fn activate_domain_exclusive(
+        &self,
+        record: &DomainRecord,
+        conflicts: &[String],
+    ) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let ok = {
+            let mut table = txn.open_table(DOMAINS)?;
+            let mut clash = false;
+            for key in conflicts {
+                if let Some(v) = table.get(key.as_str())? {
+                    let other: DomainRecord = serde_json::from_slice(v.value())?;
+                    if other.tenant_id != record.tenant_id && other.status == DomainStatus::Active {
+                        clash = true;
+                        break;
+                    }
+                }
+            }
+            if !clash {
+                let mut active = record.clone();
+                active.status = DomainStatus::Active;
+                let data = serde_json::to_vec(&active)?;
+                table.insert(active.host.as_str(), data.as_slice())?;
+            }
+            !clash
+        };
+        txn.commit()?;
+        Ok(ok)
     }
 
     pub fn list_domains_for_project(&self, project_id: &str) -> Result<Vec<DomainRecord>> {
@@ -4225,6 +4300,7 @@ mod tests {
             status,
             token: "tok".to_string(),
             created_at: 0,
+            acme_delegation: None,
         }
     }
 
@@ -4249,6 +4325,150 @@ mod tests {
         assert!(!store.host_key_available("docs").unwrap()); // taken
         assert!(store.host_key_available("blog").unwrap());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Byte-exact `DomainRecord` rows as the pre-wildcard binary wrote them (serde_json,
+    /// field order as declared, no `acme_delegation`).
+    const PRE_WILDCARD_ROWS: &[(&str, &str)] = &[
+        (
+            "docs.example.com",
+            r#"{"host":"docs.example.com","project_id":"a","tenant_id":"t1","site":"blog","kind":"custom","status":"active","token":"jkb_x","created_at":5}"#,
+        ),
+        (
+            "a",
+            r#"{"host":"a","project_id":"a","tenant_id":"t1","site":null,"kind":"subdomain","status":"active","token":"","created_at":0}"#,
+        ),
+        (
+            "pending.example.com",
+            r#"{"host":"pending.example.com","project_id":"a","tenant_id":"t1","site":null,"kind":"custom","status":"pending","token":"jkb_y","created_at":7}"#,
+        ),
+    ];
+
+    #[test]
+    fn a_pre_wildcard_store_loads_unchanged() {
+        // Build the store file the way the old binary left it: raw rows straight into
+        // the DOMAINS table, before `Store::open` (the new code) ever touches it.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("jkbase-store-prewild-{nanos}.redb"));
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(DOMAINS).unwrap();
+                for (k, v) in PRE_WILDCARD_ROWS {
+                    t.insert(*k, v.as_bytes()).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+
+        let mut all = store.list_all_domains().unwrap();
+        all.sort_by(|a, b| a.host.cmp(&b.host));
+        assert_eq!(all.len(), 3);
+        let docs = store.get_domain("docs.example.com").unwrap().unwrap();
+        assert_eq!(docs.kind, DomainKind::Custom);
+        assert_eq!(docs.status, DomainStatus::Active);
+        assert_eq!(docs.site.as_deref(), Some("blog"));
+        assert_eq!(docs.acme_delegation, None);
+        assert_eq!(docs.target().acme_delegation, None);
+        assert_eq!(docs.ownership_name(), "docs.example.com");
+        let label = store.get_domain("a").unwrap().unwrap();
+        assert_eq!(label.kind, DomainKind::Subdomain);
+
+        // Exact records re-serialize byte-identically, so a rollback reads them as before.
+        for (k, v) in PRE_WILDCARD_ROWS {
+            let r = store.get_domain(k).unwrap().unwrap();
+            assert_eq!(serde_json::to_string(&r).unwrap(), *v);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wildcard_record_round_trips_and_undecodable_rows_are_skipped() {
+        let (store, path) = tmp_db();
+        let mut w = domain("*.play.develup.win", "a", "t1", DomainStatus::Pending);
+        w.kind = DomainKind::Wildcard;
+        w.acme_delegation = Some("0123456789abcdef0123456789abcdef".into());
+        assert!(store.claim_domain(&w).unwrap());
+        let back = store.get_domain("*.play.develup.win").unwrap().unwrap();
+        assert_eq!(back.kind, DomainKind::Wildcard);
+        assert_eq!(back.ownership_name(), "play.develup.win");
+        assert_eq!(
+            back.target().acme_delegation.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(json.contains(r#""kind":"wildcard""#), "{json}");
+
+        // A row from a FUTURE kind (what an older binary sees after a rollback) must not
+        // take the whole listing — and so the boot-time domain map — down with it.
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(DOMAINS).unwrap();
+                t.insert(
+                    "x.example.com",
+                    br#"{"host":"x.example.com","project_id":"b","tenant_id":"t2","site":null,"kind":"hologram","status":"active","token":"","created_at":0}"#.as_slice(),
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let all = store.list_all_domains().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].host, "*.play.develup.win");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exclusive_activation_refuses_another_tenants_verified_overlap() {
+        let (store, path) = tmp_db();
+        let mut w = domain("*.sub.example.com", "a", "t1", DomainStatus::Pending);
+        w.kind = DomainKind::Wildcard;
+        store.claim_domain(&w).unwrap();
+        let conflicts = vec!["sub.example.com".to_string()];
+
+        // A PENDING exact claim by another tenant proves nothing → no block.
+        store
+            .claim_domain(&domain("sub.example.com", "b", "t2", DomainStatus::Pending))
+            .unwrap();
+        assert!(store.activate_domain_exclusive(&w, &conflicts).unwrap());
+        assert_eq!(
+            store
+                .get_domain("*.sub.example.com")
+                .unwrap()
+                .unwrap()
+                .status,
+            DomainStatus::Active
+        );
+
+        // Once the other tenant's exact base is VERIFIED, activation is refused and
+        // nothing is written.
+        let mut w2 = domain("*.sub.example.com", "a", "t1", DomainStatus::Pending);
+        w2.kind = DomainKind::Wildcard;
+        store.save_domain(&w2).unwrap();
+        store
+            .save_domain(&domain("sub.example.com", "b", "t2", DomainStatus::Active))
+            .unwrap();
+        assert!(!store.activate_domain_exclusive(&w2, &conflicts).unwrap());
+        assert_eq!(
+            store
+                .get_domain("*.sub.example.com")
+                .unwrap()
+                .unwrap()
+                .status,
+            DomainStatus::Pending
+        );
+
+        // The SAME tenant owning both is fine.
+        let mut w3 = w2.clone();
+        w3.tenant_id = "t2".into();
+        assert!(store.activate_domain_exclusive(&w3, &conflicts).unwrap());
         let _ = std::fs::remove_file(&path);
     }
 

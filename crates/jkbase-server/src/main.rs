@@ -2988,13 +2988,7 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
     let mut count = 0usize;
     for d in active {
         if d.status == DomainStatus::Active {
-            map.insert(
-                d.host,
-                DomainTarget {
-                    project_id: d.project_id,
-                    site: d.site,
-                },
-            );
+            map.insert(d.host.clone(), d.target());
             count += 1;
         }
     }
@@ -3008,6 +3002,11 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
 /// to migrate pre-registry data without forcing re-verification.
 fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &str) {
     if matches!(store.get_domain(host), Ok(Some(_))) {
+        return;
+    }
+    // Wildcards postdate the registry, so they are never legacy: a `*.` entry left in
+    // a stale `project.domains` cache must NOT come back Active without DNS proof.
+    if host.contains('*') {
         return;
     }
     let kind = if host.contains('.') {
@@ -3024,6 +3023,7 @@ fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &s
         status: DomainStatus::Active,
         token: String::new(),
         created_at: 0,
+        acme_delegation: None,
     };
     let _ = store.claim_domain(&record);
 }
@@ -3858,16 +3858,11 @@ async fn register_active_routes(
         .or_insert_with(|| DomainTarget {
             project_id: project_id.to_string(),
             site: None,
+            acme_delegation: None,
         });
     for d in active_domains {
         table.insert(d.host.clone(), ip.to_string());
-        map.insert(
-            d.host.clone(),
-            DomainTarget {
-                project_id: d.project_id.clone(),
-                site: d.site.clone(),
-            },
-        );
+        map.insert(d.host.clone(), d.target());
     }
 }
 

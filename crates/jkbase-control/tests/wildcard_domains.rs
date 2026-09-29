@@ -1,0 +1,458 @@
+//! Wildcard domains through the public control API (`POST/GET/DELETE
+//! /projects/{id}/domains`, `…/verify`), offline: DNS answers come from an in-memory
+//! table via `AppState::dns_lookup`, and the cert manager is replaced by recorders.
+//! Covers the tenant-hostile invariants: ownership proof on the base, the ACME CNAME
+//! delegation (random, per-domain), cross-tenant verified-overlap refusal, the
+//! fail-closed capability gate, and that removal drops route + cert.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use jkbase_control::api::{AppState, DomainMap, WildcardSupport, router};
+use jkbase_control::auth::{self, ApiToken};
+use jkbase_control::logstore::LogStore;
+use jkbase_control::store::{DomainKind, DomainRecord, DomainStatus, Project, ProjectState, Store};
+use serde_json::{Value, json};
+
+type Dns = Arc<Mutex<HashMap<(String, String), Vec<String>>>>;
+
+struct Harness {
+    addr: std::net::SocketAddr,
+    /// Bearer tokens for tenant-1 (owns project `app`) and tenant-2 (owns `rival`).
+    t1: String,
+    t2: String,
+    store: Store,
+    dns: Dns,
+    domain_map: DomainMap,
+    cert_requests: Arc<Mutex<Vec<String>>>,
+    cert_removed: Arc<Mutex<Vec<String>>>,
+    issued: Arc<Mutex<HashSet<String>>>,
+}
+
+fn tenant_with_project(store: &Store, tenant: &str, project: &str) -> String {
+    store
+        .create_tenant(&auth::Tenant {
+            id: tenant.to_string(),
+            email: format!("{tenant}@example.com"),
+            password_hash: None,
+            created_at: 1,
+        })
+        .unwrap();
+    let raw = auth::generate_token();
+    store
+        .save_api_token(&ApiToken {
+            id: auth::generate_id(),
+            tenant_id: tenant.to_string(),
+            name: "default".to_string(),
+            token_hash: auth::hash_token(&raw).unwrap(),
+            created_at: 1,
+        })
+        .unwrap();
+    store
+        .create_project(&Project {
+            id: project.to_string(),
+            name: project.to_string(),
+            tenant_id: Some(tenant.to_string()),
+            current_version: None,
+            state: ProjectState::Stopped,
+            vm_ip: None,
+            domains: vec![],
+        })
+        .unwrap();
+    raw
+}
+
+async fn spawn(tag: &str, support: WildcardSupport) -> Harness {
+    let mut base = std::env::temp_dir();
+    base.push(format!("jkbase-wildcard-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let store = Store::open(&base.join("db.redb")).unwrap();
+    let t1 = tenant_with_project(&store, "tenant-1", "app");
+    let t2 = tenant_with_project(&store, "tenant-2", "rival");
+
+    let dns: Dns = Arc::default();
+    let domain_map: DomainMap = Arc::default();
+    let cert_requests: Arc<Mutex<Vec<String>>> = Arc::default();
+    let cert_removed: Arc<Mutex<Vec<String>>> = Arc::default();
+    let issued: Arc<Mutex<HashSet<String>>> = Arc::default();
+
+    let mut state = AppState::new(
+        store.clone(),
+        LogStore::new(base.join("logs")),
+        base.join("hosting"),
+    );
+    state.platform_domain = "jkbase.app".to_string();
+    state.wildcard_support = support;
+    state.domain_map = Some(domain_map.clone());
+    let d = dns.clone();
+    state.dns_lookup = Arc::new(move |name, rtype| {
+        let answers = d
+            .lock()
+            .unwrap()
+            .get(&(name, rtype.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        Box::pin(async move { answers })
+    });
+    let reqs = cert_requests.clone();
+    state.cert_request = Some(Arc::new(move |h| reqs.lock().unwrap().push(h)));
+    let iss = issued.clone();
+    state.cert_status = Some(Arc::new(move |h| iss.lock().unwrap().contains(h)));
+    let rem = cert_removed.clone();
+    state.cert_remove = Some(Arc::new(move |h| rem.lock().unwrap().push(h)));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(Arc::new(state), "jkbase.app".to_string());
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reqwest::get(format!("http://{addr}/health")),
+    )
+    .await
+    .expect("server did not come up")
+    .expect("health request failed");
+
+    Harness {
+        addr,
+        t1,
+        t2,
+        store,
+        dns,
+        domain_map,
+        cert_requests,
+        cert_removed,
+        issued,
+    }
+}
+
+impl Harness {
+    async fn call(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
+        let mut req = reqwest::Client::new()
+            .request(method, format!("http://{}{path}", self.addr))
+            .bearer_auth(token);
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let v = resp.json::<Value>().await.unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    async fn add(&self, token: &str, project: &str, domain: &str) -> (u16, Value) {
+        self.call(
+            token,
+            reqwest::Method::POST,
+            &format!("/projects/{project}/domains"),
+            Some(json!({ "domain": domain })),
+        )
+        .await
+    }
+
+    async fn verify(&self, token: &str, project: &str, host: &str) -> (u16, Value) {
+        self.call(
+            token,
+            reqwest::Method::POST,
+            &format!("/projects/{project}/domains/{host}/verify"),
+            None,
+        )
+        .await
+    }
+
+    fn publish(&self, name: &str, rtype: &str, data: &str) {
+        self.dns
+            .lock()
+            .unwrap()
+            .entry((name.to_string(), rtype.to_string()))
+            .or_default()
+            .push(data.to_string());
+    }
+}
+
+fn dns01() -> WildcardSupport {
+    WildcardSupport::Dns01 {
+        zone: "_acme-delegation.jkbase.app".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn add_returns_txt_and_a_random_per_domain_acme_cname() {
+    let h = spawn("add", dns01()).await;
+    let (st, a) = h.add(&h.t1, "app", "*.Play.DevelUp.win.").await;
+    assert_eq!(st, 200, "{a}");
+    assert_eq!(a["host"], "*.play.develup.win");
+    assert_eq!(a["kind"], "wildcard");
+    assert_eq!(a["status"], "pending");
+    // Ownership is proven on the BASE, with the ordinary custom-domain TXT challenge.
+    assert_eq!(
+        a["verification"]["record"],
+        "_jkbase-challenge.play.develup.win"
+    );
+    assert!(
+        a["verification"]["value"]
+            .as_str()
+            .unwrap()
+            .starts_with("jkb_")
+    );
+    assert_eq!(
+        a["acme_challenge"]["record"],
+        "_acme-challenge.play.develup.win"
+    );
+    let cname = a["acme_challenge"]["cname"].as_str().unwrap().to_string();
+    let label = cname
+        .strip_suffix("._acme-delegation.jkbase.app")
+        .expect("CNAME target sits in the platform delegation zone");
+    assert_eq!(label.len(), 32);
+
+    // A second wildcard (any tenant) never shares the delegation target.
+    let (st, b) = h.add(&h.t2, "rival", "*.other.example.com").await;
+    assert_eq!(st, 200, "{b}");
+    assert_ne!(b["acme_challenge"]["cname"].as_str().unwrap(), cname);
+
+    // Pending: not routable, no cert requested.
+    assert!(
+        h.domain_map
+            .read()
+            .await
+            .get("*.play.develup.win")
+            .is_none()
+    );
+    assert!(h.cert_requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_and_platform_wildcards_are_rejected() {
+    let h = spawn("invalid", dns01()).await;
+    for bad in [
+        "*.jkbase.app",
+        "*.api.jkbase.app",
+        "*.db.jkbase.app",
+        "*.co.uk",
+        "*.com",
+        "*.*.example.com",
+        "a.*.example.com",
+        "*.github.io",
+    ] {
+        let (st, v) = h.add(&h.t1, "app", bad).await;
+        assert_eq!(st, 400, "{bad}: {v}");
+    }
+}
+
+#[tokio::test]
+async fn wildcards_are_refused_without_a_dns01_backend_but_route_on_plain_http() {
+    let h = spawn("unsupported", WildcardSupport::Unsupported).await;
+    let (st, v) = h.add(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 501, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("DNS-01"), "{v}");
+    assert!(h.store.get_domain("*.play.develup.win").unwrap().is_none());
+
+    // Local dev (no TLS): no cert needed → no CNAME demanded; TXT alone activates it.
+    let h = spawn("plain", WildcardSupport::PlainHttp).await;
+    let (st, v) = h.add(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 200, "{v}");
+    assert!(v["acme_challenge"].is_null());
+    let token = v["verification"]["value"].as_str().unwrap().to_string();
+    h.publish(
+        "_jkbase-challenge.play.develup.win",
+        "TXT",
+        &format!("\"{token}\""),
+    );
+    let (st, v) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["status"], "active");
+    assert!(v["tls"].is_null());
+    assert!(h.domain_map.read().await.contains_key("*.play.develup.win"));
+}
+
+#[tokio::test]
+async fn verify_needs_txt_then_cname_and_stays_pending_until_the_cert_issues() {
+    let h = spawn("verify", dns01()).await;
+    let (_, a) = h.add(&h.t1, "app", "*.play.develup.win").await;
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    let cname = a["acme_challenge"]["cname"].as_str().unwrap().to_string();
+
+    // No TXT yet.
+    let (st, v) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 400, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("_jkbase-challenge.play.develup.win")
+    );
+
+    // TXT but no delegation CNAME: refused (issuance could never succeed).
+    h.publish(
+        "_jkbase-challenge.play.develup.win",
+        "TXT",
+        &format!("\"{token}\""),
+    );
+    let (st, v) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 400, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .unwrap()
+            .contains("_acme-challenge.play.develup.win")
+    );
+
+    // A CNAME to some OTHER target (e.g. another domain's label) is not accepted.
+    h.publish(
+        "_acme-challenge.play.develup.win",
+        "CNAME",
+        "ffffffffffffffffffffffffffffffff._acme-delegation.jkbase.app.",
+    );
+    let (st, _) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 400);
+
+    h.publish(
+        "_acme-challenge.play.develup.win",
+        "CNAME",
+        &format!("{cname}."),
+    );
+    let (st, v) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 200, "{v}");
+    // Verified (stored Active, routable, issuance requested) but reported Pending until
+    // the cert exists.
+    assert_eq!(v["status"], "pending");
+    assert_eq!(v["tls"], "provisioning");
+    assert!(v["verification"].is_null());
+    let rec = h.store.get_domain("*.play.develup.win").unwrap().unwrap();
+    assert_eq!(rec.status, DomainStatus::Active);
+    let label = cname.split('.').next().unwrap();
+    assert_eq!(
+        h.domain_map.read().await["*.play.develup.win"]
+            .acme_delegation
+            .as_deref(),
+        Some(label)
+    );
+    assert_eq!(
+        *h.cert_requests.lock().unwrap(),
+        vec!["*.play.develup.win".to_string()]
+    );
+
+    h.issued.lock().unwrap().insert("*.play.develup.win".into());
+    let (_, list) = h
+        .call(&h.t1, reqwest::Method::GET, "/projects/app/domains", None)
+        .await;
+    let w = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["host"] == "*.play.develup.win")
+        .unwrap();
+    assert_eq!(w["status"], "active");
+    assert_eq!(w["tls"], "active");
+}
+
+/// Seed `host` as a VERIFIED record of tenant-2's project.
+fn seed_active(h: &Harness, host: &str, kind: DomainKind) {
+    h.store
+        .claim_domain(&DomainRecord {
+            host: host.to_string(),
+            project_id: "rival".to_string(),
+            tenant_id: "tenant-2".to_string(),
+            site: None,
+            kind,
+            status: DomainStatus::Active,
+            token: "jkb_t2".to_string(),
+            created_at: 1,
+            acme_delegation: None,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_base_verified_by_another_tenant_blocks_the_wildcard_and_vice_versa() {
+    let h = spawn("conflict", dns01()).await;
+    // Tenant-2 verified the exact base → tenant-1 can't take `*.base`.
+    seed_active(&h, "sub.example.com", DomainKind::Custom);
+    let (st, v) = h.add(&h.t1, "app", "*.sub.example.com").await;
+    assert_eq!(st, 409, "{v}");
+
+    // Tenant-2 verified a wildcard → tenant-1 can't take its exact base …
+    seed_active(&h, "*.other.example.com", DomainKind::Wildcard);
+    let (st, v) = h.add(&h.t1, "app", "other.example.com").await;
+    assert_eq!(st, 409, "{v}");
+    // … nor the same wildcard (global uniqueness, as for exact hosts).
+    let (st, _) = h.add(&h.t1, "app", "*.other.example.com").await;
+    assert_eq!(st, 409);
+    // … but an exact host UNDER it is allowed (and wins routing once verified).
+    let (st, v) = h.add(&h.t1, "app", "x.other.example.com").await;
+    assert_eq!(st, 200, "{v}");
+
+    // Verify-time re-check: a claim that was clean at add time loses if the other
+    // tenant verified the overlapping base in the meantime.
+    let (st, a) = h.add(&h.t1, "app", "*.late.example.com").await;
+    assert_eq!(st, 200, "{a}");
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    let cname = a["acme_challenge"]["cname"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.late.example.com", "TXT", &token);
+    h.publish("_acme-challenge.late.example.com", "CNAME", &cname);
+    seed_active(&h, "late.example.com", DomainKind::Custom);
+    let (st, v) = h.verify(&h.t1, "app", "*.late.example.com").await;
+    assert_eq!(st, 409, "{v}");
+    assert_eq!(
+        h.store
+            .get_domain("*.late.example.com")
+            .unwrap()
+            .unwrap()
+            .status,
+        DomainStatus::Pending
+    );
+    assert!(!h.domain_map.read().await.contains_key("*.late.example.com"));
+}
+
+#[tokio::test]
+async fn only_the_owner_can_verify_or_remove_and_removal_drops_route_and_cert() {
+    let h = spawn("remove", WildcardSupport::PlainHttp).await;
+    let (_, a) = h.add(&h.t1, "app", "*.play.develup.win").await;
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.play.develup.win", "TXT", &token);
+
+    // Another tenant can neither verify nor remove it (even via its own project path).
+    let (st, _) = h.verify(&h.t2, "app", "*.play.develup.win").await;
+    assert_eq!(st, 404);
+    let (st, _) = h
+        .call(
+            &h.t2,
+            reqwest::Method::DELETE,
+            "/projects/rival/domains/*.play.develup.win",
+            None,
+        )
+        .await;
+    assert_eq!(st, 404);
+
+    let (st, _) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 200);
+    assert!(h.domain_map.read().await.contains_key("*.play.develup.win"));
+
+    let (st, _) = h
+        .call(
+            &h.t1,
+            reqwest::Method::DELETE,
+            "/projects/app/domains/%2A.play.develup.win",
+            None,
+        )
+        .await;
+    assert_eq!(st, 204);
+    assert!(h.store.get_domain("*.play.develup.win").unwrap().is_none());
+    assert!(!h.domain_map.read().await.contains_key("*.play.develup.win"));
+    assert_eq!(
+        *h.cert_removed.lock().unwrap(),
+        vec!["*.play.develup.win".to_string()]
+    );
+}

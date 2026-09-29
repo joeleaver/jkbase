@@ -31,6 +31,16 @@ pub fn generate_token() -> String {
     )
 }
 
+/// A random DNS label (128 bits from the OS CSPRNG, lowercase hex — DNS is
+/// case-insensitive, so base64 would lose entropy) for a wildcard domain's ACME
+/// CNAME delegation target. Unguessable and per-domain: it is the only name the
+/// platform will ever publish that domain's DNS-01 answer under.
+pub fn generate_dns_label() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn generate_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
@@ -272,4 +282,30 @@ pub fn generate_backup_id() -> String {
         hex.push_str(&format!("{b:02x}"));
     }
     format!("bkp_{}_{}", timestamp_ms(), hex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_dns_label;
+
+    #[test]
+    fn dns_labels_are_unique_unguessable_lowercase_hex() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10_000 {
+            let l = generate_dns_label();
+            // 128 bits → 32 hex chars: a valid DNS label (≤63), case-stable under DNS
+            // folding, and never equal to another domain's.
+            assert_eq!(l.len(), 32);
+            assert!(
+                l.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            assert!(seen.insert(l), "duplicate delegation label");
+        }
+        // Not a counter / not low-entropy: bits vary across the whole label.
+        let a = generate_dns_label();
+        let b = generate_dns_label();
+        let differing = a.bytes().zip(b.bytes()).filter(|(x, y)| x != y).count();
+        assert!(differing > 8, "{a} vs {b}");
+    }
 }
