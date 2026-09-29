@@ -1652,6 +1652,10 @@ async fn async_main() -> Result<()> {
             dns_provider,
             acme_email,
             acme_delegation_zone: acme_delegation_zone.clone(),
+            // The same resolver control's `verify` checks the CNAME with.
+            cname_lookup: Arc::new(|name: String| {
+                Box::pin(jkbase_control::api::doh_lookup(name, "CNAME"))
+            }),
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
     } else {
@@ -1667,17 +1671,19 @@ async fn async_main() -> Result<()> {
     state.platform_domain = args.domain.clone();
     state.admin_token = args.admin_token.clone();
     if let Some(ref cm) = cert_manager {
+        // An explicit request (verify / re-verify) re-arms a backed-off or abandoned
+        // wildcard; the reconcile loop honours the backoff.
         let cm_req = cm.clone();
-        state.cert_request = Some(Arc::new(move |host: String| {
-            let cm = cm_req.clone();
-            tokio::spawn(async move { cm.ensure_cert(&host).await });
-        }));
+        state.cert_request = Some(Arc::new(move |host: String| cm_req.request_cert(host)));
         let cm_status = cm.clone();
         state.cert_status = Some(Arc::new(move |host: &str| {
-            if cm_status.has_cert(host) {
-                jkbase_control::api::CertState::Issued
-            } else {
-                jkbase_control::api::CertState::Missing
+            use jkbase_control::api::CertState;
+            use jkbase_proxy::tls::HostCertState;
+            match cm_status.cert_state(host) {
+                HostCertState::Missing => CertState::Missing,
+                HostCertState::Issued => CertState::Issued,
+                HostCertState::Failed => CertState::Failed,
+                HostCertState::RenewalFailed => CertState::RenewalFailed,
             }
         }));
         let cm_remove = cm.clone();

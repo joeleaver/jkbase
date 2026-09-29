@@ -33,7 +33,9 @@ use instant_acme::{
 use jkbase_common::routing::{WILDCARD_PREFIX, is_wildcard_key, normalize_host, wildcard_key};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -52,6 +54,23 @@ const RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 60 * 60); // 60 days
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Don't re-attempt issuance for a host that failed within this window.
 const ISSUE_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// Tenant wildcards back off exponentially from here (doubling per consecutive failure)…
+const WILDCARD_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+/// …up to this cap…
+const WILDCARD_BACKOFF_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+/// …and give up after this many consecutive failures (~10.5h of retries) until the owner
+/// re-verifies. Every attempt is an order on the SHARED platform ACME account, so a
+/// tenant who breaks their CNAME must not be able to spend its rate limits forever.
+const WILDCARD_MAX_FAILURES: u32 = 8;
+/// DNS-01 orders sleep ~15s for propagation; the reconcile loop runs at most this many
+/// tenant-wildcard orders per tick (concurrently), so a pile of them can't starve
+/// custom-domain and platform renewals.
+const MAX_WILDCARD_ORDERS_PER_TICK: usize = 4;
+
+/// `_acme-challenge.<base>` → its CNAME target(s). The server wires this to the SAME
+/// resolver control's `verify` uses, so "verified" and "still delegated" agree.
+pub type CnameLookup =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TlsConfig {
@@ -65,6 +84,96 @@ pub struct TlsConfig {
     /// Zone (under `domain`, writable by `dns_provider`) holding the TXT answers for
     /// tenant wildcards' delegated `_acme-challenge` CNAMEs.
     pub acme_delegation_zone: String,
+    /// Pre-order check that a wildcard's delegation CNAME is still in place.
+    pub cname_lookup: CnameLookup,
+}
+
+/// A host's cert state, for the control API's `tls` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCertState {
+    Missing,
+    Issued,
+    /// Wildcard issuance gave up (see [`WILDCARD_MAX_FAILURES`]); no cert serving.
+    Failed,
+    /// Wildcard renewal gave up; the previous cert still serves until it expires.
+    RenewalFailed,
+}
+
+/// Per-wildcard issuance health: in-flight dedupe, exponential backoff, give-up.
+#[derive(Default, Debug)]
+struct WildcardHealth {
+    failures: u32,
+    next_attempt: Option<Instant>,
+    gave_up: bool,
+    in_flight: bool,
+}
+
+#[derive(Default, Debug)]
+struct WildcardHealthBook(HashMap<String, WildcardHealth>);
+
+fn wildcard_backoff(failures: u32) -> Duration {
+    let exp = failures.saturating_sub(1).min(20);
+    WILDCARD_BACKOFF_BASE
+        .saturating_mul(1u32 << exp)
+        .min(WILDCARD_BACKOFF_MAX)
+}
+
+impl WildcardHealthBook {
+    fn due(&self, host: &str, now: Instant) -> bool {
+        self.0
+            .get(host)
+            .is_none_or(|h| !h.in_flight && !h.gave_up && h.next_attempt.is_none_or(|t| now >= t))
+    }
+    /// Take the host's order slot; `false` if not due (in flight, backing off, gave up).
+    fn begin(&mut self, host: &str, now: Instant) -> bool {
+        if !self.due(host, now) {
+            return false;
+        }
+        self.0.entry(host.to_string()).or_default().in_flight = true;
+        true
+    }
+    fn succeed(&mut self, host: &str) {
+        self.0.remove(host);
+    }
+    /// Record a failed attempt; returns `true` once the host has given up.
+    fn fail(&mut self, host: &str, now: Instant) -> bool {
+        let h = self.0.entry(host.to_string()).or_default();
+        h.in_flight = false;
+        h.failures += 1;
+        if h.failures >= WILDCARD_MAX_FAILURES {
+            h.gave_up = true;
+        } else {
+            h.next_attempt = Some(now + wildcard_backoff(h.failures));
+        }
+        h.gave_up
+    }
+    fn gave_up(&self, host: &str) -> bool {
+        self.0.get(host).is_some_and(|h| h.gave_up)
+    }
+    /// Owner re-verified (or the name was released): forget the history, but keep an
+    /// in-flight marker so a concurrent order isn't duplicated.
+    fn reset(&mut self, host: &str) {
+        match self.0.get_mut(host) {
+            Some(h) if h.in_flight => {
+                *h = WildcardHealth {
+                    in_flight: true,
+                    ..Default::default()
+                }
+            }
+            _ => {
+                self.0.remove(host);
+            }
+        }
+    }
+}
+
+/// Whether `_acme-challenge.<base>` currently CNAMEs to exactly `challenge_name`.
+async fn delegation_in_place(lookup: &CnameLookup, base: &str, challenge_name: &str) -> bool {
+    let want = normalize_host(challenge_name);
+    lookup(format!("_acme-challenge.{base}"))
+        .await
+        .iter()
+        .any(|t| normalize_host(t.trim()) == want)
 }
 
 /// Default ACME delegation zone for a platform domain. The leading underscore keeps it
@@ -153,6 +262,8 @@ pub struct CertManager {
     challenges: Arc<AsyncRwLock<HashMap<String, String>>>,
     /// Last issuance attempt per host, for dedupe + failure backoff.
     inflight: Mutex<HashMap<String, Instant>>,
+    /// Tenant-wildcard issuance health (exponential backoff + give-up).
+    wildcard_health: Mutex<WildcardHealthBook>,
 }
 
 impl CertManager {
@@ -177,6 +288,7 @@ impl CertManager {
             resolver,
             challenges: Arc::new(AsyncRwLock::new(HashMap::new())),
             inflight: Mutex::new(HashMap::new()),
+            wildcard_health: Mutex::new(WildcardHealthBook::default()),
         });
 
         mgr.ensure_wildcard().await?;
@@ -208,6 +320,27 @@ impl CertManager {
     /// Whether a per-host certificate has been issued and loaded for `host`.
     pub fn has_cert(&self, host: &str) -> bool {
         self.resolver.hosts.read().unwrap().contains_key(host)
+    }
+
+    /// `host`'s cert state (issued / pending / given up) for the control API.
+    pub fn cert_state(&self, host: &str) -> HostCertState {
+        let gave_up = self.wildcard_health.lock().unwrap().gave_up(host);
+        match (self.has_cert(host), gave_up) {
+            (true, false) => HostCertState::Issued,
+            (true, true) => HostCertState::RenewalFailed,
+            (false, true) => HostCertState::Failed,
+            (false, false) => HostCertState::Missing,
+        }
+    }
+
+    /// An explicit issuance request (a domain was just verified / re-verified): clear
+    /// any backoff or give-up for `host`, then try now. The reconcile loop calls
+    /// [`Self::ensure_cert`] instead, which honours the backoff.
+    pub fn request_cert(self: &Arc<Self>, host: String) {
+        self.wildcard_health.lock().unwrap().reset(&host);
+        self.inflight.lock().unwrap().remove(&host);
+        let mgr = self.clone();
+        tokio::spawn(async move { mgr.ensure_cert(&host).await });
     }
 
     /// Provision/renew the wildcard cert if missing or near expiry, and load it
@@ -333,6 +466,7 @@ impl CertManager {
         let host = normalize_host(host);
         self.resolver.hosts.write().unwrap().remove(&host);
         self.inflight.lock().unwrap().remove(&host);
+        self.wildcard_health.lock().unwrap().reset(&host);
         if let Some(dir) = self.host_cert_dir(&host)
             && dir.exists()
         {
@@ -387,6 +521,9 @@ impl CertManager {
 
         info!(host = %host, "issuing custom-domain certificate via ACME HTTP-01");
         match self.issue_http01(host).await {
+            // Removed while the order ran: finalize_order already wrote the cache dir —
+            // drop it rather than resurrect a released name's cert.
+            Ok(_) if !self.domains.read().await.contains_key(host) => self.forget_cert(host),
             Ok(ck) => {
                 self.resolver
                     .hosts
@@ -402,6 +539,8 @@ impl CertManager {
     /// Issue/renew a tenant wildcard's cert. Gated EXACTLY like a custom host: `host`
     /// must be an Active domain-map entry — and it must carry the delegation label
     /// control minted, which is the only place its DNS-01 TXT is ever published.
+    /// Backed off exponentially per wildcard, and abandoned after
+    /// [`WILDCARD_MAX_FAILURES`] until the owner re-verifies ([`Self::request_cert`]).
     async fn ensure_wildcard_cert(&self, host: &str) {
         let label = match self.domains.read().await.get(host) {
             Some(t) => t.acme_delegation.clone(),
@@ -411,31 +550,70 @@ impl CertManager {
             warn!(host = %host, "wildcard has no usable ACME delegation; not issuing");
             return;
         };
-        if self.host_cert_fresh(host) || !self.claim_issue_slot(host) {
+        if self.host_cert_fresh(host) {
             return;
         }
-        let Some(dir) = self.host_cert_dir(host) else {
-            return;
-        };
-        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-            warn!(host = %host, error = %e, "cannot create wildcard cert dir");
+        if !self
+            .wildcard_health
+            .lock()
+            .unwrap()
+            .begin(host, Instant::now())
+        {
             return;
         }
+        match self
+            .run_wildcard_order(host, label.as_deref(), &order)
+            .await
+        {
+            Ok(()) => self.wildcard_health.lock().unwrap().succeed(host),
+            Err(e) => {
+                let gave_up = self
+                    .wildcard_health
+                    .lock()
+                    .unwrap()
+                    .fail(host, Instant::now());
+                if gave_up {
+                    warn!(host = %host, error = %e,
+                        "wildcard issuance failed repeatedly; giving up until re-verified");
+                } else {
+                    warn!(host = %host, error = %e, "wildcard issuance failed (backing off)");
+                }
+            }
+        }
+    }
+
+    async fn run_wildcard_order(
+        &self,
+        host: &str,
+        label: Option<&str>,
+        order: &WildcardOrder,
+    ) -> Result<()> {
+        let base = host.strip_prefix(WILDCARD_PREFIX).unwrap_or(host);
+        // No order (and no spend on the shared ACME account) unless the CA can actually
+        // reach our TXT through the tenant's CNAME — re-checked before EVERY order,
+        // renewals included, since the tenant can drop it at any time.
+        if !delegation_in_place(&self.cfg.cname_lookup, base, &order.challenge_name).await {
+            anyhow::bail!(
+                "_acme-challenge.{base} no longer CNAMEs to {}",
+                order.challenge_name
+            );
+        }
+        let dir = self
+            .host_cert_dir(host)
+            .ok_or_else(|| anyhow::anyhow!("unsafe cert cache name"))?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .context("cannot create wildcard cert dir")?;
         let (cert_path, key_path) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
         info!(host = %host, challenge = %order.challenge_name,
             "issuing wildcard certificate via ACME DNS-01 (CNAME delegation)");
-        if let Err(e) = self
-            .provision_cert(
-                &order.identifiers,
-                &order.challenge_name,
-                &cert_path,
-                &key_path,
-            )
-            .await
-        {
-            warn!(host = %host, error = %e, "wildcard issuance failed (will retry)");
-            return;
-        }
+        self.provision_cert(
+            &order.identifiers,
+            &order.challenge_name,
+            &cert_path,
+            &key_path,
+        )
+        .await?;
         // Removed (or re-registered under a new label) while the order ran: don't
         // resurrect a released name's cert.
         let still_ours = self
@@ -443,22 +621,19 @@ impl CertManager {
             .read()
             .await
             .get(host)
-            .is_some_and(|t| t.acme_delegation == label);
+            .is_some_and(|t| t.acme_delegation.as_deref() == label);
         if !still_ours {
             self.forget_cert(host);
-            return;
+            return Ok(());
         }
-        match read_certified_key(&cert_path, &key_path) {
-            Ok(ck) => {
-                self.resolver
-                    .hosts
-                    .write()
-                    .unwrap()
-                    .insert(host.to_string(), Arc::new(ck));
-                info!(host = %host, "wildcard certificate issued");
-            }
-            Err(e) => warn!(host = %host, error = %e, "failed to load issued wildcard cert"),
-        }
+        let ck = read_certified_key(&cert_path, &key_path)?;
+        self.resolver
+            .hosts
+            .write()
+            .unwrap()
+            .insert(host.to_string(), Arc::new(ck));
+        info!(host = %host, "wildcard certificate issued");
+        Ok(())
     }
 
     async fn issue_http01(&self, host: &str) -> Result<CertifiedKey> {
@@ -658,7 +833,7 @@ impl CertManager {
                     mgr.ensure_db_wildcard().await;
                 }
 
-                let custom_hosts: Vec<String> = {
+                let (wildcards, custom_hosts): (Vec<String>, Vec<String>) = {
                     let map = mgr.domains.read().await;
                     map.keys()
                         .filter(|h| h.contains('.'))
@@ -666,11 +841,28 @@ impl CertManager {
                             **h != mgr.cfg.domain && !h.ends_with(&format!(".{}", mgr.cfg.domain))
                         })
                         .cloned()
+                        .partition(|h| is_wildcard_key(h))
+                };
+                // A bounded batch of DUE wildcard orders runs concurrently alongside the
+                // serial custom-domain pass; the rest wait for a later tick.
+                let due: Vec<String> = {
+                    let now = Instant::now();
+                    let book = mgr.wildcard_health.lock().unwrap();
+                    wildcards
+                        .into_iter()
+                        .filter(|h| book.due(h, now) && !mgr.host_cert_fresh(h))
+                        .take(MAX_WILDCARD_ORDERS_PER_TICK)
                         .collect()
                 };
+                let mut orders = tokio::task::JoinSet::new();
+                for host in due {
+                    let m = mgr.clone();
+                    orders.spawn(async move { m.ensure_cert(&host).await });
+                }
                 for host in custom_hosts {
                     mgr.ensure_cert(&host).await;
                 }
+                while orders.join_next().await.is_some() {}
             }
         });
     }
@@ -1151,7 +1343,83 @@ mod tests {
             dns_provider: Arc::new(NoDns),
             acme_email: "ops@example.com".into(),
             acme_delegation_zone: zone.into(),
+            cname_lookup: Arc::new(|_| Box::pin(async { Vec::new() })),
         }
+    }
+
+    fn lookup(answers: &[&str]) -> CnameLookup {
+        let answers: Vec<String> = answers.iter().map(|a| a.to_string()).collect();
+        Arc::new(move |name| {
+            let a = if name == "_acme-challenge.play.develup.win" {
+                answers.clone()
+            } else {
+                Vec::new()
+            };
+            Box::pin(async move { a })
+        })
+    }
+
+    #[tokio::test]
+    async fn pre_order_check_requires_the_exact_delegation_cname() {
+        let want = "ab12._acme-delegation.jkbase.app";
+        assert!(
+            delegation_in_place(
+                &lookup(&["AB12._acme-delegation.jkbase.app."]),
+                "play.develup.win",
+                want
+            )
+            .await
+        );
+        // Removed, or pointed elsewhere (e.g. another domain's label): no order.
+        assert!(!delegation_in_place(&lookup(&[]), "play.develup.win", want).await);
+        assert!(
+            !delegation_in_place(
+                &lookup(&["ffff._acme-delegation.jkbase.app."]),
+                "play.develup.win",
+                want
+            )
+            .await
+        );
+    }
+
+    #[test]
+    fn wildcard_backoff_doubles_to_a_day_then_gives_up_until_reset() {
+        assert_eq!(wildcard_backoff(1), Duration::from_secs(5 * 60));
+        assert_eq!(wildcard_backoff(2), Duration::from_secs(10 * 60));
+        assert_eq!(wildcard_backoff(4), Duration::from_secs(40 * 60));
+        assert_eq!(wildcard_backoff(9), Duration::from_secs(1280 * 60));
+        assert_eq!(wildcard_backoff(10), WILDCARD_BACKOFF_MAX);
+        assert_eq!(wildcard_backoff(u32::MAX), WILDCARD_BACKOFF_MAX);
+
+        let mut book = WildcardHealthBook::default();
+        let h = "*.play.develup.win";
+        let t0 = Instant::now();
+        assert!(book.begin(h, t0));
+        // In flight: no duplicate order.
+        assert!(!book.due(h, t0));
+        assert!(!book.fail(h, t0));
+        assert!(!book.due(h, t0 + Duration::from_secs(4 * 60)));
+        assert!(book.due(h, t0 + Duration::from_secs(5 * 60)));
+        let mut now = t0;
+        for n in 2..=WILDCARD_MAX_FAILURES {
+            now += WILDCARD_BACKOFF_MAX;
+            assert!(book.begin(h, now), "attempt {n}");
+            let gave_up = book.fail(h, now);
+            assert_eq!(gave_up, n == WILDCARD_MAX_FAILURES);
+        }
+        // Given up: never due again, however long we wait…
+        assert!(book.gave_up(h));
+        assert!(!book.due(h, now + WILDCARD_BACKOFF_MAX * 30));
+        // …until the owner re-verifies.
+        book.reset(h);
+        assert!(book.due(h, now));
+        assert!(book.begin(h, now));
+        book.succeed(h);
+        assert!(!book.gave_up(h) && book.due(h, now));
+        // A reset during an in-flight order keeps it deduped.
+        assert!(book.begin(h, now));
+        book.reset(h);
+        assert!(!book.due(h, now));
     }
 
     #[test]
