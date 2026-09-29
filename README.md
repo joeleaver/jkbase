@@ -573,6 +573,50 @@ routed by their own `prefix`/`domain`, not through `[routes]`.
 Or attach domains imperatively with `jkbase domain add` (handy for `_acme-challenge` /
 TXT-verification flows). `--site <name>` binds a domain to one site within a multi-site project.
 
+### Wildcard domains
+
+Register `*.sub.example.com` and **every single label under it** — `abc.sub.example.com`,
+`build-4812.sub.example.com`, … — routes to your project with the original `Host` header intact, so
+one server can serve a fresh origin per upload/tenant/preview without an API call per name:
+
+```bash
+jkbase domain add '*.play.example.com'          # quote it: the shell would glob a bare *
+```
+
+It prints the three DNS records to create (at your DNS provider, in `example.com`'s zone):
+
+| Record | Type | Value | Why |
+|---|---|---|---|
+| `_jkbase-challenge.play.example.com` | TXT | `jkb_…` (printed) | Proves you own the **base** `play.example.com` — the same check as a custom domain |
+| `_acme-challenge.play.example.com` | CNAME | `<random>._acme-delegation.<platform>` (printed) | Lets the platform answer the ACME DNS-01 challenge for the `*.play.example.com` certificate. **Keep it** — renewals use it |
+| `*.play.example.com` | A / AAAA | the jkbase server's IP | The traffic. A CNAME works too, but only to a name whose TXT records you control (e.g. your `<project>.<platform>` host) — a wildcard CNAME also answers TXT lookups under the base |
+
+Then `jkbase domain verify '*.play.example.com'`. Verification checks the TXT **and** the CNAME; the
+domain then reads `pending` (`https provisioning`) until its certificate is issued (a minute or two),
+then `active`. Or declare it in `jkbase.toml` (`domain = "*.play.example.com"` on a site, or in
+`domains = [...]`) and run `verify` after the deploy.
+
+Rules:
+
+- **Single level only** (RFC 6125). `*.play.example.com` matches `abc.play.example.com` — not
+  `play.example.com` itself and not `a.b.play.example.com`. Register those separately if you want them.
+- **Exact wins.** An exact domain — yours or anyone's, registered before *or after* the wildcard —
+  always takes precedence over it. Platform subdomains (`*.jkbase.app`) are never wildcard-routed.
+- **What you can't register:** anything on or under the platform domain (it would shadow `api.`,
+  `storage.`, `console.`, the `*.db.` zone, …); a base with fewer than two labels (`*.com`) or a
+  registry suffix (`*.co.uk`, `*.github.io`); nested or partial wildcards (`*.*.example.com`,
+  `a.*.example.com`, `ab*.example.com`); and a wildcard whose base another account has verified as an
+  exact domain (or vice versa). A wildcard itself is unique, like any domain.
+- **Removing it** (`jkbase domain rm '*.play.example.com'`) unroutes every host under it and deletes
+  its certificate; nothing renews afterwards. You can drop the DNS records.
+- **Self-hosted without TLS** (local dev): no certificate is involved — the CNAME isn't needed, the
+  TXT alone activates it, and it routes on the plain-HTTP proxy port. **With TLS**, wildcards need
+  the platform's ACME DNS-01 backend (see [Self-hosting](#self-hosting-jkbase)); the delegation zone
+  defaults to `_acme-delegation.<domain>` (`ACME_DELEGATION_ZONE` to change it — it must sit under
+  `--domain`, in the zone the DNS-01 backend writes).
+
+Design and threat notes: [`docs/wildcard-domains.md`](docs/wildcard-domains.md).
+
 ---
 
 ## Managing secrets
@@ -751,7 +795,7 @@ guest_port   = 9987              # REQUIRED — the loopback port your service b
 | `jkbase db backup\|backups\|restore <id>` | Take / list / restore managed-database backups |
 | `jkbase auth key create\|list\|rm` | Manage jkbase-Auth issuer keys (`jkbk_…`) |
 | `jkbase auth rotate\|signing-keys\|jwks\|mint` | Rotate the signing key; inspect keys/JWKS; mint a token (dev) |
-| `jkbase domain add\|verify\|list\|rm` | Manage custom domains (`add --site <name>` to bind to one site) |
+| `jkbase domain add\|verify\|list\|rm` | Manage custom and [wildcard](#wildcard-domains) domains (`add --site <name>` to bind to one site) |
 | `jkbase l4 ls` | List a project's allocated raw-UDP ports (discover the public port) |
 | `jkbase repo connect\|github\|token\|disconnect` | Push-to-deploy: mint token/remote, scaffold CI, rotate, revoke |
 
@@ -854,7 +898,10 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    # RFC2136_ZONE=your-domain.com          # defaults to --domain
    ```
    With RFC2136, the host must be able to reach the nameserver (UDP/53, the update target), and the
-   zone you update must be the one Let's Encrypt resolves publicly.
+   zone you update must be the one Let's Encrypt resolves publicly. The same backend issues tenant
+   [wildcard domains](#wildcard-domains)' certificates by writing TXT records under
+   `ACME_DELEGATION_ZONE` (default `_acme-delegation.<domain>`, inside the zone above — no extra
+   credentials).
 2. **Build toolchains** — provisioning bakes only the busybox `default.ext4`. To serve the languages
    above you additionally need the per-language toolchain images (`bun.ext4`, `node.ext4`,
    `rust.ext4`, `python.ext4`, `go.ext4`, `dockerfile.ext4`, plus `jkbuild-function.ext4` for
@@ -892,7 +939,7 @@ toolchains in place with:
 A single `jkbase-server` process is the control plane, the reverse proxy, and the orchestrator:
 
 - **Routing & TLS.** The proxy terminates HTTPS (DNS-01 ACME for the wildcard, HTTP-01 for custom
-  domains), maps the request's `Host` to a project, and forwards over a per-VM TAP/bridge. Reserved
+  domains, DNS-01 via CNAME delegation for tenant wildcard domains), maps the request's `Host` to a project, and forwards over a per-VM TAP/bridge. Reserved
   hosts short-circuit that: `api.` (the control API), `storage.` (object store), `auth.` (the
   per-project JWT issuer), and `<project>.db.` (the managed-database TLS reach edge). The console is
   just a normal jkbase project on `console.<domain>`. Raw UDP is routed by port, not `Host`.
