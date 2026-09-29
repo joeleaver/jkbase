@@ -5,17 +5,22 @@
 //! delegation (random, per-domain), cross-tenant verified-overlap refusal, the
 //! fail-closed capability gate, and that removal drops route + cert.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jkbase_control::api::{AppState, DomainMap, WildcardSupport, router};
+use jkbase_control::api::{AppState, CertState, DomainMap, WildcardSupport, router};
 use jkbase_control::auth::{self, ApiToken};
 use jkbase_control::logstore::LogStore;
-use jkbase_control::store::{DomainKind, DomainRecord, DomainStatus, Project, ProjectState, Store};
+use jkbase_control::store::{
+    DomainKind, DomainRecord, DomainStatus, Project, ProjectState, Store, WildcardLimits,
+};
 use serde_json::{Value, json};
 
 type Dns = Arc<Mutex<HashMap<(String, String), Vec<String>>>>;
+
+/// Artificial DNS latency, to open the window between verify's read and its write.
+static DNS_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct Harness {
     addr: std::net::SocketAddr,
@@ -27,7 +32,7 @@ struct Harness {
     domain_map: DomainMap,
     cert_requests: Arc<Mutex<Vec<String>>>,
     cert_removed: Arc<Mutex<Vec<String>>>,
-    issued: Arc<Mutex<HashSet<String>>>,
+    certs: Arc<Mutex<HashMap<String, CertState>>>,
 }
 
 fn tenant_with_project(store: &Store, tenant: &str, project: &str) -> String {
@@ -64,6 +69,10 @@ fn tenant_with_project(store: &Store, tenant: &str, project: &str) -> String {
 }
 
 async fn spawn(tag: &str, support: WildcardSupport) -> Harness {
+    spawn_with(tag, support, WildcardLimits::default()).await
+}
+
+async fn spawn_with(tag: &str, support: WildcardSupport, limits: WildcardLimits) -> Harness {
     let mut base = std::env::temp_dir();
     base.push(format!("jkbase-wildcard-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -76,7 +85,7 @@ async fn spawn(tag: &str, support: WildcardSupport) -> Harness {
     let domain_map: DomainMap = Arc::default();
     let cert_requests: Arc<Mutex<Vec<String>>> = Arc::default();
     let cert_removed: Arc<Mutex<Vec<String>>> = Arc::default();
-    let issued: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let certs: Arc<Mutex<HashMap<String, CertState>>> = Arc::default();
 
     let mut state = AppState::new(
         store.clone(),
@@ -85,6 +94,7 @@ async fn spawn(tag: &str, support: WildcardSupport) -> Harness {
     );
     state.platform_domain = "jkbase.app".to_string();
     state.wildcard_support = support;
+    state.wildcard_limits = limits;
     state.domain_map = Some(domain_map.clone());
     let d = dns.clone();
     state.dns_lookup = Arc::new(move |name, rtype| {
@@ -94,12 +104,24 @@ async fn spawn(tag: &str, support: WildcardSupport) -> Harness {
             .get(&(name, rtype.to_string()))
             .cloned()
             .unwrap_or_default();
-        Box::pin(async move { answers })
+        Box::pin(async move {
+            let ms = DNS_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+            if ms > 0 {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            answers
+        })
     });
     let reqs = cert_requests.clone();
     state.cert_request = Some(Arc::new(move |h| reqs.lock().unwrap().push(h)));
-    let iss = issued.clone();
-    state.cert_status = Some(Arc::new(move |h| iss.lock().unwrap().contains(h)));
+    let c = certs.clone();
+    state.cert_status = Some(Arc::new(move |h| {
+        c.lock()
+            .unwrap()
+            .get(h)
+            .copied()
+            .unwrap_or(CertState::Missing)
+    }));
     let rem = cert_removed.clone();
     state.cert_remove = Some(Arc::new(move |h| rem.lock().unwrap().push(h)));
 
@@ -128,7 +150,7 @@ async fn spawn(tag: &str, support: WildcardSupport) -> Harness {
         domain_map,
         cert_requests,
         cert_removed,
-        issued,
+        certs,
     }
 }
 
@@ -245,6 +267,10 @@ async fn invalid_and_platform_wildcards_are_rejected() {
         "*.*.example.com",
         "a.*.example.com",
         "*.github.io",
+        // Platform labels are LDH: the `_`-prefixed delegation zone is unclaimable.
+        "_acme-delegation",
+        "_acme-delegation.jkbase.app",
+        "my_site",
     ] {
         let (st, v) = h.add(&h.t1, "app", bad).await;
         assert_eq!(st, 400, "{bad}: {v}");
@@ -344,7 +370,10 @@ async fn verify_needs_txt_then_cname_and_stays_pending_until_the_cert_issues() {
         vec!["*.play.develup.win".to_string()]
     );
 
-    h.issued.lock().unwrap().insert("*.play.develup.win".into());
+    h.certs
+        .lock()
+        .unwrap()
+        .insert("*.play.develup.win".into(), CertState::Issued);
     let (_, list) = h
         .call(&h.t1, reqwest::Method::GET, "/projects/app/domains", None)
         .await;
@@ -455,4 +484,205 @@ async fn only_the_owner_can_verify_or_remove_and_removal_drops_route_and_cert() 
         *h.cert_removed.lock().unwrap(),
         vec!["*.play.develup.win".to_string()]
     );
+}
+
+impl Harness {
+    async fn rm(&self, token: &str, project: &str, host: &str) -> (u16, Value) {
+        self.call(
+            token,
+            reqwest::Method::DELETE,
+            &format!("/projects/{project}/domains/{host}"),
+            None,
+        )
+        .await
+    }
+
+    async fn list(&self, token: &str, project: &str, host: &str) -> Value {
+        let (_, list) = self
+            .call(
+                token,
+                reqwest::Method::GET,
+                &format!("/projects/{project}/domains"),
+                None,
+            )
+            .await;
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["host"] == host)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+}
+
+/// Review F: verify reads the claim, awaits DNS, then writes. A removal during that
+/// wait — and another tenant's fresh claim on the freed key — must survive: the
+/// write re-reads the row in its txn and refuses a stale claim.
+#[tokio::test]
+async fn verify_racing_a_removal_neither_resurrects_nor_clobbers() {
+    let h = spawn("race", WildcardSupport::PlainHttp).await;
+    let (st, a) = h.add(&h.t1, "app", "*.race.example.com").await;
+    assert_eq!(st, 200, "{a}");
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.race.example.com", "TXT", &token);
+
+    DNS_DELAY_MS.store(800, std::sync::atomic::Ordering::SeqCst);
+    let (addr, t1) = (h.addr, h.t1.clone());
+    let verify = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!(
+                "http://{addr}/projects/app/domains/*.race.example.com/verify"
+            ))
+            .bearer_auth(t1)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (st, _) = h.rm(&h.t1, "app", "*.race.example.com").await;
+    assert_eq!(st, 204);
+    let (st, v) = h.add(&h.t2, "rival", "*.race.example.com").await;
+    assert_eq!(st, 200, "{v}");
+    let verify_status = verify.await.unwrap();
+    DNS_DELAY_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(verify_status, 409);
+    let row = h.store.get_domain("*.race.example.com").unwrap().unwrap();
+    assert_eq!(row.tenant_id, "tenant-2");
+    assert_eq!(row.status, DomainStatus::Pending);
+    assert!(!h.domain_map.read().await.contains_key("*.race.example.com"));
+}
+
+/// Review: an unverified claim must not lock the real owner out forever. A fresh
+/// foreign claim holds (409); once stale it is replaced, and whoever proves DNS wins.
+#[tokio::test]
+async fn a_stale_pending_squat_is_taken_over_by_the_owner() {
+    let fresh = spawn("squat-fresh", dns01()).await;
+    let (st, _) = fresh.add(&fresh.t2, "rival", "*.play.victim.com").await;
+    assert_eq!(st, 200);
+    let (st, v) = fresh.add(&fresh.t1, "app", "*.play.victim.com").await;
+    assert_eq!(st, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("taken over"), "{v}");
+
+    // Takeover grace of zero: the squat is immediately stale.
+    let limits = WildcardLimits {
+        pending_takeover_secs: 0,
+        ..WildcardLimits::default()
+    };
+    let h = spawn_with("squat-stale", WildcardSupport::PlainHttp, limits).await;
+    let (st, _) = h.add(&h.t2, "rival", "*.play.victim.com").await;
+    assert_eq!(st, 200);
+    let (st, a) = h.add(&h.t1, "app", "*.play.victim.com").await;
+    assert_eq!(st, 200, "{a}");
+    // The squatter's claim is gone: it can't verify, even with a TXT for its old token.
+    let (st, _) = h.verify(&h.t2, "rival", "*.play.victim.com").await;
+    assert_eq!(st, 404);
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.play.victim.com", "TXT", &token);
+    let (st, v) = h.verify(&h.t1, "app", "*.play.victim.com").await;
+    assert_eq!(st, 200, "{v}");
+    // Verified rows are never replaceable.
+    let (st, _) = h.add(&h.t2, "rival", "*.play.victim.com").await;
+    assert_eq!(st, 409);
+}
+
+#[tokio::test]
+async fn wildcard_claims_are_capped_per_tenant() {
+    let limits = WildcardLimits {
+        max_pending_per_tenant: 2,
+        max_per_tenant: 3,
+        ..WildcardLimits::default()
+    };
+    let h = spawn_with("caps", WildcardSupport::PlainHttp, limits).await;
+    for base in ["a.t1.com", "b.t1.com"] {
+        let (st, v) = h.add(&h.t1, "app", &format!("*.{base}")).await;
+        assert_eq!(st, 200, "{v}");
+    }
+    let (st, v) = h.add(&h.t1, "app", "*.c.t1.com").await;
+    assert_eq!(st, 429, "{v}");
+    // Verifying one frees a pending slot, up to the total cap.
+    let (_, a) = h.add(&h.t1, "app", "*.a.t1.com").await; // already attached → 400
+    assert!(a["error"].as_str().unwrap().contains("already attached"));
+    let tok = h.store.get_domain("*.a.t1.com").unwrap().unwrap().token;
+    h.publish("_jkbase-challenge.a.t1.com", "TXT", &tok);
+    assert_eq!(h.verify(&h.t1, "app", "*.a.t1.com").await.0, 200);
+    assert_eq!(h.add(&h.t1, "app", "*.c.t1.com").await.0, 200);
+    let (st, v) = h.add(&h.t1, "app", "*.d.t1.com").await;
+    assert_eq!(st, 429, "{v}");
+    // Caps are per tenant.
+    assert_eq!(h.add(&h.t2, "rival", "*.d.t1.com").await.0, 200);
+}
+
+/// Review: the old binary's boot grandfathering recreates cached hosts that have no
+/// DOMAINS row as ACTIVE, proof-less custom domains. Wildcards (whose rows it can't
+/// see) and pending hosts must therefore never be in the cache.
+#[tokio::test]
+async fn project_domain_cache_never_holds_wildcards_or_pending_hosts() {
+    let h = spawn("cache", WildcardSupport::PlainHttp).await;
+    let (st, a) = h.add(&h.t2, "rival", "*.victim.com").await;
+    assert_eq!(st, 200);
+    assert_eq!(h.add(&h.t2, "rival", "pending.example.com").await.0, 200);
+    let cache = || h.store.get_project("rival").unwrap().unwrap().domains;
+    assert!(cache().is_empty(), "{:?}", cache());
+
+    // Even once verified, a wildcard stays out of it.
+    let tok = a["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.victim.com", "TXT", &tok);
+    assert_eq!(h.verify(&h.t2, "rival", "*.victim.com").await.0, 200);
+    assert!(cache().is_empty(), "{:?}", cache());
+    // A verified exact host is cached as before.
+    let tok = h
+        .store
+        .get_domain("pending.example.com")
+        .unwrap()
+        .unwrap()
+        .token;
+    h.publish("_jkbase-challenge.pending.example.com", "TXT", &tok);
+    assert_eq!(h.verify(&h.t2, "rival", "pending.example.com").await.0, 200);
+    assert_eq!(cache(), vec!["pending.example.com".to_string()]);
+}
+
+/// Review: after repeated failures the cert manager stops ordering and reports
+/// `tls: failed`; re-verifying (DNS re-checked) re-arms issuance.
+#[tokio::test]
+async fn a_given_up_wildcard_reports_failed_and_reverify_rearms_it() {
+    let h = spawn("failed", dns01()).await;
+    let (_, a) = h.add(&h.t1, "app", "*.play.develup.win").await;
+    let tok = a["verification"]["value"].as_str().unwrap().to_string();
+    let cname = a["acme_challenge"]["cname"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.play.develup.win", "TXT", &tok);
+    h.publish("_acme-challenge.play.develup.win", "CNAME", &cname);
+    assert_eq!(h.verify(&h.t1, "app", "*.play.develup.win").await.0, 200);
+    assert_eq!(h.cert_requests.lock().unwrap().len(), 1);
+
+    h.certs
+        .lock()
+        .unwrap()
+        .insert("*.play.develup.win".into(), CertState::Failed);
+    let w = h.list(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(w["tls"], "failed");
+    assert_eq!(w["status"], "pending");
+
+    // Re-verify with the CNAME gone: refused, nothing re-armed.
+    h.dns
+        .lock()
+        .unwrap()
+        .remove(&("_acme-challenge.play.develup.win".into(), "CNAME".into()));
+    assert_eq!(h.verify(&h.t1, "app", "*.play.develup.win").await.0, 400);
+    assert_eq!(h.cert_requests.lock().unwrap().len(), 1);
+    // CNAME back: re-armed.
+    h.publish("_acme-challenge.play.develup.win", "CNAME", &cname);
+    assert_eq!(h.verify(&h.t1, "app", "*.play.develup.win").await.0, 200);
+    assert_eq!(h.cert_requests.lock().unwrap().len(), 2);
+
+    // A renewal that gave up while the old cert still serves stays `active`.
+    h.certs
+        .lock()
+        .unwrap()
+        .insert("*.play.develup.win".into(), CertState::RenewalFailed);
+    let w = h.list(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(w["tls"], "renewal-failed");
+    assert_eq!(w["status"], "active");
 }

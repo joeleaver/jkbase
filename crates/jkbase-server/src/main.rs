@@ -123,6 +123,11 @@ struct Args {
     #[arg(long, env = "ACME_DELEGATION_ZONE")]
     acme_delegation_zone: Option<String>,
 
+    /// Max wildcard domains (any status) per tenant. Each is an ACME order stream on the
+    /// shared platform account, so keep this small.
+    #[arg(long, env = "MAX_WILDCARD_DOMAINS_PER_TENANT", default_value = "20")]
+    max_wildcard_domains_per_tenant: usize,
+
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
@@ -1668,10 +1673,17 @@ async fn async_main() -> Result<()> {
             tokio::spawn(async move { cm.ensure_cert(&host).await });
         }));
         let cm_status = cm.clone();
-        state.cert_status = Some(Arc::new(move |host: &str| cm_status.has_cert(host)));
+        state.cert_status = Some(Arc::new(move |host: &str| {
+            if cm_status.has_cert(host) {
+                jkbase_control::api::CertState::Issued
+            } else {
+                jkbase_control::api::CertState::Missing
+            }
+        }));
         let cm_remove = cm.clone();
         state.cert_remove = Some(Arc::new(move |host: String| cm_remove.forget_cert(&host)));
     }
+    state.wildcard_limits.max_per_tenant = args.max_wildcard_domains_per_tenant;
     // Every TLS config carries a DNS-01 backend (it's how the platform wildcard issues),
     // so wildcards are always issuable with TLS on; without TLS they route on plain HTTP.
     state.wildcard_support = if cert_manager.is_some() {
@@ -2936,6 +2948,13 @@ fn project_can_wake(data_dir: &Path, store: &Store, project_id: &str) -> bool {
 async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &DomainMap) {
     let active = {
         let mut plat = platform.lock().await;
+        // Before anything reads the registry: drop rows a pre-wildcard binary may have
+        // left behind across a rollback (proof-less `*` rows, orphaned wildcards).
+        match plat.store.purge_invalid_domain_rows() {
+            Ok(0) => {}
+            Ok(n) => warn!(removed = n, "purged invalid domain rows at boot"),
+            Err(e) => tracing::error!(error = %e, "domain-row purge failed"),
+        }
         let projects = match plat.store.list_projects() {
             Ok(p) => p,
             Err(e) => {

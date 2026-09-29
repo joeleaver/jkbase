@@ -119,8 +119,20 @@ pub type DomainMap = Arc<tokio::sync::RwLock<std::collections::HashMap<String, D
 /// Fire-and-forget request to (proactively) issue a TLS cert for a verified
 /// custom domain. Wired by the server to the proxy's CertManager.
 pub type CertRequest = Arc<dyn Fn(String) + Send + Sync>;
-/// Query whether a per-host TLS cert has been issued for a custom domain.
-pub type CertStatusFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Issuance state of a custom/wildcard host's cert, as the cert manager sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertState {
+    /// Not issued yet (issuance pending / retrying).
+    Missing,
+    Issued,
+    /// Wildcard only: repeated failures (or the `_acme-challenge` CNAME is gone); the
+    /// cert manager has STOPPED ordering until the owner re-verifies. No cert serving.
+    Failed,
+    /// Like `Failed`, but an earlier cert is still loaded and serving until it expires.
+    RenewalFailed,
+}
+/// Query a host's cert state (wired by the server to the proxy's CertManager).
+pub type CertStatusFn = Arc<dyn Fn(&str) -> CertState + Send + Sync>;
 /// Drop a released host's issued cert (resolver + on-disk cache) so a removed domain
 /// stops being served and renewed. Wired by the server to the proxy's CertManager.
 pub type CertRemove = Arc<dyn Fn(String) + Send + Sync>;
@@ -166,6 +178,8 @@ pub struct AppState {
     /// Fail-closed default [`WildcardSupport::Unsupported`]; the server sets it from
     /// its TLS config.
     pub wildcard_support: WildcardSupport,
+    /// Per-tenant anti-squat / ACME-budget caps on wildcard claims.
+    pub wildcard_limits: crate::store::WildcardLimits,
     /// Tears down live managed-DB relays on key revocation / project delete ([R5]).
     pub db_revoke_callback: Option<DbRevokeCallback>,
     /// Runs a managed-DB backup (host-relay pull → platform store). `None` ⇒ backups disabled
@@ -258,6 +272,7 @@ impl AppState {
             cert_remove: None,
             dns_lookup: Arc::new(|name, rtype| Box::pin(doh_lookup(name, rtype))),
             wildcard_support: WildcardSupport::Unsupported,
+            wildcard_limits: crate::store::WildcardLimits::default(),
             db_revoke_callback: None,
             db_backup_callback: None,
             db_restore_callback: None,
@@ -4864,22 +4879,30 @@ fn tls_status(state: &AppState, r: &crate::store::DomainRecord) -> Option<String
     if r.status != DomainStatus::Active {
         return None;
     }
-    let has_cert = || {
-        state
+    let cert = || {
+        let st = state
             .cert_status
             .as_ref()
             .map(|f| f(&r.host))
-            .unwrap_or(false)
+            .unwrap_or(CertState::Missing);
+        Some(
+            match st {
+                CertState::Missing => "provisioning",
+                CertState::Issued => "active",
+                CertState::Failed => "failed",
+                CertState::RenewalFailed => "renewal-failed",
+            }
+            .to_string(),
+        )
     };
     match r.kind {
         DomainKind::Subdomain => Some("active".to_string()),
-        DomainKind::Custom => Some(if has_cert() { "active" } else { "provisioning" }.to_string()),
+        DomainKind::Custom => cert(),
         DomainKind::Wildcard => match state.wildcard_support {
-            WildcardSupport::Dns01 { .. } => {
-                Some(if has_cert() { "active" } else { "provisioning" }.to_string())
-            }
+            WildcardSupport::Dns01 { .. } => cert(),
             _ => None,
         },
+        DomainKind::Unknown => None,
     }
 }
 
@@ -4908,7 +4931,8 @@ fn domain_response(state: &AppState, r: crate::store::DomainRecord) -> DomainRes
         None
     };
     let tls = tls_status(state, &r);
-    let status = if r.kind == DomainKind::Wildcard && tls.as_deref() == Some("provisioning") {
+    let not_serving = matches!(tls.as_deref(), Some("provisioning" | "failed"));
+    let status = if r.kind == DomainKind::Wildcard && not_serving {
         DomainStatus::Pending
     } else {
         r.status
@@ -4980,7 +5004,7 @@ fn ownership_conflicts(host: &str, kind: DomainKind) -> Vec<String> {
                 .to_string(),
         ],
         DomainKind::Custom => vec![format!("{}{host}", jkbase_common::routing::WILDCARD_PREFIX)],
-        DomainKind::Subdomain => Vec::new(),
+        DomainKind::Subdomain | DomainKind::Unknown => Vec::new(),
     }
 }
 
@@ -5013,12 +5037,64 @@ fn new_domain_record(
         kind,
         status: match kind {
             DomainKind::Subdomain => DomainStatus::Active,
-            DomainKind::Custom | DomainKind::Wildcard => DomainStatus::Pending,
+            DomainKind::Custom | DomainKind::Wildcard | DomainKind::Unknown => {
+                DomainStatus::Pending
+            }
         },
         token: auth::generate_token(),
         created_at: auth::timestamp(),
         acme_delegation: (kind == DomainKind::Wildcard).then(auth::generate_dns_label),
     }
+}
+
+/// Claim a wildcard under the anti-squat rules (see `Store::claim_wildcard`); `Some`
+/// is the error response.
+fn claim_wildcard(state: &AppState, record: &DomainRecord) -> Option<axum::response::Response> {
+    use crate::store::WildcardClaim;
+    let host = &record.host;
+    let limits = &state.wildcard_limits;
+    match state
+        .store
+        .claim_wildcard(record, limits, auth::timestamp())
+    {
+        Ok(WildcardClaim::Claimed) => None,
+        Ok(WildcardClaim::Replaced(prev)) => {
+            info!(host = %host, previous_tenant = %prev.tenant_id,
+                "took over a stale pending wildcard claim");
+            None
+        }
+        Ok(WildcardClaim::Taken(r)) if r.project_id == record.project_id => Some(bad_request(
+            format!("'{host}' is already attached to this project"),
+        )),
+        Ok(WildcardClaim::Taken(r)) if r.tenant_id == record.tenant_id => Some(conflict(format!(
+            "'{host}' is already attached to another of your projects"
+        ))),
+        Ok(WildcardClaim::Taken(r)) if r.status == DomainStatus::Pending => {
+            Some(conflict(format!(
+                "'{host}' has an unverified claim by another account; it can be taken over once \
+             that claim is {} minutes old",
+                limits.pending_takeover_secs / 60
+            )))
+        }
+        Ok(WildcardClaim::Taken(_)) => Some(conflict(format!("'{host}' is already in use"))),
+        Ok(WildcardClaim::PendingCapReached) => Some(too_many(format!(
+            "at most {} unverified wildcard domains per account; verify or remove one first",
+            limits.max_pending_per_tenant
+        ))),
+        Ok(WildcardClaim::TotalCapReached) => Some(too_many(format!(
+            "at most {} wildcard domains per account",
+            limits.max_per_tenant
+        ))),
+        Err(e) => Some(internal_error(e)),
+    }
+}
+
+fn too_many(msg: String) -> axum::response::Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorResponse { error: msg }),
+    )
+        .into_response()
 }
 
 async fn add_domain(
@@ -5040,14 +5116,16 @@ async fn add_domain(
     }
 
     // Global uniqueness: a host owned by anyone else (or reserved) is rejected.
+    // (Wildcards decide inside `claim_wildcard`'s txn: a stale foreign Pending claim
+    // there is replaceable, not a conflict.)
     match state.store.get_domain(&host) {
-        Ok(Some(existing)) => {
-            if existing.project_id == id {
-                return bad_request(format!("'{host}' is already attached to this project"));
-            }
+        Ok(Some(existing)) if existing.project_id == id => {
+            return bad_request(format!("'{host}' is already attached to this project"));
+        }
+        Ok(Some(_)) if kind != DomainKind::Wildcard => {
             return conflict(format!("'{host}' is already in use"));
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(e) => return internal_error(e),
     }
     if crate::store::host_is_reserved(&host) {
@@ -5063,10 +5141,16 @@ async fn add_domain(
     let record = new_domain_record(&host, kind, &id, &tenant.id, req.site.clone());
     let status = record.status;
 
-    match state.store.claim_domain(&record) {
-        Ok(true) => {}
-        Ok(false) => return conflict(format!("'{host}' was just claimed by someone else")),
-        Err(e) => return internal_error(e),
+    if kind == DomainKind::Wildcard {
+        if let Some(resp) = claim_wildcard(&state, &record) {
+            return resp;
+        }
+    } else {
+        match state.store.claim_domain(&record) {
+            Ok(true) => {}
+            Ok(false) => return conflict(format!("'{host}' was just claimed by someone else")),
+            Err(e) => return internal_error(e),
+        }
     }
 
     if record.status == DomainStatus::Active {
@@ -5088,7 +5172,16 @@ async fn verify_domain(
         _ => return project_not_found(&host),
     };
 
-    if record.status == DomainStatus::Active {
+    // Re-verify of a wildcard whose cert manager gave up (`tls: failed`): re-check the
+    // DNS below, then re-arm issuance. Anything else Active is a no-op.
+    let cert_gave_up = record.kind == DomainKind::Wildcard
+        && state.cert_status.as_ref().is_some_and(|f| {
+            matches!(
+                f(&record.host),
+                CertState::Failed | CertState::RenewalFailed
+            )
+        });
+    if record.status == DomainStatus::Active && !cert_gave_up {
         return Json(domain_response(&state, record)).into_response();
     }
 
@@ -5126,15 +5219,33 @@ async fn verify_domain(
         }
     }
 
-    // Flip to Active and re-check cross-kind ownership in the SAME txn.
+    if record.status == DomainStatus::Active {
+        // cert_gave_up: DNS is back in place → re-arm issuance (resets the backoff).
+        if let Some(req) = &state.cert_request {
+            req(record.host.clone());
+        }
+        info!(project = %id, host = %record.host, "wildcard re-verified; issuance re-armed");
+        return Json(domain_response(&state, record)).into_response();
+    }
+
+    // Flip to Active and re-check cross-kind ownership in the SAME txn — and only if the
+    // row is still exactly this claim (it may have been removed or taken over while we
+    // awaited DNS).
+    use crate::store::Activation;
     match state
         .store
         .activate_domain_exclusive(&record, &ownership_conflicts(&record.host, record.kind))
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(Activation::Activated) => {}
+        Ok(Activation::Conflict) => {
             return conflict(format!(
                 "'{}' overlaps a name another account has verified",
+                record.host
+            ));
+        }
+        Ok(Activation::Stale) => {
+            return conflict(format!(
+                "'{}' changed while it was being verified (removed or re-claimed); add it again",
                 record.host
             ));
         }
@@ -5243,7 +5354,13 @@ async fn deactivate_host(state: &AppState, host: &str) {
 }
 
 /// Keep `project.domains` as a denormalized cache (used by ProjectResponse) of
-/// the project's claimed hosts. Best-effort.
+/// the project's VERIFIED exact hosts. Best-effort.
+///
+/// Pending and wildcard hosts are deliberately left out: a pre-wildcard binary's boot
+/// grandfathering recreates every cached host that has no DOMAINS row as an ACTIVE
+/// custom domain with no proof — and wildcard rows live in a table it never reads, so
+/// any cached `*.x` (or a pending host whose row was since dropped) would come back
+/// "verified" after a rollback.
 fn refresh_domain_cache(state: &AppState, project_id: &str) -> anyhow::Result<()> {
     if let Some(mut project) = state.store.get_project(project_id)? {
         let mut hosts: Vec<String> = state
@@ -5251,6 +5368,7 @@ fn refresh_domain_cache(state: &AppState, project_id: &str) -> anyhow::Result<()
             .list_domains_for_project(project_id)?
             .into_iter()
             .filter(|d| d.host != project_id) // exclude the primary label
+            .filter(|d| d.status == DomainStatus::Active && d.kind != DomainKind::Wildcard)
             .map(|d| d.host)
             .collect();
         hosts.sort();
@@ -5394,7 +5512,13 @@ async fn reconcile_deploy_domains(
         }
         let record = new_domain_record(&host, kind, &project.id, &tenant_id, site);
         let status = record.status;
-        match state.store.claim_domain(&record) {
+        // Wildcards go through the capped claim; a refusal is just "not claimed".
+        let claimed = if kind == DomainKind::Wildcard {
+            Ok(claim_wildcard(state, &record).is_none())
+        } else {
+            state.store.claim_domain(&record)
+        };
+        match claimed {
             Ok(true) => {
                 if record.status == DomainStatus::Active {
                     activate_domain(state, &record).await;
