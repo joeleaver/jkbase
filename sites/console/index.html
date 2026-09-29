@@ -3787,6 +3787,9 @@ body {
       tlsChip = h("span", { className: "badge badge-active" }, "HTTPS");
     } else if (d.tls === "provisioning") {
       tlsChip = h("span", { className: "badge badge-pending" }, "HTTPS provisioning");
+    } else if (d.tls === "failed" || d.tls === "renewal-failed") {
+      tlsChip = h("span", { className: "badge badge-pending" },
+        d.tls === "failed" ? "HTTPS failed" : "HTTPS renewal failed");
     }
 
     var head = h("div", { className: "domain-head" },
@@ -3831,6 +3834,22 @@ body {
             onClick: function() { verifyDomain(project.id, d.host); },
           }, busy ? "Verifying..." : "Verify"),
           err
+        )
+      );
+    } else if ((d.tls === "failed" || d.tls === "renewal-failed") && isWildcard) {
+      var ferr = state.domainError && state.domainError.host === d.host
+        ? h("span", { className: "dns-error" }, state.domainError.message)
+        : null;
+      challenge = h("div", { className: "domain-hint" },
+        "Certificate issuance kept failing, so it was paused. Check the _acme-challenge CNAME below, then re-verify to retry.",
+        d.acme_challenge ? renderAcmeDelegation(d) : null,
+        h("div", { className: "dns-challenge-actions" },
+          h("button", {
+            className: "btn btn-primary btn-sm",
+            disabled: busy ? "disabled" : null,
+            onClick: function() { verifyDomain(project.id, d.host); },
+          }, busy ? "Verifying..." : "Re-verify"),
+          ferr
         )
       );
     } else if (d.tls === "provisioning" && isWildcard) {
