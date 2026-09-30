@@ -179,10 +179,12 @@ else can publish TXT under, or use A/AAAA.
   takeover starts with no `site` binding.
 - Exact custom domains keep first-come Pending claims (no takeover, no caps). The same approach
   would work there but changes long-standing behaviour, so it's left for a separate change.
-- The ACME flow has no test double (`instant_acme::Account` talks to a real CA), so DNS-01 issuance is
-  covered in pieces: order/challenge-name construction, label validation, the pre-order CNAME check,
-  the backoff/give-up state machine, and that the RFC2136 backend accepts the delegated name. Not
-  exercised against Pebble or LE staging.
+- Live issuance runs against Pebble + BIND (`tools/wildcard-issuance-e2e.sh`, Docker, nothing leaves
+  the box): the platform apex and `*.db` certs over RFC2136, then a tenant `*.<base>` through its
+  `_acme-challenge` CNAME (tenant zone → `<label>._acme-delegation.<platform>`), TXT cleanup, and a
+  non-delegated wildcard refused before any order. Not yet run against LE staging or the Cloudflare
+  backend. Note the CA must resolve recursively to follow the CNAME (LE does; an authoritative-only
+  test nameserver doesn't).
 - A replaced pending claimant keeps the same records (proofs are deterministic per tenant, host and
   generation) and can simply `verify` again.
 - A rollback window can split `B` and `*.B` between tenants (the old binary can't see the wildcard

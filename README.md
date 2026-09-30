@@ -926,6 +926,8 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    `ACME_DELEGATION_ZONE` (default `_acme-delegation.<domain>`, inside the zone above — no extra
    credentials; the server refuses to start if it isn't inside `RFC2136_ZONE`). Changing it later
    breaks every tenant's existing `_acme-challenge` CNAME, so pick it once.
+   `ACME_DIRECTORY_URL` (+ `ACME_CA_ROOT` for its HTTPS root, if not public) points issuance at
+   another ACME CA — a private one (step-ca, …) or Pebble for tests; it overrides `--acme-staging`.
    Tenant certificate orders share your ACME account, so they're capped: `TENANT_ACME_ORDERS_PER_3H`
    (default 60, across all tenants — the rest of Let's Encrypt's 300/3 h stays reserved for the
    platform's own certs), of which `TENANT_ACME_RENEWAL_RESERVE_PERCENT` (default 33) only renewals

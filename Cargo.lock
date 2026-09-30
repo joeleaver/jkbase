@@ -1954,6 +1954,7 @@ dependencies = [
  "tokio-rustls 0.26.4",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
