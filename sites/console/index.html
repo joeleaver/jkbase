@@ -2976,8 +2976,17 @@ body {
     state.error = null;
     var body = { domain: domain };
     if (site) body.site = site;
-    api("POST", "/projects/" + projectId + "/domains", body).then(function() {
+    api("POST", "/projects/" + projectId + "/domains", body).then(function(d) {
       state.showAddDomain = false;
+      // 202: another account holds an unverified claim. Nothing was saved for us, so the
+      // list won't show it — surface our records here; proving DNS first wins it.
+      if (d && d.note && d.verification) {
+        var msg = d.note + " TXT " + d.verification.record + " = " + d.verification.value;
+        if (d.acme_challenge) {
+          msg += "; CNAME " + d.acme_challenge.record + " -> " + d.acme_challenge.cname;
+        }
+        state.error = msg + ". Then run: jkbase domain verify '" + d.host + "'";
+      }
       loadDomains(projectId);
     }).catch(function(e) {
       state.error = e.message;
@@ -3841,7 +3850,7 @@ body {
         ? h("span", { className: "dns-error" }, state.domainError.message)
         : null;
       challenge = h("div", { className: "domain-hint" },
-        "Certificate issuance kept failing, so it was paused. Check the _acme-challenge CNAME below, then re-verify to retry.",
+        d.tls_error || "Certificate issuance kept failing, so it was paused. Check the _acme-challenge CNAME below, then re-verify to retry.",
         d.acme_challenge ? renderAcmeDelegation(d) : null,
         h("div", { className: "dns-challenge-actions" },
           h("button", {

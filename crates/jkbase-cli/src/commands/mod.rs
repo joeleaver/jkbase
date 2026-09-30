@@ -1093,6 +1093,9 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
             let body: serde_json::Value = api_json(resp).await?;
             let host = body["host"].as_str().unwrap_or(&domain);
             let status = body["status"].as_str().unwrap_or("");
+            if let Some(note) = body["note"].as_str() {
+                println!("Note: {note}");
+            }
             if let Some(v) = body.get("verification").filter(|v| !v.is_null()) {
                 println!("Domain '{host}' added (pending verification).");
                 if body["kind"] == "wildcard" {
@@ -1169,6 +1172,9 @@ async fn run_domain(cmd: DomainCommand) -> anyhow::Result<()> {
                     site,
                     tls
                 );
+                if let Some(err) = d["tls_error"].as_str() {
+                    println!("      {err}");
+                }
             }
             Ok(())
         }
