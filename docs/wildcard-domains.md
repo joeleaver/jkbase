@@ -66,11 +66,19 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
   tenant wildcard covering the SNI.
 - **ACME budget.** Every tenant cert order (custom HTTP-01 and wildcard DNS-01, issuance, renewal,
   retry, and orders triggered by verify) passes, in cost order (`CertManager::gate_tenant_order`):
-  1. the host's own backoff slot. It backs off exponentially from 5 min, doubling to a 24 h cap. A
-     wildcard gives up after 8 consecutive failures (~10.5 h); a custom domain keeps retrying at the
-     cap. This state persists in `certs/issue-health.json` (flushed once per reconcile tick and
-     after each explicit request), so a restart re-arms nothing;
-  2. free DNS pre-checks through the same DoH resolver `verify` uses: for a wildcard, that
+  1. the host's own backoff slot. Every failure backs off exponentially from 5 min, doubling to a
+     24 h cap. Only *strikes* count toward give-up: a wildcard with **no cert yet** stops after 8
+     consecutive strikes (~10.5 h), where a strike is a pre-check DNS positively answered wrong
+     (CNAME gone/changed, CAA forbids) or a failed order. A failed or timed-out lookup is never a
+     strike, and a wildcard whose cert is already serving never gives up: its renewals only back
+     off, so a DNS-provider, CA or resolver outage can't strand every tenant's cert until each
+     owner re-verifies. A custom domain keeps retrying at the cap. This state persists in
+     `certs/issue-health.json` (flushed once per reconcile tick and after each explicit request,
+     serialized), so a restart re-arms nothing;
+  2. free DNS pre-checks through the same DoH resolver `verify` uses (one shared client, 5 s
+     timeout; each lookup is also bounded at 10 s in the cert manager, so a stalled resolver can't
+     wedge the serial pass that also renews the platform certs). `Ok` is only a NOERROR/NXDOMAIN
+     answer; SERVFAIL, transport and parse errors are failed lookups. For a wildcard, that
      `_acme-challenge.<base>` still CNAMEs to its delegated name; for both kinds, an RFC 8659 CAA
      check (tree-climbing, `issuewild` for wildcards) that Let's Encrypt may issue. A CAA
      `issue ";"` is refused here instead of failing at the CA;
@@ -78,17 +86,23 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
      evenly. Platform certs (apex, `*.db`) never draw from it, so the rest of the account's limit
      (Let's Encrypt: 300 / 3 h) stays reserved for them. The bottom
      `TENANT_ACME_RENEWAL_RESERVE_PERCENT` (default 33%) serves only **renewals** of certs already
-     issued, so new-cert churn can't block renewals. It's in memory; restarts aren't
-     tenant-triggerable;
+     issued, so new-cert churn can't block renewals. "Renewal" means a cert is loaded, so a
+     tenant's own aged certs that fail HTTP-01 on purpose can dip into the reserve — bounded by
+     that tenant's persisted budget below. It's in memory; restarts aren't tenant-triggerable;
   4. the owner's **persisted per-tenant budget**: `TENANT_ACME_ORDERS_PER_DAY`, default 20 per
      sliding 24 h, stored per tenant in `tenant_acme_orders`, plus a **fair share** of the global
      bucket: at most `TENANT_ACME_MAX_SHARE_PERCENT` (default 25%, i.e. 15) of it per sliding 3 h,
-     so one tenant can't starve the others. Removing and re-adding domains, or a
+     so one tenant can't starve the others. `TENANT_ACME_ORDERS_PER_DAY=0` disables tenant certs
+     (every order denied). Removing and re-adding domains, or a
      restart, refunds nothing. Over budget, the host is parked until the next slot frees, and the
      API reports `tls: failed` with `tls_error` naming that time.
   Re-verify re-arms a stopped cert (resets its backoff and give-up) only when the tenant's budget
   has room; otherwise it answers 429 with the retry time. The reconcile loop runs at most 4 due
   wildcard orders per tick, concurrently, alongside the serial custom-domain pass.
+- **Verify.** Bounded per tenant (burst 20, then one per 6 s; 429 over), since each call spends
+  outbound DNS on the tenant's schedule. A failed lookup answers 503 (retry) and changes nothing —
+  never "record not found". Both verify paths require the caller to own the project *now*, so a
+  claim that outlived its project can't activate onto a recreated same-slug project.
 - **Status.** The stored record goes Active at verification (that gates routing + issuance, exactly as
   for custom domains). The API reports a wildcard as `pending` while `tls` is `provisioning` or
   `failed`, and `active` once a cert serves — so it reads Pending until verification *and* issuance
@@ -99,7 +113,10 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
 - **Removal.** `deactivate_host` (domain rm and project delete) also calls `cert_remove` →
   `CertManager::forget_cert`: drops the resolver entry, backoff state and cache dir. The reconcile loop
   iterates the domain map, so renewal stops. An order (DNS-01 *or* HTTP-01) that finishes after removal
-  re-checks the map and deletes what it wrote.
+  re-checks the map, deletes what it wrote and frees the host's order slot. Removal is conditional
+  in the store's write txn (`remove_domain_if_owned`): a row taken over since the caller's check
+  stays. At boot, once the domain map is built, cached certs for hosts that aren't Active domains
+  are unloaded (files kept), so a purged wildcard's cert never answers SNI.
 - **`project.domains` cache.** Holds only *verified exact* hosts. Wildcards and pending hosts are kept
   out (see Rollback for why).
 
@@ -166,4 +183,9 @@ else can publish TXT under, or use A/AAAA.
   covered in pieces: order/challenge-name construction, label validation, the pre-order CNAME check,
   the backoff/give-up state machine, and that the RFC2136 backend accepts the delegated name. Not
   exercised against Pebble or LE staging.
-- A replaced pending claimant has to `add` again and publish a new TXT token.
+- A replaced pending claimant keeps the same records (proofs are deterministic per tenant, host and
+  generation) and can simply `verify` again.
+- A rollback window can split `B` and `*.B` between tenants (the old binary can't see the wildcard
+  table); roll-forward doesn't re-check that pair. Both had to prove `_jkbase-challenge.B`.
+- An Active exact `B` (including grandfathered rows) blocks a *new* owner of `B` from `*.B` too: the
+  pre-existing "no re-verification of verified names" gap, now covering wildcards.

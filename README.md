@@ -602,7 +602,8 @@ Then `jkbase domain verify '*.play.example.com'`. Verification checks the TXT **
 domain then reads `pending` (`https provisioning`) until its certificate is issued (a minute or two),
 then `active`. If issuance keeps failing (typically: the `_acme-challenge` CNAME was removed or
 changed, or a CAA record forbids Let's Encrypt), the platform backs off and eventually stops trying,
-and the domain shows `https failed`; fix DNS and run `verify` again to retry.
+and the domain shows `https failed`; fix DNS and run `verify` again to retry. Renewals of a cert that
+is already serving never stop for good — they keep retrying on backoff.
 
 Certificate orders are metered, because every one spends the platform's shared ACME account: each
 account gets 20 orders per 24 h across all its custom and wildcard domains (issuance, renewals and
@@ -923,7 +924,8 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    zone you update must be the one Let's Encrypt resolves publicly. The same backend issues tenant
    [wildcard domains](#wildcard-domains)' certificates by writing TXT records under
    `ACME_DELEGATION_ZONE` (default `_acme-delegation.<domain>`, inside the zone above — no extra
-   credentials).
+   credentials; the server refuses to start if it isn't inside `RFC2136_ZONE`). Changing it later
+   breaks every tenant's existing `_acme-challenge` CNAME, so pick it once.
    Tenant certificate orders share your ACME account, so they're capped: `TENANT_ACME_ORDERS_PER_3H`
    (default 60, across all tenants — the rest of Let's Encrypt's 300/3 h stays reserved for the
    platform's own certs), of which `TENANT_ACME_RENEWAL_RESERVE_PERCENT` (default 33) only renewals
