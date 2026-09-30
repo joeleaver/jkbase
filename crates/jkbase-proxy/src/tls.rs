@@ -436,6 +436,8 @@ pub struct CertManager {
     challenges: Arc<AsyncRwLock<HashMap<String, String>>>,
     /// Tenant-cert issuance health (dedupe, backoff, give-up, budget blocks); persisted.
     health: Mutex<IssueHealthBook>,
+    /// `health` changed since the last [`Self::flush_health`].
+    health_dirty: std::sync::atomic::AtomicBool,
     /// Global budget for tenant-initiated orders.
     tenant_bucket: Mutex<TokenBucket>,
 }
@@ -468,6 +470,7 @@ impl CertManager {
             resolver,
             challenges: Arc::new(AsyncRwLock::new(HashMap::new())),
             health: Mutex::new(health),
+            health_dirty: std::sync::atomic::AtomicBool::new(false),
             tenant_bucket: Mutex::new(tenant_bucket),
         });
 
@@ -520,24 +523,41 @@ impl CertManager {
     pub fn request_cert(self: &Arc<Self>, host: String) {
         self.with_health(|h| h.reset(&host));
         let mgr = self.clone();
-        tokio::spawn(async move { mgr.ensure_cert(&host).await });
+        tokio::spawn(async move {
+            mgr.ensure_cert(&host).await;
+            mgr.flush_health().await;
+        });
     }
 
-    /// Mutate the issue-health book and persist it (best-effort, atomic replace).
+    /// Mutate the issue-health book in memory; [`Self::flush_health`] persists it (once
+    /// per reconcile tick / explicit request, off the lock, async I/O).
     fn with_health<R>(&self, f: impl FnOnce(&mut IssueHealthBook) -> R) -> R {
-        let mut book = self.health.lock().unwrap();
-        let out = f(&mut book);
-        let path = self.cfg.cert_dir.join(ISSUE_HEALTH_FILE);
-        if let Ok(json) = serde_json::to_vec(&*book) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json)
-                .and_then(|()| std::fs::rename(&tmp, &path))
-                .is_err()
-            {
-                warn!("failed to persist certificate issue health");
-            }
-        }
+        let out = f(&mut self.health.lock().unwrap());
+        self.health_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         out
+    }
+
+    /// Persist the issue-health book if it changed (best-effort, atomic replace). A crash
+    /// loses at most the last tick's changes, which the order budgets still bound.
+    async fn flush_health(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.health_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(json) = serde_json::to_vec(&*self.health.lock().unwrap()) else {
+            return;
+        };
+        let path = self.cfg.cert_dir.join(ISSUE_HEALTH_FILE);
+        let tmp = path.with_extension("json.tmp");
+        let written = match tokio::fs::write(&tmp, json).await {
+            Ok(()) => tokio::fs::rename(&tmp, &path).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            self.health_dirty.store(true, Ordering::Release);
+            warn!(error = %e, "failed to persist certificate issue health");
+        }
     }
 
     /// The shared pre-order gates for a TENANT cert, in cost order — all before any ACME
@@ -1097,6 +1117,7 @@ impl CertManager {
                     mgr.ensure_cert(&host).await;
                 }
                 while orders.join_next().await.is_some() {}
+                mgr.flush_health().await;
             }
         });
     }

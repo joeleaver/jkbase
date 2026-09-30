@@ -68,7 +68,8 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
   retry, and orders triggered by verify) passes, in cost order (`CertManager::gate_tenant_order`):
   1. the host's own backoff slot. It backs off exponentially from 5 min, doubling to a 24 h cap. A
      wildcard gives up after 8 consecutive failures (~10.5 h); a custom domain keeps retrying at the
-     cap. This state persists in `certs/issue-health.json`, so a restart re-arms nothing;
+     cap. This state persists in `certs/issue-health.json` (flushed once per reconcile tick and
+     after each explicit request), so a restart re-arms nothing;
   2. free DNS pre-checks through the same DoH resolver `verify` uses: for a wildcard, that
      `_acme-challenge.<base>` still CNAMEs to its delegated name; for both kinds, an RFC 8659 CAA
      check (tree-climbing, `issuewild` for wildcards) that Let's Encrypt may issue. A CAA
