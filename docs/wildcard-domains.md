@@ -75,10 +75,14 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
      `issue ";"` is refused here instead of failing at the CA;
   3. a **global token bucket** for tenant orders: `TENANT_ACME_ORDERS_PER_3H`, default 60, refilled
      evenly. Platform certs (apex, `*.db`) never draw from it, so the rest of the account's limit
-     (Let's Encrypt: 300 / 3 h) stays reserved for them. It's in memory; restarts aren't tenant-
-     triggerable;
+     (Let's Encrypt: 300 / 3 h) stays reserved for them. The bottom
+     `TENANT_ACME_RENEWAL_RESERVE_PERCENT` (default 33%) serves only **renewals** of certs already
+     issued, so new-cert churn can't block renewals. It's in memory; restarts aren't
+     tenant-triggerable;
   4. the owner's **persisted per-tenant budget**: `TENANT_ACME_ORDERS_PER_DAY`, default 20 per
-     sliding 24 h, stored per tenant in `tenant_acme_orders`. Removing and re-adding domains, or a
+     sliding 24 h, stored per tenant in `tenant_acme_orders`, plus a **fair share** of the global
+     bucket: at most `TENANT_ACME_MAX_SHARE_PERCENT` (default 25%, i.e. 15) of it per sliding 3 h,
+     so one tenant can't starve the others. Removing and re-adding domains, or a
      restart, refunds nothing. Over budget, the host is parked until the next slot frees, and the
      API reports `tls: failed` with `tls_error` naming that time.
   Re-verify re-arms a stopped cert (resets its backoff and give-up) only when the tenant's budget
@@ -148,8 +152,10 @@ else can publish TXT under, or use A/AAAA.
 - **Separate ACME account for tenant certs** (recommended): tenant orders still share the platform
   account. The budgets above bound them, and platform certs keep a reserved share, but Let's
   Encrypt's per-account *failed-validation* and *pending-authorization* limits are shared too. Many
-  Sybil tenants can also still drain the global tenant bucket, which delays other tenants' certs
-  but never the platform's.
+  Sybil tenants (each within its fair share) can still drain the unreserved part of the global
+  tenant bucket, which delays other tenants' *new* certs but never renewals or platform certs.
+- An A/AAAA pre-check before HTTP-01 orders (custom domains pointed elsewhere still cost an order
+  per backoff step), and a give-up for custom domains after N days of failures.
 - The console shows a 202 "held by another account" add as a banner with the records; verifying it
   is CLI/API only, because the name isn't in the caller's list until they win it. A proof-wins
   takeover starts with no `site` binding.

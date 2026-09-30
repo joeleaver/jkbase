@@ -899,11 +899,15 @@ impl Default for WildcardLimits {
 }
 
 /// Per-tenant ACME order budget (every custom/wildcard cert order, issuance or renewal,
-/// success or failure, is charged to the owning tenant).
+/// success or failure, is charged to the owning tenant). Two sliding windows: the daily
+/// budget, and a short-window **fair share** so one tenant can't take more than a slice
+/// of the global per-3h tenant bucket and starve everyone else's issuance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcmeOrderBudget {
     pub max_orders: usize,
     pub window_secs: u64,
+    pub share_max: usize,
+    pub share_window_secs: u64,
 }
 
 impl Default for AcmeOrderBudget {
@@ -911,6 +915,9 @@ impl Default for AcmeOrderBudget {
         Self {
             max_orders: 20,
             window_secs: 24 * 60 * 60,
+            // A quarter of the default 60-per-3h global tenant bucket.
+            share_max: 15,
+            share_window_secs: 3 * 60 * 60,
         }
     }
 }
@@ -952,23 +959,34 @@ fn rotate_if_verified_wildcard(
     Ok(())
 }
 
-/// Order timestamps still inside the budget window (oldest first).
+/// Order timestamps still inside the longer budget window (oldest first).
 fn acme_stamps(raw: Option<Vec<u8>>, now: u64, budget: &AcmeOrderBudget) -> Vec<u64> {
+    let keep = budget.window_secs.max(budget.share_window_secs);
     let mut v: Vec<u64> = raw
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    v.retain(|&t| now < t.saturating_add(budget.window_secs));
+    v.retain(|&t| now < t.saturating_add(keep));
     v.sort_unstable();
     v
 }
 
-fn acme_retry_at(stamps: &[u64], budget: &AcmeOrderBudget) -> Option<u64> {
-    if stamps.len() < budget.max_orders {
-        return None;
-    }
-    // The slot that frees next is the one that makes room for one more order.
-    let idx = stamps.len() - budget.max_orders;
-    Some(stamps[idx].saturating_add(budget.window_secs))
+/// When the next order fits under BOTH windows (`None` = it fits now).
+fn acme_retry_at(stamps: &[u64], now: u64, budget: &AcmeOrderBudget) -> Option<u64> {
+    let frees_at = |max: usize, window: u64| -> Option<u64> {
+        let inside: Vec<u64> = stamps
+            .iter()
+            .copied()
+            .filter(|&t| now < t.saturating_add(window))
+            .collect();
+        if inside.len() < max {
+            return None;
+        }
+        // The slot that frees next is the one that makes room for one more order.
+        Some(inside[inside.len() - max].saturating_add(window))
+    };
+    let daily = frees_at(budget.max_orders, budget.window_secs);
+    let share = frees_at(budget.share_max, budget.share_window_secs);
+    daily.max(share)
 }
 
 /// Result of [`Store::activate_claim`].
@@ -2422,7 +2440,7 @@ impl Store {
             let mut t = txn.open_table(TENANT_ACME_ORDERS)?;
             let mut stamps =
                 acme_stamps(t.get(tenant_id)?.map(|v| v.value().to_vec()), now, budget);
-            match acme_retry_at(&stamps, budget) {
+            match acme_retry_at(&stamps, now, budget) {
                 Some(at) => Some(at),
                 None => {
                     stamps.push(now);
@@ -2445,7 +2463,7 @@ impl Store {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(TENANT_ACME_ORDERS)?;
         let stamps = acme_stamps(t.get(tenant_id)?.map(|v| v.value().to_vec()), now, budget);
-        Ok(acme_retry_at(&stamps, budget))
+        Ok(acme_retry_at(&stamps, now, budget))
     }
 
     pub fn list_domains_for_project(&self, project_id: &str) -> Result<Vec<DomainRecord>> {
@@ -5243,6 +5261,7 @@ mod tests {
         let budget = AcmeOrderBudget {
             max_orders: 3,
             window_secs: 1000,
+            ..AcmeOrderBudget::default()
         };
         for t in [10, 20, 30] {
             assert_eq!(
@@ -5281,6 +5300,49 @@ mod tests {
         assert_eq!(
             store.charge_tenant_acme_order("t1", 1011, &budget).unwrap(),
             Some(1020)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review N2: one tenant's fair share of the global per-3h bucket is capped on top of
+    /// its daily budget; the retry time is when BOTH windows have room.
+    #[test]
+    fn tenant_fair_share_caps_bursts_within_the_daily_budget() {
+        let (store, path) = tmp_db();
+        let budget = AcmeOrderBudget {
+            max_orders: 20,
+            window_secs: 86_400,
+            share_max: 3,
+            share_window_secs: 100,
+        };
+        for t in [0, 1, 2] {
+            assert_eq!(
+                store.charge_tenant_acme_order("t1", t, &budget).unwrap(),
+                None
+            );
+        }
+        // Share exhausted long before the daily budget: wait for the oldest to leave the
+        // share window, then exactly one more fits.
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 3, &budget).unwrap(),
+            Some(100)
+        );
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 100, &budget).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 100, &budget).unwrap(),
+            Some(101)
+        );
+        // When the daily budget is the tighter one, its (later) retry time wins.
+        let tight = AcmeOrderBudget {
+            max_orders: 4,
+            ..budget.clone()
+        };
+        assert_eq!(
+            store.tenant_acme_retry_at("t1", 150, &tight).unwrap(),
+            Some(86_400)
         );
         let _ = std::fs::remove_file(&path);
     }

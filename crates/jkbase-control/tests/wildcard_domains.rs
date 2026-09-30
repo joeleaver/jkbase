@@ -788,6 +788,7 @@ async fn order_churn_via_readd_is_bounded_by_the_tenants_persisted_budget() {
     let budget = AcmeOrderBudget {
         max_orders: 5,
         window_secs: 24 * 3600,
+        ..AcmeOrderBudget::default()
     };
     for i in 0..12 {
         let host = format!("*.n{i}.attacker.com");

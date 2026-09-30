@@ -140,6 +140,20 @@ struct Args {
     #[arg(long, env = "TENANT_ACME_ORDERS_PER_DAY", default_value = "20")]
     tenant_acme_orders_per_day: usize,
 
+    /// Max share (percent) of `TENANT_ACME_ORDERS_PER_3H` any ONE tenant may use per 3 h,
+    /// so a single tenant can't starve everyone else's issuance.
+    #[arg(long, env = "TENANT_ACME_MAX_SHARE_PERCENT", default_value = "25")]
+    tenant_acme_max_share_percent: u32,
+
+    /// Percent of `TENANT_ACME_ORDERS_PER_3H` reserved for RENEWALS of certs already
+    /// issued, so new-cert churn can't block renewals.
+    #[arg(
+        long,
+        env = "TENANT_ACME_RENEWAL_RESERVE_PERCENT",
+        default_value = "33"
+    )]
+    tenant_acme_renewal_reserve_percent: u32,
+
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
@@ -1614,6 +1628,12 @@ async fn async_main() -> Result<()> {
     let acme_budget = jkbase_control::store::AcmeOrderBudget {
         max_orders: args.tenant_acme_orders_per_day,
         window_secs: 24 * 60 * 60,
+        // One tenant's fair share of the global per-3h bucket (at least one order).
+        share_max: (args.tenant_acme_orders_per_3h as usize
+            * args.tenant_acme_max_share_percent as usize)
+            .div_ceil(100)
+            .max(1),
+        share_window_secs: 3 * 60 * 60,
     };
 
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
@@ -1675,6 +1695,7 @@ async fn async_main() -> Result<()> {
             }),
             order_gate: Some(tenant_order_gate(store.clone(), acme_budget.clone())),
             tenant_orders_per_3h: args.tenant_acme_orders_per_3h,
+            tenant_renewal_reserve_percent: args.tenant_acme_renewal_reserve_percent,
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
     } else {

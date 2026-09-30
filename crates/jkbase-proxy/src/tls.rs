@@ -109,6 +109,8 @@ pub struct TlsConfig {
     pub order_gate: Option<OrderGate>,
     /// Global cap on tenant-initiated orders per 3 h (see [`TokenBucket`]).
     pub tenant_orders_per_3h: u32,
+    /// Percent of that bucket only renewals of already-issued certs may use.
+    pub tenant_renewal_reserve_percent: u32,
 }
 
 /// A host's cert state, for the control API's `tls` field.
@@ -226,31 +228,36 @@ impl IssueHealthBook {
 /// Global bucket for TENANT-initiated orders (custom + wildcard), across all tenants:
 /// `capacity` orders, refilled evenly over 3 h. Platform certs (apex, `*.db`) never draw
 /// from it, so whatever the account's limit is beyond `capacity` stays reserved for them.
-/// In memory: a restart refills it, but restarts aren't tenant-triggerable, and the
-/// per-tenant budget (persisted) still binds.
+/// The bottom `reserve` tokens only serve RENEWALS of certs already issued, so new-cert
+/// churn (whoever's) can never block a renewal; one tenant's share of the rest is capped
+/// by its persisted budget (`AcmeOrderBudget::share_max`). In memory: a restart refills
+/// it, but restarts aren't tenant-triggerable, and the per-tenant budget still binds.
 #[derive(Debug)]
 struct TokenBucket {
     capacity: f64,
+    reserve: f64,
     tokens: f64,
     per_sec: f64,
     last: u64,
 }
 
 impl TokenBucket {
-    fn per_3h(capacity: u32, now: u64) -> Self {
+    fn per_3h(capacity: u32, renewal_reserve_percent: u32, now: u64) -> Self {
         let capacity = f64::from(capacity);
         Self {
             capacity,
+            reserve: capacity * f64::from(renewal_reserve_percent.min(100)) / 100.0,
             tokens: capacity,
             per_sec: capacity / (3.0 * 3600.0),
             last: now,
         }
     }
-    fn try_take(&mut self, now: u64) -> bool {
+    fn try_take(&mut self, now: u64, renewal: bool) -> bool {
         let dt = now.saturating_sub(self.last) as f64;
         self.last = now.max(self.last);
         self.tokens = (self.tokens + dt * self.per_sec).min(self.capacity);
-        if self.tokens >= 1.0 {
+        let need = if renewal { 1.0 } else { 1.0 + self.reserve };
+        if self.tokens >= need {
             self.tokens -= 1.0;
             true
         } else {
@@ -442,7 +449,11 @@ impl CertManager {
         let account = obtain_account(&cfg, staging).await?;
 
         let health = load_health(&cfg.cert_dir.join(ISSUE_HEALTH_FILE));
-        let tenant_bucket = TokenBucket::per_3h(cfg.tenant_orders_per_3h, unix_now());
+        let tenant_bucket = TokenBucket::per_3h(
+            cfg.tenant_orders_per_3h,
+            cfg.tenant_renewal_reserve_percent,
+            unix_now(),
+        );
         let resolver = Arc::new(Resolver {
             platform_domain: cfg.domain.clone(),
             wildcard: RwLock::new(None),
@@ -546,7 +557,14 @@ impl CertManager {
             self.record_failure(host, &e, may_give_up);
             return false;
         }
-        if !self.tenant_bucket.lock().unwrap().try_take(unix_now()) {
+        // A renewal (a cert is already loaded) may dip into the renewal reserve.
+        let renewal = self.has_cert(host);
+        if !self
+            .tenant_bucket
+            .lock()
+            .unwrap()
+            .try_take(unix_now(), renewal)
+        {
             // Platform-wide throttle: not the tenant's failure; retried next tick.
             self.with_health(|h| h.release(host));
             info!(host = %host, "tenant ACME order budget (global) exhausted; deferring");
@@ -1562,6 +1580,7 @@ mod tests {
             dns_lookup: Arc::new(|_, _| Box::pin(async { Vec::new() })),
             order_gate: None,
             tenant_orders_per_3h: 60,
+            tenant_renewal_reserve_percent: 33,
         }
     }
 
@@ -1749,22 +1768,48 @@ mod tests {
 
     #[test]
     fn tenant_bucket_caps_orders_per_3h_and_refills() {
-        let mut b = TokenBucket::per_3h(60, 0);
+        let mut b = TokenBucket::per_3h(60, 0, 0);
         for _ in 0..60 {
-            assert!(b.try_take(0));
+            assert!(b.try_take(0, false));
         }
-        assert!(!b.try_take(0));
+        assert!(!b.try_take(0, false));
         // One order's worth refills every 3 minutes.
-        assert!(!b.try_take(179));
-        assert!(b.try_take(180));
-        assert!(!b.try_take(180));
+        assert!(!b.try_take(179, false));
+        assert!(b.try_take(180, false));
+        assert!(!b.try_take(180, false));
         b.refund();
-        assert!(b.try_take(180));
+        assert!(b.try_take(180, false));
         // Never above capacity, however long idle.
-        let mut b = TokenBucket::per_3h(2, 0);
-        assert!(b.try_take(1_000_000) && b.try_take(1_000_000) && !b.try_take(1_000_000));
+        let mut b = TokenBucket::per_3h(2, 0, 0);
+        assert!(
+            b.try_take(1_000_000, false)
+                && b.try_take(1_000_000, false)
+                && !b.try_take(1_000_000, false)
+        );
         // Zero disables tenant issuance entirely.
-        assert!(!TokenBucket::per_3h(0, 0).try_take(1_000_000));
+        assert!(!TokenBucket::per_3h(0, 0, 0).try_take(1_000_000, true));
+    }
+
+    /// Review N2: new-cert churn can drain only the unreserved part of the bucket;
+    /// renewals of already-issued certs can always use the reserve.
+    #[test]
+    fn renewal_reserve_survives_new_cert_churn() {
+        let mut b = TokenBucket::per_3h(60, 33, 0);
+        let mut new_orders = 0;
+        while b.try_take(0, false) {
+            new_orders += 1;
+        }
+        // 60 − 19.8 reserved → 40 new orders at most.
+        assert_eq!(new_orders, 40);
+        let mut renewals = 0;
+        while b.try_take(0, true) {
+            renewals += 1;
+        }
+        assert_eq!(renewals, 20);
+        // A 100% reserve serves renewals only.
+        let mut r = TokenBucket::per_3h(10, 100, 0);
+        assert!(!r.try_take(0, false));
+        assert!(r.try_take(0, true));
     }
 
     #[test]

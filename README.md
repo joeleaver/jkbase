@@ -926,7 +926,9 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    credentials).
    Tenant certificate orders share your ACME account, so they're capped: `TENANT_ACME_ORDERS_PER_3H`
    (default 60, across all tenants — the rest of Let's Encrypt's 300/3 h stays reserved for the
-   platform's own certs) and `TENANT_ACME_ORDERS_PER_DAY` (default 20 per tenant, persisted).
+   platform's own certs), of which `TENANT_ACME_RENEWAL_RESERVE_PERCENT` (default 33) only renewals
+   may use and any one tenant may take at most `TENANT_ACME_MAX_SHARE_PERCENT` (default 25); plus
+   `TENANT_ACME_ORDERS_PER_DAY` (default 20 per tenant, persisted).
 2. **Build toolchains** — provisioning bakes only the busybox `default.ext4`. To serve the languages
    above you additionally need the per-language toolchain images (`bun.ext4`, `node.ext4`,
    `rust.ext4`, `python.ext4`, `go.ext4`, `dockerfile.ext4`, plus `jkbuild-function.ext4` for
