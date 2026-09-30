@@ -193,6 +193,9 @@ pub struct AppState {
     /// Per-tenant ACME order budget. The server's cert manager charges it on every
     /// order; the API only reads it (re-verify refuses to re-arm past it).
     pub acme_budget: crate::store::AcmeOrderBudget,
+    /// Per-tenant bound on domain verifies: each costs outbound DNS the tenant chooses
+    /// the timing of (and may target another tenant's pending wildcard).
+    pub verify_limiter: VerifyLimiter,
     /// Tears down live managed-DB relays on key revocation / project delete ([R5]).
     pub db_revoke_callback: Option<DbRevokeCallback>,
     /// Runs a managed-DB backup (host-relay pull → platform store). `None` ⇒ backups disabled
@@ -287,6 +290,7 @@ impl AppState {
             wildcard_support: WildcardSupport::Unsupported,
             wildcard_limits: crate::store::WildcardLimits::default(),
             acme_budget: crate::store::AcmeOrderBudget::default(),
+            verify_limiter: VerifyLimiter::default(),
             db_revoke_callback: None,
             db_backup_callback: None,
             db_restore_callback: None,
@@ -1076,10 +1080,15 @@ async fn delete_project(
                     .await;
                     // Release all claimed hostnames so they can't be taken over
                     // or left dangling in the routing maps.
+                    // Conditional: a row taken over by another tenant since the
+                    // listing is theirs now and stays.
                     if let Ok(domains) = state.store.list_domains_for_project(&id) {
                         for d in domains {
-                            let _ = state.store.remove_domain(&d.host);
-                            deactivate_host(&state, &d.host).await;
+                            if let Ok(true) =
+                                state.store.remove_domain_if_owned(&d.host, &d.tenant_id, &id)
+                            {
+                                deactivate_host(&state, &d.host).await;
+                            }
                         }
                     }
                     // Stop the VM, free the IP/TAP, and remove on-disk artifacts.
@@ -5147,6 +5156,37 @@ fn claim_wildcard(state: &AppState, record: &DomainRecord) -> Option<axum::respo
     }
 }
 
+/// Per-tenant token bucket on `POST …/domains/{d}/verify`: [`Self::BURST`] back-to-back,
+/// then one per [`Self::REFILL_SECS`]. Every verify spends 1–3 outbound DNS lookups on
+/// the platform's resolver, whose throttling would push OTHER tenants' certs into
+/// backoff. In memory (a restart refilling it is not tenant-triggerable); entries for
+/// tenants back at full burst are pruned so the map stays bounded by active tenants.
+#[derive(Default)]
+pub struct VerifyLimiter(std::sync::Mutex<HashMap<String, (f64, std::time::Instant)>>);
+
+impl VerifyLimiter {
+    const BURST: f64 = 20.0;
+    const REFILL_SECS: f64 = 6.0;
+
+    /// Take one verify for `tenant`; `false` = over the limit.
+    fn try_take(&self, tenant: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let refill = |(tokens, last): (f64, std::time::Instant)| {
+            (tokens + now.duration_since(last).as_secs_f64() / Self::REFILL_SECS).min(Self::BURST)
+        };
+        if map.len() > 4096 {
+            map.retain(|_, v| refill(*v) < Self::BURST);
+        }
+        let tokens = map.get(tenant).copied().map_or(Self::BURST, refill);
+        if tokens < 1.0 {
+            return false;
+        }
+        map.insert(tenant.to_string(), (tokens - 1.0, now));
+        true
+    }
+}
+
 fn too_many(msg: String) -> axum::response::Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -5227,6 +5267,9 @@ async fn verify_domain(
     Extension(tenant): Extension<Tenant>,
     Path((id, host)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if !state.verify_limiter.try_take(&tenant.id) {
+        return too_many("too many domain verifications; try again in a few seconds".into());
+    }
     let host = jkbase_common::routing::normalize_host(&host);
     let row = match state.store.get_domain(&host) {
         Ok(Some(r)) => r,
@@ -5235,7 +5278,13 @@ async fn verify_domain(
     // `expected` is the row as read (what activation must still find); `record` is the
     // claim being proven. They differ only for a proof-wins takeover of ANOTHER tenant's
     // unverified wildcard claim: the caller proves with their own deterministic records.
-    let (expected, record) = if row.project_id == id && row.tenant_id == tenant.id {
+    // Both branches require the caller to own `id` NOW: a claim that outlived its
+    // project's deletion (an add racing the delete) must not activate onto a
+    // same-slug project recreated by someone else.
+    let (expected, record) = if row.project_id == id
+        && row.tenant_id == tenant.id
+        && owns_project(&state, &tenant, &id)
+    {
         (row.clone(), row)
     } else if row.kind == DomainKind::Wildcard
         && row.status == DomainStatus::Pending
@@ -5394,13 +5443,10 @@ async fn remove_domain(
     Path((id, domain)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let host = jkbase_common::routing::normalize_host(&domain);
-    match state.store.get_domain(&host) {
-        Ok(Some(r)) if r.project_id == id && r.tenant_id == tenant.id => {}
-        _ => return project_not_found(&host),
-    }
-
-    if let Err(e) = state.store.remove_domain(&host) {
-        return internal_error(e);
+    match state.store.remove_domain_if_owned(&host, &tenant.id, &id) {
+        Ok(true) => {}
+        Ok(false) => return project_not_found(&host),
+        Err(e) => return internal_error(e),
     }
     deactivate_host(&state, &host).await;
     let _ = refresh_domain_cache(&state, &id);

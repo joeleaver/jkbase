@@ -978,6 +978,10 @@ fn acme_retry_at(stamps: &[u64], now: u64, budget: &AcmeOrderBudget) -> Option<u
             .copied()
             .filter(|&t| now < t.saturating_add(window))
             .collect();
+        if max == 0 {
+            // A zero budget (tenant certs disabled): denied for a full window.
+            return Some(now.saturating_add(window));
+        }
         if inside.len() < max {
             return None;
         }
@@ -2193,6 +2197,40 @@ impl Store {
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    /// [`Self::remove_domain`], but only if the row is STILL `tenant_id`'s claim for
+    /// `project_id` — decided inside the write txn. A caller's ownership check and its
+    /// removal are otherwise two txns, and a proof-wins takeover committing between them
+    /// would let the loser delete the winner's fresh Active row (dropping its cert and
+    /// rotating its proof generation). `false` = nothing removed.
+    pub fn remove_domain_if_owned(
+        &self,
+        host: &str,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<bool> {
+        let txn = self.db.begin_write()?;
+        let removed = {
+            let mut table = txn.open_table(domain_table(host))?;
+            let owned = match table.get(host)? {
+                Some(v) => serde_json::from_slice::<DomainRecord>(v.value())
+                    .is_ok_and(|r| r.tenant_id == tenant_id && r.project_id == project_id),
+                None => false,
+            };
+            let removed = if owned {
+                table.remove(host)?.map(|v| v.value().to_vec())
+            } else {
+                None
+            };
+            if let Some(bytes) = &removed {
+                let mut generations = txn.open_table(CLAIM_GENERATIONS)?;
+                rotate_if_verified_wildcard(&mut generations, bytes)?;
+            }
+            removed.is_some()
+        };
+        txn.commit()?;
+        Ok(removed)
     }
 
     /// Current generation of `tenant_id`'s claim proof for `host` (0 if never rotated).

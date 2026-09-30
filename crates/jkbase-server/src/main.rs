@@ -1625,6 +1625,9 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    if args.tenant_acme_orders_per_day == 0 {
+        tracing::warn!("TENANT_ACME_ORDERS_PER_DAY=0: tenant certificates will never be ordered");
+    }
     let acme_budget = jkbase_control::store::AcmeOrderBudget {
         max_orders: args.tenant_acme_orders_per_day,
         window_secs: 24 * 60 * 60,

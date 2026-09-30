@@ -946,3 +946,116 @@ async fn records_rotate_only_after_releasing_a_verified_wildcard() {
     // Other tenants' records for the name are unaffected.
     assert_eq!(h.store.claim_generation("tenant-2", host).unwrap(), 0);
 }
+
+/// Review (TLS M2 root cause): a failed lookup is not "record missing". Verify answers a
+/// retryable 503, and nothing about the claim changes.
+#[tokio::test]
+async fn a_failed_dns_lookup_is_a_retryable_503_not_a_verdict() {
+    let h = spawn("dnsfail", WildcardSupport::PlainHttp).await;
+    let (st, a) = h.add(&h.t1, "app", "*.dnsfail.example.com").await;
+    assert_eq!(st, 200, "{a}");
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.dnsfail.example.com", "TXT", &token);
+    DNS_FAILING
+        .lock()
+        .unwrap()
+        .push("_jkbase-challenge.dnsfail.example.com".into());
+    let (st, v) = h.verify(&h.t1, "app", "*.dnsfail.example.com").await;
+    assert_eq!(st, 503, "{v}");
+    let row = h.store.get_domain("*.dnsfail.example.com").unwrap().unwrap();
+    assert_eq!(row.status, DomainStatus::Pending);
+    DNS_FAILING.lock().unwrap().clear();
+    let (st, v) = h.verify(&h.t1, "app", "*.dnsfail.example.com").await;
+    assert_eq!(st, 200, "{v}");
+}
+
+/// Review (API L2): verify spends outbound DNS on the tenant's schedule, so it is
+/// bounded per tenant — and one tenant's burst doesn't limit another.
+#[tokio::test]
+async fn verify_is_rate_limited_per_tenant() {
+    let h = spawn("verifyrate", WildcardSupport::PlainHttp).await;
+    let (st, _) = h.add(&h.t1, "app", "*.vr.example.com").await;
+    assert_eq!(st, 200);
+    // The full burst always goes through (refill only adds)…
+    for i in 0..20 {
+        let (st, _) = h.verify(&h.t1, "app", "*.vr.example.com").await;
+        assert_eq!(st, 400, "verify {i}: no TXT published yet");
+    }
+    // …then it's refused; refill is one per 6 s, so a quick run of 20 more must hit it.
+    let mut limited = false;
+    for _ in 0..20 {
+        let (st, _) = h.verify(&h.t1, "app", "*.vr.example.com").await;
+        limited |= st == 429;
+    }
+    assert!(limited, "never rate-limited");
+    let (st, _) = h.verify(&h.t2, "rival", "*.vr.example.com").await;
+    assert_ne!(st, 429, "another tenant's burst must not limit this one");
+}
+
+/// Review (routing L1): a claim that outlived its project (an add racing the delete)
+/// must not activate onto a same-slug project someone else recreated.
+#[tokio::test]
+async fn a_claim_outliving_its_project_cannot_activate_on_a_recreated_slug() {
+    let h = spawn("orphan", WildcardSupport::PlainHttp).await;
+    let (st, a) = h.add(&h.t1, "app", "*.orphan.example.com").await;
+    assert_eq!(st, 200, "{a}");
+    let token = a["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.orphan.example.com", "TXT", &token);
+    // The project goes away underneath the pending row, and tenant-2 takes the slug.
+    assert!(h.store.delete_project("app").unwrap());
+    h.store
+        .create_project(&Project {
+            id: "app".into(),
+            name: "app".into(),
+            tenant_id: Some("tenant-2".into()),
+            current_version: None,
+            state: ProjectState::Stopped,
+            vm_ip: None,
+            domains: vec![],
+        })
+        .unwrap();
+    let (st, v) = h.verify(&h.t1, "app", "*.orphan.example.com").await;
+    assert_eq!(st, 404, "{v}");
+    assert!(!h.domain_map.read().await.contains_key("*.orphan.example.com"));
+}
+
+/// Review (TLS L5): removal is decided in the write txn — a caller whose row was taken
+/// over since its ownership check removes nothing.
+#[tokio::test]
+async fn conditional_removal_never_deletes_another_tenants_row() {
+    let h = spawn("condrm", WildcardSupport::PlainHttp).await;
+    seed_active(&h, "*.condrm.example.com", DomainKind::Wildcard);
+    let row = h.store.get_domain("*.condrm.example.com").unwrap().unwrap();
+    let (other_tenant, other_project) = if row.tenant_id == "tenant-1" {
+        ("tenant-2", "rival")
+    } else {
+        ("tenant-1", "app")
+    };
+    assert!(!h
+        .store
+        .remove_domain_if_owned("*.condrm.example.com", other_tenant, other_project)
+        .unwrap());
+    assert!(h.store.get_domain("*.condrm.example.com").unwrap().is_some());
+    assert!(h
+        .store
+        .remove_domain_if_owned("*.condrm.example.com", &row.tenant_id, &row.project_id)
+        .unwrap());
+    assert!(h.store.get_domain("*.condrm.example.com").unwrap().is_none());
+}
+
+/// Review (API M1): a zero daily budget means "tenant certs disabled", not a panic in
+/// the cert manager's reconcile loop.
+#[test]
+fn a_zero_order_budget_denies_instead_of_panicking() {
+    let dir = std::env::temp_dir().join(format!("jkbase-zero-budget-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("db.redb")).unwrap();
+    let budget = AcmeOrderBudget {
+        max_orders: 0,
+        window_secs: 1000,
+        ..AcmeOrderBudget::default()
+    };
+    assert_eq!(store.tenant_acme_retry_at("t1", 10, &budget).unwrap(), Some(1010));
+    assert!(store.charge_tenant_acme_order("t1", 10, &budget).unwrap().is_some());
+}
