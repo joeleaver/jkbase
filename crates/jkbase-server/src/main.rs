@@ -1665,6 +1665,17 @@ async fn async_main() -> Result<()> {
                     .rfc2136_zone
                     .clone()
                     .unwrap_or_else(|| args.domain.clone());
+                // The delegation TXTs are written through THIS zone; one outside it would
+                // let tenants verify (and spend their order budget) on wildcards whose
+                // every order then fails at the DNS UPDATE.
+                let rfc_zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+                if acme_delegation_zone != rfc_zone
+                    && !acme_delegation_zone.ends_with(&format!(".{rfc_zone}"))
+                {
+                    anyhow::bail!(
+                        "ACME_DELEGATION_ZONE '{acme_delegation_zone}' must be inside RFC2136_ZONE '{rfc_zone}'"
+                    );
+                }
                 let key_name = args.rfc2136_tsig_name.clone().ok_or_else(|| {
                     anyhow::anyhow!("RFC2136_TSIG_NAME (--rfc2136-tsig-name) required when ACME_DNS_PROVIDER=rfc2136")
                 })?;
@@ -2089,6 +2100,11 @@ async fn async_main() -> Result<()> {
     reconcile_orphans_on_boot(&platform).await;
     reconcile_baselayers_on_boot(&platform).await;
     backfill_domains(&platform, &domain_map).await;
+    // Only now is the domain map authoritative: stop serving cached certs for hosts
+    // that are no longer Active domains (e.g. rows the boot purge just removed).
+    if let Some(ref cm) = cert_manager {
+        cm.unload_unmapped_certs().await;
+    }
 
     let proxy_tok = proxy_shutdown.clone();
     let proxy_join = tokio::spawn(async move {

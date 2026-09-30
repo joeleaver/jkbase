@@ -142,10 +142,15 @@ pub type CertStatusFn = Arc<dyn Fn(&str) -> CertState + Send + Sync>;
 /// stops being served and renewed. Wired by the server to the proxy's CertManager.
 pub type CertRemove = Arc<dyn Fn(String) + Send + Sync>;
 /// DNS read used by domain verification: `(fqdn, "TXT" | "CNAME" | "CAA")` → the answers' data.
-/// Any lookup failure is an empty answer (verification is retryable). Pluggable so the
-/// verification + conflict logic is testable offline; defaults to DoH ([`doh_lookup`]).
+/// `Ok` is an AUTHORITATIVE answer (NOERROR or NXDOMAIN; possibly empty); `Err` means the
+/// lookup itself failed (network, timeout, SERVFAIL) and says nothing about the tenant's
+/// DNS — callers must never read it as "record absent" (the cert manager would count a
+/// resolver outage against a tenant's give-up budget). Pluggable so the verification +
+/// conflict logic is testable offline; defaults to DoH ([`doh_lookup`]).
 pub type DnsLookup = Arc<
-    dyn Fn(String, &'static str) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync,
+    dyn Fn(String, &'static str) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// Whether (and how) this server can serve `*.<base>` wildcard domains.
@@ -5279,7 +5284,11 @@ async fn verify_domain(
 
     if !(rearm && record.kind == DomainKind::Custom) {
         let proof = record.ownership_name().to_string();
-        if !dns_txt_contains(&state, &proof, &record.token).await {
+        let found = match dns_txt_contains(&state, &proof, &record.token).await {
+            Ok(found) => found,
+            Err(e) => return dns_unavailable(&e),
+        };
+        if !found {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
@@ -5299,7 +5308,11 @@ async fn verify_domain(
         match (&state.wildcard_support, acme_delegation(&state, &record)) {
             (WildcardSupport::Unsupported, _) => return wildcard_unsupported(),
             (WildcardSupport::Dns01 { .. }, Some(d)) => {
-                if !dns_cname_is(&state, &d.record, &d.cname).await {
+                let delegated = match dns_cname_is(&state, &d.record, &d.cname).await {
+                    Ok(delegated) => delegated,
+                    Err(e) => return dns_unavailable(&e),
+                };
+                if !delegated {
                     return bad_request(format!(
                         "CNAME record {} -> {} not found (DNS may take a few minutes to propagate)",
                         d.record, d.cname
@@ -5415,6 +5428,19 @@ fn bad_request(msg: impl Into<String>) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse { error: msg.into() }),
+    )
+        .into_response()
+}
+
+/// A verify whose DNS lookup itself failed: retryable, and NOT a verdict on the tenant's
+/// records. The cause is logged, not echoed.
+fn dns_unavailable(e: &anyhow::Error) -> axum::response::Response {
+    tracing::warn!(error = %e, "domain verification DNS lookup failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "DNS lookup failed; try verifying again shortly".into(),
+        }),
     )
         .into_response()
 }
@@ -5649,54 +5675,72 @@ async fn reconcile_deploy_domains(
     }
 }
 
-/// Whether `_jkbase-challenge.<name>` carries the `expected` TXT token. False
-/// (retryable) on any lookup failure.
-async fn dns_txt_contains(state: &AppState, name: &str, expected: &str) -> bool {
-    let answers = (state.dns_lookup)(format!("_jkbase-challenge.{name}"), "TXT").await;
-    answers.iter().any(|data| {
+/// Whether `_jkbase-challenge.<name>` carries the `expected` TXT token. `Err` = the
+/// lookup failed (retryable; not evidence either way).
+async fn dns_txt_contains(state: &AppState, name: &str, expected: &str) -> anyhow::Result<bool> {
+    let answers = (state.dns_lookup)(format!("_jkbase-challenge.{name}"), "TXT").await?;
+    Ok(answers.iter().any(|data| {
         // TXT data is returned quoted, and may be chunked: "abc" "def".
         let joined: String = data
             .split_whitespace()
             .map(|chunk| chunk.trim_matches('"'))
             .collect();
         joined == expected || data.trim_matches('"') == expected
-    })
+    }))
 }
 
-/// Whether `name` is a CNAME to exactly `target` (case/root-dot insensitive).
-async fn dns_cname_is(state: &AppState, name: &str, target: &str) -> bool {
+/// Whether `name` is a CNAME to exactly `target` (case/root-dot insensitive). `Err` =
+/// the lookup failed.
+async fn dns_cname_is(state: &AppState, name: &str, target: &str) -> anyhow::Result<bool> {
     let want = jkbase_common::routing::normalize_host(target);
-    (state.dns_lookup)(name.to_string(), "CNAME")
-        .await
+    Ok((state.dns_lookup)(name.to_string(), "CNAME")
+        .await?
         .iter()
-        .any(|data| jkbase_common::routing::normalize_host(data.trim()) == want)
+        .any(|data| jkbase_common::routing::normalize_host(data.trim()) == want))
 }
 
-/// Default [`DnsLookup`]: DNS-over-HTTPS (Cloudflare JSON API). Empty on any
-/// network/parse error. `name` is always a validated LDH name built server-side.
-pub async fn doh_lookup(name: String, rtype: &'static str) -> Vec<String> {
-    let url = format!("https://cloudflare-dns.com/dns-query?name={name}&type={rtype}");
-    let client = reqwest::Client::new();
-    let Ok(resp) = client
-        .get(&url)
-        .header("accept", "application/dns-json")
-        .send()
-        .await
-    else {
-        return Vec::new();
-    };
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
-        return Vec::new();
-    };
+/// One DoH round trip, connect included. The cert manager awaits lookups inside its
+/// serial reconcile pass (the one that also renews the platform certs), so a stalled
+/// resolver must fail fast rather than wedge it.
+const DOH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default [`DnsLookup`]: DNS-over-HTTPS (Cloudflare JSON API) over one shared,
+/// timeout-bounded client. `Ok` only for NOERROR / NXDOMAIN; transport, HTTP, parse and
+/// resolver errors (SERVFAIL, REFUSED, …) are `Err`. `name` is always a validated LDH
+/// name built server-side.
+pub async fn doh_lookup(name: String, rtype: &'static str) -> anyhow::Result<Vec<String>> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     // Only answers of the asked type: a TXT query through a CNAME also returns the
     // CNAME hop, whose data must not be read as a TXT token (and vice versa).
     let want = match rtype {
         "TXT" => 16,
         "CNAME" => 5,
         "CAA" => 257,
-        _ => return Vec::new(),
+        _ => anyhow::bail!("unsupported DNS record type {rtype}"),
     };
-    json["Answer"]
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(DOH_TIMEOUT)
+            .connect_timeout(DOH_TIMEOUT)
+            .build()
+            .unwrap_or_default()
+    });
+    let json: serde_json::Value = client
+        .get("https://cloudflare-dns.com/dns-query")
+        .query(&[("name", name.as_str()), ("type", rtype)])
+        .header("accept", "application/dns-json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    // RFC 1035 RCODE: 0 NOERROR, 3 NXDOMAIN are answers; anything else (2 SERVFAIL
+    // included — e.g. the tenant's nameservers are down) is a failed lookup.
+    match json["Status"].as_u64() {
+        Some(0 | 3) => {}
+        other => anyhow::bail!("DoH lookup of {name} {rtype} failed (rcode {other:?})"),
+    }
+    Ok(json["Answer"]
         .as_array()
         .map(|answers| {
             answers
@@ -5705,7 +5749,7 @@ pub async fn doh_lookup(name: String, rtype: &'static str) -> Vec<String> {
                 .filter_map(|a| a["data"].as_str().map(str::to_string))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn to_response(p: &Project) -> ProjectResponse {

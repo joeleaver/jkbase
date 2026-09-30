@@ -23,6 +23,10 @@ type Dns = Arc<Mutex<HashMap<(String, String), Vec<String>>>>;
 /// Artificial DNS latency, to open the window between verify's read and its write.
 static DNS_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Names whose lookups FAIL (SERVFAIL / resolver down) rather than answer. Per-name, so
+/// tests running in parallel don't see each other's failures.
+static DNS_FAILING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 struct Harness {
     addr: std::net::SocketAddr,
     /// Bearer tokens for tenant-1 (owns project `app`) and tenant-2 (owns `rival`).
@@ -99,6 +103,9 @@ async fn spawn_with(tag: &str, support: WildcardSupport, limits: WildcardLimits)
     state.domain_map = Some(domain_map.clone());
     let d = dns.clone();
     state.dns_lookup = Arc::new(move |name, rtype| {
+        if DNS_FAILING.lock().unwrap().contains(&name) {
+            return Box::pin(async { Err(anyhow::anyhow!("SERVFAIL")) });
+        }
         let answers = d
             .lock()
             .unwrap()
@@ -110,7 +117,7 @@ async fn spawn_with(tag: &str, support: WildcardSupport, limits: WildcardLimits)
             if ms > 0 {
                 tokio::time::sleep(Duration::from_millis(ms)).await;
             }
-            answers
+            Ok(answers)
         })
     });
     let reqs = cert_requests.clone();

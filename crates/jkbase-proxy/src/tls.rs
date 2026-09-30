@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -70,12 +71,41 @@ const ACME_CA_IDENTITY: &str = "letsencrypt.org";
 /// Where issue health (backoff / give-up / budget blocks) persists across restarts.
 const ISSUE_HEALTH_FILE: &str = "issue-health.json";
 
-/// `(fqdn, "CNAME" | "CAA")` → the answers' data (empty on any failure). The server
-/// wires this to the SAME resolver control's `verify` uses, so "verified" and "still
-/// delegated" agree.
+/// `(fqdn, "CNAME" | "CAA")` → the answers' data. `Ok` is an authoritative answer
+/// (possibly empty); `Err` is a failed lookup — never read as "record absent", or a
+/// resolver outage would count against tenants' give-up budgets. The server wires this to
+/// the SAME resolver control's `verify` uses, so "verified" and "still delegated" agree.
 pub type DnsLookup = Arc<
-    dyn Fn(String, &'static str) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync,
+    dyn Fn(String, &'static str) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send>>
+        + Send
+        + Sync,
 >;
+
+/// Upper bound on one pre-order DNS lookup, whatever [`DnsLookup`] is plugged in: the
+/// custom-host pass is serial and shares a loop with the platform certs' renewal, so a
+/// hung resolver must cost one host a transient failure, never wedge the loop.
+const DNS_PRECHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn lookup(l: &DnsLookup, name: String, rtype: &'static str) -> Result<Vec<String>> {
+    tokio::time::timeout(DNS_PRECHECK_TIMEOUT, l(name.clone(), rtype))
+        .await
+        .map_err(|_| anyhow::anyhow!("DNS lookup of {name} {rtype} timed out"))?
+}
+
+/// Why a pre-order check stopped an order. Only [`Precheck::Tenant`] — DNS positively
+/// answered and the tenant's records are wrong — counts toward give-up; a failed lookup
+/// says nothing about the tenant and only backs the host off.
+enum Precheck {
+    Tenant(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+impl From<anyhow::Error> for Precheck {
+    /// `?` on a lookup: a failed lookup is transient.
+    fn from(e: anyhow::Error) -> Self {
+        Precheck::Transient(e)
+    }
+}
 
 /// Verdict of the per-tenant order budget on one prospective order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,7 +164,12 @@ pub enum HostCertState {
 /// re-arm a host that gave up or refund a backoff.
 #[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct IssueHealth {
+    /// Consecutive failures of any kind; drives the backoff.
     failures: u32,
+    /// Consecutive failures that may count toward give-up (tenant-caused, on a host with
+    /// no cert yet); [`WILDCARD_MAX_FAILURES`] of them stops issuance until re-verify.
+    #[serde(default)]
+    strikes: u32,
     next_attempt: Option<u64>,
     gave_up: bool,
     blocked_until: Option<u64>,
@@ -179,12 +214,16 @@ impl IssueHealthBook {
     fn succeed(&mut self, host: &str) {
         self.0.remove(host);
     }
-    /// Record a failed attempt; returns `true` once the host has given up.
-    fn fail(&mut self, host: &str, now: u64, may_give_up: bool) -> bool {
+    /// Record a failed attempt; returns `true` once the host has given up. Every failure
+    /// backs off; only a `strike` counts toward give-up.
+    fn fail(&mut self, host: &str, now: u64, strike: bool) -> bool {
         let h = self.0.entry(host.to_string()).or_default();
         h.in_flight = false;
         h.failures = h.failures.saturating_add(1);
-        if may_give_up && h.failures >= WILDCARD_MAX_FAILURES {
+        if strike {
+            h.strikes = h.strikes.saturating_add(1);
+        }
+        if h.strikes >= WILDCARD_MAX_FAILURES {
             h.gave_up = true;
         } else {
             h.next_attempt = Some(now + issue_backoff(h.failures));
@@ -277,28 +316,29 @@ fn unix_now() -> u64 {
 }
 
 /// Whether `_acme-challenge.<base>` currently CNAMEs to exactly `challenge_name`.
-async fn delegation_in_place(lookup: &DnsLookup, base: &str, challenge_name: &str) -> bool {
+/// `Err` = the lookup failed (no verdict).
+async fn delegation_in_place(l: &DnsLookup, base: &str, challenge_name: &str) -> Result<bool> {
     let want = normalize_host(challenge_name);
-    lookup(format!("_acme-challenge.{base}"), "CNAME")
-        .await
+    Ok(lookup(l, format!("_acme-challenge.{base}"), "CNAME")
+        .await?
         .iter()
-        .any(|t| normalize_host(t.trim()) == want)
+        .any(|t| normalize_host(t.trim()) == want))
 }
 
 /// RFC 8659 CAA pre-check: does DNS let [`ACME_CA_IDENTITY`] issue for `name` (a host,
 /// or the base of a wildcard)? Climbs from `name` towards the root and judges the FIRST
 /// non-empty CAA set; no set anywhere = allowed. Refusing here costs nothing, whereas an
 /// order a CAA record forbids fails at the CA AND spends the shared account's budget.
-async fn caa_permits(lookup: &DnsLookup, name: &str, wildcard: bool) -> bool {
+async fn caa_permits(l: &DnsLookup, name: &str, wildcard: bool) -> Result<bool> {
     let mut n = name.to_string();
     loop {
-        let set = lookup(n.clone(), "CAA").await;
+        let set = lookup(l, n.clone(), "CAA").await?;
         if !set.is_empty() {
-            return caa_set_permits(&set, wildcard);
+            return Ok(caa_set_permits(&set, wildcard));
         }
         match n.split_once('.') {
             Some((_, rest)) if rest.contains('.') => n = rest.to_string(),
-            _ => return true,
+            _ => return Ok(true),
         }
     }
 }
@@ -438,6 +478,9 @@ pub struct CertManager {
     health: Mutex<IssueHealthBook>,
     /// `health` changed since the last [`Self::flush_health`].
     health_dirty: std::sync::atomic::AtomicBool,
+    /// Serializes [`Self::flush_health`]: a reconcile tick and an explicit request can
+    /// flush concurrently, and they share one temp file.
+    health_flush: AsyncMutex<()>,
     /// Global budget for tenant-initiated orders.
     tenant_bucket: Mutex<TokenBucket>,
 }
@@ -471,6 +514,7 @@ impl CertManager {
             challenges: Arc::new(AsyncRwLock::new(HashMap::new())),
             health: Mutex::new(health),
             health_dirty: std::sync::atomic::AtomicBool::new(false),
+            health_flush: AsyncMutex::new(()),
             tenant_bucket: Mutex::new(tenant_bucket),
         });
 
@@ -542,6 +586,7 @@ impl CertManager {
     /// loses at most the last tick's changes, which the order budgets still bound.
     async fn flush_health(&self) {
         use std::sync::atomic::Ordering;
+        let _flushing = self.health_flush.lock().await;
         if !self.health_dirty.swap(false, Ordering::AcqRel) {
             return;
         }
@@ -564,18 +609,27 @@ impl CertManager {
     /// call: the host's own backoff slot, then the free DNS pre-checks (`precheck`: the
     /// delegation CNAME for a wildcard; CAA for both), then the global tenant bucket,
     /// then the owner's persisted budget. `false` = don't order now (state recorded).
+    /// A tenant-caused precheck failure is a give-up strike iff `may_give_up`; a failed
+    /// lookup never is.
     async fn gate_tenant_order(
         &self,
         host: &str,
-        precheck: impl Future<Output = Result<()>>,
+        precheck: impl Future<Output = std::result::Result<(), Precheck>>,
         may_give_up: bool,
     ) -> bool {
         if !self.with_health(|h| h.begin(host, unix_now())) {
             return false;
         }
-        if let Err(e) = precheck.await {
-            self.record_failure(host, &e, may_give_up);
-            return false;
+        match precheck.await {
+            Ok(()) => {}
+            Err(Precheck::Tenant(e)) => {
+                self.record_failure(host, &e, may_give_up);
+                return false;
+            }
+            Err(Precheck::Transient(e)) => {
+                self.record_failure(host, &e, false);
+                return false;
+            }
         }
         // A renewal (a cert is already loaded) may dip into the renewal reserve.
         let renewal = self.has_cert(host);
@@ -602,8 +656,8 @@ impl CertManager {
         }
     }
 
-    fn record_failure(&self, host: &str, e: &anyhow::Error, may_give_up: bool) {
-        if self.with_health(|h| h.fail(host, unix_now(), may_give_up)) {
+    fn record_failure(&self, host: &str, e: &anyhow::Error, strike: bool) {
+        if self.with_health(|h| h.fail(host, unix_now(), strike)) {
             warn!(host = %host, error = %e,
                 "certificate issuance failed repeatedly; giving up until re-verified");
         } else {
@@ -724,6 +778,22 @@ impl CertManager {
         self.domains.read().await.contains_key(host)
     }
 
+    /// Unload cached per-host / wildcard certs whose host is not an Active domain (a row
+    /// purged at boot, or one whose removal failed to delete the cache). Call once the
+    /// domain map is built: until then a released `*.<base>` cert would keep answering
+    /// SNI for every label under it, and a re-claim would read it as already Issued.
+    /// Files stay on disk (a re-claim overwrites them); only serving stops.
+    pub async fn unload_unmapped_certs(&self) {
+        let map = self.domains.read().await;
+        self.resolver.hosts.write().unwrap().retain(|host, _| {
+            let keep = map.contains_key(host);
+            if !keep {
+                info!(host = %host, "not an active domain; cached certificate not served");
+            }
+            keep
+        });
+    }
+
     fn host_cert_dir(&self, host: &str) -> Option<PathBuf> {
         cert_cache_dir(&self.cfg.cert_dir, host)
     }
@@ -766,10 +836,12 @@ impl CertManager {
             return;
         }
         let caa = async {
-            if caa_permits(&self.cfg.dns_lookup, host, false).await {
+            if caa_permits(&self.cfg.dns_lookup, host, false).await? {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!("CAA forbids {ACME_CA_IDENTITY} for {host}"))
+                Err(Precheck::Tenant(anyhow::anyhow!(
+                    "CAA forbids {ACME_CA_IDENTITY} for {host}"
+                )))
             }
         };
         if !self.gate_tenant_order(host, caa, false).await {
@@ -795,6 +867,10 @@ impl CertManager {
                 } else {
                     drop(map);
                     self.forget_cert(host);
+                    // forget_cert keeps the in-flight marker for a concurrent order —
+                    // which is THIS one; free the slot or the host could never issue
+                    // again (e.g. re-added to another project) until a restart.
+                    self.with_health(|h| h.succeed(host));
                 }
             }
             Err(e) => self.record_failure(host, &e, false),
@@ -823,18 +899,24 @@ impl CertManager {
         // reach our TXT through the tenant's CNAME and CAA lets it issue — re-checked
         // before EVERY order, renewals included; the tenant can change DNS any time.
         let prechecks = async {
-            if !delegation_in_place(&self.cfg.dns_lookup, base, &order.challenge_name).await {
-                anyhow::bail!(
+            if !delegation_in_place(&self.cfg.dns_lookup, base, &order.challenge_name).await? {
+                return Err(Precheck::Tenant(anyhow::anyhow!(
                     "_acme-challenge.{base} no longer CNAMEs to {}",
                     order.challenge_name
-                );
+                )));
             }
-            if !caa_permits(&self.cfg.dns_lookup, base, true).await {
-                anyhow::bail!("CAA forbids {ACME_CA_IDENTITY} for *.{base}");
+            if !caa_permits(&self.cfg.dns_lookup, base, true).await? {
+                return Err(Precheck::Tenant(anyhow::anyhow!(
+                    "CAA forbids {ACME_CA_IDENTITY} for *.{base}"
+                )));
             }
             Ok(())
         };
-        if !self.gate_tenant_order(host, prechecks, true).await {
+        // A cert that is already serving never gives up for good: its renewals only back
+        // off (capped, budget-metered), so a platform-side outage (DNS provider, CA, DoH)
+        // can't strand every tenant wildcard until each owner notices and re-verifies.
+        let first_issue = !self.has_cert(host);
+        if !self.gate_tenant_order(host, prechecks, first_issue).await {
             return;
         }
         match self
@@ -842,7 +924,7 @@ impl CertManager {
             .await
         {
             Ok(()) => self.with_health(|h| h.succeed(host)),
-            Err(e) => self.record_failure(host, &e, true),
+            Err(e) => self.record_failure(host, &e, first_issue),
         }
     }
 
@@ -1598,7 +1680,7 @@ mod tests {
             dns_provider: Arc::new(NoDns),
             acme_email: "ops@example.com".into(),
             acme_delegation_zone: zone.into(),
-            dns_lookup: Arc::new(|_, _| Box::pin(async { Vec::new() })),
+            dns_lookup: Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             order_gate: None,
             tenant_orders_per_3h: 60,
             tenant_renewal_reserve_percent: 33,
@@ -1621,7 +1703,7 @@ mod tests {
                 .get(&(name, rtype.to_string()))
                 .cloned()
                 .unwrap_or_default();
-            Box::pin(async move { a })
+            Box::pin(async move { Ok(a) })
         })
     }
 
@@ -1638,17 +1720,17 @@ mod tests {
                 "play.develup.win",
                 want
             )
-            .await
+            .await.unwrap()
         );
         // Removed, or pointed elsewhere (e.g. another domain's label): no order.
-        assert!(!delegation_in_place(&at(&[]), "play.develup.win", want).await);
+        assert!(!delegation_in_place(&at(&[]), "play.develup.win", want).await.unwrap());
         assert!(
             !delegation_in_place(
                 &at(&["ffff._acme-delegation.jkbase.app."]),
                 "play.develup.win",
                 want
             )
-            .await
+            .await.unwrap()
         );
     }
 
@@ -1657,18 +1739,18 @@ mod tests {
     #[tokio::test]
     async fn caa_pre_check_follows_rfc8659() {
         let none = dns(&[]);
-        assert!(caa_permits(&none, "n1.attacker.com", true).await);
+        assert!(caa_permits(&none, "n1.attacker.com", true).await.unwrap());
         // Forbid-all at the base, or at an ancestor (tree climbing).
         let forbid = dns(&[("n1.attacker.com", "CAA", &["0 issue \";\""])]);
-        assert!(!caa_permits(&forbid, "n1.attacker.com", true).await);
+        assert!(!caa_permits(&forbid, "n1.attacker.com", true).await.unwrap());
         let parent = dns(&[("attacker.com", "CAA", &["0 issue \"digicert.com\""])]);
-        assert!(!caa_permits(&parent, "n1.attacker.com", false).await);
+        assert!(!caa_permits(&parent, "n1.attacker.com", false).await.unwrap());
         // The closest set wins, even if an ancestor would forbid.
         let closest = dns(&[
             ("n1.attacker.com", "CAA", &["0 issue \"letsencrypt.org\""]),
             ("attacker.com", "CAA", &["0 issue \";\""]),
         ]);
-        assert!(caa_permits(&closest, "n1.attacker.com", false).await);
+        assert!(caa_permits(&closest, "n1.attacker.com", false).await.unwrap());
         // Wildcards read `issuewild` when present, else `issue`.
         let split = dns(&[(
             "b.example.com",
@@ -1679,8 +1761,8 @@ mod tests {
                 "0 iodef \"mailto:x@example.com\"",
             ],
         )]);
-        assert!(caa_permits(&split, "b.example.com", false).await);
-        assert!(!caa_permits(&split, "b.example.com", true).await);
+        assert!(caa_permits(&split, "b.example.com", false).await.unwrap());
+        assert!(!caa_permits(&split, "b.example.com", true).await.unwrap());
         // Parameters after `;`, case, and iodef-only sets.
         assert!(caa_set_permits(
             &["128 issue \"LetsEncrypt.org; accounturi=x\"".to_string()],
@@ -2115,5 +2197,59 @@ mod tests {
         )
         .unwrap();
         assert!(p.signer().is_ok());
+    }
+
+    /// Review (TLS M2): a platform-side failure — resolver outage, DNS provider or CA
+    /// trouble — must never strand a tenant wildcard. Only strikes count toward give-up;
+    /// plain failures still back off.
+    #[test]
+    fn only_strikes_count_toward_give_up() {
+        let mut book = IssueHealthBook::default();
+        let h = "*.play.develup.win";
+        let mut now = 1_000_000u64;
+        for _ in 0..(WILDCARD_MAX_FAILURES * 4) {
+            assert!(book.begin(h, now));
+            assert!(!book.fail(h, now, false), "a transient failure gave up");
+            assert!(!book.due(h, now), "a transient failure must still back off");
+            now += ISSUE_BACKOFF_MAX;
+        }
+        // Tenant-caused failures after a long transient streak get the full allowance.
+        for n in 1..=WILDCARD_MAX_FAILURES {
+            assert!(book.begin(h, now));
+            assert_eq!(book.fail(h, now, true), n == WILDCARD_MAX_FAILURES);
+            now += ISSUE_BACKOFF_MAX;
+        }
+        // Old books (no `strikes`) still load.
+        let old: IssueHealthBook =
+            serde_json::from_str(r#"{"x.example.com":{"failures":3,"next_attempt":5,"gave_up":false,"blocked_until":null}}"#)
+                .unwrap();
+        assert_eq!(old.0["x.example.com"].strikes, 0);
+    }
+
+    /// Review (TLS M1): an order finishing after its host was removed must free the
+    /// host's slot, or a re-add could never issue again until a restart.
+    #[test]
+    fn an_order_outliving_its_host_frees_the_slot() {
+        let mut book = IssueHealthBook::default();
+        let h = "x.example.com";
+        assert!(book.begin(h, 10));
+        book.reset(h); // forget_cert during the order: stays deduped…
+        assert!(!book.due(h, 10));
+        book.reset(h); // …the finishing order's own forget_cert…
+        book.succeed(h); // …then it frees the slot.
+        assert!(book.due(h, 10) && book.begin(h, 10));
+    }
+
+    /// A failed or hung lookup is no verdict: it surfaces as `Err` (→ transient), never
+    /// as "no CNAME" / "no CAA".
+    #[tokio::test(start_paused = true)]
+    async fn failed_or_hung_lookups_are_errors_not_answers() {
+        let failing: DnsLookup =
+            Arc::new(|_, _| Box::pin(async { Err(anyhow::anyhow!("SERVFAIL")) }));
+        assert!(delegation_in_place(&failing, "b.example.com", "x.z.jkbase.app").await.is_err());
+        assert!(caa_permits(&failing, "b.example.com", true).await.is_err());
+        let hung: DnsLookup = Arc::new(|_, _| Box::pin(std::future::pending()));
+        assert!(delegation_in_place(&hung, "b.example.com", "x.z.jkbase.app").await.is_err());
+        assert!(caa_permits(&hung, "b.example.com", false).await.is_err());
     }
 }
