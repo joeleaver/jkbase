@@ -28,7 +28,7 @@ use hickory_client::proto::rr::{Name, RData, Record};
 use hickory_client::proto::udp::UdpClientStream;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    RetryPolicy,
+    OrderStatus, RetryPolicy,
 };
 use jkbase_common::routing::{WILDCARD_PREFIX, is_wildcard_key, normalize_host, wildcard_key};
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
@@ -681,10 +681,10 @@ impl CertManager {
 
     fn record_failure(&self, host: &str, e: &anyhow::Error, strike: bool) {
         if self.with_health(|h| h.fail(host, unix_now(), strike)) {
-            warn!(host = %host, error = %e,
+            warn!(host = %host, error = format!("{e:#}"),
                 "certificate issuance failed repeatedly; giving up until re-verified");
         } else {
-            warn!(host = %host, error = %e, "certificate issuance failed (backing off)");
+            warn!(host = %host, error = format!("{e:#}"), "certificate issuance failed (backing off)");
         }
     }
 
@@ -1054,10 +1054,7 @@ impl CertManager {
         order: &mut instant_acme::Order,
         host: &str,
     ) -> Result<CertifiedKey> {
-        order
-            .poll_ready(&RetryPolicy::default())
-            .await
-            .context("order did not become ready")?;
+        await_order_ready(order).await?;
 
         let key_pair = KeyPair::generate()?;
         let mut params = CertificateParams::new(vec![host.to_string()])?;
@@ -1151,10 +1148,7 @@ impl CertManager {
             }
         }
 
-        order
-            .poll_ready(&RetryPolicy::default())
-            .await
-            .context("order not ready")?;
+        await_order_ready(&mut order).await?;
         let key_pair = KeyPair::generate()?;
         let domain_names: Vec<String> = identifiers
             .iter()
@@ -1383,6 +1377,33 @@ pub trait DnsProvider: Send + Sync {
     async fn create_txt(&self, name: &str, value: &str) -> Result<String>;
     /// Remove the TXT record identified by a handle from [`create_txt`](Self::create_txt).
     async fn delete_txt(&self, handle: &str) -> Result<()>;
+}
+
+/// Poll an order to `Ready`, or fail WITH the CA's reason. `poll_ready` returns
+/// `Ok(Invalid)` (not `Err`) when a challenge fails validation; finalizing anyway yields an
+/// opaque `orderNotReady` and hides the one fact an operator needs (NXDOMAIN, wrong TXT,
+/// CAA, timeout…). Re-fetch each authorization and lift its challenge `error` into ours.
+async fn await_order_ready(order: &mut instant_acme::Order) -> Result<()> {
+    let status = order
+        .poll_ready(&RetryPolicy::default())
+        .await
+        .context("order did not become ready")?;
+    if status == OrderStatus::Ready {
+        return Ok(());
+    }
+    let mut reasons = Vec::new();
+    let mut authorizations = order.authorizations();
+    while let Some(auth) = authorizations.next().await {
+        let Ok(mut auth) = auth else { continue };
+        let Ok(state) = auth.refresh().await else { continue };
+        for problem in state.challenges.iter().filter_map(|c| c.error.as_ref()) {
+            reasons.push(format!("{}: {problem}", state.identifier()));
+        }
+    }
+    if reasons.is_empty() {
+        anyhow::bail!("ACME order {status:?} (CA gave no challenge error)");
+    }
+    anyhow::bail!("ACME order {status:?}: {}", reasons.join("; "))
 }
 
 /// Cloudflare DNS-01 backend (the default; reads the `CLOUDFLARE_*` config for back-compat).
