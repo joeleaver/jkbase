@@ -37,6 +37,12 @@ const PLATFORM_SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("pla
 /// order timestamps inside the budget window. Keyed by TENANT, so removing / re-adding
 /// domains or restarting the server never refunds spent orders.
 const TENANT_ACME_ORDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_acme_orders");
+/// Generation of each tenant's wildcard claim proof for a host (`"{tenant}\0{host}"` →
+/// counter; absent = 0), mixed into `auth::wildcard_claim_proof`. Bumped whenever a
+/// VERIFIED wildcard is released (removed, project deleted, purged), so TXT/CNAME
+/// records a former owner left in DNS stop being valid proof for them. Never bumped
+/// for pending claims: re-claims and takeovers of an unverified name keep the records.
+const CLAIM_GENERATIONS: TableDefinition<&str, u64> = TableDefinition::new("claim_generations");
 const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
 const QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("quotas");
@@ -921,6 +927,31 @@ pub enum WildcardClaim {
     TotalCapReached,
 }
 
+fn claim_generation_key(tenant_id: &str, host: &str) -> String {
+    format!("{tenant_id}\0{host}")
+}
+
+/// Bump the claim-proof generation of a removed row's owner iff it was a VERIFIED
+/// wildcard. An undecodable row rotates nothing (it can't have been proven by us).
+fn rotate_if_verified_wildcard(
+    generations: &mut redb::Table<&str, u64>,
+    removed: &[u8],
+) -> Result<()> {
+    let Ok(r) = serde_json::from_slice::<DomainRecord>(removed) else {
+        return Ok(());
+    };
+    if r.kind == DomainKind::Wildcard && r.status == DomainStatus::Active {
+        let key = claim_generation_key(&r.tenant_id, &r.host);
+        let next = generations
+            .get(key.as_str())?
+            .map(|v| v.value())
+            .unwrap_or(0)
+            .wrapping_add(1);
+        generations.insert(key.as_str(), next)?;
+    }
+    Ok(())
+}
+
 /// Order timestamps still inside the budget window (oldest first).
 fn acme_stamps(raw: Option<Vec<u8>>, now: u64, budget: &AcmeOrderBudget) -> Vec<u64> {
     let mut v: Vec<u64> = raw
@@ -1017,6 +1048,7 @@ impl Store {
         let _ = txn.open_table(WILDCARD_DOMAINS)?;
         let _ = txn.open_table(PLATFORM_SECRETS)?;
         let _ = txn.open_table(TENANT_ACME_ORDERS)?;
+        let _ = txn.open_table(CLAIM_GENERATIONS)?;
         let _ = txn.open_table(SCHEDULES)?;
         let _ = txn.open_table(USAGE)?;
         let _ = txn.open_table(QUOTAS)?;
@@ -2128,14 +2160,30 @@ impl Store {
         Ok(())
     }
 
+    /// Remove a host's claim. Releasing a VERIFIED wildcard also rotates its owner's
+    /// claim-proof generation, in the same txn (see `CLAIM_GENERATIONS`).
     pub fn remove_domain(&self, host: &str) -> Result<bool> {
         let txn = self.db.begin_write()?;
         let existed = {
             let mut table = txn.open_table(domain_table(host))?;
-            table.remove(host)?.is_some()
+            let removed = table.remove(host)?.map(|v| v.value().to_vec());
+            if let Some(bytes) = &removed {
+                let mut generations = txn.open_table(CLAIM_GENERATIONS)?;
+                rotate_if_verified_wildcard(&mut generations, bytes)?;
+            }
+            removed.is_some()
         };
         txn.commit()?;
         Ok(existed)
+    }
+
+    /// Current generation of `tenant_id`'s claim proof for `host` (0 if never rotated).
+    pub fn claim_generation(&self, tenant_id: &str, host: &str) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(CLAIM_GENERATIONS)?;
+        Ok(t.get(claim_generation_key(tenant_id, host).as_str())?
+            .map(|v| v.value())
+            .unwrap_or(0))
     }
 
     /// Every routable-kind domain record, exact and wildcard. Skipped (with a warning)
@@ -2311,8 +2359,12 @@ impl Store {
                         "keeping undecodable wildcard row (not purged)"),
                 }
             }
+            let mut generations = txn.open_table(CLAIM_GENERATIONS)?;
             for k in &doomed_wild {
-                wild.remove(k.as_str())?;
+                let removed = wild.remove(k.as_str())?.map(|v| v.value().to_vec());
+                if let Some(bytes) = &removed {
+                    rotate_if_verified_wildcard(&mut generations, bytes)?;
+                }
             }
             for k in doomed_exact.iter().chain(&doomed_wild) {
                 tracing::warn!(host = %k, "purged invalid domain row");
@@ -5301,6 +5353,60 @@ mod tests {
             (row.tenant_id.as_str(), row.token.as_str(), row.status),
             ("t1", "mine", DomainStatus::Active)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review N1: releasing a VERIFIED wildcard — by removal, project delete (which
+    /// removes each row) or the boot purge of an orphan — rotates its owner's claim-proof
+    /// generation; releasing a pending one never does.
+    #[test]
+    fn claim_generation_rotates_only_on_verified_wildcard_release() {
+        let (store, path) = tmp_db();
+        let g = |t: &str, h: &str| store.claim_generation(t, h).unwrap();
+        store
+            .claim_domain(&wildcard(
+                "*.p.example.com",
+                "a",
+                "t1",
+                DomainStatus::Pending,
+            ))
+            .unwrap();
+        store.remove_domain("*.p.example.com").unwrap();
+        assert_eq!(g("t1", "*.p.example.com"), 0);
+
+        store
+            .claim_domain(&wildcard(
+                "*.p.example.com",
+                "a",
+                "t1",
+                DomainStatus::Active,
+            ))
+            .unwrap();
+        store.remove_domain("*.p.example.com").unwrap();
+        assert_eq!(g("t1", "*.p.example.com"), 1);
+        assert_eq!(g("t2", "*.p.example.com"), 0);
+        // Exact hosts have random per-claim tokens; nothing to rotate.
+        store
+            .claim_domain(&domain("x.example.com", "a", "t1", DomainStatus::Active))
+            .unwrap();
+        store.remove_domain("x.example.com").unwrap();
+        assert_eq!(g("t1", "x.example.com"), 0);
+
+        // An Active orphan purged at boot rotates too (its project "zz" is gone).
+        store
+            .claim_domain(&wildcard(
+                "*.o.example.com",
+                "zz",
+                "t1",
+                DomainStatus::Active,
+            ))
+            .unwrap();
+        assert_eq!(store.purge_invalid_domain_rows().unwrap(), 1);
+        assert_eq!(g("t1", "*.o.example.com"), 1);
+        // Survives a restart.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.claim_generation("t1", "*.p.example.com").unwrap(), 1);
         let _ = std::fs::remove_file(&path);
     }
 

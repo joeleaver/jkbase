@@ -5057,7 +5057,8 @@ fn foreign_active_owner(state: &AppState, tenant_id: &str, keys: &[String]) -> O
 /// A fresh claim record. Custom + wildcard start Pending (DNS-TXT proof pending);
 /// platform subdomains are ours → Active. A wildcard's TXT token and ACME delegation
 /// label are the tenant's deterministic claim proof for the host
-/// (`auth::wildcard_claim_proof`), so they survive re-claims.
+/// (`auth::wildcard_claim_proof`), so they survive re-claims of an unverified name and
+/// change once a verified claim is released.
 fn new_domain_record(
     state: &AppState,
     host: &str,
@@ -5067,8 +5068,12 @@ fn new_domain_record(
     site: Option<String>,
 ) -> anyhow::Result<DomainRecord> {
     let (token, acme_delegation) = if kind == DomainKind::Wildcard {
-        let (t, l) =
-            auth::wildcard_claim_proof(&state.store.domain_claim_secret()?, tenant_id, host);
+        let (t, l) = auth::wildcard_claim_proof(
+            &state.store.domain_claim_secret()?,
+            tenant_id,
+            host,
+            state.store.claim_generation(tenant_id, host)?,
+        );
         (t, Some(l))
     } else {
         (auth::generate_token(), None)

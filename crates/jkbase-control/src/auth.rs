@@ -49,13 +49,20 @@ pub fn generate_secret_bytes() -> Vec<u8> {
 }
 
 /// A tenant's wildcard claim proof for `host`: `(TXT token, ACME delegation label)`,
-/// both HMAC-SHA256 under the platform's `domain_claims` secret over (tenant, host).
-/// Deterministic per (tenant, host), so re-claiming — after a removal, or after a squatter
-/// took the pending row over — never changes the records the tenant published; and
-/// unguessable ACROSS tenants (the key never leaves the store), so nobody can predict
+/// both HMAC-SHA256 under the platform's `domain_claims` secret over (tenant, host,
+/// generation). Deterministic per (tenant, host, generation), so re-claiming an
+/// UNVERIFIED name — or having a squatter take the pending row over — never changes the
+/// records the tenant published; the generation rotates only when a verified claim is
+/// released, so records a former owner left in DNS stop proving anything for them.
+/// Unguessable ACROSS tenants (the key never leaves the store), so nobody can predict
 /// or publish another tenant's proof. The label is 128 bits of lowercase hex (a DNS
 /// label), the token is the familiar `jkb_` + 256-bit base64url.
-pub fn wildcard_claim_proof(secret: &[u8], tenant_id: &str, host: &str) -> (String, String) {
+pub fn wildcard_claim_proof(
+    secret: &[u8],
+    tenant_id: &str,
+    host: &str,
+    generation: u64,
+) -> (String, String) {
     use hmac::{Hmac, Mac};
     let mac = |purpose: &str| {
         let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret)
@@ -64,6 +71,7 @@ pub fn wildcard_claim_proof(secret: &[u8], tenant_id: &str, host: &str) -> (Stri
             m.update(part.as_bytes());
             m.update(&[0]);
         }
+        m.update(&generation.to_be_bytes());
         m.finalize().into_bytes()
     };
     let token = format!(
@@ -327,9 +335,9 @@ mod tests {
     #[test]
     fn wildcard_proofs_are_stable_per_tenant_and_distinct_across_tenants_and_keys() {
         let k = [7u8; 32];
-        let a = wildcard_claim_proof(&k, "t1", "*.play.example.com");
+        let a = wildcard_claim_proof(&k, "t1", "*.play.example.com", 0);
         // Stable: re-claims keep the tenant's published records valid.
-        assert_eq!(a, wildcard_claim_proof(&k, "t1", "*.play.example.com"));
+        assert_eq!(a, wildcard_claim_proof(&k, "t1", "*.play.example.com", 0));
         assert!(a.0.starts_with("jkb_"));
         assert_eq!(a.1.len(), 32);
         assert!(
@@ -338,11 +346,13 @@ mod tests {
         );
         // Another tenant, host or platform key → unrelated values.
         for other in [
-            wildcard_claim_proof(&k, "t2", "*.play.example.com"),
-            wildcard_claim_proof(&k, "t1", "*.other.example.com"),
-            wildcard_claim_proof(&[8u8; 32], "t1", "*.play.example.com"),
+            wildcard_claim_proof(&k, "t2", "*.play.example.com", 0),
+            wildcard_claim_proof(&k, "t1", "*.other.example.com", 0),
+            wildcard_claim_proof(&[8u8; 32], "t1", "*.play.example.com", 0),
             // Field boundaries are delimited: ("t1*", ".play…") ≠ ("t1", "*.play…").
-            wildcard_claim_proof(&k, "t1*", ".play.example.com"),
+            wildcard_claim_proof(&k, "t1*", ".play.example.com", 0),
+            // A rotated generation (a released verified claim) → new records.
+            wildcard_claim_proof(&k, "t1", "*.play.example.com", 1),
         ] {
             assert_ne!(a.0, other.0);
             assert_ne!(a.1, other.1);

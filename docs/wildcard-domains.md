@@ -30,9 +30,14 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
   token. On a TLS server `verify` *also* requires `_acme-challenge.<base>` to already CNAME to the
   record's delegation target. A wildcard's token and delegation label are the tenant's **claim
   proof**: HMAC-SHA256 under a platform secret (`platform_secrets` table, minted once, never leaves
-  the store) over (tenant, host). They're deterministic per tenant and name, so a re-claim never
-  changes the records a tenant published, and unguessable across tenants. Rows written before this
-  keep their stored random values; no migration.
+  the store) over (tenant, host, generation). They're deterministic, so re-claiming an unverified
+  name (or a squatter re-taking its pending row) never changes the records a tenant published, and
+  unguessable across tenants. The **generation** (`claim_generations` table, per tenant and host) is
+  bumped in the same txn whenever a *verified* wildcard is released: removal, project delete, or the
+  boot purge of an orphan. Records a former owner left in DNS then prove nothing for them, so they
+  can't re-snipe the name from its next claimant (review N1). Pending releases don't bump it. Rows
+  written before this keep their stored values; no migration. Users are told to delete the TXT and
+  `_acme-challenge` CNAME after removing a domain.
 - **Claims** (`Store::claim_wildcard`, one write txn). Per tenant: at most 5 pending wildcards and
   `MAX_WILDCARD_DOMAINS_PER_TENANT` (default 20) in total. **Proof wins:** adding a name another tenant
   holds as a *pending* claim answers 202 with the caller's own records (nothing is stored), and
@@ -127,6 +132,7 @@ until roll-forward. Don't hand-edit DOMAINS.
 | Make the platform publish a DNS-01 answer at a name the tenant chooses | The TXT name is `<label>.<zone>`; the label is 128-bit CSPRNG hex minted by control, validated again in the proxy, and never tenant-supplied. |
 | Answer ACME for another tenant's wildcard | Each domain has its own label; pointing your own `_acme-challenge` at a victim's label gains nothing, because the TXT value is the key authorization of the *victim's* order on the platform account. |
 | Split one DNS node between tenants (`B` exact vs `*.B`) | Refused against Active records of another tenant, atomically at verify. |
+| Former owner re-snipes a name with records it left in DNS | Releasing a verified claim rotates that owner's proof generation; the stale records no longer match. |
 | Squat a victim's wildcard with an unverifiable claim | Proof wins over any pending row; the owner's records are deterministic, so re-taking the row can't invalidate them; ≤5 pending per tenant. |
 | Undo a removal / clobber a new claim by verifying across it | Activation re-reads the row in its txn and refuses a stale claim. |
 | Rollback residue: proof-less `*` rows, orphaned wildcards | The cache never holds them; boot purge removes what an old binary left. |

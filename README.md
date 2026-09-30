@@ -624,10 +624,13 @@ Rules:
 - **Claims and limits.** An account may hold up to 5 *unverified* wildcards and 20 in total (the
   operator can change the total with `MAX_WILDCARD_DOMAINS_PER_TENANT`). An unverified claim by
   another account never locks you out: `domain add` still hands you **your** records (they're fixed
-  for your account and that name, so they never change on re-adds), and whoever verifies DNS first
-  owns it.
+  for your account and that name, so re-adding an unverified name never changes them), and whoever
+  verifies DNS first owns it.
 - **Removing it** (`jkbase domain rm '*.play.example.com'`) unroutes every host under it and deletes
-  its certificate; nothing renews afterwards. You can drop the DNS records.
+  its certificate; nothing renews afterwards. **Then delete the `_jkbase-challenge` TXT and the
+  `_acme-challenge` CNAME** (and the wildcard A/AAAA if nothing else uses it). Once a verified domain
+  is removed, its old records no longer prove anything even for the account that removed it; re-adding
+  it issues new ones. Leftover records only add confusion for whoever owns the name next.
 - **Self-hosted without TLS** (local dev): no certificate is involved — the CNAME isn't needed, the
   TXT alone activates it, and it routes on the plain-HTTP proxy port. **With TLS**, wildcards need
   the platform's ACME DNS-01 backend (see [Self-hosting](#self-hosting-jkbase)); the delegation zone

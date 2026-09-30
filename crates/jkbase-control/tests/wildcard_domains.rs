@@ -866,3 +866,75 @@ async fn rearm_is_refused_past_the_tenants_order_budget() {
     );
     assert_eq!(h.cert_requests.lock().unwrap().len(), before);
 }
+
+impl Harness {
+    /// Publish the TXT + ACME CNAME from an add/list response for `base`.
+    fn publish_records(&self, v: &Value, base: &str) {
+        self.publish(
+            &format!("_jkbase-challenge.{base}"),
+            "TXT",
+            v["verification"]["value"].as_str().unwrap(),
+        );
+        self.publish(
+            &format!("_acme-challenge.{base}"),
+            "CNAME",
+            v["acme_challenge"]["cname"].as_str().unwrap(),
+        );
+    }
+}
+
+/// Review N1: records a former owner left in DNS after releasing a VERIFIED wildcard
+/// must not let them re-snipe the name from its new claimant. Releasing it rotates the
+/// former owner's proof generation, so the stale records prove nothing.
+#[tokio::test]
+async fn stale_records_after_a_verified_release_cannot_resnipe() {
+    let h = spawn("stale", dns01()).await;
+    // Former holder t1 (e.g. an agency) set up *.shop.client.com; the client published
+    // the records.
+    let (_, a) = h.add(&h.t1, "app", "*.shop.client.com").await;
+    h.publish_records(&a, "shop.client.com");
+    assert_eq!(h.verify(&h.t1, "app", "*.shop.client.com").await.0, 200);
+    // Relationship ends: t1's claim removed. Records left in DNS.
+    assert_eq!(h.rm(&h.t1, "app", "*.shop.client.com").await.0, 204);
+    // Client (t2) claims it on its own account.
+    assert_eq!(h.add(&h.t2, "rival", "*.shop.client.com").await.0, 200);
+    // t1 re-verifies with the SAME still-published records → refused.
+    let (st, v) = h.verify(&h.t1, "app", "*.shop.client.com").await;
+    assert_eq!(st, 400, "{v}");
+    let row = h.store.get_domain("*.shop.client.com").unwrap().unwrap();
+    assert_eq!(
+        (row.tenant_id.as_str(), row.status),
+        ("tenant-2", DomainStatus::Pending)
+    );
+    // t1 would need NEW records, which only the DNS owner can publish.
+    let (st, again) = h.add(&h.t1, "app", "*.shop.client.com").await;
+    assert_eq!(st, 202, "{again}");
+    assert_ne!(again["verification"]["value"], a["verification"]["value"]);
+    assert_ne!(
+        again["acme_challenge"]["cname"],
+        a["acme_challenge"]["cname"]
+    );
+}
+
+/// Records rotate only when a VERIFIED claim is released: removing and re-adding an
+/// unverified name keeps them (so the anti-ping-pong property holds).
+#[tokio::test]
+async fn records_rotate_only_after_releasing_a_verified_wildcard() {
+    let h = spawn("rotate", dns01()).await;
+    let host = "*.r.example.com";
+    let (_, first) = h.add(&h.t1, "app", host).await;
+    // Pending remove + re-add: same records.
+    assert_eq!(h.rm(&h.t1, "app", host).await.0, 204);
+    let (_, readd) = h.add(&h.t1, "app", host).await;
+    assert_eq!(readd["verification"], first["verification"]);
+    assert_eq!(readd["acme_challenge"], first["acme_challenge"]);
+    // Verified, then removed: new records next time.
+    h.publish_records(&readd, "r.example.com");
+    assert_eq!(h.verify(&h.t1, "app", host).await.0, 200);
+    assert_eq!(h.rm(&h.t1, "app", host).await.0, 204);
+    let (_, after) = h.add(&h.t1, "app", host).await;
+    assert_ne!(after["verification"], first["verification"]);
+    assert_ne!(after["acme_challenge"], first["acme_challenge"]);
+    // Other tenants' records for the name are unaffected.
+    assert_eq!(h.store.claim_generation("tenant-2", host).unwrap(), 0);
+}
