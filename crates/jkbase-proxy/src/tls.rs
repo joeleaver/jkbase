@@ -37,7 +37,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio_rustls::rustls::ServerConfig;
@@ -52,25 +52,44 @@ use tracing::{info, warn};
 const RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 60 * 60); // 60 days
 /// How often the reconcile loop runs (wildcard renewal + custom issuance/retry).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Don't re-attempt issuance for a host that failed within this window.
-const ISSUE_BACKOFF: Duration = Duration::from_secs(5 * 60);
-/// Tenant wildcards back off exponentially from here (doubling per consecutive failure)…
-const WILDCARD_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+/// Tenant certs (custom + wildcard) back off exponentially from here (doubling per
+/// consecutive failure)…
+const ISSUE_BACKOFF_BASE: u64 = 5 * 60;
 /// …up to this cap…
-const WILDCARD_BACKOFF_MAX: Duration = Duration::from_secs(24 * 60 * 60);
-/// …and give up after this many consecutive failures (~10.5h of retries) until the owner
-/// re-verifies. Every attempt is an order on the SHARED platform ACME account, so a
-/// tenant who breaks their CNAME must not be able to spend its rate limits forever.
+const ISSUE_BACKOFF_MAX: u64 = 24 * 60 * 60;
+/// …and a WILDCARD gives up after this many consecutive failures (~10.5h of retries)
+/// until the owner re-verifies. (A custom domain keeps retrying at the cap: its DNS is
+/// often pointed late.)
 const WILDCARD_MAX_FAILURES: u32 = 8;
 /// DNS-01 orders sleep ~15s for propagation; the reconcile loop runs at most this many
 /// tenant-wildcard orders per tick (concurrently), so a pile of them can't starve
 /// custom-domain and platform renewals.
 const MAX_WILDCARD_ORDERS_PER_TICK: usize = 4;
+/// The CAA identity of the CA we order from (Let's Encrypt, prod and staging alike).
+const ACME_CA_IDENTITY: &str = "letsencrypt.org";
+/// Where issue health (backoff / give-up / budget blocks) persists across restarts.
+const ISSUE_HEALTH_FILE: &str = "issue-health.json";
 
-/// `_acme-challenge.<base>` → its CNAME target(s). The server wires this to the SAME
-/// resolver control's `verify` uses, so "verified" and "still delegated" agree.
-pub type CnameLookup =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync>;
+/// `(fqdn, "CNAME" | "CAA")` → the answers' data (empty on any failure). The server
+/// wires this to the SAME resolver control's `verify` uses, so "verified" and "still
+/// delegated" agree.
+pub type DnsLookup = Arc<
+    dyn Fn(String, &'static str) -> Pin<Box<dyn Future<Output = Vec<String>> + Send>> + Send + Sync,
+>;
+
+/// Verdict of the per-tenant order budget on one prospective order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderPermit {
+    /// Charged to the owning tenant; go.
+    Allowed,
+    /// Over budget (next slot frees at `retry_at`, unix secs) or not a registered host.
+    Denied { retry_at: Option<u64> },
+}
+
+/// Charge one tenant cert order to its owner's persisted budget (server-built over the
+/// control store, so spent orders survive removal, re-add and restart). `host` is the
+/// domain-map key.
+pub type OrderGate = Arc<dyn Fn(&str) -> OrderPermit + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TlsConfig {
@@ -84,8 +103,12 @@ pub struct TlsConfig {
     /// Zone (under `domain`, writable by `dns_provider`) holding the TXT answers for
     /// tenant wildcards' delegated `_acme-challenge` CNAMEs.
     pub acme_delegation_zone: String,
-    /// Pre-order check that a wildcard's delegation CNAME is still in place.
-    pub cname_lookup: CnameLookup,
+    /// DNS reads for the pre-order checks (delegation CNAME, CAA).
+    pub dns_lookup: DnsLookup,
+    /// Per-tenant persisted order budget; `None` = unmetered (tests / embedders).
+    pub order_gate: Option<OrderGate>,
+    /// Global cap on tenant-initiated orders per 3 h (see [`TokenBucket`]).
+    pub tenant_orders_per_3h: u32,
 }
 
 /// A host's cert state, for the control API's `tls` field.
@@ -93,69 +116,102 @@ pub struct TlsConfig {
 pub enum HostCertState {
     Missing,
     Issued,
-    /// Wildcard issuance gave up (see [`WILDCARD_MAX_FAILURES`]); no cert serving.
-    Failed,
-    /// Wildcard renewal gave up; the previous cert still serves until it expires.
-    RenewalFailed,
+    /// Issuance stopped, no cert serving: gave up (`retry_at: None`, re-verify to retry)
+    /// or the owner's order budget is spent (`retry_at: Some(unix)`).
+    Failed {
+        retry_at: Option<u64>,
+    },
+    /// Like `Failed`, but the previous cert still serves until it expires.
+    RenewalFailed {
+        retry_at: Option<u64>,
+    },
 }
 
-/// Per-wildcard issuance health: in-flight dedupe, exponential backoff, give-up.
-#[derive(Default, Debug)]
-struct WildcardHealth {
+/// Per-host issuance health: in-flight dedupe, exponential backoff, give-up, budget
+/// block. Unix seconds, so it persists ([`ISSUE_HEALTH_FILE`]) — a restart must not
+/// re-arm a host that gave up or refund a backoff.
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IssueHealth {
     failures: u32,
-    next_attempt: Option<Instant>,
+    next_attempt: Option<u64>,
     gave_up: bool,
+    blocked_until: Option<u64>,
+    #[serde(skip)]
     in_flight: bool,
 }
 
-#[derive(Default, Debug)]
-struct WildcardHealthBook(HashMap<String, WildcardHealth>);
+#[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct IssueHealthBook(HashMap<String, IssueHealth>);
 
-fn wildcard_backoff(failures: u32) -> Duration {
+fn issue_backoff(failures: u32) -> u64 {
     let exp = failures.saturating_sub(1).min(20);
-    WILDCARD_BACKOFF_BASE
-        .saturating_mul(1u32 << exp)
-        .min(WILDCARD_BACKOFF_MAX)
+    ISSUE_BACKOFF_BASE
+        .saturating_mul(1u64 << exp)
+        .min(ISSUE_BACKOFF_MAX)
 }
 
-impl WildcardHealthBook {
-    fn due(&self, host: &str, now: Instant) -> bool {
+impl IssueHealthBook {
+    fn due(&self, host: &str, now: u64) -> bool {
         self.0
             .get(host)
             .is_none_or(|h| !h.in_flight && !h.gave_up && h.next_attempt.is_none_or(|t| now >= t))
     }
-    /// Take the host's order slot; `false` if not due (in flight, backing off, gave up).
-    fn begin(&mut self, host: &str, now: Instant) -> bool {
+    /// Take the host's order slot; `false` if not due (in flight, backing off, blocked,
+    /// gave up).
+    fn begin(&mut self, host: &str, now: u64) -> bool {
         if !self.due(host, now) {
             return false;
         }
-        self.0.entry(host.to_string()).or_default().in_flight = true;
+        let h = self.0.entry(host.to_string()).or_default();
+        h.in_flight = true;
+        h.blocked_until = None;
         true
+    }
+    /// Give the slot back without an attempt (a transient platform-side throttle).
+    fn release(&mut self, host: &str) {
+        if let Some(h) = self.0.get_mut(host) {
+            h.in_flight = false;
+        }
     }
     fn succeed(&mut self, host: &str) {
         self.0.remove(host);
     }
     /// Record a failed attempt; returns `true` once the host has given up.
-    fn fail(&mut self, host: &str, now: Instant) -> bool {
+    fn fail(&mut self, host: &str, now: u64, may_give_up: bool) -> bool {
         let h = self.0.entry(host.to_string()).or_default();
         h.in_flight = false;
-        h.failures += 1;
-        if h.failures >= WILDCARD_MAX_FAILURES {
+        h.failures = h.failures.saturating_add(1);
+        if may_give_up && h.failures >= WILDCARD_MAX_FAILURES {
             h.gave_up = true;
         } else {
-            h.next_attempt = Some(now + wildcard_backoff(h.failures));
+            h.next_attempt = Some(now + issue_backoff(h.failures));
         }
         h.gave_up
     }
-    fn gave_up(&self, host: &str) -> bool {
-        self.0.get(host).is_some_and(|h| h.gave_up)
+    /// The owner's order budget is spent: park the host until `until` (not a failure).
+    fn block(&mut self, host: &str, until: u64) {
+        let h = self.0.entry(host.to_string()).or_default();
+        h.in_flight = false;
+        h.blocked_until = Some(until);
+        h.next_attempt = Some(until);
+    }
+    /// `Some(retry_at)` when issuance is stopped (see [`HostCertState::Failed`]).
+    fn stopped(&self, host: &str, now: u64) -> Option<Option<u64>> {
+        let h = self.0.get(host)?;
+        if h.gave_up {
+            Some(None)
+        } else {
+            h.blocked_until.filter(|&t| t > now).map(Some)
+        }
     }
     /// Owner re-verified (or the name was released): forget the history, but keep an
-    /// in-flight marker so a concurrent order isn't duplicated.
+    /// in-flight marker so a concurrent order isn't duplicated. The ORDER budget is not
+    /// here — it lives in the control store, keyed by tenant, and is never reset.
     fn reset(&mut self, host: &str) {
         match self.0.get_mut(host) {
             Some(h) if h.in_flight => {
-                *h = WildcardHealth {
+                *h = IssueHealth {
                     in_flight: true,
                     ..Default::default()
                 }
@@ -167,13 +223,124 @@ impl WildcardHealthBook {
     }
 }
 
+/// Global bucket for TENANT-initiated orders (custom + wildcard), across all tenants:
+/// `capacity` orders, refilled evenly over 3 h. Platform certs (apex, `*.db`) never draw
+/// from it, so whatever the account's limit is beyond `capacity` stays reserved for them.
+/// In memory: a restart refills it, but restarts aren't tenant-triggerable, and the
+/// per-tenant budget (persisted) still binds.
+#[derive(Debug)]
+struct TokenBucket {
+    capacity: f64,
+    tokens: f64,
+    per_sec: f64,
+    last: u64,
+}
+
+impl TokenBucket {
+    fn per_3h(capacity: u32, now: u64) -> Self {
+        let capacity = f64::from(capacity);
+        Self {
+            capacity,
+            tokens: capacity,
+            per_sec: capacity / (3.0 * 3600.0),
+            last: now,
+        }
+    }
+    fn try_take(&mut self, now: u64) -> bool {
+        let dt = now.saturating_sub(self.last) as f64;
+        self.last = now.max(self.last);
+        self.tokens = (self.tokens + dt * self.per_sec).min(self.capacity);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+    fn refund(&mut self) {
+        self.tokens = (self.tokens + 1.0).min(self.capacity);
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Whether `_acme-challenge.<base>` currently CNAMEs to exactly `challenge_name`.
-async fn delegation_in_place(lookup: &CnameLookup, base: &str, challenge_name: &str) -> bool {
+async fn delegation_in_place(lookup: &DnsLookup, base: &str, challenge_name: &str) -> bool {
     let want = normalize_host(challenge_name);
-    lookup(format!("_acme-challenge.{base}"))
+    lookup(format!("_acme-challenge.{base}"), "CNAME")
         .await
         .iter()
         .any(|t| normalize_host(t.trim()) == want)
+}
+
+/// RFC 8659 CAA pre-check: does DNS let [`ACME_CA_IDENTITY`] issue for `name` (a host,
+/// or the base of a wildcard)? Climbs from `name` towards the root and judges the FIRST
+/// non-empty CAA set; no set anywhere = allowed. Refusing here costs nothing, whereas an
+/// order a CAA record forbids fails at the CA AND spends the shared account's budget.
+async fn caa_permits(lookup: &DnsLookup, name: &str, wildcard: bool) -> bool {
+    let mut n = name.to_string();
+    loop {
+        let set = lookup(n.clone(), "CAA").await;
+        if !set.is_empty() {
+            return caa_set_permits(&set, wildcard);
+        }
+        match n.split_once('.') {
+            Some((_, rest)) if rest.contains('.') => n = rest.to_string(),
+            _ => return true,
+        }
+    }
+}
+
+/// Judge one CAA RRset (presentation format, `flags tag "value"`). A wildcard uses the
+/// `issuewild` entries if there are any, else `issue`. No relevant entries = allowed; an
+/// unparseable record (e.g. RFC 3597 `\#` form) is ignored rather than trusted to deny.
+fn caa_set_permits(records: &[String], wildcard: bool) -> bool {
+    let parsed: Vec<(String, String)> = records
+        .iter()
+        .filter_map(|r| {
+            let mut it = r.trim().splitn(3, char::is_whitespace);
+            it.next()?.parse::<u8>().ok()?;
+            let tag = it.next()?.to_ascii_lowercase();
+            let value = it.next().unwrap_or("").trim().trim_matches('"').to_string();
+            Some((tag, value))
+        })
+        .collect();
+    let values = |tag: &str| -> Vec<&String> {
+        parsed
+            .iter()
+            .filter(|(t, _)| t == tag)
+            .map(|(_, v)| v)
+            .collect()
+    };
+    let wild = values("issuewild");
+    let relevant = if wildcard && !wild.is_empty() {
+        wild
+    } else {
+        values("issue")
+    };
+    relevant.is_empty()
+        || relevant.iter().any(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+                == ACME_CA_IDENTITY
+        })
+}
+
+/// The persisted issue-health book (empty if absent/unreadable — fail open to "retry",
+/// which the order budgets still bound).
+fn load_health(path: &Path) -> IssueHealthBook {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
 }
 
 /// Default ACME delegation zone for a platform domain. The leading underscore keeps it
@@ -260,10 +427,10 @@ pub struct CertManager {
     resolver: Arc<Resolver>,
     /// ACME HTTP-01 challenge responses: token → key authorization.
     challenges: Arc<AsyncRwLock<HashMap<String, String>>>,
-    /// Last issuance attempt per host, for dedupe + failure backoff.
-    inflight: Mutex<HashMap<String, Instant>>,
-    /// Tenant-wildcard issuance health (exponential backoff + give-up).
-    wildcard_health: Mutex<WildcardHealthBook>,
+    /// Tenant-cert issuance health (dedupe, backoff, give-up, budget blocks); persisted.
+    health: Mutex<IssueHealthBook>,
+    /// Global budget for tenant-initiated orders.
+    tenant_bucket: Mutex<TokenBucket>,
 }
 
 impl CertManager {
@@ -274,6 +441,8 @@ impl CertManager {
         tokio::fs::create_dir_all(&cfg.cert_dir).await?;
         let account = obtain_account(&cfg, staging).await?;
 
+        let health = load_health(&cfg.cert_dir.join(ISSUE_HEALTH_FILE));
+        let tenant_bucket = TokenBucket::per_3h(cfg.tenant_orders_per_3h, unix_now());
         let resolver = Arc::new(Resolver {
             platform_domain: cfg.domain.clone(),
             wildcard: RwLock::new(None),
@@ -287,8 +456,8 @@ impl CertManager {
             account,
             resolver,
             challenges: Arc::new(AsyncRwLock::new(HashMap::new())),
-            inflight: Mutex::new(HashMap::new()),
-            wildcard_health: Mutex::new(WildcardHealthBook::default()),
+            health: Mutex::new(health),
+            tenant_bucket: Mutex::new(tenant_bucket),
         });
 
         mgr.ensure_wildcard().await?;
@@ -322,25 +491,86 @@ impl CertManager {
         self.resolver.hosts.read().unwrap().contains_key(host)
     }
 
-    /// `host`'s cert state (issued / pending / given up) for the control API.
+    /// `host`'s cert state (issued / pending / stopped) for the control API.
     pub fn cert_state(&self, host: &str) -> HostCertState {
-        let gave_up = self.wildcard_health.lock().unwrap().gave_up(host);
-        match (self.has_cert(host), gave_up) {
-            (true, false) => HostCertState::Issued,
-            (true, true) => HostCertState::RenewalFailed,
-            (false, true) => HostCertState::Failed,
-            (false, false) => HostCertState::Missing,
+        let stopped = self.health.lock().unwrap().stopped(host, unix_now());
+        match (self.has_cert(host), stopped) {
+            (true, None) => HostCertState::Issued,
+            (true, Some(retry_at)) => HostCertState::RenewalFailed { retry_at },
+            (false, Some(retry_at)) => HostCertState::Failed { retry_at },
+            (false, None) => HostCertState::Missing,
         }
     }
 
     /// An explicit issuance request (a domain was just verified / re-verified): clear
-    /// any backoff or give-up for `host`, then try now. The reconcile loop calls
+    /// `host`'s backoff and give-up, then try now. Still bound by both order budgets
+    /// (control only re-arms within the tenant's). The reconcile loop calls
     /// [`Self::ensure_cert`] instead, which honours the backoff.
     pub fn request_cert(self: &Arc<Self>, host: String) {
-        self.wildcard_health.lock().unwrap().reset(&host);
-        self.inflight.lock().unwrap().remove(&host);
+        self.with_health(|h| h.reset(&host));
         let mgr = self.clone();
         tokio::spawn(async move { mgr.ensure_cert(&host).await });
+    }
+
+    /// Mutate the issue-health book and persist it (best-effort, atomic replace).
+    fn with_health<R>(&self, f: impl FnOnce(&mut IssueHealthBook) -> R) -> R {
+        let mut book = self.health.lock().unwrap();
+        let out = f(&mut book);
+        let path = self.cfg.cert_dir.join(ISSUE_HEALTH_FILE);
+        if let Ok(json) = serde_json::to_vec(&*book) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, json)
+                .and_then(|()| std::fs::rename(&tmp, &path))
+                .is_err()
+            {
+                warn!("failed to persist certificate issue health");
+            }
+        }
+        out
+    }
+
+    /// The shared pre-order gates for a TENANT cert, in cost order — all before any ACME
+    /// call: the host's own backoff slot, then the free DNS pre-checks (`precheck`: the
+    /// delegation CNAME for a wildcard; CAA for both), then the global tenant bucket,
+    /// then the owner's persisted budget. `false` = don't order now (state recorded).
+    async fn gate_tenant_order(
+        &self,
+        host: &str,
+        precheck: impl Future<Output = Result<()>>,
+        may_give_up: bool,
+    ) -> bool {
+        if !self.with_health(|h| h.begin(host, unix_now())) {
+            return false;
+        }
+        if let Err(e) = precheck.await {
+            self.record_failure(host, &e, may_give_up);
+            return false;
+        }
+        if !self.tenant_bucket.lock().unwrap().try_take(unix_now()) {
+            // Platform-wide throttle: not the tenant's failure; retried next tick.
+            self.with_health(|h| h.release(host));
+            info!(host = %host, "tenant ACME order budget (global) exhausted; deferring");
+            return false;
+        }
+        match self.cfg.order_gate.as_ref().map(|g| g(host)) {
+            None | Some(OrderPermit::Allowed) => true,
+            Some(OrderPermit::Denied { retry_at }) => {
+                self.tenant_bucket.lock().unwrap().refund();
+                let until = retry_at.unwrap_or_else(|| unix_now() + ISSUE_BACKOFF_BASE);
+                self.with_health(|h| h.block(host, until));
+                warn!(host = %host, retry_at = until, "owner's ACME order budget exhausted");
+                false
+            }
+        }
+    }
+
+    fn record_failure(&self, host: &str, e: &anyhow::Error, may_give_up: bool) {
+        if self.with_health(|h| h.fail(host, unix_now(), may_give_up)) {
+            warn!(host = %host, error = %e,
+                "certificate issuance failed repeatedly; giving up until re-verified");
+        } else {
+            warn!(host = %host, error = %e, "certificate issuance failed (backing off)");
+        }
     }
 
     /// Provision/renew the wildcard cert if missing or near expiry, and load it
@@ -465,8 +695,7 @@ impl CertManager {
     pub fn forget_cert(&self, host: &str) {
         let host = normalize_host(host);
         self.resolver.hosts.write().unwrap().remove(&host);
-        self.inflight.lock().unwrap().remove(&host);
-        self.wildcard_health.lock().unwrap().reset(&host);
+        self.with_health(|h| h.reset(&host));
         if let Some(dir) = self.host_cert_dir(&host)
             && dir.exists()
         {
@@ -488,59 +717,57 @@ impl CertManager {
         cert.exists() && !needs_renewal(&cert)
     }
 
-    /// Claim the per-host issuance slot: `false` while a recent attempt (in flight or
-    /// failed within [`ISSUE_BACKOFF`]) holds it.
-    fn claim_issue_slot(&self, host: &str) -> bool {
-        let mut inflight = self.inflight.lock().unwrap();
-        if inflight
-            .get(host)
-            .is_some_and(|last| last.elapsed() < ISSUE_BACKOFF)
-        {
-            return false;
-        }
-        inflight.insert(host.to_string(), Instant::now());
-        true
-    }
-
     /// Ensure a valid cert exists for a verified custom `host` (HTTP-01) or tenant
     /// wildcard `*.<base>` (DNS-01 via delegation), issuing if needed. Best-effort,
-    /// deduped, and backed off on failure.
+    /// deduped, backed off on failure, and metered (see [`Self::gate_tenant_order`]).
     pub async fn ensure_cert(&self, host: &str) {
         if is_wildcard_key(host) {
             return self.ensure_wildcard_cert(host).await;
         }
-        if !self.is_issuable(host).await {
+        if !self.is_issuable(host).await || self.host_cert_fresh(host) {
             return;
         }
-        if self.host_cert_fresh(host) {
-            return;
-        }
-        if !self.claim_issue_slot(host) {
+        let caa = async {
+            if caa_permits(&self.cfg.dns_lookup, host, false).await {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("CAA forbids {ACME_CA_IDENTITY} for {host}"))
+            }
+        };
+        if !self.gate_tenant_order(host, caa, false).await {
             return;
         }
 
         info!(host = %host, "issuing custom-domain certificate via ACME HTTP-01");
         match self.issue_http01(host).await {
-            // Removed while the order ran: finalize_order already wrote the cache dir —
-            // drop it rather than resurrect a released name's cert.
-            Ok(_) if !self.domains.read().await.contains_key(host) => self.forget_cert(host),
             Ok(ck) => {
-                self.resolver
-                    .hosts
-                    .write()
-                    .unwrap()
-                    .insert(host.to_string(), Arc::new(ck));
-                info!(host = %host, "custom-domain certificate issued");
+                // Hold the domain map across the insert: a removal takes the map's WRITE
+                // lock before `forget_cert`, so it either happened already (we see it and
+                // drop what finalize_order wrote) or runs after our insert (and forgets it).
+                let map = self.domains.read().await;
+                if map.contains_key(host) {
+                    self.resolver
+                        .hosts
+                        .write()
+                        .unwrap()
+                        .insert(host.to_string(), Arc::new(ck));
+                    drop(map);
+                    self.with_health(|h| h.succeed(host));
+                    info!(host = %host, "custom-domain certificate issued");
+                } else {
+                    drop(map);
+                    self.forget_cert(host);
+                }
             }
-            Err(e) => warn!(host = %host, error = %e, "custom-domain issuance failed (will retry)"),
+            Err(e) => self.record_failure(host, &e, false),
         }
     }
 
     /// Issue/renew a tenant wildcard's cert. Gated EXACTLY like a custom host: `host`
     /// must be an Active domain-map entry — and it must carry the delegation label
     /// control minted, which is the only place its DNS-01 TXT is ever published.
-    /// Backed off exponentially per wildcard, and abandoned after
-    /// [`WILDCARD_MAX_FAILURES`] until the owner re-verifies ([`Self::request_cert`]).
+    /// Backed off exponentially and abandoned after [`WILDCARD_MAX_FAILURES`] until the
+    /// owner re-verifies ([`Self::request_cert`]).
     async fn ensure_wildcard_cert(&self, host: &str) {
         let label = match self.domains.read().await.get(host) {
             Some(t) => t.acme_delegation.clone(),
@@ -553,32 +780,31 @@ impl CertManager {
         if self.host_cert_fresh(host) {
             return;
         }
-        if !self
-            .wildcard_health
-            .lock()
-            .unwrap()
-            .begin(host, Instant::now())
-        {
+        let base = host.strip_prefix(WILDCARD_PREFIX).unwrap_or(host);
+        // No order (and no spend on the shared ACME account) unless the CA can actually
+        // reach our TXT through the tenant's CNAME and CAA lets it issue — re-checked
+        // before EVERY order, renewals included; the tenant can change DNS any time.
+        let prechecks = async {
+            if !delegation_in_place(&self.cfg.dns_lookup, base, &order.challenge_name).await {
+                anyhow::bail!(
+                    "_acme-challenge.{base} no longer CNAMEs to {}",
+                    order.challenge_name
+                );
+            }
+            if !caa_permits(&self.cfg.dns_lookup, base, true).await {
+                anyhow::bail!("CAA forbids {ACME_CA_IDENTITY} for *.{base}");
+            }
+            Ok(())
+        };
+        if !self.gate_tenant_order(host, prechecks, true).await {
             return;
         }
         match self
             .run_wildcard_order(host, label.as_deref(), &order)
             .await
         {
-            Ok(()) => self.wildcard_health.lock().unwrap().succeed(host),
-            Err(e) => {
-                let gave_up = self
-                    .wildcard_health
-                    .lock()
-                    .unwrap()
-                    .fail(host, Instant::now());
-                if gave_up {
-                    warn!(host = %host, error = %e,
-                        "wildcard issuance failed repeatedly; giving up until re-verified");
-                } else {
-                    warn!(host = %host, error = %e, "wildcard issuance failed (backing off)");
-                }
-            }
+            Ok(()) => self.with_health(|h| h.succeed(host)),
+            Err(e) => self.record_failure(host, &e, true),
         }
     }
 
@@ -588,16 +814,6 @@ impl CertManager {
         label: Option<&str>,
         order: &WildcardOrder,
     ) -> Result<()> {
-        let base = host.strip_prefix(WILDCARD_PREFIX).unwrap_or(host);
-        // No order (and no spend on the shared ACME account) unless the CA can actually
-        // reach our TXT through the tenant's CNAME — re-checked before EVERY order,
-        // renewals included, since the tenant can drop it at any time.
-        if !delegation_in_place(&self.cfg.cname_lookup, base, &order.challenge_name).await {
-            anyhow::bail!(
-                "_acme-challenge.{base} no longer CNAMEs to {}",
-                order.challenge_name
-            );
-        }
         let dir = self
             .host_cert_dir(host)
             .ok_or_else(|| anyhow::anyhow!("unsafe cert cache name"))?;
@@ -614,25 +830,25 @@ impl CertManager {
             &key_path,
         )
         .await?;
+        let ck = read_certified_key(&cert_path, &key_path)?;
         // Removed (or re-registered under a new label) while the order ran: don't
-        // resurrect a released name's cert.
-        let still_ours = self
-            .domains
-            .read()
-            .await
+        // resurrect a released name's cert. The map is held across the insert (see
+        // `ensure_cert`).
+        let map = self.domains.read().await;
+        let still_ours = map
             .get(host)
             .is_some_and(|t| t.acme_delegation.as_deref() == label);
-        if !still_ours {
+        if still_ours {
+            self.resolver
+                .hosts
+                .write()
+                .unwrap()
+                .insert(host.to_string(), Arc::new(ck));
+            info!(host = %host, "wildcard certificate issued");
+        } else {
+            drop(map);
             self.forget_cert(host);
-            return Ok(());
         }
-        let ck = read_certified_key(&cert_path, &key_path)?;
-        self.resolver
-            .hosts
-            .write()
-            .unwrap()
-            .insert(host.to_string(), Arc::new(ck));
-        info!(host = %host, "wildcard certificate issued");
         Ok(())
     }
 
@@ -846,8 +1062,8 @@ impl CertManager {
                 // A bounded batch of DUE wildcard orders runs concurrently alongside the
                 // serial custom-domain pass; the rest wait for a later tick.
                 let due: Vec<String> = {
-                    let now = Instant::now();
-                    let book = mgr.wildcard_health.lock().unwrap();
+                    let now = unix_now();
+                    let book = mgr.health.lock().unwrap();
                     wildcards
                         .into_iter()
                         .filter(|h| book.due(h, now) && !mgr.host_cert_fresh(h))
@@ -1343,18 +1559,28 @@ mod tests {
             dns_provider: Arc::new(NoDns),
             acme_email: "ops@example.com".into(),
             acme_delegation_zone: zone.into(),
-            cname_lookup: Arc::new(|_| Box::pin(async { Vec::new() })),
+            dns_lookup: Arc::new(|_, _| Box::pin(async { Vec::new() })),
+            order_gate: None,
+            tenant_orders_per_3h: 60,
         }
     }
 
-    fn lookup(answers: &[&str]) -> CnameLookup {
-        let answers: Vec<String> = answers.iter().map(|a| a.to_string()).collect();
-        Arc::new(move |name| {
-            let a = if name == "_acme-challenge.play.develup.win" {
-                answers.clone()
-            } else {
-                Vec::new()
-            };
+    /// A DNS table: `(name, rtype)` → answers.
+    fn dns(table: &[(&str, &str, &[&str])]) -> DnsLookup {
+        let table: HashMap<(String, String), Vec<String>> = table
+            .iter()
+            .map(|(n, t, a)| {
+                (
+                    (n.to_string(), t.to_string()),
+                    a.iter().map(|x| x.to_string()).collect(),
+                )
+            })
+            .collect();
+        Arc::new(move |name, rtype| {
+            let a = table
+                .get(&(name, rtype.to_string()))
+                .cloned()
+                .unwrap_or_default();
             Box::pin(async move { a })
         })
     }
@@ -1362,19 +1588,23 @@ mod tests {
     #[tokio::test]
     async fn pre_order_check_requires_the_exact_delegation_cname() {
         let want = "ab12._acme-delegation.jkbase.app";
+        let at = |targets: &[&str]| {
+            let t: Vec<&str> = targets.to_vec();
+            dns(&[("_acme-challenge.play.develup.win", "CNAME", &t)])
+        };
         assert!(
             delegation_in_place(
-                &lookup(&["AB12._acme-delegation.jkbase.app."]),
+                &at(&["AB12._acme-delegation.jkbase.app."]),
                 "play.develup.win",
                 want
             )
             .await
         );
         // Removed, or pointed elsewhere (e.g. another domain's label): no order.
-        assert!(!delegation_in_place(&lookup(&[]), "play.develup.win", want).await);
+        assert!(!delegation_in_place(&at(&[]), "play.develup.win", want).await);
         assert!(
             !delegation_in_place(
-                &lookup(&["ffff._acme-delegation.jkbase.app."]),
+                &at(&["ffff._acme-delegation.jkbase.app."]),
                 "play.develup.win",
                 want
             )
@@ -1382,44 +1612,159 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wildcard_backoff_doubles_to_a_day_then_gives_up_until_reset() {
-        assert_eq!(wildcard_backoff(1), Duration::from_secs(5 * 60));
-        assert_eq!(wildcard_backoff(2), Duration::from_secs(10 * 60));
-        assert_eq!(wildcard_backoff(4), Duration::from_secs(40 * 60));
-        assert_eq!(wildcard_backoff(9), Duration::from_secs(1280 * 60));
-        assert_eq!(wildcard_backoff(10), WILDCARD_BACKOFF_MAX);
-        assert_eq!(wildcard_backoff(u32::MAX), WILDCARD_BACKOFF_MAX);
+    /// Review a4: a CAA `issue ";"` passes the CNAME check but fails EVERY order at the
+    /// CA. It is now refused before any order (and before any budget is charged).
+    #[tokio::test]
+    async fn caa_pre_check_follows_rfc8659() {
+        let none = dns(&[]);
+        assert!(caa_permits(&none, "n1.attacker.com", true).await);
+        // Forbid-all at the base, or at an ancestor (tree climbing).
+        let forbid = dns(&[("n1.attacker.com", "CAA", &["0 issue \";\""])]);
+        assert!(!caa_permits(&forbid, "n1.attacker.com", true).await);
+        let parent = dns(&[("attacker.com", "CAA", &["0 issue \"digicert.com\""])]);
+        assert!(!caa_permits(&parent, "n1.attacker.com", false).await);
+        // The closest set wins, even if an ancestor would forbid.
+        let closest = dns(&[
+            ("n1.attacker.com", "CAA", &["0 issue \"letsencrypt.org\""]),
+            ("attacker.com", "CAA", &["0 issue \";\""]),
+        ]);
+        assert!(caa_permits(&closest, "n1.attacker.com", false).await);
+        // Wildcards read `issuewild` when present, else `issue`.
+        let split = dns(&[(
+            "b.example.com",
+            "CAA",
+            &[
+                "0 issue \"letsencrypt.org\"",
+                "0 issuewild \";\"",
+                "0 iodef \"mailto:x@example.com\"",
+            ],
+        )]);
+        assert!(caa_permits(&split, "b.example.com", false).await);
+        assert!(!caa_permits(&split, "b.example.com", true).await);
+        // Parameters after `;`, case, and iodef-only sets.
+        assert!(caa_set_permits(
+            &["128 issue \"LetsEncrypt.org; accounturi=x\"".to_string()],
+            true
+        ));
+        assert!(caa_set_permits(
+            &["0 iodef \"mailto:x@y\"".to_string()],
+            true
+        ));
+        // Unparseable (RFC 3597) records are ignored, not trusted to deny.
+        assert!(caa_set_permits(&["\\# 5 0005697373".to_string()], false));
+    }
 
-        let mut book = WildcardHealthBook::default();
+    #[test]
+    fn issue_backoff_doubles_to_a_day_then_wildcards_give_up_until_reset() {
+        assert_eq!(issue_backoff(1), 5 * 60);
+        assert_eq!(issue_backoff(2), 10 * 60);
+        assert_eq!(issue_backoff(4), 40 * 60);
+        assert_eq!(issue_backoff(9), 1280 * 60);
+        assert_eq!(issue_backoff(10), ISSUE_BACKOFF_MAX);
+        assert_eq!(issue_backoff(u32::MAX), ISSUE_BACKOFF_MAX);
+
+        let mut book = IssueHealthBook::default();
         let h = "*.play.develup.win";
-        let t0 = Instant::now();
+        let t0 = 1_000_000u64;
         assert!(book.begin(h, t0));
         // In flight: no duplicate order.
         assert!(!book.due(h, t0));
-        assert!(!book.fail(h, t0));
-        assert!(!book.due(h, t0 + Duration::from_secs(4 * 60)));
-        assert!(book.due(h, t0 + Duration::from_secs(5 * 60)));
+        assert!(!book.fail(h, t0, true));
+        assert!(!book.due(h, t0 + 4 * 60));
+        assert!(book.due(h, t0 + 5 * 60));
         let mut now = t0;
         for n in 2..=WILDCARD_MAX_FAILURES {
-            now += WILDCARD_BACKOFF_MAX;
+            now += ISSUE_BACKOFF_MAX;
             assert!(book.begin(h, now), "attempt {n}");
-            let gave_up = book.fail(h, now);
-            assert_eq!(gave_up, n == WILDCARD_MAX_FAILURES);
+            assert_eq!(book.fail(h, now, true), n == WILDCARD_MAX_FAILURES);
         }
         // Given up: never due again, however long we wait…
-        assert!(book.gave_up(h));
-        assert!(!book.due(h, now + WILDCARD_BACKOFF_MAX * 30));
+        assert_eq!(book.stopped(h, now), Some(None));
+        assert!(!book.due(h, now + ISSUE_BACKOFF_MAX * 30));
         // …until the owner re-verifies.
         book.reset(h);
         assert!(book.due(h, now));
         assert!(book.begin(h, now));
         book.succeed(h);
-        assert!(!book.gave_up(h) && book.due(h, now));
+        assert!(book.stopped(h, now).is_none() && book.due(h, now));
         // A reset during an in-flight order keeps it deduped.
         assert!(book.begin(h, now));
         book.reset(h);
         assert!(!book.due(h, now));
+
+        // A custom host never gives up: it keeps retrying at the cap.
+        let c = "docs.example.com";
+        let mut now = t0;
+        for _ in 0..50 {
+            assert!(book.begin(c, now));
+            assert!(!book.fail(c, now, false));
+            now += ISSUE_BACKOFF_MAX;
+        }
+        assert!(book.due(c, now));
+    }
+
+    #[test]
+    fn a_budget_block_reports_failed_with_a_retry_time_and_then_expires() {
+        let mut book = IssueHealthBook::default();
+        let h = "*.play.develup.win";
+        assert!(book.begin(h, 100));
+        book.block(h, 500);
+        assert_eq!(book.stopped(h, 100), Some(Some(500)));
+        assert!(!book.due(h, 499));
+        assert!(book.due(h, 500));
+        assert!(book.stopped(h, 500).is_none());
+        // A block isn't a failure: no backoff growth.
+        assert!(book.begin(h, 500));
+        assert!(!book.fail(h, 500, true));
+        assert_eq!(book.0[h].failures, 1);
+    }
+
+    /// Review: give-up state must survive a restart.
+    #[test]
+    fn issue_health_persists_give_up_and_backoff_but_not_in_flight() {
+        let mut book = IssueHealthBook::default();
+        for i in 0..WILDCARD_MAX_FAILURES {
+            assert!(book.begin("*.a.example.com", u64::from(i) * ISSUE_BACKOFF_MAX));
+            book.fail("*.a.example.com", u64::from(i) * ISSUE_BACKOFF_MAX, true);
+        }
+        assert!(book.begin("docs.example.com", 0));
+        book.fail("docs.example.com", 0, false);
+        assert!(book.begin("*.inflight.example.com", 0));
+
+        let dir = std::env::temp_dir().join(format!("jk-health-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ISSUE_HEALTH_FILE);
+        std::fs::write(&path, serde_json::to_vec(&book).unwrap()).unwrap();
+        let back = load_health(&path);
+        assert_eq!(back.stopped("*.a.example.com", u64::MAX), Some(None));
+        assert!(!back.due("docs.example.com", 1));
+        assert!(back.due("docs.example.com", ISSUE_BACKOFF_BASE));
+        // An order in flight at shutdown didn't finish: it's due again after restart.
+        assert!(back.due("*.inflight.example.com", 0));
+        // A missing / corrupt file is an empty book.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_health(&path).0.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tenant_bucket_caps_orders_per_3h_and_refills() {
+        let mut b = TokenBucket::per_3h(60, 0);
+        for _ in 0..60 {
+            assert!(b.try_take(0));
+        }
+        assert!(!b.try_take(0));
+        // One order's worth refills every 3 minutes.
+        assert!(!b.try_take(179));
+        assert!(b.try_take(180));
+        assert!(!b.try_take(180));
+        b.refund();
+        assert!(b.try_take(180));
+        // Never above capacity, however long idle.
+        let mut b = TokenBucket::per_3h(2, 0);
+        assert!(b.try_take(1_000_000) && b.try_take(1_000_000) && !b.try_take(1_000_000));
+        // Zero disables tenant issuance entirely.
+        assert!(!TokenBucket::per_3h(0, 0).try_take(1_000_000));
     }
 
     #[test]

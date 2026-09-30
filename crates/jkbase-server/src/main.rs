@@ -128,6 +128,18 @@ struct Args {
     #[arg(long, env = "MAX_WILDCARD_DOMAINS_PER_TENANT", default_value = "20")]
     max_wildcard_domains_per_tenant: usize,
 
+    /// Global cap on TENANT-initiated ACME orders (custom + wildcard certs, all tenants)
+    /// per 3 hours. Keep it well under the CA's per-account order limit (Let's Encrypt:
+    /// 300 / 3 h): the remainder is reserved for the platform's own certs.
+    #[arg(long, env = "TENANT_ACME_ORDERS_PER_3H", default_value = "60")]
+    tenant_acme_orders_per_3h: u32,
+
+    /// Per-tenant ACME order budget per 24 hours (persisted; survives domain removal,
+    /// re-add and restart). Over it, the tenant's certs report `tls: failed` with a
+    /// retry time.
+    #[arg(long, env = "TENANT_ACME_ORDERS_PER_DAY", default_value = "20")]
+    tenant_acme_orders_per_day: usize,
+
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
@@ -1599,6 +1611,11 @@ async fn async_main() -> Result<()> {
         );
     }
 
+    let acme_budget = jkbase_control::store::AcmeOrderBudget {
+        max_orders: args.tenant_acme_orders_per_day,
+        window_secs: 24 * 60 * 60,
+    };
+
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
     let cert_manager: Option<Arc<CertManager>> = if args.tls {
@@ -1653,9 +1670,11 @@ async fn async_main() -> Result<()> {
             acme_email,
             acme_delegation_zone: acme_delegation_zone.clone(),
             // The same resolver control's `verify` checks the CNAME with.
-            cname_lookup: Arc::new(|name: String| {
-                Box::pin(jkbase_control::api::doh_lookup(name, "CNAME"))
+            dns_lookup: Arc::new(|name: String, rtype: &'static str| {
+                Box::pin(jkbase_control::api::doh_lookup(name, rtype))
             }),
+            order_gate: Some(tenant_order_gate(store.clone(), acme_budget.clone())),
+            tenant_orders_per_3h: args.tenant_acme_orders_per_3h,
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
     } else {
@@ -1682,14 +1701,15 @@ async fn async_main() -> Result<()> {
             match cm_status.cert_state(host) {
                 HostCertState::Missing => CertState::Missing,
                 HostCertState::Issued => CertState::Issued,
-                HostCertState::Failed => CertState::Failed,
-                HostCertState::RenewalFailed => CertState::RenewalFailed,
+                HostCertState::Failed { retry_at } => CertState::Failed { retry_at },
+                HostCertState::RenewalFailed { retry_at } => CertState::RenewalFailed { retry_at },
             }
         }));
         let cm_remove = cm.clone();
         state.cert_remove = Some(Arc::new(move |host: String| cm_remove.forget_cert(&host)));
     }
     state.wildcard_limits.max_per_tenant = args.max_wildcard_domains_per_tenant;
+    state.acme_budget = acme_budget.clone();
     // Every TLS config carries a DNS-01 backend (it's how the platform wildcard issues),
     // so wildcards are always issuable with TLS on; without TLS they route on plain HTTP.
     state.wildcard_support = if cert_manager.is_some() {
@@ -3054,6 +3074,32 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
         domains = count,
         "domain map built; projects registered for on-demand wake"
     );
+}
+
+/// The cert manager's per-tenant order gate: charge each tenant cert order (by domain-map
+/// key) to the owning tenant's persisted budget. Unknown host, or a store error, denies
+/// (fail closed; a store error retries shortly).
+fn tenant_order_gate(
+    store: Store,
+    budget: jkbase_control::store::AcmeOrderBudget,
+) -> jkbase_proxy::tls::OrderGate {
+    use jkbase_proxy::tls::OrderPermit;
+    Arc::new(move |host: &str| {
+        let now = jkbase_control::auth::timestamp();
+        let Ok(Some(rec)) = store.get_domain(host) else {
+            return OrderPermit::Denied { retry_at: None };
+        };
+        match store.charge_tenant_acme_order(&rec.tenant_id, now, &budget) {
+            Ok(None) => OrderPermit::Allowed,
+            Ok(Some(t)) => OrderPermit::Denied { retry_at: Some(t) },
+            Err(e) => {
+                warn!(host = %host, error = %e, "ACME order budget check failed; denying");
+                OrderPermit::Denied {
+                    retry_at: Some(now + 300),
+                }
+            }
+        }
+    })
 }
 
 /// Ensure an Active DomainRecord exists for `host` (idempotent). Used by backfill

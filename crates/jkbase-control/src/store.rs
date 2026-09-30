@@ -29,6 +29,14 @@ const DOMAINS: TableDefinition<&str, &[u8]> = TableDefinition::new("domains");
 /// wildcard hosts stop routing. The key spaces are disjoint (exact keys never contain
 /// `*`), so global uniqueness needs no cross-table check.
 const WILDCARD_DOMAINS: TableDefinition<&str, &[u8]> = TableDefinition::new("wildcard_domains");
+/// Platform-wide secrets minted once and kept (name → raw bytes). `domain_claims`: the
+/// HMAC key deriving each tenant's wildcard verification token + ACME delegation label
+/// (see `auth::wildcard_claim_proof`).
+const PLATFORM_SECRETS: TableDefinition<&str, &[u8]> = TableDefinition::new("platform_secrets");
+/// Tenant-initiated ACME orders (custom + wildcard certs): `tenant_id` → JSON list of
+/// order timestamps inside the budget window. Keyed by TENANT, so removing / re-adding
+/// domains or restarting the server never refunds spent orders.
+const TENANT_ACME_ORDERS: TableDefinition<&str, &[u8]> = TableDefinition::new("tenant_acme_orders");
 const SCHEDULES: TableDefinition<&str, &[u8]> = TableDefinition::new("schedules");
 const USAGE: TableDefinition<&str, &[u8]> = TableDefinition::new("usage");
 const QUOTAS: TableDefinition<&str, &[u8]> = TableDefinition::new("quotas");
@@ -884,6 +892,23 @@ impl Default for WildcardLimits {
     }
 }
 
+/// Per-tenant ACME order budget (every custom/wildcard cert order, issuance or renewal,
+/// success or failure, is charged to the owning tenant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcmeOrderBudget {
+    pub max_orders: usize,
+    pub window_secs: u64,
+}
+
+impl Default for AcmeOrderBudget {
+    fn default() -> Self {
+        Self {
+            max_orders: 20,
+            window_secs: 24 * 60 * 60,
+        }
+    }
+}
+
 /// Result of [`Store::claim_wildcard`].
 #[derive(Debug)]
 pub enum WildcardClaim {
@@ -896,7 +921,26 @@ pub enum WildcardClaim {
     TotalCapReached,
 }
 
-/// Result of [`Store::activate_domain_exclusive`].
+/// Order timestamps still inside the budget window (oldest first).
+fn acme_stamps(raw: Option<Vec<u8>>, now: u64, budget: &AcmeOrderBudget) -> Vec<u64> {
+    let mut v: Vec<u64> = raw
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    v.retain(|&t| now < t.saturating_add(budget.window_secs));
+    v.sort_unstable();
+    v
+}
+
+fn acme_retry_at(stamps: &[u64], budget: &AcmeOrderBudget) -> Option<u64> {
+    if stamps.len() < budget.max_orders {
+        return None;
+    }
+    // The slot that frees next is the one that makes room for one more order.
+    let idx = stamps.len() - budget.max_orders;
+    Some(stamps[idx].saturating_add(budget.window_secs))
+}
+
+/// Result of [`Store::activate_claim`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Activation {
     Activated,
@@ -905,6 +949,8 @@ pub enum Activation {
     /// The row changed (removed / replaced / already active) since it was read; nothing
     /// written.
     Stale,
+    /// A proof-wins takeover would exceed the verifying tenant's wildcard cap.
+    OverCap,
 }
 
 fn domain_table(host: &str) -> TableDefinition<'static, &'static str, &'static [u8]> {
@@ -969,6 +1015,8 @@ impl Store {
         let _ = txn.open_table(BUILDS)?;
         let _ = txn.open_table(DOMAINS)?;
         let _ = txn.open_table(WILDCARD_DOMAINS)?;
+        let _ = txn.open_table(PLATFORM_SECRETS)?;
+        let _ = txn.open_table(TENANT_ACME_ORDERS)?;
         let _ = txn.open_table(SCHEDULES)?;
         let _ = txn.open_table(USAGE)?;
         let _ = txn.open_table(QUOTAS)?;
@@ -2117,19 +2165,36 @@ impl Store {
         Ok(out)
     }
 
-    /// Flip the claim `record` (as read before verify's DNS wait) to Active — in ONE
-    /// write txn that also (a) re-reads the row and requires it to be that SAME pending
-    /// claim (tenant, project, token): a removal, project delete or takeover during the
-    /// DNS wait must not be undone by writing back a stale copy; and (b) refuses if a
-    /// DIFFERENT tenant holds an Active record under any of `conflicts` (either table),
-    /// so two tenants verifying overlapping ownership (`sub.example.com` vs
-    /// `*.sub.example.com`) can't both win.
+    /// Flip the claim `record` (as read before verify's DNS wait) to Active. See
+    /// [`Store::activate_claim`].
     pub fn activate_domain_exclusive(
         &self,
         record: &DomainRecord,
         conflicts: &[String],
     ) -> Result<Activation> {
-        check_domain_table(record)?;
+        self.activate_claim(record, record, conflicts, None)
+    }
+
+    /// In ONE write txn over both domain tables: require the row at `activate.host` to
+    /// still be exactly `expected` — the pending claim read before verify's DNS wait
+    /// (same tenant, project, token, still Pending), so a removal, project delete or
+    /// takeover during the wait is never undone by a stale write-back; refuse if a
+    /// DIFFERENT tenant than `activate`'s holds an Active record under any `conflicts`
+    /// key (`B` vs `*.B` prove the same DNS node); then write `activate` as Active.
+    ///
+    /// `expected` differs from `activate` only for a proof-wins takeover: `expected` is
+    /// ANOTHER tenant's pending wildcard claim and `activate` is the verifying tenant's
+    /// own claim, whose DNS proof was just checked. `max_wildcards` then also caps the
+    /// verifying tenant's wildcard count.
+    pub fn activate_claim(
+        &self,
+        expected: &DomainRecord,
+        activate: &DomainRecord,
+        conflicts: &[String],
+        max_wildcards: Option<usize>,
+    ) -> Result<Activation> {
+        check_domain_table(activate)?;
+        anyhow::ensure!(expected.host == activate.host, "activation host mismatch");
         let txn = self.db.begin_write()?;
         let outcome = {
             let mut exact = txn.open_table(DOMAINS)?;
@@ -2141,20 +2206,37 @@ impl Store {
                 }
             };
             let pick = |k: &str| is_wildcard_key(k);
-            let current = if pick(&record.host) {
-                read(&wild, &record.host)?
+            let current = if pick(&activate.host) {
+                read(&wild, &activate.host)?
             } else {
-                read(&exact, &record.host)?
+                read(&exact, &activate.host)?
             };
             let same_claim = current.as_ref().is_some_and(|c| {
                 c.status == DomainStatus::Pending
-                    && c.kind == record.kind
-                    && c.tenant_id == record.tenant_id
-                    && c.project_id == record.project_id
-                    && c.token == record.token
+                    && c.kind == expected.kind
+                    && c.tenant_id == expected.tenant_id
+                    && c.project_id == expected.project_id
+                    && c.token == expected.token
             });
+            let over_cap = match max_wildcards {
+                Some(max) => {
+                    let mut n = 0usize;
+                    for entry in wild.iter()? {
+                        let (_k, v) = entry?;
+                        if serde_json::from_slice::<DomainRecord>(v.value())
+                            .is_ok_and(|r| r.tenant_id == activate.tenant_id)
+                        {
+                            n += 1;
+                        }
+                    }
+                    n >= max
+                }
+                None => false,
+            };
             if !same_claim {
                 Activation::Stale
+            } else if over_cap {
+                Activation::OverCap
             } else {
                 let mut clash = false;
                 for key in conflicts {
@@ -2164,7 +2246,7 @@ impl Store {
                         read(&exact, key)?
                     };
                     if other.is_some_and(|o| {
-                        o.tenant_id != record.tenant_id && o.status == DomainStatus::Active
+                        o.tenant_id != activate.tenant_id && o.status == DomainStatus::Active
                     }) {
                         clash = true;
                         break;
@@ -2173,7 +2255,7 @@ impl Store {
                 if clash {
                     Activation::Conflict
                 } else {
-                    let mut active = current.expect("checked above");
+                    let mut active = activate.clone();
                     active.status = DomainStatus::Active;
                     let data = serde_json::to_vec(&active)?;
                     let table = if pick(&active.host) {
@@ -2245,6 +2327,73 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+
+    /// The HMAC key for wildcard claim proofs, minted on first use (in one write txn, so
+    /// concurrent first calls agree) and kept for the life of the store.
+    pub fn domain_claim_secret(&self) -> Result<Vec<u8>> {
+        const NAME: &str = "domain_claims";
+        {
+            let txn = self.db.begin_read()?;
+            let t = txn.open_table(PLATFORM_SECRETS)?;
+            if let Some(v) = t.get(NAME)? {
+                return Ok(v.value().to_vec());
+            }
+        }
+        let txn = self.db.begin_write()?;
+        let secret = {
+            let mut t = txn.open_table(PLATFORM_SECRETS)?;
+            let existing = t.get(NAME)?.map(|v| v.value().to_vec());
+            match existing {
+                Some(v) => v,
+                None => {
+                    let fresh = auth::generate_secret_bytes();
+                    t.insert(NAME, fresh.as_slice())?;
+                    fresh
+                }
+            }
+        };
+        txn.commit()?;
+        Ok(secret)
+    }
+
+    /// Charge one ACME order to `tenant_id` against `budget`: `Ok(None)` = charged, go;
+    /// `Ok(Some(t))` = over budget, nothing charged, next slot frees at unix time `t`.
+    pub fn charge_tenant_acme_order(
+        &self,
+        tenant_id: &str,
+        now: u64,
+        budget: &AcmeOrderBudget,
+    ) -> Result<Option<u64>> {
+        let txn = self.db.begin_write()?;
+        let denied = {
+            let mut t = txn.open_table(TENANT_ACME_ORDERS)?;
+            let mut stamps =
+                acme_stamps(t.get(tenant_id)?.map(|v| v.value().to_vec()), now, budget);
+            match acme_retry_at(&stamps, budget) {
+                Some(at) => Some(at),
+                None => {
+                    stamps.push(now);
+                    t.insert(tenant_id, serde_json::to_vec(&stamps)?.as_slice())?;
+                    None
+                }
+            }
+        };
+        txn.commit()?;
+        Ok(denied)
+    }
+
+    /// When `tenant_id` may next order (`None` = it may now). Read-only.
+    pub fn tenant_acme_retry_at(
+        &self,
+        tenant_id: &str,
+        now: u64,
+        budget: &AcmeOrderBudget,
+    ) -> Result<Option<u64>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(TENANT_ACME_ORDERS)?;
+        let stamps = acme_stamps(t.get(tenant_id)?.map(|v| v.value().to_vec()), now, budget);
+        Ok(acme_retry_at(&stamps, budget))
     }
 
     pub fn list_domains_for_project(&self, project_id: &str) -> Result<Vec<DomainRecord>> {
@@ -5031,6 +5180,127 @@ mod tests {
         assert!(t.get("*.future.example.com").unwrap().is_some());
         drop(t);
         drop(txn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review a4: the per-tenant order budget is keyed by TENANT and persisted, so
+    /// removing / re-adding domains or restarting the server refunds nothing.
+    #[test]
+    fn tenant_order_budget_is_persisted_and_slides() {
+        let (store, path) = tmp_db();
+        let budget = AcmeOrderBudget {
+            max_orders: 3,
+            window_secs: 1000,
+        };
+        for t in [10, 20, 30] {
+            assert_eq!(
+                store.charge_tenant_acme_order("t1", t, &budget).unwrap(),
+                None
+            );
+        }
+        // Full: the next slot frees when the OLDEST order leaves the window.
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 40, &budget).unwrap(),
+            Some(1010)
+        );
+        assert_eq!(
+            store.tenant_acme_retry_at("t1", 40, &budget).unwrap(),
+            Some(1010)
+        );
+        // A denied attempt isn't charged (the retry time doesn't move).
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 50, &budget).unwrap(),
+            Some(1010)
+        );
+        // Other tenants are independent.
+        assert_eq!(store.tenant_acme_retry_at("t2", 40, &budget).unwrap(), None);
+        // Survives a restart (reopen the same file).
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.tenant_acme_retry_at("t1", 500, &budget).unwrap(),
+            Some(1010)
+        );
+        // Slides: once the oldest ages out, exactly one more fits.
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 1010, &budget).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.charge_tenant_acme_order("t1", 1011, &budget).unwrap(),
+            Some(1020)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn domain_claim_secret_is_minted_once_and_kept() {
+        let (store, path) = tmp_db();
+        let a = store.domain_claim_secret().unwrap();
+        assert_eq!(a.len(), 32);
+        assert_eq!(store.domain_claim_secret().unwrap(), a);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.domain_claim_secret().unwrap(), a);
+        let (other, path2) = tmp_db();
+        assert_ne!(other.domain_claim_secret().unwrap(), a);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    /// Proof-wins takeover: activation replaces ANOTHER tenant's pending row with the
+    /// verifier's claim — only while that pending row is unchanged, and within the
+    /// verifier's wildcard cap.
+    #[test]
+    fn proof_takeover_replaces_only_the_foreign_pending_row_it_read() {
+        let (store, path) = tmp_db();
+        let squat = wildcard("*.v.example.com", "p2", "t2", DomainStatus::Pending);
+        store.claim_domain(&squat).unwrap();
+        let mine = DomainRecord {
+            token: "mine".into(),
+            ..wildcard("*.v.example.com", "p1", "t1", DomainStatus::Pending)
+        };
+        // Over the verifier's cap → refused, nothing written.
+        store
+            .claim_domain(&wildcard(
+                "*.other.example.com",
+                "p1",
+                "t1",
+                DomainStatus::Active,
+            ))
+            .unwrap();
+        assert_eq!(
+            store.activate_claim(&squat, &mine, &[], Some(1)).unwrap(),
+            Activation::OverCap
+        );
+        assert_eq!(
+            store
+                .get_domain("*.v.example.com")
+                .unwrap()
+                .unwrap()
+                .tenant_id,
+            "t2"
+        );
+        // The squat row changed since it was read → Stale.
+        let moved = DomainRecord {
+            token: "rotated".into(),
+            ..squat.clone()
+        };
+        store.save_domain(&moved).unwrap();
+        assert_eq!(
+            store.activate_claim(&squat, &mine, &[], Some(20)).unwrap(),
+            Activation::Stale
+        );
+        // Unchanged → the verifier's claim replaces it, Active.
+        assert_eq!(
+            store.activate_claim(&moved, &mine, &[], Some(20)).unwrap(),
+            Activation::Activated
+        );
+        let row = store.get_domain("*.v.example.com").unwrap().unwrap();
+        assert_eq!(
+            (row.tenant_id.as_str(), row.token.as_str(), row.status),
+            ("t1", "mine", DomainStatus::Active)
+        );
         let _ = std::fs::remove_file(&path);
     }
 

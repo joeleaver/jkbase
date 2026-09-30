@@ -13,7 +13,8 @@ use jkbase_control::api::{AppState, CertState, DomainMap, WildcardSupport, route
 use jkbase_control::auth::{self, ApiToken};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{
-    DomainKind, DomainRecord, DomainStatus, Project, ProjectState, Store, WildcardLimits,
+    AcmeOrderBudget, DomainKind, DomainRecord, DomainStatus, Project, ProjectState, Store,
+    WildcardLimits,
 };
 use serde_json::{Value, json};
 
@@ -563,8 +564,9 @@ async fn a_stale_pending_squat_is_taken_over_by_the_owner() {
     let (st, _) = fresh.add(&fresh.t2, "rival", "*.play.victim.com").await;
     assert_eq!(st, 200);
     let (st, v) = fresh.add(&fresh.t1, "app", "*.play.victim.com").await;
-    assert_eq!(st, 409, "{v}");
-    assert!(v["error"].as_str().unwrap().contains("taken over"), "{v}");
+    // Not replaced while fresh — but the owner gets their own records to prove with.
+    assert_eq!(st, 202, "{v}");
+    assert!(v["note"].as_str().unwrap().contains("proves DNS"), "{v}");
 
     // Takeover grace of zero: the squat is immediately stale.
     let limits = WildcardLimits {
@@ -576,9 +578,18 @@ async fn a_stale_pending_squat_is_taken_over_by_the_owner() {
     assert_eq!(st, 200);
     let (st, a) = h.add(&h.t1, "app", "*.play.victim.com").await;
     assert_eq!(st, 200, "{a}");
-    // The squatter's claim is gone: it can't verify, even with a TXT for its old token.
+    // The squatter's claim is gone. It may still try to prove over the owner's pending
+    // row — but its own proof isn't in DNS, so it fails and the row stays the owner's.
     let (st, _) = h.verify(&h.t2, "rival", "*.play.victim.com").await;
-    assert_eq!(st, 404);
+    assert_eq!(st, 400);
+    assert_eq!(
+        h.store
+            .get_domain("*.play.victim.com")
+            .unwrap()
+            .unwrap()
+            .tenant_id,
+        "tenant-1"
+    );
     let token = a["verification"]["value"].as_str().unwrap().to_string();
     h.publish("_jkbase-challenge.play.victim.com", "TXT", &token);
     let (st, v) = h.verify(&h.t1, "app", "*.play.victim.com").await;
@@ -657,10 +668,10 @@ async fn a_given_up_wildcard_reports_failed_and_reverify_rearms_it() {
     assert_eq!(h.verify(&h.t1, "app", "*.play.develup.win").await.0, 200);
     assert_eq!(h.cert_requests.lock().unwrap().len(), 1);
 
-    h.certs
-        .lock()
-        .unwrap()
-        .insert("*.play.develup.win".into(), CertState::Failed);
+    h.certs.lock().unwrap().insert(
+        "*.play.develup.win".into(),
+        CertState::Failed { retry_at: None },
+    );
     let w = h.list(&h.t1, "app", "*.play.develup.win").await;
     assert_eq!(w["tls"], "failed");
     assert_eq!(w["status"], "pending");
@@ -678,11 +689,180 @@ async fn a_given_up_wildcard_reports_failed_and_reverify_rearms_it() {
     assert_eq!(h.cert_requests.lock().unwrap().len(), 2);
 
     // A renewal that gave up while the old cert still serves stays `active`.
-    h.certs
-        .lock()
-        .unwrap()
-        .insert("*.play.develup.win".into(), CertState::RenewalFailed);
+    h.certs.lock().unwrap().insert(
+        "*.play.develup.win".into(),
+        CertState::RenewalFailed { retry_at: None },
+    );
     let w = h.list(&h.t1, "app", "*.play.develup.win").await;
     assert_eq!(w["tls"], "renewal-failed");
     assert_eq!(w["status"], "active");
+}
+
+/// Review a3: a squatter bot re-taking the pending row every grace period used to rotate
+/// the owner's token + ACME label, invalidating their published records. Proofs are now
+/// deterministic per (tenant, host), and verify lets the owner's proof win over a foreign
+/// pending row — so the owner's records never change and ping-pong gets the squatter
+/// nothing.
+#[tokio::test]
+async fn squat_ping_pong_cannot_rotate_the_owners_records_and_proof_wins() {
+    let limits = WildcardLimits {
+        pending_takeover_secs: 0,
+        ..WildcardLimits::default()
+    };
+    let h = spawn_with("pingpong", dns01(), limits).await;
+    let host = "*.play.victim.com";
+    let records = |v: &Value| {
+        (
+            v["verification"]["value"].as_str().unwrap().to_string(),
+            v["acme_challenge"]["cname"].as_str().unwrap().to_string(),
+        )
+    };
+
+    assert_eq!(h.add(&h.t2, "rival", host).await.0, 200); // squat
+    let (st, first) = h.add(&h.t1, "app", host).await; // owner takes the stale row
+    assert_eq!(st, 200, "{first}");
+    let mine = records(&first);
+    for round in 0..3 {
+        // Bot re-takes; owner re-adds: the owner's records are the same every time.
+        let (st, _) = h.add(&h.t2, "rival", host).await;
+        assert_eq!(st, 200, "round {round}");
+        let (st, again) = h.add(&h.t1, "app", host).await;
+        assert_eq!(st, 200, "round {round}: {again}");
+        assert_eq!(records(&again), mine, "round {round}");
+    }
+    // The squatter holds the row at the moment the owner verifies: proof still wins.
+    let (_, squat) = h.add(&h.t2, "rival", host).await;
+    assert_ne!(records(&squat), mine, "tenants' proofs differ");
+    assert_eq!(
+        h.store.get_domain(host).unwrap().unwrap().tenant_id,
+        "tenant-2"
+    );
+    h.publish("_jkbase-challenge.play.victim.com", "TXT", &mine.0);
+    h.publish("_acme-challenge.play.victim.com", "CNAME", &mine.1);
+    let (st, v) = h.verify(&h.t1, "app", host).await;
+    assert_eq!(st, 200, "{v}");
+    let row = h.store.get_domain(host).unwrap().unwrap();
+    assert_eq!(
+        (row.tenant_id.as_str(), row.project_id.as_str(), row.status),
+        ("tenant-1", "app", DomainStatus::Active)
+    );
+    assert_eq!(row.token, mine.0);
+    // …and the squatter's proof, absent from DNS, never could have.
+    assert_eq!(h.verify(&h.t2, "rival", host).await.0, 404);
+    assert_eq!(h.add(&h.t2, "rival", host).await.0, 409);
+}
+
+/// With the default grace, a fresh foreign pending claim isn't replaced — but the owner
+/// still gets their (deterministic) records (202) and wins by proving DNS.
+#[tokio::test]
+async fn a_fresh_squat_returns_the_owners_records_and_proof_wins() {
+    let h = spawn("fresh-squat", WildcardSupport::PlainHttp).await;
+    assert_eq!(h.add(&h.t2, "rival", "*.play.victim.com").await.0, 200);
+    let (st, v) = h.add(&h.t1, "app", "*.play.victim.com").await;
+    assert_eq!(st, 202, "{v}");
+    assert!(v["note"].as_str().unwrap().contains("proves DNS"), "{v}");
+    let token = v["verification"]["value"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.play.victim.com", "TXT", &token);
+    let (st, v) = h.verify(&h.t1, "app", "*.play.victim.com").await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(
+        h.store
+            .get_domain("*.play.victim.com")
+            .unwrap()
+            .unwrap()
+            .tenant_id,
+        "tenant-1"
+    );
+    // A third party can't ride the takeover path without its own proof.
+    let (st, _) = h.verify(&h.t2, "rival", "*.play.victim.com").await;
+    assert_eq!(st, 404);
+}
+
+/// Review a4: add → verify → remove over fresh bases fired an immediate, backoff-reset
+/// order per verify. Every order is now charged to the TENANT's persisted budget (here
+/// emulating the server's gate exactly: `charge_tenant_acme_order` per order attempt),
+/// so churning names or removing them refunds nothing.
+#[tokio::test]
+async fn order_churn_via_readd_is_bounded_by_the_tenants_persisted_budget() {
+    let h = spawn("churn", dns01()).await;
+    let budget = AcmeOrderBudget {
+        max_orders: 5,
+        window_secs: 24 * 3600,
+    };
+    for i in 0..12 {
+        let host = format!("*.n{i}.attacker.com");
+        let (st, a) = h.add(&h.t1, "app", &host).await;
+        assert_eq!(st, 200, "{a}");
+        let base = &host[2..];
+        h.publish(
+            &format!("_jkbase-challenge.{base}"),
+            "TXT",
+            a["verification"]["value"].as_str().unwrap(),
+        );
+        h.publish(
+            &format!("_acme-challenge.{base}"),
+            "CNAME",
+            a["acme_challenge"]["cname"].as_str().unwrap(),
+        );
+        assert_eq!(h.verify(&h.t1, "app", &host).await.0, 200);
+        assert_eq!(h.rm(&h.t1, "app", &host).await.0, 204);
+    }
+    // The API still asks for 12 certs; the cert manager's gate lets 5 orders through.
+    let requested = h.cert_requests.lock().unwrap().clone();
+    assert_eq!(requested.len(), 12);
+    let allowed = requested
+        .iter()
+        .filter(|_| {
+            h.store
+                .charge_tenant_acme_order("tenant-1", 1_000, &budget)
+                .unwrap()
+                .is_none()
+        })
+        .count();
+    assert_eq!(allowed, 5);
+    // Another tenant has its own budget.
+    assert!(
+        h.store
+            .charge_tenant_acme_order("tenant-2", 1_000, &budget)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Re-verify may re-arm a stopped cert only within the tenant's order budget; the
+/// response says when it can retry.
+#[tokio::test]
+async fn rearm_is_refused_past_the_tenants_order_budget() {
+    let h = spawn("rearm-budget", dns01()).await;
+    let (_, a) = h.add(&h.t1, "app", "*.play.develup.win").await;
+    let tok = a["verification"]["value"].as_str().unwrap().to_string();
+    let cname = a["acme_challenge"]["cname"].as_str().unwrap().to_string();
+    h.publish("_jkbase-challenge.play.develup.win", "TXT", &tok);
+    h.publish("_acme-challenge.play.develup.win", "CNAME", &cname);
+    assert_eq!(h.verify(&h.t1, "app", "*.play.develup.win").await.0, 200);
+
+    // Budget spent (default 20/day), cert manager reports the block.
+    let now = jkbase_control::auth::timestamp();
+    for _ in 0..AcmeOrderBudget::default().max_orders {
+        h.store
+            .charge_tenant_acme_order("tenant-1", now, &AcmeOrderBudget::default())
+            .unwrap();
+    }
+    h.certs.lock().unwrap().insert(
+        "*.play.develup.win".into(),
+        CertState::Failed {
+            retry_at: Some(now + 86_400),
+        },
+    );
+    let w = h.list(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(w["tls"], "failed");
+    assert!(w["tls_error"].as_str().unwrap().contains("budget"), "{w}");
+    let before = h.cert_requests.lock().unwrap().len();
+    let (st, v) = h.verify(&h.t1, "app", "*.play.develup.win").await;
+    assert_eq!(st, 429, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("try again after"),
+        "{v}"
+    );
+    assert_eq!(h.cert_requests.lock().unwrap().len(), before);
 }

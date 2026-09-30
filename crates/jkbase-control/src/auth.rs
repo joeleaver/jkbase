@@ -41,6 +41,42 @@ pub fn generate_dns_label() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 32 bytes from the OS CSPRNG, for a platform secret kept in the store.
+pub fn generate_secret_bytes() -> Vec<u8> {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.to_vec()
+}
+
+/// A tenant's wildcard claim proof for `host`: `(TXT token, ACME delegation label)`,
+/// both HMAC-SHA256 under the platform's `domain_claims` secret over (tenant, host).
+/// Deterministic per (tenant, host), so re-claiming — after a removal, or after a squatter
+/// took the pending row over — never changes the records the tenant published; and
+/// unguessable ACROSS tenants (the key never leaves the store), so nobody can predict
+/// or publish another tenant's proof. The label is 128 bits of lowercase hex (a DNS
+/// label), the token is the familiar `jkb_` + 256-bit base64url.
+pub fn wildcard_claim_proof(secret: &[u8], tenant_id: &str, host: &str) -> (String, String) {
+    use hmac::{Hmac, Mac};
+    let mac = |purpose: &str| {
+        let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(secret)
+            .expect("HMAC accepts any key length");
+        for part in [purpose, tenant_id, host] {
+            m.update(part.as_bytes());
+            m.update(&[0]);
+        }
+        m.finalize().into_bytes()
+    };
+    let token = format!(
+        "jkb_{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac("jkbase-wildcard-txt"))
+    );
+    let label = mac("jkbase-wildcard-acme")[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    (token, label)
+}
+
 pub fn generate_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
@@ -286,7 +322,32 @@ pub fn generate_backup_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_dns_label;
+    use super::{generate_dns_label, wildcard_claim_proof};
+
+    #[test]
+    fn wildcard_proofs_are_stable_per_tenant_and_distinct_across_tenants_and_keys() {
+        let k = [7u8; 32];
+        let a = wildcard_claim_proof(&k, "t1", "*.play.example.com");
+        // Stable: re-claims keep the tenant's published records valid.
+        assert_eq!(a, wildcard_claim_proof(&k, "t1", "*.play.example.com"));
+        assert!(a.0.starts_with("jkb_"));
+        assert_eq!(a.1.len(), 32);
+        assert!(
+            a.1.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        // Another tenant, host or platform key → unrelated values.
+        for other in [
+            wildcard_claim_proof(&k, "t2", "*.play.example.com"),
+            wildcard_claim_proof(&k, "t1", "*.other.example.com"),
+            wildcard_claim_proof(&[8u8; 32], "t1", "*.play.example.com"),
+            // Field boundaries are delimited: ("t1*", ".play…") ≠ ("t1", "*.play…").
+            wildcard_claim_proof(&k, "t1*", ".play.example.com"),
+        ] {
+            assert_ne!(a.0, other.0);
+            assert_ne!(a.1, other.1);
+        }
+    }
 
     #[test]
     fn dns_labels_are_unique_unguessable_lowercase_hex() {
