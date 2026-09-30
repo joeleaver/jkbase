@@ -614,7 +614,8 @@ async fn proxy_request(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    let hostname = host.split(':').next().unwrap_or("");
+    let hostname = request_hostname(host);
+    let hostname = hostname.as_str();
     let subdomain = extract_subdomain(hostname, &shared.domain);
 
     // Route api.{domain} to the control plane (infra, never a tenant project).
@@ -668,12 +669,13 @@ async fn proxy_request(
 
     // Resolve owner + site from the domain registry. A miss means the host is
     // not claimed by anyone → 404 (this replaces the old known_projects check).
-    let target = if let Some(ref domains) = shared.domains {
-        domains.read().await.get(&host_key).cloned()
+    let on_platform = is_platform_host(hostname, &shared.domain);
+    let resolved = if let Some(ref domains) = shared.domains {
+        resolve_domain(&*domains.read().await, &host_key, on_platform)
     } else {
         None
     };
-    let Some(target) = target else {
+    let Some((host_key, target)) = resolved else {
         return Ok(not_found(&host_key));
     };
     let project_id = target.project_id;
@@ -1140,6 +1142,44 @@ async fn forward_request(
     Ok(builder.body(body).unwrap())
 }
 
+/// The routing hostname of a `Host` header: port dropped, then normalized (lowercase,
+/// no root dot) so it matches the canonical keys control stores.
+fn request_hostname(host_header: &str) -> String {
+    jkbase_common::routing::normalize_host(host_header.split(':').next().unwrap_or(""))
+}
+
+fn is_platform_host(hostname: &str, platform_domain: &str) -> bool {
+    hostname == platform_domain || hostname.ends_with(&format!(".{platform_domain}"))
+}
+
+/// Host-key → (the domain-map key that matched, its target). Precedence, all O(1):
+///   1. the exact key — platform labels and exact custom hosts ALWAYS win, including an
+///      exact host another tenant registered after a covering wildcard;
+///   2. off-platform only: the ONE single-label wildcard key (`abc.sub.example.com` →
+///      `*.sub.example.com`; never `*.example.com`, never for `a.b.sub.example.com`).
+///
+/// The matched key (not the request host) is what `routes` is keyed by. A host that
+/// itself contains `*` resolves to nothing, so a literal `Host: *.sub.example.com`
+/// can't address a wildcard registration as if it were an exact one.
+fn resolve_domain(
+    map: &HashMap<String, DomainTarget>,
+    host_key: &str,
+    on_platform: bool,
+) -> Option<(String, DomainTarget)> {
+    if host_key.contains('*') {
+        return None;
+    }
+    if let Some(t) = map.get(host_key) {
+        return Some((host_key.to_string(), t.clone()));
+    }
+    if on_platform {
+        return None;
+    }
+    let key = jkbase_common::routing::wildcard_key(host_key)?;
+    let t = map.get(&key)?.clone();
+    Some((key, t))
+}
+
 fn extract_subdomain(hostname: &str, platform_domain: &str) -> Option<String> {
     let suffix = format!(".{platform_domain}");
     if let Some(subdomain) = hostname.strip_suffix(&suffix) {
@@ -1424,6 +1464,93 @@ mod tests {
     }
 
     // (is_upgrade_request + header sanitization are tested in `jkbase-wsproxy`.)
+
+    /// Full proxy-side resolution of a raw `Host` header, as `proxy_request` does it.
+    fn route(map: &HashMap<String, DomainTarget>, host_header: &str) -> Option<String> {
+        let hostname = request_hostname(host_header);
+        let key = match extract_subdomain(&hostname, "jkbase.app").as_deref() {
+            None | Some("www") => "www".to_string(),
+            Some(sub) => sub.to_string(),
+        };
+        resolve_domain(map, &key, is_platform_host(&hostname, "jkbase.app"))
+            .map(|(k, t)| format!("{k}->{}", t.project_id))
+    }
+
+    fn target(project: &str) -> DomainTarget {
+        DomainTarget {
+            project_id: project.into(),
+            site: None,
+            acme_delegation: None,
+        }
+    }
+
+    #[test]
+    fn wildcard_is_a_single_label_fallback_behind_exact_hosts() {
+        let mut map = HashMap::new();
+        map.insert("*.play.develup.win".to_string(), target("develup"));
+        map.insert("special.play.develup.win".to_string(), target("other"));
+
+        // Any one label under the base → the wildcard owner, keyed by the wildcard.
+        assert_eq!(
+            route(&map, "abc123.play.develup.win").as_deref(),
+            Some("*.play.develup.win->develup")
+        );
+        // Exact beats wildcard.
+        assert_eq!(
+            route(&map, "special.play.develup.win").as_deref(),
+            Some("special.play.develup.win->other")
+        );
+        // An exact host registered AFTER the wildcard still wins (no caching of the
+        // fallback: every request re-does the exact lookup first).
+        assert_eq!(
+            route(&map, "late.play.develup.win").as_deref(),
+            Some("*.play.develup.win->develup")
+        );
+        map.insert("late.play.develup.win".to_string(), target("latecomer"));
+        assert_eq!(
+            route(&map, "late.play.develup.win").as_deref(),
+            Some("late.play.develup.win->latecomer")
+        );
+        // Single-level only (RFC 6125): not deeper, not the base itself.
+        assert_eq!(route(&map, "a.b.play.develup.win"), None);
+        assert_eq!(route(&map, "play.develup.win"), None);
+        // A literal `*` host never addresses the wildcard registration directly.
+        assert_eq!(route(&map, "*.play.develup.win"), None);
+    }
+
+    #[test]
+    fn wildcard_match_ignores_port_case_and_root_dot() {
+        let mut map = HashMap::new();
+        map.insert("*.play.develup.win".to_string(), target("develup"));
+        for h in [
+            "abc.play.develup.win:8080",
+            "ABC.Play.DevelUp.WIN",
+            "abc.play.develup.win.",
+            "Abc.Play.Develup.Win.:443",
+        ] {
+            assert_eq!(
+                route(&map, h).as_deref(),
+                Some("*.play.develup.win->develup"),
+                "{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_hosts_never_fall_back_to_a_wildcard() {
+        let mut map = HashMap::new();
+        map.insert("myapp".to_string(), target("myapp"));
+        // Unreachable through control (validation), planted here to prove the proxy
+        // never consults a wildcard for a platform host even if one existed.
+        map.insert("*.jkbase.app".to_string(), target("rogue"));
+        map.insert("*.b.jkbase.app".to_string(), target("rogue"));
+        assert_eq!(
+            route(&map, "MyApp.jkbase.app").as_deref(),
+            Some("myapp->myapp")
+        );
+        assert_eq!(route(&map, "unclaimed.jkbase.app"), None);
+        assert_eq!(route(&map, "a.b.jkbase.app"), None);
+    }
 
     // The apex and "www" both map to the "www" landing project's host-key.
     #[test]

@@ -249,6 +249,7 @@ async fn proxy_relays_websocket_upgrade_via_tenant_path() {
         DomainTarget {
             project_id: "myapp".to_string(),
             site: None,
+            acme_delegation: None,
         },
     );
     let routes = new_routing_table();
@@ -301,6 +302,7 @@ async fn non_upgrade_response_is_buffered_and_sanitized() {
         DomainTarget {
             project_id: "myapp".to_string(),
             site: None,
+            acme_delegation: None,
         },
     );
     let routes = new_routing_table();
@@ -427,6 +429,7 @@ async fn websocket_frame_flow_restamps_activity() {
         DomainTarget {
             project_id: "myapp".to_string(),
             site: None,
+            acme_delegation: None,
         },
     );
     let routes = new_routing_table();
@@ -496,6 +499,7 @@ async fn streamed_response_streams_through_activity_wrapper() {
         DomainTarget {
             project_id: "myapp".to_string(),
             site: None,
+            acme_delegation: None,
         },
     );
     let routes = new_routing_table();
@@ -569,6 +573,7 @@ async fn unsolicited_backend_101_becomes_502() {
         DomainTarget {
             project_id: "myapp".to_string(),
             site: None,
+            acme_delegation: None,
         },
     );
     let routes = new_routing_table();

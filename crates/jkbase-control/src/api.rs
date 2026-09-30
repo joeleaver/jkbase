@@ -1,4 +1,5 @@
 use crate::auth::{self, ApiToken, Tenant};
+use crate::domain_name::derive_host_key;
 use crate::logstore::LogStore;
 use crate::store::{
     BuildPhase, BuildRecord, DomainKind, DomainRecord, DomainStatus, PortAllocation, Project, Store,
@@ -118,8 +119,53 @@ pub type DomainMap = Arc<tokio::sync::RwLock<std::collections::HashMap<String, D
 /// Fire-and-forget request to (proactively) issue a TLS cert for a verified
 /// custom domain. Wired by the server to the proxy's CertManager.
 pub type CertRequest = Arc<dyn Fn(String) + Send + Sync>;
-/// Query whether a per-host TLS cert has been issued for a custom domain.
-pub type CertStatusFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Issuance state of a custom/wildcard host's cert, as the cert manager sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertState {
+    /// Not issued yet (issuance pending / retrying).
+    Missing,
+    Issued,
+    /// No cert serving and the cert manager STOPPED ordering: repeated failures (or the
+    /// `_acme-challenge` CNAME is gone) → `retry_at: None`, re-verify to retry; or the
+    /// owner's ACME order budget is spent → `retry_at: Some(unix)`, retried then.
+    Failed {
+        retry_at: Option<u64>,
+    },
+    /// Like `Failed`, but an earlier cert is still loaded and serving until it expires.
+    RenewalFailed {
+        retry_at: Option<u64>,
+    },
+}
+/// Query a host's cert state (wired by the server to the proxy's CertManager).
+pub type CertStatusFn = Arc<dyn Fn(&str) -> CertState + Send + Sync>;
+/// Drop a released host's issued cert (resolver + on-disk cache) so a removed domain
+/// stops being served and renewed. Wired by the server to the proxy's CertManager.
+pub type CertRemove = Arc<dyn Fn(String) + Send + Sync>;
+/// DNS read used by domain verification: `(fqdn, "TXT" | "CNAME" | "CAA")` → the answers' data.
+/// `Ok` is an AUTHORITATIVE answer (NOERROR or NXDOMAIN; possibly empty); `Err` means the
+/// lookup itself failed (network, timeout, SERVFAIL) and says nothing about the tenant's
+/// DNS — callers must never read it as "record absent" (the cert manager would count a
+/// resolver outage against a tenant's give-up budget). Pluggable so the verification +
+/// conflict logic is testable offline; defaults to DoH ([`doh_lookup`]).
+pub type DnsLookup = Arc<
+    dyn Fn(String, &'static str) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Whether (and how) this server can serve `*.<base>` wildcard domains.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WildcardSupport {
+    /// No TLS (local dev): wildcards route on the plain-HTTP proxy port; no cert.
+    PlainHttp,
+    /// TLS with a DNS-01 backend: a wildcard's cert is issued through CNAME delegation
+    /// of `_acme-challenge.<base>` to `<random-label>.<zone>` — a zone under the
+    /// platform domain the DNS-01 backend can already write.
+    Dns01 { zone: String },
+    /// TLS but no DNS-01 backend: wildcard registration is REFUSED rather than
+    /// half-working (a wildcard cert can't be obtained any other way).
+    Unsupported,
+}
 
 pub struct AppState {
     pub store: Store,
@@ -136,6 +182,20 @@ pub struct AppState {
     pub domain_map: Option<DomainMap>,
     pub cert_request: Option<CertRequest>,
     pub cert_status: Option<CertStatusFn>,
+    pub cert_remove: Option<CertRemove>,
+    /// DNS reads for TXT ownership + ACME-delegation checks (default: DoH).
+    pub dns_lookup: DnsLookup,
+    /// Fail-closed default [`WildcardSupport::Unsupported`]; the server sets it from
+    /// its TLS config.
+    pub wildcard_support: WildcardSupport,
+    /// Per-tenant anti-squat / ACME-budget caps on wildcard claims.
+    pub wildcard_limits: crate::store::WildcardLimits,
+    /// Per-tenant ACME order budget. The server's cert manager charges it on every
+    /// order; the API only reads it (re-verify refuses to re-arm past it).
+    pub acme_budget: crate::store::AcmeOrderBudget,
+    /// Per-tenant bound on domain verifies: each costs outbound DNS the tenant chooses
+    /// the timing of (and may target another tenant's pending wildcard).
+    pub verify_limiter: VerifyLimiter,
     /// Tears down live managed-DB relays on key revocation / project delete ([R5]).
     pub db_revoke_callback: Option<DbRevokeCallback>,
     /// Runs a managed-DB backup (host-relay pull → platform store). `None` ⇒ backups disabled
@@ -225,6 +285,12 @@ impl AppState {
             domain_map: None,
             cert_request: None,
             cert_status: None,
+            cert_remove: None,
+            dns_lookup: Arc::new(|name, rtype| Box::pin(doh_lookup(name, rtype))),
+            wildcard_support: WildcardSupport::Unsupported,
+            wildcard_limits: crate::store::WildcardLimits::default(),
+            acme_budget: crate::store::AcmeOrderBudget::default(),
+            verify_limiter: VerifyLimiter::default(),
             db_revoke_callback: None,
             db_backup_callback: None,
             db_restore_callback: None,
@@ -835,6 +901,7 @@ async fn create_project(
         status: DomainStatus::Active,
         token: String::new(),
         created_at: auth::timestamp(),
+        acme_delegation: None,
     };
     match state.store.claim_domain(&primary) {
         Ok(true) => {}
@@ -1013,10 +1080,15 @@ async fn delete_project(
                     .await;
                     // Release all claimed hostnames so they can't be taken over
                     // or left dangling in the routing maps.
+                    // Conditional: a row taken over by another tenant since the
+                    // listing is theirs now and stays.
                     if let Ok(domains) = state.store.list_domains_for_project(&id) {
                         for d in domains {
-                            let _ = state.store.remove_domain(&d.host);
-                            deactivate_host(&state, &d.host).await;
+                            if let Ok(true) =
+                                state.store.remove_domain_if_owned(&d.host, &d.tenant_id, &id)
+                            {
+                                deactivate_host(&state, &d.host).await;
+                            }
                         }
                     }
                     // Stop the VM, free the IP/TAP, and remove on-disk artifacts.
@@ -4796,13 +4868,25 @@ async fn db_schema_apply(
 struct DomainResponse {
     host: String,
     kind: DomainKind,
+    /// A wildcard reports `pending` until BOTH ownership is verified AND (with TLS) its
+    /// cert is issued — it can't serve HTTPS before then. The stored record is already
+    /// Active at that point (it gates routing + issuance, exactly like a custom domain).
     status: DomainStatus,
     site: Option<String>,
-    /// DNS TXT challenge the user must publish to verify a custom domain.
+    /// DNS TXT challenge the user must publish to verify a custom/wildcard domain.
     verification: Option<DomainChallenge>,
+    /// Wildcards on a TLS server: the `_acme-challenge` CNAME the tenant must publish
+    /// (and keep — renewals re-use it) so the platform can answer DNS-01 for them.
+    acme_challenge: Option<AcmeDelegation>,
     /// HTTPS status: `active` (cert serving), `provisioning` (verified custom
-    /// domain awaiting issuance), or `None` (not applicable / unverified).
+    /// domain awaiting issuance), `failed` / `renewal-failed` (issuance stopped — see
+    /// `tls_error`), or `None` (not applicable / unverified).
     tls: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tls_error: Option<String>,
+    /// Extra guidance (e.g. the name is held by another account's unverified claim).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -4811,42 +4895,105 @@ struct DomainChallenge {
     value: String,
 }
 
+#[derive(Serialize)]
+struct AcmeDelegation {
+    record: String,
+    cname: String,
+}
+
 /// HTTPS state for a domain. Subdomains are covered by the wildcard cert;
-/// custom domains get a per-host cert issued after verification.
-fn tls_status(state: &AppState, r: &crate::store::DomainRecord) -> Option<String> {
+/// custom domains get a per-host cert issued after verification; wildcards get a
+/// DNS-01 cert via delegation (or none at all on a plain-HTTP server). Returns
+/// `(tls, tls_error)` — see [`DomainResponse::tls`].
+fn tls_state(state: &AppState, r: &DomainRecord) -> (Option<String>, Option<String>) {
     if r.status != DomainStatus::Active {
-        return None;
+        return (None, None);
     }
-    match r.kind {
-        DomainKind::Subdomain => Some("active".to_string()),
-        DomainKind::Custom => {
-            let has_cert = state
-                .cert_status
-                .as_ref()
-                .map(|f| f(&r.host))
-                .unwrap_or(false);
-            Some(if has_cert { "active" } else { "provisioning" }.to_string())
+    let cert = || {
+        let st = state
+            .cert_status
+            .as_ref()
+            .map(|f| f(&r.host))
+            .unwrap_or(CertState::Missing);
+        let why = |retry_at: Option<u64>| {
+            Some(match retry_at {
+                Some(t) => format!(
+                    "this account's certificate order budget is used up; issuance retries automatically after {} (unix {t})",
+                    fmt_unix(t)
+                ),
+                None => "certificate issuance failed repeatedly and was paused; fix DNS, then verify again".to_string(),
+            })
+        };
+        match st {
+            CertState::Missing => (Some("provisioning".to_string()), None),
+            CertState::Issued => (Some("active".to_string()), None),
+            CertState::Failed { retry_at } => (Some("failed".to_string()), why(retry_at)),
+            CertState::RenewalFailed { retry_at } => {
+                (Some("renewal-failed".to_string()), why(retry_at))
+            }
         }
+    };
+    match r.kind {
+        DomainKind::Subdomain => (Some("active".to_string()), None),
+        DomainKind::Custom => cert(),
+        DomainKind::Wildcard => match state.wildcard_support {
+            WildcardSupport::Dns01 { .. } => cert(),
+            _ => (None, None),
+        },
+        DomainKind::Unknown => (None, None),
     }
 }
 
+fn fmt_unix(t: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    Utc.timestamp_opt(t as i64, 0)
+        .single()
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| t.to_string())
+}
+
+/// `_acme-challenge.<base>` → `<label>.<zone>` for a wildcard on a DNS-01 server.
+fn acme_delegation(state: &AppState, r: &DomainRecord) -> Option<AcmeDelegation> {
+    let (DomainKind::Wildcard, WildcardSupport::Dns01 { zone }, Some(label)) = (
+        r.kind,
+        &state.wildcard_support,
+        r.acme_delegation.as_deref(),
+    ) else {
+        return None;
+    };
+    Some(AcmeDelegation {
+        record: format!("_acme-challenge.{}", r.ownership_name()),
+        cname: format!("{label}.{zone}"),
+    })
+}
+
 fn domain_response(state: &AppState, r: crate::store::DomainRecord) -> DomainResponse {
-    let verification = if r.kind == DomainKind::Custom && r.status == DomainStatus::Pending {
+    let verification = if r.kind != DomainKind::Subdomain && r.status == DomainStatus::Pending {
         Some(DomainChallenge {
-            record: format!("_jkbase-challenge.{}", r.host),
+            record: format!("_jkbase-challenge.{}", r.ownership_name()),
             value: r.token.clone(),
         })
     } else {
         None
     };
-    let tls = tls_status(state, &r);
+    let (tls, tls_error) = tls_state(state, &r);
+    let not_serving = matches!(tls.as_deref(), Some("provisioning" | "failed"));
+    let status = if r.kind == DomainKind::Wildcard && not_serving {
+        DomainStatus::Pending
+    } else {
+        r.status
+    };
+    let acme_challenge = acme_delegation(state, &r);
     DomainResponse {
         host: r.host,
         kind: r.kind,
-        status: r.status,
+        status,
         site: r.site,
         verification,
+        acme_challenge,
         tls,
+        tls_error,
+        note: None,
     }
 }
 
@@ -4878,6 +5025,176 @@ pub struct AddDomainRequest {
     pub site: Option<String>,
 }
 
+fn conflict(msg: String) -> axum::response::Response {
+    (StatusCode::CONFLICT, Json(ErrorResponse { error: msg })).into_response()
+}
+
+/// Refuse a wildcard this server can't carry end-to-end.
+fn wildcard_unsupported() -> axum::response::Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(ErrorResponse {
+            error: "wildcard domains need an ACME DNS-01 backend, and this server's TLS has none configured".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// Registry keys whose Active owner must be THIS tenant for `host` to be claimed or
+/// verified. A wildcard `*.B` and an exact `B` prove ownership of the same DNS node
+/// (`_jkbase-challenge.B`), so they may not be split across tenants; every OTHER overlap
+/// (an exact `x.B` under someone's `*.B`) is allowed and resolved by exact-wins routing.
+fn ownership_conflicts(host: &str, kind: DomainKind) -> Vec<String> {
+    match kind {
+        DomainKind::Wildcard => vec![
+            host.strip_prefix(jkbase_common::routing::WILDCARD_PREFIX)
+                .unwrap_or(host)
+                .to_string(),
+        ],
+        DomainKind::Custom => vec![format!("{}{host}", jkbase_common::routing::WILDCARD_PREFIX)],
+        DomainKind::Subdomain | DomainKind::Unknown => Vec::new(),
+    }
+}
+
+/// `Some(owner-tenant)` when another tenant holds an ACTIVE record under a conflict key.
+/// Only verified records conflict: a Pending claim proves nothing, so it must not be
+/// able to block (squat) the other kind of the same name.
+fn foreign_active_owner(state: &AppState, tenant_id: &str, keys: &[String]) -> Option<String> {
+    keys.iter().find_map(|k| match state.store.get_domain(k) {
+        Ok(Some(r)) if r.tenant_id != tenant_id && r.status == DomainStatus::Active => {
+            Some(k.clone())
+        }
+        _ => None,
+    })
+}
+
+/// A fresh claim record. Custom + wildcard start Pending (DNS-TXT proof pending);
+/// platform subdomains are ours → Active. A wildcard's TXT token and ACME delegation
+/// label are the tenant's deterministic claim proof for the host
+/// (`auth::wildcard_claim_proof`), so they survive re-claims of an unverified name and
+/// change once a verified claim is released.
+fn new_domain_record(
+    state: &AppState,
+    host: &str,
+    kind: DomainKind,
+    project_id: &str,
+    tenant_id: &str,
+    site: Option<String>,
+) -> anyhow::Result<DomainRecord> {
+    let (token, acme_delegation) = if kind == DomainKind::Wildcard {
+        let (t, l) = auth::wildcard_claim_proof(
+            &state.store.domain_claim_secret()?,
+            tenant_id,
+            host,
+            state.store.claim_generation(tenant_id, host)?,
+        );
+        (t, Some(l))
+    } else {
+        (auth::generate_token(), None)
+    };
+    Ok(DomainRecord {
+        host: host.to_string(),
+        project_id: project_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        site,
+        kind,
+        status: match kind {
+            DomainKind::Subdomain => DomainStatus::Active,
+            DomainKind::Custom | DomainKind::Wildcard | DomainKind::Unknown => {
+                DomainStatus::Pending
+            }
+        },
+        token,
+        created_at: auth::timestamp(),
+        acme_delegation,
+    })
+}
+
+/// Claim a wildcard under the anti-squat rules (see `Store::claim_wildcard`); `Some`
+/// is the error response.
+fn claim_wildcard(state: &AppState, record: &DomainRecord) -> Option<axum::response::Response> {
+    use crate::store::WildcardClaim;
+    let host = &record.host;
+    let limits = &state.wildcard_limits;
+    match state
+        .store
+        .claim_wildcard(record, limits, auth::timestamp())
+    {
+        Ok(WildcardClaim::Claimed) => None,
+        Ok(WildcardClaim::Replaced(prev)) => {
+            info!(host = %host, previous_tenant = %prev.tenant_id,
+                "took over a stale pending wildcard claim");
+            None
+        }
+        Ok(WildcardClaim::Taken(r)) if r.project_id == record.project_id => Some(bad_request(
+            format!("'{host}' is already attached to this project"),
+        )),
+        Ok(WildcardClaim::Taken(r)) if r.tenant_id == record.tenant_id => Some(conflict(format!(
+            "'{host}' is already attached to another of your projects"
+        ))),
+        Ok(WildcardClaim::Taken(r)) if r.status == DomainStatus::Pending => {
+            // Proof wins: hand the caller THEIR records (deterministic, so they stay valid);
+            // `verify` takes the name over from the unverified claim as soon as the
+            // caller's proof is in DNS. (Not persisted: nothing to squat with.)
+            let mut resp = domain_response(state, record.clone());
+            resp.note = Some(format!(
+                "'{host}' has an unverified claim by another account. Publish these records \
+                 and run verify: whoever proves DNS ownership first gets it."
+            ));
+            Some((StatusCode::ACCEPTED, Json(resp)).into_response())
+        }
+        Ok(WildcardClaim::Taken(_)) => Some(conflict(format!("'{host}' is already in use"))),
+        Ok(WildcardClaim::PendingCapReached) => Some(too_many(format!(
+            "at most {} unverified wildcard domains per account; verify or remove one first",
+            limits.max_pending_per_tenant
+        ))),
+        Ok(WildcardClaim::TotalCapReached) => Some(too_many(format!(
+            "at most {} wildcard domains per account",
+            limits.max_per_tenant
+        ))),
+        Err(e) => Some(internal_error(e)),
+    }
+}
+
+/// Per-tenant token bucket on `POST …/domains/{d}/verify`: [`Self::BURST`] back-to-back,
+/// then one per [`Self::REFILL_SECS`]. Every verify spends 1–3 outbound DNS lookups on
+/// the platform's resolver, whose throttling would push OTHER tenants' certs into
+/// backoff. In memory (a restart refilling it is not tenant-triggerable); entries for
+/// tenants back at full burst are pruned so the map stays bounded by active tenants.
+#[derive(Default)]
+pub struct VerifyLimiter(std::sync::Mutex<HashMap<String, (f64, std::time::Instant)>>);
+
+impl VerifyLimiter {
+    const BURST: f64 = 20.0;
+    const REFILL_SECS: f64 = 6.0;
+
+    /// Take one verify for `tenant`; `false` = over the limit.
+    fn try_take(&self, tenant: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let refill = |(tokens, last): (f64, std::time::Instant)| {
+            (tokens + now.duration_since(last).as_secs_f64() / Self::REFILL_SECS).min(Self::BURST)
+        };
+        if map.len() > 4096 {
+            map.retain(|_, v| refill(*v) < Self::BURST);
+        }
+        let tokens = map.get(tenant).copied().map_or(Self::BURST, refill);
+        if tokens < 1.0 {
+            return false;
+        }
+        map.insert(tenant.to_string(), (tokens - 1.0, now));
+        true
+    }
+}
+
+fn too_many(msg: String) -> axum::response::Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ErrorResponse { error: msg }),
+    )
+        .into_response()
+}
+
 async fn add_domain(
     State(state): State<Arc<AppState>>,
     Extension(tenant): Extension<Tenant>,
@@ -4892,63 +5209,49 @@ async fn add_domain(
         Ok(v) => v,
         Err(msg) => return bad_request(msg),
     };
+    if kind == DomainKind::Wildcard && state.wildcard_support == WildcardSupport::Unsupported {
+        return wildcard_unsupported();
+    }
 
     // Global uniqueness: a host owned by anyone else (or reserved) is rejected.
+    // (Wildcards decide inside `claim_wildcard`'s txn: a stale foreign Pending claim
+    // there is replaceable, not a conflict.)
     match state.store.get_domain(&host) {
-        Ok(Some(existing)) => {
-            if existing.project_id == id {
-                return bad_request(format!("'{host}' is already attached to this project"));
-            }
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: format!("'{host}' is already in use"),
-                }),
-            )
-                .into_response();
+        Ok(Some(existing)) if existing.project_id == id => {
+            return bad_request(format!("'{host}' is already attached to this project"));
         }
-        Ok(None) => {}
+        Ok(Some(_)) if kind != DomainKind::Wildcard => {
+            return conflict(format!("'{host}' is already in use"));
+        }
+        Ok(_) => {}
         Err(e) => return internal_error(e),
     }
     if crate::store::host_is_reserved(&host) {
-        return (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: format!("'{host}' is a reserved name"),
-            }),
-        )
-            .into_response();
+        return conflict(format!("'{host}' is a reserved name"));
+    }
+    if let Some(other) = foreign_active_owner(&state, &tenant.id, &ownership_conflicts(&host, kind))
+    {
+        return conflict(format!(
+            "'{host}' overlaps '{other}', which another account has verified"
+        ));
     }
 
-    // Platform subdomains are owned by us → Active immediately (wildcard cert
-    // covers them). Custom domains start Pending until DNS-TXT verified.
-    let status = match kind {
-        DomainKind::Subdomain => DomainStatus::Active,
-        DomainKind::Custom => DomainStatus::Pending,
-    };
-    let record = DomainRecord {
-        host: host.clone(),
-        project_id: id.clone(),
-        tenant_id: tenant.id.clone(),
-        site: req.site.clone(),
-        kind,
-        status,
-        token: auth::generate_token(),
-        created_at: auth::timestamp(),
-    };
-
-    match state.store.claim_domain(&record) {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: format!("'{host}' was just claimed by someone else"),
-                }),
-            )
-                .into_response();
-        }
+    let record = match new_domain_record(&state, &host, kind, &id, &tenant.id, req.site.clone()) {
+        Ok(r) => r,
         Err(e) => return internal_error(e),
+    };
+    let status = record.status;
+
+    if kind == DomainKind::Wildcard {
+        if let Some(resp) = claim_wildcard(&state, &record) {
+            return resp;
+        }
+    } else {
+        match state.store.claim_domain(&record) {
+            Ok(true) => {}
+            Ok(false) => return conflict(format!("'{host}' was just claimed by someone else")),
+            Err(e) => return internal_error(e),
+        }
     }
 
     if record.status == DomainStatus::Active {
@@ -4964,40 +5267,173 @@ async fn verify_domain(
     Extension(tenant): Extension<Tenant>,
     Path((id, host)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let host = host.to_lowercase();
-    let mut record = match state.store.get_domain(&host) {
-        Ok(Some(r)) if r.project_id == id && r.tenant_id == tenant.id => r,
+    if !state.verify_limiter.try_take(&tenant.id) {
+        return too_many("too many domain verifications; try again in a few seconds".into());
+    }
+    let host = jkbase_common::routing::normalize_host(&host);
+    let row = match state.store.get_domain(&host) {
+        Ok(Some(r)) => r,
         _ => return project_not_found(&host),
     };
+    // `expected` is the row as read (what activation must still find); `record` is the
+    // claim being proven. They differ only for a proof-wins takeover of ANOTHER tenant's
+    // unverified wildcard claim: the caller proves with their own deterministic records.
+    // Both branches require the caller to own `id` NOW: a claim that outlived its
+    // project's deletion (an add racing the delete) must not activate onto a
+    // same-slug project recreated by someone else.
+    let (expected, record) = if row.project_id == id
+        && row.tenant_id == tenant.id
+        && owns_project(&state, &tenant, &id)
+    {
+        (row.clone(), row)
+    } else if row.kind == DomainKind::Wildcard
+        && row.status == DomainStatus::Pending
+        && owns_project(&state, &tenant, &id)
+    {
+        match new_domain_record(&state, &host, DomainKind::Wildcard, &id, &tenant.id, None) {
+            Ok(mine) => (row, mine),
+            Err(e) => return internal_error(e),
+        }
+    } else {
+        return project_not_found(&host);
+    };
 
-    if record.status == DomainStatus::Active {
+    // Re-arm of an Active domain whose cert isn't serving: a wildcard the cert manager
+    // gave up on (DNS re-checked below first), or a custom domain still without a cert
+    // (e.g. its DNS was pointed late and it's deep in backoff). Only within the tenant's
+    // ACME order budget — each re-arm costs an order on the SHARED platform account.
+    let cert = state.cert_status.as_ref().map(|f| f(&record.host));
+    let rearm = record.status == DomainStatus::Active
+        && match record.kind {
+            DomainKind::Wildcard => matches!(
+                cert,
+                Some(CertState::Failed { .. } | CertState::RenewalFailed { .. })
+            ),
+            DomainKind::Custom => cert.is_some_and(|c| c != CertState::Issued),
+            _ => false,
+        };
+    if record.status == DomainStatus::Active && !rearm {
+        return Json(domain_response(&state, record)).into_response();
+    }
+    if rearm {
+        match state
+            .store
+            .tenant_acme_retry_at(&tenant.id, auth::timestamp(), &state.acme_budget)
+        {
+            Ok(None) => {}
+            Ok(Some(t)) => {
+                return too_many(format!(
+                    "this account's certificate order budget is used up; try again after {} (unix {t})",
+                    fmt_unix(t)
+                ));
+            }
+            Err(e) => return internal_error(e),
+        }
+    }
+
+    if !(rearm && record.kind == DomainKind::Custom) {
+        let proof = record.ownership_name().to_string();
+        let found = match dns_txt_contains(&state, &proof, &record.token).await {
+            Ok(found) => found,
+            Err(e) => return dns_unavailable(&e),
+        };
+        if !found {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "TXT record _jkbase-challenge.{proof} not found or doesn't match (DNS may take a few minutes to propagate)"
+                    ),
+                }),
+            )
+                .into_response();
+        }
+    }
+
+    // A wildcard's cert can only come from DNS-01 through the tenant's CNAME, so demand
+    // it NOW: activating without it would only spin failed ACME orders (and burn the
+    // platform account's rate limits) until the tenant noticed.
+    if record.kind == DomainKind::Wildcard {
+        match (&state.wildcard_support, acme_delegation(&state, &record)) {
+            (WildcardSupport::Unsupported, _) => return wildcard_unsupported(),
+            (WildcardSupport::Dns01 { .. }, Some(d)) => {
+                let delegated = match dns_cname_is(&state, &d.record, &d.cname).await {
+                    Ok(delegated) => delegated,
+                    Err(e) => return dns_unavailable(&e),
+                };
+                if !delegated {
+                    return bad_request(format!(
+                        "CNAME record {} -> {} not found (DNS may take a few minutes to propagate)",
+                        d.record, d.cname
+                    ));
+                }
+            }
+            (WildcardSupport::Dns01 { .. }, None) => {
+                return internal_error("wildcard record has no ACME delegation label");
+            }
+            (WildcardSupport::PlainHttp, _) => {}
+        }
+    }
+
+    if rearm {
+        // DNS is (back) in place → re-arm issuance (resets the backoff; the order itself
+        // is still charged to the tenant's budget by the cert manager).
+        if let Some(req) = &state.cert_request {
+            req(record.host.clone());
+        }
+        info!(project = %id, host = %record.host, "domain re-verified; issuance re-armed");
         return Json(domain_response(&state, record)).into_response();
     }
 
-    if !dns_txt_contains(&record.host, &record.token).await {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!(
-                    "TXT record _jkbase-challenge.{} not found or doesn't match (DNS may take a few minutes to propagate)",
-                    record.host
-                ),
-            }),
-        )
-            .into_response();
+    // Flip to Active and re-check cross-kind ownership in the SAME txn — and only if the
+    // row is still exactly the claim we read (it may have been removed or taken over
+    // while we awaited DNS). A takeover also counts against the caller's wildcard cap.
+    use crate::store::Activation;
+    let takeover = expected.tenant_id != record.tenant_id;
+    let cap = takeover.then_some(state.wildcard_limits.max_per_tenant);
+    match state.store.activate_claim(
+        &expected,
+        &record,
+        &ownership_conflicts(&record.host, record.kind),
+        cap,
+    ) {
+        Ok(Activation::Activated) => {}
+        Ok(Activation::Conflict) => {
+            return conflict(format!(
+                "'{}' overlaps a name another account has verified",
+                record.host
+            ));
+        }
+        Ok(Activation::Stale) => {
+            return conflict(format!(
+                "'{}' changed while it was being verified (removed or re-claimed); add it again",
+                record.host
+            ));
+        }
+        Ok(Activation::OverCap) => {
+            return too_many(format!(
+                "at most {} wildcard domains per account",
+                state.wildcard_limits.max_per_tenant
+            ));
+        }
+        Err(e) => return internal_error(e),
     }
-
+    if takeover {
+        info!(host = %record.host, previous_tenant = %expected.tenant_id,
+            "unverified wildcard claim taken over by DNS proof");
+        let _ = refresh_domain_cache(&state, &expected.project_id);
+    }
+    let mut record = record;
     record.status = DomainStatus::Active;
-    if let Err(e) = state.store.save_domain(&record) {
-        return internal_error(e);
-    }
     activate_domain(&state, &record).await;
     let _ = refresh_domain_cache(&state, &id);
-    // Proactively request a TLS cert for the now-verified custom domain.
-    if let (DomainKind::Custom, Some(req)) = (record.kind, &state.cert_request) {
+    // Proactively request a TLS cert for the now-verified custom/wildcard domain.
+    if let (DomainKind::Custom | DomainKind::Wildcard, Some(req)) =
+        (record.kind, &state.cert_request)
+    {
         req(record.host.clone());
     }
-    info!(project = %id, host = %record.host, "custom domain verified");
+    info!(project = %id, host = %record.host, kind = ?record.kind, "domain verified");
     Json(domain_response(&state, record)).into_response()
 }
 
@@ -5006,14 +5442,11 @@ async fn remove_domain(
     Extension(tenant): Extension<Tenant>,
     Path((id, domain)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let host = domain.to_lowercase();
-    match state.store.get_domain(&host) {
-        Ok(Some(r)) if r.project_id == id && r.tenant_id == tenant.id => {}
-        _ => return project_not_found(&host),
-    }
-
-    if let Err(e) = state.store.remove_domain(&host) {
-        return internal_error(e);
+    let host = jkbase_common::routing::normalize_host(&domain);
+    match state.store.remove_domain_if_owned(&host, &tenant.id, &id) {
+        Ok(true) => {}
+        Ok(false) => return project_not_found(&host),
+        Err(e) => return internal_error(e),
     }
     deactivate_host(&state, &host).await;
     let _ = refresh_domain_cache(&state, &id);
@@ -5045,6 +5478,19 @@ fn bad_request(msg: impl Into<String>) -> axum::response::Response {
         .into_response()
 }
 
+/// A verify whose DNS lookup itself failed: retryable, and NOT a verdict on the tenant's
+/// records. The cause is logged, not echoed.
+fn dns_unavailable(e: &anyhow::Error) -> axum::response::Response {
+    tracing::warn!(error = %e, "domain verification DNS lookup failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "DNS lookup failed; try verifying again shortly".into(),
+        }),
+    )
+        .into_response()
+}
+
 fn internal_error(e: impl std::fmt::Display) -> axum::response::Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -5055,46 +5501,14 @@ fn internal_error(e: impl std::fmt::Display) -> axum::response::Response {
         .into_response()
 }
 
-/// Normalize a user-supplied domain to its routing host-key and classify it.
-/// Accepts a bare label (`docs`), a platform host (`docs.jkbase.app`), or a full
-/// custom domain (`docs.example.com`). Nested platform subdomains and the apex
-/// are rejected (flat scheme only).
-fn derive_host_key(input: &str, platform_domain: &str) -> Result<(String, DomainKind), String> {
-    let d = input.trim().trim_end_matches('.').to_lowercase();
-    if d.is_empty() {
-        return Err("domain cannot be empty".to_string());
-    }
-    let suffix = format!(".{platform_domain}");
-    if d == platform_domain {
-        return Err("cannot attach the platform apex domain".to_string());
-    }
-    if let Some(label) = d.strip_suffix(&suffix) {
-        if label.is_empty() || label.contains('.') {
-            return Err("only flat subdomains (<label>.{platform}) are supported"
-                .replace("{platform}", platform_domain));
-        }
-        return Ok((label.to_string(), DomainKind::Subdomain));
-    }
-    if d.contains('.') {
-        Ok((d, DomainKind::Custom))
-    } else {
-        // bare label → platform subdomain
-        Ok((d, DomainKind::Subdomain))
-    }
-}
-
 /// Insert an Active domain into the in-memory maps. Adds to `routes` only when
 /// the owning project is already running (its primary key is present), so we
 /// never point traffic at a hibernated VM's stale IP.
 async fn activate_domain(state: &AppState, record: &DomainRecord) {
     if let Some(ref dm) = state.domain_map {
-        dm.write().await.insert(
-            record.host.clone(),
-            DomainTarget {
-                project_id: record.project_id.clone(),
-                site: record.site.clone(),
-            },
-        );
+        dm.write()
+            .await
+            .insert(record.host.clone(), record.target());
     }
     if let Some(ref rt) = state.routing_table {
         let mut table = rt.write().await;
@@ -5104,6 +5518,8 @@ async fn activate_domain(state: &AppState, record: &DomainRecord) {
     }
 }
 
+/// Drop a released host from routing AND its cert, so a removed domain (notably a
+/// wildcard, whose cert covers every label under its base) is neither served nor renewed.
 async fn deactivate_host(state: &AppState, host: &str) {
     if let Some(ref dm) = state.domain_map {
         dm.write().await.remove(host);
@@ -5111,10 +5527,22 @@ async fn deactivate_host(state: &AppState, host: &str) {
     if let Some(ref rt) = state.routing_table {
         rt.write().await.remove(host);
     }
+    // Bare labels are platform subdomains (covered by the platform wildcard) — no cert.
+    if host.contains('.')
+        && let Some(ref remove) = state.cert_remove
+    {
+        remove(host.to_string());
+    }
 }
 
 /// Keep `project.domains` as a denormalized cache (used by ProjectResponse) of
-/// the project's claimed hosts. Best-effort.
+/// the project's VERIFIED exact hosts. Best-effort.
+///
+/// Pending and wildcard hosts are deliberately left out: a pre-wildcard binary's boot
+/// grandfathering recreates every cached host that has no DOMAINS row as an ACTIVE
+/// custom domain with no proof — and wildcard rows live in a table it never reads, so
+/// any cached `*.x` (or a pending host whose row was since dropped) would come back
+/// "verified" after a rollback.
 fn refresh_domain_cache(state: &AppState, project_id: &str) -> anyhow::Result<()> {
     if let Some(mut project) = state.store.get_project(project_id)? {
         let mut hosts: Vec<String> = state
@@ -5122,6 +5550,7 @@ fn refresh_domain_cache(state: &AppState, project_id: &str) -> anyhow::Result<()
             .list_domains_for_project(project_id)?
             .into_iter()
             .filter(|d| d.host != project_id) // exclude the primary label
+            .filter(|d| d.status == DomainStatus::Active && d.kind != DomainKind::Wildcard)
             .map(|d| d.host)
             .collect();
         hosts.sort();
@@ -5255,21 +5684,29 @@ async fn reconcile_deploy_domains(
             tracing::warn!(project = %project.id, host = %host, "declared domain is reserved, skipping");
             continue;
         }
-        let status = match kind {
-            DomainKind::Subdomain => DomainStatus::Active,
-            DomainKind::Custom => DomainStatus::Pending,
+        if kind == DomainKind::Wildcard && state.wildcard_support == WildcardSupport::Unsupported {
+            tracing::warn!(project = %project.id, host = %host, "declared wildcard needs an ACME DNS-01 backend, skipping");
+            continue;
+        }
+        if foreign_active_owner(state, &tenant_id, &ownership_conflicts(&host, kind)).is_some() {
+            tracing::warn!(project = %project.id, host = %host, "declared domain overlaps another account's verified name, skipping");
+            continue;
+        }
+        let record = match new_domain_record(state, &host, kind, &project.id, &tenant_id, site) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(project = %project.id, host = %host, error = %e, "failed to build domain record");
+                continue;
+            }
         };
-        let record = DomainRecord {
-            host: host.clone(),
-            project_id: project.id.clone(),
-            tenant_id: tenant_id.clone(),
-            site,
-            kind,
-            status,
-            token: auth::generate_token(),
-            created_at: auth::timestamp(),
+        let status = record.status;
+        // Wildcards go through the capped claim; a refusal is just "not claimed".
+        let claimed = if kind == DomainKind::Wildcard {
+            Ok(claim_wildcard(state, &record).is_none())
+        } else {
+            state.store.claim_domain(&record)
         };
-        match state.store.claim_domain(&record) {
+        match claimed {
             Ok(true) => {
                 if record.status == DomainStatus::Active {
                     activate_domain(state, &record).await;
@@ -5284,41 +5721,81 @@ async fn reconcile_deploy_domains(
     }
 }
 
-/// Look up `_jkbase-challenge.<host>` TXT via DNS-over-HTTPS and check the token
-/// is present. Returns false (retryable) on any network/parse error.
-async fn dns_txt_contains(host: &str, expected: &str) -> bool {
-    let name = format!("_jkbase-challenge.{host}");
-    let url = format!("https://cloudflare-dns.com/dns-query?name={name}&type=TXT");
-    let client = reqwest::Client::new();
-    let resp = match client
-        .get(&url)
+/// Whether `_jkbase-challenge.<name>` carries the `expected` TXT token. `Err` = the
+/// lookup failed (retryable; not evidence either way).
+async fn dns_txt_contains(state: &AppState, name: &str, expected: &str) -> anyhow::Result<bool> {
+    let answers = (state.dns_lookup)(format!("_jkbase-challenge.{name}"), "TXT").await?;
+    Ok(answers.iter().any(|data| {
+        // TXT data is returned quoted, and may be chunked: "abc" "def".
+        let joined: String = data
+            .split_whitespace()
+            .map(|chunk| chunk.trim_matches('"'))
+            .collect();
+        joined == expected || data.trim_matches('"') == expected
+    }))
+}
+
+/// Whether `name` is a CNAME to exactly `target` (case/root-dot insensitive). `Err` =
+/// the lookup failed.
+async fn dns_cname_is(state: &AppState, name: &str, target: &str) -> anyhow::Result<bool> {
+    let want = jkbase_common::routing::normalize_host(target);
+    Ok((state.dns_lookup)(name.to_string(), "CNAME")
+        .await?
+        .iter()
+        .any(|data| jkbase_common::routing::normalize_host(data.trim()) == want))
+}
+
+/// One DoH round trip, connect included. The cert manager awaits lookups inside its
+/// serial reconcile pass (the one that also renews the platform certs), so a stalled
+/// resolver must fail fast rather than wedge it.
+const DOH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default [`DnsLookup`]: DNS-over-HTTPS (Cloudflare JSON API) over one shared,
+/// timeout-bounded client. `Ok` only for NOERROR / NXDOMAIN; transport, HTTP, parse and
+/// resolver errors (SERVFAIL, REFUSED, …) are `Err`. `name` is always a validated LDH
+/// name built server-side.
+pub async fn doh_lookup(name: String, rtype: &'static str) -> anyhow::Result<Vec<String>> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    // Only answers of the asked type: a TXT query through a CNAME also returns the
+    // CNAME hop, whose data must not be read as a TXT token (and vice versa).
+    let want = match rtype {
+        "TXT" => 16,
+        "CNAME" => 5,
+        "CAA" => 257,
+        _ => anyhow::bail!("unsupported DNS record type {rtype}"),
+    };
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(DOH_TIMEOUT)
+            .connect_timeout(DOH_TIMEOUT)
+            .build()
+            .unwrap_or_default()
+    });
+    let json: serde_json::Value = client
+        .get("https://cloudflare-dns.com/dns-query")
+        .query(&[("name", name.as_str()), ("type", rtype)])
         .header("accept", "application/dns-json")
         .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
-    let json: serde_json::Value = match resp.json().await {
-        Ok(j) => j,
-        Err(_) => return false,
-    };
-    let Some(answers) = json["Answer"].as_array() else {
-        return false;
-    };
-    for a in answers {
-        if let Some(data) = a["data"].as_str() {
-            // TXT data is returned quoted, and may be chunked: "abc" "def".
-            let joined: String = data
-                .split_whitespace()
-                .map(|chunk| chunk.trim_matches('"'))
-                .collect();
-            if joined == expected || data.trim_matches('"') == expected {
-                return true;
-            }
-        }
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    // RFC 1035 RCODE: 0 NOERROR, 3 NXDOMAIN are answers; anything else (2 SERVFAIL
+    // included — e.g. the tenant's nameservers are down) is a failed lookup.
+    match json["Status"].as_u64() {
+        Some(0 | 3) => {}
+        other => anyhow::bail!("DoH lookup of {name} {rtype} failed (rcode {other:?})"),
     }
-    false
+    Ok(json["Answer"]
+        .as_array()
+        .map(|answers| {
+            answers
+                .iter()
+                .filter(|a| a["type"].as_u64() == Some(want))
+                .filter_map(|a| a["data"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 fn to_response(p: &Project) -> ProjectResponse {

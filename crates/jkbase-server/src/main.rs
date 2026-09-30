@@ -117,6 +117,43 @@ struct Args {
     #[arg(long, env = "RFC2136_TSIG_ALGORITHM", default_value = "hmac-sha256")]
     rfc2136_tsig_algorithm: String,
 
+    /// Zone under --domain holding the DNS-01 TXT answers for tenant wildcard domains
+    /// (their `_acme-challenge.<base>` CNAMEs to `<random>.<this zone>`). Must be
+    /// writable by the ACME DNS-01 backend. Defaults to `_acme-delegation.<domain>`.
+    #[arg(long, env = "ACME_DELEGATION_ZONE")]
+    acme_delegation_zone: Option<String>,
+
+    /// Max wildcard domains (any status) per tenant. Each is an ACME order stream on the
+    /// shared platform account, so keep this small.
+    #[arg(long, env = "MAX_WILDCARD_DOMAINS_PER_TENANT", default_value = "20")]
+    max_wildcard_domains_per_tenant: usize,
+
+    /// Global cap on TENANT-initiated ACME orders (custom + wildcard certs, all tenants)
+    /// per 3 hours. Keep it well under the CA's per-account order limit (Let's Encrypt:
+    /// 300 / 3 h): the remainder is reserved for the platform's own certs.
+    #[arg(long, env = "TENANT_ACME_ORDERS_PER_3H", default_value = "60")]
+    tenant_acme_orders_per_3h: u32,
+
+    /// Per-tenant ACME order budget per 24 hours (persisted; survives domain removal,
+    /// re-add and restart). Over it, the tenant's certs report `tls: failed` with a
+    /// retry time.
+    #[arg(long, env = "TENANT_ACME_ORDERS_PER_DAY", default_value = "20")]
+    tenant_acme_orders_per_day: usize,
+
+    /// Max share (percent) of `TENANT_ACME_ORDERS_PER_3H` any ONE tenant may use per 3 h,
+    /// so a single tenant can't starve everyone else's issuance.
+    #[arg(long, env = "TENANT_ACME_MAX_SHARE_PERCENT", default_value = "25")]
+    tenant_acme_max_share_percent: u32,
+
+    /// Percent of `TENANT_ACME_ORDERS_PER_3H` reserved for RENEWALS of certs already
+    /// issued, so new-cert churn can't block renewals.
+    #[arg(
+        long,
+        env = "TENANT_ACME_RENEWAL_RESERVE_PERCENT",
+        default_value = "33"
+    )]
+    tenant_acme_renewal_reserve_percent: u32,
+
     /// Idle timeout in seconds before VMs hibernate (0 = disable)
     #[arg(long, default_value = "300")]
     idle_timeout_secs: u64,
@@ -124,6 +161,15 @@ struct Args {
     /// Use the Let's Encrypt staging environment (untrusted certs; avoids prod rate limits)
     #[arg(long)]
     acme_staging: bool,
+
+    /// ACME directory URL to use instead of Let's Encrypt (a private CA such as step-ca, or
+    /// Pebble for tests). Overrides --acme-staging.
+    #[arg(long, env = "ACME_DIRECTORY_URL")]
+    acme_directory_url: Option<String>,
+
+    /// PEM root(s) to trust for the ACME directory's own HTTPS, when it isn't publicly trusted.
+    #[arg(long, env = "ACME_CA_ROOT")]
+    acme_ca_root: Option<std::path::PathBuf>,
 
     /// Bind address for the build egress proxy (host-side default-deny forward
     /// proxy with allowlist + public-IP pinning). Disabled when unset. Build VMs
@@ -1573,6 +1619,35 @@ async fn async_main() -> Result<()> {
     // each tick and surfaces drift (placement applies it, next card). Inert single-node.
     tokio::spawn(reconcile_loop(platform.clone(), is_leader_for_reconcile));
 
+    // Tenant wildcard certs are DNS-01 through CNAME delegation into this zone. It must sit
+    // under the platform domain: that's the zone the DNS-01 backend can write, and the
+    // tenant-facing CNAME target must be a platform-owned name.
+    let acme_delegation_zone = args
+        .acme_delegation_zone
+        .clone()
+        .map(|z| z.trim().trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| jkbase_proxy::tls::default_acme_delegation_zone(&args.domain));
+    if !acme_delegation_zone.ends_with(&format!(".{}", args.domain)) {
+        anyhow::bail!(
+            "ACME_DELEGATION_ZONE '{acme_delegation_zone}' must be a zone under --domain ({})",
+            args.domain
+        );
+    }
+
+    if args.tenant_acme_orders_per_day == 0 {
+        tracing::warn!("TENANT_ACME_ORDERS_PER_DAY=0: tenant certificates will never be ordered");
+    }
+    let acme_budget = jkbase_control::store::AcmeOrderBudget {
+        max_orders: args.tenant_acme_orders_per_day,
+        window_secs: 24 * 60 * 60,
+        // One tenant's fair share of the global per-3h bucket (at least one order).
+        share_max: (args.tenant_acme_orders_per_3h as usize
+            * args.tenant_acme_max_share_percent as usize)
+            .div_ceil(100)
+            .max(1),
+        share_window_secs: 3 * 60 * 60,
+    };
+
     // Build the TLS cert manager up front (wildcard via DNS-01 + on-demand
     // per-custom-domain certs via HTTP-01) so we can wire issuance into AppState.
     let cert_manager: Option<Arc<CertManager>> = if args.tls {
@@ -1602,6 +1677,17 @@ async fn async_main() -> Result<()> {
                     .rfc2136_zone
                     .clone()
                     .unwrap_or_else(|| args.domain.clone());
+                // The delegation TXTs are written through THIS zone; one outside it would
+                // let tenants verify (and spend their order budget) on wildcards whose
+                // every order then fails at the DNS UPDATE.
+                let rfc_zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+                if acme_delegation_zone != rfc_zone
+                    && !acme_delegation_zone.ends_with(&format!(".{rfc_zone}"))
+                {
+                    anyhow::bail!(
+                        "ACME_DELEGATION_ZONE '{acme_delegation_zone}' must be inside RFC2136_ZONE '{rfc_zone}'"
+                    );
+                }
                 let key_name = args.rfc2136_tsig_name.clone().ok_or_else(|| {
                     anyhow::anyhow!("RFC2136_TSIG_NAME (--rfc2136-tsig-name) required when ACME_DNS_PROVIDER=rfc2136")
                 })?;
@@ -1625,6 +1711,16 @@ async fn async_main() -> Result<()> {
             cert_dir: data_dir.join("certs"),
             dns_provider,
             acme_email,
+            acme_directory: args.acme_directory_url.clone(),
+            acme_ca_root: args.acme_ca_root.clone(),
+            acme_delegation_zone: acme_delegation_zone.clone(),
+            // The same resolver control's `verify` checks the CNAME with.
+            dns_lookup: Arc::new(|name: String, rtype: &'static str| {
+                Box::pin(jkbase_control::api::doh_lookup(name, rtype))
+            }),
+            order_gate: Some(tenant_order_gate(store.clone(), acme_budget.clone())),
+            tenant_orders_per_3h: args.tenant_acme_orders_per_3h,
+            tenant_renewal_reserve_percent: args.tenant_acme_renewal_reserve_percent,
         };
         Some(CertManager::new(tls_config, domain_map.clone(), args.acme_staging).await?)
     } else {
@@ -1640,14 +1736,35 @@ async fn async_main() -> Result<()> {
     state.platform_domain = args.domain.clone();
     state.admin_token = args.admin_token.clone();
     if let Some(ref cm) = cert_manager {
+        // An explicit request (verify / re-verify) re-arms a backed-off or abandoned
+        // wildcard; the reconcile loop honours the backoff.
         let cm_req = cm.clone();
-        state.cert_request = Some(Arc::new(move |host: String| {
-            let cm = cm_req.clone();
-            tokio::spawn(async move { cm.ensure_cert(&host).await });
-        }));
+        state.cert_request = Some(Arc::new(move |host: String| cm_req.request_cert(host)));
         let cm_status = cm.clone();
-        state.cert_status = Some(Arc::new(move |host: &str| cm_status.has_cert(host)));
+        state.cert_status = Some(Arc::new(move |host: &str| {
+            use jkbase_control::api::CertState;
+            use jkbase_proxy::tls::HostCertState;
+            match cm_status.cert_state(host) {
+                HostCertState::Missing => CertState::Missing,
+                HostCertState::Issued => CertState::Issued,
+                HostCertState::Failed { retry_at } => CertState::Failed { retry_at },
+                HostCertState::RenewalFailed { retry_at } => CertState::RenewalFailed { retry_at },
+            }
+        }));
+        let cm_remove = cm.clone();
+        state.cert_remove = Some(Arc::new(move |host: String| cm_remove.forget_cert(&host)));
     }
+    state.wildcard_limits.max_per_tenant = args.max_wildcard_domains_per_tenant;
+    state.acme_budget = acme_budget.clone();
+    // Every TLS config carries a DNS-01 backend (it's how the platform wildcard issues),
+    // so wildcards are always issuable with TLS on; without TLS they route on plain HTTP.
+    state.wildcard_support = if cert_manager.is_some() {
+        jkbase_control::api::WildcardSupport::Dns01 {
+            zone: acme_delegation_zone.clone(),
+        }
+    } else {
+        jkbase_control::api::WildcardSupport::PlainHttp
+    };
 
     let platform_for_cb = platform.clone();
     let routing_for_cb = routing_table.clone();
@@ -1997,6 +2114,11 @@ async fn async_main() -> Result<()> {
     reconcile_orphans_on_boot(&platform).await;
     reconcile_baselayers_on_boot(&platform).await;
     backfill_domains(&platform, &domain_map).await;
+    // Only now is the domain map authoritative: stop serving cached certs for hosts
+    // that are no longer Active domains (e.g. rows the boot purge just removed).
+    if let Some(ref cm) = cert_manager {
+        cm.unload_unmapped_certs().await;
+    }
 
     let proxy_tok = proxy_shutdown.clone();
     let proxy_join = tokio::spawn(async move {
@@ -2903,6 +3025,13 @@ fn project_can_wake(data_dir: &Path, store: &Store, project_id: &str) -> bool {
 async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &DomainMap) {
     let active = {
         let mut plat = platform.lock().await;
+        // Before anything reads the registry: drop rows a pre-wildcard binary may have
+        // left behind across a rollback (proof-less `*` rows, orphaned wildcards).
+        match plat.store.purge_invalid_domain_rows() {
+            Ok(0) => {}
+            Ok(n) => warn!(removed = n, "purged invalid domain rows at boot"),
+            Err(e) => tracing::error!(error = %e, "domain-row purge failed"),
+        }
         let projects = match plat.store.list_projects() {
             Ok(p) => p,
             Err(e) => {
@@ -2988,13 +3117,7 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
     let mut count = 0usize;
     for d in active {
         if d.status == DomainStatus::Active {
-            map.insert(
-                d.host,
-                DomainTarget {
-                    project_id: d.project_id,
-                    site: d.site,
-                },
-            );
+            map.insert(d.host.clone(), d.target());
             count += 1;
         }
     }
@@ -3004,10 +3127,41 @@ async fn backfill_domains(platform: &Arc<Mutex<PlatformState>>, domain_map: &Dom
     );
 }
 
+/// The cert manager's per-tenant order gate: charge each tenant cert order (by domain-map
+/// key) to the owning tenant's persisted budget. Unknown host, or a store error, denies
+/// (fail closed; a store error retries shortly).
+fn tenant_order_gate(
+    store: Store,
+    budget: jkbase_control::store::AcmeOrderBudget,
+) -> jkbase_proxy::tls::OrderGate {
+    use jkbase_proxy::tls::OrderPermit;
+    Arc::new(move |host: &str| {
+        let now = jkbase_control::auth::timestamp();
+        let Ok(Some(rec)) = store.get_domain(host) else {
+            return OrderPermit::Denied { retry_at: None };
+        };
+        match store.charge_tenant_acme_order(&rec.tenant_id, now, &budget) {
+            Ok(None) => OrderPermit::Allowed,
+            Ok(Some(t)) => OrderPermit::Denied { retry_at: Some(t) },
+            Err(e) => {
+                warn!(host = %host, error = %e, "ACME order budget check failed; denying");
+                OrderPermit::Denied {
+                    retry_at: Some(now + 300),
+                }
+            }
+        }
+    })
+}
+
 /// Ensure an Active DomainRecord exists for `host` (idempotent). Used by backfill
 /// to migrate pre-registry data without forcing re-verification.
 fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &str) {
     if matches!(store.get_domain(host), Ok(Some(_))) {
+        return;
+    }
+    // Wildcards postdate the registry, so they are never legacy: a `*.` entry left in
+    // a stale `project.domains` cache must NOT come back Active without DNS proof.
+    if host.contains('*') {
         return;
     }
     let kind = if host.contains('.') {
@@ -3024,6 +3178,7 @@ fn grandfather_domain(store: &Store, host: &str, project_id: &str, tenant_id: &s
         status: DomainStatus::Active,
         token: String::new(),
         created_at: 0,
+        acme_delegation: None,
     };
     let _ = store.claim_domain(&record);
 }
@@ -3858,16 +4013,11 @@ async fn register_active_routes(
         .or_insert_with(|| DomainTarget {
             project_id: project_id.to_string(),
             site: None,
+            acme_delegation: None,
         });
     for d in active_domains {
         table.insert(d.host.clone(), ip.to_string());
-        map.insert(
-            d.host.clone(),
-            DomainTarget {
-                project_id: d.project_id.clone(),
-                site: d.site.clone(),
-            },
-        );
+        map.insert(d.host.clone(), d.target());
     }
 }
 

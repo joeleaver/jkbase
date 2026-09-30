@@ -2976,8 +2976,17 @@ body {
     state.error = null;
     var body = { domain: domain };
     if (site) body.site = site;
-    api("POST", "/projects/" + projectId + "/domains", body).then(function() {
+    api("POST", "/projects/" + projectId + "/domains", body).then(function(d) {
       state.showAddDomain = false;
+      // 202: another account holds an unverified claim. Nothing was saved for us, so the
+      // list won't show it — surface our records here; proving DNS first wins it.
+      if (d && d.note && d.verification) {
+        var msg = d.note + " TXT " + d.verification.record + " = " + d.verification.value;
+        if (d.acme_challenge) {
+          msg += "; CNAME " + d.acme_challenge.record + " -> " + d.acme_challenge.cname;
+        }
+        state.error = msg + ". Then run: jkbase domain verify '" + d.host + "'";
+      }
       loadDomains(projectId);
     }).catch(function(e) {
       state.error = e.message;
@@ -3777,8 +3786,9 @@ body {
 
   function renderDomainItem(project, d) {
     var isCustom = d.kind === "custom";
+    var isWildcard = d.kind === "wildcard";
     var href = isCustom ? "https://" + d.host : "https://" + d.host + ".jkbase.app";
-    var label = isCustom ? d.host : d.host + ".jkbase.app";
+    var label = (isCustom || isWildcard) ? d.host : d.host + ".jkbase.app";
     var busy = state.domainBusy === d.host;
 
     var tlsChip = null;
@@ -3786,14 +3796,20 @@ body {
       tlsChip = h("span", { className: "badge badge-active" }, "HTTPS");
     } else if (d.tls === "provisioning") {
       tlsChip = h("span", { className: "badge badge-pending" }, "HTTPS provisioning");
+    } else if (d.tls === "failed" || d.tls === "renewal-failed") {
+      tlsChip = h("span", { className: "badge badge-pending" },
+        d.tls === "failed" ? "HTTPS failed" : "HTTPS renewal failed");
     }
 
     var head = h("div", { className: "domain-head" },
-      h("a", { className: "domain-host", href: href, target: "_blank", rel: "noopener" }, label),
+      // A wildcard names no single host, so there's nothing to link to.
+      isWildcard
+        ? h("span", { className: "domain-host plain" }, label)
+        : h("a", { className: "domain-host", href: href, target: "_blank", rel: "noopener" }, label),
       h("span", { className: "badge" }, d.kind),
       d.status === "active"
         ? h("span", { className: "badge badge-active" }, "active")
-        : h("span", { className: "badge badge-pending" }, "pending verification"),
+        : h("span", { className: "badge badge-pending" }, d.verification ? "pending verification" : "pending"),
       tlsChip,
       d.site ? h("span", { className: "domain-site" }, "site ", h("code", null, d.site)) : null,
       h("span", { className: "domain-spacer" }),
@@ -3819,6 +3835,7 @@ body {
         dnsField("Type", "TXT", false),
         dnsField("Name", d.verification.record, true),
         dnsField("Value", d.verification.value, true),
+        d.acme_challenge ? renderAcmeDelegation(d) : null,
         h("div", { className: "dns-challenge-actions" },
           h("button", {
             className: "btn btn-primary btn-sm",
@@ -3828,6 +3845,27 @@ body {
           err
         )
       );
+    } else if ((d.tls === "failed" || d.tls === "renewal-failed") && isWildcard) {
+      var ferr = state.domainError && state.domainError.host === d.host
+        ? h("span", { className: "dns-error" }, state.domainError.message)
+        : null;
+      challenge = h("div", { className: "domain-hint" },
+        d.tls_error || "Certificate issuance kept failing, so it was paused. Check the _acme-challenge CNAME below, then re-verify to retry.",
+        d.acme_challenge ? renderAcmeDelegation(d) : null,
+        h("div", { className: "dns-challenge-actions" },
+          h("button", {
+            className: "btn btn-primary btn-sm",
+            disabled: busy ? "disabled" : null,
+            onClick: function() { verifyDomain(project.id, d.host); },
+          }, busy ? "Verifying..." : "Re-verify"),
+          ferr
+        )
+      );
+    } else if (d.tls === "provisioning" && isWildcard) {
+      challenge = h("div", { className: "domain-hint" },
+        "Verified. Point " + d.host + " (A record) at the platform and keep the _acme-challenge CNAME below — the wildcard HTTPS certificate is issued automatically.",
+        d.acme_challenge ? renderAcmeDelegation(d) : null
+      );
     } else if (d.tls === "provisioning") {
       challenge = h("div", { className: "domain-hint" },
         "Point this domain's A record at the platform — an HTTPS certificate is issued automatically (usually within a few minutes)."
@@ -3835,6 +3873,18 @@ body {
     }
 
     return h("div", { className: "domain-item" }, head, challenge);
+  }
+
+  // Wildcards: the CNAME that lets the platform answer ACME DNS-01 for *.<base>.
+  function renderAcmeDelegation(d) {
+    return h("div", null,
+      h("div", { className: "dns-challenge-desc" },
+        "Also add this CNAME (keep it — certificate renewals use it). A wildcard covers exactly one label; exact domains take precedence."
+      ),
+      dnsField("Type", "CNAME", false),
+      dnsField("Name", d.acme_challenge.record, true),
+      dnsField("Target", d.acme_challenge.cname, true)
+    );
   }
 
   function renderAddDomainForm(project) {
@@ -3852,7 +3902,7 @@ body {
       h("input", {
         className: "input input-sm",
         type: "text",
-        placeholder: "docs   or   docs.example.com",
+        placeholder: "docs   or   docs.example.com   or   *.sub.example.com",
         required: "required",
         autocomplete: "off",
         style: "min-width: 240px; flex: 1",
@@ -3905,7 +3955,7 @@ body {
             }, "Add domain")
           ),
           h("div", { className: "section-desc", style: "margin-bottom: 4px" },
-            "Subdomains on jkbase.app are live immediately. Custom domains need DNS-TXT verification."
+            "Subdomains on jkbase.app are live immediately. Custom and wildcard (*.sub.example.com) domains need DNS-TXT verification."
           ),
           state.showAddDomain ? renderAddDomainForm(project) : null,
           primary,

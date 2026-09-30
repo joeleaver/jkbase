@@ -6118,6 +6118,7 @@ console.log("listening on " + port);
             DomainTarget {
                 project_id: "wsecho".to_string(),
                 site: None,
+                acme_delegation: None,
             },
         );
         let routes = new_routing_table();
