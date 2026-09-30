@@ -810,6 +810,11 @@ pub enum DomainStatus {
     Pending,
     /// Verified/owned and eligible for routing.
     Active,
+    /// A status written by a NEWER binary. Decodes instead of failing (so a rollback
+    /// keeps the row), is never routed (only `Active` is), and is never overwritten by
+    /// verification (which only flips `Pending`).
+    #[serde(other)]
+    Unknown,
 }
 
 /// A claimed hostname. The registry of these is the single source of truth for
@@ -2190,8 +2195,10 @@ impl Store {
     /// a pre-wildcard binary's grandfathering after a rollback, which recreates cached
     /// hosts as Active with NO DNS proof; (2) any wildcard row whose project is gone or
     /// changed owner — a pre-wildcard binary deleting a project never sees this table.
-    /// Also strips `*` hosts from every `project.domains` cache (see
-    /// `refresh_domain_cache`). Returns how many domain rows were removed.
+    /// A wildcard row this binary can't DECODE is left alone (warned): it may be a newer
+    /// binary's data surviving a rollback, and deleting it would lose it for good. Also
+    /// strips `*` hosts from every `project.domains` cache (see `refresh_domain_cache`).
+    /// Returns how many domain rows were removed.
     pub fn purge_invalid_domain_rows(&self) -> Result<usize> {
         let owners: std::collections::HashMap<String, Option<String>> = self
             .list_projects()?
@@ -2215,10 +2222,11 @@ impl Store {
             let mut doomed_wild = Vec::new();
             for entry in wild.iter()? {
                 let (k, v) = entry?;
-                let keep = serde_json::from_slice::<DomainRecord>(v.value())
-                    .is_ok_and(|r| owners.get(&r.project_id) == Some(&Some(r.tenant_id.clone())));
-                if !keep {
-                    doomed_wild.push(k.value().to_string());
+                match serde_json::from_slice::<DomainRecord>(v.value()) {
+                    Ok(r) if owners.get(&r.project_id) == Some(&Some(r.tenant_id.clone())) => {}
+                    Ok(_) => doomed_wild.push(k.value().to_string()),
+                    Err(e) => tracing::warn!(host = %k.value(), error = %e,
+                        "keeping undecodable wildcard row (not purged)"),
                 }
             }
             for k in &doomed_wild {
@@ -4977,6 +4985,52 @@ mod tests {
             (row.tenant_id.as_str(), row.status),
             ("t2", DomainStatus::Pending)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review a1: a `DomainStatus` from a newer binary must decode (never route, never be
+    /// activated), and the boot purge must KEEP rows it can't decode, not delete them.
+    #[test]
+    fn future_statuses_decode_and_undecodable_rows_survive_the_purge() {
+        let (store, path) = tmp_db();
+        project(&store, "a", "t1");
+        let raw = |key: &str, json: &[u8]| {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(WILDCARD_DOMAINS).unwrap();
+                t.insert(key, json).unwrap();
+            }
+            txn.commit().unwrap();
+        };
+        raw(
+            "*.future.example.com",
+            br#"{"host":"*.future.example.com","project_id":"a","tenant_id":"t1","site":null,"kind":"wildcard","status":"suspended","token":"t","created_at":0}"#,
+        );
+        raw("*.garbled.example.com", b"{not json");
+        let r = store.get_domain("*.future.example.com").unwrap().unwrap();
+        assert_eq!(r.status, DomainStatus::Unknown);
+        // Never activatable (only Pending flips) …
+        assert_eq!(
+            store.activate_domain_exclusive(&r, &[]).unwrap(),
+            Activation::Stale
+        );
+        // … never routed (boot only maps Active) …
+        assert!(
+            store
+                .list_all_domains()
+                .unwrap()
+                .iter()
+                .all(|d| d.status != DomainStatus::Active)
+        );
+        // … and the purge keeps both rows: its owner still exists, and an undecodable
+        // row may be a newer binary's data surviving a rollback.
+        assert_eq!(store.purge_invalid_domain_rows().unwrap(), 0);
+        let txn = store.db.begin_read().unwrap();
+        let t = txn.open_table(WILDCARD_DOMAINS).unwrap();
+        assert!(t.get("*.garbled.example.com").unwrap().is_some());
+        assert!(t.get("*.future.example.com").unwrap().is_some());
+        drop(t);
+        drop(txn);
         let _ = std::fs::remove_file(&path);
     }
 
