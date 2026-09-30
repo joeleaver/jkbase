@@ -51,6 +51,15 @@ use tracing::{info, warn};
 /// Renew a cert once it's within this window of (assumed 90-day) expiry. We track
 /// age by file mtime rather than parsing the cert — simple and good enough.
 const RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 60 * 60); // 60 days
+/// The same assumed lifetime: past it, a loaded cert no longer serves validly.
+const ASSUMED_CERT_LIFETIME: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+/// Deadline for a tenant order's WHOLE pre-check (every lookup, the CAA climb included):
+/// per-lookup timeouts alone would let a deep name whose nameservers answer slowly and
+/// empty hold a reconcile slot for minutes. Expiry is transient (no strike).
+const PRECHECK_DEADLINE: Duration = Duration::from_secs(15);
+/// Custom-host orders run at most this many at a time per tick, so one tenant's slow
+/// hosts can't serialize every other tenant's issuance and renewal behind them.
+const CUSTOM_ORDER_CONCURRENCY: usize = 8;
 /// How often the reconcile loop runs (wildcard renewal + custom issuance/retry).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Tenant certs (custom + wildcard) back off exponentially from here (doubling per
@@ -625,6 +634,15 @@ impl CertManager {
         if !self.with_health(|h| h.begin(host, unix_now())) {
             return false;
         }
+        let precheck = async {
+            tokio::time::timeout(PRECHECK_DEADLINE, precheck)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Precheck::Transient(anyhow::anyhow!(
+                        "pre-order DNS checks exceeded {PRECHECK_DEADLINE:?}"
+                    )))
+                })
+        };
         match precheck.await {
             Ok(()) => {}
             Err(Precheck::Tenant(e)) => {
@@ -819,6 +837,17 @@ impl CertManager {
         }
     }
 
+    /// A cert for `host` is loaded and still inside its (assumed) lifetime.
+    fn host_cert_live(&self, host: &str) -> bool {
+        self.has_cert(host)
+            && self
+                .host_cert_dir(host)
+                .and_then(|d| std::fs::metadata(d.join("fullchain.pem")).ok())
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < ASSUMED_CERT_LIFETIME)
+    }
+
     fn host_cert_fresh(&self, host: &str) -> bool {
         if !self.resolver.hosts.read().unwrap().contains_key(host) {
             return false;
@@ -917,10 +946,12 @@ impl CertManager {
             }
             Ok(())
         };
-        // A cert that is already serving never gives up for good: its renewals only back
-        // off (capped, budget-metered), so a platform-side outage (DNS provider, CA, DoH)
-        // can't strand every tenant wildcard until each owner notices and re-verifies.
-        let first_issue = !self.has_cert(host);
+        // A cert that is still VALIDLY serving never gives up for good: its renewals only
+        // back off (capped, budget-metered), so a platform-side outage (DNS provider, CA,
+        // DoH) can't strand every tenant wildcard until each owner re-verifies. Once it has
+        // expired, failures are strikes again — otherwise an abandoned or deliberately
+        // unvalidatable wildcard would order (from the renewal reserve) forever.
+        let first_issue = !self.host_cert_live(host);
         if !self.gate_tenant_order(host, prechecks, first_issue).await {
             return;
         }
@@ -1185,7 +1216,7 @@ impl CertManager {
                         .partition(|h| is_wildcard_key(h))
                 };
                 // A bounded batch of DUE wildcard orders runs concurrently alongside the
-                // serial custom-domain pass; the rest wait for a later tick.
+                // custom-domain pass (itself bounded-concurrent); the rest wait for a later tick.
                 let due: Vec<String> = {
                     let now = unix_now();
                     let book = mgr.health.lock().unwrap();
@@ -1200,9 +1231,15 @@ impl CertManager {
                     let m = mgr.clone();
                     orders.spawn(async move { m.ensure_cert(&host).await });
                 }
+                let mut custom = tokio::task::JoinSet::new();
                 for host in custom_hosts {
-                    mgr.ensure_cert(&host).await;
+                    if custom.len() >= CUSTOM_ORDER_CONCURRENCY {
+                        custom.join_next().await;
+                    }
+                    let m = mgr.clone();
+                    custom.spawn(async move { m.ensure_cert(&host).await });
                 }
+                while custom.join_next().await.is_some() {}
                 while orders.join_next().await.is_some() {}
                 mgr.flush_health().await;
             }

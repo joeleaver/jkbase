@@ -70,14 +70,14 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
      24 h cap. Only *strikes* count toward give-up: a wildcard with **no cert yet** stops after 8
      consecutive strikes (~10.5 h), where a strike is a pre-check DNS positively answered wrong
      (CNAME gone/changed, CAA forbids) or a failed order. A failed or timed-out lookup is never a
-     strike, and a wildcard whose cert is already serving never gives up: its renewals only back
-     off, so a DNS-provider, CA or resolver outage can't strand every tenant's cert until each
+     strike, and a wildcard whose cert is still validly serving (inside its 90-day lifetime)
+     never gives up: its renewals only back off, so a DNS-provider, CA or resolver outage can't strand every tenant's cert until each
      owner re-verifies. A custom domain keeps retrying at the cap. This state persists in
      `certs/issue-health.json` (flushed once per reconcile tick and after each explicit request,
      serialized), so a restart re-arms nothing;
   2. free DNS pre-checks through the same DoH resolver `verify` uses (one shared client, 5 s
      timeout; each lookup is also bounded at 10 s in the cert manager, so a stalled resolver can't
-     wedge the serial pass that also renews the platform certs). `Ok` is only a NOERROR/NXDOMAIN
+     wedge the pass that also renews the platform certs). `Ok` is only a NOERROR/NXDOMAIN
      answer; SERVFAIL, transport and parse errors are failed lookups. For a wildcard, that
      `_acme-challenge.<base>` still CNAMEs to its delegated name; for both kinds, an RFC 8659 CAA
      check (tree-climbing, `issuewild` for wildcards) that Let's Encrypt may issue. A CAA
@@ -98,7 +98,9 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
      API reports `tls: failed` with `tls_error` naming that time.
   Re-verify re-arms a stopped cert (resets its backoff and give-up) only when the tenant's budget
   has room; otherwise it answers 429 with the retry time. The reconcile loop runs at most 4 due
-  wildcard orders per tick, concurrently, alongside the serial custom-domain pass.
+  wildcard orders per tick, concurrently, alongside the custom-domain pass (at most 8 hosts at a
+  time). Each order's whole pre-check has a 15 s deadline (expiry is transient), so a deep name
+  whose nameservers answer slowly can hold one slot briefly, never the pass.
 - **Verify.** Bounded per tenant (burst 20, then one per 6 s; 429 over), since each call spends
   outbound DNS on the tenant's schedule. A failed lookup answers 503 (retry) and changes nothing —
   never "record not found". Both verify paths require the caller to own the project *now*, so a
