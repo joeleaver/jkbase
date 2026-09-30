@@ -15,9 +15,9 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
   (`wildcard_domains`), which a pre-wildcard binary never opens (see Rollback). Exact keys never
   contain `*`, so the two tables' key spaces are disjoint and uniqueness needs no cross-table check.
   `DomainRecord` gains `acme_delegation: Option<String>` (`#[serde(default)]`, skipped when `None`), so
-  pre-change rows load unchanged and exact rows re-serialize byte-identically. `DomainKind` gains
-  `#[serde(other)] Unknown`, so a kind added by a *future* binary decodes (and is not routed) instead
-  of failing the listing after a rollback.
+  pre-change rows load unchanged and exact rows re-serialize byte-identically. `DomainKind` and
+  `DomainStatus` gain `#[serde(other)] Unknown`, so a kind or status added by a *future* binary
+  decodes (never routed, never activated) instead of failing the listing after a rollback.
 - **Names** (`jkbase-control/src/domain_name.rs`). `*.` must be the entire leftmost label; the base
   must be an LDH name with ≥2 labels and an alphabetic TLD, not on/under the platform domain, not an
   ancestor of it, not a two-label `<generic-SLD>.<ccTLD>` (`co.uk`, `com.au`, …) and not a listed
@@ -28,13 +28,20 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
   the DNS-TXT proof is the boundary.
 - **Ownership.** Same mechanism as custom domains: TXT `_jkbase-challenge.<base>` = the record's
   token. On a TLS server `verify` *also* requires `_acme-challenge.<base>` to already CNAME to the
-  record's delegation target.
+  record's delegation target. A wildcard's token and delegation label are the tenant's **claim
+  proof**: HMAC-SHA256 under a platform secret (`platform_secrets` table, minted once, never leaves
+  the store) over (tenant, host). They're deterministic per tenant and name, so a re-claim never
+  changes the records a tenant published, and unguessable across tenants. Rows written before this
+  keep their stored random values; no migration.
 - **Claims** (`Store::claim_wildcard`, one write txn). Per tenant: at most 5 pending wildcards and
-  `MAX_WILDCARD_DOMAINS_PER_TENANT` (default 20) in total; each wildcard is an order stream on the shared
-  ACME account. Another tenant's **pending** claim older than 15 minutes is *replaced* by a fresh
-  claim; whoever proves DNS first wins. The 15-minute grace means a bot re-claiming in a loop can't
-  bump an owner who is mid-DNS-setup, while a squat can't lock the owner out for longer than that.
-  Active rows are never replaceable. (Exact hosts keep today's first-come behaviour; see Open.)
+  `MAX_WILDCARD_DOMAINS_PER_TENANT` (default 20) in total. **Proof wins:** adding a name another tenant
+  holds as a *pending* claim answers 202 with the caller's own records (nothing is stored), and
+  `verify` succeeds over that foreign pending row as soon as the caller's proof is in DNS
+  (`Store::activate_claim` swaps the row in its txn, if it's still the pending row that was read,
+  and within the caller's cap). A pending claim older than 15 minutes can also be replaced outright,
+  so the owner can see it in their list. A squatter re-taking the row gains nothing: the owner's
+  records never rotate. Active rows are never replaceable. (Exact hosts keep today's first-come
+  behaviour; see Open.)
 - **Activation** (`Store::activate_domain_exclusive`, one write txn over both tables). Verify reads
   the claim, awaits DNS, then flips it Active only if the row is **still that same pending claim**
   (tenant, project, token): a removal, project delete or takeover during the DNS wait yields `Stale`
@@ -52,14 +59,26 @@ per-upload `domain add` would need a TXT proof and an HTTP-01 cert per name.
   `_acme-delegation.<domain>`, inside the zone those already write). The CA follows the tenant's CNAME.
   Certs cache under `certs/wildcard/<base>/`. SNI: exact per-host cert → platform wildcards → the one
   tenant wildcard covering the SNI.
-- **ACME budget.** Before **every** wildcard order (issuance and renewal) the proxy re-checks that
-  `_acme-challenge.<base>` still CNAMEs to the delegated name, using the same DoH resolver `verify`
-  uses; if not, no order is placed. Failures (including a missing CNAME) back off per wildcard,
-  exponentially from 5 min doubling to a 24 h cap; after 8 consecutive failures (~10.5 h of retries) the manager
-  **gives up** and the API reports `tls: failed` (or `renewal-failed` while an older cert still serves)
-  until the owner re-verifies, which re-checks DNS and re-arms issuance. The reconcile loop runs at most
-  4 due wildcard orders per tick, concurrently, alongside the serial custom-domain pass, so the
-  15 s DNS-01 propagation sleep can't starve it.
+- **ACME budget.** Every tenant cert order (custom HTTP-01 and wildcard DNS-01, issuance, renewal,
+  retry, and orders triggered by verify) passes, in cost order (`CertManager::gate_tenant_order`):
+  1. the host's own backoff slot. It backs off exponentially from 5 min, doubling to a 24 h cap. A
+     wildcard gives up after 8 consecutive failures (~10.5 h); a custom domain keeps retrying at the
+     cap. This state persists in `certs/issue-health.json`, so a restart re-arms nothing;
+  2. free DNS pre-checks through the same DoH resolver `verify` uses: for a wildcard, that
+     `_acme-challenge.<base>` still CNAMEs to its delegated name; for both kinds, an RFC 8659 CAA
+     check (tree-climbing, `issuewild` for wildcards) that Let's Encrypt may issue. A CAA
+     `issue ";"` is refused here instead of failing at the CA;
+  3. a **global token bucket** for tenant orders: `TENANT_ACME_ORDERS_PER_3H`, default 60, refilled
+     evenly. Platform certs (apex, `*.db`) never draw from it, so the rest of the account's limit
+     (Let's Encrypt: 300 / 3 h) stays reserved for them. It's in memory; restarts aren't tenant-
+     triggerable;
+  4. the owner's **persisted per-tenant budget**: `TENANT_ACME_ORDERS_PER_DAY`, default 20 per
+     sliding 24 h, stored per tenant in `tenant_acme_orders`. Removing and re-adding domains, or a
+     restart, refunds nothing. Over budget, the host is parked until the next slot frees, and the
+     API reports `tls: failed` with `tls_error` naming that time.
+  Re-verify re-arms a stopped cert (resets its backoff and give-up) only when the tenant's budget
+  has room; otherwise it answers 429 with the retry time. The reconcile loop runs at most 4 due
+  wildcard orders per tick, concurrently, alongside the serial custom-domain pass.
 - **Status.** The stored record goes Active at verification (that gates routing + issuance, exactly as
   for custom domains). The API reports a wildcard as `pending` while `tls` is `provisioning` or
   `failed`, and `active` once a cert serves — so it reads Pending until verification *and* issuance
@@ -86,7 +105,8 @@ wildcard (or pending) hosts. And on roll-forward, before building the domain map
 `Store::purge_invalid_domain_rows`, which:
 - deletes any DOMAINS row whose key contains `*` (the only writer is that grandfathering);
 - deletes any wildcard row whose project is gone or now belongs to another tenant (a project the
-  old binary deleted, possibly re-created under the same id);
+  old binary deleted, possibly re-created under the same id). A wildcard row it can't *decode* is
+  kept and warned about, never deleted: it may be a newer binary's data;
 - strips `*` hosts from every `project.domains` cache.
 
 Surviving wildcard rows resume routing and renewal as they were.
@@ -107,10 +127,10 @@ until roll-forward. Don't hand-edit DOMAINS.
 | Make the platform publish a DNS-01 answer at a name the tenant chooses | The TXT name is `<label>.<zone>`; the label is 128-bit CSPRNG hex minted by control, validated again in the proxy, and never tenant-supplied. |
 | Answer ACME for another tenant's wildcard | Each domain has its own label; pointing your own `_acme-challenge` at a victim's label gains nothing, because the TXT value is the key authorization of the *victim's* order on the platform account. |
 | Split one DNS node between tenants (`B` exact vs `*.B`) | Refused against Active records of another tenant, atomically at verify. |
-| Squat a victim's wildcard with an unverifiable claim | Replaceable after 15 min; capped at 5 pending per tenant. |
+| Squat a victim's wildcard with an unverifiable claim | Proof wins over any pending row; the owner's records are deterministic, so re-taking the row can't invalidate them; ≤5 pending per tenant. |
 | Undo a removal / clobber a new claim by verifying across it | Activation re-reads the row in its txn and refuses a stale claim. |
 | Rollback residue: proof-less `*` rows, orphaned wildcards | The cache never holds them; boot purge removes what an old binary left. |
-| Burn the shared ACME account's limits | CNAME re-checked before every order; per-wildcard exponential backoff; give-up after 8 failures; ≤4 orders/tick; ≤20 wildcards per tenant. |
+| Burn the shared ACME account's limits (e.g. add → verify → remove over fresh names, with a CAA record that fails every order) | CNAME and CAA pre-checked for free; persisted per-tenant budget (20/day) that removal and restart don't refund; global tenant bucket (60/3 h) reserving the rest of the account for platform certs; persisted backoff/give-up; ≤4 wildcard orders/tick. Re-verify re-arms only within budget. |
 | Path traversal through the cert cache | Names are LDH-validated in control; `cert_cache_dir` re-checks before any write/`remove_dir_all`. |
 
 Tenant-side caveat (README): a wildcard **CNAME** for `*.<base>` also answers TXT lookups for every
@@ -119,9 +139,14 @@ else can publish TXT under, or use A/AAAA.
 
 ## Open / follow-ups
 
-- **Separate ACME account for tenant wildcards** (recommended): today tenant wildcard orders share the
-  platform account's rate limits with the platform certs and custom domains. The mitigations above
-  bound the damage but don't isolate it.
+- **Separate ACME account for tenant certs** (recommended): tenant orders still share the platform
+  account. The budgets above bound them, and platform certs keep a reserved share, but Let's
+  Encrypt's per-account *failed-validation* and *pending-authorization* limits are shared too. Many
+  Sybil tenants can also still drain the global tenant bucket, which delays other tenants' certs
+  but never the platform's.
+- The console shows a 202 "held by another account" add as a banner with the records; verifying it
+  is CLI/API only, because the name isn't in the caller's list until they win it. A proof-wins
+  takeover starts with no `site` binding.
 - Exact custom domains keep first-come Pending claims (no takeover, no caps). The same approach
   would work there but changes long-standing behaviour, so it's left for a separate change.
 - The ACME flow has no test double (`instant_acme::Account` talks to a real CA), so DNS-01 issuance is

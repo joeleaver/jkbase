@@ -601,8 +601,13 @@ publishes none).
 Then `jkbase domain verify '*.play.example.com'`. Verification checks the TXT **and** the CNAME; the
 domain then reads `pending` (`https provisioning`) until its certificate is issued (a minute or two),
 then `active`. If issuance keeps failing (typically: the `_acme-challenge` CNAME was removed or
-changed), the platform backs off and eventually stops trying, and the domain shows `https failed`;
-fix the CNAME and run `verify` again to retry. Or declare it in `jkbase.toml` (`domain = "*.play.example.com"` on a site, or in
+changed, or a CAA record forbids Let's Encrypt), the platform backs off and eventually stops trying,
+and the domain shows `https failed`; fix DNS and run `verify` again to retry.
+
+Certificate orders are metered, because every one spends the platform's shared ACME account: each
+account gets 20 orders per 24 h across all its custom and wildcard domains (issuance, renewals and
+failures alike — removing and re-adding a domain doesn't refund them). Past that, the domain shows
+`https failed` with the time it will retry. Or declare it in `jkbase.toml` (`domain = "*.play.example.com"` on a site, or in
 `domains = [...]`) and run `verify` after the deploy.
 
 Rules:
@@ -618,8 +623,9 @@ Rules:
   exact domain (or vice versa). A wildcard itself is unique, like any domain.
 - **Claims and limits.** An account may hold up to 5 *unverified* wildcards and 20 in total (the
   operator can change the total with `MAX_WILDCARD_DOMAINS_PER_TENANT`). An unverified claim by
-  another account blocks a name only for 15 minutes; after that, adding it takes the claim over, and
-  whoever verifies DNS first owns it.
+  another account never locks you out: `domain add` still hands you **your** records (they're fixed
+  for your account and that name, so they never change on re-adds), and whoever verifies DNS first
+  owns it.
 - **Removing it** (`jkbase domain rm '*.play.example.com'`) unroutes every host under it and deletes
   its certificate; nothing renews afterwards. You can drop the DNS records.
 - **Self-hosted without TLS** (local dev): no certificate is involved — the CNAME isn't needed, the
@@ -915,6 +921,9 @@ Then, on the server side (`provision.sh` prints these as it finishes):
    [wildcard domains](#wildcard-domains)' certificates by writing TXT records under
    `ACME_DELEGATION_ZONE` (default `_acme-delegation.<domain>`, inside the zone above — no extra
    credentials).
+   Tenant certificate orders share your ACME account, so they're capped: `TENANT_ACME_ORDERS_PER_3H`
+   (default 60, across all tenants — the rest of Let's Encrypt's 300/3 h stays reserved for the
+   platform's own certs) and `TENANT_ACME_ORDERS_PER_DAY` (default 20 per tenant, persisted).
 2. **Build toolchains** — provisioning bakes only the busybox `default.ext4`. To serve the languages
    above you additionally need the per-language toolchain images (`bun.ext4`, `node.ext4`,
    `rust.ext4`, `python.ext4`, `go.ext4`, `dockerfile.ext4`, plus `jkbuild-function.ext4` for
