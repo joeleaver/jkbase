@@ -130,6 +130,11 @@ pub struct TlsConfig {
     /// vendor choice is made once at startup.
     pub dns_provider: Arc<dyn DnsProvider>,
     pub acme_email: String,
+    /// ACME directory URL overriding Let's Encrypt (production / `staging`): a private CA
+    /// (step-ca, …) or a test CA (Pebble). `None` = Let's Encrypt.
+    pub acme_directory: Option<String>,
+    /// PEM root(s) to trust for the ACME API's own TLS, when the CA isn't publicly trusted.
+    pub acme_ca_root: Option<PathBuf>,
     /// Zone (under `domain`, writable by `dns_provider`) holding the TXT answers for
     /// tenant wildcards' delegated `_acme-challenge` CNAMEs.
     pub acme_delegation_zone: String,
@@ -1256,7 +1261,7 @@ async fn obtain_account(cfg: &TlsConfig, staging: bool) -> Result<Account> {
         .ok()
         .and_then(|b| serde_json::from_slice::<AccountCredentials>(&b).ok())
     {
-        match Account::builder()?.from_credentials(creds).await {
+        match account_builder(cfg)?.from_credentials(creds).await {
             Ok(account) => {
                 info!("loaded existing ACME account");
                 return Ok(account);
@@ -1264,12 +1269,12 @@ async fn obtain_account(cfg: &TlsConfig, staging: bool) -> Result<Account> {
             Err(e) => warn!(error = %e, "stored ACME account invalid, creating a new one"),
         }
     }
-    let directory = if staging {
-        LetsEncrypt::Staging.url()
-    } else {
-        LetsEncrypt::Production.url()
+    let directory = match &cfg.acme_directory {
+        Some(url) => url.as_str(),
+        None if staging => LetsEncrypt::Staging.url(),
+        None => LetsEncrypt::Production.url(),
     };
-    let (account, credentials) = Account::builder()?
+    let (account, credentials) = account_builder(cfg)?
         .create(
             &NewAccount {
                 contact: &[&format!("mailto:{}", cfg.acme_email)],
@@ -1284,8 +1289,16 @@ async fn obtain_account(cfg: &TlsConfig, staging: bool) -> Result<Account> {
     if let Ok(json) = serde_json::to_vec(&credentials) {
         let _ = tokio::fs::write(&creds_path, json).await;
     }
-    info!(staging, "created ACME account");
+    info!(staging, directory, "created ACME account");
     Ok(account)
+}
+
+fn account_builder(cfg: &TlsConfig) -> Result<instant_acme::AccountBuilder> {
+    Ok(match &cfg.acme_ca_root {
+        Some(pem) => Account::builder_with_root(pem)
+            .with_context(|| format!("cannot load ACME CA root {}", pem.display()))?,
+        None => Account::builder()?,
+    })
 }
 
 fn needs_renewal(cert_path: &Path) -> bool {
@@ -1679,6 +1692,8 @@ mod tests {
             cert_dir: PathBuf::from("/nonexistent"),
             dns_provider: Arc::new(NoDns),
             acme_email: "ops@example.com".into(),
+            acme_directory: None,
+            acme_ca_root: None,
             acme_delegation_zone: zone.into(),
             dns_lookup: Arc::new(|_, _| Box::pin(async { Ok(Vec::new()) })),
             order_gate: None,

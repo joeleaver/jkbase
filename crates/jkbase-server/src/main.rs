@@ -162,6 +162,15 @@ struct Args {
     #[arg(long)]
     acme_staging: bool,
 
+    /// ACME directory URL to use instead of Let's Encrypt (a private CA such as step-ca, or
+    /// Pebble for tests). Overrides --acme-staging.
+    #[arg(long, env = "ACME_DIRECTORY_URL")]
+    acme_directory_url: Option<String>,
+
+    /// PEM root(s) to trust for the ACME directory's own HTTPS, when it isn't publicly trusted.
+    #[arg(long, env = "ACME_CA_ROOT")]
+    acme_ca_root: Option<std::path::PathBuf>,
+
     /// Bind address for the build egress proxy (host-side default-deny forward
     /// proxy with allowlist + public-IP pinning). Disabled when unset. Build VMs
     /// route their dependency fetches through this; bind it where only the build
@@ -1702,6 +1711,8 @@ async fn async_main() -> Result<()> {
             cert_dir: data_dir.join("certs"),
             dns_provider,
             acme_email,
+            acme_directory: args.acme_directory_url.clone(),
+            acme_ca_root: args.acme_ca_root.clone(),
             acme_delegation_zone: acme_delegation_zone.clone(),
             // The same resolver control's `verify` checks the CNAME with.
             dns_lookup: Arc::new(|name: String, rtype: &'static str| {
