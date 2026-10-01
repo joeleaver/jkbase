@@ -31,8 +31,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::GlobSet;
 use jkbase_common::config::ProjectConfig;
+use jkbase_common::source_globs::{compile_globs, validate_globs};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -49,10 +50,6 @@ const KEEP_ENTRIES_PER_TARGET: usize = 2;
 /// riding one artifact indefinitely.
 const MAX_ENTRY_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
-/// Bounds on a target's `exclude` list (tenant input).
-pub(crate) const MAX_EXCLUDE_PATTERNS: usize = 64;
-pub(crate) const MAX_EXCLUDE_PATTERN_LEN: usize = 256;
-
 /// `./a/b/` → `a/b`; empty → `.`.
 fn norm(p: &str) -> String {
     let t = p.trim_start_matches("./").trim_end_matches('/');
@@ -64,37 +61,11 @@ fn inside(child: &str, parent: &str) -> bool {
     parent == "." || child == parent || child.starts_with(&format!("{parent}/"))
 }
 
-/// Compile `exclude` patterns: anchored at the context root, `*`/`?` within one segment,
-/// `**` across segments, `\` escapes.
-fn compile_globs(patterns: &[String]) -> Result<GlobSet> {
-    let mut b = GlobSetBuilder::new();
-    for p in patterns {
-        let glob = GlobBuilder::new(p)
-            .literal_separator(true)
-            .backslash_escape(true)
-            .build()
-            .with_context(|| format!("invalid exclude pattern {p:?}"))?;
-        b.add(glob);
-    }
-    b.build().context("compile exclude patterns")
-}
-
 /// Intake validation of a target's `exclude` list (fully tenant-controlled): bounded, relative,
 /// no `..`, compilable, and never matching the target's own source dir (or an ancestor of it)
 /// — which would remove the very tree the build runs in.
 pub(crate) fn validate_exclude(what: &str, patterns: &[String], build_subdir: &str) -> Result<()> {
-    if patterns.len() > MAX_EXCLUDE_PATTERNS {
-        bail!("{what} has {} exclude patterns; max {MAX_EXCLUDE_PATTERNS}", patterns.len());
-    }
-    for p in patterns {
-        if p.trim().is_empty() || p.len() > MAX_EXCLUDE_PATTERN_LEN {
-            bail!("{what} exclude pattern {p:?} must be 1-{MAX_EXCLUDE_PATTERN_LEN} bytes");
-        }
-        if p.starts_with('/') || p.split('/').any(|seg| seg == "..") {
-            bail!("{what} exclude pattern {p:?} must be relative to the build context (no leading '/' or '..')");
-        }
-    }
-    let set = compile_globs(patterns).with_context(|| what.to_string())?;
+    let set = validate_globs(&format!("{what} exclude"), patterns)?;
     let bs = norm(build_subdir);
     if bs != "." {
         let mut prefix = String::new();
@@ -517,6 +488,7 @@ fn safe_entry_file(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jkbase_common::source_globs::{MAX_PATTERN_LEN as MAX_EXCLUDE_PATTERN_LEN, MAX_PATTERNS as MAX_EXCLUDE_PATTERNS};
 
     fn tmp(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();

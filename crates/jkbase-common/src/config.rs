@@ -39,6 +39,14 @@ pub struct ProjectConfig {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectMeta {
     pub name: Option<String>,
+    /// Paths never part of a deployment, as globs relative to the project root (the
+    /// `exclude` dialect: `*` stays within one path segment, `**` crosses them — `.env*`,
+    /// `data`, `**/*.log`). The CLI leaves them out of the upload and the host drops them
+    /// again on intake (git-push deploys included), so they are never uploaded, served,
+    /// mounted in a build, or part of a build key. `jkbase.toml` is always kept. See
+    /// [`crate::source_globs`].
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
