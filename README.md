@@ -695,6 +695,26 @@ jkbase repo token            # re-mint the token (revokes the old one)
 jkbase repo disconnect       # revoke the token + remove the remote
 ```
 
+### Leaving files out of a deploy
+
+`node_modules`, `.git` and `target` are never uploaded. List anything else under `[project]`:
+
+```toml
+[project]
+name   = "my-app"
+ignore = [".env*", "data", "**/*.log", "public/drafts"]
+```
+
+Globs are relative to the project root, in the same dialect as `exclude` (`*` stays inside one path
+segment, `**` crosses them, so `*.log` is top-level only and `**/*.log` is everywhere). A matching
+directory drops its whole subtree. Ignored paths never leave your machine on `jkbase deploy`, and the
+platform drops them again when it receives the source, so a git push gets the same result. They're
+never served by a site, never mounted in a build, and never part of a build key. `jkbase.toml` itself
+is always kept. Your `.gitignore` isn't consulted: a deploy may need a locally built `dist/` that git
+ignores.
+
+`ignore` is for the whole deployment. A target's `exclude` only trims what that one build sees.
+
 ---
 
 ## Web console
@@ -719,6 +739,7 @@ domains = ["example.com", "www.example.com"]   # custom-domain aliases for the w
 
 [project]
 name = "my-app"
+# ignore = [".env*", "data"]   # never uploaded, served, or built (globs from the project root)
 
 # --- Static site (shortcut) ----------------------------------------------
 [hosting]

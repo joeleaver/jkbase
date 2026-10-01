@@ -10,6 +10,7 @@ use clap::Args;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use jkbase_common::config::ProjectConfig;
+use jkbase_common::source_globs::DeployIgnore;
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
@@ -85,8 +86,9 @@ pub async fn run(args: DeployArgs) -> Result<()> {
         })?;
     let project_id = slug(&project_name);
 
+    let ignore = DeployIgnore::new(config.project.as_ref().map_or(&[][..], |p| p.ignore.as_slice()))?;
     println!("Packaging source...");
-    let tarball = tar_source(project_dir).context("failed to package source")?;
+    let tarball = tar_source(project_dir, &ignore).context("failed to package source")?;
     println!("  {} bytes compressed", tarball.len());
 
     let token = crate::credentials::load_token()?.ok_or_else(|| {
@@ -209,12 +211,13 @@ pub async fn run(args: DeployArgs) -> Result<()> {
 }
 
 /// Tar+gzip the project source tree, paths relative to `project_dir`, excluding
-/// build/VCS dirs. Keeps `jkbase.toml` + `Dockerfile` + all source — the platform
-/// reads the manifest and builds each target from its declared subdir.
-fn tar_source(project_dir: &Path) -> Result<Vec<u8>> {
+/// build/VCS dirs and `[project] ignore` paths (so those never leave this machine; the
+/// host re-applies the list on intake). Keeps `jkbase.toml` + `Dockerfile` + all other
+/// source — the platform reads the manifest and builds each target from its declared subdir.
+fn tar_source(project_dir: &Path, ignore: &DeployIgnore) -> Result<Vec<u8>> {
     let enc = GzEncoder::new(Vec::new(), Compression::fast());
     let mut tar = tar::Builder::new(enc);
-    append_source(&mut tar, project_dir, project_dir)?;
+    append_source(&mut tar, project_dir, project_dir, ignore)?;
     let enc = tar.into_inner()?;
     Ok(enc.finish()?)
 }
@@ -223,6 +226,7 @@ fn append_source(
     tar: &mut tar::Builder<GzEncoder<Vec<u8>>>,
     root: &Path,
     dir: &Path,
+    ignore: &DeployIgnore,
 ) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -230,12 +234,15 @@ fn append_source(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         let ft = entry.file_type()?;
+        let rel = path.strip_prefix(root)?;
+        if ignore.ignored(&rel.to_string_lossy()) {
+            continue;
+        }
         if ft.is_symlink() {
             // Preserve symlinks AS symlinks. Skipping them silently dropped any
             // symlink in the source (so it never reached the build/deploy — symlinks
             // "didn't survive"); the server's untar already recreates them. Store the
             // literal target; the build/runtime resolves it.
-            let rel = path.strip_prefix(root)?;
             let target = std::fs::read_link(&path)?;
             let mut header = tar::Header::new_gnu();
             if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -255,9 +262,8 @@ fn append_source(
             if EXCLUDED_DIRS.contains(&name_str.as_ref()) {
                 continue;
             }
-            append_source(tar, root, &path)?;
+            append_source(tar, root, &path, ignore)?;
         } else if ft.is_file() {
-            let rel = path.strip_prefix(root)?;
             tar.append_path_with_name(&path, rel)?;
         }
     }
@@ -291,7 +297,7 @@ mod tests {
         std::os::unix::fs::symlink("real.txt", src.join("link.txt")).unwrap();
         std::os::unix::fs::symlink("../real.txt", src.join("sub").join("up.txt")).unwrap();
 
-        let tarball = tar_source(&src).unwrap();
+        let tarball = tar_source(&src, &DeployIgnore::new(&[]).unwrap()).unwrap();
         std::fs::create_dir_all(&out).unwrap();
         let dec = flate2::read::GzDecoder::new(&tarball[..]);
         tar::Archive::new(dec).unpack(&out).unwrap();
@@ -315,5 +321,37 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn tar_source_leaves_out_ignored_paths() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let src = std::env::temp_dir().join(format!("jkb-tarign-src-{nanos}"));
+        std::fs::create_dir_all(src.join("data/raw")).unwrap();
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::write(src.join("jkbase.toml"), b"").unwrap();
+        std::fs::write(src.join(".env"), b"SECRET=1").unwrap();
+        std::fs::write(src.join("data/raw/big.bin"), b"x").unwrap();
+        std::fs::write(src.join("src/main.rs"), b"x").unwrap();
+        std::fs::write(src.join("src/debug.log"), b"x").unwrap();
+
+        let ignore = DeployIgnore::new(
+            &[".env", "data", "**/*.log", "*.toml"].map(String::from),
+        )
+        .unwrap();
+        let tarball = tar_source(&src, &ignore).unwrap();
+        let dec = flate2::read::GzDecoder::new(&tarball[..]);
+        let mut names: Vec<String> = tar::Archive::new(dec)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["jkbase.toml", "src/main.rs"]);
+
+        let _ = std::fs::remove_dir_all(&src);
     }
 }
