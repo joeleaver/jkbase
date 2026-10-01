@@ -25,6 +25,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use jkbase_common::config::{Builder, EgressPolicy, ProjectConfig, resolve_egress};
+use jkbase_common::source_globs::DeployIgnore;
 use jkbase_control::store::{BuildPhase, BuildTargetStatus, Store, TargetKind};
 use jkbase_orch::build_image::build_ro_ext4_from_dir;
 use jkbase_orch::build_output;
@@ -1090,6 +1091,16 @@ async fn run_inner(
     let config = ProjectConfig::load(&src_dir.join("jkbase.toml"))
         .context("load jkbase.toml from uploaded source")?;
     validate_manifest(&config).context("reject unsafe names/paths in jkbase.toml")?;
+    // 2b. Drop `[project] ignore` paths before anything else reads the tree. The CLI already
+    //     left them out, but a git-push archive (or an older CLI) didn't — so the host is what
+    //     guarantees an ignored path is never served, mounted in a build, or keyed.
+    let ignore = config.project.as_ref().map_or(&[][..], |p| p.ignore.as_slice());
+    let pruned = DeployIgnore::new(ignore)
+        .and_then(|ig| ig.prune(&src_dir))
+        .context("apply [project] ignore")?;
+    if pruned > 0 {
+        info!(project_id, build_id, pruned, "dropped ignored paths from the source");
+    }
     let config = Arc::new(config);
 
     // 3. Staged artifact dir, on the same filesystem as deploy_dir so the
@@ -3718,6 +3729,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The host re-applies `[project] ignore` on intake: a source tree that arrives
+    /// unfiltered (a git-push archive, an older CLI) must still never have an ignored path
+    /// served by a committed site. Static-only, so no build VM is involved.
+    #[tokio::test]
+    async fn intake_drops_ignored_paths_from_unfiltered_source() {
+        use jkbase_control::store::{BuildPhase, BuildRecord, Store};
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!("jkb-intake-ignore-{nanos}"));
+        let src = data.join("src");
+        let put = |rel: &str, c: &str| {
+            let p = src.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, c).unwrap();
+        };
+        put(
+            "jkbase.toml",
+            "[project]\nname = \"ig\"\nignore = [\"public/.env\", \"**/*.map\", \"public/drafts\"]\n[sites.docs]\npublic = \"./public\"\n",
+        );
+        put("public/index.html", "<h1>hi</h1>");
+        put("public/.env", "SECRET=1");
+        put("public/js/app.js.map", "{}");
+        put("public/drafts/wip.html", "wip");
+
+        let mut tarbuf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut tarbuf, flate2::Compression::fast());
+            let mut tb = tar::Builder::new(enc);
+            tb.append_dir_all(".", &src).unwrap();
+            tb.into_inner().unwrap().finish().unwrap();
+        }
+
+        let store = Store::open(&data.join("t.redb")).unwrap();
+        store
+            .save_build(&BuildRecord {
+                project_id: "ig".into(),
+                build_id: 1,
+                phase: BuildPhase::Building,
+                targets: vec![],
+                log_tail: String::new(),
+                phase_timings_ms: Default::default(),
+                deployed_version: None,
+                error: None,
+                source_commit: None,
+                created_at: now(),
+                updated_at: now(),
+            })
+            .unwrap();
+        let deps = Arc::new(BuildDeps {
+            jailer_bin: PathBuf::new(),
+            firecracker_bin: PathBuf::new(),
+            kernel_path: PathBuf::new(),
+            data_dir: data.clone(),
+            deploy_dir: data.join("hosting"),
+            toolchain_dir: data.join("toolchains"),
+            store,
+            chroot_base: data.join("bj"),
+            cgroup_mount: PathBuf::new(),
+            parent_cgroup: String::new(),
+            uid: 0,
+            gid: 0,
+            timeout: Duration::from_secs(1),
+            vcpu_count: 1,
+            mem_size_mib: 128,
+            cgroup_pids_max: 1,
+            cgroup_mem_max_bytes: 1,
+            cgroup_cpu_max: String::new(),
+            scratch_size_bytes: 0,
+            output_size_bytes: 0,
+            console_log_max_bytes: 0,
+            max_concurrent: 1,
+            net: None,
+            fetch_deadline: Duration::from_secs(1),
+            cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            cache_size_bytes: 0,
+            agent_bin: None,
+        });
+
+        let staged = run_project_build("ig".into(), 1, tarbuf, false, deps).await.unwrap();
+        let site = staged.join("_site_docs");
+        assert!(site.join("index.html").exists(), "kept content is served");
+        assert!(!site.join(".env").exists(), "ignored file must not be served");
+        assert!(!site.join("js/app.js.map").exists(), "ignored glob must not be served");
+        assert!(!site.join("drafts").exists(), "ignored dir must not be served");
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 }
 

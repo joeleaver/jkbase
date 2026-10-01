@@ -8,6 +8,7 @@ pub mod l4_transit;
 pub mod layers;
 pub mod logs;
 pub mod routing;
+pub mod source_globs;
 /// SigV4 now lives in the `jkbase-sigv4` leaf crate (so the tenant object-store
 /// client can depend on just the signer, not this whole crate). Re-exported here
 /// unchanged so every existing `jkbase_common::sigv4::…` call site still resolves
