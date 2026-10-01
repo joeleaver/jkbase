@@ -42,10 +42,14 @@ pub fn compile_globs(patterns: &[String]) -> Result<GlobSet> {
 }
 
 /// Bound + confine a tenant pattern list (count, length, relative, no `..`), then compile it.
+/// A leading `./` and a trailing `/` are dropped first: matching is against bare relative
+/// paths, so the gitignore-habit spellings `secrets/` / `./secrets` would otherwise silently
+/// match nothing — and an "ignored" file would still ship.
 pub fn validate_globs(what: &str, patterns: &[String]) -> Result<GlobSet> {
     if patterns.len() > MAX_PATTERNS {
         bail!("{what} has {} patterns; max {MAX_PATTERNS}", patterns.len());
     }
+    let mut normalized = Vec::with_capacity(patterns.len());
     for p in patterns {
         if p.trim().is_empty() || p.len() > MAX_PATTERN_LEN {
             bail!("{what} pattern {p:?} must be 1-{MAX_PATTERN_LEN} bytes");
@@ -53,8 +57,13 @@ pub fn validate_globs(what: &str, patterns: &[String]) -> Result<GlobSet> {
         if p.starts_with('/') || p.split('/').any(|seg| seg == "..") {
             bail!("{what} pattern {p:?} must be relative (no leading '/' or '..')");
         }
+        let n = p.trim_start_matches("./").trim_end_matches('/');
+        if n.is_empty() || n == "." {
+            bail!("{what} pattern {p:?} names the whole root");
+        }
+        normalized.push(n.to_string());
     }
-    compile_globs(patterns).with_context(|| what.to_string())
+    compile_globs(&normalized).with_context(|| what.to_string())
 }
 
 /// The project-level deploy ignore list, anchored at the project root.
@@ -125,6 +134,17 @@ mod tests {
         assert!(i.ignored("a/b/fixtures"));
         assert!(i.ignored(".env.local"));
         assert!(!i.ignored("src/main.rs"));
+    }
+
+    #[test]
+    fn gitignore_spellings_still_match() {
+        let i = ig(&["secrets/", "./data", "./logs/"]);
+        assert!(i.ignored("secrets"));
+        assert!(i.ignored("data"));
+        assert!(i.ignored("logs"));
+        for root in ["./", ".", "./."] {
+            assert!(DeployIgnore::new(&[root.to_string()]).is_err(), "should reject {root:?}");
+        }
     }
 
     #[test]
