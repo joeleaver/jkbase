@@ -798,6 +798,8 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     let rx = v["rx_bytes"].as_u64().unwrap_or(0);
     let tx = v["tx_bytes"].as_u64().unwrap_or(0);
     let storage = v["storage_bytes"].as_u64().unwrap_or(0);
+    // What the storage quota checks count: data disks at their full size (older servers: absent).
+    let storage_reserved = v["storage_reserved_bytes"].as_u64();
     // Server-side build-VM WALL time, metered on build exit — one VM per build target,
     // so a fan-out build sums its targets. Distinct from `cpu_seconds` (runtime-VM CPU);
     // it's the field the build-minute quota gate counts against.
@@ -811,7 +813,14 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
         fmt_bytes(rx),
         fmt_bytes(tx)
     );
-    println!("  Storage:   {}", fmt_bytes(storage));
+    match storage_reserved {
+        Some(r) => println!(
+            "  Storage:   {} toward quota (data disks at full size; {} in use, billed)",
+            fmt_bytes(r),
+            fmt_bytes(storage)
+        ),
+        None => println!("  Storage:   {}", fmt_bytes(storage)),
+    }
     println!(
         "  Build:     {:.1} build-minutes ({build_seconds} build-seconds)",
         build_seconds as f64 / 60.0
@@ -1547,7 +1556,7 @@ async fn run_db_drop(force: bool, project: Option<String>, api: String) -> anyho
         eprint!(
             "This will PERMANENTLY DELETE the dedicated-tier database of project '{project_id}' \
              and its disk. Back it up first (`jkbase db backup`) if you need the data.\n\
-             Type the project name to confirm: "
+             Type the project id to confirm: "
         );
         use std::io::Write;
         let _ = std::io::stderr().flush();

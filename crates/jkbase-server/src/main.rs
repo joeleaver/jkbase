@@ -7540,9 +7540,6 @@ mod split_brain_gate {
 mod tests {
     use super::*;
 
-    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
-    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
-    /// (stamped+present rootfs blob + matching deployment version) restores.
     /// The live tree's own manifests (`_database.json`, …) count against the project budget, so
     /// a budget that would land exactly on a GiB boundary rounds down one MiB.
     const LIVE_MIB: u64 = 1;
@@ -7673,6 +7670,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
+    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
+    /// (stamped+present rootfs blob + matching deployment version) restores.
     #[test]
     fn snapshot_restore_decision_fails_open_on_every_mismatch() {
         let nanos = std::time::SystemTime::now()

@@ -75,7 +75,8 @@ pub enum DbDropOutcome {
     Dropped,
     /// There was no dedicated DB VM or disk.
     NothingToDrop,
-    /// The DB VM stayed mid-boot / mid-hibernate past the wait; nothing was touched (retry).
+    /// Something else still holds the DB VM — a wake / hibernate / boot still in flight after the
+    /// wait, or its disk lease (a fence in progress) — so nothing was touched (retry).
     Busy,
 }
 
@@ -2271,7 +2272,14 @@ pub struct UsageResponse {
     pub cpu_seconds: f64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Latest billed storage sample (data disks by blocks actually in use).
     pub storage_bytes: u64,
+    /// What the storage quota CHECKS count right now: as `storage_bytes` but with each data disk
+    /// at its full size (`jkbase_common::storage::project_reserved_bytes`). This, not the billed
+    /// figure, is what a deploy / object write is refused against. `#[serde(default)]` on the
+    /// wire for older clients.
+    #[serde(default)]
+    pub storage_reserved_bytes: u64,
     /// Month-to-date server-side build-VM seconds.
     pub build_seconds: u64,
     /// Month-to-date DB-attributable warm-VM seconds (time a VM was held warm by a
@@ -2425,11 +2433,25 @@ async fn get_project_usage(
         .store
         .sum_month_to_date(&format!("{id}.db"), month_start)
         .unwrap_or_default();
+    let storage_reserved_bytes = {
+        let data_dir = state
+            .deploy_dir
+            .parent()
+            .unwrap_or(&state.deploy_dir)
+            .to_path_buf();
+        let pid = id.clone();
+        tokio::task::spawn_blocking(move || {
+            jkbase_common::storage::project_reserved_bytes(&data_dir, &pid)
+        })
+        .await
+        .unwrap_or(0)
+    };
     Json(UsageResponse {
         cpu_seconds: base.cpu_jiffies.saturating_add(db.cpu_jiffies) as f64 / 100.0,
         rx_bytes: base.rx_bytes.saturating_add(db.rx_bytes),
         tx_bytes: base.tx_bytes.saturating_add(db.tx_bytes),
         storage_bytes: base.storage_bytes,
+        storage_reserved_bytes,
         build_seconds: base.build_seconds.saturating_add(db.build_seconds),
         warm_seconds: base.warm_seconds.saturating_add(db.warm_seconds),
         month_start,
@@ -4424,7 +4446,9 @@ struct DropDedicatedDbResponse {
 /// one way to reclaim a dedicated DB disk short of deleting the project: leaving the dedicated
 /// tier keeps it (its data would otherwise be lost to a config edit), and it counts against the
 /// storage quota at its full size. Serialized against deploy/build/rollback on the per-project
-/// deploy lock, so a drop can't tear down a DB VM a concurrent deploy is booting.
+/// deploy lock; wakes and wake-path boots don't take that lock, so the server-side drop
+/// additionally refuses (`Busy` → 409) unless it holds the DB disk's lease and no DB VM
+/// wake/hibernate/boot is in flight — it never frees a disk or IP an in-flight boot is using.
 ///
 /// Also clears a recorded `dedicated` deployed tier ([R4]): the data a later tier change would
 /// strand is gone, so back-up → drop → redeploy at the new tier → restore is a clean migration.
