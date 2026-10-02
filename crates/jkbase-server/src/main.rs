@@ -3302,9 +3302,11 @@ async fn deploy_refusal(
 }
 
 /// [R4] The refusal message for deploying a tree at managed-DB tier `new_tier` over the recorded
-/// `prior` tier, or `None` when it may proceed. Only guards when BOTH declare a managed DB:
-/// adding/removing `[database]` entirely, or a project that never had one, is not a data-stranding
-/// flip, so a plain project newly adding a dedicated DB is never refused.
+/// `prior` tier, or `None` when it may proceed. `prior` is the last tier the project EVER ran a
+/// managed DB at — it survives a deploy that drops `[database]`, since that DB's data stays on its
+/// tier's disk — so re-adding the DB at the other tier is refused like a direct flip. A tree with
+/// no DB, or a project that never had one (so a plain project newly adding a dedicated DB), is
+/// never refused.
 fn tier_flip_refusal(
     project_id: &str,
     prior: Option<&str>,
@@ -3318,6 +3320,14 @@ fn tier_flip_refusal(
              project at the new tier and restore into it."
         )),
         _ => None,
+    }
+}
+
+/// [R4] Stamp the tier `deployment_dir` runs its managed DB at. A tree with no DB leaves the
+/// prior stamp in place (see the commit-to-Running call site in [`handle_deploy`]).
+fn record_deployed_tier(store: &Store, project_id: &str, deployment_dir: &Path) {
+    if let Some(tier) = deployment_db_tier(deployment_dir) {
+        let _ = store.set_deployed_tier(project_id, tier);
     }
 }
 
@@ -3750,15 +3760,16 @@ async fn handle_deploy(
     // VM can already be writing its DB from this point: a later failure leaves this tree live (a
     // failed deploy is not rolled back) and an unstamped project would let the next deploy flip
     // tiers unrefused. A dedicated stamp before its DB VM writes anything can only over-refuse
-    // (the safe direction). Record only for a managed-DB project (nothing to strand otherwise);
-    // drop the record when the project has no DB now (e.g. it removed `[database]`) so a later
-    // re-add isn't misread as a flip.
-    if check_project_has_database(&plat.data_dir, project_id) {
-        let tier = if dedicated { "dedicated" } else { "colocated" };
-        let _ = plat.store.set_deployed_tier(project_id, tier);
-    } else {
-        let _ = plat.store.delete_deployed_tier(project_id);
-    }
+    // (the safe direction). Record only for a managed-DB project (nothing to strand otherwise),
+    // and KEEP the record when a deploy drops `[database]`: the data stays on its tier's disk
+    // (neither disk is reaped by a config edit), so re-adding the DB at the OTHER tier is the
+    // same stranding flip. Deleting it here let colocated → no DB → dedicated launder past R4.
+    // Only project deletion clears it.
+    record_deployed_tier(
+        &plat.store,
+        project_id,
+        &plat.data_dir.join("hosting").join(project_id).join("live"),
+    );
     // Cold boot always runs the CURRENT rootfs; track it so a later hibernate stamps the truthful
     // hash (and keeps the GC reference set honest). Clear any wake-failure throttle: this project
     // is now freshly booted, so a stale entry mustn't fast-fail a routing-miss request.
@@ -8073,6 +8084,15 @@ mod tests {
         assert!(tier_flip_refusal("p", Some("dedicated"), deployment_db_tier(&v1)).is_none());
         assert!(tier_flip_refusal("p", None, deployment_db_tier(&v2)).is_none());
         assert!(tier_flip_refusal("p", Some("dedicated"), deployment_db_tier(&v3)).is_none());
+
+        // A deploy that drops `[database]` keeps the stamp (the data is still on its tier's
+        // disk), so dedicated → no DB → colocated can't launder past the refusal.
+        let store = Store::open(&data.join("db.redb")).unwrap();
+        record_deployed_tier(&store, "p", &v1);
+        record_deployed_tier(&store, "p", &v3);
+        let prior = store.get_deployed_tier("p").unwrap();
+        assert_eq!(prior.as_deref(), Some("dedicated"));
+        assert!(tier_flip_refusal("p", prior.as_deref(), deployment_db_tier(&v2)).is_some());
 
         let _ = std::fs::remove_dir_all(&data);
     }

@@ -98,8 +98,9 @@ const L4_TRANSIT: TableDefinition<&str, &[u8]> = TableDefinition::new("l4_transi
 /// reads back), so the backup executor needs an independent copy here. `project_id` →
 /// token; overwritten each deploy, purged on teardown.
 const DB_ADMIN_TOKEN: TableDefinition<&str, &[u8]> = TableDefinition::new("db_admin_token");
-/// Per-project managed-DB **deployed tier** (`"colocated"` | `"dedicated"`), stamped on each
-/// successful deploy. The deploy path reads it BEFORE tearing down the old VM to refuse an
+/// Per-project managed-DB **deployed tier** (`"colocated"` | `"dedicated"`), stamped when a
+/// deploy commits a VM running a managed DB, and kept across deploys that drop `[database]` (the
+/// data stays on its tier's disk). The deploy path reads it BEFORE swapping `live` to refuse an
 /// in-place tier FLIP (which would strand the old-tier DB data on its disk — colocated data on
 /// `{id}.img`, dedicated data on `{id}.db.img` — and silently start an empty DB or orphan the
 /// sibling VM). Absent ⇒ first deploy / pre-P2 project ⇒ no flip to detect. Purged on teardown so
@@ -3081,7 +3082,7 @@ impl Store {
         Ok(())
     }
 
-    /// The tier the project's last successful deploy committed, or `None` (first deploy / pre-P2).
+    /// The tier the project last committed a managed DB at, or `None` (never had one / pre-P2).
     pub fn get_deployed_tier(&self, project_id: &str) -> Result<Option<String>> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(DB_DEPLOYED_TIER)?;
