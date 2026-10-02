@@ -7471,9 +7471,10 @@ mod tests {
         let bkt = root.join("objectstore").join("p").join("b");
         std::fs::create_dir_all(&bkt).unwrap();
         std::fs::File::create(bkt.join("o")).unwrap().set_len(3 * gib).unwrap();
-        // Creating the DB disk under a 5 GiB quota: 5 − 3 (objects) − ~0 (manifest) → < 4 GiB.
+        // Creating the DB disk under a 5 GiB quota: 5 − 3 (objects) − the manifest → just under 2 GiB,
+        // not the 4 GiB `size`.
         let got = data_disk_mib_for(&root, "p.db", true, 5 * gib);
-        assert!(got < 2048 && got >= DATA_DISK_MIB, "got {got}");
+        assert!((DATA_DISK_MIB..2048).contains(&got), "got {got}");
         // Already at its wanted size → returned as-is, no budget applied (no shrink, no walk).
         let disks = root.join("data-disks");
         std::fs::create_dir_all(&disks).unwrap();
