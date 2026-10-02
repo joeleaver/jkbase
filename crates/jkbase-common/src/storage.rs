@@ -2,7 +2,7 @@
 //! (jkbase-server) and the deploy-time storage cap (jkbase-control) so both
 //! measure the same bytes.
 //!
-//! Billed storage = user-controllable data: the content image, the data disk
+//! Billed storage = user-controllable data: the content image, the data disks
 //! (actual blocks, not the logical size), and the LIVE deployment version. The
 //! snapshot/mem files (platform-managed hibernation artifacts) and retained
 //! rollback history (older `deployments/v*`) are deliberately EXCLUDED — so
@@ -13,7 +13,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// Total billed storage bytes for `project_id` under `data_dir`: the content
-/// image, the data disk, and the **live** deployment version only. Retained
+/// image, the data disks (app + dedicated DB), and the **live** deployment version only. Retained
 /// rollback history (older `deployments/v*`) is platform-managed — bounded by a
 /// deployment count, not the storage cap — and is deliberately NOT billed, so a
 /// project's usable quota is its live footprint, not `cap − retained history`.
@@ -37,28 +37,21 @@ pub fn project_storage_bytes(data_dir: &Path, project_id: &str) -> u64 {
 pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_dir: &Path) -> u64 {
     let mut total = 0u64;
 
-    // Content image: a plain file; logical length is fine.
-    let content = data_dir
-        .join("content-images")
-        .join(format!("{project_id}.ext4"));
-    if let Ok(md) = std::fs::metadata(&content) {
-        total = total.saturating_add(md.len());
+    // Content images: plain files; logical length is fine. A dedicated DB VM's own metadata
+    // image (`{id}.db.ext4`) is the project's too — billed here, not on the `{id}.db` usage row.
+    for name in [format!("{project_id}.ext4"), format!("{project_id}.db.ext4")] {
+        if let Ok(md) = std::fs::metadata(data_dir.join("content-images").join(name)) {
+            total = total.saturating_add(md.len());
+        }
     }
 
-    // Data disk: a sparse image (logical 1 GiB); bill ACTUAL blocks used. Loop-managed
-    // as `{id}.img`; pre-substrate deployments used `{id}.ext4` — fall back to it so the
-    // quota cap + metering keep counting the disk after the rename.
-    let disks = data_dir.join("data-disks");
-    let disk = {
-        let img = disks.join(format!("{project_id}.img"));
-        if img.exists() {
-            img
-        } else {
-            disks.join(format!("{project_id}.ext4"))
+    // Data disks: sparse images; bill ACTUAL blocks used, not the logical size. Every disk the
+    // project owns counts against the ONE cap — a dedicated DB's sibling `{id}.db.img` included,
+    // or a dedicated project could fill its quota on each disk.
+    for disk in data_disk_images(data_dir, project_id) {
+        if let Ok(md) = std::fs::metadata(&disk) {
+            total = total.saturating_add(md.blocks().saturating_mul(512));
         }
-    };
-    if let Ok(md) = std::fs::metadata(&disk) {
-        total = total.saturating_add(md.blocks().saturating_mul(512));
     }
 
     // Build cache drives: per-`(project,language)` sparse warm-cache images under
@@ -97,6 +90,25 @@ pub fn project_storage_bytes_for(data_dir: &Path, project_id: &str, deployment_d
     total = total.saturating_add(dir_bytes(deployment_dir));
 
     total
+}
+
+/// The project's data-disk images under `data-disks/` (existing files only): the app VM's
+/// loop-managed `{id}.img` — or the pre-substrate `{id}.ext4` it was renamed from, so billing
+/// keeps counting the disk across the rename — and a dedicated managed DB's sibling
+/// `{id}.db.img` (the DB VM's rendered id, `vm_identity::vm_id(id, Db)` in jkbase-server).
+/// Shared by billing and the host's project-wide disk-size cap so both see the same disks.
+pub fn data_disk_images(data_dir: &Path, project_id: &str) -> Vec<std::path::PathBuf> {
+    let disks = data_dir.join("data-disks");
+    let img = disks.join(format!("{project_id}.img"));
+    let app = if img.exists() {
+        img
+    } else {
+        disks.join(format!("{project_id}.ext4"))
+    };
+    [app, disks.join(format!("{project_id}.db.img"))]
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 /// Record every `(dev, ino)` of the regular files under `dir` (never following symlinks), so
@@ -237,6 +249,54 @@ mod tests {
         write(&bkt.join("deadbeef.meta"), &[0u8; 30]);
         // content(100) + object(500) + meta(30) = 630; no deployment yet.
         assert_eq!(project_storage_bytes(&dd, pid), 630);
+        let _ = fs::remove_dir_all(&dd);
+    }
+
+    #[test]
+    fn bills_dedicated_db_disk_allocated_blocks() {
+        let dd = tmp("db-disk");
+        let pid = "proj";
+        let disks = dd.join("data-disks");
+        fs::create_dir_all(&disks).unwrap();
+        // Sparse: logical 64 MiB, nothing allocated → bills ~0, not the logical size.
+        let sparse = |name: &str| {
+            fs::File::create(disks.join(name)).unwrap().set_len(64 << 20).unwrap();
+        };
+        sparse("proj.img");
+        sparse("proj.db.img");
+        let base = project_storage_bytes(&dd, pid);
+        assert!(base < (1 << 20), "sparse disks bill allocated blocks, got {base}");
+        // Real blocks written to the DB disk count against the SAME cap as the app disk.
+        write(&disks.join("proj.db.img"), &[1u8; 1 << 20]);
+        assert!(project_storage_bytes(&dd, pid) >= base + (1 << 20));
+        write(&disks.join("proj.img"), &[1u8; 1 << 20]);
+        assert!(project_storage_bytes(&dd, pid) >= base + (2 << 20));
+        // The DB VM's metadata image is the project's too.
+        let before = project_storage_bytes(&dd, pid);
+        write(&dd.join("content-images").join("proj.db.ext4"), &[0u8; 77]);
+        assert_eq!(project_storage_bytes(&dd, pid), before + 77);
+        // Another project's DB disk is never billed here (exact-name match, not a prefix).
+        let before = project_storage_bytes(&dd, pid);
+        write(&disks.join("proj2.db.img"), &[1u8; 1 << 20]);
+        write(&disks.join("proj.db.img.bak"), &[1u8; 1 << 20]);
+        assert_eq!(project_storage_bytes(&dd, pid), before);
+        assert_eq!(
+            data_disk_images(&dd, pid),
+            vec![disks.join("proj.img"), disks.join("proj.db.img")]
+        );
+        let _ = fs::remove_dir_all(&dd);
+    }
+
+    #[test]
+    fn data_disk_images_falls_back_to_legacy_ext4() {
+        let dd = tmp("legacy-disk");
+        let disks = dd.join("data-disks");
+        assert!(data_disk_images(&dd, "p").is_empty());
+        write(&disks.join("p.ext4"), &[0u8; 8]);
+        assert_eq!(data_disk_images(&dd, "p"), vec![disks.join("p.ext4")]);
+        // A directory squatting the DB-disk name is not a disk.
+        fs::create_dir_all(disks.join("p.db.img")).unwrap();
+        assert_eq!(data_disk_images(&dd, "p"), vec![disks.join("p.ext4")]);
         let _ = fs::remove_dir_all(&dd);
     }
 

@@ -6971,7 +6971,9 @@ async fn metering_loop(
         // A dedicated project's DB VM has its OWN alloc row (`{id}.db`) but no project row, so the
         // per-project roll below skips it — accrue its usage under the rendered id (decision #3:
         // separate rows, rolled up in display by `get_project_usage`). cpu/bw are already keyed by
-        // the rendered id; storage is its own `{id}.db.img` disk.
+        // the rendered id. Storage is NOT: its `{id}.db.img` disk + `{id}.db.ext4` image are billed
+        // on the BASE row by `project_storage_bytes`, the same figure the deploy + object-store
+        // caps enforce — sampling them here too would double-bill.
         let db_vm_ids: Vec<String> = allocs
             .iter()
             .map(|(id, _)| id.clone())
@@ -6980,10 +6982,14 @@ async fn metering_loop(
 
         // Roll each VM's sample into its current hour bucket. Skip VMs with nothing to record (no
         // storage, no deltas) to avoid empty rows.
-        let roll = |id: &str| {
+        let roll = |id: &str, bills_storage: bool| {
             let cpu_j = cpu.get(id).copied().unwrap_or(0);
             let (rx, tx) = bw.get(id).copied().unwrap_or((0, 0));
-            let storage = jkbase_common::storage::project_storage_bytes(&data_dir, id);
+            let storage = if bills_storage {
+                jkbase_common::storage::project_storage_bytes(&data_dir, id)
+            } else {
+                0
+            };
             if cpu_j == 0 && rx == 0 && tx == 0 && storage == 0 {
                 return;
             }
@@ -6992,10 +6998,10 @@ async fn metering_loop(
             }
         };
         for id in &projects {
-            roll(id);
+            roll(id, true);
         }
         for id in &db_vm_ids {
-            roll(id);
+            roll(id, false);
         }
 
         // DB-attributable warm-seconds: accrue for the VM a managed-DB reach-plane relay is holding

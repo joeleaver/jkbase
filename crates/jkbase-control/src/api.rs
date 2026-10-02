@@ -2390,7 +2390,9 @@ async fn get_project_usage(
     // DB runs in a sibling VM metered under `{id}.db`; a co-located or DB-less project has no such
     // rows so this adds zero. The `.db` suffix mirrors jkbase-server's `vm_identity::vm_id` and can
     // never collide with a real project id (`is_valid_project_id` forbids `.`); the `sum_month_to_date`
-    // `"{id}:"` prefix excludes `"{id}.db:"`, so the two never double-count.
+    // `"{id}:"` prefix excludes `"{id}.db:"`, so the two never double-count. Storage is NOT rolled
+    // up: the DB VM's disk is billed on the base row (`project_storage_bytes`, which the quota caps
+    // enforce), and a `.db` row's gauge may still hold a pre-move sample this month.
     let db = state
         .store
         .sum_month_to_date(&format!("{id}.db"), month_start)
@@ -2399,7 +2401,7 @@ async fn get_project_usage(
         cpu_seconds: base.cpu_jiffies.saturating_add(db.cpu_jiffies) as f64 / 100.0,
         rx_bytes: base.rx_bytes.saturating_add(db.rx_bytes),
         tx_bytes: base.tx_bytes.saturating_add(db.tx_bytes),
-        storage_bytes: base.storage_bytes.saturating_add(db.storage_bytes),
+        storage_bytes: base.storage_bytes,
         build_seconds: base.build_seconds.saturating_add(db.build_seconds),
         warm_seconds: base.warm_seconds.saturating_add(db.warm_seconds),
         month_start,
