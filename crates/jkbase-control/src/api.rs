@@ -312,6 +312,60 @@ fn deploy_error_status(e: &anyhow::Error) -> StatusCode {
     }
 }
 
+/// Refuse a deployment tree that would make the host follow a tenant-planted symlink. A raw
+/// `POST /deploy` tarball is unpacked as-is, and tar keeps symlink entries with ANY target
+/// (it only fences hardlinks and writes inside the destination). The `_`-prefixed entries are
+/// platform sidecars the HOST reads, copies and rewrites (`_servers/*.json` secrets injection,
+/// `_functions/*.json` credential binding, `_layers/*` drive attach, `_database*` staging into
+/// the DB VM, `_servers/*.tar.gz` extraction): a symlink there points those root-privileged
+/// operations at another tenant's files or the host's. So no symlink may sit at or under one —
+/// except inside a `_servers/<name>/` rootfs dir, which only ever ships into the guest (copied
+/// link-for-link) and whose absolute links are meant to resolve there. Tenant content outside
+/// the sidecars (static sites) is likewise copied link-for-link and never read by the host.
+/// Run before anything reads the tree, and on rollback targets (they may predate this check).
+fn validate_deployment_tree(dir: &std::path::Path) -> anyhow::Result<()> {
+    fn walk(path: &std::path::Path, rel: &std::path::Path, rootfs_ok: bool) -> anyhow::Result<()> {
+        let ft = std::fs::symlink_metadata(path)?.file_type();
+        if ft.is_symlink() {
+            return Err(DeployRefused(format!(
+                "deployment contains a symlink at {} — platform files (`_`-prefixed) must be \
+                 regular files or directories",
+                rel.display()
+            ))
+            .into());
+        }
+        if ft.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let child_rel = rel.join(entry.file_name());
+                // `_servers/<name>/` is a server rootfs: its contents are guest-only.
+                let child_is_rootfs = rootfs_ok
+                    && entry
+                        .file_type()
+                        .is_ok_and(|t| t.is_dir() && !t.is_symlink());
+                if child_is_rootfs {
+                    continue;
+                }
+                walk(&entry.path(), &child_rel, false)?;
+            }
+        }
+        Ok(())
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with('_') {
+            continue;
+        }
+        walk(
+            &entry.path(),
+            std::path::Path::new(&name),
+            name == "_servers",
+        )?;
+    }
+    Ok(())
+}
+
 /// Run the server's refusal checks against `deployment_dir` (see [`DeployPrecheckCallback`]).
 async fn precheck_deployment(
     state: &AppState,
@@ -2114,6 +2168,13 @@ async fn activate_deployment(
         let _ = tokio::fs::remove_dir_all(staged).await;
     }
 
+    // Before anything on the host reads the tree (rootfs extraction below follows
+    // `_servers/*.tar.gz`): no tenant-planted symlinks in the platform sidecars.
+    if let Err(e) = validate_deployment_tree(&deploy_path) {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(e);
+    }
+
     // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM)
     let servers_dir = deploy_path.join("_servers");
     if servers_dir.exists() {
@@ -3024,6 +3085,7 @@ async fn do_rollback(
     // Refuse BEFORE moving `live` (see `activate_deployment`): rolling back across a managed-DB
     // tier change is the same data-stranding flip as deploying one. The target dir is retained
     // history, so a refusal leaves it in place.
+    validate_deployment_tree(deploy_path)?;
     precheck_deployment(state, &project.id, deploy_path).await?;
 
     // Atomically repoint `live` at the target version: symlink to a temp name then

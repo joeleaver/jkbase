@@ -5997,7 +5997,20 @@ fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
 
 /// [`check_project_has_database`] for any deployment tree.
 fn deployment_has_database(deployment_dir: &Path) -> bool {
-    deployment_dir.join("_database.json").exists()
+    read_tree_sidecar(deployment_dir, "_database.json").is_some()
+}
+
+/// A host-read sidecar of a deployment tree, only if it is a REGULAR file: a tenant-planted
+/// symlink (a raw deploy tarball keeps them) must not let the tier/rules decisions read a file
+/// outside the tree that the tenant can rewrite later. Activation refuses such trees; this
+/// covers ones that predate that check.
+fn read_tree_sidecar(deployment_dir: &Path, name: &str) -> Option<String> {
+    let path = deployment_dir.join(name);
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.file_type().is_file() {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
 }
 
 /// The VM id the DB reach plane (external `:443` edge, console query/schema/status, backup relay)
@@ -6024,8 +6037,7 @@ fn project_is_dedicated(data_dir: &Path, project_id: &str) -> bool {
 
 /// [`project_is_dedicated`] for any deployment tree.
 fn deployment_is_dedicated(deployment_dir: &Path) -> bool {
-    std::fs::read_to_string(deployment_dir.join("_database.json"))
-        .ok()
+    read_tree_sidecar(deployment_dir, "_database.json")
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| {
             v.get("tier")
@@ -6043,13 +6055,8 @@ fn deployment_is_dedicated(deployment_dir: &Path) -> bool {
 /// engine stays byte-for-byte unchanged). Mirrors [`project_is_dedicated`] — reads the same
 /// host-baked, tenant-unforgeable sidecar.
 fn project_db_rules_enabled(data_dir: &Path, project_id: &str) -> bool {
-    let path = data_dir
-        .join("hosting")
-        .join(project_id)
-        .join("live")
-        .join("_database.json");
-    std::fs::read_to_string(&path)
-        .ok()
+    let live = data_dir.join("hosting").join(project_id).join("live");
+    read_tree_sidecar(&live, "_database.json")
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| {
             v.get("rules")

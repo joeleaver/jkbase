@@ -137,12 +137,37 @@ fn artifact(files: &[(&str, &str)]) -> Vec<u8> {
     tar.into_inner().unwrap().finish().unwrap()
 }
 
+/// Like [`artifact`], plus symlink entries (name → link target).
+fn artifact_with_links(files: &[(&str, &str)], links: &[(&str, &str)]) -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    for (name, body) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, name, body.as_bytes()).unwrap();
+    }
+    for (name, target) in links {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        tar.append_link(&mut h, name, target).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap()
+}
+
 impl Harness {
     async fn deploy(&self, files: &[(&str, &str)]) -> reqwest::Response {
+        self.deploy_raw(artifact(files)).await
+    }
+
+    async fn deploy_raw(&self, body: Vec<u8>) -> reqwest::Response {
         reqwest::Client::new()
             .post(format!("http://{}/projects/app/deploy", self.addr))
             .bearer_auth(&self.token)
-            .body(artifact(files))
+            .body(body)
             .send()
             .await
             .unwrap()
@@ -290,4 +315,86 @@ async fn refused_rollback_leaves_the_current_version_live() {
     assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
     assert!(same(&h.live_target(), &h.version_dir(1)));
     assert_eq!(h.current_version(), Some(1));
+}
+
+/// A raw deploy tarball may carry symlinks with ANY target. In a platform sidecar
+/// (`_`-prefixed) one would aim the host's root-privileged reads/rewrites (secrets injection,
+/// credential binding, drive attach, DB-image staging) at another tenant's or the host's files,
+/// so activation refuses it before anything reads the tree. Links inside a `_servers/<name>/`
+/// rootfs or in static-site content ship to the guest link-for-link and stay allowed.
+#[tokio::test]
+async fn deploy_refuses_symlinks_in_platform_sidecars() {
+    let h = spawn("symlinks").await;
+    let ok = h.deploy(&[("index.html", "v1")]).await;
+    assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
+
+    let victim = "/var/lib/jkbase/hosting/victim/live";
+    for (name, target) in [
+        (
+            "_servers/api.json",
+            "/var/lib/jkbase/hosting/victim/live/_servers/api.json",
+        ),
+        ("_functions/f.json", "/etc/passwd"),
+        ("_database", "/var/lib/jkbase/hosting/victim/live/_database"),
+        ("_database.json", "/tmp/tenant-writable.json"),
+        (
+            "_layers/sha256-x.erofs",
+            "/var/lib/jkbase/data-disks/victim.img",
+        ),
+        (
+            "_servers/api.tar.gz",
+            "/var/lib/jkbase/db-backups/victim/b.tar.gz",
+        ),
+        ("_sites.json", victim),
+    ] {
+        let body = artifact_with_links(&[("index.html", "v2")], &[(name, target)]);
+        let r = h.deploy_raw(body).await;
+        assert_eq!(
+            r.status().as_u16(),
+            409,
+            "symlink at {name} must be refused"
+        );
+        let text = r.text().await.unwrap();
+        assert!(text.contains("symlink"), "{name}: {text}");
+        assert!(
+            same(&h.live_target(), &h.version_dir(1)),
+            "{name}: live must stay on v1"
+        );
+        assert_eq!(h.current_version(), Some(1));
+        assert!(!h.version_dir(2).exists(), "{name}: refused tree removed");
+    }
+    assert_eq!(
+        h.prechecked.lock().unwrap().len(),
+        1,
+        "refused before the precheck"
+    );
+
+    // Guest-only links: a server rootfs and static-site content.
+    let body = artifact_with_links(
+        &[("index.html", "v2"), ("_servers/web/etc/hostname", "web")],
+        &[
+            ("_servers/web/bin/sh", "/bin/busybox"),
+            ("assets/latest.js", "app.js"),
+        ],
+    );
+    let r = h.deploy_raw(body).await;
+    assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+    assert_eq!(h.current_version(), Some(2));
+}
+
+/// Retained versions may predate the activation check, so a rollback re-validates its target.
+#[tokio::test]
+async fn rollback_refuses_a_target_with_sidecar_symlinks() {
+    let h = spawn("rollback-symlink").await;
+    for body in ["v1", "v2"] {
+        let r = h.deploy(&[("index.html", body)]).await;
+        assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+    }
+    std::os::unix::fs::symlink("/etc/passwd", h.version_dir(1).join("_database.json")).unwrap();
+
+    let r = h.rollback(1).await;
+    assert_eq!(r.status().as_u16(), 409);
+    assert!(same(&h.live_target(), &h.version_dir(2)));
+    assert_eq!(h.current_version(), Some(2));
+    assert_eq!(*h.deployed.lock().unwrap(), vec![1, 2]);
 }
