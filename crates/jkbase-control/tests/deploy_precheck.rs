@@ -512,3 +512,107 @@ async fn callback_refusal_of_a_first_deploy_leaves_nothing_live() {
     assert!(h.history().is_empty());
     assert!(!h.version_dir(1).exists());
 }
+
+/// A gzipped tarball (bytes) of `files` + symlink `links` — the inner rootfs archive.
+fn inner_tarball(files: &[(&str, &str)], links: &[(&str, &str)]) -> Vec<u8> {
+    artifact_with_links(files, links)
+}
+
+/// Like [`artifact_with_links`], plus raw binary file entries.
+fn artifact_with_blobs(files: &[(&str, &str)], blobs: &[(&str, &[u8])]) -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    for (name, body) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, name, body.as_bytes()).unwrap();
+    }
+    for (name, body) in blobs {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        tar.append_data(&mut h, name, *body).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap()
+}
+
+/// Rootfs extraction adds tenant-shaped entries AFTER the first validation: a server name of
+/// `..`/`.`/empty would aim it at the deployment root or `_servers/` itself and plant symlinked
+/// sidecars there. Such names are refused, the tree is re-validated after extraction, and a
+/// plain name still extracts (its guest-only links intact).
+#[tokio::test]
+async fn rootfs_extraction_cannot_plant_sidecar_symlinks() {
+    let h = spawn("rootfs-escape").await;
+    let ok = h.deploy(&[("index.html", "v1")]).await;
+    assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
+
+    let evil = inner_tarball(
+        &[],
+        &[("_database", "/var/lib/jkbase/hosting/victim/live/_database")],
+    );
+    for name in [
+        "_servers/...tar.gz",
+        "_servers/..tar.gz",
+        "_servers/.tar.gz",
+    ] {
+        let body = artifact_with_blobs(&[("index.html", "v2")], &[(name, &evil)]);
+        let r = h.deploy_raw(body).await;
+        assert_eq!(r.status().as_u16(), 409, "{name} must be refused");
+        assert!(
+            same(&h.live_target(), &h.version_dir(1)),
+            "{name}: live stays on v1"
+        );
+        assert!(!h.version_dir(2).exists(), "{name}: refused tree removed");
+    }
+
+    let rootfs = inner_tarball(&[("etc/hostname", "web")], &[("bin/sh", "/bin/busybox")]);
+    let body = artifact_with_blobs(&[("index.html", "v2")], &[("_servers/web.tar.gz", &rootfs)]);
+    let r = h.deploy_raw(body).await;
+    assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+    let sh = h.version_dir(2).join("_servers/web/bin/sh");
+    assert!(
+        std::fs::symlink_metadata(&sh)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!h.version_dir(2).join("_servers/web.tar.gz").exists());
+}
+
+/// Schema push clones the live tree (recreating its links) and writes the new SDL under
+/// `_database/`; a live tree with a symlinked `_database` (one predating activation's check)
+/// must be refused BEFORE that write, or it lands in another tenant's tree as root.
+#[tokio::test]
+async fn schema_push_refuses_a_live_tree_with_a_symlinked_database_dir() {
+    let h = spawn("schema-symlink").await;
+    let ok = h
+        .deploy(&[
+            ("index.html", "v1"),
+            ("_database.json", r#"{"engine":"rhypedb"}"#),
+        ])
+        .await;
+    assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
+
+    // A victim's schema outside this tree, and a `_database` link to it planted in v1.
+    let victim = h.deploy_dir.join("victim").join("_database");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("schema.rhype"), "victim").unwrap();
+    std::os::unix::fs::symlink(&victim, h.version_dir(1).join("_database")).unwrap();
+
+    let r = reqwest::Client::new()
+        .post(format!("http://{}/projects/app/db/schema", h.addr))
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({ "sdl": "type Evil {}" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409, "{}", r.text().await.unwrap());
+    assert_eq!(
+        std::fs::read_to_string(victim.join("schema.rhype")).unwrap(),
+        "victim"
+    );
+    assert_eq!(h.current_version(), Some(1));
+}

@@ -369,6 +369,59 @@ fn validate_deployment_tree(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Unpack each `_servers/<name>.tar.gz` into `_servers/<name>/`. `<name>` is tenant-chosen, so it
+/// must be a plain server name: `_servers/...tar.gz` would otherwise extract into `_servers/..`
+/// (the deployment ROOT) and plant symlinked sidecars after [`validate_deployment_tree`] ran.
+/// tar-rs keeps every entry inside its destination, so a safe `<name>` confines the archive to
+/// that guest-only rootfs dir. The list is taken before extracting, so nothing an archive adds
+/// is itself opened, and only regular files are opened.
+fn extract_server_rootfs(servers_dir: &std::path::Path) -> anyhow::Result<()> {
+    if !std::fs::symlink_metadata(servers_dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    let mut tarballs = Vec::new();
+    for entry in std::fs::read_dir(servers_dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "gz") {
+            tarballs.push(path);
+        }
+    }
+    for path in tarballs {
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let name = file_name.strip_suffix(".tar.gz").unwrap_or_default();
+        let plain = !name.is_empty()
+            && name.len() <= 64
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+        if !plain || name.contains("..") {
+            return Err(DeployRefused(format!(
+                "server rootfs archive `_servers/{file_name}` has an invalid server name"
+            ))
+            .into());
+        }
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            return Err(
+                DeployRefused(format!("`_servers/{file_name}` is not a regular file")).into(),
+            );
+        }
+        let extract_dir = servers_dir.join(name);
+        info!(server = %name, "extracting server rootfs on host");
+        std::fs::create_dir_all(&extract_dir)?;
+        let file = std::fs::File::open(&path)?;
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(gz);
+        archive.set_preserve_permissions(true);
+        archive.unpack(&extract_dir)?;
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
 /// Run the server's refusal checks against `deployment_dir` (see [`DeployPrecheckCallback`]).
 async fn precheck_deployment(
     state: &AppState,
@@ -2189,29 +2242,13 @@ async fn activate_deployment(
         return Err(e);
     }
 
-    // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM)
-    let servers_dir = deploy_path.join("_servers");
-    if servers_dir.exists() {
-        for entry in std::fs::read_dir(&servers_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "gz") {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.strip_suffix(".tar"))
-                    .unwrap_or("unknown");
-                let extract_dir = servers_dir.join(name);
-                info!(server = %name, "extracting server rootfs on host");
-                std::fs::create_dir_all(&extract_dir)?;
-                let file = std::fs::File::open(&path)?;
-                let gz = flate2::read::GzDecoder::new(file);
-                let mut archive = tar::Archive::new(gz);
-                archive.set_preserve_permissions(true);
-                archive.unpack(&extract_dir)?;
-                std::fs::remove_file(&path)?;
-            }
-        }
+    // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM), then
+    // re-validate: extraction is the one host step that ADDS tenant-shaped entries to the tree.
+    if let Err(e) = extract_server_rootfs(&deploy_path.join("_servers"))
+        .and_then(|()| validate_deployment_tree(&deploy_path))
+    {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(e);
     }
 
     // Storage hard cap: bill the would-be-live footprint — content image + data
@@ -4972,7 +5009,7 @@ async fn db_schema_apply(
     // Serialize with deploy/build/rollback (409 on contention) — held for the whole redeploy.
     // Acquire the lock BEFORE reading `current_version`, then re-read the project FRESH under it,
     // so a concurrent deploy that advanced the version can't be clobbered by a stale snapshot
-    // (activate_deployment derives v{N} from current_version). Mirrors run_build_job's re-read.
+    // (activate_deployment derives v{N} from current_version + history). Mirrors run_build_job's re-read.
     // [adversarial-review: schema-redeploy TOCTOU]
     let _guard = match DeployLockGuard::try_acquire(&state, &id) {
         Some(g) => g,
@@ -5018,6 +5055,18 @@ async fn db_schema_apply(
     };
 
     let prev_deploy_path = proj_dir.join("deployments").join(format!("v{prev_version}"));
+    // The clone below recreates the tree's symlinks and the SDL write lands under `_database/`:
+    // a symlinked `_database` (a tree predating activation's check) would aim that root-privileged
+    // remove+write at another tenant's schema. Validate BEFORE cloning, not just at activation.
+    if let Err(e) = validate_deployment_tree(&prev_deploy_path) {
+        return (
+            deploy_error_status(&e),
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
     let staged = proj_dir.join(format!(".staging-schema-{}", auth::timestamp()));
     let _ = std::fs::remove_dir_all(&staged);
     if let Err(e) = hardlink_clone_dir(&prev_deploy_path, &staged) {
