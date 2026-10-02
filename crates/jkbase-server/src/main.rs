@@ -946,6 +946,24 @@ impl Incarnations {
     fn is_current(&self, id: &str, marker: u64) -> bool {
         self.current.get(id) == Some(&marker)
     }
+    /// No VM is committed at `id` (retired, and nothing has recommitted yet).
+    fn is_vacant(&self, id: &str) -> bool {
+        !self.current.contains_key(id)
+    }
+}
+
+/// A superseded hibernate's ONLY write: if its VM was retired and nothing has recommitted (the
+/// superseder failed or is still booting), the `Hibernating` it set is still its own — a newer
+/// incarnation's hibernate needs a commit first — so settle it to `Hibernated` (no snapshot meta ⇒
+/// the next wake cold-boots), as `force_stop_and_cleanup` would. Left alone it would wedge the id:
+/// wakes time out waiting on it and deploys wait it out then fail. Anything else is not ours.
+fn settle_superseded_hibernate(plat: &mut PlatformState, id: &str) {
+    if plat.vm_incarnations.is_vacant(id)
+        && plat.vm_states.get(id) == Some(&VmLifecycle::Hibernating)
+    {
+        plat.vm_states
+            .insert(id.to_string(), VmLifecycle::Hibernated);
+    }
 }
 
 struct PlatformState {
@@ -4248,13 +4266,14 @@ async fn hibernate_project(
 
     // Superseded mid-snapshot (redeploy / teardown / self-fence retired our incarnation while the
     // lock was down): the id's disk token, VM handle, lifecycle and snapshot meta are no longer
-    // ours. Our FC is already dead (hibernate kills it), so touch NOTHING — releasing the token
+    // ours. Our FC is already dead (hibernate kills it), so touch nothing else — releasing the token
     // would detach a newer live FC's disk, and `Hibernated` + this snapshot would clobber its
     // `Running` and later restore stale RAM against its disk. The snapshot files we just wrote
     // are inert without meta (a wake only restores via meta).
     if !plat.vm_incarnations.is_current(project_id, incarnation) {
         tracing::warn!(project = %project_id,
             "VM superseded mid-hibernate; leaving the newer incarnation's state untouched");
+        settle_superseded_hibernate(&mut plat, project_id);
         return Ok(());
     }
 
@@ -6684,9 +6703,10 @@ async fn finish_adoption(
 /// as Hibernated-with-no-snapshot, so the next request cold-boots cleanly.
 ///
 /// `incarnation`: `Some(n)` when acting for a specific VM (a hibernate that dropped the lock) —
-/// if `n` is no longer current, a newer incarnation (or a teardown) owns the id and this is a
-/// no-op: the pkill/TAP-teardown/token-release below are id-keyed and would hit the NEWER VM. The
-/// caller has already stopped its own FC. `None` = unconditional (the shutdown last resort).
+/// if `n` is no longer current, a newer incarnation (or a teardown) owns the id and this only
+/// settles our own leftover `Hibernating` ([`settle_superseded_hibernate`]): the pkill/TAP-teardown/
+/// token-release below are id-keyed and would hit the NEWER VM. The caller has already stopped its
+/// own FC. `None` = unconditional (the shutdown last resort).
 async fn force_stop_and_cleanup(
     project_id: &str,
     platform: &Arc<Mutex<PlatformState>>,
@@ -6698,6 +6718,7 @@ async fn force_stop_and_cleanup(
     {
         tracing::warn!(project = %project_id,
             "VM superseded mid-hibernate; skipping force-stop cleanup of the newer incarnation");
+        settle_superseded_hibernate(&mut plat, project_id);
         return;
     }
 
@@ -7439,10 +7460,13 @@ mod tests {
         assert!(inc.is_current("p.db", captured));
 
         // boot_db_vm's supersede retires the paused VM's incarnation…
+        assert!(!inc.is_vacant("p.db"));
         inc.retire("p.db");
         assert!(!inc.is_current("p.db", captured), "superseded, not yet recommitted");
+        assert!(inc.is_vacant("p.db"), "the stale hibernate may settle its own Hibernating");
         // …then commits the new boot.
         let new = inc.commit("p.db");
+        assert!(!inc.is_vacant("p.db"), "a newer incarnation's state is off-limits");
         assert_ne!(new, captured);
         assert!(!inc.is_current("p.db", captured), "a newer incarnation owns the id");
         assert!(inc.is_current("p.db", new));
