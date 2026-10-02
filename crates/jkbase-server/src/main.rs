@@ -1780,6 +1780,17 @@ async fn async_main() -> Result<()> {
         )
     }));
 
+    let platform_for_precheck = platform.clone();
+    state.deploy_precheck_callback = Some(Box::new(
+        move |project_id: String, deployment_dir: PathBuf| {
+            let platform = platform_for_precheck.clone();
+            Box::pin(async move {
+                let plat = platform.lock().await;
+                deploy_refusal(&plat, &project_id, &deployment_dir).await
+            })
+        },
+    ));
+
     let platform_for_teardown = platform.clone();
     state.teardown_callback = Some(Box::new(move |project_id: String| {
         let platform = platform_for_teardown.clone();
@@ -3235,6 +3246,96 @@ fn discover_uplink_ips() -> Vec<String> {
     }
 }
 
+/// Why a deployment tree must not go live — pure policy over the store + the tree, never touching
+/// the running VM. Runs twice: from the control plane's `deploy_precheck_callback` against the NEW
+/// tree BEFORE the `live` swap (so a refused version never becomes what the next
+/// wake/restart/resume boots), and in [`handle_deploy`] against `live` before teardown.
+async fn deploy_refusal(
+    plat: &PlatformState,
+    project_id: &str,
+    deployment_dir: &Path,
+) -> Result<()> {
+    // HA P3: only the OWNER host may deploy a project. On a single node every project is
+    // local (unplaced / owned by this host), so this is a no-op; in a cluster a deploy that
+    // reached a non-owner fails closed (retry) rather than booting a second owner.
+    {
+        let me = plat.host_id.clone();
+        let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+        let hosts = plat.store.list_hosts().unwrap_or_default();
+        let now = jkbase_control::auth::timestamp();
+        match deploy_target(
+            alloc.as_ref(),
+            &hosts,
+            &me,
+            now,
+            DEAD_HOST_THRESHOLD.as_secs(),
+        ) {
+            DeployTarget::Local => {}
+            DeployTarget::Remote { host_id, addr } => anyhow::bail!(
+                "project {project_id} is owned by host {host_id} ({}); the deploy must run there \
+                 (cross-host deploy forwarding not yet wired)",
+                addr.as_deref().unwrap_or("addr unknown")
+            ),
+            DeployTarget::OwnerDead { host_id } => anyhow::bail!(
+                "project {project_id}'s owner host {host_id} is down; the reconciler will reassign \
+                 it — retry the deploy shortly"
+            ),
+        }
+    }
+
+    // [R4] Refuse an in-place managed-DB TIER FLIP (colocated↔dedicated). Flipping the tier between
+    // deploys would strand the existing DB data on the OLD tier's disk (colocated data on the app
+    // VM's `{id}.img`; dedicated data on the sibling `{id}.db.img`) and silently start an EMPTY DB
+    // (or orphan the sibling DB VM) — apparent total data loss on a config toggle. The tenant
+    // migrates explicitly: back up, recreate at the new tier, restore. (First flip of a pre-P2
+    // project that never recorded a tier is not caught — dedicated is unreleased, so no such data
+    // exists yet.) A store read error fails open, as before.
+    let prior = plat.store.get_deployed_tier(project_id).ok().flatten();
+    if let Some(msg) = tier_flip_refusal(
+        project_id,
+        prior.as_deref(),
+        deployment_db_tier(deployment_dir),
+    ) {
+        anyhow::bail!(msg);
+    }
+    Ok(())
+}
+
+/// [R4] The refusal message for deploying a tree at managed-DB tier `new_tier` over the recorded
+/// `prior` tier, or `None` when it may proceed. Only guards when BOTH declare a managed DB:
+/// adding/removing `[database]` entirely, or a project that never had one, is not a data-stranding
+/// flip, so a plain project newly adding a dedicated DB is never refused.
+fn tier_flip_refusal(
+    project_id: &str,
+    prior: Option<&str>,
+    new_tier: Option<&str>,
+) -> Option<String> {
+    match (prior, new_tier) {
+        (Some(prior), Some(new_tier)) if prior != new_tier => Some(format!(
+            "project {project_id}: changing the managed-database [database] tier in place \
+             ({prior} → {new_tier}) is not supported — it would strand your existing database \
+             (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
+             project at the new tier and restore into it."
+        )),
+        _ => None,
+    }
+}
+
+/// The managed-DB tier (`"dedicated"` / `"colocated"`) a deployment tree declares, or `None` when
+/// it declares no managed DB. Same host-baked `_database.json` reads as
+/// [`check_project_has_database`] / [`project_is_dedicated`], against any tree (the not-yet-live
+/// one, for the pre-swap precheck).
+fn deployment_db_tier(deployment_dir: &Path) -> Option<&'static str> {
+    if !deployment_has_database(deployment_dir) {
+        return None;
+    }
+    Some(if deployment_is_dedicated(deployment_dir) {
+        "dedicated"
+    } else {
+        "colocated"
+    })
+}
+
 async fn handle_deploy(
     project_id: &str,
     platform: Arc<Mutex<PlatformState>>,
@@ -3271,61 +3372,11 @@ async fn handle_deploy(
         }
     };
 
-    // HA P3: only the OWNER host may deploy a project. On a single node every project is
-    // local (unplaced / owned by this host), so this is a no-op; in a cluster a deploy that
-    // reached a non-owner fails closed (retry) rather than booting a second owner.
-    {
-        let me = plat.host_id.clone();
-        let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
-        let hosts = plat.store.list_hosts().unwrap_or_default();
-        let now = jkbase_control::auth::timestamp();
-        match deploy_target(
-            alloc.as_ref(),
-            &hosts,
-            &me,
-            now,
-            DEAD_HOST_THRESHOLD.as_secs(),
-        ) {
-            DeployTarget::Local => {}
-            DeployTarget::Remote { host_id, addr } => anyhow::bail!(
-                "project {project_id} is owned by host {host_id} ({}); the deploy must run there \
-                 (cross-host deploy forwarding not yet wired)",
-                addr.as_deref().unwrap_or("addr unknown")
-            ),
-            DeployTarget::OwnerDead { host_id } => anyhow::bail!(
-                "project {project_id}'s owner host {host_id} is down; the reconciler will reassign \
-                 it — retry the deploy shortly"
-            ),
-        }
-    }
-
-    // [R4] Refuse an in-place managed-DB TIER FLIP (colocated↔dedicated) BEFORE any teardown, so a
-    // refused deploy leaves the running VM untouched. Flipping the tier between deploys would
-    // strand the existing DB data on the OLD tier's disk (colocated data on the app VM's
-    // `{id}.img`; dedicated data on the sibling `{id}.db.img`) and silently start an EMPTY DB (or
-    // orphan the sibling DB VM) — apparent total data loss on a config toggle. We only guard when
-    // BOTH the recorded prior deploy and the new deploy declare a managed DB (adding/removing
-    // `[database]` entirely, or a project that never had one, is not a data-stranding flip), so a
-    // plain project newly adding a dedicated DB is never refused. The tenant migrates explicitly:
-    // back up, recreate at the new tier, restore. (First flip of a pre-P2 project that never
-    // recorded a tier is not caught — dedicated is unreleased, so no such data exists yet.)
-    if check_project_has_database(&plat.data_dir, project_id) {
-        let new_tier = if project_is_dedicated(&plat.data_dir, project_id) {
-            "dedicated"
-        } else {
-            "colocated"
-        };
-        if let Ok(Some(prior)) = plat.store.get_deployed_tier(project_id)
-            && prior != new_tier
-        {
-            anyhow::bail!(
-                "project {project_id}: changing the managed-database [database] tier in place \
-                 ({prior} → {new_tier}) is not supported — it would strand your existing database \
-                 (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
-                 project at the new tier and restore into it."
-            );
-        }
-    }
+    // The refusals the control plane already ran against this tree before swapping `live` to it
+    // (`deploy_precheck_callback`), re-checked here under the platform lock as the last line
+    // before teardown: a refused deploy must leave the running VM untouched.
+    let live_dir = plat.data_dir.join("hosting").join(project_id).join("live");
+    deploy_refusal(&plat, project_id, &live_dir).await?;
 
     // A deploy/rollback supersedes any prior snapshot UNCONDITIONALLY — not only when
     // `Hibernated`. A VM that was restored-then-Running still carries its snapshot (restore
@@ -5939,12 +5990,12 @@ fn check_project_has_volumes(data_dir: &Path, project_id: &str) -> bool {
 /// without it the DB would write to the ephemeral overlay tmpfs and lose data. Mirrors
 /// [`check_project_has_volumes`] (reads the live deployment, set before this boot).
 fn check_project_has_database(data_dir: &Path, project_id: &str) -> bool {
-    data_dir
-        .join("hosting")
-        .join(project_id)
-        .join("live")
-        .join("_database.json")
-        .exists()
+    deployment_has_database(&data_dir.join("hosting").join(project_id).join("live"))
+}
+
+/// [`check_project_has_database`] for any deployment tree.
+fn deployment_has_database(deployment_dir: &Path) -> bool {
+    deployment_dir.join("_database.json").exists()
 }
 
 /// The VM id the DB reach plane (external `:443` edge, console query/schema/status, backup relay)
@@ -5966,12 +6017,12 @@ fn db_reach_target_vm(data_dir: &Path, project_id: &str) -> String {
 /// has no `hosting/<id>.db/`). A missing file / absent-or-other tier ⇒ co-located (the default),
 /// so this is fail-safe: only an explicit `"dedicated"` opts a project into the second VM.
 fn project_is_dedicated(data_dir: &Path, project_id: &str) -> bool {
-    let path = data_dir
-        .join("hosting")
-        .join(project_id)
-        .join("live")
-        .join("_database.json");
-    std::fs::read_to_string(&path)
+    deployment_is_dedicated(&data_dir.join("hosting").join(project_id).join("live"))
+}
+
+/// [`project_is_dedicated`] for any deployment tree.
+fn deployment_is_dedicated(deployment_dir: &Path) -> bool {
+    std::fs::read_to_string(deployment_dir.join("_database.json"))
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| {
@@ -7966,6 +8017,53 @@ mod tests {
             assert!(!project_is_dedicated(&data, id), "{id} must be co-located");
             assert_eq!(db_reach_target_vm(&data, id), id);
         }
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// [R4] The tier-flip refusal judges the tree being ACTIVATED, not `live`: the control plane
+    /// prechecks the new `deployments/v{N}` before swapping `live` to it, so `live` still names
+    /// the previous version when the check runs. Judging `live` there would wave every flip
+    /// through (prior == live's tier) and the refused tree would go live.
+    #[test]
+    fn tier_flip_is_judged_against_the_new_tree() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data = std::env::temp_dir().join(format!("jkbase-tierflip-{nanos}"));
+        let proj = data.join("hosting").join("p");
+        let tree = |v: u64, db: Option<&str>| {
+            let dir = proj.join("deployments").join(format!("v{v}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(json) = db {
+                std::fs::write(dir.join("_database.json"), json).unwrap();
+            }
+            dir
+        };
+        let v1 = tree(1, Some(r#"{"engine":"rhypedb","tier":"dedicated"}"#));
+        let v2 = tree(2, Some(r#"{"engine":"rhypedb"}"#));
+        let v3 = tree(3, None);
+        std::os::unix::fs::symlink(&v1, proj.join("live")).unwrap();
+
+        // `live` (v1) is dedicated; the new tree (v2) is co-located.
+        assert!(project_is_dedicated(&data, "p"));
+        assert_eq!(deployment_db_tier(&v1), Some("dedicated"));
+        assert_eq!(deployment_db_tier(&v2), Some("colocated"));
+        assert_eq!(deployment_db_tier(&v3), None);
+
+        // Recorded dedicated → new co-located tree is refused; the message names both tiers.
+        let msg = tier_flip_refusal("p", Some("dedicated"), deployment_db_tier(&v2))
+            .expect("dedicated → colocated must be refused");
+        assert!(msg.contains("dedicated → colocated"), "{msg}");
+        assert!(
+            tier_flip_refusal("p", Some("colocated"), deployment_db_tier(&v1)).is_some(),
+            "colocated → dedicated must be refused"
+        );
+        // Same tier, no recorded tier, or no DB in the new tree: not a data-stranding flip.
+        assert!(tier_flip_refusal("p", Some("dedicated"), deployment_db_tier(&v1)).is_none());
+        assert!(tier_flip_refusal("p", None, deployment_db_tier(&v2)).is_none());
+        assert!(tier_flip_refusal("p", Some("dedicated"), deployment_db_tier(&v3)).is_none());
 
         let _ = std::fs::remove_dir_all(&data);
     }
