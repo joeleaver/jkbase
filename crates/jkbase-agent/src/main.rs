@@ -132,9 +132,14 @@ fn mount_data_disk(device: Option<&str>) {
 
     let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, ptr::null()) };
     if ret == 0 {
-        if let Err(e) = grow_data_fs(device, target) {
-            eprintln!("data disk: online grow failed (keeping the current size): {e}");
-        }
+        // Off the boot path: a big grow zeroes new inode tables (~1.5% of the added size) and
+        // must not stall agent readiness. ext4 online resize is safe under concurrent writers.
+        let dev = device.to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = grow_data_fs(&dev, target) {
+                eprintln!("data disk: online grow failed (keeping the current size): {e}");
+            }
+        });
         let _ = std::fs::create_dir_all("/mnt/data/volumes");
     } else {
         eprintln!(
@@ -147,7 +152,7 @@ fn mount_data_disk(device: Option<&str>) {
 /// Grow the mounted data-disk ext4 online to fill its device. The host only ever extends the
 /// backing device when `[database].size` is raised — growing the filesystem is the guest's job,
 /// because the host must never parse a guest filesystem. A no-op when the fs already fills the
-/// device (the kernel returns early); runs before any tenant process exists.
+/// device (the kernel returns early).
 fn grow_data_fs(device: &str, mountpoint: &str) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     const BLKGETSIZE64: u32 = 0x8008_1272; // _IOR(0x12, 114, u64)

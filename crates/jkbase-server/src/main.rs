@@ -3624,7 +3624,7 @@ async fn handle_deploy(
     // any prior writer. Held by an RAII guard until the VM is up, so a boot failure (or
     // a cancelled future) releases the lease instead of bricking the project.
     let disk_guard = if has_disk {
-        let disk_mib = data_disk_mib_for(&data_dir, project_id, disk_cap);
+        let disk_mib = data_disk_mib_for(&data_dir, project_id, !dedicated, disk_cap);
         Some(fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?)
     } else {
         None
@@ -3871,7 +3871,7 @@ async fn boot_db_vm(
 
     // Fence the DB VM's OWN data disk (`{id}.db.img`), sized from the BASE project's
     // `_database.json` (`[database].size`). The `.db` scope is validator-legal (F1).
-    let disk_mib = data_disk_mib_for(&data_dir, project_id, disk_cap);
+    let disk_mib = data_disk_mib_for(&data_dir, project_id, true, disk_cap);
     let disk_guard = fence_data_disk(&dd, &ls, &hid, &db_id, disk_mib).await?;
 
     let db_size = vm_identity::vm_size_for(vm_identity::VmRole::Db);
@@ -4572,7 +4572,8 @@ async fn wake_project_inner(
     let disk_guard = if has_disk {
         // Size from the BASE project's `_database.json` ([database].size) — the DB VM has no
         // `hosting/<id>.db/` — but fence the disk under the RENDERED id (`{id}.db.img`), its own.
-        let disk_mib = data_disk_mib_for(&data_dir, base_pid, disk_cap);
+        let holds_db = vm_role == vm_identity::VmRole::Db || !dedicated;
+        let disk_mib = data_disk_mib_for(&data_dir, base_pid, holds_db, disk_cap);
         let g = fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?;
         config.data_disk_path = Some(g.device());
         // A grown disk can't be restored onto: the snapshot's guest believes the old size and
@@ -5875,7 +5876,8 @@ async fn fence_attach(
 ) -> Result<(PathBuf, Ensured)> {
     // `ensure` is grow-or-create and NEVER shrinks, so a re-sized `[database].size`
     // grows the disk on the next boot and a smaller value is a safe no-op (no data loss).
-    // Runs before attach, so the device is never resized under a live writer.
+    // Runs before `attach_rwo`'s live-writer check, but a grow under a still-live prior writer
+    // is harmless: its loop binding keeps the old capacity, and attach binds a fresh one.
     let ensured = data_disk
         .ensure(project_id, disk_mib * 1024 * 1024)
         .await
@@ -6140,7 +6142,13 @@ mod l4_port_decl_tests {
 /// Capped at the project's storage quota (`cap_bytes`): `size` is tenant input and the disk
 /// is real host capacity the guest can fill between deploys, while the quota is otherwise only
 /// checked at deploy time. A larger `size` is clamped, not refused, so the project still boots.
-fn data_disk_mib_for(data_dir: &Path, project_id: &str, cap_bytes: u64) -> u64 {
+///
+/// `holds_db`: whether this disk holds the managed DB (the DB VM's, or a co-located app VM's).
+/// A dedicated project's app-VM disk only carries its own volumes, so it stays at the default.
+fn data_disk_mib_for(data_dir: &Path, project_id: &str, holds_db: bool, cap_bytes: u64) -> u64 {
+    if !holds_db {
+        return DATA_DISK_MIB;
+    }
     let path = data_dir
         .join("hosting")
         .join(project_id)
@@ -7309,17 +7317,20 @@ mod tests {
             std::fs::write(live.join("_database.json"), format!(r#"{{"size_mib": {mib}}}"#)).unwrap()
         };
         // No `_database.json` → the default.
-        assert_eq!(data_disk_mib_for(&root, "p", 16 * gib), DATA_DISK_MIB);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), DATA_DISK_MIB);
         set(8192);
-        assert_eq!(data_disk_mib_for(&root, "p", 16 * gib), 8192);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 8192);
         // Too small → floored at the default.
         set(10);
-        assert_eq!(data_disk_mib_for(&root, "p", 16 * gib), DATA_DISK_MIB);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), DATA_DISK_MIB);
         // Tenant-declared size beyond the storage quota → clamped to the quota.
         set(1024 * 1024 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p", 16 * gib), 16 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 16 * 1024);
         // A quota below the default never shrinks a disk below the platform floor.
-        assert_eq!(data_disk_mib_for(&root, "p", 1), DATA_DISK_MIB);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 1), DATA_DISK_MIB);
+        // A dedicated project's app-VM disk doesn't hold the DB → default, whatever `size` says.
+        set(8192);
+        assert_eq!(data_disk_mib_for(&root, "p", false, 16 * gib), DATA_DISK_MIB);
         let _ = std::fs::remove_dir_all(&root);
     }
 
