@@ -15,8 +15,15 @@
 //! - **Reserved** ([`project_reserved_bytes`]): a disk at its full LOGICAL size — what its guest
 //!   can fill between checks with no host in the loop. Every quota CHECK uses this view, so the
 //!   quota bounds host capacity even if a tenant fills its disks after the check, and filling a
-//!   disk can never newly push a project over its cap (freed guest blocks aren't returned to a
-//!   sparse image — the guest disk has no discard — so an allocated-blocks cap would only ratchet).
+//!   data disk can never newly push a project over its cap (freed guest blocks aren't returned to
+//!   a sparse image — the guest disk has no discard — so an allocated-blocks cap would only
+//!   ratchet).
+//!
+//! Known gaps, both bounded: build-cache images (`buildcache/{id}/*.img`) are also guest-fillable
+//! (by the build VM's fetch phase) but count by allocated blocks in both views — reserving each
+//! at its multi-GiB size would eat most default quotas; and an object upload still streaming is
+//! only in the object store's in-memory reservation (a TTL-bounded soft cap), which a disk sized
+//! meanwhile doesn't see.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -72,7 +79,8 @@ pub fn project_reserved_bytes_for(data_dir: &Path, project_id: &str, deployment_
 /// The footprint is the would-be-live [`project_reserved_bytes_for`]. Refused only when it exceeds
 /// `cap` AND grows the project past what is live now: a project already over its cap (quota
 /// lowered, or disks sized before the cap counted them all) may still ship a deploy that doesn't
-/// grow it — refusing would lock it out of shipping fixes while bounding nothing.
+/// grow it — refusing would lock it out of shipping fixes while bounding nothing. (Such a project
+/// can trade freed object bytes for deployment bytes; its total still never grows.)
 pub fn deploy_exceeds_cap(
     data_dir: &Path,
     project_id: &str,
