@@ -9,7 +9,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use http_body_util::BodyExt;
 use jkbase_common::routing::DomainTarget;
@@ -56,6 +56,14 @@ pub type DbBackupCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 /// platform store and push it to the agent, which untars it and respawns rhypedb with
 /// `RHYPEDB_RESTORE_FROM`. Fire-and-forget (the server impl spawns the executor).
 pub type DbRestoreCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+
+/// Destroy a project's dedicated-tier DB VM (`{id}.db`) and its data disk `{id}.db.img` — the
+/// tenant's explicit, irreversible reclaim of a dedicated database (e.g. one stranded when the
+/// project left the dedicated tier, which no deploy will ever reap on its own). Resolves to
+/// whether there was anything to drop. A co-located DB lives on the app VM's own disk and is
+/// never touched. The server binary provides the impl (mirrors [`TeardownCallback`]).
+pub type DbDropCallback =
+    Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>> + Send + Sync>;
 
 /// A read/write op the console DB tools forward to the project's managed DB. Each maps to
 /// exactly ONE route on rhypedb's OPEN loopback HTTP plane (`/query`, `/schema`, `/status`);
@@ -206,6 +214,8 @@ pub struct AppState {
     /// Proxies a console DB read/write to the in-VM DB's open loopback HTTP plane (query /
     /// schema / status). `None` ⇒ the console DB tools are disabled (`… /db/query` → 503).
     pub db_query_callback: Option<DbQueryCallback>,
+    /// Drops a project's dedicated DB VM + disk (`DELETE … /db/dedicated`). `None` ⇒ 503.
+    pub db_drop_callback: Option<DbDropCallback>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     /// Optional platform-operator admin token (jkbase-server `--admin-token`).
@@ -295,6 +305,7 @@ impl AppState {
             db_backup_callback: None,
             db_restore_callback: None,
             db_query_callback: None,
+            db_drop_callback: None,
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -437,6 +448,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/db/query", post(db_query))
         .route("/projects/{id}/db/schema", get(db_schema).post(db_schema_apply))
         .route("/projects/{id}/db/status", get(db_status))
+        .route("/projects/{id}/db/dedicated", delete(drop_dedicated_db))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
@@ -4379,6 +4391,70 @@ impl From<crate::store::DbBackup> for DbBackupResponse {
             status: b.status,
             manifest_summary: b.manifest_summary,
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct DropDedicatedDbRequest {
+    /// Must equal the project id — a destructive, irreversible op is never one stray request.
+    confirm: String,
+}
+
+#[derive(Serialize)]
+struct DropDedicatedDbResponse {
+    dropped: bool,
+}
+
+/// `DELETE /projects/{id}/db/dedicated` — irreversibly destroy the project's dedicated-tier DB
+/// VM and its data disk (`{id}.db.img`). Owner-scoped; the body must echo the project id. The
+/// one way to reclaim a dedicated DB disk short of deleting the project: leaving the dedicated
+/// tier keeps it (its data would otherwise be lost to a config edit), and it counts against the
+/// storage quota at its full size. Serialized against deploy/build/rollback on the per-project
+/// deploy lock, so a drop can't tear down a DB VM a concurrent deploy is booting.
+///
+/// Also clears a recorded `dedicated` deployed tier ([R4]): the data a later tier change would
+/// strand is gone, so back-up → drop → redeploy at the new tier → restore is a clean migration.
+/// If the live deployment still declares `tier = "dedicated"`, its DB is down until the next
+/// deploy boots a fresh, empty one.
+async fn drop_dedicated_db(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<DropDedicatedDbRequest>,
+) -> impl IntoResponse {
+    let err = |code: StatusCode, msg: String| (code, Json(ErrorResponse { error: msg }));
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    if req.confirm != id {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("refusing to drop: `confirm` must be the project id '{id}'"),
+        )
+        .into_response();
+    }
+    let Some(cb) = &state.db_drop_callback else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database drop is not available on this server".into(),
+        )
+        .into_response();
+    };
+    let Some(_lock) = DeployLockGuard::try_acquire(&state, &id) else {
+        return err(
+            StatusCode::CONFLICT,
+            format!("a deploy, build or rollback of '{id}' is in progress; retry when it finishes"),
+        )
+        .into_response();
+    };
+    match cb(id.clone()).await {
+        Ok(dropped) => {
+            if matches!(state.store.get_deployed_tier(&id), Ok(Some(t)) if t == "dedicated") {
+                let _ = state.store.delete_deployed_tier(&id);
+            }
+            Json(DropDedicatedDbResponse { dropped }).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

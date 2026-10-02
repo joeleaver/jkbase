@@ -267,6 +267,18 @@ pub enum DbCommand {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
+    /// Destroy the project's dedicated-tier database and its disk (DESTRUCTIVE, irreversible).
+    /// Frees the storage it reserves, e.g. after leaving the dedicated tier. A co-located
+    /// database is not affected.
+    Drop {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
     /// Restore the managed DB from a backup (DESTRUCTIVE — overwrites current data)
     Restore {
         /// Backup id (from `jkbase db backups`)
@@ -1331,6 +1343,11 @@ async fn run_db(cmd: DbCommand) -> anyhow::Result<()> {
         DbCommand::Proxy(args) => db_proxy::run(args).await,
         DbCommand::Backup { project, api } => run_db_backup(project, api).await,
         DbCommand::Backups { project, api } => run_db_backups(project, api).await,
+        DbCommand::Drop {
+            force,
+            project,
+            api,
+        } => run_db_drop(force, project, api).await,
         DbCommand::Restore {
             backup_id,
             force,
@@ -1522,6 +1539,54 @@ async fn run_db_restore(
             body["error"].as_str().unwrap_or("unknown error")
         );
     }
+}
+
+async fn run_db_drop(force: bool, project: Option<String>, api: String) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    if !force {
+        eprint!(
+            "This will PERMANENTLY DELETE the dedicated-tier database of project '{project_id}' \
+             and its disk. Back it up first (`jkbase db backup`) if you need the data.\n\
+             Type the project name to confirm: "
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != project_id {
+            anyhow::bail!("confirmation did not match; drop aborted");
+        }
+    }
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+
+    let resp = client
+        .delete(format!("{api}/projects/{project_id}/db/dedicated"))
+        .json(&serde_json::json!({ "confirm": project_id }))
+        .send()
+        .await
+        .context("failed to connect to API")?;
+    if !resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "failed to drop database: {}",
+            body["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if body["dropped"].as_bool().unwrap_or(false) {
+        println!(
+            "Dropped the dedicated database of project '{project_id}'. If jkbase.toml still \
+             declares `tier = \"dedicated\"`, the next deploy starts a fresh, empty one."
+        );
+    } else {
+        println!(
+            "Project '{project_id}' has no dedicated-tier database to drop (a co-located \
+             database lives on the app's own disk and was not touched)."
+        );
+    }
+    Ok(())
 }
 
 async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {

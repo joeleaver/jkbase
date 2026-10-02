@@ -1786,6 +1786,12 @@ async fn async_main() -> Result<()> {
         Box::pin(async move { handle_teardown(&project_id, &platform).await })
     }));
 
+    let platform_for_db_drop = platform.clone();
+    state.db_drop_callback = Some(Box::new(move |project_id: String| {
+        let platform = platform_for_db_drop.clone();
+        Box::pin(async move { drop_dedicated_db(&project_id, &platform).await })
+    }));
+
     // Build-pipeline wiring: control owns the `POST /build` funnel + build-job;
     // this server owns jkbase-orch + the jailer privilege, exposed via
     // `build_callback` (mirrors `deploy_callback`). The kernel is staged onto the
@@ -2653,6 +2659,25 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
     Ok(())
 }
 
+/// The tenant's explicit drop of its dedicated DB (`DELETE /projects/{id}/db/dedicated`; the
+/// control plane holds the per-project deploy lock around this). Reaps the sibling DB VM and its
+/// `{id}.db.img` disk via [`teardown_db_vm_sibling`]; resolves to whether there was anything to
+/// drop. The app VM and its disk (where a co-located DB lives) are never touched.
+async fn drop_dedicated_db(project_id: &str, platform: &Arc<Mutex<PlatformState>>) -> Result<bool> {
+    let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
+    let present = {
+        let plat = platform.lock().await;
+        plat.vms.contains_key(&db_id)
+            || plat.store.get_vm_allocation(&db_id)?.is_some()
+            || plat.data_disk.exists(&db_id).await.unwrap_or(false)
+    };
+    if present {
+        info!(project = %project_id, db_vm = %db_id, "dropping dedicated DB VM + disk (tenant request)");
+        teardown_db_vm_sibling(project_id, platform).await;
+    }
+    Ok(present)
+}
+
 /// Best-effort teardown of a project's **sibling DB VM** (`{project_id}.db`). Mirrors
 /// [`handle_teardown`]'s reap keyed by the rendered DB id: stop the VM, hard-kill any surviving
 /// Firecracker (BEFORE destroying its disk, so a live FC can't corrupt a reused loop device),
@@ -3323,6 +3348,21 @@ async fn handle_deploy(
                  ({prior} → {new_tier}) is not supported — it would strand your existing database \
                  (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
                  project at the new tier and restore into it."
+            );
+        }
+        // The record is dropped when a deploy removes `[database]`, but a dedicated DB's disk is
+        // NOT (its data would be lost to a config edit) — so dedicated → no DB → co-located would
+        // slip past the check above and strand that disk: unreachable, yet counted against the
+        // quota at full size. Detect it from the disk itself. `exists` errors fail open (the
+        // pre-guard behaviour) rather than block every deploy on a substrate hiccup.
+        let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
+        if new_tier == "colocated" && plat.data_disk.exists(&db_id).await.unwrap_or(false) {
+            anyhow::bail!(
+                "project {project_id}: a dedicated-tier managed database from an earlier deploy \
+                 still holds data on its own disk, and a co-located database would start empty \
+                 beside it. To keep it, redeploy with `tier = \"dedicated\"` (and back it up \
+                 before migrating); to discard it, run `jkbase db drop --project {project_id}`, \
+                 then redeploy."
             );
         }
     }
