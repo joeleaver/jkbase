@@ -7483,6 +7483,229 @@ mod tests {
         assert!(!inc.is_current("r", minted));
     }
 
+    /// On-box, real Firecracker: a dedicated-DB redeploy (`boot_db_vm`) lands while the DB VM is
+    /// mid-`hibernate_project` (lock dropped, paused FC still mapping the disk). Whatever order the
+    /// two settle in, the result must be ONE coherent incarnation: the new DB VM `Running`, its VM
+    /// handle + disk token present, that token still the live lease holder, the disk attached
+    /// exactly once, exactly one FC for the id, its agent serving, and no snapshot meta that a
+    /// later wake could restore over it. Pre-fix this broke: the supersede released the paused
+    /// FC's token, the fence reaped it, and hibernate's cleanup then tore down the new boot.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/.firecracker JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_BASELAYERS=/abs/.firecracker/baselayers \
+    ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity-cur.ext4 \
+    ///       <test-bin> --ignored --nocapture db_vm_redeploy_during_hibernate_onbox
+    ///
+    /// Needs the runtime bridge `jkbr0` at 172.16.0.1/24 (created + removed here if absent) and
+    /// `ebtables` (the TAP source-guard). `JKB_RACE_ROUNDS` (default 3) repeats the race.
+    #[tokio::test]
+    #[ignore = "on-box: needs KVM + root + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn db_vm_redeploy_during_hibernate_onbox() {
+        let env = |k: &str| std::env::var(k).ok().map(PathBuf::from);
+        let (Some(fc_data), Some(fc_release), Some(baselayers), Some(rootfs)) = (
+            env("JKB_DATA"),
+            env("JKB_FC_RELEASE"),
+            env("JKB_BASELAYERS"),
+            env("JKB_ROOTFS"),
+        ) else {
+            eprintln!("skip: set JKB_DATA, JKB_FC_RELEASE, JKB_BASELAYERS, JKB_ROOTFS");
+            return;
+        };
+        let rounds: usize = std::env::var("JKB_RACE_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let kernel = if fc_data.join("vmlinux.bin").exists() {
+            fc_data.join("vmlinux.bin")
+        } else {
+            fc_data.join("vmlinux-6.12.92.bin")
+        };
+
+        // Runtime bridge: setup_tap enslaves every TAP to jkbr0.
+        let made_bridge = !std::process::Command::new("ip")
+            .args(["link", "show", "jkbr0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if made_bridge {
+            run_cmd("ip", &["link", "add", "name", "jkbr0", "type", "bridge"])
+                .await
+                .unwrap();
+            run_cmd("ip", &["addr", "add", "172.16.0.1/24", "dev", "jkbr0"])
+                .await
+                .unwrap();
+            run_cmd("ip", &["link", "set", "jkbr0", "up"]).await.unwrap();
+        }
+
+        // A fresh data dir holding just what boot_db_vm reads: the BASE project's live tree (a
+        // DbOnly image needs only `_database.json` + schema) and the shared baselayers store.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("jkbase-dbrace-{nanos}"));
+        let pid = "dbrace";
+        let db_id = vm_identity::vm_id(pid, vm_identity::VmRole::Db);
+        let live = data_dir.join("hosting").join(pid).join("live");
+        std::fs::create_dir_all(live.join("_database")).unwrap();
+        std::fs::write(
+            live.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":null,"tier":"dedicated"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            live.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+        for d in ["content-images", "run", "snapshots", "logs"] {
+            std::fs::create_dir_all(data_dir.join(d)).unwrap();
+        }
+        std::os::unix::fs::symlink(&baselayers, data_dir.join("baselayers")).unwrap();
+
+        let store = Store::open(&data_dir.join("control.redb")).unwrap();
+        let host_id = "dbrace-host".to_string();
+        let platform = Arc::new(Mutex::new(PlatformState {
+            vms: HashMap::new(),
+            vm_states: HashMap::new(),
+            vm_incarnations: Incarnations::default(),
+            vm_rootfs_hashes: HashMap::new(),
+            wake_failures: HashMap::new(),
+            store,
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel,
+            base_rootfs_path: rootfs,
+            base_rootfs_hash: "0".repeat(64),
+            data_dir: data_dir.clone(),
+            data_disk: Arc::new(LocalLoop::open(data_dir.join("data-disks")).unwrap()),
+            lease: Arc::new(FlockLease::open(data_dir.join("leases"), host_id.clone()).unwrap()),
+            disk_tokens: HashMap::new(),
+            host_id,
+            is_leader: Arc::new(AtomicBool::new(true)),
+            platform_egress: PlatformEgress::default(),
+        }));
+        let routing: jkbase_proxy::RoutingTable = Default::default();
+        let logs = data_dir.join("logs");
+        let shipper = LogShipper::new(LogStore::new(logs.clone()), logs.join(".cursors.json"));
+        let reach = jkbase_common::config::DbReachFacts {
+            splice_secret: "dbrace-splice-secret-0123456789abcdef".to_string(),
+            admin_token: "jkba_dbrace-admin-token-0123456789abcdef".to_string(),
+            dedicated: false,
+            jwks: None,
+        };
+
+        let fc_count = || {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", &vm_identity::fc_sock_pkill_pattern(&db_id)])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().count()
+        };
+        let img = data_dir.join("data-disks").join(format!("{db_id}.img"));
+        let loop_count = || {
+            let out = std::process::Command::new("losetup")
+                .args(["-j", img.to_str().unwrap()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().count()
+        };
+
+        // Run the body, then ALWAYS clean up (FCs, loops, TAP, bridge) before reporting.
+        let outcome: std::result::Result<(), String> = async {
+            boot_db_vm(pid, &platform, Some(&reach))
+                .await
+                .map_err(|e| format!("initial boot_db_vm: {e:#}"))?;
+            for round in 1..=rounds {
+                // Hibernate the DB VM; redeploy as soon as hibernate has dropped the lock.
+                let hib = tokio::spawn({
+                    let (platform, routing, shipper) =
+                        (platform.clone(), routing.clone(), shipper.clone());
+                    let db_id = db_id.clone();
+                    async move {
+                        hibernate_project(&db_id, platform, routing, shipper, None, None).await
+                    }
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let st = platform.lock().await.vm_states.get(&db_id).copied();
+                    if st == Some(VmLifecycle::Hibernating) {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return Err(format!("round {round}: never saw Hibernating ({st:?})"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let redeploy = boot_db_vm(pid, &platform, Some(&reach)).await;
+                let hib = hib.await.unwrap();
+                eprintln!("[dbrace] round {round}: redeploy={redeploy:?} hibernate={hib:?}");
+                redeploy.map_err(|e| format!("round {round}: redeploy failed: {e:#}"))?;
+                // Let any straggling hibernate-side cleanup land before judging.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let plat = platform.lock().await;
+                let state = plat.vm_states.get(&db_id).copied();
+                let has_vm = plat.vms.contains_key(&db_id);
+                let token = plat.disk_tokens.get(&db_id).cloned();
+                let snap = plat.store.get_snapshot_meta(&db_id).ok().flatten();
+                let alloc = plat.store.get_vm_allocation(&db_id).unwrap().unwrap();
+                let lease = plat.lease.clone();
+                drop(plat);
+                let lease_ok = match &token {
+                    Some(t) => lease.renew(t, DISK_LEASE_TTL).await.is_ok(),
+                    None => false,
+                };
+                let alive = agent_alive(&alloc.ip).await;
+                let (fcs, loops) = (fc_count(), loop_count());
+                eprintln!(
+                    "[dbrace] round {round}: state={state:?} vm={has_vm} token={} lease_ok={lease_ok} \
+                     snapshot_meta={} fcs={fcs} loops={loops} agent_alive={alive}",
+                    token.is_some(),
+                    snap.is_some()
+                );
+                if state != Some(VmLifecycle::Running)
+                    || !has_vm
+                    || !lease_ok
+                    || snap.is_some()
+                    || fcs != 1
+                    || loops != 1
+                    || !alive
+                {
+                    return Err(format!("round {round}: incoherent DB VM after the race"));
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        // Cleanup: stop the VM, kill any straggler FC, detach the disk, drop TAP (+ bridge).
+        {
+            let mut plat = platform.lock().await;
+            if let Some(mut vm) = plat.vms.remove(&db_id) {
+                let _ = vm.stop().await;
+            }
+            reap_firecracker(&db_id).await;
+            if let Some(t) = plat.disk_tokens.remove(&db_id) {
+                let (dd, ls) = (plat.data_disk.clone(), plat.lease.clone());
+                release_data_disk(&dd, &ls, &db_id, t).await;
+            }
+            let _ = plat.data_disk.detach(&db_id).await;
+            if let Ok(Some(a)) = plat.store.get_vm_allocation(&db_id) {
+                let _ = teardown_tap(&a.tap_device).await;
+            }
+        }
+        if made_bridge {
+            let _ = run_cmd("ip", &["link", "del", "jkbr0"]).await;
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        outcome.unwrap();
+        println!("PASS: {rounds} round(s) of DB-VM redeploy-during-hibernate left one coherent VM");
+    }
+
     /// Exactly the two lock-dropping transitions gate a supersede; settled states don't.
     #[test]
     fn lifecycle_in_flight_is_waking_or_hibernating_only() {
