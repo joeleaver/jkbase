@@ -3319,9 +3319,11 @@ fn tier_flip_refusal(
     match (prior, new_tier) {
         (Some(prior), Some(new_tier)) if prior != new_tier => Some(format!(
             "project {project_id}: changing the managed-database [database] tier in place \
-             ({prior} → {new_tier}) is not supported — it would strand your existing database \
-             (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
-             project at the new tier and restore into it."
+             ({prior} → {new_tier}) is not supported — your database's data is still on its \
+             {prior}-tier disk (also after a deploy without [database]), and a {new_tier} database \
+             would start empty beside it. Keep `tier = \"{prior}\"`, or move it yourself: export \
+             your data (e.g. over `jkbase db proxy`; platform backups do not survive deleting the \
+             project), delete and recreate the project at the new tier, and import it."
         )),
         _ => None,
     }
