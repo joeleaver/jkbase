@@ -20,7 +20,7 @@
 //! every live prior watcher is blocklisted BEFORE we map, and if any blocklist fails
 //! we refuse ([`SubstrateError::RwoUnsafe`]) rather than risk a second writer.
 
-use crate::{Backend, BlockDevice, Caps, DataDiskProvider, FenceToken, Result, SubstrateError};
+use crate::{Backend, BlockDevice, Caps, DataDiskProvider, Ensured, FenceToken, Result, SubstrateError};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -182,15 +182,31 @@ impl CephRbd {
     }
 }
 
+/// The first top-level-looking `"field": <u64>` in `rbd info --format json` (no JSON dep —
+/// this backend only shells out). `rbd info` emits `"size": <bytes>` exactly once.
+fn json_u64_field(json: &str, field: &str) -> Option<u64> {
+    let at = json.find(&format!("\"{field}\""))? + field.len() + 2;
+    let rest = json[at..].trim_start().strip_prefix(':')?.trim_start();
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 #[async_trait]
 impl DataDiskProvider for CephRbd {
-    async fn ensure(&self, id: &str, size_bytes: u64) -> Result<()> {
+    async fn ensure(&self, id: &str, size_bytes: u64) -> Result<Ensured> {
         validate_id(id)?;
-        if self.image_exists(id).await {
-            return Ok(()); // idempotent: never reformat existing data
-        }
         // RBD --size is in MiB; round up so we never under-provision.
         let size_mib = size_bytes.div_ceil(1024 * 1024).max(1).to_string();
+        if let Ok(info) = self.rbd(&["info", "--format", "json", &self.spec(id)]).await {
+            // Idempotent: never reformat existing data, never shrink; grow the image only
+            // (the guest grows its fs online — the host never touches it).
+            let cur = json_u64_field(&info, "size").ok_or_else(|| be("rbd info returned no size"))?;
+            if cur >= size_bytes {
+                return Ok(Ensured::Unchanged);
+            }
+            self.rbd(&["resize", &self.spec(id), "--size", &size_mib]).await?;
+            return Ok(Ensured::Grown);
+        }
         self.rbd(&[
             "create",
             &self.spec(id),
@@ -208,7 +224,7 @@ impl DataDiskProvider for CephRbd {
         let fmt = run("mkfs.ext4", &["-F".into(), "-q".into(), dev.clone()]).await;
         let _ = self.rbd(&["unmap", &dev]).await; // always unmap, even on mkfs failure
         fmt?;
-        Ok(())
+        Ok(Ensured::Created)
     }
 
     async fn exists(&self, id: &str) -> Result<bool> {
@@ -307,6 +323,14 @@ impl Backend for CephRbd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn json_u64_field_reads_rbd_info_size() {
+        let info = r#"{"name":"p","size":16777216,"objects":4,"order":22,"block_name_prefix":"rbd_data.1"}"#;
+        assert_eq!(super::json_u64_field(info, "size"), Some(16 * 1024 * 1024));
+        assert_eq!(super::json_u64_field(r#"{"size": 42 }"#, "size"), Some(42));
+        assert_eq!(super::json_u64_field(r#"{"name":"x"}"#, "size"), None);
+    }
+
     use super::*;
 
     #[test]
