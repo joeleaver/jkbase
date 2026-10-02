@@ -26,6 +26,17 @@ pub type DeployCallback = Box<
     dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
 >;
 
+/// Server-side refusal checks for a deployment tree that is about to go live: called with
+/// `(project_id, deployment_dir)` BEFORE the `live` swap (deploy, build, schema push, rollback),
+/// so a refused version never becomes what the next wake/restart/resume boots. Pure policy only
+/// (e.g. the [R4] managed-DB tier-flip guard) — it must not touch the running VM. Any `Err` is a
+/// refusal ([`DeployRefused`], HTTP 409); the project stays on its previous version.
+pub type DeployPrecheckCallback = Box<
+    dyn Fn(String, PathBuf) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Fully reap a deleted project's runtime resources — stop its VM, free the
 /// IP/TAP allocation, and remove its on-disk artifacts. Mirrors `DeployCallback`
 /// (control owns no orch dependency); the server binary provides the impl.
@@ -172,6 +183,9 @@ pub struct AppState {
     pub log_store: LogStore,
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
+    /// Refusal checks run against the NEW deployment dir before the `live` swap. `None` ⇒ no
+    /// server-side policy (tests without an orchestrator).
+    pub deploy_precheck_callback: Option<DeployPrecheckCallback>,
     /// Tears down a deleted project's VM + IP/TAP + on-disk artifacts (mirrors
     /// `deploy_callback`). `None` leaves cleanup to the boot-time orphan sweep.
     pub teardown_callback: Option<TeardownCallback>,
@@ -272,6 +286,46 @@ impl std::fmt::Display for QuotaExceeded {
 
 impl std::error::Error for QuotaExceeded {}
 
+/// A deploy/rollback the server's [`DeployPrecheckCallback`] refused before the `live` swap — the
+/// project is untouched and still on its previous version. HTTP 409 (the request conflicts with
+/// the project's current state, e.g. its managed-DB tier), not 500.
+#[derive(Debug)]
+struct DeployRefused(String);
+
+impl std::fmt::Display for DeployRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for DeployRefused {}
+
+/// HTTP status for a deploy/rollback error: the typed refusals keep their meaning, everything
+/// else is a 500.
+fn deploy_error_status(e: &anyhow::Error) -> StatusCode {
+    if e.downcast_ref::<QuotaExceeded>().is_some() {
+        StatusCode::PAYMENT_REQUIRED
+    } else if e.downcast_ref::<DeployRefused>().is_some() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// Run the server's refusal checks against `deployment_dir` (see [`DeployPrecheckCallback`]).
+async fn precheck_deployment(
+    state: &AppState,
+    project_id: &str,
+    deployment_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(cb) = &state.deploy_precheck_callback {
+        cb(project_id.to_string(), deployment_dir.to_path_buf())
+            .await
+            .map_err(|e| DeployRefused(format!("{e:#}")))?;
+    }
+    Ok(())
+}
+
 impl AppState {
     pub fn new(store: Store, log_store: LogStore, deploy_dir: PathBuf) -> Self {
         Self {
@@ -279,6 +333,7 @@ impl AppState {
             log_store,
             deploy_dir,
             deploy_callback: None,
+            deploy_precheck_callback: None,
             teardown_callback: None,
             build_callback: None,
             routing_table: None,
@@ -1179,13 +1234,13 @@ async fn deploy(
             }),
         )
             .into_response(),
-        Err(e) => {
-            let (status, msg) = match e.downcast_ref::<QuotaExceeded>() {
-                Some(q) => (StatusCode::PAYMENT_REQUIRED, q.to_string()),
-                None => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            (status, Json(ErrorResponse { error: msg })).into_response()
-        }
+        Err(e) => (
+            deploy_error_status(&e),
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -2004,7 +2059,7 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// `*.json` layout; it is MOVED into `deployments/v{N}` (so it must live on the
 /// same filesystem as `deploy_dir`). Shared verbatim by the artifact-upload path
 /// (`do_deploy`) and the build pipeline, so both get the identical tail: server
-/// rootfs pre-extract → storage-quota gate → atomic `live` swap → reconcile
+/// rootfs pre-extract → storage-quota gate → server precheck → atomic `live` swap → reconcile
 /// domains/schedules → record history + prune → deploy callback (boot runtime).
 /// Collect the distinct app-layer digests (`sha256:<hex>`) a deployment references,
 /// from each `_servers/<name>.json`'s `app_digest` field (written by the layered
@@ -2100,6 +2155,17 @@ async fn activate_deployment(
             "storage quota exceeded: deploy would use {footprint} bytes, cap is {cap}"
         ))
         .into());
+    }
+
+    // Server-side refusals run HERE — against the new tree, before `live` moves and before any
+    // domain/schedule/history side effect — so a refused deploy leaves the project wholly on its
+    // previous version. Checking after the swap (inside `deploy_callback`) left `live` on the
+    // refused tree: the old VM kept running, but the next wake/restart/resume booted the refused
+    // version (e.g. an [R4] tier flip ⇒ an empty co-located DB beside the real dedicated one).
+    // Removed like a quota rejection, so it leaves no orphan bytes.
+    if let Err(e) = precheck_deployment(state, &project.id, &deploy_path).await {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(e);
     }
 
     // Atomically repoint `live`: symlink to a temp name then rename over it (rename is
@@ -2940,7 +3006,7 @@ async fn rollback(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            deploy_error_status(&e),
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -2955,6 +3021,11 @@ async fn do_rollback(
     deploy_path: &std::path::Path,
     target: u64,
 ) -> anyhow::Result<()> {
+    // Refuse BEFORE moving `live` (see `activate_deployment`): rolling back across a managed-DB
+    // tier change is the same data-stranding flip as deploying one. The target dir is retained
+    // history, so a refusal leaves it in place.
+    precheck_deployment(state, &project.id, deploy_path).await?;
+
     // Atomically repoint `live` at the target version: symlink to a temp name then
     // rename over it (rename is atomic; a remove+symlink leaves a no-`live` window
     // that a concurrent wake would misread as "no deployed content").
@@ -4823,12 +4894,13 @@ async fn db_schema_apply(
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staged);
-            let status = if e.downcast_ref::<QuotaExceeded>().is_some() {
-                StatusCode::PAYMENT_REQUIRED
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            return (status, Json(ErrorResponse { error: e.to_string() })).into_response();
+            return (
+                deploy_error_status(&e),
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
         }
     };
 
@@ -4839,6 +4911,10 @@ async fn db_schema_apply(
         // rather than claiming a clean rollback. [adversarial-review: swallowed rollback error]
         let tail = match do_rollback(&state, &mut project, &prev_deploy_path, prev_version).await {
             Ok(()) => format!("rolled back to v{prev_version}."),
+            Err(e) if e.downcast_ref::<DeployRefused>().is_some() => format!(
+                "rolling back to v{prev_version} was refused ({e}) — the new schema is still live; \
+                 roll back or redeploy explicitly."
+            ),
             Err(e) => format!(
                 "the deployment pointer is back on v{prev_version}, but restarting it reported an \
                  error ({e}) — it will restart on next access, or redeploy to force it."
