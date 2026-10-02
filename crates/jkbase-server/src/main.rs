@@ -3745,6 +3745,20 @@ async fn handle_deploy(
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
+    // [R4] Stamp the tier this deploy committed so the NEXT deploy can detect an in-place flip.
+    // Stamped HERE, at commit-to-Running — not after `wait_for_agent`/`boot_db_vm` — because the
+    // VM can already be writing its DB from this point: a later failure leaves this tree live (a
+    // failed deploy is not rolled back) and an unstamped project would let the next deploy flip
+    // tiers unrefused. A dedicated stamp before its DB VM writes anything can only over-refuse
+    // (the safe direction). Record only for a managed-DB project (nothing to strand otherwise);
+    // drop the record when the project has no DB now (e.g. it removed `[database]`) so a later
+    // re-add isn't misread as a flip.
+    if check_project_has_database(&plat.data_dir, project_id) {
+        let tier = if dedicated { "dedicated" } else { "colocated" };
+        let _ = plat.store.set_deployed_tier(project_id, tier);
+    } else {
+        let _ = plat.store.delete_deployed_tier(project_id);
+    }
     // Cold boot always runs the CURRENT rootfs; track it so a later hibernate stamps the truthful
     // hash (and keeps the GC reference set honest). Clear any wake-failure throttle: this project
     // is now freshly booted, so a stale entry mustn't fast-fail a routing-miss request.
@@ -3797,18 +3811,6 @@ async fn handle_deploy(
     // this entirely (their DB is the loopback process inside the app VM booted above).
     if dedicated {
         boot_db_vm(project_id, &platform, db_reach_for_db_vm.as_ref()).await?;
-    }
-    // [R4] Stamp the tier this deploy committed so the NEXT deploy can detect an in-place flip.
-    // Record only for a managed-DB project (nothing to strand otherwise); drop the record when the
-    // project has no DB now (e.g. it removed `[database]`) so a later re-add isn't misread as a flip.
-    {
-        let plat = platform.lock().await;
-        if check_project_has_database(&plat.data_dir, project_id) {
-            let tier = if dedicated { "dedicated" } else { "colocated" };
-            let _ = plat.store.set_deployed_tier(project_id, tier);
-        } else {
-            let _ = plat.store.delete_deployed_tier(project_id);
-        }
     }
     Ok(())
 }
