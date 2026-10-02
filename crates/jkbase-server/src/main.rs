@@ -910,6 +910,11 @@ struct PlatformState {
     /// [`WAKE_BACKOFF`] of it so a doomed project can't be spun into unbounded boot attempts by
     /// continuous traffic. Cleared on a successful wake.
     wake_failures: HashMap<String, std::time::Instant>,
+    /// `boot_db_vm` calls in flight per DB VM id (a count: a deploy's and a wake-path cold boot's
+    /// can overlap). Such a boot holds the DB VM's allocation from before its fence until it
+    /// commits, so `drop_dedicated_db` refuses while this is non-zero. Each boot owns its own
+    /// increment ([`DbBootGuard`]), unlike the shared `vm_states` entry.
+    db_boots: HashMap<String, u32>,
     store: Store,
     firecracker_bin: PathBuf,
     kernel_path: PathBuf,
@@ -1563,6 +1568,7 @@ async fn async_main() -> Result<()> {
         vm_states: HashMap::new(),
         vm_rootfs_hashes: HashMap::new(),
         wake_failures: HashMap::new(),
+        db_boots: HashMap::new(),
         store: store.clone(),
         firecracker_bin: args
             .fc_dir
@@ -2663,13 +2669,20 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 /// control plane holds the per-project deploy lock around this). Reaps the sibling DB VM and its
 /// `{id}.db.img` disk; the app VM and its disk (where a co-located DB lives) are never touched.
 ///
-/// Unlike project teardown, the project lives on — so DB wakes (gateway / `*.db` edge / console /
-/// backup executors) keep arriving, and none take the deploy lock. A wake or `boot_db_vm` that has
-/// already fenced the disk but not yet started Firecracker would, if we destroyed the disk under
-/// it, boot on a freed loop device another project may since have been handed (cross-tenant
-/// write). So: wait out `Waking`/`Hibernating` (both drop the lock mid-op; `boot_db_vm` marks
-/// `Waking` too), then reap in ONE locked section a new wake can't interleave — and if the DB VM
-/// is still mid-transition after the wait, REFUSE (`Busy`) rather than proceed as teardown does.
+/// Unlike project teardown, the project lives on — DB wakes (gateway / `*.db` edge / console /
+/// backup executors) keep arriving, and a wake-path cold boot runs `boot_db_vm` outside the deploy
+/// lock. Destroying the disk under a boot that has fenced it but not yet started Firecracker would
+/// let that FC boot on a freed loop device another project may since hold (cross-tenant write);
+/// freeing the allocation under a boot that already read it would hand its IP/TAP to another VM.
+/// So the reap happens in ONE locked section (no new wake can begin) and only when:
+/// - no wake/hibernate of the DB VM is mid-flight (`Waking`/`Hibernating` — set and cleared only by
+///   that driver, which holds the allocation from before its fence to its commit), waited out;
+/// - no `boot_db_vm` is in flight ([`PlatformState::db_boots`]), likewise waited out;
+/// - and the DISK LEASE is ours — the running DB VM's token (then nothing else can be fencing), or
+///   one we acquire now (any fence in flight holds it ⇒ `LeaseHeld`). The lease is the actual
+///   fence-exclusion invariant; the two checks above keep the allocation safe.
+///
+/// Anything still mid-flight after the wait ⇒ `Busy` with nothing touched (retryable 409).
 async fn drop_dedicated_db(
     project_id: &str,
     platform: &Arc<Mutex<PlatformState>>,
@@ -2679,10 +2692,11 @@ async fn drop_dedicated_db(
     let mut attempt = 0;
     let (alloc, data_dir) = loop {
         let mut plat = platform.lock().await;
-        if matches!(
+        let in_flight = matches!(
             plat.vm_states.get(&db_id),
             Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
-        ) {
+        ) || plat.db_boots.get(&db_id).is_some_and(|n| *n > 0);
+        if in_flight {
             drop(plat);
             if attempt >= 150 {
                 return Ok(DbDropOutcome::Busy);
@@ -2697,8 +2711,25 @@ async fn drop_dedicated_db(
         if !present {
             return Ok(DbDropOutcome::NothingToDrop);
         }
+        // Not running on our token ⇒ take the lease ourselves for the destroy, or stand down.
+        let own_token = if plat.disk_tokens.contains_key(&db_id) {
+            None
+        } else {
+            let (ls, hid) = (plat.lease.clone(), plat.host_id.clone());
+            match ls.acquire(&db_id, &hid, DISK_LEASE_TTL).await {
+                Ok(t) => Some(t),
+                Err(SubstrateError::LeaseHeld { .. }) => {
+                    return Ok(DbDropOutcome::Busy);
+                }
+                Err(e) => anyhow::bail!("lease acquire for {db_id}: {e}"),
+            }
+        };
         info!(project = %project_id, db_vm = %db_id, "dropping dedicated DB VM + disk (tenant request)");
-        break reap_db_vm_locked(&mut plat, &db_id).await;
+        let reaped = reap_db_vm_locked(&mut plat, &db_id).await;
+        if let Some(t) = own_token {
+            let _ = plat.lease.release(&t).await;
+        }
+        break reaped;
     };
     finish_db_vm_teardown(&db_id, alloc, &data_dir).await;
     Ok(DbDropOutcome::Dropped)
@@ -3878,16 +3909,17 @@ async fn boot_db_vm(
 ) -> Result<()> {
     let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
 
-    // Mark the DB VM `Waking` for the whole boot (reset on any non-`Running` exit by the guard), so
-    // concurrent DB wakes wait for it instead of racing a second boot, and a tenant's
-    // `drop_dedicated_db` waits it out instead of destroying the disk this boot has fenced.
-    let waking_guard = WakingGuard::new(platform.clone(), db_id.clone());
+    // Count this boot in flight for its whole life (allocation read → fence → commit), so a
+    // tenant's `drop_dedicated_db` can't free the allocation/TAP/disk out from under it. The guard
+    // is armed with no await between it and the increment, so a cancellation can never make it
+    // decrement a count it didn't add.
+    *platform.lock().await.db_boots.entry(db_id.clone()).or_default() += 1;
+    let _boot_guard = DbBootGuard::new(platform.clone(), db_id.clone());
 
     // Snapshot the substrate handles + supersede any prior DB VM (redeploy), then release the lock
     // for the slow build + fence + boot.
     let (disk_cap, data_dir, dd, ls, hid, firecracker_bin, kernel_path, rootfs_path, platform_egress, alloc) = {
         let mut plat = platform.lock().await;
-        plat.vm_states.insert(db_id.clone(), VmLifecycle::Waking);
 
         // Supersede a prior DB VM incarnation (redeploy): drop its stale snapshot, stop it, and
         // release its data-disk hold before re-fencing — mirrors the app redeploy path.
@@ -4030,7 +4062,6 @@ async fn boot_db_vm(
     };
     plat.vms.insert(db_id.clone(), vm);
     plat.vm_states.insert(db_id.clone(), VmLifecycle::Running);
-    waking_guard.commit();
     let ran_hash = plat.base_rootfs_hash.clone();
     plat.vm_rootfs_hashes.insert(db_id.clone(), ran_hash.clone());
     plat.wake_failures.remove(&db_id);
@@ -4364,6 +4395,37 @@ impl Drop for WakingGuard {
             if plat.vm_states.get(&pid) == Some(&VmLifecycle::Waking) {
                 plat.vm_states.remove(&pid);
                 plat.vm_rootfs_hashes.remove(&pid);
+            }
+        });
+    }
+}
+
+/// One `boot_db_vm` call's share of [`PlatformState::db_boots`]: `boot_db_vm` increments under its
+/// first lock section, this decrements on ANY exit (success, error, cancellation). Drop can't await
+/// the async mutex, so the decrement is spawned (eventually-consistent) — a lagging decrement only
+/// makes a concurrent drop answer Busy, the safe direction. Armed right after the increment.
+struct DbBootGuard {
+    platform: Arc<Mutex<PlatformState>>,
+    db_id: String,
+}
+
+impl DbBootGuard {
+    fn new(platform: Arc<Mutex<PlatformState>>, db_id: String) -> Self {
+        Self { platform, db_id }
+    }
+}
+
+impl Drop for DbBootGuard {
+    fn drop(&mut self) {
+        let platform = self.platform.clone();
+        let id = self.db_id.clone();
+        tokio::spawn(async move {
+            let mut plat = platform.lock().await;
+            if let Some(n) = plat.db_boots.get_mut(&id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    plat.db_boots.remove(&id);
+                }
             }
         });
     }
