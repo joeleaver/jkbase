@@ -132,6 +132,9 @@ fn mount_data_disk(device: Option<&str>) {
 
     let ret = unsafe { libc::mount(src.as_ptr(), tgt.as_ptr(), fst.as_ptr(), 0, ptr::null()) };
     if ret == 0 {
+        if let Err(e) = grow_data_fs(device, target) {
+            eprintln!("data disk: online grow failed (keeping the current size): {e}");
+        }
         let _ = std::fs::create_dir_all("/mnt/data/volumes");
     } else {
         eprintln!(
@@ -139,6 +142,48 @@ fn mount_data_disk(device: Option<&str>) {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Grow the mounted data-disk ext4 online to fill its device. The host only ever extends the
+/// backing device when `[database].size` is raised — growing the filesystem is the guest's job,
+/// because the host must never parse a guest filesystem. A no-op when the fs already fills the
+/// device (the kernel returns early); runs before any tenant process exists.
+fn grow_data_fs(device: &str, mountpoint: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const BLKGETSIZE64: u32 = 0x8008_1272; // _IOR(0x12, 114, u64)
+    const EXT4_IOC_RESIZE_FS: u32 = 0x4008_6610; // _IOW('f', 16, u64)
+
+    let dev = std::fs::File::open(device)?;
+    let mut dev_bytes: u64 = 0;
+    if unsafe { libc::ioctl(dev.as_raw_fd(), BLKGETSIZE64 as _, &mut dev_bytes) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fs = std::fs::File::open(mountpoint)?;
+    let statfs = |f: &std::fs::File| -> std::io::Result<libc::statvfs> {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatvfs(f.as_raw_fd(), &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(st)
+    };
+    let before = statfs(&fs)?;
+    let block = before.f_frsize;
+    if block == 0 {
+        return Ok(());
+    }
+    let mut new_blocks: u64 = dev_bytes / block;
+    if unsafe { libc::ioctl(fs.as_raw_fd(), EXT4_IOC_RESIZE_FS as _, &mut new_blocks) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let after = statfs(&fs)?;
+    if after.f_blocks > before.f_blocks {
+        eprintln!(
+            "data disk: grew fs from {} to {} MiB",
+            (before.f_blocks * block) >> 20,
+            (after.f_blocks * block) >> 20
+        );
+    }
+    Ok(())
 }
 
 /// Read the host-written `_layers.json` from the metadata image, if present.
@@ -1983,6 +2028,47 @@ async fn invoke_function(
 
 #[cfg(test)]
 mod tests {
+    /// The real online grow: a loop-mounted 32 MiB ext4 whose backing file is then extended
+    /// to 64 MiB (what the host does) grows to fill it. Needs root + losetup + mkfs.ext4:
+    ///   sudo -E cargo test -p jkbase-agent -- --ignored grow_data_fs_fills_a_grown_device
+    #[test]
+    #[ignore = "needs root + losetup + mkfs.ext4"]
+    fn grow_data_fs_fills_a_grown_device() {
+        use std::process::Command;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("jkb-grow-{nanos}"));
+        let (img, mnt) = (base.join("d.img"), base.join("mnt"));
+        std::fs::create_dir_all(&mnt).unwrap();
+        let mib = 1024 * 1024u64;
+        std::fs::File::create(&img).unwrap().set_len(32 * mib).unwrap();
+        assert!(Command::new("mkfs.ext4").args(["-F", "-q"]).arg(&img).status().unwrap().success());
+        let out = Command::new("losetup").args(["--find", "--show"]).arg(&img).output().unwrap();
+        let dev = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(Command::new("mount").arg(&dev).arg(&mnt).status().unwrap().success());
+        let size = || {
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            let c = std::ffi::CString::new(mnt.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::statvfs(c.as_ptr(), &mut st) }, 0);
+            st.f_blocks * st.f_frsize
+        };
+        let before = size();
+        // No-op when the fs already fills the device.
+        grow_data_fs(&dev, mnt.to_str().unwrap()).unwrap();
+        assert_eq!(size(), before);
+        // Host side: extend the backing file + refresh the loop size.
+        std::fs::OpenOptions::new().write(true).open(&img).unwrap().set_len(64 * mib).unwrap();
+        assert!(Command::new("losetup").args(["-c", &dev]).status().unwrap().success());
+        grow_data_fs(&dev, mnt.to_str().unwrap()).unwrap();
+        let after = size();
+        let _ = Command::new("umount").arg(&mnt).status();
+        let _ = Command::new("losetup").args(["-d", &dev]).status();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(after > before + 28 * mib, "grew {before} -> {after}");
+    }
+
     use super::*;
 
     #[test]
