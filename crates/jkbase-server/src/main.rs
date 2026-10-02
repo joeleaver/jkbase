@@ -910,6 +910,11 @@ struct PlatformState {
     /// [`WAKE_BACKOFF`] of it so a doomed project can't be spun into unbounded boot attempts by
     /// continuous traffic. Cleared on a successful wake.
     wake_failures: HashMap<String, std::time::Instant>,
+    /// `boot_db_vm` calls in flight per DB VM id (a count: a deploy's and a wake-path cold boot's
+    /// can overlap). Such a boot holds the DB VM's allocation from before its fence until it
+    /// commits, so `drop_dedicated_db` refuses while this is non-zero. Each boot owns its own
+    /// increment ([`DbBootGuard`]), unlike the shared `vm_states` entry.
+    db_boots: HashMap<String, u32>,
     store: Store,
     firecracker_bin: PathBuf,
     kernel_path: PathBuf,
@@ -1563,6 +1568,7 @@ async fn async_main() -> Result<()> {
         vm_states: HashMap::new(),
         vm_rootfs_hashes: HashMap::new(),
         wake_failures: HashMap::new(),
+        db_boots: HashMap::new(),
         store: store.clone(),
         firecracker_bin: args
             .fc_dir
@@ -1784,6 +1790,12 @@ async fn async_main() -> Result<()> {
     state.teardown_callback = Some(Box::new(move |project_id: String| {
         let platform = platform_for_teardown.clone();
         Box::pin(async move { handle_teardown(&project_id, &platform).await })
+    }));
+
+    let platform_for_db_drop = platform.clone();
+    state.db_drop_callback = Some(Box::new(move |project_id: String| {
+        let platform = platform_for_db_drop.clone();
+        Box::pin(async move { drop_dedicated_db(&project_id, &platform).await })
     }));
 
     // Build-pipeline wiring: control owns the `POST /build` funnel + build-job;
@@ -2653,6 +2665,76 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
     Ok(())
 }
 
+/// The tenant's explicit drop of its dedicated DB (`DELETE /projects/{id}/db/dedicated`; the
+/// control plane holds the per-project deploy lock around this). Reaps the sibling DB VM and its
+/// `{id}.db.img` disk; the app VM and its disk (where a co-located DB lives) are never touched.
+///
+/// Unlike project teardown, the project lives on — DB wakes (gateway / `*.db` edge / console /
+/// backup executors) keep arriving, and a wake-path cold boot runs `boot_db_vm` outside the deploy
+/// lock. Destroying the disk under a boot that has fenced it but not yet started Firecracker would
+/// let that FC boot on a freed loop device another project may since hold (cross-tenant write);
+/// freeing the allocation under a boot that already read it would hand its IP/TAP to another VM.
+/// So the reap happens in ONE locked section (no new wake can begin) and only when:
+/// - no wake/hibernate of the DB VM is mid-flight (`Waking`/`Hibernating` — set and cleared only by
+///   that driver, which holds the allocation from before its fence to its commit), waited out;
+/// - no `boot_db_vm` is in flight ([`PlatformState::db_boots`]), likewise waited out;
+/// - and the DISK LEASE is ours — the running DB VM's token (then nothing else can be fencing), or
+///   one we acquire now (any fence in flight holds it ⇒ `LeaseHeld`). The lease is the actual
+///   fence-exclusion invariant; the two checks above keep the allocation safe.
+///
+/// Anything still mid-flight after the wait ⇒ `Busy` with nothing touched (retryable 409).
+async fn drop_dedicated_db(
+    project_id: &str,
+    platform: &Arc<Mutex<PlatformState>>,
+) -> Result<jkbase_control::api::DbDropOutcome> {
+    use jkbase_control::api::DbDropOutcome;
+    let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
+    let mut attempt = 0;
+    let (alloc, data_dir) = loop {
+        let mut plat = platform.lock().await;
+        let in_flight = matches!(
+            plat.vm_states.get(&db_id),
+            Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
+        ) || plat.db_boots.get(&db_id).is_some_and(|n| *n > 0);
+        if in_flight {
+            drop(plat);
+            if attempt >= 150 {
+                return Ok(DbDropOutcome::Busy);
+            }
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        let present = plat.vms.contains_key(&db_id)
+            || plat.store.get_vm_allocation(&db_id)?.is_some()
+            || plat.data_disk.exists(&db_id).await.unwrap_or(false);
+        if !present {
+            return Ok(DbDropOutcome::NothingToDrop);
+        }
+        // Not running on our token ⇒ take the lease ourselves for the destroy, or stand down.
+        let own_token = if plat.disk_tokens.contains_key(&db_id) {
+            None
+        } else {
+            let (ls, hid) = (plat.lease.clone(), plat.host_id.clone());
+            match ls.acquire(&db_id, &hid, DISK_LEASE_TTL).await {
+                Ok(t) => Some(t),
+                Err(SubstrateError::LeaseHeld { .. }) => {
+                    return Ok(DbDropOutcome::Busy);
+                }
+                Err(e) => anyhow::bail!("lease acquire for {db_id}: {e}"),
+            }
+        };
+        info!(project = %project_id, db_vm = %db_id, "dropping dedicated DB VM + disk (tenant request)");
+        let reaped = reap_db_vm_locked(&mut plat, &db_id).await;
+        if let Some(t) = own_token {
+            let _ = plat.lease.release(&t).await;
+        }
+        break reaped;
+    };
+    finish_db_vm_teardown(&db_id, alloc, &data_dir).await;
+    Ok(DbDropOutcome::Dropped)
+}
+
 /// Best-effort teardown of a project's **sibling DB VM** (`{project_id}.db`). Mirrors
 /// [`handle_teardown`]'s reap keyed by the rendered DB id: stop the VM, hard-kill any surviving
 /// Firecracker (BEFORE destroying its disk, so a live FC can't corrupt a reused loop device),
@@ -2664,33 +2746,49 @@ async fn teardown_db_vm_sibling(project_id: &str, platform: &Arc<Mutex<PlatformS
     let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
     let (alloc, data_dir) = {
         let mut plat = platform.lock().await;
-        if let Some(mut vm) = plat.vms.remove(&db_id) {
-            let _ = vm.stop().await;
-        }
-        // Kill any DB Firecracker not tracked in `vms` BEFORE destroying its disk.
-        reap_firecracker(&db_id).await;
-        handoff::remove(&plat.data_dir.join("run"), &db_id);
-        if let Some(token) = plat.disk_tokens.remove(&db_id) {
-            let ls = plat.lease.clone();
-            let _ = ls.release(&token).await;
-        }
-        let dd = plat.data_disk.clone();
-        let _ = dd.destroy(&db_id).await;
-        plat.vm_states.remove(&db_id);
-        plat.vm_rootfs_hashes.remove(&db_id);
-        plat.wake_failures.remove(&db_id);
-        let alloc = plat.store.get_vm_allocation(&db_id).ok().flatten();
-        let _ = plat.store.remove_snapshot_meta(&db_id);
-        let _ = plat.store.remove_vm_allocation(&db_id);
-        (alloc, plat.data_dir.clone())
+        reap_db_vm_locked(&mut plat, &db_id).await
     };
+    finish_db_vm_teardown(&db_id, alloc, &data_dir).await;
+}
+
+/// The locked half of [`teardown_db_vm_sibling`]: stop + hard-kill the DB VM, release its lease,
+/// destroy its disk, drop its lifecycle/snapshot/allocation rows. Runs in ONE locked section so no
+/// wake can interleave (a wake needs the lock to set `Waking`). Returns what the unlocked
+/// [`finish_db_vm_teardown`] needs.
+async fn reap_db_vm_locked(
+    plat: &mut PlatformState,
+    db_id: &str,
+) -> (Option<VmAllocation>, PathBuf) {
+    if let Some(mut vm) = plat.vms.remove(db_id) {
+        let _ = vm.stop().await;
+    }
+    // Kill any DB Firecracker not tracked in `vms` BEFORE destroying its disk.
+    reap_firecracker(db_id).await;
+    handoff::remove(&plat.data_dir.join("run"), db_id);
+    if let Some(token) = plat.disk_tokens.remove(db_id) {
+        let ls = plat.lease.clone();
+        let _ = ls.release(&token).await;
+    }
+    let dd = plat.data_disk.clone();
+    let _ = dd.destroy(db_id).await;
+    plat.vm_states.remove(db_id);
+    plat.vm_rootfs_hashes.remove(db_id);
+    plat.wake_failures.remove(db_id);
+    let alloc = plat.store.get_vm_allocation(db_id).ok().flatten();
+    let _ = plat.store.remove_snapshot_meta(db_id);
+    let _ = plat.store.remove_vm_allocation(db_id);
+    (alloc, plat.data_dir.clone())
+}
+
+/// The unlocked half of [`teardown_db_vm_sibling`]: free the TAP + remove on-disk artifacts.
+async fn finish_db_vm_teardown(db_id: &str, alloc: Option<VmAllocation>, data_dir: &Path) {
     if let Some(a) = alloc {
         let _ = teardown_tap(&a.tap_device).await;
     }
     // `remove_project_artifacts` for a `.db` id clears content-images/`{id}.db.ext4`,
     // data-disks/`{id}.db.{img,holder}`, snapshots/`{id}.db`, run/`{id}.db`; the base-only trees
     // (hosting/builds/git/buildcache/`{id}.db`) simply don't exist → no-ops.
-    remove_project_artifacts(&data_dir, &db_id).await;
+    remove_project_artifacts(data_dir, db_id).await;
 }
 
 /// Remove every per-project on-disk artifact (content image, data disk, snapshot,
@@ -3318,11 +3416,46 @@ async fn handle_deploy(
         if let Ok(Some(prior)) = plat.store.get_deployed_tier(project_id)
             && prior != new_tier
         {
+            // Leaving `dedicated` has an in-place path: its data sits on its own disk, which
+            // `jkbase db drop` discards (clearing this record). A co-located DB shares the app's
+            // disk with its volumes, so there is nothing separate to drop.
+            let migrate = if prior == "dedicated" {
+                format!(
+                    "Back up the database (`jkbase db backup`), drop it (`jkbase db drop --project \
+                     {project_id}`), redeploy at the new tier, then restore the backup into it."
+                )
+            } else {
+                "Back up the database, then recreate the project at the new tier and restore \
+                 into it."
+                    .to_string()
+            };
             anyhow::bail!(
                 "project {project_id}: changing the managed-database [database] tier in place \
                  ({prior} → {new_tier}) is not supported — it would strand your existing database \
-                 (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
-                 project at the new tier and restore into it."
+                 (its data lives on the {prior}-tier disk). {migrate}"
+            );
+        }
+        // The record is dropped when a deploy removes `[database]`, but a dedicated DB's disk is
+        // NOT (its data would be lost to a config edit) — so dedicated → no DB → co-located would
+        // slip past the check above and strand that disk: unreachable, yet counted against the
+        // quota at full size. Detect it from the disk itself. `exists` errors fail open (the
+        // pre-guard behaviour) rather than block every deploy on a substrate hiccup.
+        // Only a deploy that would CREATE that state is refused: once the project already runs
+        // co-located beside the disk (recorded tier `colocated`), refusing its restarts, rollbacks
+        // and cold boots protects nothing.
+        let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
+        let already_colocated =
+            matches!(plat.store.get_deployed_tier(project_id), Ok(Some(t)) if t == "colocated");
+        if new_tier == "colocated"
+            && !already_colocated
+            && plat.data_disk.exists(&db_id).await.unwrap_or(false)
+        {
+            anyhow::bail!(
+                "project {project_id}: a dedicated-tier managed database from an earlier deploy \
+                 still holds data on its own disk, and a co-located database would start empty \
+                 beside it. To keep it, redeploy with `tier = \"dedicated\"` (and back it up \
+                 before migrating); to discard it, run `jkbase db drop --project {project_id}`, \
+                 then redeploy."
             );
         }
     }
@@ -3624,7 +3757,7 @@ async fn handle_deploy(
     // any prior writer. Held by an RAII guard until the VM is up, so a boot failure (or
     // a cancelled future) releases the lease instead of bricking the project.
     let disk_guard = if has_disk {
-        let disk_mib = data_disk_mib_for(&data_dir, project_id, !dedicated, disk_cap);
+        let disk_mib = data_disk_mib(&data_dir, project_id, !dedicated, disk_cap).await;
         Some(fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?)
     } else {
         None
@@ -3776,6 +3909,13 @@ async fn boot_db_vm(
 ) -> Result<()> {
     let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
 
+    // Count this boot in flight for its whole life (allocation read → fence → commit), so a
+    // tenant's `drop_dedicated_db` can't free the allocation/TAP/disk out from under it. The guard
+    // is armed with no await between it and the increment, so a cancellation can never make it
+    // decrement a count it didn't add.
+    *platform.lock().await.db_boots.entry(db_id.clone()).or_default() += 1;
+    let _boot_guard = DbBootGuard::new(platform.clone(), db_id.clone());
+
     // Snapshot the substrate handles + supersede any prior DB VM (redeploy), then release the lock
     // for the slow build + fence + boot.
     let (disk_cap, data_dir, dd, ls, hid, firecracker_bin, kernel_path, rootfs_path, platform_egress, alloc) = {
@@ -3870,8 +4010,9 @@ async fn boot_db_vm(
     };
 
     // Fence the DB VM's OWN data disk (`{id}.db.img`), sized from the BASE project's
-    // `_database.json` (`[database].size`). The `.db` scope is validator-legal (F1).
-    let disk_mib = data_disk_mib_for(&data_dir, project_id, true, disk_cap);
+    // `_database.json` (`[database].size`) within the project-wide storage budget. The `.db`
+    // scope is validator-legal (F1).
+    let disk_mib = data_disk_mib(&data_dir, &db_id, true, disk_cap).await;
     let disk_guard = fence_data_disk(&dd, &ls, &hid, &db_id, disk_mib).await?;
 
     let db_size = vm_identity::vm_size_for(vm_identity::VmRole::Db);
@@ -4259,6 +4400,37 @@ impl Drop for WakingGuard {
     }
 }
 
+/// One `boot_db_vm` call's share of [`PlatformState::db_boots`]: `boot_db_vm` increments under its
+/// first lock section, this decrements on ANY exit (success, error, cancellation). Drop can't await
+/// the async mutex, so the decrement is spawned (eventually-consistent) — a lagging decrement only
+/// makes a concurrent drop answer Busy, the safe direction. Armed right after the increment.
+struct DbBootGuard {
+    platform: Arc<Mutex<PlatformState>>,
+    db_id: String,
+}
+
+impl DbBootGuard {
+    fn new(platform: Arc<Mutex<PlatformState>>, db_id: String) -> Self {
+        Self { platform, db_id }
+    }
+}
+
+impl Drop for DbBootGuard {
+    fn drop(&mut self) {
+        let platform = self.platform.clone();
+        let id = self.db_id.clone();
+        tokio::spawn(async move {
+            let mut plat = platform.lock().await;
+            if let Some(n) = plat.db_boots.get_mut(&id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    plat.db_boots.remove(&id);
+                }
+            }
+        });
+    }
+}
+
 /// How long after a failed wake to fast-fail subsequent wakes of the same project, so a broken
 /// app (or hostile traffic at a doomed project) can't spin unbounded full boot attempts — each
 /// of which bumps the data-disk lease epoch and spawns Firecracker(s). Short enough to keep the
@@ -4340,7 +4512,23 @@ async fn wake_db_reach(
 ) -> std::result::Result<String, jkbase_proxy::WakeError> {
     let target = {
         let plat = platform.lock().await;
-        db_reach_target_vm(&plat.data_dir, project_id)
+        let target = db_reach_target_vm(&plat.data_dir, project_id);
+        // A dedicated DB with no lifecycle state, allocation or disk isn't provisioned: dropped
+        // (`jkbase db drop`), or a first deploy hasn't reached `boot_db_vm` yet. Only a deploy
+        // provisions it, so don't let every connect re-drive a doomed no-allocation cold boot
+        // (`handle_deploy` of the `.db` id) under the platform lock. Transient-shaped (503 +
+        // retry), as the first-deploy case resolves on its own.
+        if target != project_id
+            && !plat.vm_states.contains_key(&target)
+            && matches!(plat.store.get_vm_allocation(&target), Ok(None))
+            && !plat.data_disk.exists(&target).await.unwrap_or(true)
+        {
+            return Err(jkbase_proxy::WakeError::Unavailable(format!(
+                "the dedicated database of {project_id} isn't provisioned (dropped, or its deploy \
+                 is still booting it) — redeploy if it doesn't come up"
+            )));
+        }
+        target
     };
     wake_project(&target, platform, routing, domain_map, shipper).await
 }
@@ -4570,10 +4758,10 @@ async fn wake_project_inner(
     // restore path patches the data drive to this fenced device; refuse→cold-boot
     // (reap + retry, else error) lives in fence_data_disk. None when no data disk.
     let disk_guard = if has_disk {
-        // Size from the BASE project's `_database.json` ([database].size) — the DB VM has no
-        // `hosting/<id>.db/` — but fence the disk under the RENDERED id (`{id}.db.img`), its own.
+        // Sized from the BASE project's `_database.json` ([database].size) — the DB VM has no
+        // `hosting/<id>.db/` — within the project-wide budget; fenced under the RENDERED id.
         let holds_db = vm_role == vm_identity::VmRole::Db || !dedicated;
-        let disk_mib = data_disk_mib_for(&data_dir, base_pid, holds_db, disk_cap);
+        let disk_mib = data_disk_mib(&data_dir, project_id, holds_db, disk_cap).await;
         let g = fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?;
         config.data_disk_path = Some(g.device());
         // A grown disk can't be restored onto: the snapshot's guest believes the old size and
@@ -6132,33 +6320,79 @@ mod l4_port_decl_tests {
     }
 }
 
-/// Desired data-disk size (MiB) for a project: the managed-DB `[database].size`
-/// (parsed host-side at deploy into `_database.json`'s `size_mib`) when present, else
-/// the platform default [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized
-/// DB grows on the next boot (`ensure` never shrinks). Floored at the default — the DB
-/// disk is never smaller than the platform minimum, so a too-small `size` is harmless.
-/// A non-DB project (no `_database.json`, or no `size_mib`) gets the default unchanged.
+/// Desired size (MiB) of data disk `disk_id` (a rendered vm id: `{id}` for the app VM, `{id}.db`
+/// for a dedicated DB VM): the managed-DB `[database].size` (parsed host-side at deploy into the
+/// BASE project's `_database.json` `size_mib`) when present, else the platform default
+/// [`DATA_DISK_MIB`]. Read at deploy AND every wake so a re-sized DB grows on the next boot
+/// (`ensure` never shrinks). Floored at the default — a disk is never smaller than the platform
+/// minimum, so a too-small `size` is harmless. A non-DB project gets the default unchanged.
 ///
-/// Capped at the project's storage quota (`cap_bytes`): `size` is tenant input and the disk
-/// is real host capacity the guest can fill between deploys, while the quota is otherwise only
-/// checked at deploy time. A larger `size` is clamped, not refused, so the project still boots.
+/// Capped PROJECT-WIDE at the storage quota (`cap_bytes`): `size` is tenant input and a disk is
+/// real host capacity the guest can fill between checks, while the quota is otherwise only checked
+/// at deploy / object-write time. The DB-holding disk gets the quota MINUS everything else the
+/// project reserves ([`jkbase_common::storage::project_reserved_bytes`]: its other disks at their
+/// full size — what their guests can fill, not what they've filled — plus content, the live
+/// deployment, build caches and the object store), so the next quota check still fits and a
+/// dedicated project can't spend its budget once per disk. An app disk a dedicated project will
+/// create for its volumes but hasn't yet is reserved at its fixed default, so boot order can't
+/// decide the total. A larger `size` is clamped, not refused, so the project still boots.
+/// Residuals: the per-disk floor wins over the budget, and a dedicated project that adds volumes
+/// AFTER its DB disk took the budget gets a default app disk on top (each ≤ one [`DATA_DISK_MIB`]);
+/// a disk grown before its quota was lowered keeps its size (`ensure` never shrinks). The deploy
+/// cap then refuses any deploy that grows such a project further.
+///
+/// The budget walk (object store included) runs only when the disk would actually GROW — never
+/// on the steady-state wake, whose latency it would otherwise tax. Blocking fs: callers go through
+/// [`data_disk_mib`].
 ///
 /// `holds_db`: whether this disk holds the managed DB (the DB VM's, or a co-located app VM's).
 /// A dedicated project's app-VM disk only carries its own volumes, so it stays at the default.
-fn data_disk_mib_for(data_dir: &Path, project_id: &str, holds_db: bool, cap_bytes: u64) -> u64 {
+fn data_disk_mib_for(data_dir: &Path, disk_id: &str, holds_db: bool, cap_bytes: u64) -> u64 {
     if !holds_db {
         return DATA_DISK_MIB;
     }
+    const MIB: u64 = 1024 * 1024;
+    let (base, role) = vm_identity::split_vm_id(disk_id);
     let path = data_dir
         .join("hosting")
-        .join(project_id)
+        .join(base)
         .join("live")
         .join("_database.json");
     let configured = std::fs::read_to_string(&path)
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| v.get("size_mib").and_then(serde_json::Value::as_u64));
-    configured.unwrap_or(0).min(cap_bytes / (1024 * 1024)).max(DATA_DISK_MIB)
+    let wanted = configured.unwrap_or(0).max(DATA_DISK_MIB);
+    // This disk's slot among `data_disk_images` (the app slot — `{base}.img` or legacy `.ext4` —
+    // or `{base}.db.img`), and its current logical size.
+    let db_img = data_dir.join("data-disks").join(format!("{base}.db.img"));
+    let is_db_disk = role == vm_identity::VmRole::Db;
+    let disks = jkbase_common::storage::data_disk_images(data_dir, base);
+    let own_bytes = disks
+        .iter()
+        .filter(|p| (**p == db_img) == is_db_disk)
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .fold(0u64, |acc, md| acc.saturating_add(md.len()));
+    if wanted.saturating_mul(MIB) <= own_bytes {
+        return wanted; // no growth: `ensure` is a no-op, skip the budget walk
+    }
+    let mut other_bytes =
+        jkbase_common::storage::project_reserved_bytes(data_dir, base).saturating_sub(own_bytes);
+    let app_disk_exists = disks.iter().any(|p| *p != db_img);
+    if is_db_disk && !app_disk_exists && check_project_has_volumes(data_dir, base) {
+        other_bytes = other_bytes.saturating_add(DATA_DISK_MIB * MIB);
+    }
+    let budget_mib = cap_bytes.saturating_sub(other_bytes) / MIB;
+    wanted.min(budget_mib).max(DATA_DISK_MIB)
+}
+
+/// [`data_disk_mib_for`] off the async runtime (its budget walk can cover a large object store).
+/// A failed task falls back to the platform floor — safe, as `ensure` never shrinks a disk.
+async fn data_disk_mib(data_dir: &Path, disk_id: &str, holds_db: bool, cap_bytes: u64) -> u64 {
+    let (dd, id) = (data_dir.to_path_buf(), disk_id.to_string());
+    tokio::task::spawn_blocking(move || data_disk_mib_for(&dd, &id, holds_db, cap_bytes))
+        .await
+        .unwrap_or(DATA_DISK_MIB)
 }
 
 /// The project's storage quota in bytes, the ceiling for its data disk
@@ -6971,7 +7205,9 @@ async fn metering_loop(
         // A dedicated project's DB VM has its OWN alloc row (`{id}.db`) but no project row, so the
         // per-project roll below skips it — accrue its usage under the rendered id (decision #3:
         // separate rows, rolled up in display by `get_project_usage`). cpu/bw are already keyed by
-        // the rendered id; storage is its own `{id}.db.img` disk.
+        // the rendered id. Storage is NOT: its `{id}.db.img` disk + `{id}.db.ext4` image are billed
+        // on the BASE row by `project_storage_bytes`, the same figure the deploy + object-store
+        // caps enforce — sampling them here too would double-bill.
         let db_vm_ids: Vec<String> = allocs
             .iter()
             .map(|(id, _)| id.clone())
@@ -6980,10 +7216,14 @@ async fn metering_loop(
 
         // Roll each VM's sample into its current hour bucket. Skip VMs with nothing to record (no
         // storage, no deltas) to avoid empty rows.
-        let roll = |id: &str| {
+        let roll = |id: &str, bills_storage: bool| {
             let cpu_j = cpu.get(id).copied().unwrap_or(0);
             let (rx, tx) = bw.get(id).copied().unwrap_or((0, 0));
-            let storage = jkbase_common::storage::project_storage_bytes(&data_dir, id);
+            let storage = if bills_storage {
+                jkbase_common::storage::project_storage_bytes(&data_dir, id)
+            } else {
+                0
+            };
             if cpu_j == 0 && rx == 0 && tx == 0 && storage == 0 {
                 return;
             }
@@ -6992,10 +7232,10 @@ async fn metering_loop(
             }
         };
         for id in &projects {
-            roll(id);
+            roll(id, true);
         }
         for id in &db_vm_ids {
-            roll(id);
+            roll(id, false);
         }
 
         // DB-attributable warm-seconds: accrue for the VM a managed-DB reach-plane relay is holding
@@ -7300,9 +7540,10 @@ mod split_brain_gate {
 mod tests {
     use super::*;
 
-    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
-    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
-    /// (stamped+present rootfs blob + matching deployment version) restores.
+    /// The live tree's own manifests (`_database.json`, …) count against the project budget, so
+    /// a budget that would land exactly on a GiB boundary rounds down one MiB.
+    const LIVE_MIB: u64 = 1;
+
     #[test]
     fn data_disk_size_is_floored_at_default_and_capped_at_quota() {
         let nanos = std::time::SystemTime::now()
@@ -7325,7 +7566,7 @@ mod tests {
         assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), DATA_DISK_MIB);
         // Tenant-declared size beyond the storage quota → clamped to the quota.
         set(1024 * 1024 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 16 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 16 * 1024 - LIVE_MIB);
         // A quota below the default never shrinks a disk below the platform floor.
         assert_eq!(data_disk_mib_for(&root, "p", true, 1), DATA_DISK_MIB);
         // A dedicated project's app-VM disk doesn't hold the DB → default, whatever `size` says.
@@ -7334,6 +7575,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The quota caps a project's disks TOGETHER, not each: a dedicated project's DB disk gets
+    /// only what its other disks (by logical size — what their guests can fill) leave over.
+    #[test]
+    fn data_disk_size_is_capped_project_wide_across_app_and_db_disks() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkbase-diskbudget-{nanos}"));
+        let live = root.join("hosting").join("p").join("live");
+        let disks = root.join("data-disks");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&disks).unwrap();
+        let (mib, gib) = (1024 * 1024u64, 1024 * 1024 * 1024u64);
+        // Sparse images: logical size only, nothing allocated.
+        let disk = |name: &str, mib_len: u64| {
+            std::fs::File::create(disks.join(name))
+                .unwrap()
+                .set_len(mib_len * mib)
+                .unwrap();
+        };
+        std::fs::write(live.join("_database.json"), r#"{"size_mib": 1048576}"#).unwrap();
+
+        // No other disk yet → the DB disk may take the whole quota.
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 16 * 1024 - LIVE_MIB);
+        // A dedicated project that declares volumes will get a default app disk: reserved up
+        // front, so the DB VM booting first can't spend it.
+        std::fs::create_dir_all(live.join("_servers")).unwrap();
+        std::fs::write(
+            live.join("_servers").join("api.json"),
+            r#"{"volumes": [{"name": "data", "mount": "/data"}]}"#,
+        )
+        .unwrap();
+        assert!(check_project_has_volumes(&root, "p"));
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 16 * 1024 - DATA_DISK_MIB - LIVE_MIB);
+        std::fs::remove_dir_all(live.join("_servers")).unwrap();
+
+        // An existing app disk (here grown to 3 GiB, e.g. a former co-located DB) is subtracted
+        // at its LOGICAL size, though sparse — its guest can still fill it.
+        disk("p.img", 3 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
+        // The legacy `.ext4` app slot counts the same way when there's no `.img`.
+        std::fs::remove_file(disks.join("p.img")).unwrap();
+        disk("p.ext4", 3 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
+        // The DB disk's OWN current size never counts against itself (re-sizing on wake).
+        disk("p.db.img", 13 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
+        // …and it counts against a co-located app disk (a stale sibling after a tier change).
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 3 * 1024 - LIVE_MIB);
+        // Other projects' disks are never part of this budget.
+        disk("q.db.img", 8 * 1024);
+        disk("p2.img", 8 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
+        // A budget exhausted by other disks still floors at the platform minimum.
+        disk("p.ext4", 16 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), DATA_DISK_MIB);
+        // A dedicated project's app disk doesn't hold the DB → the default, budget irrelevant.
+        assert_eq!(data_disk_mib_for(&root, "p", false, 16 * gib), DATA_DISK_MIB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Everything ELSE the project reserves comes out of the disk budget too (so the next deploy /
+    /// object write still fits), but only when the disk would grow — a disk already at its wanted
+    /// size is left alone however full the rest of the quota is.
+    #[test]
+    fn data_disk_budget_subtracts_non_disk_usage_only_when_growing() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkbase-diskbudget2-{nanos}"));
+        let live = root.join("hosting").join("p").join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let (mib, gib) = (1024 * 1024u64, 1024 * 1024 * 1024u64);
+        std::fs::write(live.join("_database.json"), r#"{"size_mib": 4096}"#).unwrap();
+        // 3 GiB of objects (sparse, so the test stays cheap; `dir_bytes` counts logical length).
+        let bkt = root.join("objectstore").join("p").join("b");
+        std::fs::create_dir_all(&bkt).unwrap();
+        std::fs::File::create(bkt.join("o")).unwrap().set_len(3 * gib).unwrap();
+        // Creating the DB disk under a 5 GiB quota: 5 − 3 (objects) − the manifest → just under 2 GiB,
+        // not the 4 GiB `size`.
+        let got = data_disk_mib_for(&root, "p.db", true, 5 * gib);
+        assert!((DATA_DISK_MIB..2048).contains(&got), "got {got}");
+        // Already at its wanted size → returned as-is, no budget applied (no shrink, no walk).
+        let disks = root.join("data-disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        std::fs::File::create(disks.join("p.db.img"))
+            .unwrap()
+            .set_len(4096 * mib)
+            .unwrap();
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 5 * gib), 4096);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
+    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
+    /// (stamped+present rootfs blob + matching deployment version) restores.
     #[test]
     fn snapshot_restore_decision_fails_open_on_every_mismatch() {
         let nanos = std::time::SystemTime::now()

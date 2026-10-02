@@ -267,6 +267,18 @@ pub enum DbCommand {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
+    /// Destroy the project's dedicated-tier database and its disk (DESTRUCTIVE, irreversible).
+    /// Frees the storage it reserves, e.g. after leaving the dedicated tier. A co-located
+    /// database is not affected.
+    Drop {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
     /// Restore the managed DB from a backup (DESTRUCTIVE — overwrites current data)
     Restore {
         /// Backup id (from `jkbase db backups`)
@@ -786,6 +798,8 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     let rx = v["rx_bytes"].as_u64().unwrap_or(0);
     let tx = v["tx_bytes"].as_u64().unwrap_or(0);
     let storage = v["storage_bytes"].as_u64().unwrap_or(0);
+    // What the storage quota checks count: data disks at their full size (older servers: absent).
+    let storage_reserved = v["storage_reserved_bytes"].as_u64();
     // Server-side build-VM WALL time, metered on build exit — one VM per build target,
     // so a fan-out build sums its targets. Distinct from `cpu_seconds` (runtime-VM CPU);
     // it's the field the build-minute quota gate counts against.
@@ -799,7 +813,14 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
         fmt_bytes(rx),
         fmt_bytes(tx)
     );
-    println!("  Storage:   {}", fmt_bytes(storage));
+    match storage_reserved {
+        Some(r) => println!(
+            "  Storage:   {} toward quota (data disks at full size; {} in use, billed)",
+            fmt_bytes(r),
+            fmt_bytes(storage)
+        ),
+        None => println!("  Storage:   {}", fmt_bytes(storage)),
+    }
     println!(
         "  Build:     {:.1} build-minutes ({build_seconds} build-seconds)",
         build_seconds as f64 / 60.0
@@ -1331,6 +1352,11 @@ async fn run_db(cmd: DbCommand) -> anyhow::Result<()> {
         DbCommand::Proxy(args) => db_proxy::run(args).await,
         DbCommand::Backup { project, api } => run_db_backup(project, api).await,
         DbCommand::Backups { project, api } => run_db_backups(project, api).await,
+        DbCommand::Drop {
+            force,
+            project,
+            api,
+        } => run_db_drop(force, project, api).await,
         DbCommand::Restore {
             backup_id,
             force,
@@ -1522,6 +1548,60 @@ async fn run_db_restore(
             body["error"].as_str().unwrap_or("unknown error")
         );
     }
+}
+
+async fn run_db_drop(force: bool, project: Option<String>, api: String) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    if !force {
+        eprint!(
+            "This will PERMANENTLY DELETE the dedicated-tier database of project '{project_id}' \
+             and its disk. Back it up first (`jkbase db backup`) if you need the data.\n\
+             Type the project id to confirm: "
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != project_id {
+            anyhow::bail!("confirmation did not match; drop aborted");
+        }
+    }
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+
+    let resp = client
+        .delete(format!("{api}/projects/{project_id}/db/dedicated"))
+        .json(&serde_json::json!({ "confirm": project_id }))
+        .send()
+        .await
+        .context("failed to connect to API")?;
+    if !resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        anyhow::bail!(
+            "failed to drop database: {}",
+            body["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("the drop request succeeded but its response was unreadable")?;
+    let dropped = body["dropped"]
+        .as_bool()
+        .context("the drop request succeeded but its response had no `dropped` field")?;
+    if dropped {
+        println!(
+            "Dropped the dedicated database of project '{project_id}'. If jkbase.toml still \
+             declares `tier = \"dedicated\"`, the next deploy starts a fresh, empty one."
+        );
+    } else {
+        println!(
+            "Project '{project_id}' has no dedicated-tier database to drop (a co-located \
+             database lives on the app's own disk and was not touched)."
+        );
+    }
+    Ok(())
 }
 
 async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {
