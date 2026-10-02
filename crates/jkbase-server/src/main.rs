@@ -4860,9 +4860,16 @@ async fn wake_project_inner(
     // the fire-and-forget Drop backstop, whose deferred detach could later `losetup -d`
     // a recreated same-slug VM's live device. Drop the platform lock first so the
     // release's losetup I/O isn't held under the mutex.
-    if plat.store.get_project(project_id).ok().flatten().is_none() {
+    //
+    // Look up the BASE project: a dedicated DB VM (`{id}.db`) has no project row of its own, so
+    // checking the rendered id aborted EVERY DB-VM wake as "deleted" — a hibernated DB VM could
+    // never come back short of a redeploy, and each attempt was a full unthrottled FC boot.
+    if plat.store.get_project(base_pid).ok().flatten().is_none() {
         plat.vm_states.remove(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
+        // Throttle like any failed wake, so traffic at a deleted project can't drive serial boots.
+        plat.wake_failures
+            .insert(project_id.to_string(), std::time::Instant::now());
         drop(plat);
         let _ = vm.stop().await; // synchronous-to-death before detaching the disk it maps
         if let Some(g) = disk_guard {
@@ -7567,6 +7574,23 @@ mod tests {
         std::os::unix::fs::symlink(&baselayers, data_dir.join("baselayers")).unwrap();
 
         let store = Store::open(&data_dir.join("control.redb")).unwrap();
+        store
+            .create_project(&jkbase_control::store::Project {
+                id: pid.to_string(),
+                name: pid.to_string(),
+                tenant_id: None,
+                current_version: Some(1),
+                state: ProjectState::Active,
+                vm_ip: None,
+                domains: Vec::new(),
+            })
+            .unwrap();
+        // Boot from a CAS-shaped rootfs path so a hibernate's snapshot is restore-viable on wake.
+        let rootfs_hash = "a".repeat(64);
+        let cas_dir = data_dir.join("base-rootfs");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+        let cas_rootfs = rootfs_cas::blob_path(&cas_dir, &rootfs_hash);
+        std::os::unix::fs::symlink(&rootfs, &cas_rootfs).unwrap();
         let host_id = "dbrace-host".to_string();
         let platform = Arc::new(Mutex::new(PlatformState {
             vms: HashMap::new(),
@@ -7577,8 +7601,8 @@ mod tests {
             store,
             firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
             kernel_path: kernel,
-            base_rootfs_path: rootfs,
-            base_rootfs_hash: "0".repeat(64),
+            base_rootfs_path: cas_rootfs,
+            base_rootfs_hash: rootfs_hash,
             data_dir: data_dir.clone(),
             data_disk: Arc::new(LocalLoop::open(data_dir.join("data-disks")).unwrap()),
             lease: Arc::new(FlockLease::open(data_dir.join("leases"), host_id.clone()).unwrap()),
@@ -7588,6 +7612,7 @@ mod tests {
             platform_egress: PlatformEgress::default(),
         }));
         let routing: jkbase_proxy::RoutingTable = Default::default();
+        let domain_map: DomainMap = Default::default();
         let logs = data_dir.join("logs");
         let shipper = LogShipper::new(LogStore::new(logs.clone()), logs.join(".cursors.json"));
         let reach = jkbase_common::config::DbReachFacts {
@@ -7675,6 +7700,70 @@ mod tests {
                     || !alive
                 {
                     return Err(format!("round {round}: incoherent DB VM after the race"));
+                }
+            }
+
+            // Then the DB VM must still hibernate + WAKE normally (the reach plane's path): a
+            // settled hibernate leaves a snapshot, and `wake_project_inner` on the `.db` id brings
+            // it back Running — on main this aborted every DB-VM wake as "deleted".
+            hibernate_project(&db_id, platform.clone(), routing.clone(), shipper.clone(), None, None)
+                .await
+                .map_err(|e| format!("final hibernate: {e:#}"))?;
+            {
+                let plat = platform.lock().await;
+                let st = plat.vm_states.get(&db_id).copied();
+                let snap = plat.store.get_snapshot_meta(&db_id).ok().flatten();
+                eprintln!("[dbrace] hibernated: state={st:?} snapshot_meta={}", snap.is_some());
+                if st != Some(VmLifecycle::Hibernated) || snap.is_none() {
+                    return Err("final hibernate did not settle Hibernated with a snapshot".into());
+                }
+            }
+            for wake in 1..=2 {
+                let ip = wake_project_inner(
+                    &db_id,
+                    platform.clone(),
+                    routing.clone(),
+                    domain_map.clone(),
+                    shipper.clone(),
+                )
+                .await
+                .map_err(|e| format!("DB VM wake {wake}: {e:#}"))?;
+                let plat = platform.lock().await;
+                let state = plat.vm_states.get(&db_id).copied();
+                let has_vm = plat.vms.contains_key(&db_id);
+                let token = plat.disk_tokens.get(&db_id).cloned();
+                let lease = plat.lease.clone();
+                drop(plat);
+                let lease_ok = match &token {
+                    Some(t) => lease.renew(t, DISK_LEASE_TTL).await.is_ok(),
+                    None => false,
+                };
+                let alive = agent_alive(&ip).await;
+                let (fcs, loops) = (fc_count(), loop_count());
+                eprintln!(
+                    "[dbrace] wake {wake}: ip={ip} state={state:?} vm={has_vm} lease_ok={lease_ok} \
+                     fcs={fcs} loops={loops} agent_alive={alive}"
+                );
+                if state != Some(VmLifecycle::Running)
+                    || !has_vm
+                    || !lease_ok
+                    || fcs != 1
+                    || loops != 1
+                    || !alive
+                {
+                    return Err(format!("wake {wake}: incoherent DB VM"));
+                }
+                if wake == 1 {
+                    hibernate_project(
+                        &db_id,
+                        platform.clone(),
+                        routing.clone(),
+                        shipper.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| format!("re-hibernate: {e:#}"))?;
                 }
             }
             Ok(())
