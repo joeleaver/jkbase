@@ -1036,6 +1036,7 @@ async fn create_project(
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
     let _ = state.store.delete_deployed_tier(&id);
+    let _ = state.store.delete_deploy_version_hwm(&id);
     // An admin-granted L4 egress override is per-slug, so an interrupted teardown would hand the
     // grant to the new owner of the name.
     let _ = state.store.remove_l4_egress_limits(&id);
@@ -1215,6 +1216,7 @@ async fn delete_project(
                     let _ = state.store.delete_all_db_access_keys(&id);
                     let _ = state.store.delete_db_splice_secret(&id);
                     let _ = state.store.delete_deployed_tier(&id);
+                    let _ = state.store.delete_deploy_version_hwm(&id);
                     // Managed-DB backups ([RB11]): admin token + catalog rows + backup blobs.
                     let _ = state.store.delete_db_admin_token(&id);
                     let _ = state.store.delete_all_db_backups(&id);
@@ -2204,16 +2206,18 @@ async fn activate_deployment(
     project: &mut Project,
     staged: &std::path::Path,
 ) -> anyhow::Result<u64> {
-    // Next version = one past the HIGHEST ever recorded, not `current_version + 1`: after a
+    // Next version = one past the HIGHEST ever allocated, not `current_version + 1`: after a
     // rollback (v7 → v5) the latter is v6 — a retained version whose dir this deploy would
     // overwrite, or (refused) delete while its history row stayed, 404ing a later rollback to it.
-    // The newest version is never pruned, so the history max is the true high-water mark.
+    // The store's high-water mark also covers versions an undone refusal dropped from history;
+    // the recorded max seeds it for projects that predate it.
     let newest_recorded = state
         .store
         .list_deployments(&project.id)?
         .first()
         .map(|d| d.version);
-    let version = project.current_version.max(newest_recorded).unwrap_or(0) + 1;
+    let floor = project.current_version.max(newest_recorded).unwrap_or(0);
+    let version = state.store.allocate_deploy_version(&project.id, floor)?;
 
     let deploy_path = state
         .deploy_dir
@@ -2287,8 +2291,7 @@ async fn activate_deployment(
     let proj_dir = state.deploy_dir.join(&project.id);
     let live_link = proj_dir.join("live");
     // What to restore if the deploy callback refuses after the swap (see below).
-    let prev_live = tokio::fs::read_link(&live_link).await.ok();
-    let (prev_version, prev_state) = (project.current_version, project.state);
+    let before = PreActivation::capture(state, project, &live_link, true).await;
     swap_live(&proj_dir, &deploy_path).await?;
 
     project.current_version = Some(version);
@@ -2331,16 +2334,16 @@ async fn activate_deployment(
         // let the next wake boot the refused one. Any other error is past teardown: the new tree
         // stays live (its metadata image may already be rebuilt — see the precheck comment).
         if e.downcast_ref::<DeployRefused>().is_some() {
-            undo_activation(
-                state,
-                project,
-                version,
-                &deploy_path,
-                prev_live,
-                prev_version,
-                prev_state,
-            )
-            .await;
+            if before.restore(state, project).await {
+                let _ = state.store.remove_deployment(&project.id, version);
+                let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+                info!(project_id = %project.id, version,
+                    "refused deploy undone; previous version stays live");
+            }
+        } else {
+            // Committed (past teardown): bounded like a success, or a tenant could pile up
+            // unpruned versions with deploys that fail on purpose (shared-disk DoS).
+            prune_deployments(state, &project.id, version);
         }
         return Err(e);
     }
@@ -2361,44 +2364,82 @@ async fn swap_live(proj_dir: &std::path::Path, target: &std::path::Path) -> std:
     tokio::fs::rename(&tmp_link, proj_dir.join("live")).await
 }
 
-/// Reverse [`activate_deployment`] after its deploy callback refused (nothing on the runtime was
-/// touched): `live` back to `prev_live` (removed for a first deploy), `current_version`/state
-/// restored, the new version's history row + dir dropped, and the schedule registry
-/// re-reconciled from the previous tree. Declared domains the refused version claimed stay
-/// claimed, as on a rollback (claims are additive; an Active subdomain just routes to the old
-/// tree). Best-effort: each step is logged on failure, and the caller still returns the refusal.
-#[allow(clippy::too_many_arguments)]
-async fn undo_activation(
-    state: &AppState,
-    project: &mut Project,
-    version: u64,
-    deploy_path: &std::path::Path,
-    prev_live: Option<PathBuf>,
-    prev_version: Option<u64>,
-    prev_state: crate::store::ProjectState,
-) {
-    let proj_dir = state.deploy_dir.join(&project.id);
-    let restored = match &prev_live {
-        Some(prev) => swap_live(&proj_dir, prev).await,
-        None => tokio::fs::remove_file(proj_dir.join("live")).await,
-    };
-    if let Err(e) = restored {
-        tracing::error!(project_id = %project.id, error = %e,
-            "refused deploy: failed to restore `live` — the refused version stays live");
-        return;
+/// What a `live` swap replaced, to put back when the deploy callback REFUSES after it (nothing on
+/// the runtime touched, so the old VM still serves the old tree). Declared domains the refused
+/// version claimed stay claimed, as on a rollback (claims are additive; an Active subdomain just
+/// routes to the old tree).
+struct PreActivation {
+    live: Option<PathBuf>,
+    version: Option<u64>,
+    state: crate::store::ProjectState,
+    /// The schedule registry as it was (`None` when the caller doesn't reconcile schedules):
+    /// restored verbatim, so `last_run` cadence survives the refused version's reconcile.
+    schedules: Option<Vec<crate::store::ScheduleRecord>>,
+}
+
+impl PreActivation {
+    async fn capture(
+        state: &AppState,
+        project: &Project,
+        live_link: &std::path::Path,
+        with_schedules: bool,
+    ) -> Self {
+        Self {
+            live: tokio::fs::read_link(live_link).await.ok(),
+            version: project.current_version,
+            state: project.state,
+            schedules: with_schedules.then(|| {
+                state
+                    .store
+                    .list_schedules_for_project(&project.id)
+                    .unwrap_or_default()
+            }),
+        }
     }
-    project.current_version = prev_version;
-    project.state = prev_state;
-    if let Err(e) = state.store.update_project(project) {
-        tracing::error!(project_id = %project.id, error = %e,
-            "refused deploy: failed to restore current_version");
+
+    /// Put `live` (removed if there was none), `current_version`, state and schedules back.
+    /// Returns false — leaving the store as-is, consistent with the still-swapped `live` — when
+    /// `live` can't be restored. Re-reads the project FRESH: a wake/hibernate may have written
+    /// its state since the swap, and only the swap's own `Active` is reverted.
+    async fn restore(self, state: &AppState, project: &mut Project) -> bool {
+        let proj_dir = state.deploy_dir.join(&project.id);
+        let restored = match &self.live {
+            Some(prev) => swap_live(&proj_dir, prev).await,
+            None => match tokio::fs::remove_file(proj_dir.join("live")).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            },
+        };
+        if let Err(e) = restored {
+            tracing::error!(project_id = %project.id, error = %e,
+                "refused deploy: failed to restore `live` — the refused version stays live");
+            return false;
+        }
+        if let Ok(Some(fresh)) = state.store.get_project(&project.id) {
+            *project = fresh;
+        }
+        project.current_version = self.version;
+        if project.state == crate::store::ProjectState::Active {
+            project.state = self.state;
+        }
+        if let Err(e) = state.store.update_project(project) {
+            tracing::error!(project_id = %project.id, error = %e,
+                "refused deploy: failed to restore current_version");
+        }
+        if let Some(prev) = self.schedules {
+            for cur in state
+                .store
+                .list_schedules_for_project(&project.id)
+                .unwrap_or_default()
+            {
+                let _ = state.store.remove_schedule(&project.id, &cur.function);
+            }
+            for rec in &prev {
+                let _ = state.store.save_schedule(rec);
+            }
+        }
+        true
     }
-    let _ = state.store.remove_deployment(&project.id, version);
-    let _ = tokio::fs::remove_dir_all(deploy_path).await;
-    // A first deploy has no previous tree: reconciling a nonexistent one clears its schedules.
-    let prev_tree = prev_live.unwrap_or_else(|| proj_dir.join("deployments").join("v0"));
-    reconcile_deploy_schedules(state, project, &prev_tree);
-    info!(project_id = %project.id, version, "refused deploy undone; previous version stays live");
 }
 
 /// Keep only the most recent `MAX_DEPLOYMENTS` deployments on disk + in history.
@@ -3211,8 +3252,7 @@ async fn do_rollback(
     precheck_deployment(state, &project.id, deploy_path).await?;
 
     let proj_dir = state.deploy_dir.join(&project.id);
-    let prev_live = tokio::fs::read_link(proj_dir.join("live")).await.ok();
-    let (prev_version, prev_state) = (project.current_version, project.state);
+    let before = PreActivation::capture(state, project, &proj_dir.join("live"), false).await;
     swap_live(&proj_dir, deploy_path).await?;
 
     project.current_version = Some(target);
@@ -3226,18 +3266,8 @@ async fn do_rollback(
     if let Some(cb) = &state.deploy_callback
         && let Err(e) = cb(project.id.clone(), target).await
     {
-        if e.downcast_ref::<DeployRefused>().is_some()
-            && let Some(prev) = &prev_live
-        {
-            match swap_live(&proj_dir, prev).await {
-                Ok(()) => {
-                    project.current_version = prev_version;
-                    project.state = prev_state;
-                    let _ = state.store.update_project(project);
-                }
-                Err(err) => tracing::error!(project_id = %project.id, error = %err,
-                    "refused rollback: failed to restore `live`"),
-            }
+        if e.downcast_ref::<DeployRefused>().is_some() {
+            before.restore(state, project).await;
         }
         return Err(e);
     }

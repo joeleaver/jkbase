@@ -106,6 +106,11 @@ const DB_ADMIN_TOKEN: TableDefinition<&str, &[u8]> = TableDefinition::new("db_ad
 /// sibling VM). Absent ⇒ first deploy / pre-P2 project ⇒ no flip to detect. Purged on teardown so
 /// a recreated same-slug project starts fresh.
 const DB_DEPLOYED_TIER: TableDefinition<&str, &[u8]> = TableDefinition::new("db_deployed_tier");
+/// Per-project highest deployment version ever ALLOCATED (`project_id` → version). Allocation
+/// goes past it, so a version undone after a refusal (its history row + dir dropped) is never
+/// handed out again — a snapshot or wake stamped with it can't be mistaken for a later deploy's.
+/// Purged on teardown.
+const DEPLOY_VERSION_HWM: TableDefinition<&str, u64> = TableDefinition::new("deploy_version_hwm");
 /// Per-project managed-DB **backup catalog** (primary, key = `backup_id`) + its
 /// per-project index (`"{project_id}:{backup_id}"` → `backup_id`), mirroring the
 /// [`DB_ACCESS_KEYS`] primary+index split so list/teardown stay O(backups-for-this-project)
@@ -1083,6 +1088,7 @@ impl Store {
         let _ = txn.open_table(DB_ACCESS_KEYS_BY_PROJECT)?;
         let _ = txn.open_table(DB_SPLICE)?;
         let _ = txn.open_table(DB_ADMIN_TOKEN)?;
+        let _ = txn.open_table(DEPLOY_VERSION_HWM)?;
         let _ = txn.open_table(DB_BACKUPS)?;
         let _ = txn.open_table(DB_BACKUPS_BY_PROJECT)?;
         let _ = txn.open_table(AUTH_SIGNING_KEYS)?;
@@ -3097,6 +3103,32 @@ impl Store {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(DB_DEPLOYED_TIER)?;
+            table.remove(project_id)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Allocate the project's next deployment version: one past both `floor` (the caller's view of
+    /// the live/recorded versions) and every version ever allocated. Atomic (one write txn).
+    pub fn allocate_deploy_version(&self, project_id: &str, floor: u64) -> Result<u64> {
+        let txn = self.db.begin_write()?;
+        let version = {
+            let mut table = txn.open_table(DEPLOY_VERSION_HWM)?;
+            let hwm = table.get(project_id)?.map(|v| v.value()).unwrap_or(0);
+            let version = hwm.max(floor) + 1;
+            table.insert(project_id, version)?;
+            version
+        };
+        txn.commit()?;
+        Ok(version)
+    }
+
+    /// Drop a project's version high-water mark (teardown).
+    pub fn delete_deploy_version_hwm(&self, project_id: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(DEPLOY_VERSION_HWM)?;
             table.remove(project_id)?;
         }
         txn.commit()?;

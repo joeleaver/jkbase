@@ -228,6 +228,18 @@ impl Harness {
     }
 }
 
+impl Harness {
+    /// The `deployments/v*` dirs on disk, sorted.
+    fn version_dirs(&self) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(self.deploy_dir.join("app").join("deployments"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+}
+
 fn same(a: &Path, b: &Path) -> bool {
     a.canonicalize().unwrap() == b.canonicalize().unwrap()
 }
@@ -279,12 +291,12 @@ async fn refused_deploy_leaves_the_previous_version_live() {
         "the refused tree leaves no orphan bytes"
     );
 
-    // The next accepted deploy reuses the refused version number cleanly.
+    // The next accepted deploy never reuses the refused version number.
     let ok = h.deploy(&[("index.html", "v2 fixed")]).await;
     assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
-    assert!(same(&h.live_target(), &h.version_dir(2)));
-    assert_eq!(h.current_version(), Some(2));
-    assert_eq!(h.history(), vec![1, 2]);
+    assert!(same(&h.live_target(), &h.version_dir(3)));
+    assert_eq!(h.current_version(), Some(3));
+    assert_eq!(h.history(), vec![1, 3]);
 }
 
 #[tokio::test]
@@ -374,7 +386,7 @@ async fn deploy_refuses_symlinks_in_platform_sidecars() {
             "{name}: live must stay on v1"
         );
         assert_eq!(h.current_version(), Some(1));
-        assert!(!h.version_dir(2).exists(), "{name}: refused tree removed");
+        assert_eq!(h.version_dirs(), vec!["v1"], "{name}: refused tree removed");
     }
     assert_eq!(
         h.prechecked.lock().unwrap().len(),
@@ -392,7 +404,9 @@ async fn deploy_refuses_symlinks_in_platform_sidecars() {
     );
     let r = h.deploy_raw(body).await;
     assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
-    assert_eq!(h.current_version(), Some(2));
+    let v = h.current_version().unwrap();
+    assert!(same(&h.live_target(), &h.version_dir(v)));
+    assert_eq!(h.history(), vec![1, v]);
 }
 
 /// Retained versions may predate the activation check, so a rollback re-validates its target.
@@ -434,11 +448,11 @@ async fn deploy_after_rollback_never_reuses_a_retained_version() {
     assert_eq!(std::fs::read_to_string(&v2_index).unwrap(), "v2");
     assert!(same(&h.live_target(), &h.version_dir(1)));
 
-    // An accepted deploy takes v4, and v2 is still rollback-able.
-    let ok = h.deploy(&[("index.html", "v4")]).await;
+    // An accepted deploy takes v5 (the refused one consumed v4), and v2 is still rollback-able.
+    let ok = h.deploy(&[("index.html", "v5")]).await;
     assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
-    assert_eq!(h.current_version(), Some(4));
-    assert_eq!(h.history(), vec![1, 2, 3, 4]);
+    assert_eq!(h.current_version(), Some(5));
+    assert_eq!(h.history(), vec![1, 2, 3, 5]);
     assert_eq!(std::fs::read_to_string(&v2_index).unwrap(), "v2");
     let r = h.rollback(2).await;
     assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
@@ -483,21 +497,22 @@ async fn callback_refusal_undoes_the_activation_but_a_boot_failure_does_not() {
     assert_eq!(h.current_version(), Some(1));
     assert_eq!(h.history(), vec![1]);
     assert!(!h.version_dir(2).exists());
-    assert_eq!(schedules(&h), vec!["a"], "schedules re-reconciled from v1");
+    assert_eq!(schedules(&h), vec!["a"], "schedule registry restored");
 
-    // A boot failure past teardown keeps the new version live (and retryable).
-    let failed = h.deploy(&[("index.html", "v2"), (CB_FAIL, "")]).await;
+    // A boot failure past teardown keeps the new version (v3: the undone v2 is never reused)
+    // live, and retryable.
+    let failed = h.deploy(&[("index.html", "v3"), (CB_FAIL, "")]).await;
     assert_eq!(failed.status().as_u16(), 500);
-    assert!(same(&h.live_target(), &h.version_dir(2)));
-    assert_eq!(h.current_version(), Some(2));
-    assert_eq!(h.history(), vec![1, 2]);
+    assert!(same(&h.live_target(), &h.version_dir(3)));
+    assert_eq!(h.current_version(), Some(3));
+    assert_eq!(h.history(), vec![1, 3]);
 
     // Rollback: a callback refusal puts `live` back on the version it was rolling back from.
     std::fs::write(h.version_dir(1).join(CB_REFUSE), "").unwrap();
     let r = h.rollback(1).await;
     assert_eq!(r.status().as_u16(), 409);
-    assert!(same(&h.live_target(), &h.version_dir(2)));
-    assert_eq!(h.current_version(), Some(2));
+    assert!(same(&h.live_target(), &h.version_dir(3)));
+    assert_eq!(h.current_version(), Some(3));
 }
 
 /// A refused FIRST deploy has no previous version: `live` is removed, not left on the refused
@@ -565,21 +580,22 @@ async fn rootfs_extraction_cannot_plant_sidecar_symlinks() {
             same(&h.live_target(), &h.version_dir(1)),
             "{name}: live stays on v1"
         );
-        assert!(!h.version_dir(2).exists(), "{name}: refused tree removed");
+        assert_eq!(h.version_dirs(), vec!["v1"], "{name}: refused tree removed");
     }
 
     let rootfs = inner_tarball(&[("etc/hostname", "web")], &[("bin/sh", "/bin/busybox")]);
     let body = artifact_with_blobs(&[("index.html", "v2")], &[("_servers/web.tar.gz", &rootfs)]);
     let r = h.deploy_raw(body).await;
     assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
-    let sh = h.version_dir(2).join("_servers/web/bin/sh");
+    let v = h.version_dir(h.current_version().unwrap());
+    let sh = v.join("_servers/web/bin/sh");
     assert!(
         std::fs::symlink_metadata(&sh)
             .unwrap()
             .file_type()
             .is_symlink()
     );
-    assert!(!h.version_dir(2).join("_servers/web.tar.gz").exists());
+    assert!(!v.join("_servers/web.tar.gz").exists());
 }
 
 /// Schema push clones the live tree (recreating its links) and writes the new SDL under
@@ -615,4 +631,21 @@ async fn schema_push_refuses_a_live_tree_with_a_symlinked_database_dir() {
         "victim"
     );
     assert_eq!(h.current_version(), Some(1));
+}
+
+/// A deploy that fails PAST teardown (bad manifest → boot failure) is committed, so it is pruned
+/// like a success: otherwise a tenant could pile up unpruned versions with deploys that fail on
+/// purpose (shared-disk DoS; the storage cap bills only the live version).
+#[tokio::test]
+async fn failed_deploys_are_still_pruned() {
+    let h = spawn("prune-failed").await;
+    for i in 0..14 {
+        let body = format!("v{i}");
+        let r = h
+            .deploy(&[("index.html", body.as_str()), (CB_FAIL, "")])
+            .await;
+        assert_eq!(r.status().as_u16(), 500);
+    }
+    assert_eq!(h.history().len(), 10, "history bounded");
+    assert_eq!(h.version_dirs().len(), 10, "dirs bounded");
 }
