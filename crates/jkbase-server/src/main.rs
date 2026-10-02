@@ -6147,10 +6147,11 @@ mod l4_port_decl_tests {
 /// what they've filled so far — allocated bytes would let the budget be spent twice). An app disk
 /// a dedicated project will create for its volumes but hasn't yet is reserved at its fixed
 /// default, so boot order can't decide the total. A larger `size` is clamped, not refused, so the
-/// project still boots. Residual: the per-disk floor wins over the budget, so a quota under two
-/// default disks can be exceeded by at most one [`DATA_DISK_MIB`]; and a disk already grown past
-/// a later-shrunk budget keeps its size (`ensure` never shrinks) — billing still counts its
-/// allocated blocks against the cap at the next deploy.
+/// project still boots. Residuals, each bounded by one [`DATA_DISK_MIB`] or by real billed blocks:
+/// the per-disk floor wins over the budget (a quota under two default disks); a dedicated project
+/// that adds volumes AFTER its DB disk took the full budget gets a default app disk on top; and a
+/// disk already grown past a later-shrunk budget keeps its size (`ensure` never shrinks). Billing
+/// counts every disk's allocated blocks against the cap at the next deploy either way.
 ///
 /// `holds_db`: whether this disk holds the managed DB (the DB VM's, or a co-located app VM's).
 /// A dedicated project's app-VM disk only carries its own volumes, so it stays at the default.

@@ -264,12 +264,22 @@ mod tests {
         };
         sparse("proj.img");
         sparse("proj.db.img");
+        // Incompressible fill, so a compressing fs (btrfs/zfs) still allocates the blocks.
+        let mut x = 0x9e37_79b9_u32;
+        let noise: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
         let base = project_storage_bytes(&dd, pid);
         assert!(base < (1 << 20), "sparse disks bill allocated blocks, got {base}");
         // Real blocks written to the DB disk count against the SAME cap as the app disk.
-        write(&disks.join("proj.db.img"), &[1u8; 1 << 20]);
+        write(&disks.join("proj.db.img"), &noise);
         assert!(project_storage_bytes(&dd, pid) >= base + (1 << 20));
-        write(&disks.join("proj.img"), &[1u8; 1 << 20]);
+        write(&disks.join("proj.img"), &noise);
         assert!(project_storage_bytes(&dd, pid) >= base + (2 << 20));
         // The DB VM's metadata image is the project's too.
         let before = project_storage_bytes(&dd, pid);
