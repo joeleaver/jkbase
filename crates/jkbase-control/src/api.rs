@@ -2146,7 +2146,16 @@ async fn activate_deployment(
     project: &mut Project,
     staged: &std::path::Path,
 ) -> anyhow::Result<u64> {
-    let version = project.current_version.unwrap_or(0) + 1;
+    // Next version = one past the HIGHEST ever recorded, not `current_version + 1`: after a
+    // rollback (v7 → v5) the latter is v6 — a retained version whose dir this deploy would
+    // overwrite, or (refused) delete while its history row stayed, 404ing a later rollback to it.
+    // The newest version is never pruned, so the history max is the true high-water mark.
+    let newest_recorded = state
+        .store
+        .list_deployments(&project.id)?
+        .first()
+        .map(|d| d.version);
+    let version = project.current_version.max(newest_recorded).unwrap_or(0) + 1;
 
     let deploy_path = state
         .deploy_dir

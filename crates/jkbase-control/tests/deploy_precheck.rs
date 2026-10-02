@@ -398,3 +398,35 @@ async fn rollback_refuses_a_target_with_sidecar_symlinks() {
     assert_eq!(h.current_version(), Some(2));
     assert_eq!(*h.deployed.lock().unwrap(), vec![1, 2]);
 }
+
+/// After a rollback, the next deploy must not reuse a retained version number: `current + 1`
+/// would land on a version still in history, overwriting it (or, when refused, deleting its dir
+/// while its history row stayed — a later rollback to it then 404s).
+#[tokio::test]
+async fn deploy_after_rollback_never_reuses_a_retained_version() {
+    let h = spawn("version-reuse").await;
+    for body in ["v1", "v2", "v3"] {
+        let r = h.deploy(&[("index.html", body)]).await;
+        assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+    }
+    let r = h.rollback(1).await;
+    assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+    let v2_index = h.version_dir(2).join("index.html");
+    assert_eq!(std::fs::read_to_string(&v2_index).unwrap(), "v2");
+
+    // A refused deploy leaves every retained version intact.
+    let refused = h.deploy(&[("index.html", "bad"), (REFUSE, "")]).await;
+    assert_eq!(refused.status().as_u16(), 409);
+    assert_eq!(h.history(), vec![1, 2, 3]);
+    assert_eq!(std::fs::read_to_string(&v2_index).unwrap(), "v2");
+    assert!(same(&h.live_target(), &h.version_dir(1)));
+
+    // An accepted deploy takes v4, and v2 is still rollback-able.
+    let ok = h.deploy(&[("index.html", "v4")]).await;
+    assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
+    assert_eq!(h.current_version(), Some(4));
+    assert_eq!(h.history(), vec![1, 2, 3, 4]);
+    assert_eq!(std::fs::read_to_string(&v2_index).unwrap(), "v2");
+    let r = h.rollback(2).await;
+    assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+}
