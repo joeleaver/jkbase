@@ -285,7 +285,9 @@ impl ObjectStoreService {
         let dd = self.data_dir.clone();
         let pid = project_id.to_string();
         let bytes = match tokio::task::spawn_blocking(move || {
-            jkbase_common::storage::project_storage_bytes(&dd, &pid)
+            // The RESERVED view: data disks at full size, so objects can't spend capacity the
+            // project's guests can still fill without a host check.
+            jkbase_common::storage::project_reserved_bytes(&dd, &pid)
         })
         .await
         {
@@ -354,7 +356,8 @@ impl ObjectStoreService {
                 StatusCode::INSUFFICIENT_STORAGE,
                 "QuotaExceeded",
                 &format!(
-                    "storage quota exceeded: would use {projected_bytes} bytes, cap is {}",
+                    "storage quota exceeded: would use {projected_bytes} bytes (data disks count \
+                     at their full size), cap is {}",
                     quota.storage_bytes_max
                 ),
             ));

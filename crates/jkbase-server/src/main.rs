@@ -3624,7 +3624,7 @@ async fn handle_deploy(
     // any prior writer. Held by an RAII guard until the VM is up, so a boot failure (or
     // a cancelled future) releases the lease instead of bricking the project.
     let disk_guard = if has_disk {
-        let disk_mib = data_disk_mib_for(&data_dir, project_id, !dedicated, disk_cap);
+        let disk_mib = data_disk_mib(&data_dir, project_id, !dedicated, disk_cap).await;
         Some(fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?)
     } else {
         None
@@ -3872,7 +3872,7 @@ async fn boot_db_vm(
     // Fence the DB VM's OWN data disk (`{id}.db.img`), sized from the BASE project's
     // `_database.json` (`[database].size`) within the project-wide storage budget. The `.db`
     // scope is validator-legal (F1).
-    let disk_mib = data_disk_mib_for(&data_dir, &db_id, true, disk_cap);
+    let disk_mib = data_disk_mib(&data_dir, &db_id, true, disk_cap).await;
     let disk_guard = fence_data_disk(&dd, &ls, &hid, &db_id, disk_mib).await?;
 
     let db_size = vm_identity::vm_size_for(vm_identity::VmRole::Db);
@@ -4574,7 +4574,7 @@ async fn wake_project_inner(
         // Sized from the BASE project's `_database.json` ([database].size) — the DB VM has no
         // `hosting/<id>.db/` — within the project-wide budget; fenced under the RENDERED id.
         let holds_db = vm_role == vm_identity::VmRole::Db || !dedicated;
-        let disk_mib = data_disk_mib_for(&data_dir, project_id, holds_db, disk_cap);
+        let disk_mib = data_disk_mib(&data_dir, project_id, holds_db, disk_cap).await;
         let g = fence_data_disk(&dd, &ls, &hid, project_id, disk_mib).await?;
         config.data_disk_path = Some(g.device());
         // A grown disk can't be restored onto: the snapshot's guest believes the old size and
@@ -6141,17 +6141,22 @@ mod l4_port_decl_tests {
 /// minimum, so a too-small `size` is harmless. A non-DB project gets the default unchanged.
 ///
 /// Capped PROJECT-WIDE at the storage quota (`cap_bytes`): `size` is tenant input and a disk is
-/// real host capacity the guest can fill between deploys, while the quota is otherwise only
-/// checked at deploy/write time. A dedicated project owns two disks, so the DB-holding disk gets
-/// the quota MINUS the logical size of the project's other disks (what their guests can fill, not
-/// what they've filled so far — allocated bytes would let the budget be spent twice). An app disk
-/// a dedicated project will create for its volumes but hasn't yet is reserved at its fixed
-/// default, so boot order can't decide the total. A larger `size` is clamped, not refused, so the
-/// project still boots. Residuals, each bounded by one [`DATA_DISK_MIB`] or by real billed blocks:
-/// the per-disk floor wins over the budget (a quota under two default disks); a dedicated project
-/// that adds volumes AFTER its DB disk took the full budget gets a default app disk on top; and a
-/// disk already grown past a later-shrunk budget keeps its size (`ensure` never shrinks). Billing
-/// counts every disk's allocated blocks against the cap at the next deploy either way.
+/// real host capacity the guest can fill between checks, while the quota is otherwise only checked
+/// at deploy / object-write time. The DB-holding disk gets the quota MINUS everything else the
+/// project reserves ([`jkbase_common::storage::project_reserved_bytes`]: its other disks at their
+/// full size — what their guests can fill, not what they've filled — plus content, the live
+/// deployment, build caches and the object store), so the next quota check still fits and a
+/// dedicated project can't spend its budget once per disk. An app disk a dedicated project will
+/// create for its volumes but hasn't yet is reserved at its fixed default, so boot order can't
+/// decide the total. A larger `size` is clamped, not refused, so the project still boots.
+/// Residuals: the per-disk floor wins over the budget, and a dedicated project that adds volumes
+/// AFTER its DB disk took the budget gets a default app disk on top (each ≤ one [`DATA_DISK_MIB`]);
+/// a disk grown before its quota was lowered keeps its size (`ensure` never shrinks). The deploy
+/// cap then refuses any deploy that grows such a project further.
+///
+/// The budget walk (object store included) runs only when the disk would actually GROW — never
+/// on the steady-state wake, whose latency it would otherwise tax. Blocking fs: callers go through
+/// [`data_disk_mib`].
 ///
 /// `holds_db`: whether this disk holds the managed DB (the DB VM's, or a co-located app VM's).
 /// A dedicated project's app-VM disk only carries its own volumes, so it stays at the default.
@@ -6170,22 +6175,37 @@ fn data_disk_mib_for(data_dir: &Path, disk_id: &str, holds_db: bool, cap_bytes: 
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
         .and_then(|v| v.get("size_mib").and_then(serde_json::Value::as_u64));
-    // The project's OTHER disks, by logical size. `data_disk_images` = the app slot (`{base}.img`
-    // or legacy `.ext4`) + `{base}.db.img`; this disk is whichever slot matches its role.
+    let wanted = configured.unwrap_or(0).max(DATA_DISK_MIB);
+    // This disk's slot among `data_disk_images` (the app slot — `{base}.img` or legacy `.ext4` —
+    // or `{base}.db.img`), and its current logical size.
     let db_img = data_dir.join("data-disks").join(format!("{base}.db.img"));
     let is_db_disk = role == vm_identity::VmRole::Db;
-    let others = jkbase_common::storage::data_disk_images(data_dir, base);
-    let app_disk_exists = others.iter().any(|p| *p != db_img);
-    let mut other_bytes = others
+    let disks = jkbase_common::storage::data_disk_images(data_dir, base);
+    let own_bytes = disks
         .iter()
-        .filter(|p| (**p == db_img) != is_db_disk)
+        .filter(|p| (**p == db_img) == is_db_disk)
         .filter_map(|p| std::fs::metadata(p).ok())
         .fold(0u64, |acc, md| acc.saturating_add(md.len()));
+    if wanted.saturating_mul(MIB) <= own_bytes {
+        return wanted; // no growth: `ensure` is a no-op, skip the budget walk
+    }
+    let mut other_bytes =
+        jkbase_common::storage::project_reserved_bytes(data_dir, base).saturating_sub(own_bytes);
+    let app_disk_exists = disks.iter().any(|p| *p != db_img);
     if is_db_disk && !app_disk_exists && check_project_has_volumes(data_dir, base) {
         other_bytes = other_bytes.saturating_add(DATA_DISK_MIB * MIB);
     }
     let budget_mib = cap_bytes.saturating_sub(other_bytes) / MIB;
-    configured.unwrap_or(0).min(budget_mib).max(DATA_DISK_MIB)
+    wanted.min(budget_mib).max(DATA_DISK_MIB)
+}
+
+/// [`data_disk_mib_for`] off the async runtime (its budget walk can cover a large object store).
+/// A failed task falls back to the platform floor — safe, as `ensure` never shrinks a disk.
+async fn data_disk_mib(data_dir: &Path, disk_id: &str, holds_db: bool, cap_bytes: u64) -> u64 {
+    let (dd, id) = (data_dir.to_path_buf(), disk_id.to_string());
+    tokio::task::spawn_blocking(move || data_disk_mib_for(&dd, &id, holds_db, cap_bytes))
+        .await
+        .unwrap_or(DATA_DISK_MIB)
 }
 
 /// The project's storage quota in bytes, the ceiling for its data disk
@@ -7336,6 +7356,10 @@ mod tests {
     /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
     /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
     /// (stamped+present rootfs blob + matching deployment version) restores.
+    /// The live tree's own manifests (`_database.json`, …) count against the project budget, so
+    /// a budget that would land exactly on a GiB boundary rounds down one MiB.
+    const LIVE_MIB: u64 = 1;
+
     #[test]
     fn data_disk_size_is_floored_at_default_and_capped_at_quota() {
         let nanos = std::time::SystemTime::now()
@@ -7358,7 +7382,7 @@ mod tests {
         assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), DATA_DISK_MIB);
         // Tenant-declared size beyond the storage quota → clamped to the quota.
         set(1024 * 1024 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 16 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 16 * 1024 - LIVE_MIB);
         // A quota below the default never shrinks a disk below the platform floor.
         assert_eq!(data_disk_mib_for(&root, "p", true, 1), DATA_DISK_MIB);
         // A dedicated project's app-VM disk doesn't hold the DB → default, whatever `size` says.
@@ -7391,7 +7415,7 @@ mod tests {
         std::fs::write(live.join("_database.json"), r#"{"size_mib": 1048576}"#).unwrap();
 
         // No other disk yet → the DB disk may take the whole quota.
-        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 16 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 16 * 1024 - LIVE_MIB);
         // A dedicated project that declares volumes will get a default app disk: reserved up
         // front, so the DB VM booting first can't spend it.
         std::fs::create_dir_all(live.join("_servers")).unwrap();
@@ -7401,31 +7425,63 @@ mod tests {
         )
         .unwrap();
         assert!(check_project_has_volumes(&root, "p"));
-        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 16 * 1024 - DATA_DISK_MIB);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 16 * 1024 - DATA_DISK_MIB - LIVE_MIB);
         std::fs::remove_dir_all(live.join("_servers")).unwrap();
 
         // An existing app disk (here grown to 3 GiB, e.g. a former co-located DB) is subtracted
         // at its LOGICAL size, though sparse — its guest can still fill it.
         disk("p.img", 3 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
         // The legacy `.ext4` app slot counts the same way when there's no `.img`.
         std::fs::remove_file(disks.join("p.img")).unwrap();
         disk("p.ext4", 3 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
         // The DB disk's OWN current size never counts against itself (re-sizing on wake).
         disk("p.db.img", 13 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
         // …and it counts against a co-located app disk (a stale sibling after a tier change).
-        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 3 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p", true, 16 * gib), 3 * 1024 - LIVE_MIB);
         // Other projects' disks are never part of this budget.
         disk("q.db.img", 8 * 1024);
         disk("p2.img", 8 * 1024);
-        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024);
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), 13 * 1024 - LIVE_MIB);
         // A budget exhausted by other disks still floors at the platform minimum.
         disk("p.ext4", 16 * 1024);
         assert_eq!(data_disk_mib_for(&root, "p.db", true, 16 * gib), DATA_DISK_MIB);
         // A dedicated project's app disk doesn't hold the DB → the default, budget irrelevant.
         assert_eq!(data_disk_mib_for(&root, "p", false, 16 * gib), DATA_DISK_MIB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Everything ELSE the project reserves comes out of the disk budget too (so the next deploy /
+    /// object write still fits), but only when the disk would grow — a disk already at its wanted
+    /// size is left alone however full the rest of the quota is.
+    #[test]
+    fn data_disk_budget_subtracts_non_disk_usage_only_when_growing() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("jkbase-diskbudget2-{nanos}"));
+        let live = root.join("hosting").join("p").join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        let (mib, gib) = (1024 * 1024u64, 1024 * 1024 * 1024u64);
+        std::fs::write(live.join("_database.json"), r#"{"size_mib": 4096}"#).unwrap();
+        // 3 GiB of objects (sparse, so the test stays cheap; `dir_bytes` counts logical length).
+        let bkt = root.join("objectstore").join("p").join("b");
+        std::fs::create_dir_all(&bkt).unwrap();
+        std::fs::File::create(bkt.join("o")).unwrap().set_len(3 * gib).unwrap();
+        // Creating the DB disk under a 5 GiB quota: 5 − 3 (objects) − ~0 (manifest) → < 4 GiB.
+        let got = data_disk_mib_for(&root, "p.db", true, 5 * gib);
+        assert!(got < 2048 && got >= DATA_DISK_MIB, "got {got}");
+        // Already at its wanted size → returned as-is, no budget applied (no shrink, no walk).
+        let disks = root.join("data-disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        std::fs::File::create(disks.join("p.db.img"))
+            .unwrap()
+            .set_len(4096 * mib)
+            .unwrap();
+        assert_eq!(data_disk_mib_for(&root, "p.db", true, 5 * gib), 4096);
         let _ = std::fs::remove_dir_all(&root);
     }
 

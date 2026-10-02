@@ -2084,20 +2084,22 @@ async fn activate_deployment(
         }
     }
 
-    // Storage hard cap: bill the would-be-live footprint — content image + data
-    // disk + THIS version only, NOT the retained rollback history (bounded by a
-    // deployment count, not the cap). Measured before the `live` symlink is
-    // repointed, so a deploy whose live footprint fits is never refused by old
-    // versions still on disk. Reject + remove the just-unpacked artifacts so a
-    // rejected deploy leaves no orphan bytes.
+    // Storage hard cap (`deploy_exceeds_cap`): the would-be-live RESERVED footprint — content
+    // images + data disks at their full size + object store + THIS version only, NOT the retained
+    // rollback history (bounded by a deployment count, not the cap). Measured before the `live`
+    // symlink is repointed, so a deploy whose live footprint fits is never refused by old versions
+    // still on disk; a non-growing deploy of an already-over-cap project still ships. Reject +
+    // remove the just-unpacked artifacts so a rejected deploy leaves no orphan bytes.
     let cap = state.store.get_quota(&project.id)?.storage_bytes_max;
     let data_dir = state.deploy_dir.parent().unwrap_or(&state.deploy_dir);
-    let footprint =
-        jkbase_common::storage::project_storage_bytes_for(data_dir, &project.id, &deploy_path);
-    if footprint > cap {
+    if let Some(footprint) =
+        jkbase_common::storage::deploy_exceeds_cap(data_dir, &project.id, &deploy_path, cap)
+    {
         let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        let disks = jkbase_common::storage::data_disks_reserved_bytes(data_dir, &project.id);
         return Err(QuotaExceeded(format!(
-            "storage quota exceeded: deploy would use {footprint} bytes, cap is {cap}"
+            "storage quota exceeded: deploy would use {footprint} bytes (of which data disks \
+             reserve {disks} at their full size), cap is {cap}"
         ))
         .into());
     }
