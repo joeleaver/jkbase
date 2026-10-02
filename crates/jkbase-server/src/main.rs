@@ -3343,11 +3343,23 @@ async fn handle_deploy(
         if let Ok(Some(prior)) = plat.store.get_deployed_tier(project_id)
             && prior != new_tier
         {
+            // Leaving `dedicated` has an in-place path: its data sits on its own disk, which
+            // `jkbase db drop` discards (clearing this record). A co-located DB shares the app's
+            // disk with its volumes, so there is nothing separate to drop.
+            let migrate = if prior == "dedicated" {
+                format!(
+                    "Back up the database (`jkbase db backup`), drop it (`jkbase db drop --project \
+                     {project_id}`), redeploy at the new tier, then restore the backup into it."
+                )
+            } else {
+                "Back up the database, then recreate the project at the new tier and restore \
+                 into it."
+                    .to_string()
+            };
             anyhow::bail!(
                 "project {project_id}: changing the managed-database [database] tier in place \
                  ({prior} → {new_tier}) is not supported — it would strand your existing database \
-                 (its data lives on the {prior}-tier disk). Back up the database, then recreate the \
-                 project at the new tier and restore into it."
+                 (its data lives on the {prior}-tier disk). {migrate}"
             );
         }
         // The record is dropped when a deploy removes `[database]`, but a dedicated DB's disk is
