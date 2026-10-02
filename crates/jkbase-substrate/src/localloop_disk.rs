@@ -14,7 +14,7 @@
 //! jkbase-server by the systemd cgroup, so "owner dead ⇒ writer dead" holds; the
 //! restore-path-fence card refines this to track the Firecracker PID directly.
 
-use crate::{Backend, BlockDevice, Caps, DataDiskProvider, FenceToken, Result, SubstrateError};
+use crate::{Backend, BlockDevice, Caps, DataDiskProvider, Ensured, FenceToken, Result, SubstrateError};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
@@ -184,13 +184,20 @@ impl LocalLoop {
 
 #[async_trait]
 impl DataDiskProvider for LocalLoop {
-    async fn ensure(&self, id: &str, size_bytes: u64) -> Result<()> {
+    async fn ensure(&self, id: &str, size_bytes: u64) -> Result<Ensured> {
         validate_id(id)?;
         let img = self.img_path(id);
         if tokio::fs::try_exists(&img).await.unwrap_or(false) {
-            // Idempotent: an existing disk keeps its data; never reformat, and
-            // never shrink. (Growing the fs is resize2fs territory — out of scope.)
-            return Ok(());
+            // Idempotent: an existing disk keeps its data; never reformat, never shrink.
+            // Grow = extend the (sparse) backing file only — the host never parses the guest
+            // fs; the agent grows ext4 online to the new device size at its next mount.
+            let f = tokio::fs::OpenOptions::new().write(true).open(&img).await?;
+            if f.metadata().await?.len() >= size_bytes {
+                return Ok(Ensured::Unchanged);
+            }
+            f.set_len(size_bytes).await?;
+            f.sync_all().await?;
+            return Ok(Ensured::Grown);
         }
         if let Some(p) = img.parent() {
             tokio::fs::create_dir_all(p).await?;
@@ -201,7 +208,7 @@ impl DataDiskProvider for LocalLoop {
         f.set_len(size_bytes).await?;
         drop(f);
         run("mkfs.ext4", &["-F", "-q", img.to_str().unwrap()]).await?;
-        Ok(())
+        Ok(Ensured::Created)
     }
 
     async fn exists(&self, id: &str) -> Result<bool> {
@@ -530,6 +537,22 @@ mod tests {
         ));
         assert_eq!(p.caps(), Caps::NODE_LOCAL_RWO);
         assert_eq!(p.backend_name(), "localloop");
+        let _ = std::fs::remove_dir_all(&p.dir);
+    }
+
+    /// `ensure` grows an undersized disk's device and never shrinks it. Only mkfs on a regular
+    /// file is needed (no root, no loop device).
+    #[tokio::test]
+    async fn ensure_grows_never_shrinks() {
+        let p = LocalLoop::open(dir("grow")).unwrap();
+        let (m8, m16) = (8 * 1024 * 1024, 16 * 1024 * 1024);
+        let len = || std::fs::metadata(p.img_path("d")).unwrap().len();
+        assert_eq!(p.ensure("d", m8).await.unwrap(), Ensured::Created);
+        assert_eq!(p.ensure("d", m8).await.unwrap(), Ensured::Unchanged);
+        assert_eq!(p.ensure("d", m16).await.unwrap(), Ensured::Grown);
+        assert_eq!(len(), m16);
+        assert_eq!(p.ensure("d", m8).await.unwrap(), Ensured::Unchanged, "never shrinks");
+        assert_eq!(len(), m16);
         let _ = std::fs::remove_dir_all(&p.dir);
     }
 

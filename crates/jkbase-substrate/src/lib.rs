@@ -283,6 +283,17 @@ pub struct BlockDevice {
     pub path: PathBuf,
 }
 
+/// What [`DataDiskProvider::ensure`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ensured {
+    /// Created + formatted at the requested size.
+    Created,
+    /// Existed smaller; the device was grown to the requested size.
+    Grown,
+    /// Existed at (or above) the requested size; untouched.
+    Unchanged,
+}
+
 /// R3 — per-project persistent data disks with **read-write-once** semantics: at
 /// most one host may hold a disk RW at a time. `attach_rwo` takes the caller's
 /// [`FenceToken`] so the provider can preempt a prior writer and confirm the old
@@ -292,8 +303,12 @@ pub struct BlockDevice {
 #[async_trait]
 pub trait DataDiskProvider: Backend {
     /// Ensure a disk of at least `size_bytes` exists for `id` (idempotent; formats
-    /// on first creation, never reformats existing data).
-    async fn ensure(&self, id: &str, size_bytes: u64) -> Result<()>;
+    /// on first creation, never reformats existing data). An existing disk smaller than
+    /// `size_bytes` has its DEVICE grown (never shrunk); the filesystem on it is the
+    /// guest's to grow — the host never touches it. Call only while `id` is detached: a
+    /// guest restored from a snapshot still believes the old size, so a caller that sees
+    /// [`Ensured::Grown`] must cold-boot.
+    async fn ensure(&self, id: &str, size_bytes: u64) -> Result<Ensured>;
     /// Whether a disk for `id` already exists (without attaching it).
     async fn exists(&self, id: &str) -> Result<bool>;
     /// Attach `id` read-write-once to this host, fencing any prior writer using
