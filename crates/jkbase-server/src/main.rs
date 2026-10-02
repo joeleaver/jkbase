@@ -3863,8 +3863,11 @@ async fn boot_db_vm(
         // `hibernate_project` is the backstop for that; this wait keeps us from causing it). Same
         // ~80s budget as `handle_deploy` (outlasts hibernate's 3s ship + 60s snapshot); on expiry
         // FAIL the boot — the deploy is retryable. We only READ `vm_states` here: this boot never
-        // writes a shared `Waking` it doesn't own (that broke the dedicated-DB drop's safety); the
-        // wait and the supersede share ONE lock section, so no wake/hibernate can start between.
+        // writes a shared `Waking` it doesn't own (that broke the dedicated-DB drop's safety). The
+        // wait and the supersede share ONE lock section, so nothing starts between THEM; after it,
+        // while we build + fence + boot unlocked, a DB wake may still start (the id is left
+        // `Hibernated`/`Running`) — the disk lease is what excludes it (one side fails LeaseHeld,
+        // retryably), and a hibernate can't (we removed the VM handle it needs).
         let mut attempt = 0;
         let mut plat = loop {
             let plat = platform.lock().await;
@@ -4321,11 +4324,20 @@ async fn hibernate_project(
         base_rootfs_hash,
         deployment_version,
     };
-    plat.store.save_snapshot_meta(&meta)?;
+    // Past this point the FC is dead and its disk released, so a store error must not strand the
+    // id in `Hibernating` (wakes would time out on it; deploys + boot_db_vm would wait it out and
+    // fail): fail OPEN — no snapshot meta ⇒ the next wake cold-boots — and still settle below.
+    if let Err(e) = plat.store.save_snapshot_meta(&meta) {
+        tracing::error!(project = %project_id, error = %e,
+            "persisting snapshot meta failed; settling Hibernated without a snapshot (cold boot next)");
+        let _ = plat.store.remove_snapshot_meta(project_id);
+    }
 
     if let Ok(Some(mut proj)) = plat.store.get_project(project_id) {
         proj.state = ProjectState::Hibernated;
-        plat.store.update_project(&proj)?;
+        if let Err(e) = plat.store.update_project(&proj) {
+            tracing::warn!(project = %project_id, error = %e, "persisting Hibernated project state failed");
+        }
     }
 
     // Keep TAP device and VmAllocation for fast restore
@@ -6739,14 +6751,39 @@ async fn force_stop_and_cleanup(
     // The FC is being reaped below — drop its re-adoption record so a later start can't adopt it.
     // (hibernate_project already removed it before its pause; idempotent if so.)
     handoff::remove(&plat.data_dir.join("run"), project_id);
-    // Release the data-disk hold so the next wake re-fences (the FC is reaped below).
+
+    // Everything id-keyed — the FC kill, the disk release, the TAP teardown — runs UNDER the lock
+    // and BEFORE `Hibernated` is published below: deploy / boot_db_vm / wake treat `Hibernated` as
+    // settled and proceed, so a kill or TAP teardown still pending after it could land on the NEXT
+    // incarnation's FC/TAP (same socket path, same TAP name). Kill first, then release the disk.
+    //
+    // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
+    let _ = tokio::process::Command::new("pkill")
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
+        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
+        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
+        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
+        .status()
+        .await;
+
+    // Release the data-disk hold so the next wake re-fences.
     if let Some(token) = plat.disk_tokens.remove(project_id) {
         let dd = plat.data_disk.clone();
         let ls = plat.lease.clone();
         release_data_disk(&dd, &ls, project_id, token).await;
     }
 
-    let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+    // Tear down TAP so cleanup_orphans reconciles consistently on next boot (a
+    // leaked-but-listening process would otherwise read as "reachable" and the
+    // stale allocation would never be reaped). wake re-runs setup_tap.
+    if let Ok(Some(a)) = plat.store.get_vm_allocation(project_id) {
+        let _ = teardown_tap(&a.tap_device).await;
+    }
 
     // Drop any snapshot meta so wake deterministically cold-boots rather than
     // trying to restore a stale or half-written snapshot.
@@ -6763,29 +6800,6 @@ async fn force_stop_and_cleanup(
     // make wake_project spin and bail on every subsequent request).
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Hibernated);
-
-    drop(plat);
-
-    // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
-    let _ = tokio::process::Command::new("pkill")
-        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
-        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
-        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
-        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
-        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
-        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
-        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
-        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
-        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
-        .status()
-        .await;
-
-    // Tear down TAP so cleanup_orphans reconciles consistently on next boot (a
-    // leaked-but-listening process would otherwise read as "reachable" and the
-    // stale allocation would never be reaped). wake re-runs setup_tap.
-    if let Some(a) = alloc {
-        let _ = teardown_tap(&a.tap_device).await;
-    }
 }
 
 use chrono::{TimeZone, Utc};
@@ -7469,13 +7483,25 @@ mod tests {
         // boot_db_vm's supersede retires the paused VM's incarnation…
         assert!(!inc.is_vacant("p.db"));
         inc.retire("p.db");
-        assert!(!inc.is_current("p.db", captured), "superseded, not yet recommitted");
-        assert!(inc.is_vacant("p.db"), "the stale hibernate may settle its own Hibernating");
+        assert!(
+            !inc.is_current("p.db", captured),
+            "superseded, not yet recommitted"
+        );
+        assert!(
+            inc.is_vacant("p.db"),
+            "the stale hibernate may settle its own Hibernating"
+        );
         // …then commits the new boot.
         let new = inc.commit("p.db");
-        assert!(!inc.is_vacant("p.db"), "a newer incarnation's state is off-limits");
+        assert!(
+            !inc.is_vacant("p.db"),
+            "a newer incarnation's state is off-limits"
+        );
         assert_ne!(new, captured);
-        assert!(!inc.is_current("p.db", captured), "a newer incarnation owns the id");
+        assert!(
+            !inc.is_current("p.db", captured),
+            "a newer incarnation owns the id"
+        );
         assert!(inc.is_current("p.db", new));
 
         // A marker is unique across ids too: another VM's marker never reads current here.
@@ -7544,7 +7570,9 @@ mod tests {
             run_cmd("ip", &["addr", "add", "172.16.0.1/24", "dev", "jkbr0"])
                 .await
                 .unwrap();
-            run_cmd("ip", &["link", "set", "jkbr0", "up"]).await.unwrap();
+            run_cmd("ip", &["link", "set", "jkbr0", "up"])
+                .await
+                .unwrap();
         }
 
         // A fresh data dir holding just what boot_db_vm reads: the BASE project's live tree (a
