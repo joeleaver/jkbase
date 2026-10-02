@@ -3271,11 +3271,15 @@ async fn deploy_refusal(
             DEAD_HOST_THRESHOLD.as_secs(),
         ) {
             DeployTarget::Local => {}
-            DeployTarget::Remote { host_id, addr } => anyhow::bail!(
-                "project {project_id} is owned by host {host_id} ({}); the deploy must run there \
-                 (cross-host deploy forwarding not yet wired)",
-                addr.as_deref().unwrap_or("addr unknown")
-            ),
+            DeployTarget::Remote { host_id, addr } => {
+                // The refusal text reaches the tenant: the owner's address stays in the log.
+                warn!(project = %project_id, owner = %host_id, addr = ?addr,
+                    "deploy reached a non-owner host");
+                anyhow::bail!(
+                    "project {project_id} is owned by another host; the deploy must run there \
+                     (cross-host deploy forwarding not yet wired)"
+                )
+            }
             DeployTarget::OwnerDead { host_id } => anyhow::bail!(
                 "project {project_id}'s owner host {host_id} is down; the reconciler will reassign \
                  it — retry the deploy shortly"
