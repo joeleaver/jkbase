@@ -1574,8 +1574,14 @@ async fn run_db_drop(force: bool, project: Option<String>, api: String) -> anyho
             body["error"].as_str().unwrap_or("unknown error")
         );
     }
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    if body["dropped"].as_bool().unwrap_or(false) {
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("the drop request succeeded but its response was unreadable")?;
+    let dropped = body["dropped"]
+        .as_bool()
+        .context("the drop request succeeded but its response had no `dropped` field")?;
+    if dropped {
         println!(
             "Dropped the dedicated database of project '{project_id}'. If jkbase.toml still \
              declares `tier = \"dedicated\"`, the next deploy starts a fresh, empty one."

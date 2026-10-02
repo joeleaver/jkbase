@@ -59,11 +59,25 @@ pub type DbRestoreCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 
 /// Destroy a project's dedicated-tier DB VM (`{id}.db`) and its data disk `{id}.db.img` — the
 /// tenant's explicit, irreversible reclaim of a dedicated database (e.g. one stranded when the
-/// project left the dedicated tier, which no deploy will ever reap on its own). Resolves to
-/// whether there was anything to drop. A co-located DB lives on the app VM's own disk and is
-/// never touched. The server binary provides the impl (mirrors [`TeardownCallback`]).
-pub type DbDropCallback =
-    Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>> + Send + Sync>;
+/// project left the dedicated tier, which no deploy will ever reap on its own). A co-located DB
+/// lives on the app VM's own disk and is never touched. The server binary provides the impl
+/// (mirrors [`TeardownCallback`]).
+pub type DbDropCallback = Box<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<DbDropOutcome>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What a [`DbDropCallback`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbDropOutcome {
+    /// The DB VM and its disk are gone.
+    Dropped,
+    /// There was no dedicated DB VM or disk.
+    NothingToDrop,
+    /// The DB VM stayed mid-boot / mid-hibernate past the wait; nothing was touched (retry).
+    Busy,
+}
 
 /// A read/write op the console DB tools forward to the project's managed DB. Each maps to
 /// exactly ONE route on rhypedb's OPEN loopback HTTP plane (`/query`, `/schema`, `/status`);
@@ -4448,11 +4462,19 @@ async fn drop_dedicated_db(
         .into_response();
     };
     match cb(id.clone()).await {
-        Ok(dropped) => {
+        Ok(DbDropOutcome::Busy) => err(
+            StatusCode::CONFLICT,
+            format!("the database of '{id}' is starting or hibernating; retry in a moment"),
+        )
+        .into_response(),
+        Ok(outcome) => {
             if matches!(state.store.get_deployed_tier(&id), Ok(Some(t)) if t == "dedicated") {
                 let _ = state.store.delete_deployed_tier(&id);
             }
-            Json(DropDedicatedDbResponse { dropped }).into_response()
+            Json(DropDedicatedDbResponse {
+                dropped: outcome == DbDropOutcome::Dropped,
+            })
+            .into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use jkbase_control::api::{router, AppState};
+use jkbase_control::api::{router, AppState, DbDropOutcome};
 use jkbase_control::auth::{self, ApiToken};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{Project, ProjectState, Store};
@@ -46,8 +46,8 @@ fn add_tenant(store: &Store, id: &str) -> String {
 }
 
 /// A control API with project `app` owned by `tenant-1`, a second tenant, and a drop callback
-/// that counts its calls and reports `dropped`.
-async fn spawn(tag: &str, dropped: bool) -> Harness {
+/// that counts its calls and reports `outcome`.
+async fn spawn(tag: &str, outcome: DbDropOutcome) -> Harness {
     let mut base = std::env::temp_dir();
     base.push(format!("jkbase-dbdrop-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
@@ -80,7 +80,7 @@ async fn spawn(tag: &str, dropped: bool) -> Harness {
         Box::pin(async move {
             assert_eq!(id, "app");
             calls.fetch_add(1, Ordering::SeqCst);
-            Ok(dropped)
+            Ok(outcome)
         })
     }));
 
@@ -119,7 +119,7 @@ async fn drop_db(h: &Harness, token: &str, confirm: &str) -> reqwest::Response {
 
 #[tokio::test]
 async fn drop_requires_the_owner_and_an_exact_confirmation() {
-    let h = spawn("auth", true).await;
+    let h = spawn("auth", DbDropOutcome::Dropped).await;
     // Another tenant can't even see the project.
     assert_eq!(drop_db(&h, &h.other_token, "app").await.status().as_u16(), 404);
     // The owner must echo the project id exactly.
@@ -130,7 +130,7 @@ async fn drop_requires_the_owner_and_an_exact_confirmation() {
 
 #[tokio::test]
 async fn drop_clears_a_dedicated_tier_record_only() {
-    let h = spawn("tier", true).await;
+    let h = spawn("tier", DbDropOutcome::Dropped).await;
     h.store.set_deployed_tier("app", "dedicated").unwrap();
     let resp = drop_db(&h, &h.token, "app").await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -150,9 +150,21 @@ async fn drop_clears_a_dedicated_tier_record_only() {
 
 #[tokio::test]
 async fn drop_reports_nothing_to_drop() {
-    let h = spawn("none", false).await;
+    let h = spawn("none", DbDropOutcome::NothingToDrop).await;
     let resp = drop_db(&h, &h.token, "app").await;
     assert_eq!(resp.status().as_u16(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["dropped"], false);
+}
+
+/// A DB VM stuck mid-boot/hibernate is a retryable 409 that leaves the tier record alone.
+#[tokio::test]
+async fn drop_busy_is_a_conflict_and_changes_nothing() {
+    let h = spawn("busy", DbDropOutcome::Busy).await;
+    h.store.set_deployed_tier("app", "dedicated").unwrap();
+    assert_eq!(drop_db(&h, &h.token, "app").await.status().as_u16(), 409);
+    assert_eq!(
+        h.store.get_deployed_tier("app").unwrap().as_deref(),
+        Some("dedicated")
+    );
 }

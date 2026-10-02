@@ -2661,21 +2661,47 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
 
 /// The tenant's explicit drop of its dedicated DB (`DELETE /projects/{id}/db/dedicated`; the
 /// control plane holds the per-project deploy lock around this). Reaps the sibling DB VM and its
-/// `{id}.db.img` disk via [`teardown_db_vm_sibling`]; resolves to whether there was anything to
-/// drop. The app VM and its disk (where a co-located DB lives) are never touched.
-async fn drop_dedicated_db(project_id: &str, platform: &Arc<Mutex<PlatformState>>) -> Result<bool> {
+/// `{id}.db.img` disk; the app VM and its disk (where a co-located DB lives) are never touched.
+///
+/// Unlike project teardown, the project lives on — so DB wakes (gateway / `*.db` edge / console /
+/// backup executors) keep arriving, and none take the deploy lock. A wake or `boot_db_vm` that has
+/// already fenced the disk but not yet started Firecracker would, if we destroyed the disk under
+/// it, boot on a freed loop device another project may since have been handed (cross-tenant
+/// write). So: wait out `Waking`/`Hibernating` (both drop the lock mid-op; `boot_db_vm` marks
+/// `Waking` too), then reap in ONE locked section a new wake can't interleave — and if the DB VM
+/// is still mid-transition after the wait, REFUSE (`Busy`) rather than proceed as teardown does.
+async fn drop_dedicated_db(
+    project_id: &str,
+    platform: &Arc<Mutex<PlatformState>>,
+) -> Result<jkbase_control::api::DbDropOutcome> {
+    use jkbase_control::api::DbDropOutcome;
     let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
-    let present = {
-        let plat = platform.lock().await;
-        plat.vms.contains_key(&db_id)
+    let mut attempt = 0;
+    let (alloc, data_dir) = loop {
+        let mut plat = platform.lock().await;
+        if matches!(
+            plat.vm_states.get(&db_id),
+            Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
+        ) {
+            drop(plat);
+            if attempt >= 150 {
+                return Ok(DbDropOutcome::Busy);
+            }
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        let present = plat.vms.contains_key(&db_id)
             || plat.store.get_vm_allocation(&db_id)?.is_some()
-            || plat.data_disk.exists(&db_id).await.unwrap_or(false)
-    };
-    if present {
+            || plat.data_disk.exists(&db_id).await.unwrap_or(false);
+        if !present {
+            return Ok(DbDropOutcome::NothingToDrop);
+        }
         info!(project = %project_id, db_vm = %db_id, "dropping dedicated DB VM + disk (tenant request)");
-        teardown_db_vm_sibling(project_id, platform).await;
-    }
-    Ok(present)
+        break reap_db_vm_locked(&mut plat, &db_id).await;
+    };
+    finish_db_vm_teardown(&db_id, alloc, &data_dir).await;
+    Ok(DbDropOutcome::Dropped)
 }
 
 /// Best-effort teardown of a project's **sibling DB VM** (`{project_id}.db`). Mirrors
@@ -2689,33 +2715,49 @@ async fn teardown_db_vm_sibling(project_id: &str, platform: &Arc<Mutex<PlatformS
     let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
     let (alloc, data_dir) = {
         let mut plat = platform.lock().await;
-        if let Some(mut vm) = plat.vms.remove(&db_id) {
-            let _ = vm.stop().await;
-        }
-        // Kill any DB Firecracker not tracked in `vms` BEFORE destroying its disk.
-        reap_firecracker(&db_id).await;
-        handoff::remove(&plat.data_dir.join("run"), &db_id);
-        if let Some(token) = plat.disk_tokens.remove(&db_id) {
-            let ls = plat.lease.clone();
-            let _ = ls.release(&token).await;
-        }
-        let dd = plat.data_disk.clone();
-        let _ = dd.destroy(&db_id).await;
-        plat.vm_states.remove(&db_id);
-        plat.vm_rootfs_hashes.remove(&db_id);
-        plat.wake_failures.remove(&db_id);
-        let alloc = plat.store.get_vm_allocation(&db_id).ok().flatten();
-        let _ = plat.store.remove_snapshot_meta(&db_id);
-        let _ = plat.store.remove_vm_allocation(&db_id);
-        (alloc, plat.data_dir.clone())
+        reap_db_vm_locked(&mut plat, &db_id).await
     };
+    finish_db_vm_teardown(&db_id, alloc, &data_dir).await;
+}
+
+/// The locked half of [`teardown_db_vm_sibling`]: stop + hard-kill the DB VM, release its lease,
+/// destroy its disk, drop its lifecycle/snapshot/allocation rows. Runs in ONE locked section so no
+/// wake can interleave (a wake needs the lock to set `Waking`). Returns what the unlocked
+/// [`finish_db_vm_teardown`] needs.
+async fn reap_db_vm_locked(
+    plat: &mut PlatformState,
+    db_id: &str,
+) -> (Option<VmAllocation>, PathBuf) {
+    if let Some(mut vm) = plat.vms.remove(db_id) {
+        let _ = vm.stop().await;
+    }
+    // Kill any DB Firecracker not tracked in `vms` BEFORE destroying its disk.
+    reap_firecracker(db_id).await;
+    handoff::remove(&plat.data_dir.join("run"), db_id);
+    if let Some(token) = plat.disk_tokens.remove(db_id) {
+        let ls = plat.lease.clone();
+        let _ = ls.release(&token).await;
+    }
+    let dd = plat.data_disk.clone();
+    let _ = dd.destroy(db_id).await;
+    plat.vm_states.remove(db_id);
+    plat.vm_rootfs_hashes.remove(db_id);
+    plat.wake_failures.remove(db_id);
+    let alloc = plat.store.get_vm_allocation(db_id).ok().flatten();
+    let _ = plat.store.remove_snapshot_meta(db_id);
+    let _ = plat.store.remove_vm_allocation(db_id);
+    (alloc, plat.data_dir.clone())
+}
+
+/// The unlocked half of [`teardown_db_vm_sibling`]: free the TAP + remove on-disk artifacts.
+async fn finish_db_vm_teardown(db_id: &str, alloc: Option<VmAllocation>, data_dir: &Path) {
     if let Some(a) = alloc {
         let _ = teardown_tap(&a.tap_device).await;
     }
     // `remove_project_artifacts` for a `.db` id clears content-images/`{id}.db.ext4`,
     // data-disks/`{id}.db.{img,holder}`, snapshots/`{id}.db`, run/`{id}.db`; the base-only trees
     // (hosting/builds/git/buildcache/`{id}.db`) simply don't exist → no-ops.
-    remove_project_artifacts(&data_dir, &db_id).await;
+    remove_project_artifacts(data_dir, db_id).await;
 }
 
 /// Remove every per-project on-disk artifact (content image, data disk, snapshot,
@@ -3367,8 +3409,16 @@ async fn handle_deploy(
         // slip past the check above and strand that disk: unreachable, yet counted against the
         // quota at full size. Detect it from the disk itself. `exists` errors fail open (the
         // pre-guard behaviour) rather than block every deploy on a substrate hiccup.
+        // Only a deploy that would CREATE that state is refused: once the project already runs
+        // co-located beside the disk (recorded tier `colocated`), refusing its restarts, rollbacks
+        // and cold boots protects nothing.
         let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
-        if new_tier == "colocated" && plat.data_disk.exists(&db_id).await.unwrap_or(false) {
+        let already_colocated =
+            matches!(plat.store.get_deployed_tier(project_id), Ok(Some(t)) if t == "colocated");
+        if new_tier == "colocated"
+            && !already_colocated
+            && plat.data_disk.exists(&db_id).await.unwrap_or(false)
+        {
             anyhow::bail!(
                 "project {project_id}: a dedicated-tier managed database from an earlier deploy \
                  still holds data on its own disk, and a co-located database would start empty \
@@ -3828,10 +3878,16 @@ async fn boot_db_vm(
 ) -> Result<()> {
     let db_id = vm_identity::vm_id(project_id, vm_identity::VmRole::Db);
 
+    // Mark the DB VM `Waking` for the whole boot (reset on any non-`Running` exit by the guard), so
+    // concurrent DB wakes wait for it instead of racing a second boot, and a tenant's
+    // `drop_dedicated_db` waits it out instead of destroying the disk this boot has fenced.
+    let waking_guard = WakingGuard::new(platform.clone(), db_id.clone());
+
     // Snapshot the substrate handles + supersede any prior DB VM (redeploy), then release the lock
     // for the slow build + fence + boot.
     let (disk_cap, data_dir, dd, ls, hid, firecracker_bin, kernel_path, rootfs_path, platform_egress, alloc) = {
         let mut plat = platform.lock().await;
+        plat.vm_states.insert(db_id.clone(), VmLifecycle::Waking);
 
         // Supersede a prior DB VM incarnation (redeploy): drop its stale snapshot, stop it, and
         // release its data-disk hold before re-fencing — mirrors the app redeploy path.
@@ -3974,6 +4030,7 @@ async fn boot_db_vm(
     };
     plat.vms.insert(db_id.clone(), vm);
     plat.vm_states.insert(db_id.clone(), VmLifecycle::Running);
+    waking_guard.commit();
     let ran_hash = plat.base_rootfs_hash.clone();
     plat.vm_rootfs_hashes.insert(db_id.clone(), ran_hash.clone());
     plat.wake_failures.remove(&db_id);
@@ -4393,7 +4450,23 @@ async fn wake_db_reach(
 ) -> std::result::Result<String, jkbase_proxy::WakeError> {
     let target = {
         let plat = platform.lock().await;
-        db_reach_target_vm(&plat.data_dir, project_id)
+        let target = db_reach_target_vm(&plat.data_dir, project_id);
+        // A dedicated DB with no lifecycle state, allocation or disk isn't provisioned: dropped
+        // (`jkbase db drop`), or a first deploy hasn't reached `boot_db_vm` yet. Only a deploy
+        // provisions it, so don't let every connect re-drive a doomed no-allocation cold boot
+        // (`handle_deploy` of the `.db` id) under the platform lock. Transient-shaped (503 +
+        // retry), as the first-deploy case resolves on its own.
+        if target != project_id
+            && !plat.vm_states.contains_key(&target)
+            && matches!(plat.store.get_vm_allocation(&target), Ok(None))
+            && !plat.data_disk.exists(&target).await.unwrap_or(true)
+        {
+            return Err(jkbase_proxy::WakeError::Unavailable(format!(
+                "the dedicated database of {project_id} isn't provisioned (dropped, or its deploy \
+                 is still booting it) — redeploy if it doesn't come up"
+            )));
+        }
+        target
     };
     wake_project(&target, platform, routing, domain_map, shipper).await
 }
