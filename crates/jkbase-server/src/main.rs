@@ -3369,9 +3369,12 @@ async fn handle_deploy(
                 Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
             ) {
                 if attempt >= 400 {
-                    anyhow::bail!(
+                    // Nothing touched yet: typed as a refusal so the control plane puts `live`
+                    // back on the version the (still-running) old VM serves.
+                    return Err(jkbase_control::api::DeployRefused(format!(
                         "project {project_id} busy (wake/hibernate still in flight after ~80s); retry deploy"
-                    );
+                    ))
+                    .into());
                 }
                 drop(plat);
                 attempt += 1;
@@ -3384,9 +3387,13 @@ async fn handle_deploy(
 
     // The refusals the control plane already ran against this tree before swapping `live` to it
     // (`deploy_precheck_callback`), re-checked here under the platform lock as the last line
-    // before teardown: a refused deploy must leave the running VM untouched.
+    // before teardown: a refused deploy must leave the running VM untouched. Typed as a refusal
+    // (only ever returned from before teardown) so the control plane undoes the `live` swap —
+    // e.g. the owner-host gate can flip between the precheck and here.
     let live_dir = plat.data_dir.join("hosting").join(project_id).join("live");
-    deploy_refusal(&plat, project_id, &live_dir).await?;
+    deploy_refusal(&plat, project_id, &live_dir)
+        .await
+        .map_err(|e| jkbase_control::api::DeployRefused(format!("{e:#}")))?;
 
     // A deploy/rollback supersedes any prior snapshot UNCONDITIONALLY — not only when
     // `Hibernated`. A VM that was restored-then-Running still carries its snapshot (restore

@@ -286,11 +286,14 @@ impl std::fmt::Display for QuotaExceeded {
 
 impl std::error::Error for QuotaExceeded {}
 
-/// A deploy/rollback the server's [`DeployPrecheckCallback`] refused before the `live` swap — the
-/// project is untouched and still on its previous version. HTTP 409 (the request conflicts with
-/// the project's current state, e.g. its managed-DB tier), not 500.
+/// A deploy/rollback refused before it touched the runtime — by the activation checks, the
+/// server's [`DeployPrecheckCallback`], or a [`DeployCallback`] that bailed BEFORE any teardown
+/// (the server returns this type only from such exits). The project ends on its previous
+/// version: a refusal from the deploy callback, which runs after the `live` swap, makes the
+/// control plane undo the activation. HTTP 409 (the request conflicts with the project's current
+/// state, e.g. its managed-DB tier, or a wake still in flight), not 500.
 #[derive(Debug)]
-struct DeployRefused(String);
+pub struct DeployRefused(pub String);
 
 impl std::fmt::Display for DeployRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2113,8 +2116,10 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// `*.json` layout; it is MOVED into `deployments/v{N}` (so it must live on the
 /// same filesystem as `deploy_dir`). Shared verbatim by the artifact-upload path
 /// (`do_deploy`) and the build pipeline, so both get the identical tail: server
-/// rootfs pre-extract → storage-quota gate → server precheck → atomic `live` swap → reconcile
-/// domains/schedules → record history + prune → deploy callback (boot runtime).
+/// symlink validation → rootfs pre-extract → storage-quota gate → server precheck → atomic
+/// `live` swap → reconcile
+/// domains/schedules → record history → deploy callback (boot runtime; a refusal there undoes
+/// the activation) → prune.
 /// Collect the distinct app-layer digests (`sha256:<hex>`) a deployment references,
 /// from each `_servers/<name>.json`'s `app_digest` field (written by the layered
 /// build collection). Recorded on the deployment so a future content-store GC knows
@@ -2244,10 +2249,10 @@ async fn activate_deployment(
     // mark the project NeedsRedeploy.
     let proj_dir = state.deploy_dir.join(&project.id);
     let live_link = proj_dir.join("live");
-    let tmp_link = proj_dir.join(".live.swap");
-    let _ = tokio::fs::remove_file(&tmp_link).await;
-    tokio::fs::symlink(&deploy_path, &tmp_link).await?;
-    tokio::fs::rename(&tmp_link, &live_link).await?;
+    // What to restore if the deploy callback refuses after the swap (see below).
+    let prev_live = tokio::fs::read_link(&live_link).await.ok();
+    let (prev_version, prev_state) = (project.current_version, project.state);
+    swap_live(&proj_dir, &deploy_path).await?;
 
     project.current_version = Some(version);
     project.state = crate::store::ProjectState::Active;
@@ -2273,7 +2278,6 @@ async fn activate_deployment(
         created_at: auth::timestamp(),
         layer_digests: collect_app_layer_digests(&deploy_path),
     })?;
-    prune_deployments(state, &project.id, version);
 
     info!(
         project_id = %project.id,
@@ -2281,11 +2285,83 @@ async fn activate_deployment(
         "deployment activated"
     );
 
-    if let Some(cb) = &state.deploy_callback {
-        cb(project.id.clone(), version).await?;
+    if let Some(cb) = &state.deploy_callback
+        && let Err(e) = cb(project.id.clone(), version).await
+    {
+        // A refusal from the callback means it bailed before touching the runtime (e.g. the
+        // owner-host gate flipped since the precheck, or a wake/hibernate outlasted its wait):
+        // the old VM still runs the old tree, so put `live` and the store back on it rather than
+        // let the next wake boot the refused one. Any other error is past teardown: the new tree
+        // stays live (its metadata image may already be rebuilt — see the precheck comment).
+        if e.downcast_ref::<DeployRefused>().is_some() {
+            undo_activation(
+                state,
+                project,
+                version,
+                &deploy_path,
+                prev_live,
+                prev_version,
+                prev_state,
+            )
+            .await;
+        }
+        return Err(e);
     }
+    // Pruned only once the version is committed, so a refusal undone above pruned nothing.
+    prune_deployments(state, &project.id, version);
 
     Ok(version)
+}
+
+/// Atomically repoint `{proj_dir}/live` at `target`: symlink to a temp name then rename over it
+/// (rename is atomic on the same dir). A plain remove+symlink leaves a window where `live` is
+/// absent, which a concurrent wake reads as "no deployed content" and would wrongly mark the
+/// project NeedsRedeploy.
+async fn swap_live(proj_dir: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let tmp_link = proj_dir.join(".live.swap");
+    let _ = tokio::fs::remove_file(&tmp_link).await;
+    tokio::fs::symlink(target, &tmp_link).await?;
+    tokio::fs::rename(&tmp_link, proj_dir.join("live")).await
+}
+
+/// Reverse [`activate_deployment`] after its deploy callback refused (nothing on the runtime was
+/// touched): `live` back to `prev_live` (removed for a first deploy), `current_version`/state
+/// restored, the new version's history row + dir dropped, and the schedule registry
+/// re-reconciled from the previous tree. Declared domains the refused version claimed stay
+/// claimed, as on a rollback (claims are additive; an Active subdomain just routes to the old
+/// tree). Best-effort: each step is logged on failure, and the caller still returns the refusal.
+#[allow(clippy::too_many_arguments)]
+async fn undo_activation(
+    state: &AppState,
+    project: &mut Project,
+    version: u64,
+    deploy_path: &std::path::Path,
+    prev_live: Option<PathBuf>,
+    prev_version: Option<u64>,
+    prev_state: crate::store::ProjectState,
+) {
+    let proj_dir = state.deploy_dir.join(&project.id);
+    let restored = match &prev_live {
+        Some(prev) => swap_live(&proj_dir, prev).await,
+        None => tokio::fs::remove_file(proj_dir.join("live")).await,
+    };
+    if let Err(e) = restored {
+        tracing::error!(project_id = %project.id, error = %e,
+            "refused deploy: failed to restore `live` — the refused version stays live");
+        return;
+    }
+    project.current_version = prev_version;
+    project.state = prev_state;
+    if let Err(e) = state.store.update_project(project) {
+        tracing::error!(project_id = %project.id, error = %e,
+            "refused deploy: failed to restore current_version");
+    }
+    let _ = state.store.remove_deployment(&project.id, version);
+    let _ = tokio::fs::remove_dir_all(deploy_path).await;
+    // A first deploy has no previous tree: reconciling a nonexistent one clears its schedules.
+    let prev_tree = prev_live.unwrap_or_else(|| proj_dir.join("deployments").join("v0"));
+    reconcile_deploy_schedules(state, project, &prev_tree);
+    info!(project_id = %project.id, version, "refused deploy undone; previous version stays live");
 }
 
 /// Keep only the most recent `MAX_DEPLOYMENTS` deployments on disk + in history.
@@ -3097,15 +3173,10 @@ async fn do_rollback(
     validate_deployment_tree(deploy_path)?;
     precheck_deployment(state, &project.id, deploy_path).await?;
 
-    // Atomically repoint `live` at the target version: symlink to a temp name then
-    // rename over it (rename is atomic; a remove+symlink leaves a no-`live` window
-    // that a concurrent wake would misread as "no deployed content").
     let proj_dir = state.deploy_dir.join(&project.id);
-    let live_link = proj_dir.join("live");
-    let tmp_link = proj_dir.join(".live.swap");
-    let _ = tokio::fs::remove_file(&tmp_link).await;
-    tokio::fs::symlink(deploy_path, &tmp_link).await?;
-    tokio::fs::rename(&tmp_link, &live_link).await?;
+    let prev_live = tokio::fs::read_link(proj_dir.join("live")).await.ok();
+    let (prev_version, prev_state) = (project.current_version, project.state);
+    swap_live(&proj_dir, deploy_path).await?;
 
     project.current_version = Some(target);
     project.state = crate::store::ProjectState::Active;
@@ -3113,9 +3184,25 @@ async fn do_rollback(
 
     info!(project_id = %project.id, version = target, "rolled back");
 
-    // Rebuild the content image from the now-current `live` and restart the VM.
-    if let Some(cb) = &state.deploy_callback {
-        cb(project.id.clone(), target).await?;
+    // Rebuild the content image from the now-current `live` and restart the VM. A refusal
+    // (nothing on the runtime touched) puts `live` back, as in `activate_deployment`.
+    if let Some(cb) = &state.deploy_callback
+        && let Err(e) = cb(project.id.clone(), target).await
+    {
+        if e.downcast_ref::<DeployRefused>().is_some()
+            && let Some(prev) = &prev_live
+        {
+            match swap_live(&proj_dir, prev).await {
+                Ok(()) => {
+                    project.current_version = prev_version;
+                    project.state = prev_state;
+                    let _ = state.store.update_project(project);
+                }
+                Err(err) => tracing::error!(project_id = %project.id, error = %err,
+                    "refused rollback: failed to restore `live`"),
+            }
+        }
+        return Err(e);
     }
 
     Ok(())
@@ -3277,7 +3364,7 @@ async fn restart(
                 .into_response()
         }
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            deploy_error_status(&e),
             Json(ErrorResponse {
                 error: e.to_string(),
             }),

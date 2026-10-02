@@ -12,13 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jkbase_control::api::{AppState, router};
+use jkbase_control::api::{AppState, DeployRefused, router};
 use jkbase_control::auth::{self, ApiToken};
 use jkbase_control::logstore::LogStore;
 use jkbase_control::store::{Project, ProjectState, Store};
 
 /// Marker a test tree carries to make the fake precheck refuse it.
 const REFUSE: &str = "REFUSE";
+/// Marker making the fake deploy callback REFUSE (bail before teardown) once the tree is live.
+const CB_REFUSE: &str = "CB_REFUSE";
+/// Marker making the fake deploy callback FAIL past teardown (a boot failure).
+const CB_FAIL: &str = "CB_FAIL";
 
 struct Harness {
     addr: std::net::SocketAddr,
@@ -89,10 +93,19 @@ async fn spawn(tag: &str) -> Harness {
         })
     }));
     let dc = deployed.clone();
+    let live = deploy_dir.join("app").join("live");
     state.deploy_callback = Some(Box::new(move |_id: String, version: u64| {
         let dc = dc.clone();
+        let live = live.clone();
         Box::pin(async move {
+            // Like `handle_deploy`, the callback reads the tree through `live`.
+            if live.join(CB_REFUSE).exists() {
+                return Err(DeployRefused("owner host changed (test)".to_string()).into());
+            }
             dc.lock().unwrap().push(version);
+            if live.join(CB_FAIL).exists() {
+                anyhow::bail!("VM failed to boot (test)");
+            }
             Ok(())
         })
     }));
@@ -429,4 +442,73 @@ async fn deploy_after_rollback_never_reuses_a_retained_version() {
     assert_eq!(std::fs::read_to_string(&v2_index).unwrap(), "v2");
     let r = h.rollback(2).await;
     assert_eq!(r.status().as_u16(), 200, "{}", r.text().await.unwrap());
+}
+
+fn schedules(h: &Harness) -> Vec<String> {
+    let mut v: Vec<String> = h
+        .store
+        .list_schedules_for_project("app")
+        .unwrap()
+        .into_iter()
+        .map(|s| s.function)
+        .collect();
+    v.sort();
+    v
+}
+
+/// The deploy callback runs AFTER the `live` swap; when it refuses before touching the runtime
+/// (the owner-host gate flipped since the precheck, a wake outlasted its wait) the old VM still
+/// serves the old tree, so the activation is undone: `live`, version, history, the new dir and
+/// the schedule registry all go back. A failure past teardown (boot) is NOT undone.
+#[tokio::test]
+async fn callback_refusal_undoes_the_activation_but_a_boot_failure_does_not() {
+    let h = spawn("cb-refuse").await;
+    let sched = |f: &str| format!(r#"[{{"function":"{f}","cron":"*/5 * * * *"}}]"#);
+
+    let ok = h
+        .deploy(&[("index.html", "v1"), ("_schedules.json", &sched("a"))])
+        .await;
+    assert_eq!(ok.status().as_u16(), 200, "{}", ok.text().await.unwrap());
+    assert_eq!(schedules(&h), vec!["a"]);
+
+    let refused = h
+        .deploy(&[
+            ("index.html", "v2"),
+            ("_schedules.json", &sched("b")),
+            (CB_REFUSE, ""),
+        ])
+        .await;
+    assert_eq!(refused.status().as_u16(), 409);
+    assert!(same(&h.live_target(), &h.version_dir(1)), "live back on v1");
+    assert_eq!(h.current_version(), Some(1));
+    assert_eq!(h.history(), vec![1]);
+    assert!(!h.version_dir(2).exists());
+    assert_eq!(schedules(&h), vec!["a"], "schedules re-reconciled from v1");
+
+    // A boot failure past teardown keeps the new version live (and retryable).
+    let failed = h.deploy(&[("index.html", "v2"), (CB_FAIL, "")]).await;
+    assert_eq!(failed.status().as_u16(), 500);
+    assert!(same(&h.live_target(), &h.version_dir(2)));
+    assert_eq!(h.current_version(), Some(2));
+    assert_eq!(h.history(), vec![1, 2]);
+
+    // Rollback: a callback refusal puts `live` back on the version it was rolling back from.
+    std::fs::write(h.version_dir(1).join(CB_REFUSE), "").unwrap();
+    let r = h.rollback(1).await;
+    assert_eq!(r.status().as_u16(), 409);
+    assert!(same(&h.live_target(), &h.version_dir(2)));
+    assert_eq!(h.current_version(), Some(2));
+}
+
+/// A refused FIRST deploy has no previous version: `live` is removed, not left on the refused
+/// tree, and the project stays undeployed.
+#[tokio::test]
+async fn callback_refusal_of_a_first_deploy_leaves_nothing_live() {
+    let h = spawn("cb-refuse-first").await;
+    let r = h.deploy(&[("index.html", "v1"), (CB_REFUSE, "")]).await;
+    assert_eq!(r.status().as_u16(), 409);
+    assert!(std::fs::symlink_metadata(h.deploy_dir.join("app").join("live")).is_err());
+    assert_eq!(h.current_version(), None);
+    assert!(h.history().is_empty());
+    assert!(!h.version_dir(1).exists());
 }
