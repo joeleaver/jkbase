@@ -5388,6 +5388,8 @@ body {
       body = h("div", { className: "domain-hint" }, "No usage data yet.");
     } else {
       var storageMax = q.storage_bytes_max || 0;
+      // What the quota checks count (disks at full size); older servers lack it → billed figure.
+      var storageUsed = u.storage_reserved_bytes != null ? u.storage_reserved_bytes : (u.storage_bytes || 0);
       var bwMax = q.bandwidth_bytes_per_month || 0;
       var bw = (u.rx_bytes || 0) + (u.tx_bytes || 0);
       body = h("div", {},
@@ -5407,8 +5409,11 @@ body {
         ),
         h("div", {},
           h("div", { className: "section-desc" },
-            "Storage — " + fmtBytes(u.storage_bytes) + " of " + fmtBytes(storageMax)),
-          usageBar(u.storage_bytes || 0, storageMax)
+            "Storage — " + fmtBytes(storageUsed) + " of " + fmtBytes(storageMax)),
+          usageBar(storageUsed, storageMax),
+          h("div", { style: "font-size:11px;color:#888;margin-top:3px" },
+            "Data disks count at their full size toward the cap · " +
+            fmtBytes(u.storage_bytes) + " actually in use (billed)")
         ),
         h("div", { style: "font-size:11px;color:#888;margin-top:12px" },
           "Limits: " + (q.overridden ? "per-project override" : "platform default") +

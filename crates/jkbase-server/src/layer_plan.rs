@@ -235,7 +235,7 @@ pub fn compute_layer_plan_with(
     // device assignment (so cold-boot deploy and wake agree on the same `_layers.json`).
     let servers_dir = deployment_dir.join("_servers");
     let mut servers: Vec<(String, ServerLayerInfo)> = Vec::new();
-    if content.includes_app() && servers_dir.is_dir() {
+    if content.includes_app() && is_real(&servers_dir, true) {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&servers_dir)
             .with_context(|| format!("read {}", servers_dir.display()))?
             .filter_map(|e| e.ok())
@@ -249,7 +249,10 @@ pub fn compute_layer_plan_with(
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_string();
-            let info: ServerLayerInfo = serde_json::from_slice(&std::fs::read(&p)?)
+            let Some(bytes) = read_regular(&p)? else {
+                continue;
+            };
+            let info: ServerLayerInfo = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse server manifest {}", p.display()))?;
             if info.app_layer.is_some() {
                 servers.push((name, info));
@@ -261,7 +264,7 @@ pub fn compute_layer_plan_with(
     // (NOT a `_servers/*.json` entry — the DB is not a tenant server). It attaches the
     // shared rhypedb runtime layer over the platform base even for a DB-only project
     // (no tenant servers at all).
-    let has_db = content.includes_db() && deployment_dir.join("_database.json").exists();
+    let has_db = content.includes_db() && is_real(&deployment_dir.join("_database.json"), false);
 
     if servers.is_empty() && !has_db {
         return Ok(LayerPlan::empty(has_data_disk));
@@ -333,9 +336,18 @@ pub fn compute_layer_plan_with(
             .app_digest
             .clone()
             .unwrap_or_else(|| filename_to_digest(file));
+        // The blob is attached as a VM drive by path: a symlink would hand the guest whatever
+        // host file it names (sha256 verification only checks the TENANT-declared digest).
+        let blob = deployment_dir.join("_layers").join(file);
+        ensure!(
+            !std::fs::symlink_metadata(&blob).is_ok_and(|m| m.file_type().is_symlink())
+                && !std::fs::symlink_metadata(deployment_dir.join("_layers"))
+                    .is_ok_and(|m| m.file_type().is_symlink()),
+            "app layer {file:?} for server '{name}' is a symlink — refusing"
+        );
         app_idx.insert(name.clone(), order.len());
         order.push(BlobRef {
-            path: deployment_dir.join("_layers").join(file),
+            path: blob,
             digest,
             // Per-tenant app layer: self-affecting, host-sha256-verified at attach, no
             // verity tree → mounted directly by the agent.
@@ -579,9 +591,9 @@ pub fn build_metadata_image_with(
     }
 
     // Bake the device map the agent reads at boot...
-    std::fs::write(
-        stage.join(RuntimeLayers::FILE),
-        serde_json::to_vec_pretty(&plan.runtime_layers)?,
+    write_fresh(
+        &stage.join(RuntimeLayers::FILE),
+        &serde_json::to_vec_pretty(&plan.runtime_layers)?,
     )?;
     // ...and the host-only attach order (read back at wake via debugfs), so both are
     // published atomically by the single image rename below.
@@ -590,9 +602,9 @@ pub fn build_metadata_image_with(
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
-    std::fs::write(
-        stage.join(LAYER_PATHS_FILE),
-        serde_json::to_vec_pretty(&paths)?,
+    write_fresh(
+        &stage.join(LAYER_PATHS_FILE),
+        &serde_json::to_vec_pretty(&paths)?,
     )?;
 
     // Host-asserted platform egress facts (`_platform.json`): the OWN object-store host
@@ -600,18 +612,18 @@ pub fn build_metadata_image_with(
     // per-VM image only — overriding any same-named file a tenant might have smuggled into
     // their source tree, so this region is genuinely host-authored and tenant-unforgeable
     // (P0-EGRESS-OWN-HOST-ASSERTED). NEVER `jkbase.toml`-derived.
-    std::fs::write(
-        stage.join(PlatformEgress::FILE),
-        serde_json::to_vec_pretty(platform)?,
+    write_fresh(
+        &stage.join(PlatformEgress::FILE),
+        &serde_json::to_vec_pretty(platform)?,
     )?;
 
     // Host-authored reach-plane facts (`_db_reach.json`): the per-deploy splice secret,
     // present only for a project with a managed DB. Written LAST (same reasoning as
     // `_platform.json`) so it's tenant-unforgeable, and into the per-VM image only.
     if let Some(reach) = db_reach {
-        std::fs::write(
-            stage.join(DbReachFacts::FILE),
-            serde_json::to_vec_pretty(reach)?,
+        write_fresh(
+            &stage.join(DbReachFacts::FILE),
+            &serde_json::to_vec_pretty(reach)?,
         )?;
     }
 
@@ -619,7 +631,7 @@ pub fn build_metadata_image_with(
     // loopback ports for the agent's land-forward. Written LAST (same reasoning as
     // `_db_reach.json`) so it's tenant-unforgeable, and only for a project with `[l4.*]`.
     if let Some(l4) = l4_facts {
-        std::fs::write(stage.join(L4Facts::FILE), serde_json::to_vec_pretty(l4)?)?;
+        write_fresh(&stage.join(L4Facts::FILE), &serde_json::to_vec_pretty(l4)?)?;
     }
 
     build_ro_ext4_from_dir(&stage, &tmp_img, 8)
@@ -632,6 +644,49 @@ pub fn build_metadata_image_with(
     Ok(())
 }
 
+/// A deployment tree is tenant-shaped (a raw `POST /deploy` tarball is unpacked as-is, and tar
+/// keeps symlinks with ANY target), and staging copies it link-for-link. So every host read of a
+/// tree/stage path goes through [`read_regular`] and every host write through [`write_fresh`]:
+/// a planted symlink must never aim a root-privileged read (exfil into the image) or write
+/// (cross-tenant/host overwrite) outside the tree. The control plane refuses such trees at
+/// activation; this is the backstop for trees that predate that check.
+fn is_real(path: &Path, want_dir: bool) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| {
+        let ft = m.file_type();
+        !ft.is_symlink() && if want_dir { ft.is_dir() } else { ft.is_file() }
+    })
+}
+
+/// Read `path` only if it is a regular file — never through a symlink. `Ok(None)` when absent.
+fn read_regular(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+        Ok(m) if m.file_type().is_file() => Ok(Some(std::fs::read(path)?)),
+        Ok(_) => anyhow::bail!(
+            "{} is not a regular file (symlink?) — refusing",
+            path.display()
+        ),
+    }
+}
+
+/// Write `bytes` as a NEW file at `path`, replacing whatever is staged there without following
+/// it (`O_CREAT|O_EXCL` never follows a symlink, so a racing re-plant fails instead).
+fn write_fresh(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(_) => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes))
+        .with_context(|| format!("write {}", path.display()))
+}
+
 /// Stage the deployment tree into the metadata-image build dir, restricted to `content`. The
 /// erofs blobs under `_layers/` are always excluded (they attach as drives). For a DB-only image
 /// we copy ONLY the DB inputs — no tenant servers/routes/sites/functions, and none of a large
@@ -642,12 +697,16 @@ fn stage_deployment_tree(deployment_dir: &Path, stage: &Path, content: ImageCont
     match content {
         ImageContent::DbOnly => {
             let db_json = deployment_dir.join("_database.json");
-            if db_json.exists() {
-                std::fs::copy(&db_json, stage.join("_database.json"))
-                    .context("stage _database.json for DB VM")?;
+            if let Some(bytes) = read_regular(&db_json).context("stage _database.json for DB VM")? {
+                write_fresh(&stage.join("_database.json"), &bytes)?;
             }
+            // `copy_dir_except` copies link-for-link below the root; the root itself must be a
+            // real dir, or `read_dir` would follow it and copy a foreign tree into this image.
             let db_dir = deployment_dir.join("_database");
-            if db_dir.is_dir() {
+            if std::fs::symlink_metadata(&db_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+                anyhow::bail!("_database is a symlink — refusing to stage it");
+            }
+            if is_real(&db_dir, true) {
                 copy_dir_except(&db_dir, &stage.join("_database"), "")
                     .context("stage _database/ for DB VM")?;
             }
@@ -705,7 +764,11 @@ const RESERVED_ENV: &[&str] = &["PORT", "HOME", "HOSTNAME", "PATH"];
 /// the staged copy. Secrets override build-time env (e.g. `NODE_ENV`) on conflict;
 /// reserved platform keys are skipped. A manifest lacking an `env` object gets one.
 fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Result<()> {
-    if !servers_dir.is_dir() {
+    if !is_real(servers_dir, true) {
+        ensure!(
+            !std::fs::symlink_metadata(servers_dir).is_ok_and(|m| m.file_type().is_symlink()),
+            "_servers is a symlink — refusing to inject secrets through it"
+        );
         return Ok(());
     }
     for entry in std::fs::read_dir(servers_dir)? {
@@ -713,7 +776,10 @@ fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Res
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
+        let Some(bytes) = read_regular(&path)? else {
+            continue;
+        };
+        let mut manifest: serde_json::Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse server manifest {}", path.display()))?;
         let Some(obj) = manifest.as_object_mut() else {
             continue;
@@ -738,7 +804,7 @@ fn inject_secrets(servers_dir: &Path, secrets: &BTreeMap<String, String>) -> Res
             }
             env.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
-        std::fs::write(&path, serde_json::to_vec_pretty(&manifest)?)?;
+        write_fresh(&path, &serde_json::to_vec_pretty(&manifest)?)?;
     }
     Ok(())
 }
@@ -758,7 +824,11 @@ fn inject_function_secrets(
     secrets: &BTreeMap<String, String>,
     binding: Option<&StorageBinding>,
 ) -> Result<()> {
-    if !functions_dir.is_dir() {
+    if !is_real(functions_dir, true) {
+        ensure!(
+            !std::fs::symlink_metadata(functions_dir).is_ok_and(|m| m.file_type().is_symlink()),
+            "_functions is a symlink — refusing to inject secrets through it"
+        );
         return Ok(());
     }
     for entry in std::fs::read_dir(functions_dir)? {
@@ -767,11 +837,10 @@ fn inject_function_secrets(
             continue;
         }
         let sidecar = wasm.with_extension("json");
-        let mut manifest: serde_json::Value = match std::fs::read(&sidecar) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+        let mut manifest: serde_json::Value = match read_regular(&sidecar)? {
+            Some(bytes) => serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse function sidecar {}", sidecar.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-            Err(e) => return Err(e).with_context(|| format!("read {}", sidecar.display())),
+            None => serde_json::json!({}),
         };
         let Some(obj) = manifest.as_object_mut() else {
             continue;
@@ -806,7 +875,7 @@ fn inject_function_secrets(
             // No binding this deploy → ensure no stale credential lingers in the sidecar.
             obj.remove("storage_credential");
         }
-        std::fs::write(&sidecar, serde_json::to_vec_pretty(&manifest)?)?;
+        write_fresh(&sidecar, &serde_json::to_vec_pretty(&manifest)?)?;
     }
     Ok(())
 }
@@ -814,6 +883,77 @@ fn inject_function_secrets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A deploy tree may carry tenant-planted symlinks (a raw tarball keeps them); staging must
+    /// never write through one (cross-tenant/host overwrite as root, e.g. secrets/env into
+    /// another tenant's manifest) nor read through one into the image (exfil). Activation
+    /// refuses such trees; this is the backstop for trees that predate it.
+    #[test]
+    fn staging_never_follows_planted_symlinks() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ls-symlink-{nanos}"));
+        let outside = root.join("victim");
+        std::fs::create_dir_all(outside.join("_database")).unwrap();
+        let victim_manifest = outside.join("api.json");
+        std::fs::write(&victim_manifest, br#"{"env":{}}"#).unwrap();
+        std::fs::write(outside.join("_database/schema.rhype"), b"victim").unwrap();
+        let secrets = BTreeMap::from([("LD_PRELOAD".to_string(), "/evil.so".to_string())]);
+
+        // `_servers/api.json` → a victim's manifest: injection refuses, victim untouched.
+        let stage = root.join("stage");
+        std::fs::create_dir_all(stage.join("_servers")).unwrap();
+        std::os::unix::fs::symlink(&victim_manifest, stage.join("_servers/api.json")).unwrap();
+        assert!(inject_secrets(&stage.join("_servers"), &secrets).is_err());
+        assert_eq!(std::fs::read(&victim_manifest).unwrap(), br#"{"env":{}}"#);
+
+        // `_servers` itself → a victim's dir: refused, nothing written there.
+        let stage2 = root.join("stage2");
+        std::fs::create_dir_all(&stage2).unwrap();
+        std::os::unix::fs::symlink(&outside, stage2.join("_servers")).unwrap();
+        assert!(inject_secrets(&stage2.join("_servers"), &secrets).is_err());
+        assert_eq!(std::fs::read(&victim_manifest).unwrap(), br#"{"env":{}}"#);
+
+        // Function sidecar → a victim file: the credential is never written through it.
+        let stage3 = root.join("stage3");
+        std::fs::create_dir_all(stage3.join("_functions")).unwrap();
+        std::fs::write(stage3.join("_functions/f.wasm"), b"\0asm").unwrap();
+        std::os::unix::fs::symlink(&victim_manifest, stage3.join("_functions/f.json")).unwrap();
+        assert!(inject_function_secrets(&stage3.join("_functions"), &secrets, None).is_err());
+        assert_eq!(std::fs::read(&victim_manifest).unwrap(), br#"{"env":{}}"#);
+
+        // A host-authored file whose name a tenant planted as a symlink is REPLACED, not
+        // written through.
+        let planted = stage.join(PlatformEgress::FILE);
+        std::os::unix::fs::symlink(&victim_manifest, &planted).unwrap();
+        write_fresh(&planted, b"host").unwrap();
+        assert_eq!(std::fs::read(&planted).unwrap(), b"host");
+        assert!(
+            !std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&victim_manifest).unwrap(), br#"{"env":{}}"#);
+
+        // DB-VM staging: a symlinked `_database` / `_database.json` never pulls foreign
+        // content into the image.
+        let deploy = root.join("deploy");
+        std::fs::create_dir_all(&deploy).unwrap();
+        std::os::unix::fs::symlink(outside.join("_database"), deploy.join("_database")).unwrap();
+        let db_stage = root.join("db-stage");
+        std::fs::create_dir_all(&db_stage).unwrap();
+        assert!(stage_deployment_tree(&deploy, &db_stage, ImageContent::DbOnly).is_err());
+        assert!(!db_stage.join("_database/schema.rhype").exists());
+        std::fs::remove_file(deploy.join("_database")).unwrap();
+        std::os::unix::fs::symlink(&victim_manifest, deploy.join("_database.json")).unwrap();
+        assert!(stage_deployment_tree(&deploy, &db_stage, ImageContent::DbOnly).is_err());
+        assert!(!db_stage.join("_database.json").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn safe_filename() {
@@ -1231,6 +1371,41 @@ mod tests {
         .unwrap();
         let plan = compute_layer_plan(&deploy, &store, false, false).unwrap();
         assert!(plan.runtime_layers.verity.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tenant app layer is attached to the VM BY PATH, and its sha256 is checked only against
+    /// the tenant-declared digest — so a `_layers/<blob>` symlink would hand the guest any host
+    /// file whose name/digest it can guess (e.g. another tenant's content-addressed layer).
+    /// Likewise a symlinked server manifest must not be read.
+    #[test]
+    fn symlinked_app_layer_or_manifest_is_refused() {
+        let root = std::env::temp_dir().join(format!("lp-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let deploy = root.join("deploy");
+        let victim = root.join("victim");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::create_dir_all(deploy.join("_servers")).unwrap();
+        std::fs::create_dir_all(deploy.join("_layers")).unwrap();
+        let app_f = format!("sha256-{}.erofs", "d".repeat(64));
+        std::fs::write(victim.join(&app_f), b"victim layer").unwrap();
+        std::os::unix::fs::symlink(victim.join(&app_f), deploy.join("_layers").join(&app_f))
+            .unwrap();
+        let manifest = format!(r#"{{"app_layer":"{app_f}","runtime":"image/self","port":8080}}"#);
+        std::fs::write(deploy.join("_servers/web.json"), &manifest).unwrap();
+        let err = compute_layer_plan(&deploy, &store, false, false).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+
+        // Manifest itself symlinked (layer real): refused too.
+        std::fs::remove_file(deploy.join("_layers").join(&app_f)).unwrap();
+        std::fs::write(deploy.join("_layers").join(&app_f), b"app").unwrap();
+        std::fs::write(victim.join("web.json"), &manifest).unwrap();
+        std::fs::remove_file(deploy.join("_servers/web.json")).unwrap();
+        std::os::unix::fs::symlink(victim.join("web.json"), deploy.join("_servers/web.json"))
+            .unwrap();
+        assert!(compute_layer_plan(&deploy, &store, false, false).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

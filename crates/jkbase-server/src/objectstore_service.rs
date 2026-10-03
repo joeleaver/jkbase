@@ -285,7 +285,9 @@ impl ObjectStoreService {
         let dd = self.data_dir.clone();
         let pid = project_id.to_string();
         let bytes = match tokio::task::spawn_blocking(move || {
-            jkbase_common::storage::project_storage_bytes(&dd, &pid)
+            // The RESERVED view: data disks at full size, so objects can't spend capacity the
+            // project's guests can still fill without a host check.
+            jkbase_common::storage::project_reserved_bytes(&dd, &pid)
         })
         .await
         {
@@ -349,12 +351,16 @@ impl ObjectStoreService {
             .base_bytes
             .saturating_add(u.reserved_bytes)
             .saturating_add(len);
-        if projected_bytes > quota.storage_bytes_max {
+        // A write that adds no bytes (a same-or-smaller overwrite, CompleteMultipart) never grows
+        // the footprint, so it passes even over the cap — as a non-growing deploy does. A project
+        // can be over through no write of its own (a lowered quota, disks counted at full size).
+        if len > 0 && projected_bytes > quota.storage_bytes_max {
             return Some(s3_error(
                 StatusCode::INSUFFICIENT_STORAGE,
                 "QuotaExceeded",
                 &format!(
-                    "storage quota exceeded: would use {projected_bytes} bytes, cap is {}",
+                    "storage quota exceeded: would use {projected_bytes} bytes (data disks count \
+                     at their full size), cap is {}",
                     quota.storage_bytes_max
                 ),
             ));
@@ -3074,6 +3080,59 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE);
         assert!(body.contains("TooManyObjects"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Data disks count at their FULL size against the byte cap (their guests can fill them with no
+    /// host check), so objects can't spend that capacity; but a write that adds no bytes still
+    /// passes when the project is over its cap, so an over-cap project isn't frozen.
+    #[tokio::test]
+    async fn byte_cap_reserves_disks_at_full_size_but_lets_non_growing_writes_through() {
+        let dir = tmp("diskreserve");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let put = |app: &axum::Router, path: &str, body: &'static str| {
+            let req = signed("PUT", path, &a.access_key_id, &a.secret_key, body);
+            let app = app.clone();
+            async move { status_body(app.oneshot(req).await.unwrap()).await }
+        };
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store.clone(),
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        assert_eq!(put(&app, "/bkt", "").await.0, StatusCode::OK);
+        assert_eq!(put(&app, "/bkt/o1", "abc").await.0, StatusCode::OK);
+
+        // A sparse 1 MiB DB disk (nothing allocated) and a 64 KiB cap: over, by reservation alone.
+        let disks = dir.join("data").join("data-disks");
+        std::fs::create_dir_all(&disks).unwrap();
+        std::fs::File::create(disks.join("proj.db.img"))
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let mut q = DEFAULT_QUOTA;
+        q.storage_bytes_max = 64 * 1024;
+        store.set_quota("proj", &q).unwrap();
+        // A fresh service (no cached usage walk) sees the disk.
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        let (st, body) = put(&app, "/bkt/o2", "y").await;
+        assert_eq!(st, StatusCode::INSUFFICIENT_STORAGE, "{body}");
+        assert!(body.contains("QuotaExceeded"), "{body}");
+        // A same-size overwrite grows nothing → allowed though over the cap.
+        assert_eq!(put(&app, "/bkt/o1", "xyz").await.0, StatusCode::OK);
+        // A growing overwrite is refused.
+        assert_eq!(
+            put(&app, "/bkt/o1", "wxyz").await.0,
+            StatusCode::INSUFFICIENT_STORAGE
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
