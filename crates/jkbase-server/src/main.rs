@@ -599,6 +599,7 @@ async fn self_fence_project(
         plat.disk_tokens.remove(project_id);
         handoff::remove(&plat.data_dir.join("run"), project_id);
         plat.vm_states.remove(project_id);
+        plat.vm_incarnations.retire(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
         (plat.vms.remove(project_id), plat.data_disk.clone())
     };
@@ -897,9 +898,79 @@ enum VmLifecycle {
     Hibernating,
 }
 
+/// True while a wake or hibernate is mid-flight for a VM id. Both drop the platform lock across
+/// their slow VM op while still holding the id's data-disk lease (+ for hibernate, a paused-but-
+/// alive FC mapping the disk), so anything that would supersede/re-fence that id must wait it out.
+fn lifecycle_in_flight(state: Option<&VmLifecycle>) -> bool {
+    matches!(
+        state,
+        Some(VmLifecycle::Waking) | Some(VmLifecycle::Hibernating)
+    )
+}
+
+/// Per-VM-id incarnation markers. A fresh marker is minted at every commit-to-Running (deploy,
+/// wake, DB-VM boot, re-adoption) and dropped whenever the VM is retired — superseded, torn down,
+/// self-fenced, force-stopped or hibernated. `hibernate_project` drops the lock across its
+/// pause+snapshot: it captures the marker up front and, on relocking, acts only if it is STILL
+/// current. Otherwise the VM it paused was retired under it and the id's `disk_tokens` / `vms` /
+/// `vm_states` / snapshot meta now belong to a newer incarnation (or to nobody) — releasing that
+/// token would detach a LIVE FC's loop device (RWO broken), and stamping `Hibernated` + a snapshot
+/// over a `Running` VM would later restore stale guest RAM against a newer disk.
+#[derive(Default)]
+struct Incarnations {
+    current: HashMap<String, u64>,
+    /// Monotonic across ALL ids for the process lifetime, so a marker is never reused (no ABA:
+    /// a retired-then-recommitted id can't collide with a stale captured value).
+    next: u64,
+}
+
+impl Incarnations {
+    /// Commit-to-Running: mint this id's new marker (replacing any prior one).
+    fn commit(&mut self, id: &str) -> u64 {
+        self.next += 1;
+        self.current.insert(id.to_string(), self.next);
+        self.next
+    }
+    /// The live VM at `id` is gone (or going): no capture taken before this stays current.
+    fn retire(&mut self, id: &str) {
+        self.current.remove(id);
+    }
+    /// The marker of the VM a lock-dropping op is about to act on. A `Running` VM always has one;
+    /// mint defensively if not, so the op still detects a later supersede.
+    fn capture(&mut self, id: &str) -> u64 {
+        match self.current.get(id) {
+            Some(n) => *n,
+            None => self.commit(id),
+        }
+    }
+    fn is_current(&self, id: &str, marker: u64) -> bool {
+        self.current.get(id) == Some(&marker)
+    }
+    /// No VM is committed at `id` (retired, and nothing has recommitted yet).
+    fn is_vacant(&self, id: &str) -> bool {
+        !self.current.contains_key(id)
+    }
+}
+
+/// A superseded hibernate's ONLY write: if its VM was retired and nothing has recommitted (the
+/// superseder failed or is still booting), the `Hibernating` it set is still its own — a newer
+/// incarnation's hibernate needs a commit first — so settle it to `Hibernated` (no snapshot meta ⇒
+/// the next wake cold-boots), as `force_stop_and_cleanup` would. Left alone it would wedge the id:
+/// wakes time out waiting on it and deploys wait it out then fail. Anything else is not ours.
+fn settle_superseded_hibernate(plat: &mut PlatformState, id: &str) {
+    if plat.vm_incarnations.is_vacant(id)
+        && plat.vm_states.get(id) == Some(&VmLifecycle::Hibernating)
+    {
+        plat.vm_states
+            .insert(id.to_string(), VmLifecycle::Hibernated);
+    }
+}
+
 struct PlatformState {
     vms: HashMap<String, VmInstance>,
     vm_states: HashMap<String, VmLifecycle>,
+    /// See [`Incarnations`]: lets a lock-dropping hibernate tell "my VM" from a newer one.
+    vm_incarnations: Incarnations,
     /// The base-rootfs hash each RUNNING VM is ACTUALLY mapped against (cold boot ⇒ the current
     /// hash; a restored VM ⇒ the hash it restored from, which after a redeploy is the OLD blob,
     /// not `base_rootfs_hash`). Stamped into the snapshot at hibernate so the next restore + the
@@ -1566,6 +1637,7 @@ async fn async_main() -> Result<()> {
     let platform = Arc::new(Mutex::new(PlatformState {
         vms: HashMap::new(),
         vm_states: HashMap::new(),
+        vm_incarnations: Incarnations::default(),
         vm_rootfs_hashes: HashMap::new(),
         wake_failures: HashMap::new(),
         db_boots: HashMap::new(),
@@ -2532,7 +2604,7 @@ async fn shutdown_signal(
             // hibernate_project self-cleans its own wedge/timeout paths; this is a
             // last-resort catch for an unexpected Err, routed through the same helper.
             tracing::error!(project = %project_id, error = %e, "hibernate errored, force stopping");
-            force_stop_and_cleanup(project_id, &platform).await;
+            force_stop_and_cleanup(project_id, &platform, None).await;
         }
     }
 
@@ -2610,6 +2682,7 @@ async fn handle_teardown(project_id: &str, platform: &Arc<Mutex<PlatformState>>)
             if let Some(mut vm) = plat.vms.remove(project_id) {
                 let _ = vm.stop().await;
             }
+            plat.vm_incarnations.retire(project_id);
             // Force-kill ANY Firecracker for this project — including one a wake that
             // outlasted our wait-loop hasn't yet recorded in `vms` — BEFORE we destroy
             // the disk, so `destroy()` can never detach a loop device a live VM still
@@ -2773,6 +2846,7 @@ async fn reap_db_vm_locked(
     if let Some(mut vm) = plat.vms.remove(db_id) {
         let _ = vm.stop().await;
     }
+    plat.vm_incarnations.retire(db_id);
     // Kill any DB Firecracker not tracked in `vms` BEFORE destroying its disk.
     reap_firecracker(db_id).await;
     handoff::remove(&plat.data_dir.join("run"), db_id);
@@ -3553,6 +3627,7 @@ async fn handle_deploy(
         }
         let _ = old_vm.stop().await;
     }
+    plat.vm_incarnations.retire(project_id);
     // The old VM is gone (or being replaced); drop its re-adoption record so a crash between
     // here and the new commit can't leave a handoff pointing at the now-dead old FC. The new
     // VM writes a fresh record at its commit-to-Running below.
@@ -3897,6 +3972,7 @@ async fn handle_deploy(
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
+    plat.vm_incarnations.commit(project_id);
     // [R4] Stamp the tier this deploy committed so the NEXT deploy can detect an in-place flip.
     // Stamped HERE, at commit-to-Running — not after `wait_for_agent`/`boot_db_vm` — because the
     // VM can already be writing its DB from this point: a later failure leaves this tree live (a
@@ -3992,7 +4068,34 @@ async fn boot_db_vm(
     // Snapshot the substrate handles + supersede any prior DB VM (redeploy), then release the lock
     // for the slow build + fence + boot.
     let (disk_cap, data_dir, dd, ls, hid, firecracker_bin, kernel_path, rootfs_path, platform_egress, alloc) = {
-        let mut plat = platform.lock().await;
+        // Wait out an in-flight wake/hibernate OF THE DB VM before superseding it (the caller's
+        // `handle_deploy` gate only covers the APP id). Hibernate drops the lock mid-snapshot
+        // still holding the disk token while its paused FC maps the disk: releasing that token
+        // under it lets our fence hit `RwoUnsafe` → `reap_firecracker` the paused FC, after which
+        // hibernate's second section would tear down OUR commit (the incarnation check in
+        // `hibernate_project` is the backstop for that; this wait keeps us from causing it). Same
+        // ~80s budget as `handle_deploy` (outlasts hibernate's 3s ship + 60s snapshot); on expiry
+        // FAIL the boot — the deploy is retryable. We only READ `vm_states` here: this boot never
+        // writes a shared `Waking` it doesn't own (that broke the dedicated-DB drop's safety). The
+        // wait and the supersede share ONE lock section, so nothing starts between THEM; after it,
+        // while we build + fence + boot unlocked, a DB wake may still start (the id is left
+        // `Hibernated`/`Running`) — the disk lease is what excludes it (one side fails LeaseHeld,
+        // retryably), and a hibernate can't (we removed the VM handle it needs).
+        let mut attempt = 0;
+        let mut plat = loop {
+            let plat = platform.lock().await;
+            if !lifecycle_in_flight(plat.vm_states.get(&db_id)) {
+                break plat;
+            }
+            drop(plat);
+            if attempt >= 400 {
+                anyhow::bail!(
+                    "DB VM {db_id} busy (wake/hibernate still in flight after ~80s); retry deploy"
+                );
+            }
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
 
         // Supersede a prior DB VM incarnation (redeploy): drop its stale snapshot, stop it, and
         // release its data-disk hold before re-fencing — mirrors the app redeploy path.
@@ -4002,6 +4105,7 @@ async fn boot_db_vm(
         if let Some(mut old) = plat.vms.remove(&db_id) {
             let _ = old.stop().await;
         }
+        plat.vm_incarnations.retire(&db_id);
         plat.vm_rootfs_hashes.remove(&db_id);
         handoff::remove(&plat.data_dir.join("run"), &db_id);
         if let Some(token) = plat.disk_tokens.remove(&db_id) {
@@ -4135,6 +4239,7 @@ async fn boot_db_vm(
     };
     plat.vms.insert(db_id.clone(), vm);
     plat.vm_states.insert(db_id.clone(), VmLifecycle::Running);
+    plat.vm_incarnations.commit(&db_id);
     let ran_hash = plat.base_rootfs_hash.clone();
     plat.vm_rootfs_hashes.insert(db_id.clone(), ran_hash.clone());
     plat.wake_failures.remove(&db_id);
@@ -4301,6 +4406,10 @@ async fn hibernate_project(
             anyhow::bail!("no VM instance for {project_id}");
         }
     };
+    // Pin the incarnation we're hibernating: we drop the lock below for the pause+snapshot, and
+    // every later state write (here and in `force_stop_and_cleanup`) is gated on it still being
+    // current — a supersede in that window owns the id's state from then on, not us.
+    let incarnation = plat.vm_incarnations.capture(project_id);
 
     // VM re-adoption §6/R4: remove the handoff record FIRST — before the pause below — so even a
     // SIGKILL of this server mid-snapshot can't leave a PAUSED FC that the next start would
@@ -4328,7 +4437,12 @@ async fn hibernate_project(
     };
     if wedged {
         tracing::warn!(project = %project_id, "agent unreachable/wedged, force-stopping instead of hibernating");
-        force_stop_and_cleanup(project_id, &platform).await;
+        // Kill OUR FC synchronously-to-death first (as the snapshot-failure arms do): the cleanup
+        // below finds no `vms` handle (we took it) and stands down entirely if we've been
+        // superseded, so it can't be relied on to reap this FC — and a bare drop() of an Adopted
+        // survivor wouldn't kill it at all.
+        let _ = vm.stop().await;
+        force_stop_and_cleanup(project_id, &platform, Some(incarnation)).await;
         return Ok(());
     }
 
@@ -4354,18 +4468,31 @@ async fn hibernate_project(
             // Adopted survivor (its Drop is a no-op), leaving force_stop to detach the loop under a
             // live FC. Kill here so the FC is gone before force_stop releases the disk.
             let _ = vm.stop().await;
-            force_stop_and_cleanup(project_id, &platform).await;
+            force_stop_and_cleanup(project_id, &platform, Some(incarnation)).await;
             return Ok(());
         }
         Err(_elapsed) => {
             tracing::error!(project = %project_id, "hibernate timed out (VM wedged), force-stopping");
             let _ = vm.stop().await;
-            force_stop_and_cleanup(project_id, &platform).await;
+            force_stop_and_cleanup(project_id, &platform, Some(incarnation)).await;
             return Ok(());
         }
     };
 
     let mut plat = platform.lock().await;
+
+    // Superseded mid-snapshot (redeploy / teardown / self-fence retired our incarnation while the
+    // lock was down): the id's disk token, VM handle, lifecycle and snapshot meta are no longer
+    // ours. Our FC is already dead (hibernate kills it), so touch nothing else — releasing the token
+    // would detach a newer live FC's disk, and `Hibernated` + this snapshot would clobber its
+    // `Running` and later restore stale RAM against its disk. The snapshot files we just wrote
+    // are inert without meta (a wake only restores via meta).
+    if !plat.vm_incarnations.is_current(project_id, incarnation) {
+        tracing::warn!(project = %project_id,
+            "VM superseded mid-hibernate; leaving the newer incarnation's state untouched");
+        settle_superseded_hibernate(&mut plat, project_id);
+        return Ok(());
+    }
 
     // The VM is down (hibernate killed the FC); release its data-disk hold NOW —
     // before persisting snapshot meta — so a persistence error can't leak the lease
@@ -4411,16 +4538,26 @@ async fn hibernate_project(
         base_rootfs_hash,
         deployment_version,
     };
-    plat.store.save_snapshot_meta(&meta)?;
+    // Past this point the FC is dead and its disk released, so a store error must not strand the
+    // id in `Hibernating` (wakes would time out on it; deploys + boot_db_vm would wait it out and
+    // fail): fail OPEN — no snapshot meta ⇒ the next wake cold-boots — and still settle below.
+    if let Err(e) = plat.store.save_snapshot_meta(&meta) {
+        tracing::error!(project = %project_id, error = %e,
+            "persisting snapshot meta failed; settling Hibernated without a snapshot (cold boot next)");
+        let _ = plat.store.remove_snapshot_meta(project_id);
+    }
 
     if let Ok(Some(mut proj)) = plat.store.get_project(project_id) {
         proj.state = ProjectState::Hibernated;
-        plat.store.update_project(&proj)?;
+        if let Err(e) = plat.store.update_project(&proj) {
+            tracing::warn!(project = %project_id, error = %e, "persisting Hibernated project state failed");
+        }
     }
 
     // Keep TAP device and VmAllocation for fast restore
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Hibernated);
+    plat.vm_incarnations.retire(project_id);
 
     info!(project = %project_id, "VM hibernated");
     Ok(())
@@ -4996,9 +5133,16 @@ async fn wake_project_inner(
     // the fire-and-forget Drop backstop, whose deferred detach could later `losetup -d`
     // a recreated same-slug VM's live device. Drop the platform lock first so the
     // release's losetup I/O isn't held under the mutex.
-    if plat.store.get_project(project_id).ok().flatten().is_none() {
+    //
+    // Look up the BASE project: a dedicated DB VM (`{id}.db`) has no project row of its own, so
+    // checking the rendered id aborted EVERY DB-VM wake as "deleted" — a hibernated DB VM could
+    // never come back short of a redeploy, and each attempt was a full unthrottled FC boot.
+    if plat.store.get_project(base_pid).ok().flatten().is_none() {
         plat.vm_states.remove(project_id);
         plat.vm_rootfs_hashes.remove(project_id);
+        // Throttle like any failed wake, so traffic at a deleted project can't drive serial boots.
+        plat.wake_failures
+            .insert(project_id.to_string(), std::time::Instant::now());
         drop(plat);
         let _ = vm.stop().await; // synchronous-to-death before detaching the disk it maps
         if let Some(g) = disk_guard {
@@ -5040,6 +5184,7 @@ async fn wake_project_inner(
     plat.vms.insert(project_id.to_string(), vm);
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Running);
+    plat.vm_incarnations.commit(project_id);
     // Track the rootfs this VM actually ran so the NEXT hibernate stamps the truthful hash
     // (a restored VM ran the OLD blob, not `current`). Clear any prior wake-failure throttle.
     plat.vm_rootfs_hashes
@@ -6850,6 +6995,7 @@ async fn finish_adoption(
         }
         plat.vms.insert(id.to_string(), vm);
         plat.vm_states.insert(id.to_string(), VmLifecycle::Running);
+        plat.vm_incarnations.commit(id);
         plat.vm_rootfs_hashes
             .insert(id.to_string(), rec.base_rootfs_hash.clone());
         plat.wake_failures.remove(id);
@@ -6888,26 +7034,70 @@ async fn finish_adoption(
 /// Idempotent and best-effort: every step is independently fallible-ignored so a
 /// failure in one does not strand the others. After this runs the project is left
 /// as Hibernated-with-no-snapshot, so the next request cold-boots cleanly.
-async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformState>>) {
+///
+/// `incarnation`: `Some(n)` when acting for a specific VM (a hibernate that dropped the lock) —
+/// if `n` is no longer current, a newer incarnation (or a teardown) owns the id and this only
+/// settles our own leftover `Hibernating` ([`settle_superseded_hibernate`]): the pkill/TAP-teardown/
+/// token-release below are id-keyed and would hit the NEWER VM. The caller has already stopped its
+/// own FC. `None` = unconditional (the shutdown last resort).
+async fn force_stop_and_cleanup(
+    project_id: &str,
+    platform: &Arc<Mutex<PlatformState>>,
+    incarnation: Option<u64>,
+) {
     let mut plat = platform.lock().await;
+    if let Some(n) = incarnation
+        && !plat.vm_incarnations.is_current(project_id, n)
+    {
+        tracing::warn!(project = %project_id,
+            "VM superseded mid-hibernate; skipping force-stop cleanup of the newer incarnation");
+        settle_superseded_hibernate(&mut plat, project_id);
+        return;
+    }
 
     // The VM handle may already be gone (hibernate_project removes it before the
     // pause that fails) — stop() it if present, but don't rely on it.
     if let Some(mut vm) = plat.vms.remove(project_id) {
         let _ = vm.stop().await;
     }
+    plat.vm_incarnations.retire(project_id);
     plat.vm_rootfs_hashes.remove(project_id);
     // The FC is being reaped below — drop its re-adoption record so a later start can't adopt it.
     // (hibernate_project already removed it before its pause; idempotent if so.)
     handoff::remove(&plat.data_dir.join("run"), project_id);
-    // Release the data-disk hold so the next wake re-fences (the FC is reaped below).
+
+    // Everything id-keyed — the FC kill, the disk release, the TAP teardown — runs UNDER the lock
+    // and BEFORE `Hibernated` is published below: deploy / boot_db_vm / wake treat `Hibernated` as
+    // settled and proceed, so a kill or TAP teardown still pending after it could land on the NEXT
+    // incarnation's FC/TAP (same socket path, same TAP name). Kill first, then release the disk.
+    //
+    // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
+    let _ = tokio::process::Command::new("pkill")
+        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
+        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
+        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
+        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
+        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
+        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
+        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
+        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
+        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
+        .status()
+        .await;
+
+    // Release the data-disk hold so the next wake re-fences.
     if let Some(token) = plat.disk_tokens.remove(project_id) {
         let dd = plat.data_disk.clone();
         let ls = plat.lease.clone();
         release_data_disk(&dd, &ls, project_id, token).await;
     }
 
-    let alloc = plat.store.get_vm_allocation(project_id).ok().flatten();
+    // Tear down TAP so cleanup_orphans reconciles consistently on next boot (a
+    // leaked-but-listening process would otherwise read as "reachable" and the
+    // stale allocation would never be reaped). wake re-runs setup_tap.
+    if let Ok(Some(a)) = plat.store.get_vm_allocation(project_id) {
+        let _ = teardown_tap(&a.tap_device).await;
+    }
 
     // Drop any snapshot meta so wake deterministically cold-boots rather than
     // trying to restore a stale or half-written snapshot.
@@ -6924,29 +7114,6 @@ async fn force_stop_and_cleanup(project_id: &str, platform: &Arc<Mutex<PlatformS
     // make wake_project spin and bail on every subsequent request).
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Hibernated);
-
-    drop(plat);
-
-    // Guarantee the leaked Firecracker process dies even when `vms` had no handle.
-    let _ = tokio::process::Command::new("pkill")
-        // Anchor to the EXACT api-sock path segment (/<id>/firecracker.sock), not an unanchored
-        // `firecracker.*<id>` substring of the whole cmdline: project ids are user-chosen slugs
-        // ([a-z0-9-]), and every FC cmdline carries `--api-sock .../run/<id>/firecracker.sock`, so
-        // a short id like `a` matched as a substring would SIGKILL every tenant's FC host-wide
-        // (cross-tenant kill). `<id>` is a single path segment bounded by `/`, so `/a/` never
-        // matches `/ab/`. A rendered DB VM id (`{id}.db`) carries a `.` — itself an ERE
-        // metacharacter — so `fc_sock_pkill_pattern` escapes every `.` in the id (else `foo.db`
-        // would match `/fooadb/…` and cross-tenant-kill project `fooadb`).
-        .args(["-f", &vm_identity::fc_sock_pkill_pattern(project_id)])
-        .status()
-        .await;
-
-    // Tear down TAP so cleanup_orphans reconciles consistently on next boot (a
-    // leaked-but-listening process would otherwise read as "reachable" and the
-    // stale allocation would never be reaped). wake re-runs setup_tap.
-    if let Some(a) = alloc {
-        let _ = teardown_tap(&a.tap_device).await;
-    }
 }
 
 use chrono::{TimeZone, Utc};
@@ -7620,6 +7787,376 @@ mod split_brain_gate {
 mod tests {
     use super::*;
 
+    /// The hibernate-vs-supersede race: a hibernate captures its VM's marker, drops the lock, and
+    /// meanwhile a redeploy retires that VM and commits a new one. On relock the capture must read
+    /// stale — both in the supersede-only window (nothing recommitted yet) and after the new commit
+    /// — while an undisturbed hibernate still reads current. Markers never repeat across ids or
+    /// retire/recommit cycles (no ABA).
+    #[test]
+    fn hibernate_capture_goes_stale_on_supersede_and_never_aliases() {
+        let mut inc = Incarnations::default();
+        let old = inc.commit("p.db");
+        let captured = inc.capture("p.db");
+        assert_eq!(captured, old, "capture of a committed VM is its marker");
+        assert!(inc.is_current("p.db", captured));
+
+        // boot_db_vm's supersede retires the paused VM's incarnation…
+        assert!(!inc.is_vacant("p.db"));
+        inc.retire("p.db");
+        assert!(
+            !inc.is_current("p.db", captured),
+            "superseded, not yet recommitted"
+        );
+        assert!(
+            inc.is_vacant("p.db"),
+            "the stale hibernate may settle its own Hibernating"
+        );
+        // …then commits the new boot.
+        let new = inc.commit("p.db");
+        assert!(
+            !inc.is_vacant("p.db"),
+            "a newer incarnation's state is off-limits"
+        );
+        assert_ne!(new, captured);
+        assert!(
+            !inc.is_current("p.db", captured),
+            "a newer incarnation owns the id"
+        );
+        assert!(inc.is_current("p.db", new));
+
+        // A marker is unique across ids too: another VM's marker never reads current here.
+        let other = inc.commit("q");
+        assert!(!inc.is_current("p.db", other));
+        assert!(inc.is_current("q", other));
+
+        // A Running VM with no marker (defensive) is minted one, which then guards like any other.
+        let minted = inc.capture("r");
+        assert!(inc.is_current("r", minted));
+        inc.commit("r");
+        assert!(!inc.is_current("r", minted));
+    }
+
+    /// On-box, real Firecracker: a dedicated-DB redeploy (`boot_db_vm`) lands while the DB VM is
+    /// mid-`hibernate_project` (lock dropped, paused FC still mapping the disk). Whatever order the
+    /// two settle in, the result must be ONE coherent incarnation: the new DB VM `Running`, its VM
+    /// handle + disk token present, that token still the live lease holder, the disk attached
+    /// exactly once, exactly one FC for the id, its agent serving, and no snapshot meta that a
+    /// later wake could restore over it. Pre-fix this broke: the supersede released the paused
+    /// FC's token, the fence reaped it, and hibernate's cleanup then tore down the new boot.
+    ///
+    ///   cargo test -p jkbase-server --no-run
+    ///   sudo env JKB_DATA=/abs/.firecracker JKB_FC_RELEASE=/abs/.firecracker/release-v1.15.1-x86_64 \
+    ///       JKB_BASELAYERS=/abs/.firecracker/baselayers \
+    ///       JKB_ROOTFS=/abs/.firecracker/base-rootfs-verity-cur.ext4 \
+    ///       <test-bin> --ignored --nocapture db_vm_redeploy_during_hibernate_onbox
+    ///
+    /// Needs the runtime bridge `jkbr0` at 172.16.0.1/24 (created + removed here if absent) and
+    /// `ebtables` (the TAP source-guard). `JKB_RACE_ROUNDS` (default 3) repeats the race.
+    #[tokio::test]
+    #[ignore = "on-box: needs KVM + root + baselayers + verity rootfs (JKB_ROOTFS)"]
+    async fn db_vm_redeploy_during_hibernate_onbox() {
+        let env = |k: &str| std::env::var(k).ok().map(PathBuf::from);
+        let (Some(fc_data), Some(fc_release), Some(baselayers), Some(rootfs)) = (
+            env("JKB_DATA"),
+            env("JKB_FC_RELEASE"),
+            env("JKB_BASELAYERS"),
+            env("JKB_ROOTFS"),
+        ) else {
+            eprintln!("skip: set JKB_DATA, JKB_FC_RELEASE, JKB_BASELAYERS, JKB_ROOTFS");
+            return;
+        };
+        let rounds: usize = std::env::var("JKB_RACE_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let kernel = if fc_data.join("vmlinux.bin").exists() {
+            fc_data.join("vmlinux.bin")
+        } else {
+            fc_data.join("vmlinux-6.12.92.bin")
+        };
+
+        // Runtime bridge: setup_tap enslaves every TAP to jkbr0.
+        let made_bridge = !std::process::Command::new("ip")
+            .args(["link", "show", "jkbr0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if made_bridge {
+            run_cmd("ip", &["link", "add", "name", "jkbr0", "type", "bridge"])
+                .await
+                .unwrap();
+            run_cmd("ip", &["addr", "add", "172.16.0.1/24", "dev", "jkbr0"])
+                .await
+                .unwrap();
+            run_cmd("ip", &["link", "set", "jkbr0", "up"])
+                .await
+                .unwrap();
+        }
+
+        // A fresh data dir holding just what boot_db_vm reads: the BASE project's live tree (a
+        // DbOnly image needs only `_database.json` + schema) and the shared baselayers store.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!("jkbase-dbrace-{nanos}"));
+        let pid = "dbrace";
+        let db_id = vm_identity::vm_id(pid, vm_identity::VmRole::Db);
+        let live = data_dir.join("hosting").join(pid).join("live");
+        std::fs::create_dir_all(live.join("_database")).unwrap();
+        std::fs::write(
+            live.join("_database.json"),
+            r#"{"engine":"rhypedb","schema":"schema.rhype","rules":null,"tier":"dedicated"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            live.join("_database/schema.rhype"),
+            "type User {\n    name: String\n}\n",
+        )
+        .unwrap();
+        for d in ["content-images", "run", "snapshots", "logs"] {
+            std::fs::create_dir_all(data_dir.join(d)).unwrap();
+        }
+        std::os::unix::fs::symlink(&baselayers, data_dir.join("baselayers")).unwrap();
+
+        let store = Store::open(&data_dir.join("control.redb")).unwrap();
+        store
+            .create_project(&jkbase_control::store::Project {
+                id: pid.to_string(),
+                name: pid.to_string(),
+                tenant_id: None,
+                current_version: Some(1),
+                state: ProjectState::Active,
+                vm_ip: None,
+                domains: Vec::new(),
+            })
+            .unwrap();
+        // Boot from a CAS-shaped rootfs path so a hibernate's snapshot is restore-viable on wake.
+        let rootfs_hash = "a".repeat(64);
+        let cas_dir = data_dir.join("base-rootfs");
+        std::fs::create_dir_all(&cas_dir).unwrap();
+        let cas_rootfs = rootfs_cas::blob_path(&cas_dir, &rootfs_hash);
+        std::os::unix::fs::symlink(&rootfs, &cas_rootfs).unwrap();
+        let host_id = "dbrace-host".to_string();
+        let platform = Arc::new(Mutex::new(PlatformState {
+            vms: HashMap::new(),
+            vm_states: HashMap::new(),
+            vm_incarnations: Incarnations::default(),
+            db_boots: HashMap::new(),
+            vm_rootfs_hashes: HashMap::new(),
+            wake_failures: HashMap::new(),
+            store,
+            firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
+            kernel_path: kernel,
+            base_rootfs_path: cas_rootfs,
+            base_rootfs_hash: rootfs_hash,
+            data_dir: data_dir.clone(),
+            data_disk: Arc::new(LocalLoop::open(data_dir.join("data-disks")).unwrap()),
+            lease: Arc::new(FlockLease::open(data_dir.join("leases"), host_id.clone()).unwrap()),
+            disk_tokens: HashMap::new(),
+            host_id,
+            is_leader: Arc::new(AtomicBool::new(true)),
+            platform_egress: PlatformEgress::default(),
+        }));
+        let routing: jkbase_proxy::RoutingTable = Default::default();
+        let domain_map: DomainMap = Default::default();
+        let logs = data_dir.join("logs");
+        let shipper = LogShipper::new(LogStore::new(logs.clone()), logs.join(".cursors.json"));
+        let reach = jkbase_common::config::DbReachFacts {
+            splice_secret: "dbrace-splice-secret-0123456789abcdef".to_string(),
+            admin_token: "jkba_dbrace-admin-token-0123456789abcdef".to_string(),
+            dedicated: false,
+            jwks: None,
+        };
+
+        let fc_count = || {
+            let out = std::process::Command::new("pgrep")
+                .args(["-f", &vm_identity::fc_sock_pkill_pattern(&db_id)])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().count()
+        };
+        let img = data_dir.join("data-disks").join(format!("{db_id}.img"));
+        let loop_count = || {
+            let out = std::process::Command::new("losetup")
+                .args(["-j", img.to_str().unwrap()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).lines().count()
+        };
+
+        // Run the body, then ALWAYS clean up (FCs, loops, TAP, bridge) before reporting.
+        let outcome: std::result::Result<(), String> = async {
+            boot_db_vm(pid, &platform, Some(&reach))
+                .await
+                .map_err(|e| format!("initial boot_db_vm: {e:#}"))?;
+            for round in 1..=rounds {
+                // Hibernate the DB VM; redeploy as soon as hibernate has dropped the lock.
+                let hib = tokio::spawn({
+                    let (platform, routing, shipper) =
+                        (platform.clone(), routing.clone(), shipper.clone());
+                    let db_id = db_id.clone();
+                    async move {
+                        hibernate_project(&db_id, platform, routing, shipper, None, None).await
+                    }
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let st = platform.lock().await.vm_states.get(&db_id).copied();
+                    if st == Some(VmLifecycle::Hibernating) {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        return Err(format!("round {round}: never saw Hibernating ({st:?})"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let redeploy = boot_db_vm(pid, &platform, Some(&reach)).await;
+                let hib = hib.await.unwrap();
+                eprintln!("[dbrace] round {round}: redeploy={redeploy:?} hibernate={hib:?}");
+                redeploy.map_err(|e| format!("round {round}: redeploy failed: {e:#}"))?;
+                // Let any straggling hibernate-side cleanup land before judging.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let plat = platform.lock().await;
+                let state = plat.vm_states.get(&db_id).copied();
+                let has_vm = plat.vms.contains_key(&db_id);
+                let token = plat.disk_tokens.get(&db_id).cloned();
+                let snap = plat.store.get_snapshot_meta(&db_id).ok().flatten();
+                let alloc = plat.store.get_vm_allocation(&db_id).unwrap().unwrap();
+                let lease = plat.lease.clone();
+                drop(plat);
+                let lease_ok = match &token {
+                    Some(t) => lease.renew(t, DISK_LEASE_TTL).await.is_ok(),
+                    None => false,
+                };
+                let alive = agent_alive(&alloc.ip).await;
+                let (fcs, loops) = (fc_count(), loop_count());
+                eprintln!(
+                    "[dbrace] round {round}: state={state:?} vm={has_vm} token={} lease_ok={lease_ok} \
+                     snapshot_meta={} fcs={fcs} loops={loops} agent_alive={alive}",
+                    token.is_some(),
+                    snap.is_some()
+                );
+                if state != Some(VmLifecycle::Running)
+                    || !has_vm
+                    || !lease_ok
+                    || snap.is_some()
+                    || fcs != 1
+                    || loops != 1
+                    || !alive
+                {
+                    return Err(format!("round {round}: incoherent DB VM after the race"));
+                }
+            }
+
+            // Then the DB VM must still hibernate + WAKE normally (the reach plane's path): a
+            // settled hibernate leaves a snapshot, and `wake_project_inner` on the `.db` id brings
+            // it back Running — on main this aborted every DB-VM wake as "deleted".
+            hibernate_project(&db_id, platform.clone(), routing.clone(), shipper.clone(), None, None)
+                .await
+                .map_err(|e| format!("final hibernate: {e:#}"))?;
+            {
+                let plat = platform.lock().await;
+                let st = plat.vm_states.get(&db_id).copied();
+                let snap = plat.store.get_snapshot_meta(&db_id).ok().flatten();
+                eprintln!("[dbrace] hibernated: state={st:?} snapshot_meta={}", snap.is_some());
+                if st != Some(VmLifecycle::Hibernated) || snap.is_none() {
+                    return Err("final hibernate did not settle Hibernated with a snapshot".into());
+                }
+            }
+            for wake in 1..=2 {
+                let ip = wake_project_inner(
+                    &db_id,
+                    platform.clone(),
+                    routing.clone(),
+                    domain_map.clone(),
+                    shipper.clone(),
+                )
+                .await
+                .map_err(|e| format!("DB VM wake {wake}: {e:#}"))?;
+                let plat = platform.lock().await;
+                let state = plat.vm_states.get(&db_id).copied();
+                let has_vm = plat.vms.contains_key(&db_id);
+                let token = plat.disk_tokens.get(&db_id).cloned();
+                let lease = plat.lease.clone();
+                drop(plat);
+                let lease_ok = match &token {
+                    Some(t) => lease.renew(t, DISK_LEASE_TTL).await.is_ok(),
+                    None => false,
+                };
+                let alive = agent_alive(&ip).await;
+                let (fcs, loops) = (fc_count(), loop_count());
+                eprintln!(
+                    "[dbrace] wake {wake}: ip={ip} state={state:?} vm={has_vm} lease_ok={lease_ok} \
+                     fcs={fcs} loops={loops} agent_alive={alive}"
+                );
+                if state != Some(VmLifecycle::Running)
+                    || !has_vm
+                    || !lease_ok
+                    || fcs != 1
+                    || loops != 1
+                    || !alive
+                {
+                    return Err(format!("wake {wake}: incoherent DB VM"));
+                }
+                if wake == 1 {
+                    hibernate_project(
+                        &db_id,
+                        platform.clone(),
+                        routing.clone(),
+                        shipper.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| format!("re-hibernate: {e:#}"))?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        // Cleanup: stop the VM, kill any straggler FC, detach the disk, drop TAP (+ bridge).
+        {
+            let mut plat = platform.lock().await;
+            if let Some(mut vm) = plat.vms.remove(&db_id) {
+                let _ = vm.stop().await;
+            }
+            reap_firecracker(&db_id).await;
+            if let Some(t) = plat.disk_tokens.remove(&db_id) {
+                let (dd, ls) = (plat.data_disk.clone(), plat.lease.clone());
+                release_data_disk(&dd, &ls, &db_id, t).await;
+            }
+            let _ = plat.data_disk.detach(&db_id).await;
+            if let Ok(Some(a)) = plat.store.get_vm_allocation(&db_id) {
+                let _ = teardown_tap(&a.tap_device).await;
+            }
+        }
+        if made_bridge {
+            let _ = run_cmd("ip", &["link", "del", "jkbr0"]).await;
+        }
+        let _ = std::fs::remove_dir_all(&data_dir);
+
+        outcome.unwrap();
+        println!("PASS: {rounds} round(s) of DB-VM redeploy-during-hibernate left one coherent VM");
+    }
+
+    /// Exactly the two lock-dropping transitions gate a supersede; settled states don't.
+    #[test]
+    fn lifecycle_in_flight_is_waking_or_hibernating_only() {
+        assert!(lifecycle_in_flight(Some(&VmLifecycle::Waking)));
+        assert!(lifecycle_in_flight(Some(&VmLifecycle::Hibernating)));
+        assert!(!lifecycle_in_flight(Some(&VmLifecycle::Running)));
+        assert!(!lifecycle_in_flight(Some(&VmLifecycle::Hibernated)));
+        assert!(!lifecycle_in_flight(None));
+    }
+
+    /// The fail-open routing at the heart of "redeploys never brick": every reason a snapshot
+    /// can't be trusted must route to a cold boot (None), and only a fully-coherent snapshot
+    /// (stamped+present rootfs blob + matching deployment version) restores.
     /// The live tree's own manifests (`_database.json`, …) count against the project budget, so
     /// a budget that would land exactly on a GiB boundary rounds down one MiB.
     const LIVE_MIB: u64 = 1;
