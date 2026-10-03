@@ -2002,20 +2002,20 @@ async fn async_main() -> Result<()> {
     let state = Arc::new(state);
     let router = api::router(state, args.domain.clone());
 
-    // Set up wake callback for the proxy
-    let platform_for_wake = platform.clone();
-    let routing_for_wake = routing_table.clone();
-    let domain_for_wake = domain_map.clone();
-    let shipper_for_wake = log_shipper.clone();
-    let wake_callback: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
-        let platform = platform_for_wake.clone();
-        let routing = routing_for_wake.clone();
-        let domains = domain_for_wake.clone();
-        let shipper = shipper_for_wake.clone();
-        Box::pin(
-            async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await },
-        )
-    });
+    // The proxy's two wake seams: HTTP/WebSocket routing wakes the APP VM (it forwards the request
+    // to the returned IP); the `jkbase-db` edge wakes the VM serving the managed DB.
+    let wake_callback = app_wake_callback(
+        platform.clone(),
+        routing_table.clone(),
+        domain_map.clone(),
+        log_shipper.clone(),
+    );
+    let db_wake_callback = db_reach_wake_callback(
+        platform.clone(),
+        routing_table.clone(),
+        domain_map.clone(),
+        log_shipper.clone(),
+    );
 
     let api_addr = format!("127.0.0.1:{}", args.api_port);
 
@@ -2103,6 +2103,7 @@ async fn async_main() -> Result<()> {
         domains: Some(domain_map.clone()),
         activity_tracker: Some(activity_tracker.clone()),
         wake_callback: Some(wake_callback),
+        db_wake_callback: Some(db_wake_callback),
         backend_port: 80,
         relay_idle_timeout: jkbase_wsproxy::DEFAULT_RELAY_IDLE_TIMEOUT,
         max_concurrent_upgrades: 1024,
@@ -2153,21 +2154,15 @@ async fn async_main() -> Result<()> {
     // P2 §7.6 — the app→DB in-guest leg's host gateway. Lets a dedicated project's app VM reach
     // its sibling DB VM on the same `127.0.0.1:4200/4201` as co-located, host-mediated over the
     // bridge gateway IP and authenticated by the guest's unforgeable source IP. Best-effort bind
-    // (see `db_gateway::serve`); its own wake closure mirrors the proxy's (both call `wake_db_reach`,
-    // which resolves the dedicated `.db` target).
+    // (see `db_gateway::serve`); it wakes like the proxy's DB edge (the dedicated `.db` target).
     {
         let store = store.clone();
-        let platform_for_gw = platform.clone();
-        let routing_for_gw = routing_table.clone();
-        let domain_for_gw = domain_map.clone();
-        let shipper_for_gw = log_shipper.clone();
-        let gw_wake: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
-            let platform = platform_for_gw.clone();
-            let routing = routing_for_gw.clone();
-            let domains = domain_for_gw.clone();
-            let shipper = shipper_for_gw.clone();
-            Box::pin(async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await })
-        });
+        let gw_wake = db_reach_wake_callback(
+            platform.clone(),
+            routing_table.clone(),
+            domain_map.clone(),
+            log_shipper.clone(),
+        );
         let registry = db_relay_registry.clone();
         // This host's id — the gateway resolves peer_ip→project only among THIS host's allocations
         // ([R3], HA IP-collision safety); empty on single-node/pre-HA (matches every alloc).
@@ -2191,26 +2186,21 @@ async fn async_main() -> Result<()> {
     // L4 UDP scale-to-zero ingress — the plane-global throttle/egress controller + the reconcile
     // loop that materializes `[l4.*]` port allocations into live edge sockets + the datagram pump.
     // The plane is shared with the idle + metering loops (they read its established-flow gauge,
-    // last-activity clock, drop counters, and reflection-suspected kill-switch flags). Its wake
-    // closure mirrors the proxy/DB gateway (all call `wake_db_reach`, resolving the app VM);
-    // Axis-1/Axis-2 abuse bounds live inside the plane + pump, keyed on base-project/tenant/dest-IP
+    // last-activity clock, drop counters, and reflection-suspected kill-switch flags). It wakes the
+    // APP VM like HTTP routing does — L4 ports are app-VM only, so a dedicated project's DB VM must
+    // never receive its datagrams; Axis-1/Axis-2 abuse bounds live inside the plane + pump, keyed on base-project/tenant/dest-IP
     // — never the spoofable source (design §3(c)).
     // Live L4 ports, so an UPGRADE shutdown can hand its flow identities to the successor: the
     // tenant VM survives a zero-bounce restart, so its agent still holds every loopback socket, and
     // resuming the identities is what keeps the app-visible tuples from moving underneath it.
     let l4_registry: l4_runtime::L4PortRegistry = Default::default();
     let l4_plane: Arc<jkbase_proxy::l4_plane::L4Plane> = {
-        let platform_for_l4 = platform.clone();
-        let routing_for_l4 = routing_table.clone();
-        let domain_for_l4 = domain_map.clone();
-        let shipper_for_l4 = log_shipper.clone();
-        let l4_wake: jkbase_proxy::WakeCallback = Arc::new(move |project_id: String| {
-            let platform = platform_for_l4.clone();
-            let routing = routing_for_l4.clone();
-            let domains = domain_for_l4.clone();
-            let shipper = shipper_for_l4.clone();
-            Box::pin(async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await })
-        });
+        let l4_wake = app_wake_callback(
+            platform.clone(),
+            routing_table.clone(),
+            domain_map.clone(),
+            log_shipper.clone(),
+        );
         let plane = jkbase_proxy::l4_plane::L4Plane::new(Default::default(), l4_wake);
         let (l4_host_id, l4_data_dir) = {
             let plat = platform.lock().await;
@@ -4568,6 +4558,50 @@ async fn wake_project(
     wake_project_inner(project_id, platform, routing, domain_map, shipper)
         .await
         .map_err(|e| jkbase_proxy::WakeError::Unavailable(e.to_string()))
+}
+
+/// The wake seam for anything that then talks to the project's APP VM — HTTP/WebSocket routing
+/// and L4 UDP ingress. Wakes the base project id as-is, so a `tier="dedicated"` project's app VM
+/// comes up (never its sibling DB VM — the caller forwards tenant traffic to the returned IP).
+fn app_wake_callback(
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domain_map: DomainMap,
+    shipper: Arc<LogShipper>,
+) -> jkbase_proxy::WakeCallback {
+    Arc::new(move |project_id: String| {
+        let (platform, routing, domains, shipper) = (
+            platform.clone(),
+            routing.clone(),
+            domain_map.clone(),
+            shipper.clone(),
+        );
+        Box::pin(
+            async move { wake_project(&project_id, platform, routing, domains, shipper).await },
+        )
+    })
+}
+
+/// The wake seam for the managed-DB reach plane (`jkbase-db` edge, app→DB host gateway): follows
+/// [`wake_db_reach`] to the VM serving the DB. Never hand this to an app-traffic edge — for a
+/// dedicated project it resolves the DB VM, and app traffic would then be forwarded there.
+fn db_reach_wake_callback(
+    platform: Arc<Mutex<PlatformState>>,
+    routing: jkbase_proxy::RoutingTable,
+    domain_map: DomainMap,
+    shipper: Arc<LogShipper>,
+) -> jkbase_proxy::WakeCallback {
+    Arc::new(move |project_id: String| {
+        let (platform, routing, domains, shipper) = (
+            platform.clone(),
+            routing.clone(),
+            domain_map.clone(),
+            shipper.clone(),
+        );
+        Box::pin(
+            async move { wake_db_reach(&project_id, platform, routing, domains, shipper).await },
+        )
+    })
 }
 
 /// Wake the VM that serves a project's managed DB for the reach plane, and return its IP. Resolves
