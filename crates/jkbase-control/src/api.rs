@@ -9,7 +9,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use http_body_util::BodyExt;
 use jkbase_common::routing::DomainTarget;
@@ -24,6 +24,17 @@ use tracing::info;
 
 pub type DeployCallback = Box<
     dyn Fn(String, u64) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> + Send + Sync,
+>;
+
+/// Server-side refusal checks for a deployment tree that is about to go live: called with
+/// `(project_id, deployment_dir)` BEFORE the `live` swap (deploy, build, schema push, rollback),
+/// so a refused version never becomes what the next wake/restart/resume boots. Pure policy only
+/// (e.g. the [R4] managed-DB tier-flip guard) — it must not touch the running VM. Any `Err` is a
+/// refusal ([`DeployRefused`], HTTP 409); the project stays on its previous version.
+pub type DeployPrecheckCallback = Box<
+    dyn Fn(String, PathBuf) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// Fully reap a deleted project's runtime resources — stop its VM, free the
@@ -56,6 +67,29 @@ pub type DbBackupCallback = Arc<dyn Fn(String, String) + Send + Sync>;
 /// platform store and push it to the agent, which untars it and respawns rhypedb with
 /// `RHYPEDB_RESTORE_FROM`. Fire-and-forget (the server impl spawns the executor).
 pub type DbRestoreCallback = Arc<dyn Fn(String, String) + Send + Sync>;
+
+/// Destroy a project's dedicated-tier DB VM (`{id}.db`) and its data disk `{id}.db.img` — the
+/// tenant's explicit, irreversible reclaim of a dedicated database (e.g. one stranded when the
+/// project left the dedicated tier, which no deploy will ever reap on its own). A co-located DB
+/// lives on the app VM's own disk and is never touched. The server binary provides the impl
+/// (mirrors [`TeardownCallback`]).
+pub type DbDropCallback = Box<
+    dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<DbDropOutcome>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What a [`DbDropCallback`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbDropOutcome {
+    /// The DB VM and its disk are gone.
+    Dropped,
+    /// There was no dedicated DB VM or disk.
+    NothingToDrop,
+    /// Something else still holds the DB VM — a wake / hibernate / boot still in flight after the
+    /// wait, or its disk lease (a fence in progress) — so nothing was touched (retry).
+    Busy,
+}
 
 /// A read/write op the console DB tools forward to the project's managed DB. Each maps to
 /// exactly ONE route on rhypedb's OPEN loopback HTTP plane (`/query`, `/schema`, `/status`);
@@ -172,6 +206,9 @@ pub struct AppState {
     pub log_store: LogStore,
     pub deploy_dir: PathBuf,
     pub deploy_callback: Option<DeployCallback>,
+    /// Refusal checks run against the NEW deployment dir before the `live` swap. `None` ⇒ no
+    /// server-side policy (tests without an orchestrator).
+    pub deploy_precheck_callback: Option<DeployPrecheckCallback>,
     /// Tears down a deleted project's VM + IP/TAP + on-disk artifacts (mirrors
     /// `deploy_callback`). `None` leaves cleanup to the boot-time orphan sweep.
     pub teardown_callback: Option<TeardownCallback>,
@@ -206,6 +243,8 @@ pub struct AppState {
     /// Proxies a console DB read/write to the in-VM DB's open loopback HTTP plane (query /
     /// schema / status). `None` ⇒ the console DB tools are disabled (`… /db/query` → 503).
     pub db_query_callback: Option<DbQueryCallback>,
+    /// Drops a project's dedicated DB VM + disk (`DELETE … /db/dedicated`). `None` ⇒ 503.
+    pub db_drop_callback: Option<DbDropCallback>,
     /// Platform apex (e.g. `jkbase.app`), for classifying subdomains vs custom domains.
     pub platform_domain: String,
     /// Optional platform-operator admin token (jkbase-server `--admin-token`).
@@ -272,6 +311,156 @@ impl std::fmt::Display for QuotaExceeded {
 
 impl std::error::Error for QuotaExceeded {}
 
+/// A deploy/rollback refused before it touched the runtime — by the activation checks, the
+/// server's [`DeployPrecheckCallback`], or a [`DeployCallback`] that bailed BEFORE any teardown
+/// (the server returns this type only from such exits). The project ends on its previous
+/// version: a refusal from the deploy callback, which runs after the `live` swap, makes the
+/// control plane undo the activation. HTTP 409 (the request conflicts with the project's current
+/// state, e.g. its managed-DB tier, or a wake still in flight), not 500.
+#[derive(Debug)]
+pub struct DeployRefused(pub String);
+
+impl std::fmt::Display for DeployRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for DeployRefused {}
+
+/// HTTP status for a deploy/rollback error: the typed refusals keep their meaning, everything
+/// else is a 500.
+fn deploy_error_status(e: &anyhow::Error) -> StatusCode {
+    if e.downcast_ref::<QuotaExceeded>().is_some() {
+        StatusCode::PAYMENT_REQUIRED
+    } else if e.downcast_ref::<DeployRefused>().is_some() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// Refuse a deployment tree that would make the host follow a tenant-planted symlink. A raw
+/// `POST /deploy` tarball is unpacked as-is, and tar keeps symlink entries with ANY target
+/// (it only fences hardlinks and writes inside the destination). The `_`-prefixed entries are
+/// platform sidecars the HOST reads, copies and rewrites (`_servers/*.json` secrets injection,
+/// `_functions/*.json` credential binding, `_layers/*` drive attach, `_database*` staging into
+/// the DB VM, `_servers/*.tar.gz` extraction): a symlink there points those root-privileged
+/// operations at another tenant's files or the host's. So no symlink may sit at or under one —
+/// except inside a `_servers/<name>/` rootfs dir, which only ever ships into the guest (copied
+/// link-for-link) and whose absolute links are meant to resolve there. Tenant content outside
+/// the sidecars (static sites) is likewise copied link-for-link and never read by the host.
+/// Run before anything reads the tree, and on rollback targets (they may predate this check).
+fn validate_deployment_tree(dir: &std::path::Path) -> anyhow::Result<()> {
+    fn walk(path: &std::path::Path, rel: &std::path::Path, rootfs_ok: bool) -> anyhow::Result<()> {
+        let ft = std::fs::symlink_metadata(path)?.file_type();
+        if ft.is_symlink() {
+            return Err(DeployRefused(format!(
+                "deployment contains a symlink at {} — platform files (`_`-prefixed) must be \
+                 regular files or directories",
+                rel.display()
+            ))
+            .into());
+        }
+        if ft.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let child_rel = rel.join(entry.file_name());
+                // `_servers/<name>/` is a server rootfs: its contents are guest-only.
+                let child_is_rootfs = rootfs_ok
+                    && entry
+                        .file_type()
+                        .is_ok_and(|t| t.is_dir() && !t.is_symlink());
+                if child_is_rootfs {
+                    continue;
+                }
+                walk(&entry.path(), &child_rel, false)?;
+            }
+        }
+        Ok(())
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with('_') {
+            continue;
+        }
+        walk(
+            &entry.path(),
+            std::path::Path::new(&name),
+            name == "_servers",
+        )?;
+    }
+    Ok(())
+}
+
+/// Unpack each `_servers/<name>.tar.gz` into `_servers/<name>/`. `<name>` is tenant-chosen, so it
+/// must be a plain server name: `_servers/...tar.gz` would otherwise extract into `_servers/..`
+/// (the deployment ROOT) and plant symlinked sidecars after [`validate_deployment_tree`] ran.
+/// tar-rs keeps every entry inside its destination, so a safe `<name>` confines the archive to
+/// that guest-only rootfs dir. The list is taken before extracting, so nothing an archive adds
+/// is itself opened, and only regular files are opened.
+fn extract_server_rootfs(servers_dir: &std::path::Path) -> anyhow::Result<()> {
+    if !std::fs::symlink_metadata(servers_dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
+    let mut tarballs = Vec::new();
+    for entry in std::fs::read_dir(servers_dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "gz") {
+            tarballs.push(path);
+        }
+    }
+    for path in tarballs {
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let name = file_name.strip_suffix(".tar.gz").unwrap_or_default();
+        let plain = !name.is_empty()
+            && name.len() <= 64
+            && !name.starts_with('.')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+        if !plain || name.contains("..") {
+            return Err(DeployRefused(format!(
+                "server rootfs archive `_servers/{file_name}` has an invalid server name"
+            ))
+            .into());
+        }
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file()) {
+            return Err(
+                DeployRefused(format!("`_servers/{file_name}` is not a regular file")).into(),
+            );
+        }
+        let extract_dir = servers_dir.join(name);
+        info!(server = %name, "extracting server rootfs on host");
+        std::fs::create_dir_all(&extract_dir)?;
+        let file = std::fs::File::open(&path)?;
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(gz);
+        archive.set_preserve_permissions(true);
+        archive.unpack(&extract_dir)?;
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// Run the server's refusal checks against `deployment_dir` (see [`DeployPrecheckCallback`]).
+async fn precheck_deployment(
+    state: &AppState,
+    project_id: &str,
+    deployment_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(cb) = &state.deploy_precheck_callback {
+        cb(project_id.to_string(), deployment_dir.to_path_buf())
+            .await
+            .map_err(|e| DeployRefused(format!("{e:#}")))?;
+    }
+    Ok(())
+}
+
 impl AppState {
     pub fn new(store: Store, log_store: LogStore, deploy_dir: PathBuf) -> Self {
         Self {
@@ -279,6 +468,7 @@ impl AppState {
             log_store,
             deploy_dir,
             deploy_callback: None,
+            deploy_precheck_callback: None,
             teardown_callback: None,
             build_callback: None,
             routing_table: None,
@@ -295,6 +485,7 @@ impl AppState {
             db_backup_callback: None,
             db_restore_callback: None,
             db_query_callback: None,
+            db_drop_callback: None,
             platform_domain: "jkbase.app".to_string(),
             admin_token: None,
             deploy_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -437,6 +628,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/db/query", post(db_query))
         .route("/projects/{id}/db/schema", get(db_schema).post(db_schema_apply))
         .route("/projects/{id}/db/status", get(db_status))
+        .route("/projects/{id}/db/dedicated", delete(drop_dedicated_db))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
             "/projects/{id}/repo/git-token",
@@ -871,6 +1063,7 @@ async fn create_project(
     let _ = state.store.delete_all_db_access_keys(&id);
     let _ = state.store.delete_db_splice_secret(&id);
     let _ = state.store.delete_deployed_tier(&id);
+    let _ = state.store.delete_deploy_version_hwm(&id);
     // An admin-granted L4 egress override is per-slug, so an interrupted teardown would hand the
     // grant to the new owner of the name.
     let _ = state.store.remove_l4_egress_limits(&id);
@@ -1050,6 +1243,7 @@ async fn delete_project(
                     let _ = state.store.delete_all_db_access_keys(&id);
                     let _ = state.store.delete_db_splice_secret(&id);
                     let _ = state.store.delete_deployed_tier(&id);
+                    let _ = state.store.delete_deploy_version_hwm(&id);
                     // Managed-DB backups ([RB11]): admin token + catalog rows + backup blobs.
                     let _ = state.store.delete_db_admin_token(&id);
                     let _ = state.store.delete_all_db_backups(&id);
@@ -1179,13 +1373,13 @@ async fn deploy(
             }),
         )
             .into_response(),
-        Err(e) => {
-            let (status, msg) = match e.downcast_ref::<QuotaExceeded>() {
-                Some(q) => (StatusCode::PAYMENT_REQUIRED, q.to_string()),
-                None => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            };
-            (status, Json(ErrorResponse { error: msg })).into_response()
-        }
+        Err(e) => (
+            deploy_error_status(&e),
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -2004,8 +2198,10 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
 /// `*.json` layout; it is MOVED into `deployments/v{N}` (so it must live on the
 /// same filesystem as `deploy_dir`). Shared verbatim by the artifact-upload path
 /// (`do_deploy`) and the build pipeline, so both get the identical tail: server
-/// rootfs pre-extract → storage-quota gate → atomic `live` swap → reconcile
-/// domains/schedules → record history + prune → deploy callback (boot runtime).
+/// symlink validation → rootfs pre-extract → storage-quota gate → server precheck → atomic
+/// `live` swap → reconcile
+/// domains/schedules → record history → deploy callback (boot runtime; a refusal there undoes
+/// the activation) → prune.
 /// Collect the distinct app-layer digests (`sha256:<hex>`) a deployment references,
 /// from each `_servers/<name>.json`'s `app_digest` field (written by the layered
 /// build collection). Recorded on the deployment so a future content-store GC knows
@@ -2037,7 +2233,18 @@ async fn activate_deployment(
     project: &mut Project,
     staged: &std::path::Path,
 ) -> anyhow::Result<u64> {
-    let version = project.current_version.unwrap_or(0) + 1;
+    // Next version = one past the HIGHEST ever allocated, not `current_version + 1`: after a
+    // rollback (v7 → v5) the latter is v6 — a retained version whose dir this deploy would
+    // overwrite, or (refused) delete while its history row stayed, 404ing a later rollback to it.
+    // The store's high-water mark also covers versions an undone refusal dropped from history;
+    // the recorded max seeds it for projects that predate it.
+    let newest_recorded = state
+        .store
+        .list_deployments(&project.id)?
+        .first()
+        .map(|d| d.version);
+    let floor = project.current_version.max(newest_recorded).unwrap_or(0);
+    let version = state.store.allocate_deploy_version(&project.id, floor)?;
 
     let deploy_path = state
         .deploy_dir
@@ -2059,47 +2266,51 @@ async fn activate_deployment(
         let _ = tokio::fs::remove_dir_all(staged).await;
     }
 
-    // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM)
-    let servers_dir = deploy_path.join("_servers");
-    if servers_dir.exists() {
-        for entry in std::fs::read_dir(&servers_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "gz") {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.strip_suffix(".tar"))
-                    .unwrap_or("unknown");
-                let extract_dir = servers_dir.join(name);
-                info!(server = %name, "extracting server rootfs on host");
-                std::fs::create_dir_all(&extract_dir)?;
-                let file = std::fs::File::open(&path)?;
-                let gz = flate2::read::GzDecoder::new(file);
-                let mut archive = tar::Archive::new(gz);
-                archive.set_preserve_permissions(true);
-                archive.unpack(&extract_dir)?;
-                std::fs::remove_file(&path)?;
-            }
-        }
+    // Before anything on the host reads the tree (rootfs extraction below follows
+    // `_servers/*.tar.gz`): no tenant-planted symlinks in the platform sidecars.
+    if let Err(e) = validate_deployment_tree(&deploy_path) {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(e);
     }
 
-    // Storage hard cap: bill the would-be-live footprint — content image + data
-    // disk + THIS version only, NOT the retained rollback history (bounded by a
-    // deployment count, not the cap). Measured before the `live` symlink is
-    // repointed, so a deploy whose live footprint fits is never refused by old
-    // versions still on disk. Reject + remove the just-unpacked artifacts so a
-    // rejected deploy leaves no orphan bytes.
+    // Extract server rootfs tarballs so the VM doesn't have to (saves tmpfs RAM), then
+    // re-validate: extraction is the one host step that ADDS tenant-shaped entries to the tree.
+    if let Err(e) = extract_server_rootfs(&deploy_path.join("_servers"))
+        .and_then(|()| validate_deployment_tree(&deploy_path))
+    {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(e);
+    }
+
+    // Storage hard cap (`deploy_exceeds_cap`): the would-be-live RESERVED footprint — content
+    // images + data disks at their full size + object store + THIS version only, NOT the retained
+    // rollback history (bounded by a deployment count, not the cap). Measured before the `live`
+    // symlink is repointed, so a deploy whose live footprint fits is never refused by old versions
+    // still on disk; a non-growing deploy of an already-over-cap project still ships. Reject +
+    // remove the just-unpacked artifacts so a rejected deploy leaves no orphan bytes.
     let cap = state.store.get_quota(&project.id)?.storage_bytes_max;
     let data_dir = state.deploy_dir.parent().unwrap_or(&state.deploy_dir);
-    let footprint =
-        jkbase_common::storage::project_storage_bytes_for(data_dir, &project.id, &deploy_path);
-    if footprint > cap {
+    if let Some(footprint) =
+        jkbase_common::storage::deploy_exceeds_cap(data_dir, &project.id, &deploy_path, cap)
+    {
         let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        let disks = jkbase_common::storage::data_disks_reserved_bytes(data_dir, &project.id);
         return Err(QuotaExceeded(format!(
-            "storage quota exceeded: deploy would use {footprint} bytes, cap is {cap}"
+            "storage quota exceeded: deploy would use {footprint} bytes (of which data disks \
+             reserve {disks} at their full size), cap is {cap}"
         ))
         .into());
+    }
+
+    // Server-side refusals run HERE — against the new tree, before `live` moves and before any
+    // domain/schedule/history side effect — so a refused deploy leaves the project wholly on its
+    // previous version. Checking after the swap (inside `deploy_callback`) left `live` on the
+    // refused tree: the old VM kept running, but the next wake/restart/resume booted the refused
+    // version (e.g. an [R4] tier flip ⇒ an empty co-located DB beside the real dedicated one).
+    // Removed like a quota rejection, so it leaves no orphan bytes.
+    if let Err(e) = precheck_deployment(state, &project.id, &deploy_path).await {
+        let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+        return Err(e);
     }
 
     // Atomically repoint `live`: symlink to a temp name then rename over it (rename is
@@ -2108,10 +2319,9 @@ async fn activate_deployment(
     // mark the project NeedsRedeploy.
     let proj_dir = state.deploy_dir.join(&project.id);
     let live_link = proj_dir.join("live");
-    let tmp_link = proj_dir.join(".live.swap");
-    let _ = tokio::fs::remove_file(&tmp_link).await;
-    tokio::fs::symlink(&deploy_path, &tmp_link).await?;
-    tokio::fs::rename(&tmp_link, &live_link).await?;
+    // What to restore if the deploy callback refuses after the swap (see below).
+    let before = PreActivation::capture(state, project, &live_link, true).await;
+    swap_live(&proj_dir, &deploy_path).await?;
 
     project.current_version = Some(version);
     project.state = crate::store::ProjectState::Active;
@@ -2137,7 +2347,6 @@ async fn activate_deployment(
         created_at: auth::timestamp(),
         layer_digests: collect_app_layer_digests(&deploy_path),
     })?;
-    prune_deployments(state, &project.id, version);
 
     info!(
         project_id = %project.id,
@@ -2145,11 +2354,121 @@ async fn activate_deployment(
         "deployment activated"
     );
 
-    if let Some(cb) = &state.deploy_callback {
-        cb(project.id.clone(), version).await?;
+    if let Some(cb) = &state.deploy_callback
+        && let Err(e) = cb(project.id.clone(), version).await
+    {
+        // A refusal from the callback means it bailed before touching the runtime (e.g. the
+        // owner-host gate flipped since the precheck, or a wake/hibernate outlasted its wait):
+        // the old VM still runs the old tree, so put `live` and the store back on it rather than
+        // let the next wake boot the refused one. Any other error is past teardown: the new tree
+        // stays live (its metadata image may already be rebuilt — see the precheck comment).
+        if e.downcast_ref::<DeployRefused>().is_some() {
+            if before.restore(state, project).await {
+                let _ = state.store.remove_deployment(&project.id, version);
+                let _ = tokio::fs::remove_dir_all(&deploy_path).await;
+                info!(project_id = %project.id, version,
+                    "refused deploy undone; previous version stays live");
+            }
+        } else {
+            // Committed (past teardown): bounded like a success, or a tenant could pile up
+            // unpruned versions with deploys that fail on purpose (shared-disk DoS).
+            prune_deployments(state, &project.id, version);
+        }
+        return Err(e);
     }
+    // Pruned only once the version is committed, so a refusal undone above pruned nothing.
+    prune_deployments(state, &project.id, version);
 
     Ok(version)
+}
+
+/// Atomically repoint `{proj_dir}/live` at `target`: symlink to a temp name then rename over it
+/// (rename is atomic on the same dir). A plain remove+symlink leaves a window where `live` is
+/// absent, which a concurrent wake reads as "no deployed content" and would wrongly mark the
+/// project NeedsRedeploy.
+async fn swap_live(proj_dir: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let tmp_link = proj_dir.join(".live.swap");
+    let _ = tokio::fs::remove_file(&tmp_link).await;
+    tokio::fs::symlink(target, &tmp_link).await?;
+    tokio::fs::rename(&tmp_link, proj_dir.join("live")).await
+}
+
+/// What a `live` swap replaced, to put back when the deploy callback REFUSES after it (nothing on
+/// the runtime touched, so the old VM still serves the old tree). Declared domains the refused
+/// version claimed stay claimed, as on a rollback (claims are additive; an Active subdomain just
+/// routes to the old tree).
+struct PreActivation {
+    live: Option<PathBuf>,
+    version: Option<u64>,
+    state: crate::store::ProjectState,
+    /// The schedule registry as it was (`None` when the caller doesn't reconcile schedules):
+    /// restored verbatim, so `last_run` cadence survives the refused version's reconcile.
+    schedules: Option<Vec<crate::store::ScheduleRecord>>,
+}
+
+impl PreActivation {
+    async fn capture(
+        state: &AppState,
+        project: &Project,
+        live_link: &std::path::Path,
+        with_schedules: bool,
+    ) -> Self {
+        Self {
+            live: tokio::fs::read_link(live_link).await.ok(),
+            version: project.current_version,
+            state: project.state,
+            schedules: with_schedules.then(|| {
+                state
+                    .store
+                    .list_schedules_for_project(&project.id)
+                    .unwrap_or_default()
+            }),
+        }
+    }
+
+    /// Put `live` (removed if there was none), `current_version`, state and schedules back.
+    /// Returns false — leaving the store as-is, consistent with the still-swapped `live` — when
+    /// `live` can't be restored. Re-reads the project FRESH: a wake/hibernate may have written
+    /// its state since the swap, and only the swap's own `Active` is reverted.
+    async fn restore(self, state: &AppState, project: &mut Project) -> bool {
+        let proj_dir = state.deploy_dir.join(&project.id);
+        let restored = match &self.live {
+            Some(prev) => swap_live(&proj_dir, prev).await,
+            None => match tokio::fs::remove_file(proj_dir.join("live")).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                r => r,
+            },
+        };
+        if let Err(e) = restored {
+            tracing::error!(project_id = %project.id, error = %e,
+                "refused deploy: failed to restore `live` — the refused version stays live");
+            return false;
+        }
+        if let Ok(Some(fresh)) = state.store.get_project(&project.id) {
+            *project = fresh;
+        }
+        project.current_version = self.version;
+        if project.state == crate::store::ProjectState::Active {
+            project.state = self.state;
+        }
+        if let Err(e) = state.store.update_project(project) {
+            tracing::error!(project_id = %project.id, error = %e,
+                "refused deploy: failed to restore current_version");
+        }
+        if let Some(prev) = self.schedules {
+            for cur in state
+                .store
+                .list_schedules_for_project(&project.id)
+                .unwrap_or_default()
+            {
+                let _ = state.store.remove_schedule(&project.id, &cur.function);
+            }
+            for rec in &prev {
+                let _ = state.store.save_schedule(rec);
+            }
+        }
+        true
+    }
 }
 
 /// Keep only the most recent `MAX_DEPLOYMENTS` deployments on disk + in history.
@@ -2243,7 +2562,14 @@ pub struct UsageResponse {
     pub cpu_seconds: f64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Latest billed storage sample (data disks by blocks actually in use).
     pub storage_bytes: u64,
+    /// What the storage quota CHECKS count right now: as `storage_bytes` but with each data disk
+    /// at its full size (`jkbase_common::storage::project_reserved_bytes`). This, not the billed
+    /// figure, is what a deploy / object write is refused against. `#[serde(default)]` on the
+    /// wire for older clients.
+    #[serde(default)]
+    pub storage_reserved_bytes: u64,
     /// Month-to-date server-side build-VM seconds.
     pub build_seconds: u64,
     /// Month-to-date DB-attributable warm-VM seconds (time a VM was held warm by a
@@ -2390,16 +2716,32 @@ async fn get_project_usage(
     // DB runs in a sibling VM metered under `{id}.db`; a co-located or DB-less project has no such
     // rows so this adds zero. The `.db` suffix mirrors jkbase-server's `vm_identity::vm_id` and can
     // never collide with a real project id (`is_valid_project_id` forbids `.`); the `sum_month_to_date`
-    // `"{id}:"` prefix excludes `"{id}.db:"`, so the two never double-count.
+    // `"{id}:"` prefix excludes `"{id}.db:"`, so the two never double-count. Storage is NOT rolled
+    // up: the DB VM's disk is billed on the base row (`project_storage_bytes`, which the quota caps
+    // enforce), and a `.db` row's gauge may still hold a pre-move sample this month.
     let db = state
         .store
         .sum_month_to_date(&format!("{id}.db"), month_start)
         .unwrap_or_default();
+    let storage_reserved_bytes = {
+        let data_dir = state
+            .deploy_dir
+            .parent()
+            .unwrap_or(&state.deploy_dir)
+            .to_path_buf();
+        let pid = id.clone();
+        tokio::task::spawn_blocking(move || {
+            jkbase_common::storage::project_reserved_bytes(&data_dir, &pid)
+        })
+        .await
+        .unwrap_or(0)
+    };
     Json(UsageResponse {
         cpu_seconds: base.cpu_jiffies.saturating_add(db.cpu_jiffies) as f64 / 100.0,
         rx_bytes: base.rx_bytes.saturating_add(db.rx_bytes),
         tx_bytes: base.tx_bytes.saturating_add(db.tx_bytes),
-        storage_bytes: base.storage_bytes.saturating_add(db.storage_bytes),
+        storage_bytes: base.storage_bytes,
+        storage_reserved_bytes,
         build_seconds: base.build_seconds.saturating_add(db.build_seconds),
         warm_seconds: base.warm_seconds.saturating_add(db.warm_seconds),
         month_start,
@@ -2940,7 +3282,7 @@ async fn rollback(
         )
             .into_response(),
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            deploy_error_status(&e),
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -2955,15 +3297,15 @@ async fn do_rollback(
     deploy_path: &std::path::Path,
     target: u64,
 ) -> anyhow::Result<()> {
-    // Atomically repoint `live` at the target version: symlink to a temp name then
-    // rename over it (rename is atomic; a remove+symlink leaves a no-`live` window
-    // that a concurrent wake would misread as "no deployed content").
+    // Refuse BEFORE moving `live` (see `activate_deployment`): rolling back across a managed-DB
+    // tier change is the same data-stranding flip as deploying one. The target dir is retained
+    // history, so a refusal leaves it in place.
+    validate_deployment_tree(deploy_path)?;
+    precheck_deployment(state, &project.id, deploy_path).await?;
+
     let proj_dir = state.deploy_dir.join(&project.id);
-    let live_link = proj_dir.join("live");
-    let tmp_link = proj_dir.join(".live.swap");
-    let _ = tokio::fs::remove_file(&tmp_link).await;
-    tokio::fs::symlink(deploy_path, &tmp_link).await?;
-    tokio::fs::rename(&tmp_link, &live_link).await?;
+    let before = PreActivation::capture(state, project, &proj_dir.join("live"), false).await;
+    swap_live(&proj_dir, deploy_path).await?;
 
     project.current_version = Some(target);
     project.state = crate::store::ProjectState::Active;
@@ -2971,9 +3313,15 @@ async fn do_rollback(
 
     info!(project_id = %project.id, version = target, "rolled back");
 
-    // Rebuild the content image from the now-current `live` and restart the VM.
-    if let Some(cb) = &state.deploy_callback {
-        cb(project.id.clone(), target).await?;
+    // Rebuild the content image from the now-current `live` and restart the VM. A refusal
+    // (nothing on the runtime touched) puts `live` back, as in `activate_deployment`.
+    if let Some(cb) = &state.deploy_callback
+        && let Err(e) = cb(project.id.clone(), target).await
+    {
+        if e.downcast_ref::<DeployRefused>().is_some() {
+            before.restore(state, project).await;
+        }
+        return Err(e);
     }
 
     Ok(())
@@ -3135,7 +3483,7 @@ async fn restart(
                 .into_response()
         }
         Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            deploy_error_status(&e),
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -4379,6 +4727,80 @@ impl From<crate::store::DbBackup> for DbBackupResponse {
 }
 
 #[derive(Deserialize)]
+struct DropDedicatedDbRequest {
+    /// Must equal the project id — a destructive, irreversible op is never one stray request.
+    confirm: String,
+}
+
+#[derive(Serialize)]
+struct DropDedicatedDbResponse {
+    dropped: bool,
+}
+
+/// `DELETE /projects/{id}/db/dedicated` — irreversibly destroy the project's dedicated-tier DB
+/// VM and its data disk (`{id}.db.img`). Owner-scoped; the body must echo the project id. The
+/// one way to reclaim a dedicated DB disk short of deleting the project: leaving the dedicated
+/// tier keeps it (its data would otherwise be lost to a config edit), and it counts against the
+/// storage quota at its full size. Serialized against deploy/build/rollback on the per-project
+/// deploy lock; wakes and wake-path boots don't take that lock, so the server-side drop
+/// additionally refuses (`Busy` → 409) unless it holds the DB disk's lease and no DB VM
+/// wake/hibernate/boot is in flight — it never frees a disk or IP an in-flight boot is using.
+///
+/// Also clears a recorded `dedicated` deployed tier ([R4]): the data a later tier change would
+/// strand is gone, so back-up → drop → redeploy at the new tier → restore is a clean migration.
+/// If the live deployment still declares `tier = "dedicated"`, its DB is down until the next
+/// deploy boots a fresh, empty one.
+async fn drop_dedicated_db(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+    Json(req): Json<DropDedicatedDbRequest>,
+) -> impl IntoResponse {
+    let err = |code: StatusCode, msg: String| (code, Json(ErrorResponse { error: msg }));
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    if req.confirm != id {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("refusing to drop: `confirm` must be the project id '{id}'"),
+        )
+        .into_response();
+    }
+    let Some(cb) = &state.db_drop_callback else {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database drop is not available on this server".into(),
+        )
+        .into_response();
+    };
+    let Some(_lock) = DeployLockGuard::try_acquire(&state, &id) else {
+        return err(
+            StatusCode::CONFLICT,
+            format!("a deploy, build or rollback of '{id}' is in progress; retry when it finishes"),
+        )
+        .into_response();
+    };
+    match cb(id.clone()).await {
+        Ok(DbDropOutcome::Busy) => err(
+            StatusCode::CONFLICT,
+            format!("the database of '{id}' is starting or hibernating; retry in a moment"),
+        )
+        .into_response(),
+        Ok(outcome) => {
+            if matches!(state.store.get_deployed_tier(&id), Ok(Some(t)) if t == "dedicated") {
+                let _ = state.store.delete_deployed_tier(&id);
+            }
+            Json(DropDedicatedDbResponse {
+                dropped: outcome == DbDropOutcome::Dropped,
+            })
+            .into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct RestoreRequest {
     backup_id: String,
 }
@@ -4743,7 +5165,7 @@ async fn db_schema_apply(
     // Serialize with deploy/build/rollback (409 on contention) — held for the whole redeploy.
     // Acquire the lock BEFORE reading `current_version`, then re-read the project FRESH under it,
     // so a concurrent deploy that advanced the version can't be clobbered by a stale snapshot
-    // (activate_deployment derives v{N} from current_version). Mirrors run_build_job's re-read.
+    // (activate_deployment derives v{N} from current_version + history). Mirrors run_build_job's re-read.
     // [adversarial-review: schema-redeploy TOCTOU]
     let _guard = match DeployLockGuard::try_acquire(&state, &id) {
         Some(g) => g,
@@ -4789,6 +5211,18 @@ async fn db_schema_apply(
     };
 
     let prev_deploy_path = proj_dir.join("deployments").join(format!("v{prev_version}"));
+    // The clone below recreates the tree's symlinks and the SDL write lands under `_database/`:
+    // a symlinked `_database` (a tree predating activation's check) would aim that root-privileged
+    // remove+write at another tenant's schema. Validate BEFORE cloning, not just at activation.
+    if let Err(e) = validate_deployment_tree(&prev_deploy_path) {
+        return (
+            deploy_error_status(&e),
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response();
+    }
     let staged = proj_dir.join(format!(".staging-schema-{}", auth::timestamp()));
     let _ = std::fs::remove_dir_all(&staged);
     if let Err(e) = hardlink_clone_dir(&prev_deploy_path, &staged) {
@@ -4823,12 +5257,13 @@ async fn db_schema_apply(
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&staged);
-            let status = if e.downcast_ref::<QuotaExceeded>().is_some() {
-                StatusCode::PAYMENT_REQUIRED
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            return (status, Json(ErrorResponse { error: e.to_string() })).into_response();
+            return (
+                deploy_error_status(&e),
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
         }
     };
 
@@ -4839,6 +5274,10 @@ async fn db_schema_apply(
         // rather than claiming a clean rollback. [adversarial-review: swallowed rollback error]
         let tail = match do_rollback(&state, &mut project, &prev_deploy_path, prev_version).await {
             Ok(()) => format!("rolled back to v{prev_version}."),
+            Err(e) if e.downcast_ref::<DeployRefused>().is_some() => format!(
+                "rolling back to v{prev_version} was refused ({e}) — the new schema is still live; \
+                 roll back or redeploy explicitly."
+            ),
             Err(e) => format!(
                 "the deployment pointer is back on v{prev_version}, but restarting it reported an \
                  error ({e}) — it will restart on next access, or redeploy to force it."
