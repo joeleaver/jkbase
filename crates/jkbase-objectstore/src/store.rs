@@ -9,6 +9,130 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Longest single file name the bucket's filesystem accepts (ext4 / xfs / btrfs).
+const NAME_MAX: usize = 255;
+const META_SUFFIX: &str = ".meta";
+
+/// Keys up to this many bytes are stored under `hex(key)`: the longest whose sidecar
+/// name (`2n` hex chars + `.meta`) still fits `NAME_MAX`. Every object written before
+/// longer keys were storable is in this range (the old temp-file name capped keys at
+/// 123 bytes at most), so it is read back with no migration.
+const HEX_NAME_MAX_KEY: usize = (NAME_MAX - META_SUFFIX.len()) / 2;
+
+/// Name prefix of a key stored whole in base64 ([`b64`]): `b-<b64(key)>`. Fits keys up
+/// to [`B64_NAME_MAX_KEY`] bytes.
+const B64_NAME_PREFIX: &str = "b-";
+const B64_NAME_MAX_KEY: usize = 186; // 2 + ceil(186·4/3) + ".meta" = 255
+
+/// Name prefix of a key too long for any whole-key name: `k-<b64(sha256(key))>.<b64(head)>`,
+/// 43 + 204 base64 chars — 255 bytes with `.meta`. Neither prefix is valid hex (`-`), so
+/// the three name spaces are disjoint and a `hex(key)`-only reader skips the new ones.
+const HASH_NAME_PREFIX: &str = "k-";
+const HASH_NAME_DIGEST_CHARS: usize = 43;
+
+/// Leading key bytes embedded in a hashed name. Listing uses this head to filter by
+/// prefix, fold folders and paginate WITHOUT opening the sidecar of every such object.
+const HASH_NAME_HEAD: usize = 153; // ceil(153·4/3) = 204
+
+/// The on-disk file-name stem for `key` (the bytes live at `<stem>`, the JSON sidecar
+/// at `<stem>.meta`). Pure function of the key; traversal-safe (no `/`, no `.` first).
+///
+/// - `<= 125` bytes: `hex(key)` — the original scheme.
+/// - `<= 186` bytes: `b-<b64(key)>` — hex would exceed `NAME_MAX`; base64 still holds
+///   the whole key, so the name alone identifies it (no sidecar read to list).
+/// - up to the 1024-byte S3 limit: `k-<b64(sha256(key))>.<b64(first 153 bytes)>`. The
+///   full key is in the sidecar; the hash keeps keys that share a head in distinct files.
+fn object_stem(key: &str) -> String {
+    let b = key.as_bytes();
+    if b.len() <= HEX_NAME_MAX_KEY {
+        hex(b)
+    } else if b.len() <= B64_NAME_MAX_KEY {
+        format!("{B64_NAME_PREFIX}{}", b64(b))
+    } else {
+        format!(
+            "{HASH_NAME_PREFIX}{}.{}",
+            b64(&Sha256::digest(b)),
+            b64(&b[..HASH_NAME_HEAD])
+        )
+    }
+}
+
+/// What a listing learns about an object from its file-name stem alone.
+enum StemKey {
+    /// A whole-key name (`hex` or `b-`): the key.
+    Exact(String),
+    /// A hashed name: only the key's first [`HASH_NAME_HEAD`] bytes (the rest is in the
+    /// sidecar). May end mid-way through a multi-byte character.
+    Head(Vec<u8>),
+}
+
+/// Parse a stem written by [`object_stem`]; `None` for anything else (skipped). A name
+/// only counts in the tier `object_stem` would have chosen for its key, so every object
+/// has exactly one name.
+fn parse_stem(stem: &str) -> Option<StemKey> {
+    if let Some(rest) = stem.strip_prefix(HASH_NAME_PREFIX) {
+        let (digest, head) = rest.split_at_checked(HASH_NAME_DIGEST_CHARS)?;
+        let head = b64_decode(head.strip_prefix('.')?)?;
+        b64_decode(digest)?;
+        return (head.len() == HASH_NAME_HEAD).then_some(StemKey::Head(head));
+    }
+    let key = match stem.strip_prefix(B64_NAME_PREFIX) {
+        Some(rest) => b64_decode(rest).filter(|k| k.len() > HEX_NAME_MAX_KEY)?,
+        None => hex_decode(stem).ok()?,
+    };
+    String::from_utf8(key).ok().map(StemKey::Exact)
+}
+
+/// What a hashed name's head alone settles for a listing under `prefix` / `delimiter`.
+enum HeadVerdict {
+    /// The key cannot match `prefix`.
+    Skip,
+    /// The key folds into this common prefix (the delimiter occurs inside the head).
+    Folder(String),
+    /// Matches as far as the head goes; the full key (sidecar) decides the rest.
+    NeedKey,
+}
+
+fn judge_head(head: &[u8], prefix: &str, delimiter: Option<&str>) -> HeadVerdict {
+    let p = prefix.as_bytes();
+    if p.len() > head.len() {
+        // The prefix reaches past the head: the head can only rule the key out.
+        return if p.starts_with(head) {
+            HeadVerdict::NeedKey
+        } else {
+            HeadVerdict::Skip
+        };
+    }
+    if !head.starts_with(p) {
+        return HeadVerdict::Skip;
+    }
+    if let Some(d) = delimiter.filter(|d| !d.is_empty()) {
+        let d = d.as_bytes();
+        // The first occurrence inside the head is the first in the key. UTF-8 is
+        // self-synchronizing, so the cut after a whole delimiter is a char boundary.
+        if let Some(i) = head[p.len()..].windows(d.len()).position(|w| w == d)
+            && let Ok(folder) = String::from_utf8(head[..p.len() + i + d.len()].to_vec())
+        {
+            return HeadVerdict::Folder(folder);
+        }
+    }
+    HeadVerdict::NeedKey
+}
+
+/// Concurrent listings of one store (one project). A listing scans the whole bucket
+/// directory, and hashed-name objects sharing a head cost a sidecar read each, so a
+/// tenant could otherwise multiply that host I/O by issuing LISTs in parallel. Extra
+/// requests wait their turn; they are not refused.
+const MAX_CONCURRENT_LISTS: usize = 4;
+
+/// A key starting with `head` is certainly `<= start_after` (so a resumed listing has
+/// already passed it): `head` sorts strictly before `start_after` at a byte both have.
+fn head_precedes(head: &[u8], start_after: &str) -> bool {
+    let sa = start_after.as_bytes();
+    let n = head.len().min(sa.len());
+    head[..n] < sa[..n]
+}
+
 /// Per-idle-read timeout for put_object / upload_part (slow-loris guard).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -147,9 +271,11 @@ pub struct MultipartUpload {
 }
 
 /// A tenant object store rooted at `root`, one subdirectory per bucket. Each
-/// object is two files: `<hex(key)>` (the bytes) and `<hex(key)>.meta` (JSON).
+/// object is two files: `<stem>` (the bytes) and `<stem>.meta` (JSON), where the stem
+/// is [`object_stem`] of its key.
 pub struct ObjectStore {
     root: PathBuf,
+    list_permits: tokio::sync::Semaphore,
 }
 
 impl ObjectStore {
@@ -157,7 +283,10 @@ impl ObjectStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            list_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_LISTS),
+        })
     }
 
     // ---- buckets ----------------------------------------------------------
@@ -304,13 +433,9 @@ impl ObjectStore {
     ) -> Result<ObjectMeta> {
         validate_key(key)?;
         let dir = self.require_bucket(bucket).await?;
-        let hk = hex(key.as_bytes());
+        let hk = object_stem(key);
         let obj = dir.join(&hk);
-        let tmp = dir.join(format!(
-            "{hk}.tmp.{}.{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let tmp = dir.join(tmp_name("tmp"));
 
         let result = write_stream(&tmp, &mut reader, expected_sha256, declared_len).await;
         match result {
@@ -376,7 +501,7 @@ impl ObjectStore {
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         let dir = self.require_bucket(bucket).await?;
         validate_key(key)?;
-        let hk = hex(key.as_bytes());
+        let hk = object_stem(key);
         let _ = tokio::fs::remove_file(dir.join(&hk)).await;
         let _ = tokio::fs::remove_file(dir.join(format!("{hk}.meta"))).await;
         Ok(())
@@ -430,6 +555,8 @@ impl ObjectStore {
     ) -> Result<ListV2Page> {
         let max_keys = max_keys.clamp(1, 1000);
         let dir = self.require_bucket(bucket).await?;
+        // Never closed, so this only ever waits.
+        let _scan = self.list_permits.acquire().await;
 
         // A list "entry" is either an object (its key) or a folded folder (a common
         // prefix). Both sort by their string form. We keep the smallest `cap` DISTINCT
@@ -468,27 +595,55 @@ impl ObjectStore {
         let mut rd = tokio::fs::read_dir(&dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(hex_key) = name.strip_suffix(".meta") else {
+            let Some(stem) = name.strip_suffix(META_SUFFIX) else {
                 continue;
             };
-            // Hex-decode filename back to the original key bytes.
-            let Ok(key_bytes) = hex_decode(hex_key) else {
-                continue;
+            // The key comes from the name alone wherever it can: a whole-key name is
+            // the key, and a hashed name's head usually settles the entry (wrong prefix,
+            // a folder, already listed, or past this page). Only a hashed-name key still
+            // in contention for the page costs a sidecar read.
+            let mut folded = None;
+            let key = match parse_stem(stem) {
+                None => continue,
+                Some(StemKey::Exact(key)) => key,
+                Some(StemKey::Head(head)) => match judge_head(&head, prefix, delimiter) {
+                    HeadVerdict::Skip => continue,
+                    HeadVerdict::Folder(folder) => {
+                        folded = Some(folder);
+                        String::new()
+                    }
+                    HeadVerdict::NeedKey => {
+                        if start_after.is_some_and(|sa| head_precedes(&head, sa)) {
+                            continue;
+                        }
+                        // The key sorts at or after its head, so past a full page's
+                        // largest entry it can't make the page.
+                        if heap.len() == cap
+                            && head.as_slice() > heap.peek().unwrap().sort_key.as_bytes()
+                        {
+                            continue;
+                        }
+                        let Ok(bytes) = tokio::fs::read(entry.path()).await else {
+                            continue; // raced with a delete
+                        };
+                        match serde_json::from_slice::<ObjectMeta>(&bytes) {
+                            // Only a sidecar sitting under its own key's name counts.
+                            Ok(meta) if object_stem(&meta.key) == stem => meta.key,
+                            _ => continue,
+                        }
+                    }
+                },
             };
-            let Ok(key) = String::from_utf8(key_bytes) else {
-                continue;
-            };
-            if !key.starts_with(prefix) {
-                continue;
-            }
 
             // Fold to a folder when a delimiter occurs in the remainder after `prefix`.
-            let (sort_key, is_prefix) = match delimiter {
-                Some(d) if !d.is_empty() => match key[prefix.len()..].find(d) {
+            let (sort_key, is_prefix) = match (folded, delimiter) {
+                (Some(folder), _) => (folder, true),
+                (None, _) if !key.starts_with(prefix) => continue,
+                (None, Some(d)) if !d.is_empty() => match key[prefix.len()..].find(d) {
                     Some(i) => (key[..prefix.len() + i + d.len()].to_string(), true),
                     None => (key, false),
                 },
-                _ => (key, false),
+                (None, _) => (key, false),
             };
 
             // Resume strictly AFTER the previous page's last entry, compared at the
@@ -538,7 +693,7 @@ impl ObjectStore {
                 common_prefixes.push(e.sort_key);
                 continue;
             }
-            let hk = hex(e.sort_key.as_bytes());
+            let hk = object_stem(&e.sort_key);
             let meta_path = dir.join(format!("{hk}.meta"));
             let bytes = match tokio::fs::read(&meta_path).await {
                 Ok(b) => b,
@@ -671,13 +826,9 @@ impl ObjectStore {
         // Re-validate the bucket here too (every other write path goes through
         // require_bucket); staging() already did, but don't rely on call-order.
         let dir = self.require_bucket(bucket).await?;
-        let hk = hex(key.as_bytes());
+        let hk = object_stem(key);
         let obj = dir.join(&hk);
-        let tmp = dir.join(format!(
-            "{hk}.cmpl.{}.{}",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
+        let tmp = dir.join(tmp_name("cmpl"));
         let mut concat = Md5::new();
         let mut size = 0u64;
         {
@@ -889,7 +1040,7 @@ impl ObjectStore {
     async fn locate(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, PathBuf)> {
         let dir = self.require_bucket(bucket).await?;
         validate_key(key)?;
-        let hk = hex(key.as_bytes());
+        let hk = object_stem(key);
         let obj = dir.join(&hk);
         let meta_path = dir.join(format!("{hk}.meta"));
         let bytes = match tokio::fs::read(&meta_path).await {
@@ -901,6 +1052,10 @@ impl ObjectStore {
         };
         let meta: ObjectMeta = serde_json::from_slice(&bytes)
             .map_err(|_| ObjectError::CorruptMeta(key.to_string()))?;
+        // A hashed name is not the key: never serve a sidecar that names a different one.
+        if meta.key != key {
+            return Err(ObjectError::NoSuchKey(key.to_string()));
+        }
         Ok((meta, obj))
     }
 }
@@ -970,6 +1125,52 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A bucket-dir scratch name for a body being written before its atomic rename into
+/// place. Short and independent of the key (it used to be `<hex(key)>.tmp.<pid>.<seq>`,
+/// which overflowed `NAME_MAX` for keys well under the hex-name limit — and sooner as
+/// `<seq>` grew over the process's life). Never ends in `.meta`, so no scan counts it.
+fn tmp_name(kind: &str) -> String {
+    format!(
+        ".{kind}.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Base64 over a file-name-safe alphabet in ASCII order (`-`, digits, upper, `_`,
+/// lower), unpadded. Needs a case-sensitive filesystem (ext4 / xfs / btrfs are).
+const B64_ALPHABET: &[u8; 64] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+
+fn b64(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
+            << (8 * (3 - chunk.len()));
+        for i in 0..=chunk.len() {
+            s.push(B64_ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+        }
+    }
+    s
+}
+
+/// Inverse of [`b64`]; `None` unless `s` is exactly what `b64` writes for some bytes
+/// (so a name maps to one key and back).
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for chunk in s.as_bytes().chunks(4) {
+        let mut n = 0u32;
+        for &c in chunk {
+            n = (n << 6) | B64_ALPHABET.iter().position(|&a| a == c)? as u32;
+        }
+        n <<= 6 * (4 - chunk.len());
+        let bytes = chunk.len().checked_sub(1).filter(|&b| b > 0)?;
+        out.extend_from_slice(&n.to_be_bytes()[1..=bytes]);
+    }
+    (b64(&out) == s).then_some(out)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1048,8 +1249,9 @@ fn validate_bucket(bucket: &str) -> Result<()> {
     }
 }
 
-/// Object keys: 1–1024 bytes, UTF-8 (guaranteed by `&str`), no NUL. The flat
-/// keyspace (incl. `/`) is preserved because keys are hex-encoded for storage.
+/// Object keys: 1–1024 bytes (the S3 limit), UTF-8 (guaranteed by `&str`), no NUL. The
+/// flat keyspace (incl. `/`) is preserved because a key never becomes a path — see
+/// [`object_stem`].
 fn validate_key(key: &str) -> Result<()> {
     if (1..=1024).contains(&key.len()) && !key.contains('\0') {
         Ok(())
@@ -1484,5 +1686,378 @@ mod tests {
             .await
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- long keys (issue: PUT failed above ~116-byte keys) -------------------
+
+    /// A key of exactly `n` bytes with a recognisable shape.
+    fn key_of(n: usize, tag: &str) -> String {
+        let mut k = format!("bundle-inputs/{tag}/");
+        while k.len() < n {
+            k.push('x');
+        }
+        k.truncate(n);
+        k
+    }
+
+    #[tokio::test]
+    async fn keys_up_to_the_s3_limit_round_trip() {
+        let dir = root("longkeys");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        // Either side of every boundary: the old ~116–123 cap, the hex-name and
+        // base64-name limits, the S3 limit.
+        for n in [1, 116, 117, 123, 124, 125, 126, 127, 186, 187, 255, 512, 1024] {
+            let key = key_of(n, "a");
+            let body = format!("body-{n}");
+            let meta = s
+                .put_object("bkt", &key, body.as_bytes(), "text/plain", None)
+                .await
+                .unwrap_or_else(|e| panic!("put {n}-byte key: {e}"));
+            assert_eq!(meta.key, key);
+            let (got, f) = s.get_object("bkt", &key).await.unwrap();
+            assert_eq!(got.key, key);
+            assert_eq!(read_all(f).await, body.as_bytes(), "{n}-byte key");
+            assert_eq!(s.head_object("bkt", &key).await.unwrap().size, body.len() as u64);
+        }
+        // Every file name stays inside the filesystem's limit, and nothing is left over.
+        let mut names = Vec::new();
+        for e in std::fs::read_dir(dir.join("bkt")).unwrap() {
+            names.push(e.unwrap().file_name().to_string_lossy().into_owned());
+        }
+        assert!(names.iter().all(|n| n.len() <= NAME_MAX), "{names:?}");
+        assert!(names.iter().all(|n| !n.starts_with('.')), "temp file left: {names:?}");
+        assert_eq!(names.len(), 13 * 2);
+        assert_eq!(s.usage_counts().await.unwrap(), (1, 13));
+
+        // One past the limit is a clean InvalidKey on every path — never an I/O error.
+        let over = key_of(1025, "a");
+        assert!(matches!(
+            s.put_object("bkt", &over, &b"x"[..], "t", None).await,
+            Err(ObjectError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            s.get_object("bkt", &over).await,
+            Err(ObjectError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            s.create_multipart("bkt", &over, "t", None).await,
+            Err(ObjectError::InvalidKey(_))
+        ));
+    }
+
+    /// The temp name no longer grows with the key or with the process's sequence
+    /// counter: a 125-byte key still writes after the counter is large.
+    #[tokio::test]
+    async fn the_key_limit_does_not_drift_with_the_temp_sequence() {
+        let s = ObjectStore::open(root("tmpseq")).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        TMP_SEQ.fetch_add(10_000_000_000, Ordering::Relaxed);
+        let key = key_of(HEX_NAME_MAX_KEY, "a");
+        s.put_object("bkt", &key, &b"x"[..], "t", None).await.unwrap();
+        assert_eq!(object_stem(&key), hex(key.as_bytes()));
+    }
+
+    /// Objects written by the previous naming (`hex(key)` for every key, up to the 123
+    /// bytes its temp name allowed) are read, listed, overwritten and deleted unchanged.
+    #[tokio::test]
+    async fn objects_stored_under_the_old_naming_stay_readable() {
+        let dir = root("legacy");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let keys = ["a.txt".to_string(), key_of(116, "old"), key_of(123, "old")];
+        for key in &keys {
+            let hk = hex(key.as_bytes());
+            std::fs::write(dir.join("bkt").join(&hk), b"legacy").unwrap();
+            let meta = ObjectMeta {
+                key: key.clone(),
+                size: 6,
+                etag: "e".into(),
+                content_type: "text/plain".into(),
+                last_modified: 1,
+                cache_control: None,
+            };
+            std::fs::write(
+                dir.join("bkt").join(format!("{hk}.meta")),
+                serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+        }
+        for key in &keys {
+            let (meta, f) = s.get_object("bkt", key).await.unwrap();
+            assert_eq!(&meta.key, key);
+            assert_eq!(read_all(f).await, b"legacy");
+        }
+        let listed: Vec<String> = s
+            .list_objects("bkt", "", None, 1000)
+            .await
+            .unwrap()
+            .objects
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        let mut want = keys.to_vec();
+        want.sort();
+        assert_eq!(listed, want);
+        // Overwrite lands on the same files (no second copy under a new name).
+        s.put_object("bkt", &keys[2], &b"new"[..], "t", None).await.unwrap();
+        assert_eq!(s.usage_counts().await.unwrap(), (1, 3));
+        assert_eq!(read_all(s.get_object("bkt", &keys[2]).await.unwrap().1).await, b"new");
+        s.delete_object("bkt", &keys[1]).await.unwrap();
+        assert_eq!(s.usage_counts().await.unwrap(), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn long_keys_overwrite_delete_and_multipart() {
+        let dir = root("longops");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let key = key_of(700, "a");
+        s.put_object("bkt", &key, &b"one"[..], "t", None).await.unwrap();
+        s.put_object("bkt", &key, &b"two!"[..], "t", None).await.unwrap();
+        assert_eq!(s.usage_counts().await.unwrap(), (1, 1));
+        assert_eq!(s.object_size("bkt", &key).await.unwrap(), Some(4));
+        s.delete_object("bkt", &key).await.unwrap();
+        assert!(matches!(
+            s.get_object("bkt", &key).await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
+        assert_eq!(std::fs::read_dir(dir.join("bkt")).unwrap().count(), 0);
+
+        let mp = key_of(1024, "mp");
+        let id = s.create_multipart("bkt", &mp, "t", None).await.unwrap();
+        s.upload_part("bkt", &id, 1, &b"hello "[..], None).await.unwrap();
+        s.upload_part("bkt", &id, 2, &b"world"[..], None).await.unwrap();
+        s.complete_multipart("bkt", &mp, &id, &[1, 2]).await.unwrap();
+        assert_eq!(read_all(s.get_object("bkt", &mp).await.unwrap().1).await, b"hello world");
+        s.delete_object("bkt", &mp).await.unwrap();
+        // Bucket is empty again (no stray temp / staging), so it can be deleted.
+        s.delete_bucket("bkt").await.unwrap();
+    }
+
+    /// Listing over a mix of short and long keys matches a plain sort + filter of the
+    /// keys, for every prefix / delimiter / page size — including prefixes longer than
+    /// a hashed name's head, long keys that share one head, and a multi-byte character
+    /// straddling the head's cut.
+    #[tokio::test]
+    async fn listing_long_keys_matches_the_flat_keyspace() {
+        let s = ObjectStore::open(root("longlist")).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let shared_head = "h/".to_string() + &"s".repeat(200); // > the head, in common
+        let straddle = "é".repeat(100); // the head's cut (byte 153) splits an `é`
+        let mut keys: Vec<String> = vec![
+            "a.txt".into(),
+            "docs/readme.md".into(),
+            "docs/".to_string() + &"d".repeat(200) + "/deep/file.bin",
+            "docs/".to_string() + &"d".repeat(200) + "/deep/other.bin",
+            "docs/".to_string() + &"e".repeat(40) + "/" + &"f".repeat(300),
+            "docs/".to_string() + &"g".repeat(140), // whole-key base64 name
+            "docs/".to_string() + &"g".repeat(140) + "/in/base64",
+            format!("{shared_head}/one"),
+            format!("{shared_head}/two"),
+            format!("{shared_head}0"),
+            straddle.clone(),
+            straddle.clone() + "/tail",
+            "z".repeat(1024),
+            "z".repeat(1023) + "/",
+        ];
+        for i in 0..30 {
+            keys.push(format!("bundle-inputs/{}/{i:04}/{}.tar.gz", "k".repeat(40), "n".repeat(80)));
+        }
+        for k in &keys {
+            s.put_object("bkt", k, k.as_bytes(), "t", None).await.unwrap();
+        }
+        keys.sort();
+
+        // Reference model: the S3 flat keyspace over the sorted key list.
+        let model = |prefix: &str, delim: Option<&str>| -> Vec<(String, bool)> {
+            let mut out: Vec<(String, bool)> = Vec::new();
+            for k in keys.iter().filter(|k| k.starts_with(prefix)) {
+                let e = match delim.and_then(|d| k[prefix.len()..].find(d).map(|i| (i, d))) {
+                    Some((i, d)) => (k[..prefix.len() + i + d.len()].to_string(), true),
+                    None => (k.clone(), false),
+                };
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+            out.sort();
+            out
+        };
+
+        let deep = "docs/".to_string() + &"d".repeat(200) + "/";
+        let prefixes = [
+            "".to_string(),
+            "docs/".into(),
+            "bundle-inputs/".into(),
+            format!("bundle-inputs/{}/00", "k".repeat(40)),
+            deep.clone(),
+            deep.clone() + "deep/f",
+            shared_head.clone(),
+            format!("{shared_head}/"),
+            "é".repeat(44),
+            "é".repeat(77),
+            straddle.clone(),
+            "docs/".to_string() + &"g".repeat(100),
+            "z".repeat(1000),
+            "nope/".into(),
+        ];
+        for prefix in &prefixes {
+            for delim in [None, Some("/"), Some("deep/")] {
+                for page in [1usize, 2, 7, 1000] {
+                    let want = model(prefix, delim);
+                    let mut got: Vec<(String, bool)> = Vec::new();
+                    let mut after: Option<String> = None;
+                    loop {
+                        let p = s
+                            .list_v2("bkt", prefix, delim, after.as_deref(), page)
+                            .await
+                            .unwrap();
+                        let mut entries: Vec<(String, bool)> = p
+                            .objects
+                            .iter()
+                            .map(|m| (m.key.clone(), false))
+                            .chain(p.common_prefixes.iter().map(|c| (c.clone(), true)))
+                            .collect();
+                        entries.sort();
+                        assert!(entries.len() <= page);
+                        got.extend(entries);
+                        if !p.is_truncated {
+                            break;
+                        }
+                        after = p.next_continuation_token;
+                        assert!(after.is_some());
+                    }
+                    assert_eq!(got, want, "prefix={prefix:?} delim={delim:?} page={page}");
+                }
+            }
+        }
+    }
+
+    /// A hashed name is not the key: a sidecar found under it that names another key is
+    /// never served or listed.
+    #[tokio::test]
+    async fn a_long_name_never_serves_another_key() {
+        let dir = root("longmismatch");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let (a, b) = (key_of(300, "a"), key_of(300, "b"));
+        s.put_object("bkt", &a, &b"A"[..], "t", None).await.unwrap();
+        // Move A's files under B's name (as corruption / tampering would).
+        let (sa, sb) = (object_stem(&a), object_stem(&b));
+        for suffix in ["", ".meta"] {
+            std::fs::rename(
+                dir.join("bkt").join(format!("{sa}{suffix}")),
+                dir.join("bkt").join(format!("{sb}{suffix}")),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            s.get_object("bkt", &b).await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
+        assert!(s.list_objects("bkt", "", None, 10).await.unwrap().objects.is_empty());
+    }
+
+    #[test]
+    fn stems_fit_the_filesystem_and_never_overlap() {
+        let fits = |n: usize| object_stem(&key_of(n, "a")).len() + META_SUFFIX.len();
+        assert_eq!(fits(HEX_NAME_MAX_KEY), NAME_MAX);
+        assert_eq!(fits(B64_NAME_MAX_KEY), NAME_MAX);
+        assert_eq!(fits(B64_NAME_MAX_KEY + 1), NAME_MAX);
+        assert_eq!(fits(1024), NAME_MAX);
+        for n in 1..=1024 {
+            let mut key = "é😀/".repeat(n / 7 + 1);
+            while !key.is_char_boundary(n) {
+                key.insert(0, 'p');
+            }
+            key.truncate(n);
+            let stem = object_stem(&key);
+            assert!(stem.len() + META_SUFFIX.len() <= NAME_MAX, "{n}");
+            assert!(!stem.contains('/') && !stem.starts_with('.'), "{n}");
+            match parse_stem(&stem) {
+                Some(StemKey::Exact(k)) => assert!(n <= B64_NAME_MAX_KEY && k == key, "{n}"),
+                Some(StemKey::Head(h)) => {
+                    assert!(n > B64_NAME_MAX_KEY && key.as_bytes().starts_with(&h), "{n}")
+                }
+                None => panic!("{n}: own stem did not parse"),
+            }
+            // A reader that only knows `hex(key)` names must skip the new ones.
+            assert_eq!(hex_decode(&stem).is_ok(), n <= HEX_NAME_MAX_KEY, "{n}");
+        }
+        // Same head, different key → different file.
+        let head = "p".repeat(300);
+        assert_ne!(object_stem(&format!("{head}1")), object_stem(&format!("{head}2")));
+        // One name per key: a short key dressed up in a longer tier's name is not listed.
+        assert!(parse_stem(&format!("{B64_NAME_PREFIX}{}", b64(b"short"))).is_none());
+    }
+
+    #[test]
+    fn b64_round_trips_and_rejects_non_canonical_names() {
+        for len in 0..=200usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 131 + len * 7) as u8).collect();
+            let enc = b64(&bytes);
+            assert_eq!(enc.len(), (len * 4).div_ceil(3));
+            assert_eq!(b64_decode(&enc).as_deref(), Some(&bytes[..]), "{len}");
+        }
+        assert!(b64_decode("A").is_none()); // impossible length
+        assert!(b64_decode("AA=").is_none()); // outside the alphabet
+        assert!(b64_decode("--0").is_none()); // stray low bits: not what b64 writes
+        assert!(b64_decode("/-").is_none());
+    }
+
+    /// Listings of one store queue past `MAX_CONCURRENT_LISTS` instead of running at
+    /// once, and all complete.
+    #[tokio::test]
+    async fn concurrent_listings_are_bounded_and_all_complete() {
+        let s = std::sync::Arc::new(ObjectStore::open(root("listcap")).unwrap());
+        s.create_bucket("bkt").await.unwrap();
+        s.put_object("bkt", "a", &b"x"[..], "t", None).await.unwrap();
+        let held = s
+            .list_permits
+            .acquire_many(MAX_CONCURRENT_LISTS as u32)
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..3 * MAX_CONCURRENT_LISTS {
+            let s = s.clone();
+            tasks.spawn(async move {
+                s.list_objects("bkt", "", None, 10).await.unwrap().objects.len()
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(tasks.try_join_next().is_none(), "a listing ran past the cap");
+        drop(held);
+        while let Some(n) = tasks.join_next().await {
+            assert_eq!(n.unwrap(), 1);
+        }
+    }
+    /// Keys up to 186 bytes are listed from file names alone: the scan must not depend
+    /// on (or pay for) any sidecar but the returned page's own.
+    #[tokio::test]
+    async fn whole_key_names_list_without_reading_other_sidecars() {
+        let dir = root("noread");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let keys: Vec<String> = (0..20)
+            .map(|i| format!("{}/{i:02}", "p".repeat(B64_NAME_MAX_KEY - 3)))
+            .collect();
+        for k in &keys {
+            assert_eq!(k.len(), B64_NAME_MAX_KEY);
+            s.put_object("bkt", k, &b"x"[..], "t", None).await.unwrap();
+        }
+        // Wreck every sidecar except the first key's.
+        for k in &keys[1..] {
+            let meta = dir.join("bkt").join(format!("{}.meta", object_stem(k)));
+            std::fs::write(meta, b"not json").unwrap();
+        }
+        let page = s.list_v2("bkt", "", None, None, 1).await.unwrap();
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key, keys[0]);
+        assert!(page.is_truncated);
+        assert_eq!(page.next_continuation_token.as_deref(), Some(keys[0].as_str()));
+        // Folding never needs them either.
+        let folded = s.list_v2("bkt", "", Some("/"), None, 10).await.unwrap();
+        assert_eq!(folded.common_prefixes, vec![format!("{}/", "p".repeat(B64_NAME_MAX_KEY - 3))]);
     }
 }

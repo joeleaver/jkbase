@@ -8,10 +8,12 @@
 //! are layered on top in their own cards.
 //!
 //! The S3 keyspace is flat (a key like `a/b` and `a/b/c` may both be objects),
-//! which a hierarchical filesystem can't represent directly, so each key is
-//! hex-encoded into a single flat filename. The original key + metadata live in a
-//! sidecar; listing reads the sidecars. Hex encoding also makes traversal (`..`,
-//! absolute paths) structurally impossible.
+//! which a hierarchical filesystem can't represent directly, so each key maps to a
+//! single flat filename: `hex(key)` up to 125 bytes, a base64 of the key up to 186, and
+//! beyond that (to the 1024-byte S3 limit, which no whole-key name fits) a SHA-256 of
+//! the key plus its base64-encoded first 153 bytes. The original key + metadata live in
+//! a sidecar. A name never contains `/` or starts with `.`, so traversal (`..`,
+//! absolute paths) is structurally impossible.
 
 pub mod cors;
 mod http;

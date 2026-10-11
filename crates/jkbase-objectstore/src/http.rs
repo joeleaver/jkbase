@@ -664,6 +664,10 @@ fn s3_error(e: ObjectError) -> Response {
         ObjectError::BucketAlreadyExists(_) => (StatusCode::CONFLICT, "BucketAlreadyExists"),
         ObjectError::BucketNotEmpty(_) => (StatusCode::CONFLICT, "BucketNotEmpty"),
         ObjectError::InvalidBucketName(_) => (StatusCode::BAD_REQUEST, "InvalidBucketName"),
+        // S3's own code for a key past the 1024-byte limit, so SDKs report it as such.
+        ObjectError::InvalidKey(k) if k.len() > 1024 => {
+            (StatusCode::BAD_REQUEST, "KeyTooLongError")
+        }
         ObjectError::InvalidKey(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
         ObjectError::NoSuchUpload(_) => (StatusCode::NOT_FOUND, "NoSuchUpload"),
         ObjectError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
@@ -1183,5 +1187,73 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys up to S3's 1024 bytes work end to end over HTTP (they used to fail around
+    /// 116 bytes with an I/O error); one byte more is S3's own `KeyTooLongError`.
+    #[tokio::test]
+    async fn long_keys_over_http_and_key_too_long() {
+        let (s, dir) = store();
+        let app = router(s);
+        let r = app
+            .clone()
+            .oneshot(Request::put("/my-bucket").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let key = format!("bundle-inputs/{}/file.tar.gz", "a".repeat(1024 - 26));
+        assert_eq!(key.len(), 1024);
+        let r = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/my-bucket/{key}"))
+                    .body(Body::from("long key body"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/my-bucket/{key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            &to_bytes(r.into_body(), usize::MAX).await.unwrap()[..],
+            b"long key body"
+        );
+        let r = app
+            .clone()
+            .oneshot(
+                Request::get("/my-bucket?list-type=2&prefix=bundle-inputs/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let xml = String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec())
+            .unwrap();
+        assert!(xml.contains(&format!("<Key>{key}</Key>")), "{xml}");
+
+        let r = app
+            .clone()
+            .oneshot(
+                Request::put(format!("/my-bucket/{key}x"))
+                    .body(Body::from("nope"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let xml = String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec())
+            .unwrap();
+        assert!(xml.contains("<Code>KeyTooLongError</Code>"), "{xml}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

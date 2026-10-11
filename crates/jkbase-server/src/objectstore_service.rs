@@ -1164,7 +1164,7 @@ async fn console_put_object(
                 ObjectError::NoSuchBucket(_) => {
                     json_error(StatusCode::NOT_FOUND, "bucket not found")
                 }
-                ObjectError::InvalidKey(_) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
+                ObjectError::InvalidKey(_) => json_error(StatusCode::BAD_REQUEST, "invalid key (1 to 1024 bytes)"),
                 ObjectError::Timeout(_) => {
                     json_error(StatusCode::REQUEST_TIMEOUT, "upload timed out")
                 }
@@ -1194,7 +1194,7 @@ async fn console_delete_object(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(ObjectError::NoSuchBucket(_)) => json_error(StatusCode::NOT_FOUND, "bucket not found"),
-        Err(ObjectError::InvalidKey(_)) => json_error(StatusCode::BAD_REQUEST, "invalid key"),
+        Err(ObjectError::InvalidKey(_)) => json_error(StatusCode::BAD_REQUEST, "invalid key (1 to 1024 bytes)"),
         Err(e) => console_internal("object api", e),
     }
 }
