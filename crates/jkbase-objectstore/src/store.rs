@@ -77,10 +77,12 @@ fn parse_stem(stem: &str) -> Option<StemKey> {
         return (head.len() == HASH_NAME_HEAD).then_some(StemKey::Head(head));
     }
     let key = match stem.strip_prefix(B64_NAME_PREFIX) {
-        Some(rest) => b64_decode(rest).filter(|k| k.len() > HEX_NAME_MAX_KEY)?,
+        Some(rest) => b64_decode(rest)?,
         None => hex_decode(stem).ok()?,
     };
-    String::from_utf8(key).ok().map(StemKey::Exact)
+    let key = String::from_utf8(key).ok()?;
+    // Wrong tier for its length, or uppercase hex: not a name this store writes.
+    (object_stem(&key) == stem).then_some(StemKey::Exact(key))
 }
 
 /// What a hashed name's head alone settles for a listing under `prefix` / `delimiter`.
@@ -1990,6 +1992,7 @@ mod tests {
         assert_ne!(object_stem(&format!("{head}1")), object_stem(&format!("{head}2")));
         // One name per key: a short key dressed up in a longer tier's name is not listed.
         assert!(parse_stem(&format!("{B64_NAME_PREFIX}{}", b64(b"short"))).is_none());
+        assert!(parse_stem("4A").is_none() && parse_stem("4a").is_some());
     }
 
     #[test]
