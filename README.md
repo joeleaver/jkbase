@@ -496,6 +496,9 @@ Every project gets its own **S3-compatible object store** at `https://storage.<d
 addressing and region **`us-east-1`**. Buckets and objects are isolated to the project that owns the
 key; another project's credentials can't see them.
 
+Object keys can be up to **1024 bytes** (the S3 limit); a longer key is refused with S3's
+`KeyTooLongError` (400).
+
 ### Issue an access key
 
 ```bash
