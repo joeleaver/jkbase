@@ -210,7 +210,14 @@ pub struct ProxyConfig {
     pub auth_addr: Option<String>,
     pub domains: Option<DomainMap>,
     pub activity_tracker: Option<ActivityTracker>,
+    /// Wakes the project's APP VM — the one HTTP/WebSocket routing forwards to. Must resolve the
+    /// app VM even for a dedicated-DB project: its IP is where the request is then sent.
     pub wake_callback: Option<WakeCallback>,
+    /// Wakes whichever VM serves the project's managed DB — the sibling DB VM for a dedicated
+    /// project, else the app VM — for the `jkbase-db` reach-plane edge only. Kept separate from
+    /// [`Self::wake_callback`] so neither edge can be pointed at the other's VM. `None` (with
+    /// `db_auth_callback`) disables the DB ingress.
+    pub db_wake_callback: Option<WakeCallback>,
     /// TCP port tenant backends listen on (default 80). Configurable so an
     /// integration test can point `forward_request` at a local echo server.
     pub backend_port: u16,
@@ -276,12 +283,12 @@ pub async fn serve(
     let http_port = config.http_port;
     let domain = Arc::new(config.platform_domain);
     let activity = config.activity_tracker;
-    // Assemble the managed-DB reach-plane edge iff its auth + registry + wake are all
+    // Assemble the managed-DB reach-plane edge iff its auth + registry + DB wake are all
     // configured; otherwise a `jkbase-db`-ALPN connection is dropped at the demux.
     let db_ingress = match (
         config.db_auth_callback,
         config.db_relay_registry,
-        config.wake_callback.clone(),
+        config.db_wake_callback,
     ) {
         (Some(auth), Some(registry), Some(wake)) => Some(Arc::new(db_ingress::DbIngress {
             domain: domain.clone(),
