@@ -55,6 +55,22 @@ pub(crate) const PENDING_ORPHAN_AGE: u64 = 12 * 3600;
 /// segment on every GET of it.
 pub(crate) const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
+/// Part rows a project may have staged across all its unfinished uploads. Parts — even
+/// zero-byte ones, which the byte quota doesn't see — each cost an index row and a segment
+/// file until their upload completes or is swept, so they are capped (10 uploads' worth at
+/// S3's 10 000-part maximum). Re-uploading an existing part number is always allowed.
+#[cfg(not(test))]
+pub(crate) const MAX_STAGED_PARTS: u64 = 100_000;
+#[cfg(test)]
+pub(crate) const MAX_STAGED_PARTS: u64 = 50;
+
+/// Part rows retired per sweep transaction, so one tenant's abandoned uploads can't make
+/// a single huge transaction or hold the sweeper away from every other project.
+#[cfg(not(test))]
+const SWEEP_PART_ROWS: usize = 10_000;
+#[cfg(test)]
+const SWEEP_PART_ROWS: usize = 20;
+
 /// Page cache per open index. redb's default (1 GiB) is per database, and the server keeps
 /// thousands of project stores open.
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -290,17 +306,20 @@ impl Index {
     /// Give up on pending segments whose write failed or whose commit was refused: they
     /// become garbage (nothing ever referenced them). An id no longer pending is left
     /// alone — a request cancelled mid-commit releases its segment AFTER the commit that
-    /// referenced it landed, and must not make a live segment garbage.
-    pub fn discard_pending(&self, ids: &[String], now: u64) -> Result<()> {
+    /// referenced it landed, and must not make a live segment garbage. Returns the ids
+    /// it retired — the only ones the caller may delete.
+    pub fn discard_pending(&self, ids: &[String], now: u64) -> Result<Retired> {
         self.write(|w| {
             let mut p = w.open_table(PENDING)?;
             let mut g = w.open_table(GARBAGE)?;
+            let mut retired = Vec::new();
             for id in ids {
                 if p.remove(id.as_str())?.is_some() {
                     g.insert(id.as_str(), now)?;
+                    retired.push(id.clone());
                 }
             }
-            Ok(())
+            Ok(retired)
         })
     }
 
@@ -568,10 +587,20 @@ impl Index {
     ) -> Result<Retired> {
         self.write(|w| {
             require_upload(w, bucket, upload_id)?;
+            let k = part_key(upload_id, part);
+            {
+                let parts = w.open_table(PARTS)?;
+                if parts.get(k.as_slice())?.is_none() && parts.len()? >= MAX_STAGED_PARTS {
+                    return Err(ObjectError::InvalidArgument(format!(
+                        "more than {MAX_STAGED_PARTS} parts are staged in unfinished uploads; \
+                         complete or abort some first"
+                    )));
+                }
+            }
             take_pending(w, std::iter::once(row.segment.as_str()))?;
             let old = w
                 .open_table(PARTS)?
-                .insert(part_key(upload_id, part).as_slice(), json(row).as_slice())?
+                .insert(k.as_slice(), json(row).as_slice())?
                 .map(|v| v.value().to_vec());
             let mut retired = Vec::new();
             if let Some(old) = old
@@ -697,8 +726,9 @@ impl Index {
         Ok(out)
     }
 
-    /// Abort up to `limit` uploads initiated at or before `threshold`; returns how many
-    /// and the segments that retired.
+    /// Abort up to `limit` uploads initiated at or before `threshold`, stopping once
+    /// [`SWEEP_PART_ROWS`] parts have been retired; returns how many and the segments that
+    /// retired. What is left waits for the next sweep.
     pub fn abort_uploads_before(
         &self,
         threshold: u64,
@@ -719,15 +749,20 @@ impl Index {
                 }
             }
             let mut retired = Vec::new();
+            let mut aborted = 0;
             for k in &stale {
+                if retired.len() >= SWEEP_PART_ROWS {
+                    break;
+                }
                 let Some(nul) = k.iter().position(|&b| b == 0) else {
                     continue;
                 };
                 let bucket = String::from_utf8_lossy(&k[..nul]).into_owned();
                 let upload_id = String::from_utf8_lossy(&k[nul + 1..]).into_owned();
                 drop_upload(w, &bucket, &upload_id, now, &mut retired)?;
+                aborted += 1;
             }
-            Ok((stale.len(), retired))
+            Ok((aborted, retired))
         })
     }
 

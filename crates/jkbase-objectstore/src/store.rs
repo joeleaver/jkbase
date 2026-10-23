@@ -322,15 +322,20 @@ impl Shared {
     /// Delete the bytes of retired segments no reader holds, then forget them. Best
     /// effort: what fails or is pinned stays garbage for the sweeper.
     async fn reclaim(self: &Arc<Self>, ids: Vec<String>) -> Result<usize> {
-        let mut gone = Vec::with_capacity(ids.len());
-        for id in ids {
-            if !self.pins.is_pinned(&id) && self.segments.delete(&id).await.is_ok() {
-                gone.push(id);
+        let mut n = 0;
+        // Forgotten in chunks, so a big reclaim (an aborted 10 000-part upload) commits as
+        // it goes rather than in one transaction at the end.
+        for chunk in ids.chunks(1_000) {
+            let mut gone = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                if !self.pins.is_pinned(id) && self.segments.delete(id).await.is_ok() {
+                    gone.push(id.clone());
+                }
             }
-        }
-        let n = gone.len();
-        if n > 0 {
-            self.ixw(move |ix| ix.forget_segments(&gone)).await?;
+            n += gone.len();
+            if !gone.is_empty() {
+                self.ixw(move |ix| ix.forget_segments(&gone)).await?;
+            }
         }
         Ok(n)
     }
@@ -356,10 +361,7 @@ impl PendingSegment {
 
     async fn discard(mut self) {
         if let Some(id) = self.id.take() {
-            let _ = self
-                .shared
-                .ixw(move |ix| ix.discard_pending(&[id], now_secs()))
-                .await;
+            release(&self.shared, id).await;
         }
     }
 }
@@ -370,12 +372,20 @@ impl Drop for PendingSegment {
             && let Ok(rt) = tokio::runtime::Handle::try_current()
         {
             let shared = self.shared.clone();
-            rt.spawn(async move {
-                let _ = shared
-                    .ixw(move |ix| ix.discard_pending(&[id], now_secs()))
-                    .await;
-            });
+            rt.spawn(async move { release(&shared, id).await });
         }
+    }
+}
+
+/// Retire a pending segment nothing will reference and delete its bytes at once — but
+/// only if it was still pending: a cancelled request's release can run after its commit
+/// referenced the segment, and then there is nothing to release.
+async fn release(shared: &Arc<Shared>, id: String) {
+    if let Ok(retired) = shared
+        .ixw(move |ix| ix.discard_pending(&[id], now_secs()))
+        .await
+    {
+        let _ = shared.reclaim(retired).await;
     }
 }
 
@@ -1805,6 +1815,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Staged parts are capped per project (zero-byte parts cost rows and files the byte
+    /// quota can't see), re-uploading an existing part number still works, and the stale-
+    /// upload sweep retires a bounded number of parts per pass.
+    #[tokio::test]
+    async fn staged_parts_are_capped_and_swept_in_bounded_passes() {
+        let dir = root("staged-cap");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let cap = crate::index::MAX_STAGED_PARTS as u32; // 50 under test
+        let mut uploads = Vec::new();
+        for u in 0..3 {
+            let uid = s
+                .create_multipart("bkt", &format!("k{u}"), "t", None)
+                .await
+                .unwrap();
+            for pn in 1..=20 {
+                let r = s.upload_part("bkt", &uid, pn, &b""[..], None).await;
+                let staged = u * 20 + pn;
+                if staged <= cap {
+                    r.unwrap();
+                } else {
+                    assert!(
+                        matches!(r, Err(ObjectError::InvalidArgument(_))),
+                        "part {staged}: {r:?}"
+                    );
+                }
+            }
+            uploads.push(uid);
+        }
+        // At the cap, an existing part number can still be re-uploaded.
+        s.upload_part("bkt", &uploads[0], 1, &b"again"[..], None)
+            .await
+            .unwrap();
+        assert_eq!(segment_files(&dir), cap as usize);
+        // 50 staged parts, 20 retired per pass: three passes, never more than one upload's
+        // worth (20 parts) in one.
+        let mut passes = 0;
+        while !s.list_multipart_uploads("bkt").await.unwrap().is_empty() {
+            assert_eq!(s.sweep_stale_uploads(Duration::ZERO).await.unwrap(), 1);
+            passes += 1;
+        }
+        assert_eq!(passes, 3);
+        assert_eq!(segment_files(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A GET keeps reading the version it looked up after an overwrite or delete: its
     /// segments are pinned for as long as the body (or its stream) lives, then reclaimed
     /// by the next sweep.
@@ -1888,8 +1944,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A failed write (bad checksum) leaves no pending row behind: its id is garbage at
-    /// once, and the bytes never became a segment.
+    /// A failed write (bad checksum) leaves nothing behind: no pending row, no garbage,
+    /// no bytes.
     #[tokio::test]
     async fn failed_writes_release_their_segment() {
         let dir = root("failed-write");
@@ -1901,12 +1957,12 @@ mod tests {
             Err(ObjectError::ContentSha256Mismatch)
         ));
         assert_eq!(segment_files(&dir), 0);
-        assert_eq!(s.collect_garbage().await.unwrap(), 1);
+        assert_eq!(s.collect_garbage().await.unwrap(), 0, "released at once");
         assert!(due(&s).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A PUT cancelled mid-body (client gone) releases its pending segment instead of
+    /// A PUT cancelled mid-body (client gone) releases and deletes its segment instead of
     /// leaving it for the 12 h orphan sweep.
     #[tokio::test]
     async fn a_cancelled_write_releases_its_segment() {
@@ -1925,8 +1981,14 @@ mod tests {
         task.abort();
         let _ = task.await;
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let pending = s.inner.index.claim_due(now_secs(), usize::MAX).unwrap();
-        assert_eq!(pending.len(), 1, "released to garbage, not left pending");
+        // Neither left pending (a claim far in the future would retire it) nor garbage.
+        let later = now_secs() + crate::index::PENDING_ORPHAN_AGE + 1;
+        let left = s.inner.index.claim_due(later, usize::MAX).unwrap();
+        assert!(
+            left.is_empty(),
+            "released and deleted, not left for the sweeper: {left:?}"
+        );
+        assert_eq!(segment_files(&dir), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
