@@ -1,136 +1,221 @@
-//! One-way migration from the layout-1 store (the directory tree WAS the index: one
-//! subdirectory per bucket, an object = `<stem>` bytes + `<stem>.meta` JSON sidecar,
-//! multipart staging under `<bucket>/.uploads/<id>/`, CORS under `.cors/<bucket>.json`)
-//! into the layout-2 index + segments.
+//! Migration from the layout-1 store (the directory tree WAS the index: one subdirectory
+//! per bucket, an object = `<stem>` bytes + `<stem>.meta` JSON sidecar, multipart staging
+//! under `<bucket>/.uploads/<id>/`, CORS under `.cors/<bucket>.json`) into the layout-2
+//! index + segments.
 //!
-//! Crash-safe and idempotent, so an interrupted run simply runs again: per object the
-//! bytes are hard-linked into a segment whose id is recorded pending FIRST, the index row
-//! is committed only if the key isn't already there (a previous run got that far), and
-//! only then are the legacy files unlinked. A crash leaves at worst a pending segment the
-//! sweeper reclaims. Roll-forward only: an older binary can't read a migrated store.
+//! Runs whenever a root holds layout-1 content — not only once: an older binary run
+//! after a migration (a rollback) writes layout-1 bucket directories again, and those
+//! writes must not be stranded. Invariants that make that safe:
+//!
+//! - **A bucket directory is hidden before it is migrated**: renamed to
+//!   `.migrating-<bucket>`, which no layout-1 binary lists. An older binary therefore
+//!   only ever sees buckets nobody has started migrating, so it can neither write an
+//!   object this run already moved nor delete one and have it come back.
+//! - **Legacy content always wins.** It is never older than the index: a plain bucket
+//!   directory was written by an older binary after anything the index holds for it,
+//!   and a `.migrating-` directory is finished before the store serves a request. So
+//!   rows are committed unconditionally, replacing (and retiring) what is there.
+//! - **Crash-safe at every step**: segment ids are recorded pending before their hard
+//!   links exist, a batch's rows commit in one transaction, and legacy files are unlinked
+//!   only after their rows committed. A re-run repeats at most one batch.
+//!
+//! An object that can't be migrated (a corrupt sidecar — already unreadable through the
+//! API) is never deleted: its bucket's leftovers move to `.unmigrated/`.
 
 use crate::index::{Index, LAYOUT_V2, ObjectRow, PartRow, SegRef};
-use crate::segments::LocalSegments;
+use crate::segments::{LocalSegments, sync_dir_blocking};
 use crate::store::{
     ObjectError, ObjectMeta, UploadInfo, new_id, now_secs, validate_bucket, validate_key,
 };
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 type Result<T> = std::result::Result<T, ObjectError>;
 
 const META_SUFFIX: &str = ".meta";
+const MIGRATING: &str = ".migrating-";
+const UNMIGRATED: &str = ".unmigrated";
 
-/// Migrate the store at `root` into `index` + `segs`, then stamp layout 2. Anything that
-/// could not be migrated (a corrupt sidecar — already unreadable through the API) is left
-/// where it is, with its bucket directory, and logged; it is never deleted.
-pub(crate) fn migrate(root: &Path, index: &Index, segs: &LocalSegments) -> Result<()> {
-    let mut moved = 0usize;
-    let mut skipped = 0usize;
+/// Objects committed per index transaction (one fsync per batch, not per object).
+const BATCH: usize = 512;
+
+/// Whether `root` holds anything layout 1 wrote: a bucket directory (any non-dot
+/// directory), a half-migrated one, or no layout-2 stamp yet.
+pub(crate) fn needs_migration(root: &Path, index: &Index) -> Result<bool> {
+    if index.layout()? < LAYOUT_V2 {
+        return Ok(true);
+    }
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') || !entry.file_type()?.is_dir() || validate_bucket(&name).is_err()
-        {
-            continue;
-        }
-        let dir = entry.path();
-        index.ensure_bucket(&name, mtime(&dir))?;
-        if let Ok(bytes) = std::fs::read(root.join(".cors").join(format!("{name}.json")))
-            && let Ok(cfg) = serde_json::from_slice(&bytes)
-            && index.get_cors(&name)?.is_none()
-        {
-            index.set_cors(&name, Some(cfg))?;
-        }
-
-        let mut left = 0usize;
-        for obj in std::fs::read_dir(&dir)? {
-            let obj = obj?;
-            let fname = obj.file_name().to_string_lossy().into_owned();
-            if let Some(stem) = fname.strip_suffix(META_SUFFIX) {
-                if migrate_object(&dir, &name, stem, index, segs)? {
-                    moved += 1;
-                } else {
-                    left += 1;
-                }
-            }
-        }
-        let uploads = dir.join(".uploads");
-        if let Ok(rd) = std::fs::read_dir(&uploads) {
-            for up in rd {
-                let up = up?;
-                if up.file_type()?.is_dir() {
-                    migrate_upload(&up.path(), &name, index, segs)?;
-                }
-            }
-        }
-        // Everything still here is a temp file or bytes without a sidecar — unreachable
-        // through the API already — unless an object refused to migrate.
-        if left == 0 {
-            std::fs::remove_dir_all(&dir)?;
-        } else {
-            skipped += left;
-            tracing::warn!(root = %root.display(), bucket = %name, left,
-                "object-store migration: unreadable legacy objects left in place");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type()?.is_dir() && (!name.starts_with('.') || name.starts_with(MIGRATING)) {
+            return Ok(true);
         }
     }
-    let _ = std::fs::remove_dir_all(root.join(".cors"));
+    Ok(false)
+}
+
+/// Migrate every layout-1 bucket under `root`, then stamp layout 2.
+pub(crate) fn migrate(root: &Path, index: &Index, segs: &LocalSegments) -> Result<()> {
+    let mut moved = 0usize;
+    // Finish what an interrupted run already hid, before hiding anything new: a plain
+    // directory of the same name (written by an older binary since) can only be renamed
+    // once its `.migrating-` twin is gone.
+    for (bucket, dir) in buckets(root, true)? {
+        moved += migrate_bucket(root, &bucket, &dir, index, segs)?;
+    }
+    for (bucket, dir) in buckets(root, false)? {
+        let hidden = root.join(format!("{MIGRATING}{bucket}"));
+        std::fs::rename(&dir, &hidden)?;
+        sync_dir_blocking(root)?;
+        moved += migrate_bucket(root, &bucket, &hidden, index, segs)?;
+    }
+    let _ = std::fs::remove_dir(root.join(".cors")); // only once every sidecar moved
     index.set_layout(LAYOUT_V2)?;
-    if moved > 0 || skipped > 0 {
-        tracing::info!(root = %root.display(), moved, skipped, "object-store: migrated to the index layout");
+    if moved > 0 {
+        tracing::info!(root = %root.display(), moved, "object-store: migrated layout-1 objects into the index");
     }
     Ok(())
 }
 
-/// Migrate one `<stem>` + `<stem>.meta` pair. `Ok(false)` = left in place (unreadable).
-fn migrate_object(
-    dir: &Path,
+/// `(bucket, dir)` for each plain bucket directory, or with `hidden` each
+/// `.migrating-<bucket>` one. Names that aren't valid buckets are left alone.
+fn buckets(root: &Path, hidden: bool) -> Result<Vec<(String, PathBuf)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let bucket = match (hidden, name.strip_prefix(MIGRATING)) {
+            (true, Some(b)) => b.to_string(),
+            (false, None) if !name.starts_with('.') => name,
+            _ => continue,
+        };
+        if validate_bucket(&bucket).is_ok() {
+            out.push((bucket, entry.path()));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Migrate one (hidden) bucket directory; returns how many objects moved.
+fn migrate_bucket(
+    root: &Path,
     bucket: &str,
-    stem: &str,
+    dir: &Path,
     index: &Index,
     segs: &LocalSegments,
-) -> Result<bool> {
+) -> Result<usize> {
+    index.ensure_bucket(bucket, mtime(dir))?;
+    let cors = root.join(".cors").join(format!("{bucket}.json"));
+    if let Ok(bytes) = std::fs::read(&cors)
+        && let Ok(cfg) = serde_json::from_slice(&bytes)
+    {
+        index.set_cors(bucket, Some(cfg))?;
+    }
+
+    let mut objects = Vec::new();
+    let mut unreadable = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(stem) = name.strip_suffix(META_SUFFIX) {
+            match read_legacy(dir, stem)? {
+                Legacy::Object(meta, size) => objects.push((stem.to_string(), meta, size)),
+                Legacy::Gone => {}
+                Legacy::Unreadable => unreadable += 1,
+            }
+        }
+    }
+    let moved = objects.len();
+    for batch in objects.chunks(BATCH) {
+        let ids: Vec<String> = batch.iter().map(|_| new_id()).collect();
+        let now = now_secs();
+        index.add_pending(&ids, now)?;
+        let mut fans = BTreeSet::new();
+        let mut rows = Vec::with_capacity(batch.len());
+        for ((stem, meta, size), id) in batch.iter().zip(&ids) {
+            fans.insert(segs.link_blocking(id, &dir.join(stem))?);
+            rows.push(ObjectRow {
+                meta: ObjectMeta {
+                    size: *size,
+                    ..meta.clone()
+                },
+                segments: vec![SegRef {
+                    id: id.clone(),
+                    size: *size,
+                }],
+            });
+        }
+        for fan in &fans {
+            sync_dir_blocking(fan)?;
+        }
+        // Whatever these replace (a previous interrupted run's links, or rows the
+        // older binary's writes supersede) is garbage the boot sweep reclaims.
+        index.commit_objects(bucket, &rows, now)?;
+        for (stem, _, _) in batch {
+            std::fs::remove_file(dir.join(stem))?;
+            std::fs::remove_file(dir.join(format!("{stem}{META_SUFFIX}")))?;
+        }
+    }
+
+    if let Ok(rd) = std::fs::read_dir(dir.join(".uploads")) {
+        for up in rd {
+            let up = up?;
+            if up.file_type()?.is_dir() {
+                migrate_upload(&up.path(), bucket, index, segs)?;
+            }
+        }
+    }
+
+    // What is left is temp files and bytes without a sidecar (unreachable through the
+    // API already) — unless some object couldn't be read; then keep it all, aside.
+    if unreadable == 0 {
+        std::fs::remove_dir_all(dir)?;
+    } else {
+        let aside = root.join(UNMIGRATED);
+        std::fs::create_dir_all(&aside)?;
+        std::fs::rename(dir, aside.join(format!("{bucket}.{}", new_id())))?;
+        tracing::warn!(root = %root.display(), bucket, unreadable,
+            "object-store migration: unreadable legacy objects set aside in .unmigrated/");
+    }
+    let _ = std::fs::remove_file(&cors);
+    Ok(moved)
+}
+
+enum Legacy {
+    Object(ObjectMeta, u64),
+    /// A sidecar whose bytes are missing (the old engine answered it with an IO error):
+    /// nothing to keep, sidecar removed.
+    Gone,
+    Unreadable,
+}
+
+fn read_legacy(dir: &Path, stem: &str) -> Result<Legacy> {
     let sidecar = dir.join(format!("{stem}{META_SUFFIX}"));
-    let bytes_path = dir.join(stem);
-    let Ok(raw) = std::fs::read(&sidecar) else {
-        return Ok(false);
-    };
-    let Ok(mut meta) = serde_json::from_slice::<ObjectMeta>(&raw) else {
-        return Ok(false);
+    let Ok(meta) = std::fs::read(&sidecar)
+        .map_err(|_| ())
+        .and_then(|raw| serde_json::from_slice::<ObjectMeta>(&raw).map_err(|_| ()))
+    else {
+        return Ok(Legacy::Unreadable);
     };
     // Only a sidecar under its own key's name was ever served (see the old `locate`).
     if validate_key(&meta.key).is_err() || object_stem(&meta.key) != stem {
-        return Ok(false);
+        return Ok(Legacy::Unreadable);
     }
-    let size = match std::fs::metadata(&bytes_path) {
-        Ok(m) => m.len(),
-        // Sidecar without bytes: the old engine answered this with an IO error. Nothing
-        // to keep.
+    match std::fs::metadata(dir.join(stem)) {
+        Ok(m) => Ok(Legacy::Object(meta, m.len())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             std::fs::remove_file(&sidecar)?;
-            return Ok(true);
+            Ok(Legacy::Gone)
         }
-        Err(e) => return Err(e.into()),
-    };
-    meta.size = size;
-    let id = new_id();
-    let now = now_secs();
-    index.add_pending(&id, now)?;
-    segs.link_blocking(&id, &bytes_path)?;
-    let row = ObjectRow {
-        meta,
-        segments: vec![SegRef {
-            id: id.clone(),
-            size,
-        }],
-    };
-    if !index.commit_object(bucket, &row, now, true)? {
-        index.discard_pending(&[id], now)?; // an earlier, interrupted run already moved it
+        Err(e) => Err(e.into()),
     }
-    std::fs::remove_file(&bytes_path)?;
-    std::fs::remove_file(&sidecar)?;
-    Ok(true)
 }
 
 /// Migrate one in-flight multipart upload (`info.json`, `part-N`, `part-N.md5`), so an
@@ -149,7 +234,7 @@ fn migrate_upload(sdir: &Path, bucket: &str, index: &Index, segs: &LocalSegments
         if info.initiated == 0 {
             info.initiated = mtime(&sdir.join("info.json"));
         }
-        index.ensure_upload(bucket, &upload_id, &info)?;
+        index.create_upload(bucket, &upload_id, &info, true)?;
         for f in std::fs::read_dir(sdir)? {
             let f = f?;
             let fname = f.file_name().to_string_lossy().into_owned();
@@ -166,16 +251,15 @@ fn migrate_upload(sdir: &Path, bucket: &str, index: &Index, segs: &LocalSegments
             let size = f.metadata()?.len();
             let id = new_id();
             let now = now_secs();
-            index.add_pending(&id, now)?;
-            segs.link_blocking(&id, &f.path())?;
+            index.add_pending(std::slice::from_ref(&id), now)?;
+            let fan = segs.link_blocking(&id, &f.path())?;
+            sync_dir_blocking(&fan)?;
             let row = PartRow {
-                segment: id.clone(),
+                segment: id,
                 size,
                 md5: hex(&md5),
             };
-            if !index.commit_part(bucket, &upload_id, pn, &row, now, true)? {
-                index.discard_pending(&[id], now)?;
-            }
+            index.commit_part(bucket, &upload_id, pn, &row, now)?;
         }
     }
     // Unreadable staging was unusable before too (complete needs info.json).

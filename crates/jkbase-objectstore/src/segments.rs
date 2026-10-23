@@ -64,8 +64,15 @@ pub trait SegmentWriter: Send {
 /// hash of the id (ids are time-ordered, so their own leading chars would pile every
 /// segment into one directory). In-progress writes live in `.tmp/`, which is emptied on
 /// open: anything there belonged to a process that is gone.
+///
+/// A segment becomes visible by `link(tmp, dst)` — which, unlike rename, never replaces
+/// an existing segment — followed by an fsync of its directory, so a segment the index
+/// references after a power loss is still there. Writes are refused once the directory
+/// is no longer the one this handle opened (the project was deleted, maybe recreated):
+/// bytes never land in another incarnation's store, unreferenced and billed to it.
 pub struct LocalSegments {
     dir: PathBuf,
+    ident: (u64, u64),
 }
 
 impl LocalSegments {
@@ -74,16 +81,33 @@ impl LocalSegments {
         let tmp = dir.join(".tmp");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
-        Ok(Self { dir })
+        let ident = dir_ident(&dir)?;
+        Ok(Self { dir, ident })
     }
 
-    /// Blocking [`SegmentStore::import_file`], for the migration that runs inside `open`.
-    pub(crate) fn link_blocking(&self, id: &str, src: &Path) -> io::Result<()> {
-        let dst = self.path(id)?;
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+    fn check_live(&self) -> io::Result<()> {
+        if dir_ident(&self.dir).ok() == Some(self.ident) {
+            Ok(())
+        } else {
+            Err(io::Error::other("object store root was replaced"))
         }
-        std::fs::hard_link(src, &dst)
+    }
+
+    /// Blocking hard link of `src` as segment `id`, for the migration that runs inside
+    /// `open`. Returns the directory it landed in, which the caller fsyncs (once per
+    /// batch) before committing the rows that reference it.
+    pub(crate) fn link_blocking(&self, id: &str, src: &Path) -> io::Result<PathBuf> {
+        let dst = self.path(id)?;
+        let fan = dst
+            .parent()
+            .expect("segment paths have a fan directory")
+            .to_path_buf();
+        if !fan.exists() {
+            std::fs::create_dir_all(&fan)?;
+            sync_dir_blocking(&self.dir)?;
+        }
+        std::fs::hard_link(src, &dst)?;
+        Ok(fan)
     }
 
     fn path(&self, id: &str) -> io::Result<PathBuf> {
@@ -100,6 +124,7 @@ impl SegmentStore for LocalSegments {
     }
 
     async fn create(&self, id: &str) -> io::Result<Box<dyn SegmentWriter>> {
+        self.check_live()?;
         let dst = self.path(id)?;
         let tmp = self.dir.join(".tmp").join(id);
         let file = tokio::fs::File::create(&tmp).await?;
@@ -107,6 +132,8 @@ impl SegmentStore for LocalSegments {
             file,
             tmp,
             dst,
+            dir: self.dir.clone(),
+            ident: self.ident,
             done: false,
         }))
     }
@@ -133,11 +160,9 @@ impl SegmentStore for LocalSegments {
     /// A hard link: the legacy file and the segment are one inode, so migration moves no
     /// bytes and never needs twice the space. Both live under the project root.
     async fn import_file(&self, id: &str, src: &Path) -> io::Result<()> {
-        let dst = self.path(id)?;
-        if let Some(parent) = dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::hard_link(src, &dst).await
+        self.check_live()?;
+        let fan = self.link_blocking(id, src)?;
+        sync_dir(&fan).await
     }
 }
 
@@ -152,6 +177,8 @@ struct LocalWriter {
     file: tokio::fs::File,
     tmp: PathBuf,
     dst: PathBuf,
+    dir: PathBuf,
+    ident: (u64, u64),
     done: bool,
 }
 
@@ -163,12 +190,23 @@ impl SegmentWriter for LocalWriter {
 
     async fn commit(mut self: Box<Self>) -> io::Result<()> {
         self.file.sync_all().await?;
-        if let Some(parent) = self.dst.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        if dir_ident(&self.dir).ok() != Some(self.ident) {
+            return Err(io::Error::other("object store root was replaced"));
         }
-        tokio::fs::rename(&self.tmp, &self.dst).await?;
+        let fan = self
+            .dst
+            .parent()
+            .expect("segment paths have a fan directory")
+            .to_path_buf();
+        if tokio::fs::metadata(&fan).await.is_err() {
+            tokio::fs::create_dir_all(&fan).await?;
+            sync_dir(&self.dir).await?;
+        }
+        // EEXIST rather than replace if an id ever repeated.
+        tokio::fs::hard_link(&self.tmp, &self.dst).await?;
+        let _ = tokio::fs::remove_file(&self.tmp).await;
         self.done = true;
-        Ok(())
+        sync_dir(&fan).await
     }
 }
 
@@ -178,6 +216,24 @@ impl Drop for LocalWriter {
             let _ = std::fs::remove_file(&self.tmp);
         }
     }
+}
+
+fn dir_ident(p: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p)?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// fsync a directory so the entries just created in it survive a power loss.
+pub(crate) fn sync_dir_blocking(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+async fn sync_dir(dir: &Path) -> io::Result<()> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || sync_dir_blocking(&dir))
+        .await
+        .map_err(io::Error::other)?
 }
 
 /// Ids are lowercase hex the engine minted; anything else never reaches a path.

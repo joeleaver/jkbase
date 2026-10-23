@@ -137,10 +137,15 @@ impl MultipartUpload<'_> {
         Ok(())
     }
 
-    /// Complete the upload, concatenating parts in ascending part-number order. Returns
+    /// Complete the upload, concatenating parts in ascending part-number order. A part
+    /// number uploaded more than once counts once, as its last upload (the server keeps
+    /// the latest, and S3 rejects a repeated number in the completion list). Returns
     /// the final object's raw hex MD5 ETag.
     pub async fn complete(mut self) -> Result<String> {
+        // Latest upload first within each number (sort is stable), then keep that one.
+        self.parts.reverse();
         self.parts.sort_by_key(|(n, _)| *n);
+        self.parts.dedup_by_key(|(n, _)| *n);
         let mut body = String::from("<CompleteMultipartUpload>");
         for (n, _etag) in &self.parts {
             body.push_str(&format!("<Part><PartNumber>{n}</PartNumber></Part>"));

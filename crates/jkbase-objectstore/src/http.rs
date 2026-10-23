@@ -672,13 +672,22 @@ fn s3_error(e: ObjectError) -> Response {
         ObjectError::ContentSha256Mismatch => {
             (StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch")
         }
+        ObjectError::InvalidPartOrder => (StatusCode::BAD_REQUEST, "InvalidPartOrder"),
         ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
         }
     };
+    // Internal failures carry host detail (index errors, paths): log it, don't send it.
+    let message = match &e {
+        ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
+            tracing::warn!(error = %e, "object store internal error");
+            "We encountered an internal error. Please try again.".to_string()
+        }
+        _ => e.to_string(),
+    };
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{}</Message></Error>",
-        xml_escape(&e.to_string())
+        xml_escape(&message)
     );
     (status, [(header::CONTENT_TYPE, "application/xml")], body).into_response()
 }

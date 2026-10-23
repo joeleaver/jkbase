@@ -1,5 +1,5 @@
 use crate::cors::CorsConfig;
-use crate::index::{Index, LAYOUT_V2, ObjectRow, PartRow, SegRef};
+use crate::index::{Index, ObjectRow, PartRow, SegRef};
 use crate::segments::{ByteStream, LocalSegments, SegmentStore, SegmentWriter};
 use futures_util::{StreamExt, TryStreamExt};
 use md5::{Digest, Md5};
@@ -90,6 +90,9 @@ pub enum ObjectError {
     /// x-amz-content-sha256 mismatch (body corrupted in transit).
     #[error("content sha256 mismatch")]
     ContentSha256Mismatch,
+    /// CompleteMultipartUpload listed parts out of ascending order (or repeated one).
+    #[error("parts must be listed in ascending order without repeats")]
+    InvalidPartOrder,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -163,12 +166,14 @@ pub struct MultipartUpload {
     pub initiated: u64,
 }
 
-/// An object's bytes as of the moment it was looked up: its segment manifest. Streaming
-/// opens segments one at a time, and an overwrite or delete after the lookup leaves them
-/// readable for the index's `GRACE`, so a GET never mixes two versions.
+/// An object's bytes as of the moment it was looked up: its segment manifest, pinned.
+/// While the body is alive (until its stream is dropped) none of its segments is deleted,
+/// even if the object is overwritten or deleted meanwhile, so a GET never mixes versions
+/// and never loses bytes mid-stream.
 pub struct ObjectBody {
     segments: Vec<SegRef>,
     store: Arc<dyn SegmentStore>,
+    pin: PinGuard,
 }
 
 impl ObjectBody {
@@ -185,10 +190,13 @@ impl ObjectBody {
             }
             pos += s.size;
         }
-        let store = self.store;
+        let (store, pin) = (self.store, self.pin);
         Box::pin(
             futures_util::stream::iter(plan)
                 .then(move |(id, offset, n)| {
+                    // The closure owns `pin`, and the stream owns the closure: the
+                    // segments stay pinned until the body is dropped.
+                    let _ = &pin;
                     let store = store.clone();
                     async move { store.read(&id, offset, n).await }
                 })
@@ -203,15 +211,77 @@ impl ObjectBody {
     }
 }
 
+/// In-process read pins: segment id → number of live [`ObjectBody`]s reading it. Reclaim
+/// skips a pinned segment (it stays garbage; the next sweep retries). The pin is taken
+/// and then re-validated against the index (see [`ObjectStore::get_object`]), so a
+/// segment is either pinned before it can be retired, or the reader sees the newer
+/// manifest instead.
+#[derive(Default)]
+struct Pins(Mutex<HashMap<String, usize>>);
+
+impl Pins {
+    fn is_pinned(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+}
+
+/// Held only for its `Drop`, which releases the pins.
+struct PinGuard(#[allow(dead_code)] Arc<PinSet>);
+
+struct PinSet {
+    shared: Arc<Shared>,
+    ids: Vec<String>,
+}
+
+impl PinGuard {
+    fn new(shared: &Arc<Shared>, segments: &[SegRef]) -> Self {
+        let ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
+        let mut pins = shared.pins.0.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &ids {
+            *pins.entry(id.clone()).or_default() += 1;
+        }
+        drop(pins);
+        PinGuard(Arc::new(PinSet {
+            shared: shared.clone(),
+            ids,
+        }))
+    }
+}
+
+impl Drop for PinSet {
+    fn drop(&mut self) {
+        let mut pins = self.shared.pins.0.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &self.ids {
+            if let Some(n) = pins.get_mut(id) {
+                *n -= 1;
+                if *n == 0 {
+                    pins.remove(id);
+                }
+            }
+        }
+    }
+}
+
 /// One open store per root per process: the index file is exclusively locked while open,
-/// and two handles on one root would be two views of the truth. Entries are weak, so a
-/// store closes once nothing uses it.
-static OPEN: LazyLock<Mutex<HashMap<PathBuf, Weak<Shared>>>> = LazyLock::new(Default::default);
+/// and two handles on one root would be two views of the truth. Each root has its own
+/// slot, so opening (or migrating) one project's store never waits on another's; the
+/// map lock is only held to find the slot. Entries are weak, so a store closes once
+/// nothing uses it.
+type Slot = Arc<Mutex<Weak<Shared>>>;
+static OPEN: LazyLock<Mutex<HashMap<PathBuf, Slot>>> = LazyLock::new(Default::default);
 
 struct Shared {
     index: Index,
     segments: Arc<dyn SegmentStore>,
+    pins: Pins,
     list_permits: tokio::sync::Semaphore,
+    /// Index writes queue here, in async land, one at a time per project (redb has a
+    /// single writer anyway). Without it a flood of writes would park a blocking-pool
+    /// thread each on this project's write lock and starve every other project's work.
+    write_permit: tokio::sync::Semaphore,
     index_path: PathBuf,
     /// `(dev, inode)` of the index file this handle opened — see [`ObjectStore::is_current`].
     ident: (u64, u64),
@@ -220,6 +290,87 @@ struct Shared {
 impl Shared {
     fn is_current(&self) -> bool {
         file_ident(&self.index_path).is_ok_and(|id| id == self.ident)
+    }
+
+    /// Run `f` against the index on the blocking pool.
+    async fn ix<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Index) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let inner = self.clone();
+        tokio::task::spawn_blocking(move || f(&inner.index))
+            .await
+            .map_err(|e| ObjectError::Io(std::io::Error::other(e)))?
+    }
+
+    /// [`ix`](Self::ix) for a write transaction: queued behind this project's
+    /// `write_permit`.
+    async fn ixw<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Index) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        // Never closed, so this only ever waits.
+        let _permit = self.write_permit.acquire().await;
+        self.ix(f).await
+    }
+
+    /// Delete the bytes of retired segments no reader holds, then forget them. Best
+    /// effort: what fails or is pinned stays garbage for the sweeper.
+    async fn reclaim(self: &Arc<Self>, ids: Vec<String>) -> Result<usize> {
+        let mut gone = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !self.pins.is_pinned(&id) && self.segments.delete(&id).await.is_ok() {
+                gone.push(id);
+            }
+        }
+        let n = gone.len();
+        if n > 0 {
+            self.ixw(move |ix| ix.forget_segments(&gone)).await?;
+        }
+        Ok(n)
+    }
+}
+
+/// A segment recorded pending whose write hasn't been committed into a row yet. If the
+/// request is cancelled (client gone) before [`take`](Self::take), the drop releases it
+/// to garbage instead of leaving a pending row for the orphan sweep.
+struct PendingSegment {
+    shared: Arc<Shared>,
+    id: Option<String>,
+}
+
+impl PendingSegment {
+    fn id(&self) -> &str {
+        self.id.as_deref().unwrap_or_default()
+    }
+
+    /// The row referencing it is committed (or its failure handled): nothing to release.
+    fn take(mut self) -> String {
+        self.id.take().unwrap_or_default()
+    }
+
+    async fn discard(mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self
+                .shared
+                .ixw(move |ix| ix.discard_pending(&[id], now_secs()))
+                .await;
+        }
+    }
+}
+
+impl Drop for PendingSegment {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let shared = self.shared.clone();
+            rt.spawn(async move {
+                let _ = shared
+                    .ixw(move |ix| ix.discard_pending(&[id], now_secs()))
+                    .await;
+            });
+        }
     }
 }
 
@@ -230,13 +381,29 @@ pub struct ObjectStore {
     inner: Arc<Shared>,
 }
 
+/// At most this many segments are deleted per store per sweep, so one tenant's churn
+/// can't hold the sweeper away from every other project.
+const SWEEP_BATCH: usize = 10_000;
+
+/// At most this many stale uploads are aborted per store per sweep.
+const SWEEP_UPLOADS: usize = 1_000;
+
 impl ObjectStore {
-    /// Open (creating if absent) the object store rooted at `root`, migrating a layout-1
-    /// store on first open. Blocking; cheap once a root has been migrated.
+    /// Open (creating if absent) the object store rooted at `root`, migrating any
+    /// layout-1 content found there. Blocking — call it off the async workers; cheap
+    /// once a root has been migrated.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(inner) = open.get(&root).and_then(Weak::upgrade)
+        let slot = {
+            let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
+            // Drop slots nobody holds or is opening (a slot being opened is locked).
+            open.retain(|_, s| {
+                Arc::strong_count(s) > 1 || s.try_lock().map_or(true, |w| w.strong_count() > 0)
+            });
+            open.entry(root.clone()).or_default().clone()
+        };
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(inner) = slot.upgrade()
             && inner.is_current()
         {
             return Ok(Self { inner });
@@ -246,18 +413,19 @@ impl ObjectStore {
         let index = Index::open(&index_path)?;
         let ident = file_ident(&index_path)?;
         let local = Arc::new(LocalSegments::open(root.join(SEGMENTS_DIR))?);
-        if index.layout()? < LAYOUT_V2 {
+        if crate::legacy::needs_migration(&root, &index)? {
             crate::legacy::migrate(&root, &index, &local)?;
         }
         let inner = Arc::new(Shared {
             index,
             segments: local,
+            pins: Pins::default(),
             list_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_LISTS),
+            write_permit: tokio::sync::Semaphore::new(1),
             index_path,
             ident,
         });
-        open.retain(|_, w| w.strong_count() > 0);
-        open.insert(root, Arc::downgrade(&inner));
+        *slot = Arc::downgrade(&inner);
         Ok(Self { inner })
     }
 
@@ -269,23 +437,13 @@ impl ObjectStore {
         self.inner.is_current()
     }
 
-    /// Run `f` against the index on the blocking pool.
-    async fn ix<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&Index) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || f(&inner.index))
-            .await
-            .map_err(|e| ObjectError::Io(std::io::Error::other(e)))?
-    }
-
     // ---- buckets ----------------------------------------------------------
 
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         validate_bucket(bucket)?;
         let bucket = bucket.to_string();
-        self.ix(move |ix| ix.create_bucket(&bucket, now_secs()))
+        self.inner
+            .ixw(move |ix| ix.create_bucket(&bucket, now_secs()))
             .await
     }
 
@@ -294,22 +452,42 @@ impl ObjectStore {
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         validate_bucket(bucket)?;
         let bucket = bucket.to_string();
-        self.ix(move |ix| ix.delete_bucket(&bucket)).await
+        self.inner.ixw(move |ix| ix.delete_bucket(&bucket)).await
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<String>> {
-        self.ix(|ix| ix.list_buckets()).await
+        self.inner.ix(|ix| ix.list_buckets()).await
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
         validate_bucket(bucket)?;
         let bucket = bucket.to_string();
-        self.ix(move |ix| ix.bucket_exists(&bucket)).await
+        self.inner.ix(move |ix| ix.bucket_exists(&bucket)).await
     }
 
     async fn require_bucket(&self, bucket: &str) -> Result<()> {
         if !self.bucket_exists(bucket).await? {
             return Err(ObjectError::NoSuchBucket(bucket.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Validate names in S3's order for requests on an existing object or upload: a
+    /// missing bucket is `NoSuchBucket` whatever is wrong with the key or upload id.
+    async fn check_names(
+        &self,
+        bucket: &str,
+        key: Option<&str>,
+        upload_id: Option<&str>,
+    ) -> Result<()> {
+        validate_bucket(bucket)?;
+        let bad = key
+            .map(validate_key)
+            .and_then(Result::err)
+            .or_else(|| upload_id.map(validate_upload_id).and_then(Result::err));
+        if let Some(e) = bad {
+            self.require_bucket(bucket).await?;
+            return Err(e);
         }
         Ok(())
     }
@@ -320,7 +498,9 @@ impl ObjectStore {
     pub async fn put_bucket_cors(&self, bucket: &str, cfg: &CorsConfig) -> Result<()> {
         validate_bucket(bucket)?;
         let (bucket, cfg) = (bucket.to_string(), cfg.clone());
-        self.ix(move |ix| ix.set_cors(&bucket, Some(cfg))).await
+        self.inner
+            .ixw(move |ix| ix.set_cors(&bucket, Some(cfg)))
+            .await
     }
 
     /// The bucket's CORS config, or `None` if unset. An unreadable config reads as
@@ -329,66 +509,77 @@ impl ObjectStore {
     pub async fn get_bucket_cors(&self, bucket: &str) -> Result<Option<CorsConfig>> {
         validate_bucket(bucket)?;
         let bucket = bucket.to_string();
-        self.ix(move |ix| ix.get_cors(&bucket)).await
+        self.inner.ix(move |ix| ix.get_cors(&bucket)).await
     }
 
     /// Remove the bucket's CORS config (idempotent).
     pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<()> {
         validate_bucket(bucket)?;
         let bucket = bucket.to_string();
-        self.ix(move |ix| ix.set_cors(&bucket, None)).await
+        self.inner.ixw(move |ix| ix.set_cors(&bucket, None)).await
     }
 
     // ---- segments ---------------------------------------------------------
 
     /// Stream `reader` into a new segment (recorded pending before its first byte).
-    /// Returns `(segment id, size, raw md5)`. On any failure the segment is discarded.
+    /// Returns the pending segment, its size and raw md5. On failure it is discarded.
     async fn write_segment<R: AsyncRead + Unpin>(
         &self,
         reader: &mut R,
         expected_sha256: Option<&str>,
         declared_len: Option<u64>,
-    ) -> Result<(String, u64, Vec<u8>)> {
+    ) -> Result<(PendingSegment, u64, Vec<u8>)> {
         let id = new_id();
         let pid = id.clone();
-        self.ix(move |ix| ix.add_pending(&pid, now_secs())).await?;
-        let written = match self.inner.segments.create(&id).await {
+        self.inner
+            .ixw(move |ix| ix.add_pending(&[pid], now_secs()))
+            .await?;
+        let pending = PendingSegment {
+            shared: self.inner.clone(),
+            id: Some(id),
+        };
+        let written = match self.inner.segments.create(pending.id()).await {
             Ok(w) => write_stream(w, reader, expected_sha256, declared_len).await,
             Err(e) => Err(e.into()),
         };
         match written {
-            Ok((size, md5)) => Ok((id, size, md5)),
+            Ok((size, md5)) => Ok((pending, size, md5)),
             Err(e) => {
-                self.discard(id).await;
+                pending.discard().await;
                 Err(e)
             }
         }
     }
 
-    /// Release a pending segment the caller won't reference. Best effort: if this fails
-    /// the sweeper reclaims it once it is `PENDING_ORPHAN_AGE` old.
-    async fn discard(&self, id: String) {
-        let _ = self
-            .ix(move |ix| ix.discard_pending(&[id], now_secs()))
-            .await;
-    }
-
-    /// Delete the bytes of every segment that is due — unreachable for at least the
-    /// grace period, or pending past the orphan age — then forget them. Returns how many
-    /// were reclaimed; one that fails to delete stays listed and is retried next sweep.
-    pub async fn collect_garbage(&self) -> Result<usize> {
-        let due = self.ix(|ix| ix.due_segments(now_secs())).await?;
-        let mut gone = Vec::with_capacity(due.len());
-        for id in due {
-            if self.inner.segments.delete(&id).await.is_ok() {
-                gone.push(id);
+    /// Commit a row that consumes `pending`: on success its retired segments are
+    /// reclaimed at once; on failure `pending` is let go.
+    async fn commit_with<T: Send + 'static>(
+        &self,
+        pending: PendingSegment,
+        f: impl FnOnce(&Index) -> Result<(T, Vec<String>)> + Send + 'static,
+    ) -> Result<T> {
+        match self.inner.ixw(f).await {
+            Ok((v, retired)) => {
+                pending.take();
+                let _ = self.inner.reclaim(retired).await;
+                Ok(v)
+            }
+            Err(e) => {
+                pending.discard().await;
+                Err(e)
             }
         }
-        let n = gone.len();
-        if n > 0 {
-            self.ix(move |ix| ix.forget_segments(&gone)).await?;
-        }
-        Ok(n)
+    }
+
+    /// Delete the bytes of up to [`SWEEP_BATCH`] segments that are garbage (or pending
+    /// past the orphan age) and that no reader holds, then forget them. Returns how many
+    /// were reclaimed; one that is pinned or fails to delete is retried next sweep.
+    pub async fn collect_garbage(&self) -> Result<usize> {
+        let due = self
+            .inner
+            .ixw(|ix| ix.claim_due(now_secs(), SWEEP_BATCH))
+            .await?;
+        self.inner.reclaim(due).await
     }
 
     // ---- objects ----------------------------------------------------------
@@ -426,6 +617,10 @@ impl ObjectStore {
     /// total upload deadline — see [`upload_deadline`]. Authenticated front-ends pass
     /// the declared length so a large single PUT over a slow link isn't capped at the
     /// small-upload floor; plain `put_object` (unknown length) uses the floor.
+    ///
+    /// The bytes an overwrite replaces are deleted as soon as the new row commits
+    /// (unless a GET is still reading them), so overwrite churn never piles up
+    /// unaccounted bytes on the shared disk.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_object_capped<R: AsyncRead + Unpin>(
         &self,
@@ -440,7 +635,7 @@ impl ObjectStore {
         validate_key(key)?;
         validate_bucket(bucket)?;
         self.require_bucket(bucket).await?;
-        let (id, size, md5) = self
+        let (pending, size, md5) = self
             .write_segment(&mut reader, expected_sha256, declared_len)
             .await?;
         let row = ObjectRow {
@@ -453,44 +648,57 @@ impl ObjectStore {
                 cache_control: cache_control.map(str::to_string),
             },
             segments: vec![SegRef {
-                id: id.clone(),
+                id: pending.id().to_string(),
                 size,
             }],
         };
         let meta = row.meta.clone();
         let bucket = bucket.to_string();
         // The bucket can be deleted while the body streams; then the segment is let go.
-        if let Err(e) = self
-            .ix(move |ix| ix.commit_object(&bucket, &row, now_secs(), false))
-            .await
-        {
-            self.discard(id).await;
-            return Err(e);
-        }
+        self.commit_with(pending, move |ix| {
+            Ok(((), ix.commit_object(&bucket, &row, now_secs())?))
+        })
+        .await?;
         Ok(meta)
     }
 
     /// Look up `bucket/key`, returning its metadata and a handle that streams its bytes.
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, ObjectBody)> {
-        let row = self.row(bucket, key).await?;
-        Ok((
-            row.meta,
-            ObjectBody {
-                segments: row.segments,
-                store: self.inner.segments.clone(),
-            },
-        ))
+        let mut row = self.row(bucket, key).await?;
+        // Pin, then confirm the manifest is still current: if it changed in between, the
+        // pinned segments may already be retired (and deleted), so pin the new one. Each
+        // retry means the object was rewritten meanwhile; a bound keeps a hot key from
+        // spinning a reader forever.
+        for _ in 0..16 {
+            let pin = PinGuard::new(&self.inner, &row.segments);
+            let now = self.row(bucket, key).await?;
+            if now.segments == row.segments {
+                return Ok((
+                    now.meta,
+                    ObjectBody {
+                        segments: now.segments,
+                        store: self.inner.segments.clone(),
+                        pin,
+                    },
+                ));
+            }
+            row = now;
+        }
+        Err(ObjectError::Io(std::io::Error::other(
+            "object is being rewritten too fast to read",
+        )))
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta> {
-        Ok(self.row(bucket, key).await?.meta)
+        self.check_names(bucket, Some(key), None).await?;
+        let (bucket, key) = (bucket.to_string(), key.to_string());
+        self.inner.ix(move |ix| ix.get_meta(&bucket, &key)).await
     }
 
     async fn row(&self, bucket: &str, key: &str) -> Result<ObjectRow> {
-        validate_bucket(bucket)?;
-        validate_key(key)?;
+        self.check_names(bucket, Some(key), None).await?;
         let (bucket, key) = (bucket.to_string(), key.to_string());
-        self.ix(move |ix| ix.get_object(&bucket, &key)).await
+        self.inner.ix(move |ix| ix.get_object(&bucket, &key)).await
     }
 
     /// The size of `bucket/key` if it currently exists, else `None` (a missing key or
@@ -504,13 +712,21 @@ impl ObjectStore {
         }
     }
 
-    /// Idempotent (S3 DELETE returns success even if the key is absent).
+    /// Idempotent (S3 DELETE returns success even if the key is absent). An absent key
+    /// costs a read, never a write transaction.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
-        validate_bucket(bucket)?;
-        validate_key(key)?;
+        match self.head_object(bucket, key).await {
+            Err(ObjectError::NoSuchKey(_)) => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
         let (bucket, key) = (bucket.to_string(), key.to_string());
-        self.ix(move |ix| ix.delete_object(&bucket, &key, now_secs()))
-            .await
+        let retired = self
+            .inner
+            .ixw(move |ix| ix.delete_object(&bucket, &key, now_secs()))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
+        Ok(())
     }
 
     /// List objects in `bucket` whose key starts with `prefix`, sorted by key.
@@ -563,16 +779,17 @@ impl ObjectStore {
         let (bucket, prefix) = (bucket.to_string(), prefix.to_string());
         let delimiter = delimiter.map(str::to_string);
         let start_after = start_after.map(str::to_string);
-        self.ix(move |ix| {
-            ix.list(
-                &bucket,
-                &prefix,
-                delimiter.as_deref(),
-                start_after.as_deref(),
-                max_keys,
-            )
-        })
-        .await
+        self.inner
+            .ix(move |ix| {
+                ix.list(
+                    &bucket,
+                    &prefix,
+                    delimiter.as_deref(),
+                    start_after.as_deref(),
+                    max_keys,
+                )
+            })
+            .await
     }
 
     // ---- multipart upload -------------------------------------------------
@@ -595,7 +812,8 @@ impl ObjectStore {
             cache_control: cache_control.map(str::to_string),
         };
         let (bucket, uid) = (bucket.to_string(), upload_id.clone());
-        self.ix(move |ix| ix.create_upload(&bucket, &uid, &info))
+        self.inner
+            .ixw(move |ix| ix.create_upload(&bucket, &uid, &info, false))
             .await?;
         Ok(upload_id)
     }
@@ -640,35 +858,31 @@ impl ObjectStore {
                 "part number {part_number}"
             )));
         }
-        validate_bucket(bucket)?;
-        validate_upload_id(upload_id)?;
+        self.check_names(bucket, None, Some(upload_id)).await?;
         let (b, u) = (bucket.to_string(), upload_id.to_string());
-        if !self.ix(move |ix| ix.upload_exists(&b, &u)).await? {
+        if !self.inner.ix(move |ix| ix.upload_exists(&b, &u)).await? {
             return Err(ObjectError::NoSuchUpload(upload_id.to_string()));
         }
-        let (id, size, md5) = self
+        let (pending, size, md5) = self
             .write_segment(&mut reader, expected_sha256, declared_len)
             .await?;
         let row = PartRow {
-            segment: id.clone(),
+            segment: pending.id().to_string(),
             size,
             md5: hex(&md5),
         };
         let (b, u) = (bucket.to_string(), upload_id.to_string());
-        // Aborted (or completed) while the part streamed: let the segment go.
-        if let Err(e) = self
-            .ix(move |ix| ix.commit_part(&b, &u, part_number, &row, now_secs(), false))
-            .await
-        {
-            self.discard(id).await;
-            return Err(e);
-        }
+        // Aborted (or completed) while the part streamed: the segment is let go.
+        self.commit_with(pending, move |ix| {
+            Ok(((), ix.commit_part(&b, &u, part_number, &row, now_secs())?))
+        })
+        .await?;
         Ok(hex(&md5))
     }
 
     /// Complete a multipart upload. The object is the listed parts' segments in order —
     /// no byte is copied — with the S3 multipart etag `md5(concat of the part md5s)-<count>`.
-    /// Parts must be listed in ascending order, as S3 requires.
+    /// As in S3, parts must be listed in ascending order.
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -677,37 +891,46 @@ impl ObjectStore {
         part_numbers: &[u32],
     ) -> Result<ObjectMeta> {
         validate_key(key)?;
-        validate_bucket(bucket)?;
-        validate_upload_id(upload_id)?;
+        self.check_names(bucket, None, Some(upload_id)).await?;
         let (b, k, u) = (bucket.to_string(), key.to_string(), upload_id.to_string());
         let pns = part_numbers.to_vec();
-        self.ix(move |ix| ix.complete_upload(&b, &k, &u, &pns, now_secs()))
-            .await
+        let (meta, retired) = self
+            .inner
+            .ixw(move |ix| ix.complete_upload(&b, &k, &u, &pns, now_secs()))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
+        Ok(meta)
     }
 
     /// Abort a multipart upload, discarding its staged parts.
     pub async fn abort_multipart(&self, bucket: &str, upload_id: &str) -> Result<()> {
-        validate_bucket(bucket)?;
-        validate_upload_id(upload_id)?;
+        self.check_names(bucket, None, Some(upload_id)).await?;
         let (b, u) = (bucket.to_string(), upload_id.to_string());
-        self.ix(move |ix| ix.abort_upload(&b, &u, now_secs())).await
+        let retired = self
+            .inner
+            .ixw(move |ix| ix.abort_upload(&b, &u, now_secs()))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
+        Ok(())
     }
 
     /// List all pending multipart uploads in `bucket`, by upload id.
     pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUpload>> {
         validate_bucket(bucket)?;
         let bucket = bucket.to_string();
-        self.ix(move |ix| ix.list_uploads(&bucket)).await
+        self.inner.ix(move |ix| ix.list_uploads(&bucket)).await
     }
 
-    /// Abort uploads initiated more than `max_age` ago, then reclaim every segment that
-    /// is due (see [`collect_garbage`](Self::collect_garbage)). Returns the number of
-    /// uploads aborted. Driven by the server's sweeper on boot + a timer.
+    /// Abort up to [`SWEEP_UPLOADS`] uploads initiated more than `max_age` ago, then
+    /// reclaim due segments (see [`collect_garbage`](Self::collect_garbage)). Returns
+    /// the number of uploads aborted. Driven by the server's sweeper on boot + a timer.
     pub async fn sweep_stale_uploads(&self, max_age: Duration) -> Result<usize> {
         let threshold = now_secs().saturating_sub(max_age.as_secs());
-        let n = self
-            .ix(move |ix| ix.abort_uploads_before(threshold, now_secs()))
+        let (n, retired) = self
+            .inner
+            .ixw(move |ix| ix.abort_uploads_before(threshold, now_secs(), SWEEP_UPLOADS))
             .await?;
+        let _ = self.inner.reclaim(retired).await;
         self.collect_garbage().await?;
         Ok(n)
     }
@@ -715,12 +938,12 @@ impl ObjectStore {
     /// `(buckets, objects)` in this store — O(1), read from the index. Used by the
     /// server's per-project count quota.
     pub async fn usage_counts(&self) -> Result<(u64, u64)> {
-        self.ix(|ix| ix.counts()).await
+        self.inner.ix(|ix| ix.counts()).await
     }
 
     /// In-flight multipart uploads across all buckets, capped at `cap`.
     pub async fn count_inflight_uploads(&self, cap: u64) -> Result<u64> {
-        Ok(self.ix(|ix| ix.upload_count()).await?.min(cap))
+        Ok(self.inner.ix(|ix| ix.upload_count()).await?.min(cap))
     }
 }
 
@@ -806,7 +1029,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn validate_upload_id(id: &str) -> Result<()> {
-    if !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(())
     } else {
         Err(ObjectError::InvalidArgument(format!(
@@ -1373,9 +1596,9 @@ mod tests {
 
     // ---- index/segments split ---------------------------------------------
 
-    /// Segment ids currently in the index's pending / garbage tables.
-    fn tracked(s: &ObjectStore, now: u64) -> Vec<String> {
-        let mut v = s.inner.index.due_segments(now).unwrap();
+    /// Claim (and return, sorted) every segment the sweeper would reclaim now.
+    fn due(s: &ObjectStore) -> Vec<String> {
+        let mut v = s.inner.index.claim_due(now_secs(), usize::MAX).unwrap();
         v.sort();
         v
     }
@@ -1384,12 +1607,25 @@ mod tests {
         s.inner.index.get_object(bucket, key).unwrap()
     }
 
+    /// Segment files on disk (excluding in-progress temp files).
+    fn segment_files(dir: &Path) -> usize {
+        let mut n = 0;
+        for fan in std::fs::read_dir(dir.join(SEGMENTS_DIR)).unwrap() {
+            let fan = fan.unwrap();
+            if fan.file_name() != ".tmp" {
+                n += std::fs::read_dir(fan.path()).unwrap().count();
+            }
+        }
+        n
+    }
+
     fn local(dir: &Path) -> LocalSegments {
         LocalSegments::open(dir.join(SEGMENTS_DIR)).unwrap()
     }
 
     /// A completed multipart object IS its parts' segments — nothing was copied — and a
-    /// ranged read across part boundaries returns exactly the right bytes.
+    /// ranged read across part boundaries returns exactly the right bytes. A part that
+    /// was uploaded but not listed is deleted at complete.
     #[tokio::test]
     async fn multipart_is_a_manifest_and_ranges_span_segments() {
         let dir = root("manifest");
@@ -1402,10 +1638,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // An unused part is retired at complete, not left referenced.
         s.upload_part("bkt", &uid, 9, &b"unused"[..], None)
             .await
             .unwrap();
+        assert_eq!(segment_files(&dir), 4);
         s.complete_multipart("bkt", "m", &uid, &[1, 2, 3])
             .await
             .unwrap();
@@ -1413,6 +1649,11 @@ mod tests {
         assert_eq!(
             r.segments.iter().map(|g| g.size).collect::<Vec<_>>(),
             [7, 3, 11]
+        );
+        assert_eq!(
+            segment_files(&dir),
+            3,
+            "the unused part is gone, nothing copied"
         );
         let whole: Vec<u8> = parts.concat();
         for start in 0..whole.len() as u64 {
@@ -1426,8 +1667,7 @@ mod tests {
                 );
             }
         }
-        // Only the unused part is garbage.
-        assert_eq!(tracked(&s, u64::MAX).len(), 1);
+        assert!(due(&s).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1446,7 +1686,7 @@ mod tests {
         for bad in [&[2, 1][..], &[1, 1, 2][..]] {
             assert!(matches!(
                 s.complete_multipart("bkt", "k", &uid, bad).await,
-                Err(ObjectError::InvalidArgument(_))
+                Err(ObjectError::InvalidPartOrder)
             ));
         }
         // A refused complete changed nothing: the upload still completes.
@@ -1475,12 +1715,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A GET that looked an object up keeps reading THAT version after an overwrite or
-    /// delete (its segments are only garbage, not gone), and the reclaim happens once the
-    /// grace has passed.
+    /// Overwrites, deletes, part re-uploads and aborts delete the bytes they replace
+    /// right away: churn never piles up unaccounted bytes on the shared disk (the byte
+    /// quota lets a net-zero overwrite through, so retained garbage would bypass it).
     #[tokio::test]
-    async fn readers_keep_their_version_and_garbage_waits_out_the_grace() {
-        let dir = root("grace");
+    async fn churn_leaves_no_garbage_on_disk() {
+        let dir = root("churn");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        for i in 0..50u8 {
+            s.put_object("bkt", "k", &[i; 1000][..], "t", None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(segment_files(&dir), 1);
+        let uid = s.create_multipart("bkt", "m", "t", None).await.unwrap();
+        for _ in 0..20 {
+            s.upload_part("bkt", &uid, 1, &b"part"[..], None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(segment_files(&dir), 2);
+        s.abort_multipart("bkt", &uid).await.unwrap();
+        s.delete_object("bkt", "k").await.unwrap();
+        assert_eq!(segment_files(&dir), 0);
+        assert!(due(&s).is_empty(), "nothing left for the sweeper");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A GET keeps reading the version it looked up after an overwrite or delete: its
+    /// segments are pinned for as long as the body (or its stream) lives, then reclaimed
+    /// by the next sweep.
+    #[tokio::test]
+    async fn readers_pin_their_version_until_dropped() {
+        let dir = root("pins");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bkt").await.unwrap();
         s.put_object("bkt", "k", &b"old"[..], "t", None)
@@ -1488,37 +1756,31 @@ mod tests {
             .unwrap();
         let old_seg = row(&s, "bkt", "k").segments[0].id.clone();
         let (_, before) = s.get_object("bkt", "k").await.unwrap();
+        let stream = before.into_stream(); // the stream, not just the body, holds the pin
         s.put_object("bkt", "k", &b"new!"[..], "t", None)
             .await
             .unwrap();
-        assert_eq!(read_all(before).await, b"old");
+        assert!(
+            local(&dir).exists(&old_seg),
+            "pinned segment survived the overwrite"
+        );
+        assert_eq!(s.collect_garbage().await.unwrap(), 0, "and the sweep");
+        let chunks: Vec<_> = stream.try_collect().await.unwrap();
+        assert_eq!(chunks.concat(), b"old");
         assert_eq!(
             read_all(s.get_object("bkt", "k").await.unwrap().1).await,
             b"new!"
         );
-
-        // Not due yet: a sweep now reclaims nothing.
-        assert_eq!(s.collect_garbage().await.unwrap(), 0);
-        assert!(local(&dir).exists(&old_seg));
-        let now = now_secs();
-        assert!(tracked(&s, now).is_empty());
-        assert_eq!(
-            tracked(&s, now + crate::index::GRACE),
-            vec![old_seg.clone()]
-        );
-
-        // Delete: the live segment is retired the same way.
-        let new_seg = row(&s, "bkt", "k").segments[0].id.clone();
-        s.delete_object("bkt", "k").await.unwrap();
-        let mut both = vec![old_seg.clone(), new_seg.clone()];
-        both.sort();
-        assert_eq!(tracked(&s, now + crate::index::GRACE), both);
+        // Stream consumed and dropped: the pin is released and the sweep reclaims it.
+        assert_eq!(s.collect_garbage().await.unwrap(), 1);
+        assert!(!local(&dir).exists(&old_seg));
+        assert_eq!(segment_files(&dir), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A write whose process died between "pending" and its commit is reclaimed once it
-    /// is past the orphan age, and never before; a commit that finds its pending row gone
-    /// refuses to reference the segment.
+    /// is past the orphan age, and never before; a commit whose pending row was claimed
+    /// meanwhile (a live writer the clock made look dead) is refused.
     #[tokio::test]
     async fn crashed_writes_are_reclaimed_after_the_orphan_age() {
         let dir = root("orphan");
@@ -1526,10 +1788,16 @@ mod tests {
         s.create_bucket("bkt").await.unwrap();
         let now = now_secs();
         let (fresh, dead) = (new_id(), new_id());
-        s.inner.index.add_pending(&fresh, now).unwrap();
         s.inner
             .index
-            .add_pending(&dead, now - crate::index::PENDING_ORPHAN_AGE - 1)
+            .add_pending(std::slice::from_ref(&fresh), now)
+            .unwrap();
+        s.inner
+            .index
+            .add_pending(
+                std::slice::from_ref(&dead),
+                now - crate::index::PENDING_ORPHAN_AGE - 1,
+            )
             .unwrap();
         for id in [&fresh, &dead] {
             let mut w = s.inner.segments.create(id).await.unwrap();
@@ -1539,7 +1807,6 @@ mod tests {
         assert_eq!(s.collect_garbage().await.unwrap(), 1);
         assert!(!local(&dir).exists(&dead) && local(&dir).exists(&fresh));
 
-        // Referencing a reclaimed segment is refused.
         let r = ObjectRow {
             meta: ObjectMeta {
                 key: "k".into(),
@@ -1551,7 +1818,7 @@ mod tests {
             },
             segments: vec![SegRef { id: dead, size: 5 }],
         };
-        assert!(s.inner.index.commit_object("bkt", &r, now, false).is_err());
+        assert!(s.inner.index.commit_object("bkt", &r, now).is_err());
         assert!(matches!(
             s.head_object("bkt", "k").await,
             Err(ObjectError::NoSuchKey(_))
@@ -1559,8 +1826,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A failed write (bad checksum, bucket gone) leaves no pending row behind: its
-    /// segment is garbage due immediately.
+    /// A failed write (bad checksum) leaves no pending row behind: its id is garbage at
+    /// once, and the bytes never became a segment.
     #[tokio::test]
     async fn failed_writes_release_their_segment() {
         let dir = root("failed-write");
@@ -1571,16 +1838,39 @@ mod tests {
                 .await,
             Err(ObjectError::ContentSha256Mismatch)
         ));
-        // The checksum failed before commit, so no segment exists; its id is garbage now.
-        assert_eq!(tracked(&s, now_secs()).len(), 1);
+        assert_eq!(segment_files(&dir), 0);
         assert_eq!(s.collect_garbage().await.unwrap(), 1);
-        assert!(tracked(&s, u64::MAX).is_empty());
+        assert!(due(&s).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PUT cancelled mid-body (client gone) releases its pending segment instead of
+    /// leaving it for the 12 h orphan sweep.
+    #[tokio::test]
+    async fn a_cancelled_write_releases_its_segment() {
+        let dir = root("cancelled");
+        let s = Arc::new(ObjectStore::open(&dir).unwrap());
+        s.create_bucket("bkt").await.unwrap();
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = {
+            let s = s.clone();
+            tokio::spawn(async move { s.put_object("bkt", "k", rx, "t", None).await })
+        };
+        tokio::io::AsyncWriteExt::write_all(&mut tx, b"partial")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending = s.inner.index.claim_due(now_secs(), usize::MAX).unwrap();
+        assert_eq!(pending.len(), 1, "released to garbage, not left pending");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Deleting a store's root under an open handle (project deleted and re-registered
-    /// with the same id) makes the handle stale; reopening gives a fresh, empty store
-    /// instead of the old incarnation's unlinked index.
+    /// with the same id) makes the handle stale; reopening gives a fresh, empty store,
+    /// and the stale handle can't write segments into the new incarnation.
     #[tokio::test]
     async fn a_recreated_root_is_a_new_store() {
         let dir = root("recreate");
@@ -1596,6 +1886,46 @@ mod tests {
         let fresh = ObjectStore::open(&dir).unwrap();
         assert!(fresh.is_current() && !Arc::ptr_eq(&s.inner, &fresh.inner));
         assert!(fresh.list_buckets().await.unwrap().is_empty());
+        assert!(
+            s.put_object("bkt", "k", &b"x"[..], "t", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(segment_files(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing bucket is reported before a bad key or upload id, as before.
+    #[tokio::test]
+    async fn missing_bucket_wins_over_bad_names() {
+        let dir = root("precedence");
+        let s = ObjectStore::open(&dir).unwrap();
+        let long = "k".repeat(1025);
+        assert!(matches!(
+            s.get_object("nope", &long).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.head_object("nope", &long).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.delete_object("nope", &long).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.upload_part("nope", "zz", 1, &b"x"[..], None).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        s.create_bucket("bkt").await.unwrap();
+        assert!(matches!(
+            s.get_object("bkt", &long).await,
+            Err(ObjectError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            s.abort_multipart("bkt", &"a".repeat(100)).await,
+            Err(ObjectError::NoSuchUpload(_))
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1621,6 +1951,15 @@ mod tests {
         .unwrap();
     }
 
+    fn root_entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
     /// A layout-1 store (all three file-name tiers, an in-flight multipart upload, a CORS
     /// sidecar, temp junk) opens as the same store: same keys, bytes and metadata, the
     /// upload still completes, and the legacy tree is gone.
@@ -1634,9 +1973,8 @@ mod tests {
         }
         std::fs::create_dir_all(dir.join("empty-bucket")).unwrap();
         std::fs::write(dir.join("bkt").join(".tmp.1.2"), b"junk").unwrap();
-        let cors = r#"{"rules":[]}"#;
         std::fs::create_dir_all(dir.join(".cors")).unwrap();
-        std::fs::write(dir.join(".cors").join("bkt.json"), cors).unwrap();
+        std::fs::write(dir.join(".cors").join("bkt.json"), r#"{"rules":[]}"#).unwrap();
         let up = dir.join("bkt").join(".uploads").join("00ab");
         std::fs::create_dir_all(&up).unwrap();
         std::fs::write(
@@ -1677,51 +2015,63 @@ mod tests {
             read_all(s.get_object("bkt", "mp").await.unwrap().1).await,
             b"hello world"
         );
-
-        // Nothing of layout 1 is left.
-        let mut left: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, [INDEX_FILE, SEGMENTS_DIR]);
+        assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A migration interrupted after committing some rows but before unlinking their
-    /// legacy files re-runs cleanly: the committed version wins, no object is doubled,
-    /// and the redundant segment is garbage.
+    /// A migration interrupted after hiding a bucket and committing some of it re-runs
+    /// cleanly: no object is doubled, the bytes are right, and the redundant link from
+    /// the first pass is garbage.
     #[tokio::test]
     async fn an_interrupted_migration_reruns_cleanly() {
         let dir = root("migrate-twice");
         std::fs::create_dir_all(&dir).unwrap();
         legacy_object(&dir, "bkt", "k", b"first");
         drop(ObjectStore::open(&dir).unwrap());
-        // As if the first run died before unlinking (and before stamping the layout).
+        // As if the first run died after committing but before unlinking.
         legacy_object(&dir, "bkt", "k", b"first");
-        {
-            let ix = Index::open(&dir.join(INDEX_FILE)).unwrap();
-            ix.set_layout(1).unwrap();
-        }
+        std::fs::rename(dir.join("bkt"), dir.join(".migrating-bkt")).unwrap();
         let s = ObjectStore::open(&dir).unwrap();
         assert_eq!(s.usage_counts().await.unwrap(), (1, 1));
         assert_eq!(
             read_all(s.get_object("bkt", "k").await.unwrap().1).await,
             b"first"
         );
+        assert_eq!(due(&s).len(), 1, "the first pass's link is garbage");
+        assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content an older binary wrote after the migration (a rollback) is never stranded:
+    /// the next open migrates it, and it wins over what the index had, being newer.
+    #[tokio::test]
+    async fn writes_from_a_rolled_back_binary_are_picked_up() {
+        let dir = root("rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        legacy_object(&dir, "bkt", "k", b"v1");
+        drop(ObjectStore::open(&dir).unwrap());
+        // The older binary sees no buckets (they were all migrated); its writes recreate
+        // a layout-1 bucket directory.
+        legacy_object(&dir, "bkt", "k", b"v2-from-old-binary");
+        legacy_object(&dir, "other", "n", b"new");
+        let s = ObjectStore::open(&dir).unwrap();
         assert_eq!(
-            tracked(&s, now_secs()).len(),
-            1,
-            "the redundant link is garbage"
+            read_all(s.get_object("bkt", "k").await.unwrap().1).await,
+            b"v2-from-old-binary"
         );
-        assert!(!dir.join("bkt").exists());
+        assert_eq!(
+            read_all(s.get_object("other", "n").await.unwrap().1).await,
+            b"new"
+        );
+        assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Only a sidecar under its own key's name was ever served; one that isn't (or that
-    /// doesn't parse) is not migrated — and not deleted: it stays where it was.
+    /// doesn't parse) is not migrated — and not deleted: its bucket's leftovers are set
+    /// aside under `.unmigrated/`, out of every later migration's way.
     #[tokio::test]
-    async fn unreadable_legacy_objects_stay_in_place() {
+    async fn unreadable_legacy_objects_are_set_aside() {
         let dir = root("migrate-bad");
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b) = (key_of(300, "a"), key_of(300, "b"));
@@ -1751,7 +2101,24 @@ mod tests {
             read_all(s.get_object("bkt", "fine").await.unwrap().1).await,
             b"ok"
         );
-        assert!(dir.join("bkt").join(format!("{sb}.meta")).exists());
+        let aside: Vec<_> = std::fs::read_dir(dir.join(".unmigrated"))
+            .unwrap()
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(
+            aside[0]
+                .as_ref()
+                .unwrap()
+                .path()
+                .join(format!("{sb}.meta"))
+                .exists()
+        );
+        drop(s);
+        // Set aside means set aside: reopening doesn't try again.
+        assert!(
+            !crate::legacy::needs_migration(&dir, &Index::open(&dir.join(INDEX_FILE)).unwrap())
+                .unwrap()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
