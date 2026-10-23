@@ -83,6 +83,11 @@ pub struct ObjectStoreService {
     control: Store,
     public_host: String,
     projects: Mutex<HashMap<String, Arc<ProjectEntry>>>,
+    /// One opener per project at a time. Requests for a project whose store is still
+    /// opening (a layout-1 migration can take seconds) wait here, in async land, instead
+    /// of each parking a blocking-pool thread on the store's open slot. One small entry
+    /// per project ever opened (bounded by the registered projects).
+    opening: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ObjectStoreService {
@@ -92,6 +97,7 @@ impl ObjectStoreService {
             control,
             public_host,
             projects: Mutex::new(HashMap::new()),
+            opening: Mutex::new(HashMap::new()),
         }
     }
 
@@ -240,6 +246,20 @@ impl ObjectStoreService {
             }
         };
         close_off_runtime(stale);
+        let gate = self
+            .opening
+            .lock()
+            .unwrap()
+            .entry(project_id.to_string())
+            .or_default()
+            .clone();
+        let _opening = gate.lock().await;
+        // Whoever held the gate before us may have opened it already.
+        if let Some(e) = self.projects.lock().unwrap().get(project_id)
+            && e.store.is_current()
+        {
+            return Ok(e.clone());
+        }
         let root = self.data_dir.join("objectstore").join(project_id);
         let store = tokio::task::spawn_blocking(move || ObjectStore::open(&root))
             .await

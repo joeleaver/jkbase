@@ -72,7 +72,7 @@ pub trait SegmentWriter: Send {
 /// bytes never land in another incarnation's store, unreferenced and billed to it.
 pub struct LocalSegments {
     dir: PathBuf,
-    ident: (u64, u64),
+    ident: FileIdent,
 }
 
 impl LocalSegments {
@@ -81,12 +81,12 @@ impl LocalSegments {
         let tmp = dir.join(".tmp");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp)?;
-        let ident = dir_ident(&dir)?;
+        let ident = file_ident(&dir)?;
         Ok(Self { dir, ident })
     }
 
     fn check_live(&self) -> io::Result<()> {
-        if dir_ident(&self.dir).ok() == Some(self.ident) {
+        if file_ident(&self.dir).ok() == Some(self.ident) {
             Ok(())
         } else {
             Err(io::Error::other("object store root was replaced"))
@@ -150,10 +150,14 @@ impl SegmentStore for LocalSegments {
         Ok(Box::pin(ReaderStream::new(f.take(len))))
     }
 
+    /// The unlink is fsynced before returning: the index forgets the segment next, and an
+    /// unlink a crash undid would leave a file nothing references (billed, never reclaimed).
     async fn delete(&self, id: &str) -> io::Result<()> {
-        match tokio::fs::remove_file(self.path(id)?).await {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+        let path = self.path(id)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => sync_dir(path.parent().expect("segment paths have a fan directory")).await,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -178,7 +182,7 @@ struct LocalWriter {
     tmp: PathBuf,
     dst: PathBuf,
     dir: PathBuf,
-    ident: (u64, u64),
+    ident: FileIdent,
     done: bool,
 }
 
@@ -190,7 +194,7 @@ impl SegmentWriter for LocalWriter {
 
     async fn commit(mut self: Box<Self>) -> io::Result<()> {
         self.file.sync_all().await?;
-        if dir_ident(&self.dir).ok() != Some(self.ident) {
+        if file_ident(&self.dir).ok() != Some(self.ident) {
             return Err(io::Error::other("object store root was replaced"));
         }
         let fan = self
@@ -218,10 +222,20 @@ impl Drop for LocalWriter {
     }
 }
 
-fn dir_ident(p: &Path) -> io::Result<(u64, u64)> {
+/// Which file (or directory) a path names: `(dev, inode, birth time)`. The inode alone
+/// isn't enough — ext4 reuses inode numbers, so a root deleted and recreated could get
+/// its old number back; the birth time (statx) tells the two incarnations apart.
+pub(crate) type FileIdent = (u64, u64, u128);
+
+pub(crate) fn file_ident(p: &Path) -> io::Result<FileIdent> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(p)?;
-    Ok((m.dev(), m.ino()))
+    let born = m
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Ok((m.dev(), m.ino(), born))
 }
 
 /// fsync a directory so the entries just created in it survive a power loss.

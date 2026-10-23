@@ -177,10 +177,15 @@ fn migrate_bucket(
     // API already) — unless some object couldn't be read; then keep it all, aside.
     if unreadable == 0 {
         std::fs::remove_dir_all(dir)?;
+        // Durably gone before anything is served: a `.migrating-` dir a crash brought back
+        // would be re-migrated as "newer" over later writes.
+        sync_dir_blocking(root)?;
     } else {
         let aside = root.join(UNMIGRATED);
         std::fs::create_dir_all(&aside)?;
         std::fs::rename(dir, aside.join(format!("{bucket}.{}", new_id())))?;
+        sync_dir_blocking(&aside)?;
+        sync_dir_blocking(root)?;
         tracing::warn!(root = %root.display(), bucket, unreadable,
             "object-store migration: unreadable legacy objects set aside in .unmigrated/");
     }
@@ -196,12 +201,17 @@ enum Legacy {
     Unreadable,
 }
 
+/// Only a sidecar that doesn't parse, or names another key, is `Unreadable`. An IO error
+/// reading it (EMFILE, EIO, …) fails the migration — the store then fails to open and
+/// the next open retries — rather than set a readable object aside.
 fn read_legacy(dir: &Path, stem: &str) -> Result<Legacy> {
     let sidecar = dir.join(format!("{stem}{META_SUFFIX}"));
-    let Ok(meta) = std::fs::read(&sidecar)
-        .map_err(|_| ())
-        .and_then(|raw| serde_json::from_slice::<ObjectMeta>(&raw).map_err(|_| ()))
-    else {
+    let raw = match std::fs::read(&sidecar) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Legacy::Gone),
+        Err(e) => return Err(e.into()),
+    };
+    let Ok(meta) = serde_json::from_slice::<ObjectMeta>(&raw) else {
         return Ok(Legacy::Unreadable);
     };
     // Only a sidecar under its own key's name was ever served (see the old `locate`).

@@ -1,6 +1,8 @@
 use crate::cors::CorsConfig;
 use crate::index::{Index, ObjectRow, PartRow, SegRef};
-use crate::segments::{ByteStream, LocalSegments, SegmentStore, SegmentWriter};
+use crate::segments::{
+    ByteStream, FileIdent, LocalSegments, SegmentStore, SegmentWriter, file_ident,
+};
 use futures_util::{StreamExt, TryStreamExt};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -286,8 +288,8 @@ struct Shared {
     /// thread each on this project's write lock and starve every other project's work.
     write_permit: tokio::sync::Semaphore,
     index_path: PathBuf,
-    /// `(dev, inode)` of the index file this handle opened — see [`ObjectStore::is_current`].
-    ident: (u64, u64),
+    /// Identity of the index file this handle opened — see [`ObjectStore::is_current`].
+    ident: FileIdent,
 }
 
 impl Shared {
@@ -993,12 +995,6 @@ async fn write_stream<R: AsyncRead + Unpin>(
     }
     w.commit().await?;
     Ok((size, md5_hasher.finalize().to_vec()))
-}
-
-fn file_ident(p: &Path) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(p)?;
-    Ok((m.dev(), m.ino()))
 }
 
 pub(crate) fn now_secs() -> u64 {
@@ -2329,5 +2325,101 @@ mod tests {
         while let Some(n) = tasks.join_next().await {
             assert_eq!(n.unwrap(), 1);
         }
+    }
+
+    /// Regression (re-review BLOCKER): a request cancelled while its commit transaction is
+    /// on the blocking pool lets the commit land AND drops its PendingSegment, whose
+    /// release must then do nothing — it used to put the now-referenced id into garbage,
+    /// and the sweeper deleted a committed object's bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_cancelled_mid_commit_keeps_its_bytes() {
+        let dir = root("cancel-commit");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let mut body: &[u8] = b"precious bytes";
+        let (pending, size, md5) = s.write_segment(&mut body, None, None).await.unwrap();
+        let id = pending.id().to_string();
+        let row = ObjectRow {
+            meta: ObjectMeta {
+                key: "k".into(),
+                size,
+                etag: hex(&md5),
+                content_type: "t".into(),
+                last_modified: now_secs(),
+                cache_control: None,
+            },
+            segments: vec![SegRef {
+                id: id.clone(),
+                size,
+            }],
+        };
+        // Same closure put_object_capped passes; the sleep stands in for a slow fsync.
+        let fut = s.commit_with(pending, move |ix| {
+            // Committed; the request is cancelled before the blocking task's result is
+            // polled (equivalently: cancelled while redb's fsync holds the write lock, so
+            // the Drop's discard queues behind it).
+            let retired = ix.commit_object("bkt", &row, now_secs())?;
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(((), retired))
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), fut)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // The row committed.
+        s.head_object("bkt", "k").await.unwrap();
+        // ...and its only segment is now garbage.
+        let due = s.inner.index.claim_due(now_secs(), usize::MAX).unwrap();
+        assert!(!due.contains(&id), "a referenced segment is never garbage");
+        assert_eq!(s.collect_garbage().await.unwrap(), 0);
+        let got = match s.get_object("bkt", "k").await {
+            Ok((_, b)) => b
+                .into_stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .map(|c| c.concat()),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        };
+        assert_eq!(
+            got.as_deref().ok(),
+            Some(&b"precious bytes"[..]),
+            "GET after sweep: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PUTs abandoned by their client at arbitrary points (a timeout drops the request
+    /// future). Every object that nevertheless committed stays readable after a sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoned_puts_never_lose_committed_objects() {
+        let dir = root("abandon");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let body = vec![7u8; 64 * 1024];
+        for i in 0..400u64 {
+            let key = format!("k{i}");
+            let us = 200 + (i * 37) % 6000;
+            let _ = tokio::time::timeout(
+                Duration::from_micros(us),
+                s.put_object("bkt", &key, &body[..], "t", None),
+            )
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        s.collect_garbage().await.unwrap();
+        let (mut ok, mut lost) = (0, 0);
+        for i in 0..400u64 {
+            if let Ok((_, b)) = s.get_object("bkt", &format!("k{i}")).await {
+                match b.into_stream().try_collect::<Vec<_>>().await {
+                    Ok(_) => ok += 1,
+                    Err(_) => lost += 1,
+                }
+            }
+        }
+        eprintln!("committed+readable {ok}, committed but bytes deleted {lost}");
+        assert_eq!(lost, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

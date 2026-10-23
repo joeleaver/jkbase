@@ -288,14 +288,17 @@ impl Index {
     }
 
     /// Give up on pending segments whose write failed or whose commit was refused: they
-    /// become garbage (nothing ever referenced them).
+    /// become garbage (nothing ever referenced them). An id no longer pending is left
+    /// alone — a request cancelled mid-commit releases its segment AFTER the commit that
+    /// referenced it landed, and must not make a live segment garbage.
     pub fn discard_pending(&self, ids: &[String], now: u64) -> Result<()> {
         self.write(|w| {
             let mut p = w.open_table(PENDING)?;
             let mut g = w.open_table(GARBAGE)?;
             for id in ids {
-                p.remove(id.as_str())?;
-                g.insert(id.as_str(), now)?;
+                if p.remove(id.as_str())?.is_some() {
+                    g.insert(id.as_str(), now)?;
+                }
             }
             Ok(())
         })
