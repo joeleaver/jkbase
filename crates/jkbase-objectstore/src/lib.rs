@@ -24,8 +24,13 @@ mod http;
 /// sites are unchanged. The tenant client itself lives in its own crate, depending only on
 /// `jkbase-sigv4` + reqwest — never this engine crate.
 pub use jkbase_common::sigv4;
+mod index;
+mod legacy;
+pub mod segments;
 mod store;
 pub use http::router;
 pub use sigv4::{presign, sign_header, verify_header, verify_presigned};
 pub use cors::{CorsConfig, cors_config_to_xml, parse_cors_config_xml};
-pub use store::{ListPage, ListV2Page, MultipartUpload, ObjectError, ObjectMeta, ObjectStore};
+pub use store::{
+    ListPage, ListV2Page, MultipartUpload, ObjectBody, ObjectError, ObjectMeta, ObjectStore,
+};

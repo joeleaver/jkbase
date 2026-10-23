@@ -1880,13 +1880,16 @@ dependencies = [
 name = "jkbase-objectstore"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "futures-util",
  "hmac",
  "http-body-util",
  "jkbase-common",
  "md-5",
+ "redb",
  "reqwest",
  "serde",
  "serde_json",
@@ -1895,6 +1898,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "tracing",
 ]
 
 [[package]]

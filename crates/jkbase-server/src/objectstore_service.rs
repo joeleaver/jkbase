@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::StreamReader;
 use tower::ServiceExt; // oneshot
 use tower_http::cors::CorsLayer;
 use tracing::warn;
@@ -83,6 +83,11 @@ pub struct ObjectStoreService {
     control: Store,
     public_host: String,
     projects: Mutex<HashMap<String, Arc<ProjectEntry>>>,
+    /// One opener per project at a time. Requests for a project whose store is still
+    /// opening (a layout-1 migration can take seconds) wait here, in async land, instead
+    /// of each parking a blocking-pool thread on the store's open slot. One small entry
+    /// per project ever opened (bounded by the registered projects).
+    opening: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ObjectStoreService {
@@ -92,6 +97,7 @@ impl ObjectStoreService {
             control,
             public_host,
             projects: Mutex::new(HashMap::new()),
+            opening: Mutex::new(HashMap::new()),
         }
     }
 
@@ -169,7 +175,7 @@ impl ObjectStoreService {
     // The Err is a ready-to-return `Response` (the file's pattern for fail-closed
     // handler helpers); boxing it would only churn the 7 call sites.
     #[allow(clippy::result_large_err)]
-    fn console_auth(
+    async fn console_auth(
         &self,
         headers: &HeaderMap,
         project_id: &str,
@@ -203,7 +209,7 @@ impl ObjectStoreService {
                 ));
             }
         }
-        self.project_entry(project_id).map_err(|e| {
+        self.project_entry(project_id).await.map_err(|e| {
             warn!(project = %project_id, error = %e, "console: object store open failed");
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -214,7 +220,11 @@ impl ObjectStoreService {
 
     /// Get-or-open the per-project entry. Opening creates `{data_dir}/objectstore/{id}`
     /// lazily (mirrors how data disks / content images are made on first use).
-    fn project_entry(&self, project_id: &str) -> std::io::Result<Arc<ProjectEntry>> {
+    ///
+    /// Opening is blocking work (redb open + recovery, and a layout-1 migration on the
+    /// first open after the index layout shipped), so it runs on the blocking pool and
+    /// never under the `projects` lock: a slow open stalls only that project's requests.
+    async fn project_entry(&self, project_id: &str) -> std::io::Result<Arc<ProjectEntry>> {
         // Defense-in-depth: project_id becomes a path component for the store root.
         // The control plane only ever mints keys for validated `[a-z0-9-]` slugs, but
         // refuse to join anything else (esp. empty → the shared `objectstore/` parent)
@@ -224,12 +234,36 @@ impl ObjectStoreService {
                 "invalid project id {project_id:?}"
             )));
         }
-        let mut map = self.projects.lock().unwrap();
-        if let Some(e) = map.get(project_id) {
+        // A store is stateful (its index is open), so a cached entry is only good while
+        // its index is still the one on disk: a project deleted and recreated under the
+        // same id must not keep writing into the old incarnation's unlinked index.
+        let stale = {
+            let mut map = self.projects.lock().unwrap();
+            match map.get(project_id) {
+                Some(e) if e.store.is_current() => return Ok(e.clone()),
+                Some(_) => map.remove(project_id),
+                None => None,
+            }
+        };
+        close_off_runtime(stale);
+        let gate = self
+            .opening
+            .lock()
+            .unwrap()
+            .entry(project_id.to_string())
+            .or_default()
+            .clone();
+        let _opening = gate.lock().await;
+        // Whoever held the gate before us may have opened it already.
+        if let Some(e) = self.projects.lock().unwrap().get(project_id)
+            && e.store.is_current()
+        {
             return Ok(e.clone());
         }
         let root = self.data_dir.join("objectstore").join(project_id);
-        let store = ObjectStore::open(&root)
+        let store = tokio::task::spawn_blocking(move || ObjectStore::open(&root))
+            .await
+            .map_err(std::io::Error::other)?
             .map_err(|e| std::io::Error::other(format!("open object store: {e}")))?;
         let entry = Arc::new(ProjectEntry {
             store: Arc::new(store),
@@ -246,15 +280,27 @@ impl ObjectStoreService {
                 reserved_buckets: 0,
             }),
         });
-        // Keep the cache bounded: evict an arbitrary entry once at capacity (cheap to
-        // reopen). Never evicts the one we're about to insert.
-        if map.len() >= PROJECT_CACHE_CAP
-            && !map.contains_key(project_id)
-            && let Some(victim) = map.keys().next().cloned()
-        {
-            map.remove(&victim);
-        }
-        map.insert(project_id.to_string(), entry.clone());
+        let evicted = {
+            let mut map = self.projects.lock().unwrap();
+            // Another request opened it meanwhile: same store (one per root), keep the
+            // entry already there so its usage reservations stay in one place.
+            if let Some(e) = map.get(project_id)
+                && e.store.is_current()
+            {
+                return Ok(e.clone());
+            }
+            // Keep the cache bounded: evict an arbitrary entry once at capacity (cheap to
+            // reopen). Never evicts the one we're about to insert.
+            let victim = if map.len() >= PROJECT_CACHE_CAP && !map.contains_key(project_id) {
+                map.keys().next().cloned()
+            } else {
+                None
+            };
+            let evicted = victim.and_then(|v| map.remove(&v));
+            map.insert(project_id.to_string(), entry.clone());
+            evicted
+        };
+        close_off_runtime(evicted);
         Ok(entry)
     }
 
@@ -439,8 +485,9 @@ impl ObjectStoreService {
             .unwrap_or_else(Instant::now);
     }
 
-    /// Sweep abandoned multipart staging across every registered project. Returns the
-    /// total number of stale `.uploads/{id}` dirs removed. Driven on boot + on a timer.
+    /// Sweep every registered project's store: abort abandoned multipart uploads and
+    /// reclaim unreachable segments. Returns the number of uploads aborted. Driven on boot
+    /// (which is also when a layout-1 store gets migrated) + on a timer.
     pub async fn sweep_all_stale_uploads(&self, max_age: Duration) -> usize {
         let projects = match self.control.list_projects() {
             Ok(p) => p,
@@ -455,11 +502,22 @@ impl ObjectStoreService {
             if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
                 continue;
             }
-            if let Ok(store) = ObjectStore::open(&root)
-                && let Ok(n) = store.sweep_stale_uploads(max_age).await
-            {
-                total += n;
+            // Opening may migrate a layout-1 store (first boot of the index layout):
+            // blocking filesystem work, kept off the async workers.
+            let opened = tokio::task::spawn_blocking(move || ObjectStore::open(&root)).await;
+            let store = match opened {
+                Ok(Ok(store)) => store,
+                Ok(Err(e)) => {
+                    warn!(project = %p.id, error = %e, "object-store: open failed during sweep");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            match store.sweep_stale_uploads(max_age).await {
+                Ok(n) => total += n,
+                Err(e) => warn!(project = %p.id, error = %e, "object-store: sweep failed"),
             }
+            close_off_runtime(Some(store));
         }
         total
     }
@@ -538,7 +596,7 @@ impl ObjectStoreService {
             _ => return s3_access_denied("access key not valid for the current project owner"),
         }
 
-        let entry = match self.project_entry(&project_id) {
+        let entry = match self.project_entry(&project_id).await {
             Ok(e) => e,
             Err(e) => {
                 warn!(project = %project_id, error = %e, "object store open failed");
@@ -724,7 +782,7 @@ impl ObjectStoreService {
         ) else {
             return s3_access_denied("anonymous requests are not allowed");
         };
-        let Some(store) = self.resolve_store_for_preflight(query) else {
+        let Some(store) = self.resolve_store_for_preflight(query).await else {
             return preflight_denied();
         };
         let cfg = match store.get_bucket_cors(bucket).await {
@@ -750,7 +808,10 @@ impl ObjectStoreService {
     /// `X-Amz-Credential` (`<AKID>/<date>/<region>/<service>/aws4_request`). Applies the
     /// SAME owner re-bind as the authed path so an orphaned key can't resolve to a
     /// project a different tenant now owns. `None` (⇒ deny) when unresolvable.
-    fn resolve_store_for_preflight(&self, query: &[(String, String)]) -> Option<Arc<ObjectStore>> {
+    async fn resolve_store_for_preflight(
+        &self,
+        query: &[(String, String)],
+    ) -> Option<Arc<ObjectStore>> {
         let cred = query.iter().find(|(k, _)| k == "X-Amz-Credential")?;
         let akid = cred.1.split('/').next()?;
         let key = self.control.lookup_access_key(akid).ok().flatten()?;
@@ -758,7 +819,14 @@ impl ObjectStoreService {
             Ok(Some(p)) if p.tenant_id.as_deref() == Some(key.tenant_id.as_str()) => {}
             _ => return None,
         }
+        // An anonymous preflight must not create a store for a project that never used
+        // storage (it has no bucket, so no CORS config, to grant anything from).
+        let root = self.data_dir.join("objectstore").join(&key.project_id);
+        if !is_valid_project_id(&key.project_id) || !tokio::fs::try_exists(&root).await.unwrap_or(false) {
+            return None;
+        }
         self.project_entry(&key.project_id)
+            .await
             .ok()
             .map(|e| e.store.clone())
     }
@@ -854,6 +922,14 @@ impl ObjectStoreService {
     }
 }
 
+/// Drop what may be the last handle on a project store on the blocking pool: closing a
+/// redb index flushes and fsyncs, which must not run on an async worker.
+fn close_off_runtime<T: Send + 'static>(handle: Option<T>) {
+    if let Some(h) = handle {
+        tokio::task::spawn_blocking(move || drop(h));
+    }
+}
+
 async fn dispatch(State(svc): State<Arc<ObjectStoreService>>, req: Request) -> Response {
     svc.handle(req).await
 }
@@ -922,7 +998,7 @@ async fn console_list_buckets(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    let entry = match svc.console_auth(&headers, &id) {
+    let entry = match svc.console_auth(&headers, &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -943,7 +1019,7 @@ async fn console_create_bucket(
     headers: HeaderMap,
     Json(req): Json<CreateBucketReq>,
 ) -> Response {
-    let entry = match svc.console_auth(&headers, &id) {
+    let entry = match svc.console_auth(&headers, &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -986,7 +1062,7 @@ async fn console_delete_bucket(
     Path((id, bucket)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let entry = match svc.console_auth(&headers, &id) {
+    let entry = match svc.console_auth(&headers, &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -1010,7 +1086,7 @@ async fn console_list_objects(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let entry = match svc.console_auth(&headers, &id) {
+    let entry = match svc.console_auth(&headers, &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -1055,7 +1131,7 @@ async fn console_get_object(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let entry = match svc.console_auth(&headers, &id) {
+    let entry = match svc.console_auth(&headers, &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -1068,7 +1144,7 @@ async fn console_get_object(
         Some("1") | Some("true")
     );
     match entry.store.get_object(&bucket, key).await {
-        Ok((meta, file)) => {
+        Ok((meta, object)) => {
             let disp = if download {
                 format!("attachment; filename=\"{}\"", sanitize_filename(key))
             } else {
@@ -1080,7 +1156,7 @@ async fn console_get_object(
                 (header::ETAG, format!("\"{}\"", meta.etag)),
                 (header::CONTENT_DISPOSITION, disp),
             ];
-            (parts, Body::from_stream(ReaderStream::new(file))).into_response()
+            (parts, Body::from_stream(object.into_stream())).into_response()
         }
         Err(ObjectError::NoSuchKey(_)) | Err(ObjectError::NoSuchBucket(_)) => {
             json_error(StatusCode::NOT_FOUND, "not found")
@@ -1097,7 +1173,7 @@ async fn console_put_object(
     Path((id, bucket)): Path<(String, String)>,
     req: Request,
 ) -> Response {
-    let entry = match svc.console_auth(req.headers(), &id) {
+    let entry = match svc.console_auth(req.headers(), &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -1180,7 +1256,7 @@ async fn console_delete_object(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    let entry = match svc.console_auth(&headers, &id) {
+    let entry = match svc.console_auth(&headers, &id).await {
         Ok(e) => e,
         Err(r) => return r,
     };
@@ -3133,6 +3209,48 @@ mod tests {
             put(&app, "/bkt/o1", "wxyz").await.0,
             StatusCode::INSUFFICIENT_STORAGE
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (storage scale-out review HIGH): an overwrite reserves only its net
+    /// growth, so the bytes it replaces must leave the disk with it — retained versions
+    /// would let same-size overwrite churn fill the shared disk past any cap. And bytes a
+    /// DELETE frees are free again for the next write.
+    #[tokio::test]
+    async fn overwrite_churn_stays_within_the_byte_cap() {
+        let dir = tmp("overwrite-churn");
+        let store = store_at(&dir);
+        mk_project(&store, "proj", "tenant-x");
+        let mut q = DEFAULT_QUOTA;
+        q.storage_bytes_max = 4 << 20;
+        store.set_quota("proj", &q).unwrap();
+        let a = store.create_access_key("proj", "tenant-x", "").unwrap();
+        let svc = Arc::new(ObjectStoreService::new(
+            dir.join("data"),
+            store,
+            "storage.test".to_string(),
+        ));
+        let app = svc.into_router();
+        let body = "x".repeat(1 << 20);
+        let put = |path: &str| {
+            let req = signed("PUT", path, &a.access_key_id, &a.secret_key, &body);
+            let app = app.clone();
+            async move { status_body(app.oneshot(req).await.unwrap()).await }
+        };
+        assert_eq!(put("/bkt").await.0, StatusCode::OK);
+        for i in 0..20 {
+            let (st, b) = put("/bkt/o1").await;
+            assert_eq!(st, StatusCode::OK, "overwrite {i}: {b}");
+        }
+        let root = dir.join("data").join("objectstore").join("proj");
+        let on_disk = jkbase_common::storage::dir_bytes(&root);
+        assert!(on_disk < 4 << 20, "{on_disk} bytes on disk after 20 x 1 MiB overwrites");
+        let del = signed("DELETE", "/bkt/o1", &a.access_key_id, &a.secret_key, "");
+        assert_eq!(app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
+        // Past the quota sample TTL, so the gate re-measures the disk.
+        tokio::time::sleep(QUOTA_TTL + Duration::from_millis(100)).await;
+        let (st, b) = put("/bkt/o2").await;
+        assert_eq!(st, StatusCode::OK, "{b}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

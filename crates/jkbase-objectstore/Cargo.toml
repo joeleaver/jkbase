@@ -17,6 +17,10 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+redb = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

@@ -5,7 +5,7 @@
 //! This layer is **unauthenticated** — the productized server uses `router(store)`
 //! with per-project filesystem-root isolation as the sole tenant boundary.
 
-use crate::{ObjectError, ObjectMeta, ObjectStore};
+use crate::{ObjectBody, ObjectError, ObjectMeta, ObjectStore};
 use axum::{
     Router,
     body::Body,
@@ -17,8 +17,8 @@ use axum::{
 use futures_util::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::{ReaderStream, StreamReader};
+
+use tokio_util::io::StreamReader;
 
 /// Build the S3 router backed by `store`.
 pub fn router(store: Arc<ObjectStore>) -> Router {
@@ -103,7 +103,7 @@ async fn get_object(
     headers: HeaderMap,
 ) -> Response {
     match store.get_object(&bucket, &key).await {
-        Ok((meta, file)) => respond_object(meta, Some(file), &headers).await,
+        Ok((meta, object)) => respond_object(meta, Some(object), &headers).await,
         Err(e) => s3_error(e),
     }
 }
@@ -120,12 +120,12 @@ async fn head_object(
 }
 
 /// Build a GET/HEAD response, honoring conditional GET (`If-None-Match` /
-/// `If-Modified-Since` → 304) and a single `Range` (→ 206 / 416). `file` is `Some`
+/// `If-Modified-Since` → 304) and a single `Range` (→ 206 / 416). `object` is `Some`
 /// for GET (streamed body), `None` for HEAD. `Accept-Ranges: bytes` is always
 /// advertised so clients know ranged reads are available.
 async fn respond_object(
     meta: ObjectMeta,
-    file: Option<tokio::fs::File>,
+    object: Option<ObjectBody>,
     headers: &HeaderMap,
 ) -> Response {
     // Conditional GET wins over Range: an unchanged resource is 304 regardless.
@@ -133,22 +133,19 @@ async fn respond_object(
         return build_object_response(StatusCode::NOT_MODIFIED, &meta, None, None);
     }
     let total = meta.size;
-    let Some(mut file) = file else {
+    let Some(object) = object else {
         // HEAD: validators + Content-Length, no body.
         return build_object_response(StatusCode::OK, &meta, None, None);
     };
     match parse_range(headers.get(header::RANGE), total) {
         RangeOutcome::Full => {
-            let body = Body::from_stream(ReaderStream::new(file));
+            let body = Body::from_stream(object.stream(0, total));
             build_object_response(StatusCode::OK, &meta, Some(body), None)
         }
         RangeOutcome::Unsatisfiable => range_not_satisfiable(total),
         RangeOutcome::Partial { start, end } => {
-            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-                return s3_error(ObjectError::Io(std::io::Error::other("range seek failed")));
-            }
             let len = end - start + 1;
-            let body = Body::from_stream(ReaderStream::new(file.take(len)));
+            let body = Body::from_stream(object.stream(start, len));
             build_object_response(
                 StatusCode::PARTIAL_CONTENT,
                 &meta,
@@ -675,13 +672,23 @@ fn s3_error(e: ObjectError) -> Response {
         ObjectError::ContentSha256Mismatch => {
             (StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch")
         }
+        ObjectError::InvalidPartOrder => (StatusCode::BAD_REQUEST, "InvalidPartOrder"),
+        ObjectError::EntityTooSmall(_) => (StatusCode::BAD_REQUEST, "EntityTooSmall"),
         ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
         }
     };
+    // Internal failures carry host detail (index errors, paths): log it, don't send it.
+    let message = match &e {
+        ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
+            tracing::warn!(error = %e, "object store internal error");
+            "We encountered an internal error. Please try again.".to_string()
+        }
+        _ => e.to_string(),
+    };
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{}</Message></Error>",
-        xml_escape(&e.to_string())
+        xml_escape(&message)
     );
     (status, [(header::CONTENT_TYPE, "application/xml")], body).into_response()
 }
@@ -1071,8 +1078,9 @@ mod tests {
         let (_, _, xml) = body_str(r).await;
         let uid = between(&xml, "<UploadId>", "</UploadId>");
 
-        // Upload two parts.
-        for (n, data) in [(1, "AAAA"), (2, "BB")] {
+        // Upload two parts (all but the last must be at least 5 MiB, as in S3).
+        let first = "A".repeat(5 << 20);
+        for (n, data) in [(1, first.clone()), (2, "BB".to_string())] {
             let r = app
                 .clone()
                 .oneshot(
@@ -1128,7 +1136,7 @@ mod tests {
             .await
             .unwrap();
         let (_, _, text) = body_str(r).await;
-        assert_eq!(text, "AAAABB");
+        assert_eq!(text, first + "BB");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

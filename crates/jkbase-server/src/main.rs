@@ -1386,14 +1386,16 @@ async fn async_main() -> Result<()> {
             store.clone(),
             format!("storage.{}", args.domain),
         ));
-        // Multipart-staging sweeper: reap abandoned `.uploads/{id}` dirs older than
-        // MULTIPART_MAX_AGE on boot, then on a timer (mirrors S3's abort-incomplete-
-        // multipart lifecycle), so a crashed/forgotten upload can't pin disk forever.
+        // Object-store sweeper, on boot then on a timer: aborts multipart uploads older
+        // than MULTIPART_MAX_AGE (S3's abort-incomplete-multipart lifecycle) and deletes
+        // segments that became unreachable (overwrite/delete/abort) once their grace has
+        // passed, so neither can pin disk forever. The boot pass also migrates any
+        // layout-1 store to the index layout.
         {
             let sweeper = svc.clone();
             tokio::spawn(async move {
                 const MULTIPART_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
-                const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
+                const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
                 let mut tick = tokio::time::interval(SWEEP_INTERVAL);
                 loop {
                     tick.tick().await; // fires immediately on the first iteration (boot)

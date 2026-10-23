@@ -34,7 +34,7 @@ mod xml;
 
 pub use error::{Error, Result, S3ErrorCode};
 pub use list::{ListObjectsOptions, ListPage, ObjectEntry};
-pub use multipart::{MultipartUpload, PendingUpload};
+pub use multipart::{MIN_PART_SIZE, MultipartUpload, PendingUpload};
 pub use objects::{GetObject, ObjectMeta};
 
 use bytes::Bytes;
