@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::StreamReader;
 use tower::ServiceExt; // oneshot
 use tower_http::cors::CorsLayer;
 use tracing::warn;
@@ -225,8 +225,14 @@ impl ObjectStoreService {
             )));
         }
         let mut map = self.projects.lock().unwrap();
+        // A store is stateful (its index is open), so a cached entry is only good while
+        // its index is still the one on disk: a project deleted and recreated under the
+        // same id must not keep writing into the old incarnation's unlinked index.
         if let Some(e) = map.get(project_id) {
-            return Ok(e.clone());
+            if e.store.is_current() {
+                return Ok(e.clone());
+            }
+            map.remove(project_id);
         }
         let root = self.data_dir.join("objectstore").join(project_id);
         let store = ObjectStore::open(&root)
@@ -439,8 +445,9 @@ impl ObjectStoreService {
             .unwrap_or_else(Instant::now);
     }
 
-    /// Sweep abandoned multipart staging across every registered project. Returns the
-    /// total number of stale `.uploads/{id}` dirs removed. Driven on boot + on a timer.
+    /// Sweep every registered project's store: abort abandoned multipart uploads and
+    /// reclaim unreachable segments. Returns the number of uploads aborted. Driven on boot
+    /// (which is also when a layout-1 store gets migrated) + on a timer.
     pub async fn sweep_all_stale_uploads(&self, max_age: Duration) -> usize {
         let projects = match self.control.list_projects() {
             Ok(p) => p,
@@ -455,10 +462,20 @@ impl ObjectStoreService {
             if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
                 continue;
             }
-            if let Ok(store) = ObjectStore::open(&root)
-                && let Ok(n) = store.sweep_stale_uploads(max_age).await
-            {
-                total += n;
+            // Opening may migrate a layout-1 store (first boot of the index layout):
+            // blocking filesystem work, kept off the async workers.
+            let opened = tokio::task::spawn_blocking(move || ObjectStore::open(&root)).await;
+            let store = match opened {
+                Ok(Ok(store)) => store,
+                Ok(Err(e)) => {
+                    warn!(project = %p.id, error = %e, "object-store: open failed during sweep");
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            match store.sweep_stale_uploads(max_age).await {
+                Ok(n) => total += n,
+                Err(e) => warn!(project = %p.id, error = %e, "object-store: sweep failed"),
             }
         }
         total
@@ -1068,7 +1085,7 @@ async fn console_get_object(
         Some("1") | Some("true")
     );
     match entry.store.get_object(&bucket, key).await {
-        Ok((meta, file)) => {
+        Ok((meta, object)) => {
             let disp = if download {
                 format!("attachment; filename=\"{}\"", sanitize_filename(key))
             } else {
@@ -1080,7 +1097,7 @@ async fn console_get_object(
                 (header::ETAG, format!("\"{}\"", meta.etag)),
                 (header::CONTENT_DISPOSITION, disp),
             ];
-            (parts, Body::from_stream(ReaderStream::new(file))).into_response()
+            (parts, Body::from_stream(object.into_stream())).into_response()
         }
         Err(ObjectError::NoSuchKey(_)) | Err(ObjectError::NoSuchBucket(_)) => {
             json_error(StatusCode::NOT_FOUND, "not found")
