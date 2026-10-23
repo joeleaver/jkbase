@@ -50,6 +50,11 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// being deleted.
 pub(crate) const PENDING_ORPHAN_AGE: u64 = 12 * 3600;
 
+/// S3's minimum size for every part of a multipart upload but the last. Without it an
+/// object could be 10 000 one-byte segments: a 10 000-entry manifest and a file open per
+/// segment on every GET of it.
+pub(crate) const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+
 /// Page cache per open index. redb's default (1 GiB) is per database, and the server keeps
 /// thousands of project stores open.
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -577,13 +582,10 @@ impl Index {
     }
 
     /// Complete an upload: the object's segments ARE the listed parts' segments, in
-    /// order — no byte is copied. Parts uploaded but not listed are retired. The etag is
-    /// S3's `md5(concat of part md5s)-<count>`.
-    ///
-    /// Unlike S3, parts under 5 MiB are accepted (clients written against this server,
-    /// our SDK example among them, use small parts), so an object can have up to 10 000
-    /// segments. That costs only its own GETs: the manifest is kept apart from the
-    /// metadata HEAD and LIST read.
+    /// order — no byte is copied. As in S3, every listed part but the last must be at
+    /// least [`MIN_PART_SIZE`]; a refused complete changes nothing, so the client can
+    /// retry. Parts uploaded but not listed are retired. The etag is S3's
+    /// `md5(concat of part md5s)-<count>`.
     pub fn complete_upload(
         &self,
         bucket: &str,
@@ -618,10 +620,13 @@ impl Index {
             }
             let mut concat = Md5::new();
             let mut segments = Vec::with_capacity(part_numbers.len());
-            for &pn in part_numbers {
+            for (i, &pn) in part_numbers.iter().enumerate() {
                 let Some(row) = staged.remove(&pn) else {
                     return Err(ObjectError::InvalidArgument(format!("missing part {pn}")));
                 };
+                if row.size < MIN_PART_SIZE && i + 1 < part_numbers.len() {
+                    return Err(ObjectError::EntityTooSmall(pn));
+                }
                 concat.update(unhex(&row.md5));
                 segments.push(SegRef {
                     id: row.segment,

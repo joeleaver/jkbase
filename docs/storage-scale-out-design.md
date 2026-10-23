@@ -150,11 +150,14 @@ likely sit on the `object_store` crate for remote), but not the trait.
   sidecars migrate too; unreadable objects are moved to `.unmigrated/`, never deleted.
   **Rolling back is unsupported but not silently lossy:** an older binary sees an empty store, and
   whatever it writes is picked up on the next start of this one.
-- Deliberate S3-fidelity change: CompleteMultipartUpload with parts out of ascending order (or
-  repeated) is refused with `InvalidPartOrder`, as S3 does; the old engine silently reordered or
-  duplicated bytes. The Rust SDK now de-duplicates re-uploaded part numbers. S3's 5 MiB minimum
-  part size is **not** enforced: clients written against this server (our SDK example included) use
-  small parts, and the manifest split keeps tiny-part objects cheap for everyone but their reader.
+- Deliberate S3-fidelity changes to CompleteMultipartUpload, both as S3 does them: parts out of
+  ascending order (or repeated) are refused with `InvalidPartOrder` — the old engine silently
+  reordered or duplicated bytes — and every part but the last must be at least 5 MiB
+  (`EntityTooSmall`), so no object is 10 000 one-byte segments. A refused complete changes nothing.
+  Checked against every project storing data on prod on 2026-10-23 (oxidegen,
+  beardictate-telemetry, playweft, plus one 2-object external tenant): none uses multipart. The
+  Rust SDK exports `MIN_PART_SIZE`, its example uses it, and it de-duplicates re-uploaded part
+  numbers.
 - Quota counts read `len()`; byte billing (`dir_bytes` over the project root) is unchanged because
   segments + index still live under `{data_dir}/objectstore/{id}`.
 - Done = full existing test suite green (S3 + console + quota + CORS + range), new tests for

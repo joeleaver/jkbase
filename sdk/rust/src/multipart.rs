@@ -84,6 +84,9 @@ impl ObjectClient {
     }
 }
 
+/// S3's (and jkbase's) minimum size for every part of a multipart upload but the last.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
 impl MultipartUpload<'_> {
     /// The server-assigned upload id.
     pub fn upload_id(&self) -> &str {
@@ -91,7 +94,9 @@ impl MultipartUpload<'_> {
     }
 
     /// Upload one part (in-memory). Part numbers should be ascending and unique; the
-    /// engine concatenates them in the order passed to `complete`.
+    /// engine concatenates them in the order passed to `complete`. As in S3, every part
+    /// but the last must be at least 5 MiB ([`MIN_PART_SIZE`]), or `complete` fails with
+    /// `EntityTooSmall`.
     pub async fn upload_part(&mut self, part_number: u32, body: impl Into<Bytes>) -> Result<()> {
         let q = vec![
             ("uploadId".into(), self.upload_id.clone()),

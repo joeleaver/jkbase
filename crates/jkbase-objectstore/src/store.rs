@@ -93,6 +93,9 @@ pub enum ObjectError {
     /// CompleteMultipartUpload listed parts out of ascending order (or repeated one).
     #[error("parts must be listed in ascending order without repeats")]
     InvalidPartOrder,
+    /// A part other than the last is under S3's 5 MiB minimum.
+    #[error("part {0} is smaller than the 5 MiB minimum for all but the last part")]
+    EntityTooSmall(u32),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -882,7 +885,8 @@ impl ObjectStore {
 
     /// Complete a multipart upload. The object is the listed parts' segments in order —
     /// no byte is copied — with the S3 multipart etag `md5(concat of the part md5s)-<count>`.
-    /// As in S3, parts must be listed in ascending order.
+    /// As in S3, parts must be listed in ascending order and every part but the last
+    /// must be at least 5 MiB.
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -1073,6 +1077,11 @@ mod tests {
         let d = std::env::temp_dir().join(format!("jkb-obj-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// A part exactly at S3's minimum for all but the last part.
+    fn big(fill: u8) -> Vec<u8> {
+        vec![fill; crate::index::MIN_PART_SIZE as usize]
     }
 
     async fn read_all(body: ObjectBody) -> Vec<u8> {
@@ -1371,26 +1380,27 @@ mod tests {
             .create_multipart("mp-bucket", "big/file", "application/octet-stream", None)
             .await
             .unwrap();
+        let first = big(b'h');
         let e1 = s
-            .upload_part("mp-bucket", &uid, 1, &b"hello "[..], None)
+            .upload_part("mp-bucket", &uid, 1, &first[..], None)
             .await
             .unwrap();
         let e2 = s
             .upload_part("mp-bucket", &uid, 2, &b"world"[..], None)
             .await
             .unwrap();
-        assert_eq!(e1, format!("{:x}", Md5::digest(b"hello ")));
+        assert_eq!(e1, format!("{:x}", Md5::digest(&first)));
         assert_eq!(e2, format!("{:x}", Md5::digest(b"world")));
 
         let meta = s
             .complete_multipart("mp-bucket", "big/file", &uid, &[1, 2])
             .await
             .unwrap();
-        assert_eq!(meta.size, 11);
+        assert_eq!(meta.size, first.len() as u64 + 5);
         assert!(meta.etag.ends_with("-2")); // S3 multipart etag carries the part count
         assert_eq!(
             read_all(s.get_object("mp-bucket", "big/file").await.unwrap().1).await,
-            b"hello world"
+            [first.as_slice(), b"world"].concat()
         );
 
         // The upload id is consumed by complete.
@@ -1576,7 +1586,8 @@ mod tests {
 
         let mp = key_of(1024, "mp");
         let id = s.create_multipart("bkt", &mp, "t", None).await.unwrap();
-        s.upload_part("bkt", &id, 1, &b"hello "[..], None)
+        let first = big(b'h');
+        s.upload_part("bkt", &id, 1, &first[..], None)
             .await
             .unwrap();
         s.upload_part("bkt", &id, 2, &b"world"[..], None)
@@ -1587,7 +1598,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             read_all(s.get_object("bkt", &mp).await.unwrap().1).await,
-            b"hello world"
+            [first.as_slice(), b"world"].concat()
         );
         s.delete_object("bkt", &mp).await.unwrap();
         s.delete_bucket("bkt").await.unwrap();
@@ -1631,10 +1642,17 @@ mod tests {
         let dir = root("manifest");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bkt").await.unwrap();
-        let parts: [&[u8]; 3] = [b"abcdefg", b"hij", b"klmnopqrstu"];
+        // Distinct bytes everywhere, so a misplaced range can't read back equal.
+        let pattern = |seed: u8, n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+        let m = crate::index::MIN_PART_SIZE as usize;
+        let parts = [pattern(1, m), pattern(2, m), pattern(3, 11)];
         let uid = s.create_multipart("bkt", "m", "t", None).await.unwrap();
         for (i, p) in parts.iter().enumerate() {
-            s.upload_part("bkt", &uid, i as u32 + 1, *p, None)
+            s.upload_part("bkt", &uid, i as u32 + 1, &p[..], None)
                 .await
                 .unwrap();
         }
@@ -1648,7 +1666,7 @@ mod tests {
         let r = row(&s, "bkt", "m");
         assert_eq!(
             r.segments.iter().map(|g| g.size).collect::<Vec<_>>(),
-            [7, 3, 11]
+            [m as u64, m as u64, 11]
         );
         assert_eq!(
             segment_files(&dir),
@@ -1656,18 +1674,65 @@ mod tests {
             "the unused part is gone, nothing copied"
         );
         let whole: Vec<u8> = parts.concat();
-        for start in 0..whole.len() as u64 {
-            for len in 0..=(whole.len() as u64 - start) {
+        let total = whole.len() as u64;
+        let (m, t) = (m as u64, total);
+        // Starts and lengths on, just before and just after every segment boundary.
+        let starts = [0, 1, m - 1, m, m + 1, 2 * m - 1, 2 * m, 2 * m + 5, t - 1];
+        for start in starts {
+            for len in [0, 1, 2, 7, m - 1, m, m + 2, t - start] {
+                let len = len.min(t - start);
                 let (_, body) = s.get_object("bkt", "m").await.unwrap();
                 let got: Vec<_> = body.stream(start, len).try_collect().await.unwrap();
-                assert_eq!(
-                    got.concat(),
-                    &whole[start as usize..(start + len) as usize],
+                assert!(
+                    got.concat() == whole[start as usize..(start + len) as usize],
                     "[{start}, +{len})"
                 );
             }
         }
         assert!(due(&s).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As in S3, every part but the last must be at least 5 MiB. A refused complete
+    /// changes nothing: re-uploading the small part lets it complete. A lone part (the
+    /// last) may be any size.
+    #[tokio::test]
+    async fn non_final_parts_must_meet_the_minimum() {
+        let dir = root("mp-min");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let uid = s.create_multipart("bkt", "k", "t", None).await.unwrap();
+        let mut short = big(b'a');
+        short.pop();
+        s.upload_part("bkt", &uid, 1, &short[..], None)
+            .await
+            .unwrap();
+        s.upload_part("bkt", &uid, 2, &b"tail"[..], None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.complete_multipart("bkt", "k", &uid, &[1, 2]).await,
+            Err(ObjectError::EntityTooSmall(1))
+        ));
+        let first = big(b'a');
+        s.upload_part("bkt", &uid, 1, &first[..], None)
+            .await
+            .unwrap();
+        s.complete_multipart("bkt", "k", &uid, &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.head_object("bkt", "k").await.unwrap().size,
+            first.len() as u64 + 4
+        );
+
+        let lone = s.create_multipart("bkt", "one", "t", None).await.unwrap();
+        s.upload_part("bkt", &lone, 1, &b"x"[..], None)
+            .await
+            .unwrap();
+        s.complete_multipart("bkt", "one", &lone, &[1])
+            .await
+            .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1677,7 +1742,8 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bkt").await.unwrap();
         let uid = s.create_multipart("bkt", "k", "t", None).await.unwrap();
-        s.upload_part("bkt", &uid, 1, &b"a"[..], None)
+        let first = big(b'a');
+        s.upload_part("bkt", &uid, 1, &first[..], None)
             .await
             .unwrap();
         s.upload_part("bkt", &uid, 2, &b"b"[..], None)
@@ -1695,7 +1761,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             read_all(s.get_object("bkt", "k").await.unwrap().1).await,
-            b"ab"
+            [first.as_slice(), b"b"].concat()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1988,8 +2054,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        std::fs::write(up.join("part-1"), b"hello ").unwrap();
-        std::fs::write(up.join("part-1.md5"), Md5::digest(b"hello ")).unwrap();
+        let first = big(b'h');
+        std::fs::write(up.join("part-1"), &first).unwrap();
+        std::fs::write(up.join("part-1.md5"), Md5::digest(&first)).unwrap();
 
         let s = ObjectStore::open(&dir).unwrap();
         assert_eq!(s.list_buckets().await.unwrap(), ["bkt", "empty-bucket"]);
@@ -2013,7 +2080,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             read_all(s.get_object("bkt", "mp").await.unwrap().1).await,
-            b"hello world"
+            [first.as_slice(), b"world"].concat()
         );
         assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
         let _ = std::fs::remove_dir_all(&dir);

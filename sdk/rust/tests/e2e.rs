@@ -172,7 +172,9 @@ async fn multipart_roundtrip_and_abort() {
         .await
         .unwrap();
     assert!(!up.upload_id().is_empty());
-    up.upload_part(1, b"AAAA".to_vec()).await.unwrap();
+    // Every part but the last must be at least 5 MiB.
+    let first = vec![b'A'; jkbase_objectstore_client::MIN_PART_SIZE];
+    up.upload_part(1, first.clone()).await.unwrap();
     up.upload_part(2, b"BB".to_vec()).await.unwrap();
 
     let pending = c.list_multipart_uploads("multi").await.unwrap();
@@ -181,7 +183,7 @@ async fn multipart_roundtrip_and_abort() {
     up.complete().await.unwrap();
     assert_eq!(
         &c.get_object_bytes("multi", "big.bin").await.unwrap()[..],
-        b"AAAABB"
+        [first.as_slice(), b"BB"].concat()
     );
 
     // Abort discards a started upload.

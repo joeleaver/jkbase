@@ -673,6 +673,7 @@ fn s3_error(e: ObjectError) -> Response {
             (StatusCode::BAD_REQUEST, "XAmzContentSHA256Mismatch")
         }
         ObjectError::InvalidPartOrder => (StatusCode::BAD_REQUEST, "InvalidPartOrder"),
+        ObjectError::EntityTooSmall(_) => (StatusCode::BAD_REQUEST, "EntityTooSmall"),
         ObjectError::CorruptMeta(_) | ObjectError::Io(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
         }
@@ -1077,8 +1078,9 @@ mod tests {
         let (_, _, xml) = body_str(r).await;
         let uid = between(&xml, "<UploadId>", "</UploadId>");
 
-        // Upload two parts.
-        for (n, data) in [(1, "AAAA"), (2, "BB")] {
+        // Upload two parts (all but the last must be at least 5 MiB, as in S3).
+        let first = "A".repeat(5 << 20);
+        for (n, data) in [(1, first.clone()), (2, "BB".to_string())] {
             let r = app
                 .clone()
                 .oneshot(
@@ -1134,7 +1136,7 @@ mod tests {
             .await
             .unwrap();
         let (_, _, text) = body_str(r).await;
-        assert_eq!(text, "AAAABB");
+        assert_eq!(text, first + "BB");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
