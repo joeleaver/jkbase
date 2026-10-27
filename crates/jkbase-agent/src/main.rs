@@ -2233,8 +2233,8 @@ mod tests {
     }
 
     /// Without a bound host, the longest matching prefix wins, at segment boundaries —
-    /// antsome's layout on prod: `/favicon.ico` belongs to the root site, not to the `/f`
-    /// SPA (which used to swallow it as `avicon.ico` and answer with its index.html).
+    /// antsome's layout on prod: `/faq` or `/apple` are not under the `/f` or `/app` SPAs
+    /// (which used to answer them with their own index.html) but under the root site.
     #[test]
     fn unbound_hosts_pick_the_longest_prefix_at_a_segment_boundary() {
         let sites = [
