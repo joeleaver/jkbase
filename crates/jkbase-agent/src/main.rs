@@ -503,6 +503,8 @@ struct SiteEntry {
     root: PathBuf,
     prefix: String,
     spa: bool,
+    /// The host this site is bound to, as declared (`[sites.x] domain`), if any.
+    domain: Option<String>,
 }
 
 #[tokio::main]
@@ -833,7 +835,7 @@ fn load_sites_config(serve_dir: &Path) -> Vec<SiteEntry> {
         Err(_) => return Vec::new(),
     };
 
-    // Sites are already sorted by prefix length (longest first) from the CLI
+    // Order doesn't matter: `select_site` picks the longest matching prefix itself.
     sites
         .into_iter()
         .map(|s| {
@@ -843,6 +845,7 @@ fn load_sites_config(serve_dir: &Path) -> Vec<SiteEntry> {
                 root,
                 prefix: s.prefix,
                 spa: s.spa,
+                domain: s.domain,
             }
         })
         .filter(|s| s.root.exists())
@@ -866,7 +869,7 @@ fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
             Err(_) => return Vec::new(),
         };
 
-    routes
+    let mut routes: Vec<RouteEntry> = routes
         .iter()
         .filter_map(|(prefix, target)| {
             // Typed backend kind; an unknown service is dropped (forward-compat + fail-closed)
@@ -882,7 +885,79 @@ fn load_route_config(serve_dir: &Path) -> Vec<RouteEntry> {
                 kind,
             })
         })
-        .collect()
+        .collect();
+    // The request loop takes the first match, so the most specific prefix must come first:
+    // `/api/projects/*` wins over `/api/*` (the nginx `location` rule). `_routes.json` is
+    // an unordered map, so without this, overlapping prefixes matched in whatever order
+    // the map happened to iterate — differently across restarts. Ties break by name for a
+    // stable order.
+    routes.sort_by(|a, b| {
+        let len = |r: &RouteEntry| r.prefix.trim_end_matches('*').len();
+        len(b).cmp(&len(a)).then_with(|| a.prefix.cmp(&b.prefix))
+    });
+    routes
+}
+
+/// Where `prefix` mounts `path`, at a path-segment boundary: `Some(rest)` (the path below
+/// the mount, `""` for the mount point itself) or `None`. `/play` mounts `/play` and
+/// `/play/x` but not `/playground`; `/` (or `""`) mounts everything.
+fn mount<'p>(prefix: &str, path: &'p str) -> Option<&'p str> {
+    let p = prefix.trim_end_matches('/');
+    let rest = path.strip_prefix(p)?;
+    (p.is_empty() || rest.is_empty() || rest.starts_with('/')).then_some(rest)
+}
+
+fn same_domain(a: &str, b: &str) -> bool {
+    let norm = |d: &str| d.trim().trim_end_matches('.').to_ascii_lowercase();
+    norm(a) == norm(b)
+}
+
+/// The static site that serves `path`, and the path within that site — the longest
+/// matching prefix wins.
+///
+/// `host_site` is the site the proxy says this request's host is bound to (the trusted
+/// `X-Jkbase-Site`). On a bound host the candidates are the sites bound to that same
+/// domain plus the sites bound to none; the bound site with the shortest prefix is the
+/// host's ROOT, serving its whole tree at `/` (whatever its own prefix), and every other
+/// candidate is mounted at its prefix. So `studio` (`domain = "playweft"`) serves
+/// `playweft.jkbase.app/` while `play` (`prefix = "/play"`, bound to the same domain or to
+/// none) serves `/play/*` with its own SPA fallback. A site bound to a DIFFERENT domain is
+/// never served on this host. The control plane records one site per host (the first to
+/// claim it), so the domain — not that site's name — decides the candidates.
+///
+/// A host bound through the API to a site that declares no domain works the same way, with
+/// that site as the root. Without a bound site, every site is a candidate at its prefix.
+fn select_site<'s, 'p>(
+    sites: &'s [SiteEntry],
+    host_site: Option<&str>,
+    path: &'p str,
+) -> Option<(&'s SiteEntry, &'p str)> {
+    let longest = |candidates: &mut dyn Iterator<Item = &'s SiteEntry>| {
+        candidates
+            .filter_map(|s| mount(&s.prefix, path).map(|rest| (s, rest)))
+            .max_by_key(|(s, _)| s.prefix.trim_end_matches('/').len())
+    };
+    let Some(bound) = host_site.and_then(|name| sites.iter().find(|s| s.name == name)) else {
+        return longest(&mut sites.iter());
+    };
+    // Sites bound to this host's domain. A host bound through the API to a site that
+    // declares no domain has just that one.
+    let bound_here = |s: &SiteEntry| match (bound.domain.as_deref(), s.domain.as_deref()) {
+        (Some(d), Some(e)) => same_domain(d, e),
+        (None, _) => s.name == bound.name,
+        (Some(_), None) => false,
+    };
+    let root = sites
+        .iter()
+        .filter(|s| bound_here(s))
+        .min_by_key(|s| (s.prefix.trim_end_matches('/').len(), s.name != bound.name))
+        .unwrap_or(bound);
+    let mounted = longest(&mut sites.iter().filter(|s| {
+        (s.domain.is_none() || bound_here(s))
+            && s.name != root.name
+            && !s.prefix.trim_end_matches('/').is_empty()
+    }));
+    Some(mounted.unwrap_or((root, path)))
 }
 
 /// Unified agent response body. Most branches build a buffered [`Full`] (health, control
@@ -1007,45 +1082,22 @@ async fn handle_request(
         return Ok(box_full(not_found_response()));
     }
 
-    // Host-bound site: the proxy sets X-Jkbase-Site (stripped from inbound, so
-    // trusted) when the request's hostname maps to a specific site. Serve that
-    // site's whole tree.
-    if let Some(site_name) = req
+    // Static sites. The proxy sets X-Jkbase-Site (stripped from inbound, so trusted) when
+    // the request's hostname is bound to a site; `select_site` mounts that host's root
+    // site plus any longer-prefix site, and otherwise picks by prefix alone.
+    let host_site = req
         .headers()
         .get("x-jkbase-site")
-        .and_then(|v| v.to_str().ok())
-        && let Some(site) = state.sites.iter().find(|s| s.name == site_name)
-    {
+        .and_then(|v| v.to_str().ok());
+    if let Some((site, sub_path)) = select_site(&state.sites, host_site, &path) {
         return static_server::handle_static_with_path(
             &site.root,
-            &path,
+            sub_path,
             site.spa,
             &static_server::ReqConds::from_headers(req.headers()),
         )
         .await
         .map(box_full);
-    }
-
-    // Multi-site routing: find the best matching site by prefix
-    if !state.sites.is_empty() {
-        for site in &state.sites {
-            let prefix = site.prefix.trim_end_matches('/');
-            if prefix.is_empty() || path.starts_with(prefix) {
-                let sub_path = if prefix.is_empty() {
-                    path.to_string()
-                } else {
-                    path.strip_prefix(prefix).unwrap_or(&path).to_string()
-                };
-                return static_server::handle_static_with_path(
-                    &site.root,
-                    &sub_path,
-                    site.spa,
-                    &static_server::ReqConds::from_headers(req.headers()),
-                )
-                .await
-                .map(box_full);
-            }
-        }
     }
 
     // Fall through to default static file serving. handle_static serves the image
@@ -2115,6 +2167,255 @@ mod tests {
         let web = routes.iter().find(|r| r.prefix == "/").unwrap();
         assert_eq!(web.kind, RouteKind::Server);
         assert!(!routes.iter().any(|r| r.prefix == "/x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overlapping route prefixes resolve to the most specific one, whatever order the
+    /// unordered `_routes.json` map parses in.
+    #[test]
+    fn routes_are_ordered_longest_prefix_first() {
+        let dir = std::env::temp_dir().join(format!("jkagent-route-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("_routes.json"),
+            r#"{
+              "/*":             {"service":"server","name":"web"},
+              "/api/*":         {"service":"server","name":"accounts"},
+              "/api/projects/*":{"service":"server","name":"store"},
+              "/api":           {"service":"server","name":"bare"},
+              "/":              {"service":"server","name":"root"}
+            }"#,
+        )
+        .unwrap();
+        let order: Vec<String> = load_route_config(&dir).into_iter().map(|r| r.prefix).collect();
+        assert_eq!(order, ["/api/projects/*", "/api/*", "/api", "/", "/*"]);
+        let first = |path: &str| {
+            load_route_config(&dir)
+                .into_iter()
+                .find(|r| path.starts_with(r.prefix.trim_end_matches('*')))
+                .map(|r| r.name)
+        };
+        assert_eq!(first("/api/projects/7").as_deref(), Some("store"));
+        assert_eq!(first("/api/me").as_deref(), Some("accounts"));
+        assert_eq!(first("/index.html").as_deref(), Some("root"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn site(name: &str, prefix: &str, domain: Option<&str>) -> SiteEntry {
+        SiteEntry {
+            name: name.into(),
+            root: PathBuf::from(format!("/sites/{name}")),
+            prefix: prefix.into(),
+            spa: true,
+            domain: domain.map(Into::into),
+        }
+    }
+
+    /// `(site, path within it)` for a request, or `None`.
+    fn pick(sites: &[SiteEntry], host_site: Option<&str>, path: &str) -> Option<(String, String)> {
+        select_site(sites, host_site, path).map(|(s, rest)| (s.name.clone(), rest.to_string()))
+    }
+
+    fn at(name: &str, rest: &str) -> Option<(String, String)> {
+        Some((name.into(), rest.into()))
+    }
+
+    #[test]
+    fn prefixes_mount_at_segment_boundaries() {
+        assert_eq!(mount("/play", "/play"), Some(""));
+        assert_eq!(mount("/play", "/play/"), Some("/"));
+        assert_eq!(mount("/play/", "/play/abc/x.js"), Some("/abc/x.js"));
+        assert_eq!(mount("/play", "/playground"), None);
+        assert_eq!(mount("/f", "/favicon.ico"), None);
+        assert_eq!(mount("/", "/anything"), Some("/anything"));
+        assert_eq!(mount("", "/anything"), Some("/anything"));
+    }
+
+    /// Without a bound host, the longest matching prefix wins, at segment boundaries —
+    /// antsome's layout on prod: `/favicon.ico` belongs to the root site, not to the `/f`
+    /// SPA (which used to swallow it as `avicon.ico` and answer with its index.html).
+    #[test]
+    fn unbound_hosts_pick_the_longest_prefix_at_a_segment_boundary() {
+        let sites = [
+            site("home", "/", None),
+            site("f", "/f", None),
+            site("app", "/app", None),
+            site("terms", "/terms", None),
+        ];
+        assert_eq!(pick(&sites, None, "/favicon.ico"), at("home", "/favicon.ico"));
+        assert_eq!(pick(&sites, None, "/f/abc"), at("f", "/abc"));
+        assert_eq!(pick(&sites, None, "/f"), at("f", ""));
+        assert_eq!(pick(&sites, None, "/apple-touch-icon.png"), at("home", "/apple-touch-icon.png"));
+        assert_eq!(pick(&sites, None, "/app/settings"), at("app", "/settings"));
+        // No root site: an unmatched path has no site.
+        assert_eq!(pick(&sites[1..], None, "/other"), None);
+    }
+
+    /// The Playweft ask: the domain-bound root site serves the host, and a longer-prefix
+    /// site — bound to the same domain or to none — serves its prefix with its own SPA.
+    #[test]
+    fn a_longer_prefix_site_is_served_on_a_bound_host() {
+        for play_domain in [Some("playweft"), None, Some("PlayWeft.")] {
+            let sites = [
+                site("studio", "/", Some("playweft")),
+                site("play", "/play", play_domain),
+            ];
+            // Whichever site the control plane recorded for the host: the first to claim
+            // it, so `play` too when both declare the domain.
+            let headers: &[&str] = if play_domain.is_some() { &["studio", "play"] } else { &["studio"] };
+            for &header in headers {
+                let h = Some(header);
+                assert_eq!(pick(&sites, h, "/"), at("studio", "/"), "{play_domain:?} {header}");
+                assert_eq!(pick(&sites, h, "/verify"), at("studio", "/verify"));
+                assert_eq!(pick(&sites, h, "/play/p123"), at("play", "/p123"));
+                assert_eq!(pick(&sites, h, "/play/assets/g.wasm"), at("play", "/assets/g.wasm"));
+                assert_eq!(pick(&sites, h, "/playground"), at("studio", "/playground"));
+            }
+        }
+    }
+
+    /// A bound host never serves a site bound to a different domain, and an unbound root
+    /// site doesn't displace the bound one.
+    #[test]
+    fn a_bound_host_only_serves_its_own_and_unbound_sites() {
+        let sites = [
+            site("www", "/", Some("example.com")),
+            site("docs", "/docs", Some("docs.example.com")),
+            site("blog", "/blog", None),
+            site("fallback", "/", None),
+        ];
+        let h = Some("www");
+        assert_eq!(pick(&sites, h, "/docs/intro"), at("www", "/docs/intro"));
+        assert_eq!(pick(&sites, h, "/blog/post"), at("blog", "/post"));
+        assert_eq!(pick(&sites, h, "/"), at("www", "/"));
+        // On docs' own host, docs is the root (its `/docs` prefix doesn't apply there).
+        assert_eq!(pick(&sites, Some("docs"), "/intro"), at("docs", "/intro"));
+        assert_eq!(pick(&sites, Some("docs"), "/blog/x"), at("blog", "/x"));
+        // The project's own host (no binding): plain prefix routing over every site.
+        assert_eq!(pick(&sites, None, "/docs/intro"), at("docs", "/intro"));
+        assert_eq!(pick(&sites, None, "/x"), at("fallback", "/x"));
+    }
+
+    /// A single domain-bound site is served whole on its host, as before — including
+    /// when it declares a prefix of its own.
+    #[test]
+    fn a_lone_bound_site_still_serves_its_whole_tree() {
+        let sites = [site("docs", "/docs", Some("docs")), site("home", "/", None)];
+        assert_eq!(pick(&sites, Some("docs"), "/"), at("docs", "/"));
+        assert_eq!(pick(&sites, Some("docs"), "/docs/x"), at("docs", "/docs/x"));
+        // An API-bound host whose site declares no domain: that site is the root, and
+        // unbound longer prefixes still mount.
+        let sites = [site("main", "/", None), site("admin", "/admin", None)];
+        assert_eq!(pick(&sites, Some("main"), "/admin/users"), at("admin", "/users"));
+        assert_eq!(pick(&sites, Some("main"), "/x"), at("main", "/x"));
+        // A header naming no deployed site falls back to plain prefix routing.
+        assert_eq!(pick(&sites, Some("gone"), "/x"), at("main", "/x"));
+    }
+
+    /// Serve `serve_dir` through the agent's real request handler on a loopback port.
+    async fn serve_agent(serve_dir: &Path) -> SocketAddr {
+        let log_sink = Arc::new(LogSink::new());
+        let egress = function_egress::EgressContext::new(
+            &jkbase_common::config::PlatformEgress::default(),
+            log_sink.clone(),
+        )
+        .unwrap();
+        let state = Arc::new(AgentState {
+            serve_dir: serve_dir.to_path_buf(),
+            functions_dir: serve_dir.join("_functions"),
+            functions: FunctionRuntime::new(egress),
+            containers: Arc::new(ContainerSupervisor::new(
+                serve_dir.join("_servers"),
+                HashMap::new(),
+                log_sink.clone(),
+            )),
+            log_sink,
+            route_config: load_route_config(serve_dir),
+            sites: load_sites_config(serve_dir),
+            db_splice_secret: None,
+            db_admin_token: None,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| handle_request(state.clone(), req, true));
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// `GET path` with an optional proxy-stamped site header → (status, body).
+    async fn get(addr: SocketAddr, site: Option<&str>, path: &str) -> (u16, String) {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut req = Request::get(path).header("host", "playweft.jkbase.app");
+        if let Some(site) = site {
+            req = req.header("x-jkbase-site", site);
+        }
+        let resp = sender
+            .send_request(req.body(http_body_util::Empty::<Bytes>::new()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// End to end through the real handler: the Playweft layout — a domain-bound SPA at
+    /// the root and a second SPA at `/play` on the same host — plus a site bound to another
+    /// domain, which this host must never serve.
+    #[tokio::test]
+    async fn a_bound_host_serves_a_longer_prefix_site_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("jkagent-sites-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (site, files) in [
+            ("studio", &[("index.html", "STUDIO"), ("app.js", "studio-js")][..]),
+            ("play", &[("index.html", "PLAY"), ("assets/g.js", "play-js")][..]),
+            ("docs", &[("index.html", "DOCS")][..]),
+        ] {
+            for (name, body) in files {
+                let f = dir.join(format!("_site_{site}")).join(name);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, body).unwrap();
+            }
+        }
+        // As the deploy writes it: resolved sites, longest prefix first.
+        std::fs::write(
+            dir.join("_sites.json"),
+            r#"[
+              {"name":"play","public":"p","spa":true,"prefix":"/play","domain":"playweft"},
+              {"name":"docs","public":"d","spa":false,"prefix":"/docs","domain":"docs.example.com"},
+              {"name":"studio","public":"s","spa":true,"prefix":"/","domain":"playweft"}
+            ]"#,
+        )
+        .unwrap();
+        let addr = serve_agent(&dir).await;
+        // The control plane may have recorded either site for the host.
+        for host_site in ["studio", "play"] {
+            let h = Some(host_site);
+            assert_eq!(get(addr, h, "/").await, (200, "STUDIO".into()), "{host_site}");
+            assert_eq!(get(addr, h, "/app.js").await, (200, "studio-js".into()));
+            assert_eq!(get(addr, h, "/verify").await, (200, "STUDIO".into()), "studio SPA fallback");
+            assert_eq!(get(addr, h, "/play/p123").await, (200, "PLAY".into()), "play SPA fallback");
+            assert_eq!(get(addr, h, "/play/assets/g.js").await, (200, "play-js".into()));
+            assert_eq!(get(addr, h, "/playground").await, (200, "STUDIO".into()));
+            // docs is bound elsewhere: on this host /docs is just a studio route.
+            assert_eq!(get(addr, h, "/docs").await, (200, "STUDIO".into()));
+        }
+        // docs on its own host is its root.
+        assert_eq!(get(addr, Some("docs"), "/").await, (200, "DOCS".into()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
