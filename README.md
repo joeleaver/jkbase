@@ -124,7 +124,26 @@ spa = true
 
 A committed site **must** set `public` (a site with no `public` and no `build` is rejected at
 deploy, so you can never accidentally publish your whole source tree). Longest matching `prefix`
-wins.
+wins, at a path-segment boundary: `/docs` serves `/docs` and `/docs/…`, never `/docsearch`.
+
+A site with a `domain` is that host's **root** — it serves the whole host. Other sites still mount
+on that host at their own `prefix` if they're bound to the **same** domain or to **none**, so one
+origin can carry an app plus a separately built sub-app:
+
+```toml
+[sites.studio]               # https://playweft.jkbase.app/…
+public = "./studio/dist"
+spa = true
+domain = "playweft"
+
+[sites.play]                 # https://playweft.jkbase.app/play/… (its own SPA fallback)
+build = "trunk"
+source = "player"
+prefix = "/play"
+spa = true
+```
+
+A site bound to a *different* domain is never served on this host.
 
 ### Built sites (Rust/WASM via Trunk)
 
@@ -570,8 +589,10 @@ domains = ["example.com", "www.example.com"]
 ```
 
 `service` is either `"server"` or `"function"` (the only two honored values — anything else, and the
-route silently doesn't exist); `name` matches a `[servers.*]`/`[functions.*]` key. Static sites are
-routed by their own `prefix`/`domain`, not through `[routes]`.
+route silently doesn't exist); `name` matches a `[servers.*]`/`[functions.*]` key. When several
+routes match, the **longest** prefix wins — `"/api/projects/*"` beats `"/api/*"` — and routes are
+checked before static sites. Static sites are routed by their own `prefix`/`domain`, not through
+`[routes]`.
 
 Or attach domains imperatively with `jkbase domain add` (handy for `_acme-challenge` /
 TXT-verification flows). `--site <name>` binds a domain to one site within a multi-site project.
