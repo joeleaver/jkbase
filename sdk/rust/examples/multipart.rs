@@ -7,7 +7,7 @@
 //! cargo run -p jkbase-objectstore-client --example multipart
 //! ```
 
-use jkbase_objectstore_client::ObjectClient;
+use jkbase_objectstore_client::{MIN_PART_SIZE, ObjectClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,13 +22,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initiate, upload a few parts, then complete (parts are concatenated in order).
+    // Every part but the last must be at least 5 MiB (`MIN_PART_SIZE`), as in S3.
     let mut upload = s3
         .create_multipart(bucket, "report.bin", "application/octet-stream")
         .await?;
     println!("upload id: {}", upload.upload_id());
     for (n, chunk) in [
-        (1, vec![b'A'; 64]),
-        (2, vec![b'B'; 32]),
+        (1, vec![b'A'; MIN_PART_SIZE]),
+        (2, vec![b'B'; MIN_PART_SIZE]),
         (3, vec![b'C'; 16]),
     ] {
         upload.upload_part(n, chunk).await?;

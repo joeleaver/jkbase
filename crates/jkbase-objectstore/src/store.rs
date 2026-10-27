@@ -1,139 +1,30 @@
 use crate::cors::CorsConfig;
+use crate::index::{Index, ObjectRow, PartRow, SegRef};
+use crate::segments::{
+    ByteStream, FileIdent, LocalSegments, SegmentStore, SegmentWriter, file_ident,
+};
+use futures_util::{StreamExt, TryStreamExt};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Longest single file name the bucket's filesystem accepts (ext4 / xfs / btrfs).
-const NAME_MAX: usize = 255;
-const META_SUFFIX: &str = ".meta";
+/// The index file and segment directory under a project's store root. Dot-prefixed: a
+/// layout-1 bucket directory can't start with `.`, so neither can collide with one.
+const INDEX_FILE: &str = ".index.redb";
+const SEGMENTS_DIR: &str = ".segments";
 
-/// Keys up to this many bytes are stored under `hex(key)`: the longest whose sidecar
-/// name (`2n` hex chars + `.meta`) still fits `NAME_MAX`. Every object written before
-/// longer keys were storable is in this range (the old temp-file name capped keys at
-/// 123 bytes at most), so it is read back with no migration.
-const HEX_NAME_MAX_KEY: usize = (NAME_MAX - META_SUFFIX.len()) / 2;
-
-/// Name prefix of a key stored whole in base64 ([`b64`]): `b-<b64(key)>`. Fits keys up
-/// to [`B64_NAME_MAX_KEY`] bytes.
-const B64_NAME_PREFIX: &str = "b-";
-const B64_NAME_MAX_KEY: usize = 186; // 2 + ceil(186·4/3) + ".meta" = 255
-
-/// Name prefix of a key too long for any whole-key name: `k-<b64(sha256(key))>.<b64(head)>`,
-/// 43 + 204 base64 chars — 255 bytes with `.meta`. Neither prefix is valid hex (`-`), so
-/// the three name spaces are disjoint and a `hex(key)`-only reader skips the new ones.
-const HASH_NAME_PREFIX: &str = "k-";
-const HASH_NAME_DIGEST_CHARS: usize = 43;
-
-/// Leading key bytes embedded in a hashed name. Listing uses this head to filter by
-/// prefix, fold folders and paginate WITHOUT opening the sidecar of every such object.
-const HASH_NAME_HEAD: usize = 153; // ceil(153·4/3) = 204
-
-/// The on-disk file-name stem for `key` (the bytes live at `<stem>`, the JSON sidecar
-/// at `<stem>.meta`). Pure function of the key; traversal-safe (no `/`, no `.` first).
-///
-/// - `<= 125` bytes: `hex(key)` — the original scheme.
-/// - `<= 186` bytes: `b-<b64(key)>` — hex would exceed `NAME_MAX`; base64 still holds
-///   the whole key, so the name alone identifies it (no sidecar read to list).
-/// - up to the 1024-byte S3 limit: `k-<b64(sha256(key))>.<b64(first 153 bytes)>`. The
-///   full key is in the sidecar; the hash keeps keys that share a head in distinct files.
-fn object_stem(key: &str) -> String {
-    let b = key.as_bytes();
-    if b.len() <= HEX_NAME_MAX_KEY {
-        hex(b)
-    } else if b.len() <= B64_NAME_MAX_KEY {
-        format!("{B64_NAME_PREFIX}{}", b64(b))
-    } else {
-        format!(
-            "{HASH_NAME_PREFIX}{}.{}",
-            b64(&Sha256::digest(b)),
-            b64(&b[..HASH_NAME_HEAD])
-        )
-    }
-}
-
-/// What a listing learns about an object from its file-name stem alone.
-enum StemKey {
-    /// A whole-key name (`hex` or `b-`): the key.
-    Exact(String),
-    /// A hashed name: only the key's first [`HASH_NAME_HEAD`] bytes (the rest is in the
-    /// sidecar). May end mid-way through a multi-byte character.
-    Head(Vec<u8>),
-}
-
-/// Parse a stem written by [`object_stem`]; `None` for anything else (skipped). A name
-/// only counts in the tier `object_stem` would have chosen for its key, so every object
-/// has exactly one name.
-fn parse_stem(stem: &str) -> Option<StemKey> {
-    if let Some(rest) = stem.strip_prefix(HASH_NAME_PREFIX) {
-        let (digest, head) = rest.split_at_checked(HASH_NAME_DIGEST_CHARS)?;
-        let head = b64_decode(head.strip_prefix('.')?)?;
-        b64_decode(digest)?;
-        return (head.len() == HASH_NAME_HEAD).then_some(StemKey::Head(head));
-    }
-    let key = match stem.strip_prefix(B64_NAME_PREFIX) {
-        Some(rest) => b64_decode(rest)?,
-        None => hex_decode(stem).ok()?,
-    };
-    let key = String::from_utf8(key).ok()?;
-    // Wrong tier for its length, or uppercase hex: not a name this store writes.
-    (object_stem(&key) == stem).then_some(StemKey::Exact(key))
-}
-
-/// What a hashed name's head alone settles for a listing under `prefix` / `delimiter`.
-enum HeadVerdict {
-    /// The key cannot match `prefix`.
-    Skip,
-    /// The key folds into this common prefix (the delimiter occurs inside the head).
-    Folder(String),
-    /// Matches as far as the head goes; the full key (sidecar) decides the rest.
-    NeedKey,
-}
-
-fn judge_head(head: &[u8], prefix: &str, delimiter: Option<&str>) -> HeadVerdict {
-    let p = prefix.as_bytes();
-    if p.len() > head.len() {
-        // The prefix reaches past the head: the head can only rule the key out.
-        return if p.starts_with(head) {
-            HeadVerdict::NeedKey
-        } else {
-            HeadVerdict::Skip
-        };
-    }
-    if !head.starts_with(p) {
-        return HeadVerdict::Skip;
-    }
-    if let Some(d) = delimiter.filter(|d| !d.is_empty()) {
-        let d = d.as_bytes();
-        // The first occurrence inside the head is the first in the key. UTF-8 is
-        // self-synchronizing, so the cut after a whole delimiter is a char boundary.
-        if let Some(i) = head[p.len()..].windows(d.len()).position(|w| w == d)
-            && let Ok(folder) = String::from_utf8(head[..p.len() + i + d.len()].to_vec())
-        {
-            return HeadVerdict::Folder(folder);
-        }
-    }
-    HeadVerdict::NeedKey
-}
-
-/// Concurrent listings of one store (one project). A listing scans the whole bucket
-/// directory, and hashed-name objects sharing a head cost a sidecar read each, so a
-/// tenant could otherwise multiply that host I/O by issuing LISTs in parallel. Extra
-/// requests wait their turn; they are not refused.
+/// Concurrent listings of one store (one project). A listing is an index range scan now,
+/// but a delimiter-less scan of a large bucket still reads up to `max_keys` rows; extra
+/// requests wait their turn rather than multiply that work. They are not refused.
 const MAX_CONCURRENT_LISTS: usize = 4;
-
-/// A key starting with `head` is certainly `<= start_after` (so a resumed listing has
-/// already passed it): `head` sorts strictly before `start_after` at a byte both have.
-fn head_precedes(head: &[u8], start_after: &str) -> bool {
-    let sa = start_after.as_bytes();
-    let n = head.len().min(sa.len());
-    head[..n] < sa[..n]
-}
 
 /// Per-idle-read timeout for put_object / upload_part (slow-loris guard).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -155,7 +46,8 @@ const MIN_UPLOAD_RATE: u64 = 1024 * 1024;
 /// very large) byte quota — so without this ceiling a large-quota tenant could
 /// declare a huge length and hold a connection open for days/years by trickling one
 /// byte per `IDLE_TIMEOUT`. 6h covers a full default-quota (16 GiB) single PUT at the
-/// floor rate (~4.6h); larger objects must use multipart.
+/// floor rate (~4.6h); larger objects must use multipart. The index's
+/// `PENDING_ORPHAN_AGE` must stay above this.
 const MAX_UPLOAD_DEADLINE: Duration = Duration::from_secs(6 * 3600);
 
 /// Total wall-clock budget for one upload body of `declared_len` (the declared
@@ -200,6 +92,12 @@ pub enum ObjectError {
     /// x-amz-content-sha256 mismatch (body corrupted in transit).
     #[error("content sha256 mismatch")]
     ContentSha256Mismatch,
+    /// CompleteMultipartUpload listed parts out of ascending order (or repeated one).
+    #[error("parts must be listed in ascending order without repeats")]
+    InvalidPartOrder,
+    /// A part other than the last is under S3's 5 MiB minimum.
+    #[error("part {0} is smaller than the 5 MiB minimum for all but the last part")]
+    EntityTooSmall(u32),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -207,16 +105,16 @@ pub enum ObjectError {
 /// Per-upload info persisted at multipart-initiate (the final object's key +
 /// content-type, applied at complete).
 #[derive(Serialize, Deserialize)]
-struct UploadInfo {
-    key: String,
-    content_type: String,
+pub(crate) struct UploadInfo {
+    pub key: String,
+    pub content_type: String,
     /// Unix seconds at which the upload was initiated. Defaulted to 0 for
     /// uploads created before this field existed (pre-hardening).
     #[serde(default)]
-    initiated: u64,
+    pub initiated: u64,
     /// `Cache-Control` captured at initiate, applied to the completed object.
     #[serde(default)]
-    cache_control: Option<String>,
+    pub cache_control: Option<String>,
 }
 
 type Result<T> = std::result::Result<T, ObjectError>;
@@ -226,13 +124,14 @@ type Result<T> = std::result::Result<T, ObjectError>;
 pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
-    /// S3 single-part etag: the hex MD5 of the object bytes (the API layer quotes it).
+    /// S3 etag (the API layer quotes it): hex MD5 of the bytes for a single PUT,
+    /// `md5(part md5s)-<count>` for a multipart upload.
     pub etag: String,
     pub content_type: String,
     /// Last-modified, unix seconds.
     pub last_modified: u64,
     /// Client-supplied `Cache-Control` to echo on GET/HEAD. `#[serde(default)]` so
-    /// sidecars written before this field existed still deserialize (as `None`).
+    /// rows written before this field existed still deserialize (as `None`).
     #[serde(default)]
     pub cache_control: Option<String>,
 }
@@ -272,127 +171,430 @@ pub struct MultipartUpload {
     pub initiated: u64,
 }
 
-/// A tenant object store rooted at `root`, one subdirectory per bucket. Each
-/// object is two files: `<stem>` (the bytes) and `<stem>.meta` (JSON), where the stem
-/// is [`object_stem`] of its key.
-pub struct ObjectStore {
-    root: PathBuf,
-    list_permits: tokio::sync::Semaphore,
+/// An object's bytes as of the moment it was looked up: its segment manifest, pinned.
+/// While the body is alive (until its stream is dropped) none of its segments is deleted,
+/// even if the object is overwritten or deleted meanwhile, so a GET never mixes versions
+/// and never loses bytes mid-stream.
+pub struct ObjectBody {
+    segments: Vec<SegRef>,
+    store: Arc<dyn SegmentStore>,
+    pin: PinGuard,
 }
 
+impl ObjectBody {
+    /// Stream bytes `[start, start + len)` of the object. The caller bounds the range by
+    /// the object's size (it has already promised the client a Content-Length).
+    pub fn stream(self, start: u64, len: u64) -> ByteStream {
+        let end = start.saturating_add(len);
+        let mut plan = Vec::new();
+        let mut pos = 0u64;
+        for s in self.segments {
+            let (lo, hi) = (start.max(pos), end.min(pos + s.size));
+            if lo < hi {
+                plan.push((s.id, lo - pos, hi - lo));
+            }
+            pos += s.size;
+        }
+        let (store, pin) = (self.store, self.pin);
+        Box::pin(
+            futures_util::stream::iter(plan)
+                .then(move |(id, offset, n)| {
+                    // The closure owns `pin`, and the stream owns the closure: the
+                    // segments stay pinned until the body is dropped.
+                    let _ = &pin;
+                    let store = store.clone();
+                    async move { store.read(&id, offset, n).await }
+                })
+                .try_flatten(),
+        )
+    }
+
+    /// The whole object.
+    pub fn into_stream(self) -> ByteStream {
+        let total = self.segments.iter().map(|s| s.size).sum();
+        self.stream(0, total)
+    }
+}
+
+/// In-process read pins: segment id → number of live [`ObjectBody`]s reading it. Reclaim
+/// skips a pinned segment (it stays garbage; the next sweep retries). The pin is taken
+/// and then re-validated against the index (see [`ObjectStore::get_object`]), so a
+/// segment is either pinned before it can be retired, or the reader sees the newer
+/// manifest instead.
+#[derive(Default)]
+struct Pins(Mutex<HashMap<String, usize>>);
+
+impl Pins {
+    fn is_pinned(&self, id: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+}
+
+/// Held only for its `Drop`, which releases the pins.
+struct PinGuard(#[allow(dead_code)] Arc<PinSet>);
+
+struct PinSet {
+    shared: Arc<Shared>,
+    ids: Vec<String>,
+}
+
+impl PinGuard {
+    fn new(shared: &Arc<Shared>, segments: &[SegRef]) -> Self {
+        let ids: Vec<String> = segments.iter().map(|s| s.id.clone()).collect();
+        let mut pins = shared.pins.0.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &ids {
+            *pins.entry(id.clone()).or_default() += 1;
+        }
+        drop(pins);
+        PinGuard(Arc::new(PinSet {
+            shared: shared.clone(),
+            ids,
+        }))
+    }
+}
+
+impl Drop for PinSet {
+    fn drop(&mut self) {
+        let mut pins = self.shared.pins.0.lock().unwrap_or_else(|p| p.into_inner());
+        for id in &self.ids {
+            if let Some(n) = pins.get_mut(id) {
+                *n -= 1;
+                if *n == 0 {
+                    pins.remove(id);
+                }
+            }
+        }
+    }
+}
+
+/// One open store per root per process: the index file is exclusively locked while open,
+/// and two handles on one root would be two views of the truth. Each root has its own
+/// slot, so opening (or migrating) one project's store never waits on another's; the
+/// map lock is only held to find the slot. Entries are weak, so a store closes once
+/// nothing uses it.
+type Slot = Arc<Mutex<Weak<Shared>>>;
+static OPEN: LazyLock<Mutex<HashMap<PathBuf, Slot>>> = LazyLock::new(Default::default);
+
+struct Shared {
+    index: Index,
+    segments: Arc<dyn SegmentStore>,
+    pins: Pins,
+    list_permits: tokio::sync::Semaphore,
+    /// Index writes queue here, in async land, one at a time per project (redb has a
+    /// single writer anyway). Without it a flood of writes would park a blocking-pool
+    /// thread each on this project's write lock and starve every other project's work.
+    write_permit: tokio::sync::Semaphore,
+    index_path: PathBuf,
+    /// Identity of the index file this handle opened — see [`ObjectStore::is_current`].
+    ident: FileIdent,
+}
+
+impl Shared {
+    fn is_current(&self) -> bool {
+        file_ident(&self.index_path).is_ok_and(|id| id == self.ident)
+    }
+
+    /// Run `f` against the index on the blocking pool.
+    async fn ix<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Index) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let inner = self.clone();
+        tokio::task::spawn_blocking(move || f(&inner.index))
+            .await
+            .map_err(|e| ObjectError::Io(std::io::Error::other(e)))?
+    }
+
+    /// [`ix`](Self::ix) for a write transaction: queued behind this project's
+    /// `write_permit`.
+    async fn ixw<T: Send + 'static>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&Index) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        // Never closed, so this only ever waits.
+        let _permit = self.write_permit.acquire().await;
+        self.ix(f).await
+    }
+
+    /// Delete the bytes of retired segments no reader holds, then forget them. Best
+    /// effort: what fails or is pinned stays garbage for the sweeper.
+    async fn reclaim(self: &Arc<Self>, ids: Vec<String>) -> Result<usize> {
+        let mut n = 0;
+        // Forgotten in chunks, so a big reclaim (an aborted 10 000-part upload) commits as
+        // it goes rather than in one transaction at the end.
+        for chunk in ids.chunks(1_000) {
+            let mut gone = Vec::with_capacity(chunk.len());
+            for id in chunk {
+                if !self.pins.is_pinned(id) && self.segments.delete(id).await.is_ok() {
+                    gone.push(id.clone());
+                }
+            }
+            n += gone.len();
+            if !gone.is_empty() {
+                self.ixw(move |ix| ix.forget_segments(&gone)).await?;
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// A segment recorded pending whose write hasn't been committed into a row yet. If the
+/// request is cancelled (client gone) before [`take`](Self::take), the drop releases it
+/// to garbage instead of leaving a pending row for the orphan sweep.
+struct PendingSegment {
+    shared: Arc<Shared>,
+    id: Option<String>,
+}
+
+impl PendingSegment {
+    fn id(&self) -> &str {
+        self.id.as_deref().unwrap_or_default()
+    }
+
+    /// The row referencing it is committed (or its failure handled): nothing to release.
+    fn take(mut self) -> String {
+        self.id.take().unwrap_or_default()
+    }
+
+    async fn discard(mut self) {
+        if let Some(id) = self.id.take() {
+            release(&self.shared, id).await;
+        }
+    }
+}
+
+impl Drop for PendingSegment {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let shared = self.shared.clone();
+            rt.spawn(async move { release(&shared, id).await });
+        }
+    }
+}
+
+/// Retire a pending segment nothing will reference and delete its bytes at once — but
+/// only if it was still pending: a cancelled request's release can run after its commit
+/// referenced the segment, and then there is nothing to release.
+async fn release(shared: &Arc<Shared>, id: String) {
+    if let Ok(retired) = shared
+        .ixw(move |ix| ix.discard_pending(&[id], now_secs()))
+        .await
+    {
+        let _ = shared.reclaim(retired).await;
+    }
+}
+
+/// A tenant object store rooted at `root` (one per project): a transactional index of
+/// buckets, objects and uploads, plus the segments that hold the bytes. See
+/// `docs/storage-scale-out-design.md`.
+pub struct ObjectStore {
+    inner: Arc<Shared>,
+}
+
+/// At most this many segments are deleted per store per sweep, so one tenant's churn
+/// can't hold the sweeper away from every other project.
+const SWEEP_BATCH: usize = 10_000;
+
+/// At most this many stale uploads are aborted per store per sweep.
+const SWEEP_UPLOADS: usize = 1_000;
+
 impl ObjectStore {
-    /// Open (creating if absent) an object store rooted at `root`.
+    /// Open (creating if absent) the object store rooted at `root`, migrating any
+    /// layout-1 content found there. Blocking — call it off the async workers; cheap
+    /// once a root has been migrated.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let slot = {
+            let mut open = OPEN.lock().unwrap_or_else(|p| p.into_inner());
+            // Drop slots nobody holds or is opening (a slot being opened is locked).
+            open.retain(|_, s| {
+                Arc::strong_count(s) > 1 || s.try_lock().map_or(true, |w| w.strong_count() > 0)
+            });
+            open.entry(root.clone()).or_default().clone()
+        };
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(inner) = slot.upgrade()
+            && inner.is_current()
+        {
+            return Ok(Self { inner });
+        }
         std::fs::create_dir_all(&root)?;
-        Ok(Self {
-            root,
+        let index_path = root.join(INDEX_FILE);
+        let index = Index::open(&index_path)?;
+        let ident = file_ident(&index_path)?;
+        let local = Arc::new(LocalSegments::open(root.join(SEGMENTS_DIR))?);
+        if crate::legacy::needs_migration(&root, &index)? {
+            crate::legacy::migrate(&root, &index, &local)?;
+        }
+        let inner = Arc::new(Shared {
+            index,
+            segments: local,
+            pins: Pins::default(),
             list_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_LISTS),
-        })
+            write_permit: tokio::sync::Semaphore::new(1),
+            index_path,
+            ident,
+        });
+        *slot = Arc::downgrade(&inner);
+        Ok(Self { inner })
+    }
+
+    /// Whether this handle's index is still the one at its root. False once the root was
+    /// deleted (and perhaps recreated) under it — e.g. a project deleted and re-registered
+    /// with the same id: a cached handle must then be dropped and the store reopened, or
+    /// writes would land in the previous incarnation's unlinked index.
+    pub fn is_current(&self) -> bool {
+        self.inner.is_current()
     }
 
     // ---- buckets ----------------------------------------------------------
 
     pub async fn create_bucket(&self, bucket: &str) -> Result<()> {
         validate_bucket(bucket)?;
-        let dir = self.root.join(bucket);
-        if tokio::fs::try_exists(&dir).await? {
-            return Err(ObjectError::BucketAlreadyExists(bucket.to_string()));
-        }
-        tokio::fs::create_dir_all(&dir).await?;
-        Ok(())
+        let bucket = bucket.to_string();
+        self.inner
+            .ixw(move |ix| ix.create_bucket(&bucket, now_secs()))
+            .await
     }
 
+    /// S3 refuses to delete a bucket that still holds objects or unfinished multipart
+    /// uploads. The bucket's CORS config goes with it.
     pub async fn delete_bucket(&self, bucket: &str) -> Result<()> {
         validate_bucket(bucket)?;
-        let dir = self.root.join(bucket);
-        if !tokio::fs::try_exists(&dir).await? {
-            return Err(ObjectError::NoSuchBucket(bucket.to_string()));
-        }
-        // S3 refuses to delete a non-empty bucket.
-        let mut rd = tokio::fs::read_dir(&dir).await?;
-        if rd.next_entry().await?.is_some() {
-            return Err(ObjectError::BucketNotEmpty(bucket.to_string()));
-        }
-        tokio::fs::remove_dir(&dir).await?;
-        // Drop any CORS sidecar (it lives outside the bucket dir, so it didn't count
-        // toward the emptiness check above) so a re-created same-name bucket starts clean.
-        let _ = self.delete_bucket_cors(bucket).await;
-        Ok(())
+        let bucket = bucket.to_string();
+        self.inner.ixw(move |ix| ix.delete_bucket(&bucket)).await
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<String>> {
-        let mut out = Vec::new();
-        let mut rd = match tokio::fs::read_dir(&self.root).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(entry) = rd.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // Skip bookkeeping dirs (e.g. `.owners`); a real bucket can't start with `.`.
-            if !name.starts_with('.') && entry.file_type().await?.is_dir() {
-                out.push(name);
-            }
-        }
-        out.sort();
-        Ok(out)
+        self.inner.ix(|ix| ix.list_buckets()).await
     }
 
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
         validate_bucket(bucket)?;
-        Ok(tokio::fs::try_exists(self.root.join(bucket)).await?)
+        let bucket = bucket.to_string();
+        self.inner.ix(move |ix| ix.bucket_exists(&bucket)).await
     }
 
-    async fn require_bucket(&self, bucket: &str) -> Result<PathBuf> {
-        validate_bucket(bucket)?;
-        let dir = self.root.join(bucket);
-        if !tokio::fs::try_exists(&dir).await? {
+    async fn require_bucket(&self, bucket: &str) -> Result<()> {
+        if !self.bucket_exists(bucket).await? {
             return Err(ObjectError::NoSuchBucket(bucket.to_string()));
         }
-        Ok(dir)
-    }
-
-    // ---- per-bucket CORS config -------------------------------------------
-    //
-    // Stored OUTSIDE the bucket dir at `{root}/.cors/{bucket}.json` on purpose: an
-    // in-bucket sidecar would make an otherwise-empty bucket fail `delete_bucket`'s
-    // emptiness check (same latent trap as `.uploads`), and `.cors` is dot-prefixed
-    // so `list_buckets` already skips it. `validate_bucket` keeps the `{bucket}.json`
-    // filename to `[a-z0-9-]` — no traversal.
-
-    fn cors_path(&self, bucket: &str) -> PathBuf {
-        self.root.join(".cors").join(format!("{bucket}.json"))
-    }
-
-    /// Store the bucket's CORS config (bucket must exist).
-    pub async fn put_bucket_cors(&self, bucket: &str, cfg: &CorsConfig) -> Result<()> {
-        self.require_bucket(bucket).await?;
-        let path = self.cors_path(bucket);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::write(&path, serde_json::to_vec(cfg).unwrap()).await?;
         Ok(())
     }
 
-    /// The bucket's CORS config, or `None` if unset. A corrupt sidecar reads as
-    /// `None` (fail-open to "no CORS"): it governs only the tenant's own bucket, so
-    /// the worst case is their browser client loses access, never a cross-tenant leak.
+    /// Validate names in S3's order for requests on an existing object or upload: a
+    /// missing bucket is `NoSuchBucket` whatever is wrong with the key or upload id.
+    async fn check_names(
+        &self,
+        bucket: &str,
+        key: Option<&str>,
+        upload_id: Option<&str>,
+    ) -> Result<()> {
+        validate_bucket(bucket)?;
+        let bad = key
+            .map(validate_key)
+            .and_then(Result::err)
+            .or_else(|| upload_id.map(validate_upload_id).and_then(Result::err));
+        if let Some(e) = bad {
+            self.require_bucket(bucket).await?;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    // ---- per-bucket CORS config -------------------------------------------
+
+    /// Store the bucket's CORS config (bucket must exist).
+    pub async fn put_bucket_cors(&self, bucket: &str, cfg: &CorsConfig) -> Result<()> {
+        validate_bucket(bucket)?;
+        let (bucket, cfg) = (bucket.to_string(), cfg.clone());
+        self.inner
+            .ixw(move |ix| ix.set_cors(&bucket, Some(cfg)))
+            .await
+    }
+
+    /// The bucket's CORS config, or `None` if unset. An unreadable config reads as
+    /// `None` (fail-open to "no CORS"): it governs only the tenant's own bucket, so the
+    /// worst case is their browser client loses access, never a cross-tenant leak.
     pub async fn get_bucket_cors(&self, bucket: &str) -> Result<Option<CorsConfig>> {
         validate_bucket(bucket)?;
-        match tokio::fs::read(self.cors_path(bucket)).await {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let bucket = bucket.to_string();
+        self.inner.ix(move |ix| ix.get_cors(&bucket)).await
     }
 
     /// Remove the bucket's CORS config (idempotent).
     pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<()> {
         validate_bucket(bucket)?;
-        let _ = tokio::fs::remove_file(self.cors_path(bucket)).await;
-        Ok(())
+        let bucket = bucket.to_string();
+        self.inner.ixw(move |ix| ix.set_cors(&bucket, None)).await
+    }
+
+    // ---- segments ---------------------------------------------------------
+
+    /// Stream `reader` into a new segment (recorded pending before its first byte).
+    /// Returns the pending segment, its size and raw md5. On failure it is discarded.
+    async fn write_segment<R: AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+        expected_sha256: Option<&str>,
+        declared_len: Option<u64>,
+    ) -> Result<(PendingSegment, u64, Vec<u8>)> {
+        let id = new_id();
+        let pid = id.clone();
+        self.inner
+            .ixw(move |ix| ix.add_pending(&[pid], now_secs()))
+            .await?;
+        let pending = PendingSegment {
+            shared: self.inner.clone(),
+            id: Some(id),
+        };
+        let written = match self.inner.segments.create(pending.id()).await {
+            Ok(w) => write_stream(w, reader, expected_sha256, declared_len).await,
+            Err(e) => Err(e.into()),
+        };
+        match written {
+            Ok((size, md5)) => Ok((pending, size, md5)),
+            Err(e) => {
+                pending.discard().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Commit a row that consumes `pending`: on success its retired segments are
+    /// reclaimed at once; on failure `pending` is let go.
+    async fn commit_with<T: Send + 'static>(
+        &self,
+        pending: PendingSegment,
+        f: impl FnOnce(&Index) -> Result<(T, Vec<String>)> + Send + 'static,
+    ) -> Result<T> {
+        match self.inner.ixw(f).await {
+            Ok((v, retired)) => {
+                pending.take();
+                let _ = self.inner.reclaim(retired).await;
+                Ok(v)
+            }
+            Err(e) => {
+                pending.discard().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete the bytes of up to [`SWEEP_BATCH`] segments that are garbage (or pending
+    /// past the orphan age) and that no reader holds, then forget them. Returns how many
+    /// were reclaimed; one that is pinned or fails to delete is retried next sweep.
+    pub async fn collect_garbage(&self) -> Result<usize> {
+        let due = self
+            .inner
+            .ixw(|ix| ix.claim_due(now_secs(), SWEEP_BATCH))
+            .await?;
+        self.inner.reclaim(due).await
     }
 
     // ---- objects ----------------------------------------------------------
@@ -414,14 +616,26 @@ impl ObjectStore {
         content_type: &str,
         expected_sha256: Option<&str>,
     ) -> Result<ObjectMeta> {
-        self.put_object_capped(bucket, key, reader, content_type, None, expected_sha256, None)
-            .await
+        self.put_object_capped(
+            bucket,
+            key,
+            reader,
+            content_type,
+            None,
+            expected_sha256,
+            None,
+        )
+        .await
     }
 
     /// Like [`put_object`], but `declared_len` (the declared Content-Length) sizes the
     /// total upload deadline — see [`upload_deadline`]. Authenticated front-ends pass
     /// the declared length so a large single PUT over a slow link isn't capped at the
     /// small-upload floor; plain `put_object` (unknown length) uses the floor.
+    ///
+    /// The bytes an overwrite replaces are deleted as soon as the new row commits
+    /// (unless a GET is still reading them), so overwrite churn never piles up
+    /// unaccounted bytes on the shared disk.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_object_capped<R: AsyncRead + Unpin>(
         &self,
@@ -434,58 +648,72 @@ impl ObjectStore {
         declared_len: Option<u64>,
     ) -> Result<ObjectMeta> {
         validate_key(key)?;
-        let dir = self.require_bucket(bucket).await?;
-        let hk = object_stem(key);
-        let obj = dir.join(&hk);
-        let tmp = dir.join(tmp_name("tmp"));
-
-        let result = write_stream(&tmp, &mut reader, expected_sha256, declared_len).await;
-        match result {
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Err(e)
-            }
-            Ok((size, etag, _)) => {
-                if let Err(e) = tokio::fs::rename(&tmp, &obj).await {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(e.into());
-                }
-                let meta = ObjectMeta {
-                    key: key.to_string(),
-                    size,
-                    etag,
-                    content_type: content_type.to_string(),
-                    last_modified: now_secs(),
-                    cache_control: cache_control.map(str::to_string),
-                };
-                let meta_path = dir.join(format!("{hk}.meta"));
-                if let Err(e) =
-                    tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await
-                {
-                    // Bytes are committed but unreadable without the sidecar — don't leave
-                    // a quota-consuming orphan; drop both and fail.
-                    let _ = tokio::fs::remove_file(&obj).await;
-                    let _ = tokio::fs::remove_file(&meta_path).await;
-                    return Err(e.into());
-                }
-                Ok(meta)
-            }
-        }
+        validate_bucket(bucket)?;
+        self.require_bucket(bucket).await?;
+        let (pending, size, md5) = self
+            .write_segment(&mut reader, expected_sha256, declared_len)
+            .await?;
+        let row = ObjectRow {
+            meta: ObjectMeta {
+                key: key.to_string(),
+                size,
+                etag: hex(&md5),
+                content_type: content_type.to_string(),
+                last_modified: now_secs(),
+                cache_control: cache_control.map(str::to_string),
+            },
+            segments: vec![SegRef {
+                id: pending.id().to_string(),
+                size,
+            }],
+        };
+        let meta = row.meta.clone();
+        let bucket = bucket.to_string();
+        // The bucket can be deleted while the body streams; then the segment is let go.
+        self.commit_with(pending, move |ix| {
+            Ok(((), ix.commit_object(&bucket, &row, now_secs())?))
+        })
+        .await?;
+        Ok(meta)
     }
 
-    /// Open `bucket/key` for streaming, returning its metadata + the file handle.
-    pub async fn get_object(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<(ObjectMeta, tokio::fs::File)> {
-        let (meta, obj) = self.locate(bucket, key).await?;
-        let f = tokio::fs::File::open(&obj).await?;
-        Ok((meta, f))
+    /// Look up `bucket/key`, returning its metadata and a handle that streams its bytes.
+    pub async fn get_object(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, ObjectBody)> {
+        let mut row = self.row(bucket, key).await?;
+        // Pin, then confirm the manifest is still current: if it changed in between, the
+        // pinned segments may already be retired (and deleted), so pin the new one. Each
+        // retry means the object was rewritten meanwhile; a bound keeps a hot key from
+        // spinning a reader forever.
+        for _ in 0..16 {
+            let pin = PinGuard::new(&self.inner, &row.segments);
+            let now = self.row(bucket, key).await?;
+            if now.segments == row.segments {
+                return Ok((
+                    now.meta,
+                    ObjectBody {
+                        segments: now.segments,
+                        store: self.inner.segments.clone(),
+                        pin,
+                    },
+                ));
+            }
+            row = now;
+        }
+        Err(ObjectError::Io(std::io::Error::other(
+            "object is being rewritten too fast to read",
+        )))
     }
 
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta> {
-        Ok(self.locate(bucket, key).await?.0)
+        self.check_names(bucket, Some(key), None).await?;
+        let (bucket, key) = (bucket.to_string(), key.to_string());
+        self.inner.ix(move |ix| ix.get_meta(&bucket, &key)).await
+    }
+
+    async fn row(&self, bucket: &str, key: &str) -> Result<ObjectRow> {
+        self.check_names(bucket, Some(key), None).await?;
+        let (bucket, key) = (bucket.to_string(), key.to_string());
+        self.inner.ix(move |ix| ix.get_object(&bucket, &key)).await
     }
 
     /// The size of `bucket/key` if it currently exists, else `None` (a missing key or
@@ -499,13 +727,20 @@ impl ObjectStore {
         }
     }
 
-    /// Idempotent (S3 DELETE returns success even if the key is absent).
+    /// Idempotent (S3 DELETE returns success even if the key is absent). An absent key
+    /// costs a read, never a write transaction.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
-        let dir = self.require_bucket(bucket).await?;
-        validate_key(key)?;
-        let hk = object_stem(key);
-        let _ = tokio::fs::remove_file(dir.join(&hk)).await;
-        let _ = tokio::fs::remove_file(dir.join(format!("{hk}.meta"))).await;
+        match self.head_object(bucket, key).await {
+            Err(ObjectError::NoSuchKey(_)) => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(_) => {}
+        }
+        let (bucket, key) = (bucket.to_string(), key.to_string());
+        let retired = self
+            .inner
+            .ixw(move |ix| ix.delete_object(&bucket, &key, now_secs()))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
         Ok(())
     }
 
@@ -513,11 +748,8 @@ impl ObjectStore {
     ///
     /// Returns a page of up to `max_keys` objects (clamped to 1..=1000).
     /// `start_after`: skip all keys ≤ this value (both V1 marker and V2
-    /// continuation-token are passed here by the HTTP layer).
-    ///
-    /// Only reads `.meta` files for the page's keys — a million-object bucket
-    /// never loads every meta into RAM. A thin delegate over [`list_v2`] with no
-    /// delimiter (so `common_prefixes` is always empty).
+    /// continuation-token are passed here by the HTTP layer). A thin delegate over
+    /// [`list_v2`] with no delimiter (so `common_prefixes` is always empty).
     pub async fn list_objects(
         &self,
         bucket: &str,
@@ -545,8 +777,8 @@ impl ObjectStore {
     /// a page is the smallest `max_keys` of their merged order and `start_after`
     /// resumes after the previous page's last ENTRY (object key or folder marker).
     ///
-    /// Bounded memory: O(max_keys) regardless of bucket size — a single folder may
-    /// hold millions of keys yet costs one slot — mirroring the non-delimited path.
+    /// Bounded: O(max_keys) memory and index rows read, however many keys a folder
+    /// holds.
     pub async fn list_v2(
         &self,
         bucket: &str,
@@ -555,164 +787,24 @@ impl ObjectStore {
         start_after: Option<&str>,
         max_keys: usize,
     ) -> Result<ListV2Page> {
+        validate_bucket(bucket)?;
         let max_keys = max_keys.clamp(1, 1000);
-        let dir = self.require_bucket(bucket).await?;
         // Never closed, so this only ever waits.
-        let _scan = self.list_permits.acquire().await;
-
-        // A list "entry" is either an object (its key) or a folded folder (a common
-        // prefix). Both sort by their string form. We keep the smallest `cap` DISTINCT
-        // entries in a bounded max-heap — so per-request memory is O(max_keys), NOT
-        // O(objects-in-bucket): a bucket at its object-count quota (default 1M) can't
-        // amplify one list into ~100 MB of strings on the shared host. `present` holds
-        // the heap's sort keys (≤ cap) so a folder generated by many keys is counted
-        // once toward the page.
-        let cap = max_keys + 1;
-
-        struct Entry {
-            sort_key: String,
-            is_prefix: bool,
-        }
-        impl PartialEq for Entry {
-            fn eq(&self, o: &Self) -> bool {
-                self.sort_key == o.sort_key
-            }
-        }
-        impl Eq for Entry {}
-        impl Ord for Entry {
-            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-                self.sort_key.cmp(&o.sort_key)
-            }
-        }
-        impl PartialOrd for Entry {
-            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(o))
-            }
-        }
-
-        let mut heap: std::collections::BinaryHeap<Entry> =
-            std::collections::BinaryHeap::with_capacity(cap + 1);
-        let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let mut rd = tokio::fs::read_dir(&dir).await?;
-        while let Some(entry) = rd.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(stem) = name.strip_suffix(META_SUFFIX) else {
-                continue;
-            };
-            // The key comes from the name alone wherever it can: a whole-key name is
-            // the key, and a hashed name's head usually settles the entry (wrong prefix,
-            // a folder, already listed, or past this page). Only a hashed-name key still
-            // in contention for the page costs a sidecar read.
-            let mut folded = None;
-            let key = match parse_stem(stem) {
-                None => continue,
-                Some(StemKey::Exact(key)) => key,
-                Some(StemKey::Head(head)) => match judge_head(&head, prefix, delimiter) {
-                    HeadVerdict::Skip => continue,
-                    HeadVerdict::Folder(folder) => {
-                        folded = Some(folder);
-                        String::new()
-                    }
-                    HeadVerdict::NeedKey => {
-                        if start_after.is_some_and(|sa| head_precedes(&head, sa)) {
-                            continue;
-                        }
-                        // The key sorts at or after its head, so past a full page's
-                        // largest entry it can't make the page.
-                        if heap.len() == cap
-                            && head.as_slice() > heap.peek().unwrap().sort_key.as_bytes()
-                        {
-                            continue;
-                        }
-                        let Ok(bytes) = tokio::fs::read(entry.path()).await else {
-                            continue; // raced with a delete
-                        };
-                        match serde_json::from_slice::<ObjectMeta>(&bytes) {
-                            // Only a sidecar sitting under its own key's name counts.
-                            Ok(meta) if object_stem(&meta.key) == stem => meta.key,
-                            _ => continue,
-                        }
-                    }
-                },
-            };
-
-            // Fold to a folder when a delimiter occurs in the remainder after `prefix`.
-            let (sort_key, is_prefix) = match (folded, delimiter) {
-                (Some(folder), _) => (folder, true),
-                (None, _) if !key.starts_with(prefix) => continue,
-                (None, Some(d)) if !d.is_empty() => match key[prefix.len()..].find(d) {
-                    Some(i) => (key[..prefix.len() + i + d.len()].to_string(), true),
-                    None => (key, false),
-                },
-                (None, _) => (key, false),
-            };
-
-            // Resume strictly AFTER the previous page's last entry, compared at the
-            // ENTRY level: a folder already emitted on a prior page is skipped even
-            // though its member keys sort lexicographically after the folder marker.
-            if start_after.is_some_and(|sa| sort_key.as_str() <= sa) {
-                continue;
-            }
-            if present.contains(&sort_key) {
-                continue; // a folder already represented by an earlier member key
-            }
-            if heap.len() < cap {
-                present.insert(sort_key.clone());
-                heap.push(Entry {
-                    sort_key,
-                    is_prefix,
-                });
-            } else if sort_key.as_str() < heap.peek().unwrap().sort_key.as_str() {
-                // Evict the current largest to make room for this smaller distinct entry.
-                let popped = heap.pop().unwrap();
-                present.remove(&popped.sort_key);
-                present.insert(sort_key.clone());
-                heap.push(Entry {
-                    sort_key,
-                    is_prefix,
-                });
-            }
-        }
-
-        // Ascending page; truncated iff a `cap`-th (overflow) entry was retained.
-        let mut entries = heap.into_sorted_vec();
-        let is_truncated = entries.len() > max_keys;
-        if is_truncated {
-            entries.truncate(max_keys);
-        }
-        let next_continuation_token = if is_truncated {
-            entries.last().map(|e| e.sort_key.clone())
-        } else {
-            None
-        };
-
-        // Read metadata only for the page's object keys (folders carry no meta).
-        let mut objects = Vec::new();
-        let mut common_prefixes = Vec::new();
-        for e in entries {
-            if e.is_prefix {
-                common_prefixes.push(e.sort_key);
-                continue;
-            }
-            let hk = object_stem(&e.sort_key);
-            let meta_path = dir.join(format!("{hk}.meta"));
-            let bytes = match tokio::fs::read(&meta_path).await {
-                Ok(b) => b,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue, // raced with delete
-                Err(err) => return Err(err.into()),
-            };
-            let meta: ObjectMeta = serde_json::from_slice(&bytes)
-                .map_err(|_| ObjectError::CorruptMeta(e.sort_key.clone()))?;
-            objects.push(meta);
-        }
-
-        Ok(ListV2Page {
-            objects,
-            common_prefixes,
-            is_truncated,
-            next_continuation_token,
-        })
+        let _scan = self.inner.list_permits.acquire().await;
+        let (bucket, prefix) = (bucket.to_string(), prefix.to_string());
+        let delimiter = delimiter.map(str::to_string);
+        let start_after = start_after.map(str::to_string);
+        self.inner
+            .ix(move |ix| {
+                ix.list(
+                    &bucket,
+                    &prefix,
+                    delimiter.as_deref(),
+                    start_after.as_deref(),
+                    max_keys,
+                )
+            })
+            .await
     }
 
     // ---- multipart upload -------------------------------------------------
@@ -726,17 +818,18 @@ impl ObjectStore {
         cache_control: Option<&str>,
     ) -> Result<String> {
         validate_key(key)?;
-        let dir = self.require_bucket(bucket).await?;
-        let upload_id = new_upload_id();
-        let sdir = dir.join(".uploads").join(&upload_id);
-        tokio::fs::create_dir_all(&sdir).await?;
+        validate_bucket(bucket)?;
+        let upload_id = new_id();
         let info = UploadInfo {
             key: key.to_string(),
             content_type: content_type.to_string(),
             initiated: now_secs(),
             cache_control: cache_control.map(str::to_string),
         };
-        tokio::fs::write(sdir.join("info.json"), serde_json::to_vec(&info).unwrap()).await?;
+        let (bucket, uid) = (bucket.to_string(), upload_id.clone());
+        self.inner
+            .ixw(move |ix| ix.create_upload(&bucket, &uid, &info, false))
+            .await?;
         Ok(upload_id)
     }
 
@@ -780,31 +873,32 @@ impl ObjectStore {
                 "part number {part_number}"
             )));
         }
-        let sdir = self.staging(bucket, upload_id).await?;
-        let part = sdir.join(format!("part-{part_number}"));
-        let tmp = sdir.join(format!("part-{part_number}.tmp"));
-
-        let result = write_stream(&tmp, &mut reader, expected_sha256, declared_len).await;
-        match result {
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                Err(e)
-            }
-            Ok((_, _, raw_md5)) => {
-                if let Err(e) = tokio::fs::rename(&tmp, &part).await {
-                    let _ = tokio::fs::remove_file(&tmp).await;
-                    return Err(e.into());
-                }
-                // Persist the raw 16-byte digest; the final multipart etag is md5-of-md5s.
-                tokio::fs::write(sdir.join(format!("part-{part_number}.md5")), &raw_md5).await?;
-                Ok(hex(&raw_md5))
-            }
+        self.check_names(bucket, None, Some(upload_id)).await?;
+        let (b, u) = (bucket.to_string(), upload_id.to_string());
+        if !self.inner.ix(move |ix| ix.upload_exists(&b, &u)).await? {
+            return Err(ObjectError::NoSuchUpload(upload_id.to_string()));
         }
+        let (pending, size, md5) = self
+            .write_segment(&mut reader, expected_sha256, declared_len)
+            .await?;
+        let row = PartRow {
+            segment: pending.id().to_string(),
+            size,
+            md5: hex(&md5),
+        };
+        let (b, u) = (bucket.to_string(), upload_id.to_string());
+        // Aborted (or completed) while the part streamed: the segment is let go.
+        self.commit_with(pending, move |ix| {
+            Ok(((), ix.commit_part(&b, &u, part_number, &row, now_secs())?))
+        })
+        .await?;
+        Ok(hex(&md5))
     }
 
-    /// Complete a multipart upload: concatenate `part_numbers` in order into the
-    /// final object, returning its metadata with the S3 multipart etag
-    /// `md5(concat of the part md5s)-<count>`.
+    /// Complete a multipart upload. The object is the listed parts' segments in order —
+    /// no byte is copied — with the S3 multipart etag `md5(concat of the part md5s)-<count>`.
+    /// As in S3, parts must be listed in ascending order and every part but the last
+    /// must be at least 5 MiB.
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -813,273 +907,77 @@ impl ObjectStore {
         part_numbers: &[u32],
     ) -> Result<ObjectMeta> {
         validate_key(key)?;
-        let sdir = self.staging(bucket, upload_id).await?;
-        let info: UploadInfo =
-            serde_json::from_slice(&tokio::fs::read(sdir.join("info.json")).await?)
-                .map_err(|_| ObjectError::CorruptMeta(upload_id.to_string()))?;
-        if info.key != key {
-            return Err(ObjectError::InvalidArgument(
-                "key does not match upload".into(),
-            ));
-        }
-        if part_numbers.is_empty() {
-            return Err(ObjectError::InvalidArgument("no parts".into()));
-        }
-        // Re-validate the bucket here too (every other write path goes through
-        // require_bucket); staging() already did, but don't rely on call-order.
-        let dir = self.require_bucket(bucket).await?;
-        let hk = object_stem(key);
-        let obj = dir.join(&hk);
-        let tmp = dir.join(tmp_name("cmpl"));
-        let mut concat = Md5::new();
-        let mut size = 0u64;
-        {
-            let mut out = tokio::fs::File::create(&tmp).await?;
-            for &pn in part_numbers {
-                let mut pf = match tokio::fs::File::open(sdir.join(format!("part-{pn}"))).await {
-                    Ok(f) => f,
-                    Err(_) => {
-                        let _ = tokio::fs::remove_file(&tmp).await;
-                        return Err(ObjectError::InvalidArgument(format!("missing part {pn}")));
-                    }
-                };
-                size += tokio::io::copy(&mut pf, &mut out).await?;
-                concat.update(&tokio::fs::read(sdir.join(format!("part-{pn}.md5"))).await?);
-            }
-            out.sync_all().await?;
-        }
-        tokio::fs::rename(&tmp, &obj).await?;
-        let meta = ObjectMeta {
-            key: key.to_string(),
-            size,
-            etag: format!("{}-{}", hex(&concat.finalize()), part_numbers.len()),
-            content_type: info.content_type,
-            last_modified: now_secs(),
-            cache_control: info.cache_control,
-        };
-        let meta_path = dir.join(format!("{hk}.meta"));
-        if let Err(e) = tokio::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).await {
-            // Drop the orphaned bytes; leave staging intact so the client can retry.
-            let _ = tokio::fs::remove_file(&obj).await;
-            let _ = tokio::fs::remove_file(&meta_path).await;
-            return Err(e.into());
-        }
-        let _ = tokio::fs::remove_dir_all(&sdir).await;
-        if let Some(p) = sdir.parent() {
-            let _ = tokio::fs::remove_dir(p).await; // drop .uploads if now empty
-        }
+        self.check_names(bucket, None, Some(upload_id)).await?;
+        let (b, k, u) = (bucket.to_string(), key.to_string(), upload_id.to_string());
+        let pns = part_numbers.to_vec();
+        let (meta, retired) = self
+            .inner
+            .ixw(move |ix| ix.complete_upload(&b, &k, &u, &pns, now_secs()))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
         Ok(meta)
     }
 
     /// Abort a multipart upload, discarding its staged parts.
     pub async fn abort_multipart(&self, bucket: &str, upload_id: &str) -> Result<()> {
-        let sdir = self.staging(bucket, upload_id).await?;
-        let _ = tokio::fs::remove_dir_all(&sdir).await;
-        if let Some(p) = sdir.parent() {
-            let _ = tokio::fs::remove_dir(p).await; // drop .uploads if now empty
-        }
+        self.check_names(bucket, None, Some(upload_id)).await?;
+        let (b, u) = (bucket.to_string(), upload_id.to_string());
+        let retired = self
+            .inner
+            .ixw(move |ix| ix.abort_upload(&b, &u, now_secs()))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
         Ok(())
     }
 
-    /// List all pending multipart uploads in `bucket`.
+    /// List all pending multipart uploads in `bucket`, by upload id.
     pub async fn list_multipart_uploads(&self, bucket: &str) -> Result<Vec<MultipartUpload>> {
-        let dir = self.require_bucket(bucket).await?;
-        let uploads_dir = dir.join(".uploads");
-        let mut out = Vec::new();
-        let mut rd = match tokio::fs::read_dir(&uploads_dir).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(entry) = rd.next_entry().await? {
-            if !entry.file_type().await?.is_dir() {
-                continue;
-            }
-            let upload_id = entry.file_name().to_string_lossy().into_owned();
-            let info_path = entry.path().join("info.json");
-            let bytes = match tokio::fs::read(&info_path).await {
-                Ok(b) => b,
-                Err(_) => continue, // partially created or already removed
-            };
-            let info: UploadInfo = match serde_json::from_slice(&bytes) {
-                Ok(i) => i,
-                Err(_) => continue,
-            };
-            out.push(MultipartUpload {
-                upload_id,
-                key: info.key,
-                initiated: info.initiated,
-            });
-        }
-        out.sort_by(|a, b| a.upload_id.cmp(&b.upload_id));
-        Ok(out)
+        validate_bucket(bucket)?;
+        let bucket = bucket.to_string();
+        self.inner.ix(move |ix| ix.list_uploads(&bucket)).await
     }
 
-    /// Remove abandoned uploads across ALL buckets whose `info.json` mtime (or
-    /// `initiated` field) is older than `max_age`. Returns the number of upload
-    /// directories removed. Also removes empty `.uploads` parent dirs.
+    /// Abort up to [`SWEEP_UPLOADS`] uploads initiated more than `max_age` ago, then
+    /// reclaim due segments (see [`collect_garbage`](Self::collect_garbage)). Returns
+    /// the number of uploads aborted. Driven by the server's sweeper on boot + a timer.
     pub async fn sweep_stale_uploads(&self, max_age: Duration) -> Result<usize> {
         let threshold = now_secs().saturating_sub(max_age.as_secs());
-        let mut removed = 0usize;
-
-        let mut rd = match tokio::fs::read_dir(&self.root).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(bucket_entry) = rd.next_entry().await? {
-            let name = bucket_entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || !bucket_entry.file_type().await?.is_dir() {
-                continue;
-            }
-            let uploads_dir = bucket_entry.path().join(".uploads");
-            let mut urd = match tokio::fs::read_dir(&uploads_dir).await {
-                Ok(rd) => rd,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            while let Some(uid_entry) = urd.next_entry().await? {
-                if !uid_entry.file_type().await?.is_dir() {
-                    continue;
-                }
-                let info_path = uid_entry.path().join("info.json");
-                // Use the `initiated` field if present, fall back to file mtime.
-                let age_secs = if let Ok(bytes) = tokio::fs::read(&info_path).await {
-                    if let Ok(info) = serde_json::from_slice::<UploadInfo>(&bytes) {
-                        if info.initiated > 0 {
-                            info.initiated
-                        } else {
-                            mtime_secs(&info_path).await.unwrap_or(0)
-                        }
-                    } else {
-                        mtime_secs(&info_path).await.unwrap_or(0)
-                    }
-                } else {
-                    mtime_secs(&uid_entry.path()).await.unwrap_or(0)
-                };
-                if age_secs <= threshold {
-                    let _ = tokio::fs::remove_dir_all(uid_entry.path()).await;
-                    removed += 1;
-                }
-            }
-            // Clean up empty .uploads dir.
-            let _ = tokio::fs::remove_dir(&uploads_dir).await;
-        }
-        Ok(removed)
+        let (n, retired) = self
+            .inner
+            .ixw(move |ix| ix.abort_uploads_before(threshold, now_secs(), SWEEP_UPLOADS))
+            .await?;
+        let _ = self.inner.reclaim(retired).await;
+        self.collect_garbage().await?;
+        Ok(n)
     }
 
-    /// Count `(buckets, objects)` for this store in a single pass — buckets are the
-    /// non-dot top-level dirs, objects are the `.meta` sidecars within them. Used by
-    /// the server's per-project count quota (cached on a TTL, never per request).
+    /// `(buckets, objects)` in this store — O(1), read from the index. Used by the
+    /// server's per-project count quota.
     pub async fn usage_counts(&self) -> Result<(u64, u64)> {
-        let mut buckets = 0u64;
-        let mut objects = 0u64;
-        let mut rd = match tokio::fs::read_dir(&self.root).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(bucket_entry) = rd.next_entry().await? {
-            let name = bucket_entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || !bucket_entry.file_type().await?.is_dir() {
-                continue;
-            }
-            buckets += 1;
-            let mut brd = match tokio::fs::read_dir(bucket_entry.path()).await {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            while let Some(obj) = brd.next_entry().await? {
-                if obj.file_name().to_string_lossy().ends_with(".meta") {
-                    objects += 1;
-                }
-            }
-        }
-        Ok((buckets, objects))
+        self.inner.ix(|ix| ix.counts()).await
     }
 
-    /// Total in-flight multipart uploads across all buckets (`.uploads/*` dirs).
-    /// Counting stops once `cap` is reached so the initiate gate stays O(cap), not
-    /// O(all staged uploads). Returns `min(actual, cap)`.
+    /// In-flight multipart uploads across all buckets, capped at `cap`.
     pub async fn count_inflight_uploads(&self, cap: u64) -> Result<u64> {
-        let mut total = 0u64;
-        let mut rd = match tokio::fs::read_dir(&self.root).await {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e.into()),
-        };
-        while let Some(bucket_entry) = rd.next_entry().await? {
-            let name = bucket_entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || !bucket_entry.file_type().await?.is_dir() {
-                continue;
-            }
-            let mut urd = match tokio::fs::read_dir(bucket_entry.path().join(".uploads")).await {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            while let Some(u) = urd.next_entry().await? {
-                if u.file_type().await?.is_dir() {
-                    total += 1;
-                    if total >= cap {
-                        return Ok(total);
-                    }
-                }
-            }
-        }
-        Ok(total)
-    }
-
-    async fn staging(&self, bucket: &str, upload_id: &str) -> Result<PathBuf> {
-        let dir = self.require_bucket(bucket).await?;
-        validate_upload_id(upload_id)?;
-        let sdir = dir.join(".uploads").join(upload_id);
-        if !tokio::fs::try_exists(&sdir).await? {
-            return Err(ObjectError::NoSuchUpload(upload_id.to_string()));
-        }
-        Ok(sdir)
-    }
-
-    async fn locate(&self, bucket: &str, key: &str) -> Result<(ObjectMeta, PathBuf)> {
-        let dir = self.require_bucket(bucket).await?;
-        validate_key(key)?;
-        let hk = object_stem(key);
-        let obj = dir.join(&hk);
-        let meta_path = dir.join(format!("{hk}.meta"));
-        let bytes = match tokio::fs::read(&meta_path).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ObjectError::NoSuchKey(key.to_string()));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let meta: ObjectMeta = serde_json::from_slice(&bytes)
-            .map_err(|_| ObjectError::CorruptMeta(key.to_string()))?;
-        // A hashed name is not the key: never serve a sidecar that names a different one.
-        if meta.key != key {
-            return Err(ObjectError::NoSuchKey(key.to_string()));
-        }
-        Ok((meta, obj))
+        Ok(self.inner.ix(|ix| ix.upload_count()).await?.min(cap))
     }
 }
 
-/// Shared write-loop for `put_object` and `upload_part`. Streams `reader` into
-/// `tmp`, enforcing per-read idle timeout and total-upload cap. Computes MD5
-/// (for etag) and SHA-256 (for content binding) simultaneously.
-///
-/// Returns `(size, hex_md5_etag, raw_md5_bytes)` on success.
-/// The caller is responsible for unlinking `tmp` on any `Err` return.
+/// Shared write loop for `put_object` and `upload_part`. Streams `reader` into `w`,
+/// enforcing the per-read idle timeout and the total upload deadline, computing MD5
+/// (etag) and SHA-256 (content binding) as it goes, and commits the segment only once
+/// the body is complete and verified. Returns `(size, raw_md5)`.
 async fn write_stream<R: AsyncRead + Unpin>(
-    tmp: &PathBuf,
+    mut w: Box<dyn SegmentWriter>,
     reader: &mut R,
     expected_sha256: Option<&str>,
     declared_len: Option<u64>,
-) -> Result<(u64, String, Vec<u8>)> {
+) -> Result<(u64, Vec<u8>)> {
     let mut md5_hasher: Md5 = Md5::new();
     let mut sha_hasher: Sha256 = Sha256::new();
     let mut size = 0u64;
     let deadline = Instant::now() + upload_deadline(declared_len);
 
-    let mut f = tokio::fs::File::create(tmp).await?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         if Instant::now() >= deadline {
@@ -1095,13 +993,9 @@ async fn write_stream<R: AsyncRead + Unpin>(
         }
         md5_hasher.update(&buf[..n]);
         sha_hasher.update(&buf[..n]);
-        f.write_all(&buf[..n]).await?;
+        w.write(&buf[..n]).await?;
         size += n as u64;
     }
-    f.sync_all().await?;
-
-    let raw_md5 = md5_hasher.finalize().to_vec();
-    let etag = hex(&raw_md5);
 
     if let Some(exp) = expected_sha256 {
         let actual = hex(&sha_hasher.finalize());
@@ -1109,70 +1003,30 @@ async fn write_stream<R: AsyncRead + Unpin>(
             return Err(ObjectError::ContentSha256Mismatch);
         }
     }
-
-    Ok((size, etag, raw_md5))
+    w.commit().await?;
+    Ok((size, md5_hasher.finalize().to_vec()))
 }
 
-async fn mtime_secs(path: &std::path::Path) -> Option<u64> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    meta.modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs())
-}
-
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-/// A bucket-dir scratch name for a body being written before its atomic rename into
-/// place. Short and independent of the key (it used to be `<hex(key)>.tmp.<pid>.<seq>`,
-/// which overflowed `NAME_MAX` for keys well under the hex-name limit — and sooner as
-/// `<seq>` grew over the process's life). Never ends in `.meta`, so no scan counts it.
-fn tmp_name(kind: &str) -> String {
+/// A fresh opaque id (lowercase hex) for a segment or an upload: time, process and a
+/// per-process sequence, so unique on this host. Never derived from content (no
+/// cross-tenant dedup oracle) and never from tenant input.
+pub(crate) fn new_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     format!(
-        ".{kind}.{}.{}",
+        "{nanos:032x}{:08x}{:08x}",
         std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        SEQ.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// Base64 over a file-name-safe alphabet in ASCII order (`-`, digits, upper, `_`,
-/// lower), unpadded. Needs a case-sensitive filesystem (ext4 / xfs / btrfs are).
-const B64_ALPHABET: &[u8; 64] = b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
-
-fn b64(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
-            << (8 * (3 - chunk.len()));
-        for i in 0..=chunk.len() {
-            s.push(B64_ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
-        }
-    }
-    s
-}
-
-/// Inverse of [`b64`]; `None` unless `s` is exactly what `b64` writes for some bytes
-/// (so a name maps to one key and back).
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    for chunk in s.as_bytes().chunks(4) {
-        let mut n = 0u32;
-        for &c in chunk {
-            n = (n << 6) | B64_ALPHABET.iter().position(|&a| a == c)? as u32;
-        }
-        n <<= 6 * (4 - chunk.len());
-        let bytes = chunk.len().checked_sub(1).filter(|&b| b > 0)?;
-        out.extend_from_slice(&n.to_be_bytes()[1..=bytes]);
-    }
-    (b64(&out) == s).then_some(out)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1182,47 +1036,6 @@ fn hex(bytes: &[u8]) -> String {
         s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
     }
     s
-}
-
-/// Decode a lowercase-hex string to bytes. Returns `Err(())` if the input is
-/// not valid even-length hex (filenames are always valid since we write them,
-/// but malformed entries are silently skipped in listings).
-fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
-    if !s.len().is_multiple_of(2) {
-        return Err(());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        let hi = hex_digit(b[i])?;
-        let lo = hex_digit(b[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Ok(out)
-}
-
-fn hex_digit(b: u8) -> std::result::Result<u8, ()> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(()),
-    }
-}
-
-/// Opaque, traversal-safe (pure hex) upload id.
-fn new_upload_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(
-        "{nanos:032x}{:08x}{:08x}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    )
 }
 
 fn validate_upload_id(id: &str) -> Result<()> {
@@ -1237,7 +1050,7 @@ fn validate_upload_id(id: &str) -> Result<()> {
 
 /// S3 bucket naming (simplified): 3–63 chars, lowercase letters/digits/hyphen, not
 /// starting or ending with a hyphen.
-fn validate_bucket(bucket: &str) -> Result<()> {
+pub(crate) fn validate_bucket(bucket: &str) -> Result<()> {
     let ok = (3..=63).contains(&bucket.len())
         && bucket
             .bytes()
@@ -1251,10 +1064,10 @@ fn validate_bucket(bucket: &str) -> Result<()> {
     }
 }
 
-/// Object keys: 1–1024 bytes (the S3 limit), UTF-8 (guaranteed by `&str`), no NUL. The
-/// flat keyspace (incl. `/`) is preserved because a key never becomes a path — see
-/// [`object_stem`].
-fn validate_key(key: &str) -> Result<()> {
+/// Object keys: 1–1024 bytes (the S3 limit), UTF-8 (guaranteed by `&str`), no NUL (the
+/// index separates bucket from key with one). A key never becomes a path or a byte-store
+/// name — the segment store only sees engine-minted ids.
+pub(crate) fn validate_key(key: &str) -> Result<()> {
     if (1..=1024).contains(&key.len()) && !key.contains('\0') {
         Ok(())
     } else {
@@ -1272,10 +1085,14 @@ mod tests {
         d
     }
 
-    async fn read_all(mut f: tokio::fs::File) -> Vec<u8> {
-        let mut v = Vec::new();
-        f.read_to_end(&mut v).await.unwrap();
-        v
+    /// A part exactly at S3's minimum for all but the last part.
+    fn big(fill: u8) -> Vec<u8> {
+        vec![fill; crate::index::MIN_PART_SIZE as usize]
+    }
+
+    async fn read_all(body: ObjectBody) -> Vec<u8> {
+        let chunks: Vec<_> = body.into_stream().try_collect().await.unwrap();
+        chunks.concat()
     }
 
     #[tokio::test]
@@ -1569,26 +1386,27 @@ mod tests {
             .create_multipart("mp-bucket", "big/file", "application/octet-stream", None)
             .await
             .unwrap();
+        let first = big(b'h');
         let e1 = s
-            .upload_part("mp-bucket", &uid, 1, &b"hello "[..], None)
+            .upload_part("mp-bucket", &uid, 1, &first[..], None)
             .await
             .unwrap();
         let e2 = s
             .upload_part("mp-bucket", &uid, 2, &b"world"[..], None)
             .await
             .unwrap();
-        assert_eq!(e1, format!("{:x}", Md5::digest(b"hello ")));
+        assert_eq!(e1, format!("{:x}", Md5::digest(&first)));
         assert_eq!(e2, format!("{:x}", Md5::digest(b"world")));
 
         let meta = s
             .complete_multipart("mp-bucket", "big/file", &uid, &[1, 2])
             .await
             .unwrap();
-        assert_eq!(meta.size, 11);
+        assert_eq!(meta.size, first.len() as u64 + 5);
         assert!(meta.etag.ends_with("-2")); // S3 multipart etag carries the part count
         assert_eq!(
             read_all(s.get_object("mp-bucket", "big/file").await.unwrap().1).await,
-            b"hello world"
+            [first.as_slice(), b"world"].concat()
         );
 
         // The upload id is consumed by complete.
@@ -1607,7 +1425,10 @@ mod tests {
         let dir = root("mpu-abort");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("ab-bucket").await.unwrap();
-        let uid = s.create_multipart("ab-bucket", "k", "x", None).await.unwrap();
+        let uid = s
+            .create_multipart("ab-bucket", "k", "x", None)
+            .await
+            .unwrap();
         s.upload_part("ab-bucket", &uid, 1, &b"data"[..], None)
             .await
             .unwrap();
@@ -1629,7 +1450,12 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("sweep-bucket").await.unwrap();
         let uid = s
-            .create_multipart("sweep-bucket", "pending/obj", "application/octet-stream", None)
+            .create_multipart(
+                "sweep-bucket",
+                "pending/obj",
+                "application/octet-stream",
+                None,
+            )
             .await
             .unwrap();
         s.upload_part("sweep-bucket", &uid, 1, &b"part"[..], None)
@@ -1690,7 +1516,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- long keys (issue: PUT failed above ~116-byte keys) -------------------
+    // ---- long keys --------------------------------------------------------
 
     /// A key of exactly `n` bytes with a recognisable shape.
     fn key_of(n: usize, tag: &str) -> String {
@@ -1701,15 +1527,15 @@ mod tests {
         k.truncate(n);
         k
     }
-
     #[tokio::test]
     async fn keys_up_to_the_s3_limit_round_trip() {
         let dir = root("longkeys");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bkt").await.unwrap();
-        // Either side of every boundary: the old ~116–123 cap, the hex-name and
-        // base64-name limits, the S3 limit.
-        for n in [1, 116, 117, 123, 124, 125, 126, 127, 186, 187, 255, 512, 1024] {
+        // Either side of every boundary the layout-1 file names had, and the S3 limit.
+        for n in [
+            1, 116, 117, 123, 124, 125, 126, 127, 186, 187, 255, 512, 1024,
+        ] {
             let key = key_of(n, "a");
             let body = format!("body-{n}");
             let meta = s
@@ -1720,16 +1546,11 @@ mod tests {
             let (got, f) = s.get_object("bkt", &key).await.unwrap();
             assert_eq!(got.key, key);
             assert_eq!(read_all(f).await, body.as_bytes(), "{n}-byte key");
-            assert_eq!(s.head_object("bkt", &key).await.unwrap().size, body.len() as u64);
+            assert_eq!(
+                s.head_object("bkt", &key).await.unwrap().size,
+                body.len() as u64
+            );
         }
-        // Every file name stays inside the filesystem's limit, and nothing is left over.
-        let mut names = Vec::new();
-        for e in std::fs::read_dir(dir.join("bkt")).unwrap() {
-            names.push(e.unwrap().file_name().to_string_lossy().into_owned());
-        }
-        assert!(names.iter().all(|n| n.len() <= NAME_MAX), "{names:?}");
-        assert!(names.iter().all(|n| !n.starts_with('.')), "temp file left: {names:?}");
-        assert_eq!(names.len(), 13 * 2);
         assert_eq!(s.usage_counts().await.unwrap(), (1, 13));
 
         // One past the limit is a clean InvalidKey on every path — never an I/O error.
@@ -1746,67 +1567,7 @@ mod tests {
             s.create_multipart("bkt", &over, "t", None).await,
             Err(ObjectError::InvalidKey(_))
         ));
-    }
-
-    /// The temp name no longer grows with the key or with the process's sequence
-    /// counter: a 125-byte key still writes after the counter is large.
-    #[tokio::test]
-    async fn the_key_limit_does_not_drift_with_the_temp_sequence() {
-        let s = ObjectStore::open(root("tmpseq")).unwrap();
-        s.create_bucket("bkt").await.unwrap();
-        TMP_SEQ.fetch_add(10_000_000_000, Ordering::Relaxed);
-        let key = key_of(HEX_NAME_MAX_KEY, "a");
-        s.put_object("bkt", &key, &b"x"[..], "t", None).await.unwrap();
-        assert_eq!(object_stem(&key), hex(key.as_bytes()));
-    }
-
-    /// Objects written by the previous naming (`hex(key)` for every key, up to the 123
-    /// bytes its temp name allowed) are read, listed, overwritten and deleted unchanged.
-    #[tokio::test]
-    async fn objects_stored_under_the_old_naming_stay_readable() {
-        let dir = root("legacy");
-        let s = ObjectStore::open(&dir).unwrap();
-        s.create_bucket("bkt").await.unwrap();
-        let keys = ["a.txt".to_string(), key_of(116, "old"), key_of(123, "old")];
-        for key in &keys {
-            let hk = hex(key.as_bytes());
-            std::fs::write(dir.join("bkt").join(&hk), b"legacy").unwrap();
-            let meta = ObjectMeta {
-                key: key.clone(),
-                size: 6,
-                etag: "e".into(),
-                content_type: "text/plain".into(),
-                last_modified: 1,
-                cache_control: None,
-            };
-            std::fs::write(
-                dir.join("bkt").join(format!("{hk}.meta")),
-                serde_json::to_vec(&meta).unwrap(),
-            )
-            .unwrap();
-        }
-        for key in &keys {
-            let (meta, f) = s.get_object("bkt", key).await.unwrap();
-            assert_eq!(&meta.key, key);
-            assert_eq!(read_all(f).await, b"legacy");
-        }
-        let listed: Vec<String> = s
-            .list_objects("bkt", "", None, 1000)
-            .await
-            .unwrap()
-            .objects
-            .into_iter()
-            .map(|m| m.key)
-            .collect();
-        let mut want = keys.to_vec();
-        want.sort();
-        assert_eq!(listed, want);
-        // Overwrite lands on the same files (no second copy under a new name).
-        s.put_object("bkt", &keys[2], &b"new"[..], "t", None).await.unwrap();
-        assert_eq!(s.usage_counts().await.unwrap(), (1, 3));
-        assert_eq!(read_all(s.get_object("bkt", &keys[2]).await.unwrap().1).await, b"new");
-        s.delete_object("bkt", &keys[1]).await.unwrap();
-        assert_eq!(s.usage_counts().await.unwrap(), (1, 2));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1815,8 +1576,12 @@ mod tests {
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bkt").await.unwrap();
         let key = key_of(700, "a");
-        s.put_object("bkt", &key, &b"one"[..], "t", None).await.unwrap();
-        s.put_object("bkt", &key, &b"two!"[..], "t", None).await.unwrap();
+        s.put_object("bkt", &key, &b"one"[..], "t", None)
+            .await
+            .unwrap();
+        s.put_object("bkt", &key, &b"two!"[..], "t", None)
+            .await
+            .unwrap();
         assert_eq!(s.usage_counts().await.unwrap(), (1, 1));
         assert_eq!(s.object_size("bkt", &key).await.unwrap(), Some(4));
         s.delete_object("bkt", &key).await.unwrap();
@@ -1824,17 +1589,662 @@ mod tests {
             s.get_object("bkt", &key).await,
             Err(ObjectError::NoSuchKey(_))
         ));
-        assert_eq!(std::fs::read_dir(dir.join("bkt")).unwrap().count(), 0);
 
         let mp = key_of(1024, "mp");
         let id = s.create_multipart("bkt", &mp, "t", None).await.unwrap();
-        s.upload_part("bkt", &id, 1, &b"hello "[..], None).await.unwrap();
-        s.upload_part("bkt", &id, 2, &b"world"[..], None).await.unwrap();
-        s.complete_multipart("bkt", &mp, &id, &[1, 2]).await.unwrap();
-        assert_eq!(read_all(s.get_object("bkt", &mp).await.unwrap().1).await, b"hello world");
+        let first = big(b'h');
+        s.upload_part("bkt", &id, 1, &first[..], None)
+            .await
+            .unwrap();
+        s.upload_part("bkt", &id, 2, &b"world"[..], None)
+            .await
+            .unwrap();
+        s.complete_multipart("bkt", &mp, &id, &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(s.get_object("bkt", &mp).await.unwrap().1).await,
+            [first.as_slice(), b"world"].concat()
+        );
         s.delete_object("bkt", &mp).await.unwrap();
-        // Bucket is empty again (no stray temp / staging), so it can be deleted.
         s.delete_bucket("bkt").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- index/segments split ---------------------------------------------
+
+    /// Claim (and return, sorted) every segment the sweeper would reclaim now.
+    fn due(s: &ObjectStore) -> Vec<String> {
+        let mut v = s.inner.index.claim_due(now_secs(), usize::MAX).unwrap();
+        v.sort();
+        v
+    }
+
+    fn row(s: &ObjectStore, bucket: &str, key: &str) -> ObjectRow {
+        s.inner.index.get_object(bucket, key).unwrap()
+    }
+
+    /// Segment files on disk (excluding in-progress temp files).
+    fn segment_files(dir: &Path) -> usize {
+        let mut n = 0;
+        for fan in std::fs::read_dir(dir.join(SEGMENTS_DIR)).unwrap() {
+            let fan = fan.unwrap();
+            if fan.file_name() != ".tmp" {
+                n += std::fs::read_dir(fan.path()).unwrap().count();
+            }
+        }
+        n
+    }
+
+    fn local(dir: &Path) -> LocalSegments {
+        LocalSegments::open(dir.join(SEGMENTS_DIR)).unwrap()
+    }
+
+    /// A completed multipart object IS its parts' segments — nothing was copied — and a
+    /// ranged read across part boundaries returns exactly the right bytes. A part that
+    /// was uploaded but not listed is deleted at complete.
+    #[tokio::test]
+    async fn multipart_is_a_manifest_and_ranges_span_segments() {
+        let dir = root("manifest");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        // Distinct bytes everywhere, so a misplaced range can't read back equal.
+        let pattern = |seed: u8, n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+                .collect()
+        };
+        let m = crate::index::MIN_PART_SIZE as usize;
+        let parts = [pattern(1, m), pattern(2, m), pattern(3, 11)];
+        let uid = s.create_multipart("bkt", "m", "t", None).await.unwrap();
+        for (i, p) in parts.iter().enumerate() {
+            s.upload_part("bkt", &uid, i as u32 + 1, &p[..], None)
+                .await
+                .unwrap();
+        }
+        s.upload_part("bkt", &uid, 9, &b"unused"[..], None)
+            .await
+            .unwrap();
+        assert_eq!(segment_files(&dir), 4);
+        s.complete_multipart("bkt", "m", &uid, &[1, 2, 3])
+            .await
+            .unwrap();
+        let r = row(&s, "bkt", "m");
+        assert_eq!(
+            r.segments.iter().map(|g| g.size).collect::<Vec<_>>(),
+            [m as u64, m as u64, 11]
+        );
+        assert_eq!(
+            segment_files(&dir),
+            3,
+            "the unused part is gone, nothing copied"
+        );
+        let whole: Vec<u8> = parts.concat();
+        let total = whole.len() as u64;
+        let (m, t) = (m as u64, total);
+        // Starts and lengths on, just before and just after every segment boundary.
+        let starts = [0, 1, m - 1, m, m + 1, 2 * m - 1, 2 * m, 2 * m + 5, t - 1];
+        for start in starts {
+            for len in [0, 1, 2, 7, m - 1, m, m + 2, t - start] {
+                let len = len.min(t - start);
+                let (_, body) = s.get_object("bkt", "m").await.unwrap();
+                let got: Vec<_> = body.stream(start, len).try_collect().await.unwrap();
+                assert!(
+                    got.concat() == whole[start as usize..(start + len) as usize],
+                    "[{start}, +{len})"
+                );
+            }
+        }
+        assert!(due(&s).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As in S3, every part but the last must be at least 5 MiB. A refused complete
+    /// changes nothing: re-uploading the small part lets it complete. A lone part (the
+    /// last) may be any size.
+    #[tokio::test]
+    async fn non_final_parts_must_meet_the_minimum() {
+        let dir = root("mp-min");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let uid = s.create_multipart("bkt", "k", "t", None).await.unwrap();
+        let mut short = big(b'a');
+        short.pop();
+        s.upload_part("bkt", &uid, 1, &short[..], None)
+            .await
+            .unwrap();
+        s.upload_part("bkt", &uid, 2, &b"tail"[..], None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            s.complete_multipart("bkt", "k", &uid, &[1, 2]).await,
+            Err(ObjectError::EntityTooSmall(1))
+        ));
+        let first = big(b'a');
+        s.upload_part("bkt", &uid, 1, &first[..], None)
+            .await
+            .unwrap();
+        s.complete_multipart("bkt", "k", &uid, &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            s.head_object("bkt", "k").await.unwrap().size,
+            first.len() as u64 + 4
+        );
+
+        let lone = s.create_multipart("bkt", "one", "t", None).await.unwrap();
+        s.upload_part("bkt", &lone, 1, &b"x"[..], None)
+            .await
+            .unwrap();
+        s.complete_multipart("bkt", "one", &lone, &[1])
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn complete_requires_ascending_parts() {
+        let dir = root("mp-order");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let uid = s.create_multipart("bkt", "k", "t", None).await.unwrap();
+        let first = big(b'a');
+        s.upload_part("bkt", &uid, 1, &first[..], None)
+            .await
+            .unwrap();
+        s.upload_part("bkt", &uid, 2, &b"b"[..], None)
+            .await
+            .unwrap();
+        for bad in [&[2, 1][..], &[1, 1, 2][..]] {
+            assert!(matches!(
+                s.complete_multipart("bkt", "k", &uid, bad).await,
+                Err(ObjectError::InvalidPartOrder)
+            ));
+        }
+        // A refused complete changed nothing: the upload still completes.
+        s.complete_multipart("bkt", "k", &uid, &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(s.get_object("bkt", "k").await.unwrap().1).await,
+            [first.as_slice(), b"b"].concat()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bucket_with_an_unfinished_upload_is_not_empty() {
+        let dir = root("busy-bucket");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let uid = s.create_multipart("bkt", "k", "t", None).await.unwrap();
+        assert!(matches!(
+            s.delete_bucket("bkt").await,
+            Err(ObjectError::BucketNotEmpty(_))
+        ));
+        s.abort_multipart("bkt", &uid).await.unwrap();
+        s.delete_bucket("bkt").await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Overwrites, deletes, part re-uploads and aborts delete the bytes they replace
+    /// right away: churn never piles up unaccounted bytes on the shared disk (the byte
+    /// quota lets a net-zero overwrite through, so retained garbage would bypass it).
+    #[tokio::test]
+    async fn churn_leaves_no_garbage_on_disk() {
+        let dir = root("churn");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        for i in 0..50u8 {
+            s.put_object("bkt", "k", &[i; 1000][..], "t", None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(segment_files(&dir), 1);
+        let uid = s.create_multipart("bkt", "m", "t", None).await.unwrap();
+        for _ in 0..20 {
+            s.upload_part("bkt", &uid, 1, &b"part"[..], None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(segment_files(&dir), 2);
+        s.abort_multipart("bkt", &uid).await.unwrap();
+        s.delete_object("bkt", "k").await.unwrap();
+        assert_eq!(segment_files(&dir), 0);
+        assert!(due(&s).is_empty(), "nothing left for the sweeper");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staged parts are capped per project (zero-byte parts cost rows and files the byte
+    /// quota can't see), re-uploading an existing part number still works, and the stale-
+    /// upload sweep retires a bounded number of parts per pass.
+    #[tokio::test]
+    async fn staged_parts_are_capped_and_swept_in_bounded_passes() {
+        let dir = root("staged-cap");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let cap = crate::index::MAX_STAGED_PARTS as u32; // 50 under test
+        let mut uploads = Vec::new();
+        for u in 0..3 {
+            let uid = s
+                .create_multipart("bkt", &format!("k{u}"), "t", None)
+                .await
+                .unwrap();
+            for pn in 1..=20 {
+                let r = s.upload_part("bkt", &uid, pn, &b""[..], None).await;
+                let staged = u * 20 + pn;
+                if staged <= cap {
+                    r.unwrap();
+                } else {
+                    assert!(
+                        matches!(r, Err(ObjectError::InvalidArgument(_))),
+                        "part {staged}: {r:?}"
+                    );
+                }
+            }
+            uploads.push(uid);
+        }
+        // At the cap, an existing part number can still be re-uploaded.
+        s.upload_part("bkt", &uploads[0], 1, &b"again"[..], None)
+            .await
+            .unwrap();
+        assert_eq!(segment_files(&dir), cap as usize);
+        // 50 staged parts, 20 retired per pass: three passes, never more than one upload's
+        // worth (20 parts) in one.
+        let mut passes = 0;
+        while !s.list_multipart_uploads("bkt").await.unwrap().is_empty() {
+            assert_eq!(s.sweep_stale_uploads(Duration::ZERO).await.unwrap(), 1);
+            passes += 1;
+        }
+        assert_eq!(passes, 3);
+        assert_eq!(segment_files(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A GET keeps reading the version it looked up after an overwrite or delete: its
+    /// segments are pinned for as long as the body (or its stream) lives, then reclaimed
+    /// by the next sweep.
+    #[tokio::test]
+    async fn readers_pin_their_version_until_dropped() {
+        let dir = root("pins");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        s.put_object("bkt", "k", &b"old"[..], "t", None)
+            .await
+            .unwrap();
+        let old_seg = row(&s, "bkt", "k").segments[0].id.clone();
+        let (_, before) = s.get_object("bkt", "k").await.unwrap();
+        let stream = before.into_stream(); // the stream, not just the body, holds the pin
+        s.put_object("bkt", "k", &b"new!"[..], "t", None)
+            .await
+            .unwrap();
+        assert!(
+            local(&dir).exists(&old_seg),
+            "pinned segment survived the overwrite"
+        );
+        assert_eq!(s.collect_garbage().await.unwrap(), 0, "and the sweep");
+        let chunks: Vec<_> = stream.try_collect().await.unwrap();
+        assert_eq!(chunks.concat(), b"old");
+        assert_eq!(
+            read_all(s.get_object("bkt", "k").await.unwrap().1).await,
+            b"new!"
+        );
+        // Stream consumed and dropped: the pin is released and the sweep reclaims it.
+        assert_eq!(s.collect_garbage().await.unwrap(), 1);
+        assert!(!local(&dir).exists(&old_seg));
+        assert_eq!(segment_files(&dir), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write whose process died between "pending" and its commit is reclaimed once it
+    /// is past the orphan age, and never before; a commit whose pending row was claimed
+    /// meanwhile (a live writer the clock made look dead) is refused.
+    #[tokio::test]
+    async fn crashed_writes_are_reclaimed_after_the_orphan_age() {
+        let dir = root("orphan");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let now = now_secs();
+        let (fresh, dead) = (new_id(), new_id());
+        s.inner
+            .index
+            .add_pending(std::slice::from_ref(&fresh), now)
+            .unwrap();
+        s.inner
+            .index
+            .add_pending(
+                std::slice::from_ref(&dead),
+                now - crate::index::PENDING_ORPHAN_AGE - 1,
+            )
+            .unwrap();
+        for id in [&fresh, &dead] {
+            let mut w = s.inner.segments.create(id).await.unwrap();
+            w.write(b"bytes").await.unwrap();
+            w.commit().await.unwrap();
+        }
+        assert_eq!(s.collect_garbage().await.unwrap(), 1);
+        assert!(!local(&dir).exists(&dead) && local(&dir).exists(&fresh));
+
+        let r = ObjectRow {
+            meta: ObjectMeta {
+                key: "k".into(),
+                size: 5,
+                etag: "e".into(),
+                content_type: "t".into(),
+                last_modified: now,
+                cache_control: None,
+            },
+            segments: vec![SegRef { id: dead, size: 5 }],
+        };
+        assert!(s.inner.index.commit_object("bkt", &r, now).is_err());
+        assert!(matches!(
+            s.head_object("bkt", "k").await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed write (bad checksum) leaves nothing behind: no pending row, no garbage,
+    /// no bytes.
+    #[tokio::test]
+    async fn failed_writes_release_their_segment() {
+        let dir = root("failed-write");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        assert!(matches!(
+            s.put_object("bkt", "k", &b"body"[..], "t", Some(&"0".repeat(64)))
+                .await,
+            Err(ObjectError::ContentSha256Mismatch)
+        ));
+        assert_eq!(segment_files(&dir), 0);
+        assert_eq!(s.collect_garbage().await.unwrap(), 0, "released at once");
+        assert!(due(&s).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PUT cancelled mid-body (client gone) releases and deletes its segment instead of
+    /// leaving it for the 12 h orphan sweep.
+    #[tokio::test]
+    async fn a_cancelled_write_releases_its_segment() {
+        let dir = root("cancelled");
+        let s = Arc::new(ObjectStore::open(&dir).unwrap());
+        s.create_bucket("bkt").await.unwrap();
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let task = {
+            let s = s.clone();
+            tokio::spawn(async move { s.put_object("bkt", "k", rx, "t", None).await })
+        };
+        tokio::io::AsyncWriteExt::write_all(&mut tx, b"partial")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Neither left pending (a claim far in the future would retire it) nor garbage.
+        let later = now_secs() + crate::index::PENDING_ORPHAN_AGE + 1;
+        let left = s.inner.index.claim_due(later, usize::MAX).unwrap();
+        assert!(
+            left.is_empty(),
+            "released and deleted, not left for the sweeper: {left:?}"
+        );
+        assert_eq!(segment_files(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting a store's root under an open handle (project deleted and re-registered
+    /// with the same id) makes the handle stale; reopening gives a fresh, empty store,
+    /// and the stale handle can't write segments into the new incarnation.
+    #[tokio::test]
+    async fn a_recreated_root_is_a_new_store() {
+        let dir = root("recreate");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        assert!(s.is_current());
+        assert!(Arc::ptr_eq(
+            &s.inner,
+            &ObjectStore::open(&dir).unwrap().inner
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!s.is_current());
+        let fresh = ObjectStore::open(&dir).unwrap();
+        assert!(fresh.is_current() && !Arc::ptr_eq(&s.inner, &fresh.inner));
+        assert!(fresh.list_buckets().await.unwrap().is_empty());
+        assert!(
+            s.put_object("bkt", "k", &b"x"[..], "t", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(segment_files(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing bucket is reported before a bad key or upload id, as before.
+    #[tokio::test]
+    async fn missing_bucket_wins_over_bad_names() {
+        let dir = root("precedence");
+        let s = ObjectStore::open(&dir).unwrap();
+        let long = "k".repeat(1025);
+        assert!(matches!(
+            s.get_object("nope", &long).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.head_object("nope", &long).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.delete_object("nope", &long).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        assert!(matches!(
+            s.upload_part("nope", "zz", 1, &b"x"[..], None).await,
+            Err(ObjectError::NoSuchBucket(_))
+        ));
+        s.create_bucket("bkt").await.unwrap();
+        assert!(matches!(
+            s.get_object("bkt", &long).await,
+            Err(ObjectError::InvalidKey(_))
+        ));
+        assert!(matches!(
+            s.abort_multipart("bkt", &"a".repeat(100)).await,
+            Err(ObjectError::NoSuchUpload(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- layout-1 migration -----------------------------------------------
+
+    fn legacy_object(dir: &Path, bucket: &str, key: &str, body: &[u8]) {
+        let b = dir.join(bucket);
+        std::fs::create_dir_all(&b).unwrap();
+        let stem = crate::legacy::object_stem(key);
+        std::fs::write(b.join(&stem), body).unwrap();
+        let meta = ObjectMeta {
+            key: key.to_string(),
+            size: body.len() as u64,
+            etag: hex(&Md5::digest(body)),
+            content_type: "text/plain".into(),
+            last_modified: 1,
+            cache_control: Some("max-age=60".into()),
+        };
+        std::fs::write(
+            b.join(format!("{stem}.meta")),
+            serde_json::to_vec(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn root_entries(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A layout-1 store (all three file-name tiers, an in-flight multipart upload, a CORS
+    /// sidecar, temp junk) opens as the same store: same keys, bytes and metadata, the
+    /// upload still completes, and the legacy tree is gone.
+    #[tokio::test]
+    async fn a_layout_one_store_migrates_on_open() {
+        let dir = root("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keys = ["a.txt".to_string(), key_of(150, "b64"), key_of(900, "hash")];
+        for k in &keys {
+            legacy_object(&dir, "bkt", k, k.as_bytes());
+        }
+        std::fs::create_dir_all(dir.join("empty-bucket")).unwrap();
+        std::fs::write(dir.join("bkt").join(".tmp.1.2"), b"junk").unwrap();
+        std::fs::create_dir_all(dir.join(".cors")).unwrap();
+        std::fs::write(dir.join(".cors").join("bkt.json"), r#"{"rules":[]}"#).unwrap();
+        let up = dir.join("bkt").join(".uploads").join("00ab");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(
+            up.join("info.json"),
+            serde_json::to_vec(&UploadInfo {
+                key: "mp".into(),
+                content_type: "t".into(),
+                initiated: 0,
+                cache_control: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let first = big(b'h');
+        std::fs::write(up.join("part-1"), &first).unwrap();
+        std::fs::write(up.join("part-1.md5"), Md5::digest(&first)).unwrap();
+
+        let s = ObjectStore::open(&dir).unwrap();
+        assert_eq!(s.list_buckets().await.unwrap(), ["bkt", "empty-bucket"]);
+        for k in &keys {
+            let (meta, body) = s.get_object("bkt", k).await.unwrap();
+            assert_eq!(&meta.key, k);
+            assert_eq!(meta.size, k.len() as u64);
+            assert_eq!(meta.cache_control.as_deref(), Some("max-age=60"));
+            assert_eq!(read_all(body).await, k.as_bytes());
+        }
+        assert_eq!(s.usage_counts().await.unwrap(), (2, 3));
+        assert!(s.get_bucket_cors("bkt").await.unwrap().is_some());
+        let uploads = s.list_multipart_uploads("bkt").await.unwrap();
+        assert_eq!((uploads.len(), uploads[0].key.as_str()), (1, "mp"));
+        assert!(uploads[0].initiated > 0, "legacy upload got its mtime");
+        s.upload_part("bkt", "00ab", 2, &b"world"[..], None)
+            .await
+            .unwrap();
+        s.complete_multipart("bkt", "mp", "00ab", &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(s.get_object("bkt", "mp").await.unwrap().1).await,
+            [first.as_slice(), b"world"].concat()
+        );
+        assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A migration interrupted after hiding a bucket and committing some of it re-runs
+    /// cleanly: no object is doubled, the bytes are right, and the redundant link from
+    /// the first pass is garbage.
+    #[tokio::test]
+    async fn an_interrupted_migration_reruns_cleanly() {
+        let dir = root("migrate-twice");
+        std::fs::create_dir_all(&dir).unwrap();
+        legacy_object(&dir, "bkt", "k", b"first");
+        drop(ObjectStore::open(&dir).unwrap());
+        // As if the first run died after committing but before unlinking.
+        legacy_object(&dir, "bkt", "k", b"first");
+        std::fs::rename(dir.join("bkt"), dir.join(".migrating-bkt")).unwrap();
+        let s = ObjectStore::open(&dir).unwrap();
+        assert_eq!(s.usage_counts().await.unwrap(), (1, 1));
+        assert_eq!(
+            read_all(s.get_object("bkt", "k").await.unwrap().1).await,
+            b"first"
+        );
+        assert_eq!(due(&s).len(), 1, "the first pass's link is garbage");
+        assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Content an older binary wrote after the migration (a rollback) is never stranded:
+    /// the next open migrates it, and it wins over what the index had, being newer.
+    #[tokio::test]
+    async fn writes_from_a_rolled_back_binary_are_picked_up() {
+        let dir = root("rollback");
+        std::fs::create_dir_all(&dir).unwrap();
+        legacy_object(&dir, "bkt", "k", b"v1");
+        drop(ObjectStore::open(&dir).unwrap());
+        // The older binary sees no buckets (they were all migrated); its writes recreate
+        // a layout-1 bucket directory.
+        legacy_object(&dir, "bkt", "k", b"v2-from-old-binary");
+        legacy_object(&dir, "other", "n", b"new");
+        let s = ObjectStore::open(&dir).unwrap();
+        assert_eq!(
+            read_all(s.get_object("bkt", "k").await.unwrap().1).await,
+            b"v2-from-old-binary"
+        );
+        assert_eq!(
+            read_all(s.get_object("other", "n").await.unwrap().1).await,
+            b"new"
+        );
+        assert_eq!(root_entries(&dir), [INDEX_FILE, SEGMENTS_DIR]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a sidecar under its own key's name was ever served; one that isn't (or that
+    /// doesn't parse) is not migrated — and not deleted: its bucket's leftovers are set
+    /// aside under `.unmigrated/`, out of every later migration's way.
+    #[tokio::test]
+    async fn unreadable_legacy_objects_are_set_aside() {
+        let dir = root("migrate-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (key_of(300, "a"), key_of(300, "b"));
+        legacy_object(&dir, "bkt", &a, b"A");
+        legacy_object(&dir, "bkt", "fine", b"ok");
+        let (sa, sb) = (
+            crate::legacy::object_stem(&a),
+            crate::legacy::object_stem(&b),
+        );
+        for suffix in ["", ".meta"] {
+            std::fs::rename(
+                dir.join("bkt").join(format!("{sa}{suffix}")),
+                dir.join("bkt").join(format!("{sb}{suffix}")),
+            )
+            .unwrap();
+        }
+        let s = ObjectStore::open(&dir).unwrap();
+        assert!(matches!(
+            s.get_object("bkt", &b).await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
+        assert!(matches!(
+            s.get_object("bkt", &a).await,
+            Err(ObjectError::NoSuchKey(_))
+        ));
+        assert_eq!(
+            read_all(s.get_object("bkt", "fine").await.unwrap().1).await,
+            b"ok"
+        );
+        let aside: Vec<_> = std::fs::read_dir(dir.join(".unmigrated"))
+            .unwrap()
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert!(
+            aside[0]
+                .as_ref()
+                .unwrap()
+                .path()
+                .join(format!("{sb}.meta"))
+                .exists()
+        );
+        drop(s);
+        // Set aside means set aside: reopening doesn't try again.
+        assert!(
+            !crate::legacy::needs_migration(&dir, &Index::open(&dir.join(INDEX_FILE)).unwrap())
+                .unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Listing over a mix of short and long keys matches a plain sort + filter of the
@@ -1864,10 +2274,16 @@ mod tests {
             "z".repeat(1023) + "/",
         ];
         for i in 0..30 {
-            keys.push(format!("bundle-inputs/{}/{i:04}/{}.tar.gz", "k".repeat(40), "n".repeat(80)));
+            keys.push(format!(
+                "bundle-inputs/{}/{i:04}/{}.tar.gz",
+                "k".repeat(40),
+                "n".repeat(80)
+            ));
         }
         for k in &keys {
-            s.put_object("bkt", k, k.as_bytes(), "t", None).await.unwrap();
+            s.put_object("bkt", k, k.as_bytes(), "t", None)
+                .await
+                .unwrap();
         }
         keys.sort();
 
@@ -1936,87 +2352,17 @@ mod tests {
         }
     }
 
-    /// A hashed name is not the key: a sidecar found under it that names another key is
-    /// never served or listed.
-    #[tokio::test]
-    async fn a_long_name_never_serves_another_key() {
-        let dir = root("longmismatch");
-        let s = ObjectStore::open(&dir).unwrap();
-        s.create_bucket("bkt").await.unwrap();
-        let (a, b) = (key_of(300, "a"), key_of(300, "b"));
-        s.put_object("bkt", &a, &b"A"[..], "t", None).await.unwrap();
-        // Move A's files under B's name (as corruption / tampering would).
-        let (sa, sb) = (object_stem(&a), object_stem(&b));
-        for suffix in ["", ".meta"] {
-            std::fs::rename(
-                dir.join("bkt").join(format!("{sa}{suffix}")),
-                dir.join("bkt").join(format!("{sb}{suffix}")),
-            )
-            .unwrap();
-        }
-        assert!(matches!(
-            s.get_object("bkt", &b).await,
-            Err(ObjectError::NoSuchKey(_))
-        ));
-        assert!(s.list_objects("bkt", "", None, 10).await.unwrap().objects.is_empty());
-    }
-
-    #[test]
-    fn stems_fit_the_filesystem_and_never_overlap() {
-        let fits = |n: usize| object_stem(&key_of(n, "a")).len() + META_SUFFIX.len();
-        assert_eq!(fits(HEX_NAME_MAX_KEY), NAME_MAX);
-        assert_eq!(fits(B64_NAME_MAX_KEY), NAME_MAX);
-        assert_eq!(fits(B64_NAME_MAX_KEY + 1), NAME_MAX);
-        assert_eq!(fits(1024), NAME_MAX);
-        for n in 1..=1024 {
-            let mut key = "é😀/".repeat(n / 7 + 1);
-            while !key.is_char_boundary(n) {
-                key.insert(0, 'p');
-            }
-            key.truncate(n);
-            let stem = object_stem(&key);
-            assert!(stem.len() + META_SUFFIX.len() <= NAME_MAX, "{n}");
-            assert!(!stem.contains('/') && !stem.starts_with('.'), "{n}");
-            match parse_stem(&stem) {
-                Some(StemKey::Exact(k)) => assert!(n <= B64_NAME_MAX_KEY && k == key, "{n}"),
-                Some(StemKey::Head(h)) => {
-                    assert!(n > B64_NAME_MAX_KEY && key.as_bytes().starts_with(&h), "{n}")
-                }
-                None => panic!("{n}: own stem did not parse"),
-            }
-            // A reader that only knows `hex(key)` names must skip the new ones.
-            assert_eq!(hex_decode(&stem).is_ok(), n <= HEX_NAME_MAX_KEY, "{n}");
-        }
-        // Same head, different key → different file.
-        let head = "p".repeat(300);
-        assert_ne!(object_stem(&format!("{head}1")), object_stem(&format!("{head}2")));
-        // One name per key: a short key dressed up in a longer tier's name is not listed.
-        assert!(parse_stem(&format!("{B64_NAME_PREFIX}{}", b64(b"short"))).is_none());
-        assert!(parse_stem("4A").is_none() && parse_stem("4a").is_some());
-    }
-
-    #[test]
-    fn b64_round_trips_and_rejects_non_canonical_names() {
-        for len in 0..=200usize {
-            let bytes: Vec<u8> = (0..len).map(|i| (i * 131 + len * 7) as u8).collect();
-            let enc = b64(&bytes);
-            assert_eq!(enc.len(), (len * 4).div_ceil(3));
-            assert_eq!(b64_decode(&enc).as_deref(), Some(&bytes[..]), "{len}");
-        }
-        assert!(b64_decode("A").is_none()); // impossible length
-        assert!(b64_decode("AA=").is_none()); // outside the alphabet
-        assert!(b64_decode("--0").is_none()); // stray low bits: not what b64 writes
-        assert!(b64_decode("/-").is_none());
-    }
-
     /// Listings of one store queue past `MAX_CONCURRENT_LISTS` instead of running at
     /// once, and all complete.
     #[tokio::test]
     async fn concurrent_listings_are_bounded_and_all_complete() {
         let s = std::sync::Arc::new(ObjectStore::open(root("listcap")).unwrap());
         s.create_bucket("bkt").await.unwrap();
-        s.put_object("bkt", "a", &b"x"[..], "t", None).await.unwrap();
+        s.put_object("bkt", "a", &b"x"[..], "t", None)
+            .await
+            .unwrap();
         let held = s
+            .inner
             .list_permits
             .acquire_many(MAX_CONCURRENT_LISTS as u32)
             .await
@@ -2025,42 +2371,117 @@ mod tests {
         for _ in 0..3 * MAX_CONCURRENT_LISTS {
             let s = s.clone();
             tasks.spawn(async move {
-                s.list_objects("bkt", "", None, 10).await.unwrap().objects.len()
+                s.list_objects("bkt", "", None, 10)
+                    .await
+                    .unwrap()
+                    .objects
+                    .len()
             });
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(tasks.try_join_next().is_none(), "a listing ran past the cap");
+        assert!(
+            tasks.try_join_next().is_none(),
+            "a listing ran past the cap"
+        );
         drop(held);
         while let Some(n) = tasks.join_next().await {
             assert_eq!(n.unwrap(), 1);
         }
     }
-    /// Keys up to 186 bytes are listed from file names alone: the scan must not depend
-    /// on (or pay for) any sidecar but the returned page's own.
-    #[tokio::test]
-    async fn whole_key_names_list_without_reading_other_sidecars() {
-        let dir = root("noread");
+
+    /// Regression (re-review BLOCKER): a request cancelled while its commit transaction is
+    /// on the blocking pool lets the commit land AND drops its PendingSegment, whose
+    /// release must then do nothing — it used to put the now-referenced id into garbage,
+    /// and the sweeper deleted a committed object's bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_cancelled_mid_commit_keeps_its_bytes() {
+        let dir = root("cancel-commit");
         let s = ObjectStore::open(&dir).unwrap();
         s.create_bucket("bkt").await.unwrap();
-        let keys: Vec<String> = (0..20)
-            .map(|i| format!("{}/{i:02}", "p".repeat(B64_NAME_MAX_KEY - 3)))
-            .collect();
-        for k in &keys {
-            assert_eq!(k.len(), B64_NAME_MAX_KEY);
-            s.put_object("bkt", k, &b"x"[..], "t", None).await.unwrap();
+        let mut body: &[u8] = b"precious bytes";
+        let (pending, size, md5) = s.write_segment(&mut body, None, None).await.unwrap();
+        let id = pending.id().to_string();
+        let row = ObjectRow {
+            meta: ObjectMeta {
+                key: "k".into(),
+                size,
+                etag: hex(&md5),
+                content_type: "t".into(),
+                last_modified: now_secs(),
+                cache_control: None,
+            },
+            segments: vec![SegRef {
+                id: id.clone(),
+                size,
+            }],
+        };
+        // Same closure put_object_capped passes; the sleep stands in for a slow fsync.
+        let fut = s.commit_with(pending, move |ix| {
+            // Committed; the request is cancelled before the blocking task's result is
+            // polled (equivalently: cancelled while redb's fsync holds the write lock, so
+            // the Drop's discard queues behind it).
+            let retired = ix.commit_object("bkt", &row, now_secs())?;
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(((), retired))
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), fut)
+                .await
+                .is_err()
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // The row committed.
+        s.head_object("bkt", "k").await.unwrap();
+        // ...and its only segment is now garbage.
+        let due = s.inner.index.claim_due(now_secs(), usize::MAX).unwrap();
+        assert!(!due.contains(&id), "a referenced segment is never garbage");
+        assert_eq!(s.collect_garbage().await.unwrap(), 0);
+        let got = match s.get_object("bkt", "k").await {
+            Ok((_, b)) => b
+                .into_stream()
+                .try_collect::<Vec<_>>()
+                .await
+                .map(|c| c.concat()),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        };
+        assert_eq!(
+            got.as_deref().ok(),
+            Some(&b"precious bytes"[..]),
+            "GET after sweep: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PUTs abandoned by their client at arbitrary points (a timeout drops the request
+    /// future). Every object that nevertheless committed stays readable after a sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoned_puts_never_lose_committed_objects() {
+        let dir = root("abandon");
+        let s = ObjectStore::open(&dir).unwrap();
+        s.create_bucket("bkt").await.unwrap();
+        let body = vec![7u8; 64 * 1024];
+        for i in 0..400u64 {
+            let key = format!("k{i}");
+            let us = 200 + (i * 37) % 6000;
+            let _ = tokio::time::timeout(
+                Duration::from_micros(us),
+                s.put_object("bkt", &key, &body[..], "t", None),
+            )
+            .await;
         }
-        // Wreck every sidecar except the first key's.
-        for k in &keys[1..] {
-            let meta = dir.join("bkt").join(format!("{}.meta", object_stem(k)));
-            std::fs::write(meta, b"not json").unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        s.collect_garbage().await.unwrap();
+        let (mut ok, mut lost) = (0, 0);
+        for i in 0..400u64 {
+            if let Ok((_, b)) = s.get_object("bkt", &format!("k{i}")).await {
+                match b.into_stream().try_collect::<Vec<_>>().await {
+                    Ok(_) => ok += 1,
+                    Err(_) => lost += 1,
+                }
+            }
         }
-        let page = s.list_v2("bkt", "", None, None, 1).await.unwrap();
-        assert_eq!(page.objects.len(), 1);
-        assert_eq!(page.objects[0].key, keys[0]);
-        assert!(page.is_truncated);
-        assert_eq!(page.next_continuation_token.as_deref(), Some(keys[0].as_str()));
-        // Folding never needs them either.
-        let folded = s.list_v2("bkt", "", Some("/"), None, 10).await.unwrap();
-        assert_eq!(folded.common_prefixes, vec![format!("{}/", "p".repeat(B64_NAME_MAX_KEY - 3))]);
+        eprintln!("committed+readable {ok}, committed but bytes deleted {lost}");
+        assert_eq!(lost, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

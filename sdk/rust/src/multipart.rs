@@ -84,6 +84,9 @@ impl ObjectClient {
     }
 }
 
+/// S3's (and jkbase's) minimum size for every part of a multipart upload but the last.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
 impl MultipartUpload<'_> {
     /// The server-assigned upload id.
     pub fn upload_id(&self) -> &str {
@@ -91,7 +94,9 @@ impl MultipartUpload<'_> {
     }
 
     /// Upload one part (in-memory). Part numbers should be ascending and unique; the
-    /// engine concatenates them in the order passed to `complete`.
+    /// engine concatenates them in the order passed to `complete`. As in S3, every part
+    /// but the last must be at least 5 MiB ([`MIN_PART_SIZE`]), or `complete` fails with
+    /// `EntityTooSmall`.
     pub async fn upload_part(&mut self, part_number: u32, body: impl Into<Bytes>) -> Result<()> {
         let q = vec![
             ("uploadId".into(), self.upload_id.clone()),
@@ -137,10 +142,15 @@ impl MultipartUpload<'_> {
         Ok(())
     }
 
-    /// Complete the upload, concatenating parts in ascending part-number order. Returns
+    /// Complete the upload, concatenating parts in ascending part-number order. A part
+    /// number uploaded more than once counts once, as its last upload (the server keeps
+    /// the latest, and S3 rejects a repeated number in the completion list). Returns
     /// the final object's raw hex MD5 ETag.
     pub async fn complete(mut self) -> Result<String> {
+        // Latest upload first within each number (sort is stable), then keep that one.
+        self.parts.reverse();
         self.parts.sort_by_key(|(n, _)| *n);
+        self.parts.dedup_by_key(|(n, _)| *n);
         let mut body = String::from("<CompleteMultipartUpload>");
         for (n, _etag) in &self.parts {
             body.push_str(&format!("<Part><PartNumber>{n}</PartNumber></Part>"));
