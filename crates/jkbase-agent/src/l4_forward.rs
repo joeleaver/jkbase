@@ -19,6 +19,20 @@
 //! MAC is direction-bound (`L4Dir`) so a reply frame can't be replayed back into the guest, and
 //! vice versa (P0-L4-11).
 //!
+//! **Flow source address.** Each flow reaches the app FROM [`L4_FLOW_SOURCE_ADDR`] (a host-scope
+//! /32 the agent adds to `lo`, main.rs), not `127.0.0.1`. The app still binds loopback only and
+//! the destination is still `127.0.0.1:guest_port` — only the source the app observes changes.
+//! That source leaks back to the client inside protocol payloads: an ICE-lite server (mediasoup)
+//! echoes it as the STUN XOR-MAPPED-ADDRESS, and Firefox discards a loopback mapped address by
+//! default (`media.peerconnection.ice.loopback`), so ICE never completes and DTLS never starts —
+//! WebRTC was Chrome-only behind this plane. It also stops a stock app treating every client as a
+//! trusted local peer (allowlists that exempt `127.0.0.1`) — though every client still shares ONE
+//! address, so a per-IP limit or ban on it still applies to all clients alike. If the alias can't
+//! be added the agent falls back to `127.0.0.1` — the pre-fix behaviour, never worse. Flow sockets are unconnected (an app bound to the wildcard replies FROM the alias, which
+//! a socket connected to `127.0.0.1` would drop) and admit only `{127.0.0.1, alias}:guest_port`;
+//! both are local addresses, martian on eth0, and the bridge's port isolation + ebtables source
+//! guard already keep anything but the host off the VM's L2. See [`FlowSocket`].
+//!
 //! Modelled on the agent's loopback DB reach leg (`db_leg_loopback_proxy`, main.rs): bind-or-disable
 //! (a bind failure logs + returns, it never crashes the agent), a bounded map fail-closed on
 //! overflow, one self-contained task per port.
@@ -26,7 +40,7 @@
 use jkbase_common::config::L4PortFact;
 use jkbase_common::l4_transit::{self, L4_HEADER_LEN, L4Dir, L4TransitHeader};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -57,6 +71,13 @@ const UDP_MAX_DATAGRAM: usize = 65535;
 /// loopback MTU (`L4_GUEST_LOOPBACK_MTU`, host `main.rs`). Diagnostic threshold only — nothing here
 /// enforces it.
 const TRANSIT_SAFE_FRAME: usize = 1472;
+
+/// The source every flow is presented to the app FROM (see the module doc). RFC 1918 so Firefox
+/// accepts it as a STUN mapped address — loopback and link-local (`169.254/16`) are both filtered
+/// by default — and a single /32 clear of every range jkbase assigns: the VM bridge island
+/// `172.16.0.0/24` and the DNS forwarder's `10.77.0.0/24`. Added host-scope, so the kernel never
+/// picks it as the automatic source for traffic leaving eth0; only an explicit bind uses it.
+pub const L4_FLOW_SOURCE_ADDR: Ipv4Addr = Ipv4Addr::new(10, 254, 254, 1);
 
 /// How long to wait for the guest to bind `127.0.0.1:guest_port` before giving up on the first
 /// datagram of a port. The host cannot prove the guest UDP bind is up; the agent polls
@@ -128,9 +149,9 @@ struct LoopbackFlow {
     /// The `(flow_id, epoch)` this entry authenticates for. A datagram with a higher epoch
     /// supersedes; a lower epoch is a stale rebind and is dropped.
     epoch: u32,
-    /// Connected `127.0.0.1:<ephemeral> → 127.0.0.1:guest_port`. Reused for the flow's life so the
+    /// `<source_ip>:<derived> → 127.0.0.1:guest_port` (see [`FlowSocket`]). Reused for the flow's life so the
     /// app sees a stable source port per flow (client→loopback-port continuity, best-effort v1).
-    sock: Arc<UdpSocket>,
+    sock: Arc<FlowSocket>,
     /// Anti-replay high-water for the host→agent direction of THIS `(flow_id, epoch)`.
     in_nonce_hw: u64,
     /// Last-activity clock in EITHER direction — millis since [`LandForward::base`]. Bumped by the
@@ -201,6 +222,9 @@ impl DropCounters {
 struct LandForward {
     name: Arc<str>,
     guest_port: u16,
+    /// Address each flow's socket binds — [`L4_FLOW_SOURCE_ADDR`], or `127.0.0.1` when the agent
+    /// couldn't add the alias.
+    source_ip: Ipv4Addr,
     secret: Arc<Vec<u8>>,
     listener: Arc<UdpSocket>,
     flows: HashMap<u32, LoopbackFlow>,
@@ -226,7 +250,7 @@ fn elapsed_ms(base: Instant) -> u64 {
 /// crash the agent); empty transit secret ⇒ start nothing (fail-closed — an empty key would let a
 /// co-tenant forge the MAC). One task per port; the caller spawns one of these per `_l4.json`
 /// entry. v1 serves UDP only; a non-udp fact is ignored rather than opened as a silent TCP path.
-pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String) {
+pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String, source_ip: Ipv4Addr) {
     if transit_secret.is_empty() {
         error!(
             name = %fact.name,
@@ -255,6 +279,7 @@ pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String) {
         name = %fact.name,
         agent_udp_port = fact.agent_udp_port,
         guest_port = fact.guest_port,
+        %source_ip,
         host_idle_timeout_secs = fact.idle_timeout_secs,
         flow_idle_ttl_secs = flow_idle_ttl.as_secs(),
         "l4 land-forward listening"
@@ -262,6 +287,7 @@ pub async fn run_l4_land_forward(fact: L4PortFact, transit_secret: String) {
     let lf = LandForward {
         name: Arc::from(fact.name.as_str()),
         guest_port: fact.guest_port,
+        source_ip,
         secret: Arc::new(transit_secret.into_bytes()),
         listener,
         flows: HashMap::new(),
@@ -482,7 +508,7 @@ impl LandForward {
         hdr: L4TransitHeader,
         payload: &[u8],
         src: SocketAddr,
-        reuse: Option<Arc<UdpSocket>>,
+        reuse: Option<Arc<FlowSocket>>,
     ) {
         // Map full: LRU-evict the least-recently-active entry to make room rather than DROP this
         // (authenticated) new flow. Dropping would let a churn flood of short-lived flows wedge the
@@ -526,7 +552,7 @@ impl LandForward {
         }
         let sock = match reuse {
             Some(s) => s,
-            None => match connect_loopback(self.guest_port, hdr.flow_id).await {
+            None => match connect_loopback(self.source_ip, self.guest_port, hdr.flow_id).await {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     warn!(error = %e, port = %self.name, guest_port = self.guest_port, "l4 land-forward: failed to open loopback socket");
@@ -618,7 +644,7 @@ struct ReplyPump {
     epoch: u32,
     name: Arc<str>,
     secret: Arc<Vec<u8>>,
-    loopback: Arc<UdpSocket>,
+    loopback: Arc<FlowSocket>,
     listener: Arc<UdpSocket>,
     reply_to: SocketAddr,
     cancel: Arc<Notify>,
@@ -689,10 +715,61 @@ impl ReplyPump {
     }
 }
 
-/// Open a loopback UDP socket bound to an ephemeral `127.0.0.1` source and connected to
-/// `127.0.0.1:guest_port`, so `send`/`recv` reach the guest app and receive its replies. Connecting
-/// pins the peer, so a reply from any other source is ignored by the kernel.
-async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpSocket> {
+/// One flow's guest-side socket: bound to `source_ip`, sends to `127.0.0.1:guest_port`, and admits
+/// replies only from `{127.0.0.1, source_ip}:guest_port`.
+///
+/// Deliberately NOT `connect()`ed. Which source the app's reply carries depends on how the app
+/// bound: an app on `127.0.0.1` replies from `127.0.0.1`, but an app on the wildcard (`0.0.0.0`,
+/// or a dual-stack `::` — the common default, which the readiness gate accepts) replies from the
+/// local route's preferred source for our address, i.e. `source_ip` itself. A socket connected to
+/// `127.0.0.1:guest_port` has the kernel silently drop that second case — every reply lost, in
+/// every browser. So [`FlowSocket::recv`] does the peer check the kernel used to: both admitted
+/// sources are local addresses, which `fib_validate_source` rejects as martians when they arrive
+/// on eth0 (on top of the bridge port isolation + ebtables source guard), so the filter admits
+/// only the guest app.
+struct FlowSocket {
+    sock: UdpSocket,
+    app: SocketAddr,
+    source_ip: Ipv4Addr,
+}
+
+impl FlowSocket {
+    /// Forward one client datagram to the guest app.
+    async fn send(&self, payload: &[u8]) -> std::io::Result<usize> {
+        self.sock.send_to(payload, self.app).await
+    }
+
+    /// Next datagram from the guest app; anything from another source is discarded.
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let (n, from) = self.sock.recv_from(buf).await?;
+            if from.port() == self.app.port()
+                && (from.ip() == self.app.ip() || from.ip() == self.source_ip)
+            {
+                return Ok(n);
+            }
+            debug!(%from, "l4 flow socket: dropped a datagram not from the guest app");
+        }
+    }
+
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.sock.local_addr()
+    }
+}
+
+/// Open the [`FlowSocket`] for `flow_id`, bound to `source_ip` (see [`L4_FLOW_SOURCE_ADDR`]).
+async fn connect_loopback(
+    source_ip: Ipv4Addr,
+    guest_port: u16,
+    flow_id: u32,
+) -> std::io::Result<FlowSocket> {
+    let app = SocketAddr::from((Ipv4Addr::LOCALHOST, guest_port));
+    let flow = |sock| FlowSocket {
+        sock,
+        app,
+        source_ip,
+    };
     // Bind a source port DERIVED FROM `flow_id` rather than letting the kernel pick, so the tuple
     // the guest app sees is a pure function of the flow — reproduced identically whenever this
     // socket has to be re-created. That is what carries a pinning app (WebRTC/DTLS, QUIC) through
@@ -719,17 +796,13 @@ async fn connect_loopback(guest_port: u16, flow_id: u32) -> std::io::Result<UdpS
         let Some(candidate) = derived_source_port(flow_id, guest_port, attempt) else {
             break;
         };
-        if let Ok(sock) = UdpSocket::bind(("127.0.0.1", candidate)).await
-            && sock.connect(("127.0.0.1", guest_port)).await.is_ok()
-        {
-            return Ok(sock);
+        if let Ok(sock) = UdpSocket::bind((source_ip, candidate)).await {
+            return Ok(flow(sock));
         }
     }
     // Fall back to an ephemeral port: every candidate was taken. Correct but not reproducible —
     // this flow's tuple will move if the socket is ever re-created. No worse than before this.
-    let sock = UdpSocket::bind(("127.0.0.1", 0)).await?;
-    sock.connect(("127.0.0.1", guest_port)).await?;
-    Ok(sock)
+    Ok(flow(UdpSocket::bind((source_ip, 0)).await?))
 }
 
 /// Ceiling on waiting for a cancelled reply pump to stop, on every path that retires a flow.
@@ -1061,6 +1134,115 @@ mod tests {
         assert_eq!(seq, again, "the sequence must reproduce exactly");
     }
 
+    /// The app must observe the CONFIGURED flow source, not a hardcoded `127.0.0.1` — that observed
+    /// address is what an ICE-lite app echoes to the client as its STUN mapped address. Uses
+    /// `127.0.0.2` as the stand-in source: the real `L4_FLOW_SOURCE_ADDR` needs `CAP_NET_ADMIN` to
+    /// add, but Linux treats all of `127/8` as local, so this proves the plumbing unprivileged.
+    #[tokio::test]
+    async fn the_app_sees_the_configured_flow_source_and_its_reply_returns() {
+        let app = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let guest_port = app.local_addr().unwrap().port();
+        let source = Ipv4Addr::new(127, 0, 0, 2);
+
+        let flow = connect_loopback(source, guest_port, 7).await.unwrap();
+        assert_eq!(flow.local_addr().unwrap().ip(), source);
+
+        flow.send(b"binding-request").await.unwrap();
+        let mut buf = [0u8; 32];
+        let (n, peer) = app.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"binding-request");
+        assert_eq!(
+            peer.ip(),
+            source,
+            "the app must see the flow source, not 127.0.0.1"
+        );
+
+        // The app replies to whatever source it saw; the connected flow socket must get it back.
+        app.send_to(b"binding-response", peer).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), flow.recv(&mut buf))
+            .await
+            .expect("reply must reach the flow socket")
+            .unwrap();
+        assert_eq!(&buf[..n], b"binding-response");
+    }
+
+    /// The real path, in a throwaway network namespace so the host's `lo` is never touched: add
+    /// the flow source with the agent's own netlink call (twice — `NLM_F_REPLACE` must make an agent
+    /// restart idempotent), then round-trip through a real [`FlowSocket`] against an app bound each
+    /// way a tenant plausibly binds. The wildcard cases are the ones that matter: such an app
+    /// replies FROM the alias, which a socket connected to `127.0.0.1` silently drops. Needs
+    /// `CAP_SYS_ADMIN` for `unshare(CLONE_NEWNET)` — root, or unprivileged in a user namespace:
+    ///   unshare -r <jkbase-agent test binary> --ignored flow_source_alias
+    #[test]
+    #[ignore]
+    fn flow_source_alias_round_trips_in_a_private_netns() {
+        std::thread::spawn(|| {
+            // SAFETY: unshare/socket/ioctl on this thread only; fd closed; ifreq correctly sized.
+            unsafe {
+                assert_eq!(
+                    libc::unshare(libc::CLONE_NEWNET),
+                    0,
+                    "unshare(CLONE_NEWNET)"
+                );
+                // A fresh netns has lo DOWN; bring it up (SIOCGIFFLAGS / SIOCSIFFLAGS).
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+                let mut req = [0u8; 40];
+                req[..2].copy_from_slice(b"lo");
+                assert_eq!(
+                    libc::ioctl(fd, libc::SIOCGIFFLAGS as _, req.as_mut_ptr()),
+                    0
+                );
+                let flags = i16::from_ne_bytes([req[16], req[17]]) | libc::IFF_UP as i16;
+                req[16..18].copy_from_slice(&flags.to_ne_bytes());
+                assert_eq!(
+                    libc::ioctl(fd, libc::SIOCSIFFLAGS as _, req.as_mut_ptr()),
+                    0
+                );
+                libc::close(fd);
+            }
+            crate::add_loopback_flow_source(L4_FLOW_SOURCE_ADDR).expect("add alias");
+            crate::add_loopback_flow_source(L4_FLOW_SOURCE_ADDR).expect("re-add is idempotent");
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for (i, bind) in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let app = UdpSocket::bind(bind).await.unwrap();
+                    let guest_port = app.local_addr().unwrap().port();
+                    let flow = connect_loopback(L4_FLOW_SOURCE_ADDR, guest_port, i as u32)
+                        .await
+                        .unwrap();
+                    flow.send(b"binding-request").await.unwrap();
+                    let mut buf = [0u8; 32];
+                    let (n, peer) = app.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(&buf[..n], b"binding-request");
+                    let seen = match peer.ip() {
+                        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4),
+                        v4 => Some(v4),
+                    };
+                    assert_eq!(
+                        seen,
+                        Some(L4_FLOW_SOURCE_ADDR.into()),
+                        "{bind}: app sees alias"
+                    );
+                    app.send_to(b"binding-response", peer).await.unwrap();
+                    let n = tokio::time::timeout(Duration::from_secs(2), flow.recv(&mut buf))
+                        .await
+                        .unwrap_or_else(|_| panic!("{bind}: the app's reply was dropped"))
+                        .unwrap();
+                    assert_eq!(&buf[..n], b"binding-response");
+                }
+            });
+        })
+        .join()
+        .expect("netns round-trip");
+    }
+
     /// The failure the eviction joins exist to prevent, at the level `connect_loopback` sees it:
     /// a flow re-created while its OWN previous socket is still bound cannot get its derived port
     /// back, so the tuple moves. Cancelling a pump does not close its socket — the task holds an
@@ -1073,11 +1255,15 @@ mod tests {
         let guest_port = app.local_addr().unwrap().port();
         let flow_id = 4242u32;
 
-        let first = connect_loopback(guest_port, flow_id).await.unwrap();
+        let first = connect_loopback(Ipv4Addr::LOCALHOST, guest_port, flow_id)
+            .await
+            .unwrap();
         let p1 = first.local_addr().unwrap().port();
 
         // Re-create while the old socket is STILL OPEN — the lingering-pump case.
-        let second = connect_loopback(guest_port, flow_id).await.unwrap();
+        let second = connect_loopback(Ipv4Addr::LOCALHOST, guest_port, flow_id)
+            .await
+            .unwrap();
         let p2 = second.local_addr().unwrap().port();
         assert_ne!(p2, p1, "the old socket still holds p1, so this must land elsewhere");
 
@@ -1085,7 +1271,9 @@ mod tests {
         // joins worth doing.
         drop(first);
         drop(second);
-        let third = connect_loopback(guest_port, flow_id).await.unwrap();
+        let third = connect_loopback(Ipv4Addr::LOCALHOST, guest_port, flow_id)
+            .await
+            .unwrap();
         assert_eq!(
             third.local_addr().unwrap().port(),
             p1,

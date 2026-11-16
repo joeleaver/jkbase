@@ -20,7 +20,7 @@ use hyper_util::rt::TokioIo;
 use jkbase_common::layers::RuntimeLayers;
 use log_sink::LogSink;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -291,6 +291,106 @@ fn set_loopback_mtu(mtu: i32) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Add `addr/32` to `lo`, host scope, via one rtnetlink `RTM_NEWADDR` — the L4 flow source
+/// (`l4_forward::L4_FLOW_SOURCE_ADDR`). Netlink, not `SIOCSIFADDR` on a `lo:` alias: the ioctl
+/// creates the address with its CLASSFUL mask (a /8 for `10.x`) and needs a second
+/// `SIOCSIFNETMASK` to narrow it, so for a moment — or for good, if the second call fails — all of
+/// `10.0.0.0/8` would route into `lo`. `RTM_NEWADDR` installs the /32 atomically. `NLM_F_REPLACE`
+/// makes it idempotent across an agent restart. Same no-iproute2 constraint as
+/// [`set_loopback_mtu`]. Best-effort: the caller falls back to a `127.0.0.1` flow source.
+fn add_loopback_flow_source(addr: Ipv4Addr) -> std::io::Result<()> {
+    // SAFETY: `if_nametoindex` reads a NUL-terminated name; the netlink socket is closed on every
+    // path; every buffer handed to the kernel is a correctly-sized local array.
+    unsafe {
+        let ifindex = libc::if_nametoindex(c"lo".as_ptr());
+        if ifindex == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = (|| {
+            let req = rtm_newaddr_request(ifindex, addr, 1);
+            let mut kernel: libc::sockaddr_nl = std::mem::zeroed();
+            kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+            let sent = libc::sendto(
+                fd,
+                req.as_ptr().cast(),
+                req.len(),
+                0,
+                (&kernel as *const libc::sockaddr_nl).cast(),
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            );
+            if sent < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // NLM_F_ACK ⇒ the kernel answers with NLMSG_ERROR carrying 0 (ok) or -errno.
+            let mut ack = [0u8; 256];
+            let n = libc::recv(fd, ack.as_mut_ptr().cast(), ack.len(), 0);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            parse_netlink_ack(&ack[..n as usize])
+        })();
+        libc::close(fd);
+        result
+    }
+}
+
+/// The 40-byte `RTM_NEWADDR` request for [`add_loopback_flow_source`]: `nlmsghdr` (16) +
+/// `ifaddrmsg` (8) + `IFA_LOCAL` and `IFA_ADDRESS` rtattrs (8 each). Header fields are host byte
+/// order; the address is network order. Pure, so the layout is unit-tested without privileges.
+fn rtm_newaddr_request(ifindex: u32, addr: Ipv4Addr, seq: u32) -> [u8; 40] {
+    const RTM_NEWADDR: u16 = 20;
+    const NLM_F_REQUEST: u16 = 0x001;
+    const NLM_F_ACK: u16 = 0x004;
+    const NLM_F_REPLACE: u16 = 0x100;
+    const NLM_F_CREATE: u16 = 0x400;
+    const IFA_ADDRESS: u16 = 1;
+    const IFA_LOCAL: u16 = 2;
+    const IFA_F_PERMANENT: u8 = 0x80;
+    const RT_SCOPE_HOST: u8 = 254;
+    let mut m = [0u8; 40];
+    // nlmsghdr { len, type, flags, seq, pid = 0 (the kernel) }
+    m[0..4].copy_from_slice(&40u32.to_ne_bytes());
+    m[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+    let flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE | NLM_F_CREATE;
+    m[6..8].copy_from_slice(&flags.to_ne_bytes());
+    m[8..12].copy_from_slice(&seq.to_ne_bytes());
+    // ifaddrmsg { family, prefixlen, flags, scope, index }
+    m[16] = libc::AF_INET as u8;
+    m[17] = 32;
+    m[18] = IFA_F_PERMANENT;
+    m[19] = RT_SCOPE_HOST;
+    m[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+    // rtattr { len = 8, type } + the 4-byte address, twice.
+    for (off, ty) in [(24, IFA_LOCAL), (32, IFA_ADDRESS)] {
+        m[off..off + 2].copy_from_slice(&8u16.to_ne_bytes());
+        m[off + 2..off + 4].copy_from_slice(&ty.to_ne_bytes());
+        m[off + 4..off + 8].copy_from_slice(&addr.octets());
+    }
+    m
+}
+
+/// Read the kernel's `NLMSG_ERROR` ack: `nlmsghdr` (16) then an `i32` that is 0 on success or a
+/// negative errno. Anything else (short read, unexpected type) is an error — fail toward the
+/// `127.0.0.1` fallback, never toward assuming the alias exists.
+fn parse_netlink_ack(buf: &[u8]) -> std::io::Result<()> {
+    const NLMSG_ERROR: u16 = 2;
+    if buf.len() < 20 || u16::from_ne_bytes([buf[4], buf[5]]) != NLMSG_ERROR {
+        return Err(std::io::Error::other("unexpected rtnetlink reply"));
+    }
+    match i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]) {
+        0 => Ok(()),
+        e => Err(std::io::Error::from_raw_os_error(-e)),
+    }
 }
 
 /// dm-verity mapper name for a layer block device (e.g. `/dev/vdc` → `jkverity-vdc`):
@@ -629,6 +729,31 @@ async fn main() -> Result<()> {
             ),
         }
     }
+    // The address flows are presented to the app FROM (see `l4_forward::L4_FLOW_SOURCE_ADDR`).
+    // Added before the land-forward starts so no flow ever binds before it exists, and only when
+    // a land-forward WILL start (ports + a transit secret). On failure, fall back to `127.0.0.1` —
+    // correct for every non-WebRTC app, and no worse than before.
+    let l4_flow_source = if l4.ports.is_empty() || l4.transit_secret.is_empty() {
+        Ipv4Addr::LOCALHOST
+    } else {
+        match add_loopback_flow_source(l4_forward::L4_FLOW_SOURCE_ADDR) {
+            Ok(()) => {
+                info!(
+                    addr = %l4_forward::L4_FLOW_SOURCE_ADDR,
+                    "l4: flows reach the app from a non-loopback source"
+                );
+                l4_forward::L4_FLOW_SOURCE_ADDR
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "l4: failed to add the flow source address; flows will come from 127.0.0.1 \
+                     (WebRTC clients that drop loopback mapped addresses, e.g. Firefox, will fail ICE)"
+                );
+                Ipv4Addr::LOCALHOST
+            }
+        }
+    };
 
     let containers = Arc::new(ContainerSupervisor::new(
         servers_dir,
@@ -755,17 +880,19 @@ async fn main() -> Result<()> {
 
     // L4 (UDP) scale-to-zero ingress land-forward. The host relay dials `vm_ip:agent_udp_port` with
     // per-datagram-authenticated transit frames (`l4_transit`); each task const-time verifies +
-    // strips the header and forwards the payload to `127.0.0.1:guest_port` (the port the tenant's
-    // service binds in its OWN code — the agent never binds eth0, P0-L4-1). Facts are host-authored
-    // and tenant-unforgeable (`_l4.json`). Empty transit secret (old images / no `[l4.*]`) ⇒ start
-    // nothing (fail-closed — an empty key would let a co-tenant forge the MAC). One task per port,
-    // each self-contained (not a field on AgentState) so a fault on one port can't wedge another.
-    // `l4` was loaded above (for the loopback-MTU decision); reuse it to start the land-forward.
+    // strips the header and forwards the payload, from `l4_flow_source` (above), to
+    // `127.0.0.1:guest_port` (the port the tenant's service binds in its OWN code — the agent never
+    // binds eth0, P0-L4-1). Facts are host-authored and tenant-unforgeable (`_l4.json`). Empty
+    // transit secret (old images / no `[l4.*]`) ⇒ start nothing (fail-closed — an empty key would
+    // let a co-tenant forge the MAC). One task per port, each self-contained (not a field on
+    // AgentState) so a fault on one port can't wedge another. `l4` was loaded above (for the
+    // loopback-MTU decision); reuse it to start the land-forward.
     if !l4.transit_secret.is_empty() {
         for fact in &l4.ports {
             tokio::spawn(l4_forward::run_l4_land_forward(
                 fact.clone(),
                 l4.transit_secret.clone(),
+                l4_flow_source,
             ));
         }
     }
@@ -2085,6 +2212,62 @@ async fn invoke_function(
 
 #[cfg(test)]
 mod tests {
+    /// Byte layout of the `RTM_NEWADDR` request — the part a typo would silently break (the kernel
+    /// would EINVAL and the agent would fall back to a `127.0.0.1` flow source).
+    #[test]
+    fn rtm_newaddr_request_layout() {
+        let addr = std::net::Ipv4Addr::new(10, 254, 254, 1);
+        let m = super::rtm_newaddr_request(1, addr, 7);
+        let u16_at = |o: usize| u16::from_ne_bytes([m[o], m[o + 1]]);
+        let u32_at = |o: usize| u32::from_ne_bytes([m[o], m[o + 1], m[o + 2], m[o + 3]]);
+        assert_eq!(u32_at(0), 40, "nlmsg_len covers the whole message");
+        assert_eq!(u16_at(4), 20, "RTM_NEWADDR");
+        assert_eq!(
+            u16_at(6),
+            0x001 | 0x004 | 0x100 | 0x400,
+            "REQUEST|ACK|REPLACE|CREATE"
+        );
+        assert_eq!(u32_at(8), 7, "seq");
+        assert_eq!(u32_at(12), 0, "pid 0 = addressed to the kernel");
+        assert_eq!(m[16], libc::AF_INET as u8);
+        assert_eq!(
+            m[17], 32,
+            "a /32 — never a prefix that would route a range into lo"
+        );
+        assert_eq!(
+            m[19], 254,
+            "host scope: never auto-picked as a source for eth0 traffic"
+        );
+        assert_eq!(u32_at(20), 1, "ifindex");
+        for (off, ty) in [(24, 2u16), (32, 1u16)] {
+            assert_eq!(u16_at(off), 8, "rtattr len");
+            assert_eq!(u16_at(off + 2), ty, "IFA_LOCAL then IFA_ADDRESS");
+            assert_eq!(
+                &m[off + 4..off + 8],
+                &addr.octets(),
+                "address in network order"
+            );
+        }
+    }
+
+    #[test]
+    fn netlink_ack_parsing_fails_toward_the_fallback() {
+        let ack = |ty: u16, err: i32| {
+            let mut b = vec![0u8; 36];
+            b[4..6].copy_from_slice(&ty.to_ne_bytes());
+            b[16..20].copy_from_slice(&err.to_ne_bytes());
+            b
+        };
+        assert!(super::parse_netlink_ack(&ack(2, 0)).is_ok());
+        let eperm = super::parse_netlink_ack(&ack(2, -libc::EPERM)).unwrap_err();
+        assert_eq!(eperm.raw_os_error(), Some(libc::EPERM));
+        assert!(
+            super::parse_netlink_ack(&ack(3, 0)).is_err(),
+            "not NLMSG_ERROR"
+        );
+        assert!(super::parse_netlink_ack(&[0u8; 8]).is_err(), "short read");
+    }
+
     /// The real online grow: a loop-mounted 32 MiB ext4 whose backing file is then extended
     /// to 64 MiB (what the host does) grows to fill it. Needs root + losetup + mkfs.ext4:
     ///   sudo -E cargo test -p jkbase-agent -- --ignored grow_data_fs_fills_a_grown_device
