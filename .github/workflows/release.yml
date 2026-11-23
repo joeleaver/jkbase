@@ -25,8 +25,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Once, on Linux (the Windows runner has no reliable python3): a tag must name the workspace
+  # version, or `jkbase upgrade` would install a binary reporting a different one (and refuse it).
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/cli-v')
+        run: |
+          want="${GITHUB_REF_NAME#cli-v}"
+          have="$(cargo pkgid -p jkbase-cli | sed 's/.*[#@]//')"
+          [ -n "$have" ] && [ "$want" = "$have" ] \
+            || { echo "::error::tag $GITHUB_REF_NAME != workspace version '$have'"; exit 1; }
+
   build:
     name: build (${{ matrix.target }})
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -43,17 +58,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Tag matches the workspace version
-        if: startsWith(github.ref, 'refs/tags/cli-v')
-        run: |
-          want="${GITHUB_REF_NAME#cli-v}"
-          have="$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c 'import json,sys;print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="jkbase-cli"))')"
-          [ "$want" = "$have" ] || { echo "::error::tag $GITHUB_REF_NAME != workspace version $have"; exit 1; }
-
+      # ring compiles C. For a -musl target on a -gnu host the cc crate looks for
+      # `<arch>-linux-musl-gcc`, which Ubuntu doesn't ship (musl-tools has only `musl-gcc`).
       - name: musl toolchain
         if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+          t="$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "CC_$t=musl-gcc" >> "$GITHUB_ENV"
+          echo "AR_$t=ar" >> "$GITHUB_ENV"
 
       # rust-toolchain.toml pins the compiler; add this job's target to it.
       - name: Rust target

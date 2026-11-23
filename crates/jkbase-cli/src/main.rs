@@ -11,14 +11,20 @@ struct Cli {
     command: commands::Command,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let cli = Cli::parse();
     let checks = !matches!(cli.command, commands::Command::Upgrade(_));
-    let result = commands::run(cli.command).await;
-    if checks {
-        update_check::maybe_notify(&update_check::api_from_args(&args)).await;
-    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async move {
+        let result = commands::run(cli.command).await;
+        if checks {
+            update_check::maybe_notify(&update_check::api_from_args(&args)).await;
+        }
+        result
+    });
+    // Don't wait on blocking-pool threads: a timed-out update check can leave a getaddrinfo
+    // stuck on an unreachable resolver, which would otherwise hold the exit for many seconds.
+    rt.shutdown_background();
     result
 }

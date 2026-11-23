@@ -60,11 +60,25 @@ fn client() -> Result<reqwest::Client> {
 
 /// GET into memory, refusing bodies over `cap` (declared or actual).
 async fn fetch(client: &reqwest::Client, url: &str, cap: u64) -> Result<Vec<u8>> {
-    let mut resp = client
-        .get(url)
+    let mut req = client.get(url);
+    // Only the API host gets the token (the download redirects to a CDN that must not see it).
+    if url.starts_with("https://api.github.com/")
+        && let Ok(t) = std::env::var("GITHUB_TOKEN")
+        && !t.is_empty()
+    {
+        req = req.bearer_auth(t);
+    }
+    let mut resp = req
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
+    if resp.status() == reqwest::StatusCode::FORBIDDEN || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        bail!(
+            "GET {url}: HTTP {} — GitHub's anonymous rate limit (60/hour per IP) is probably \
+             exhausted; retry later, set GITHUB_TOKEN, or pin a version with --version",
+            resp.status()
+        );
+    }
     ensure!(resp.status().is_success(), "GET {url}: HTTP {}", resp.status());
     ensure!(resp.content_length().unwrap_or(0) <= cap, "GET {url}: response too large");
     let mut buf = Vec::new();
@@ -167,13 +181,28 @@ fn install(exe: &Path, bin: &[u8], version: &str) -> Result<()> {
         );
         #[cfg(windows)]
         {
-            // A running .exe can be renamed but not overwritten.
+            // A running .exe can be renamed but not overwritten: move it aside, and put it BACK
+            // if the new one can't take its place (AV scanners briefly lock a file they just
+            // watched run), so a failed upgrade never leaves the user without a jkbase.exe.
             let old = exe.with_extension("exe.old");
             let _ = std::fs::remove_file(&old);
             std::fs::rename(exe, &old).context("move the running jkbase.exe aside")?;
+            let mut last = None;
+            for attempt in 0..5 {
+                match std::fs::rename(&tmp, exe) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last = Some(e),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
+            }
+            let _ = std::fs::rename(&old, exe);
+            return Err(last.unwrap()).with_context(|| format!("replace {}", exe.display()));
         }
-        std::fs::rename(&tmp, exe).with_context(|| format!("replace {}", exe.display()))?;
-        Ok(())
+        #[cfg(not(windows))]
+        {
+            std::fs::rename(&tmp, exe).with_context(|| format!("replace {}", exe.display()))?;
+            Ok(())
+        }
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -225,6 +254,9 @@ pub async fn run(args: UpgradeArgs) -> Result<()> {
     let exe = std::env::current_exe()?
         .canonicalize()
         .context("locate the running jkbase binary")?;
+    // canonicalize() on Windows yields a `\\?\` verbatim path; fine for fs calls, ugly to print.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(exe.with_extension("exe.old"));
     install(&exe, &bin, &version)?;
     println!("Upgraded jkbase {CLI_VERSION} → {version} ({})", exe.display());
     Ok(())

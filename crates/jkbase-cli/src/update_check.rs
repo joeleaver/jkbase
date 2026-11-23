@@ -18,14 +18,20 @@ const DEFAULT_API: &str = "https://api.jkbase.app";
 const CHECK_EVERY: u64 = 24 * 3600;
 const NOTIFY_EVERY: u64 = 24 * 3600;
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Cache {
-    api: String,
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct Entry {
     checked_at: u64,
     #[serde(default)]
     info: Option<CliVersionInfo>,
     #[serde(default)]
     notified_at: u64,
+}
+
+/// Keyed by API base, so alternating `--api` (self-hosted vs ours) doesn't refetch every switch.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Cache {
+    #[serde(default)]
+    apis: std::collections::BTreeMap<String, Entry>,
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -89,31 +95,42 @@ pub async fn maybe_notify(api: &str) {
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
     let t = now();
-    let api = api.trim_end_matches('/');
+    let api = api.trim_end_matches('/').to_string();
+    let mut e = cache.apis.get(&api).cloned().unwrap_or_default();
 
-    if cache.api != api || t.saturating_sub(cache.checked_at) >= CHECK_EVERY {
-        cache.info = fetch(api).await.or(if cache.api == api { cache.info } else { None });
-        cache.api = api.to_string();
-        cache.checked_at = t; // a failed check also waits a day: never hammer a down API
+    if t.saturating_sub(e.checked_at) >= CHECK_EVERY {
+        // Record the attempt FIRST: if the cache can't be written (read-only HOME, throwaway CI
+        // container) we'd otherwise re-ask on every single command — so then don't ask at all.
+        // A failed fetch also waits a day: never hammer a down API.
+        e.checked_at = t;
+        cache.apis.insert(api.clone(), e.clone());
+        if !save(&path, &cache) {
+            return;
+        }
+        if let Some(info) = fetch(&api).await {
+            e.info = Some(info);
+        }
     }
 
     let interactive = std::io::stderr().is_terminal();
-    let may_nudge = interactive && t.saturating_sub(cache.notified_at) >= NOTIFY_EVERY;
-    if let Some(info) = &cache.info
+    let may_nudge = interactive && t.saturating_sub(e.notified_at) >= NOTIFY_EVERY;
+    if let Some(info) = &e.info
         && let Some(msg) = notice(info, CLI_VERSION, may_nudge)
     {
         eprintln!("\n{msg}");
         if may_nudge {
-            cache.notified_at = t;
+            e.notified_at = t;
         }
     }
+    cache.apis.insert(api, e);
+    save(&path, &cache);
+}
 
+fn save(path: &std::path::Path, cache: &Cache) -> bool {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(b) = serde_json::to_vec(&cache) {
-        let _ = std::fs::write(&path, b);
-    }
+    serde_json::to_vec(cache).is_ok_and(|b| std::fs::write(path, b).is_ok())
 }
 
 async fn fetch(api: &str) -> Option<CliVersionInfo> {
@@ -126,9 +143,14 @@ async fn fetch(api: &str) -> Option<CliVersionInfo> {
     if !resp.status().is_success() {
         return None;
     }
-    let body = resp.bytes().await.ok()?;
-    if body.len() > 4096 {
-        return None;
+    // Capped while streaming: a hostile API can't make us buffer more than 4 KiB.
+    let mut resp = resp;
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() > 4096 {
+            return None;
+        }
     }
     serde_json::from_slice(&body).ok()
 }

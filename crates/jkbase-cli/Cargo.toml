@@ -22,8 +22,10 @@ dirs = "6"
 # `jkbase upgrade`: verify the release archive against its SHA256SUMS.
 sha2 = { workspace = true }
 # `jkbase db proxy` sidecar: client TLS to the managed-DB reach-plane edge.
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
+# ring only (db_proxy names the ring provider explicitly): rustls/tokio-rustls defaults pull in
+# aws-lc-sys, a C/CMake build that breaks the static-musl release cross-compiles.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = { workspace = true }
 rustls-pemfile = { workspace = true }
 

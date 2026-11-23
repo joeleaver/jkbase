@@ -22,7 +22,12 @@ need uname; need tar; need mkdir; need mktemp
 if command -v curl >/dev/null 2>&1; then
     get() { curl -fsSL --proto '=https' --tlsv1.2 "$1" -o "$2"; }
 elif command -v wget >/dev/null 2>&1; then
-    get() { wget -q --https-only "$1" -O "$2"; }
+    # busybox wget (Alpine's default) has no --https-only; every URL here is https:// anyway.
+    if wget --help 2>&1 | grep -q -- --https-only; then
+        get() { wget -q --https-only "$1" -O "$2"; }
+    else
+        get() { wget -q "$1" -O "$2"; }
+    fi
 else
     die "needs curl or wget"
 fi
@@ -61,7 +66,9 @@ else
 fi
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT INT TERM
+staged=""
+trap 'rm -rf "$tmp"; [ -z "$staged" ] || rm -f "$staged"' EXIT
+trap 'exit 130' INT TERM
 
 say "downloading $asset"
 get "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "no release found at $base"
@@ -72,11 +79,17 @@ want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp/SHA256SUMS
 
 tar -xzf "$tmp/$asset" -C "$tmp" jkbase
 [ -f "$tmp/jkbase" ] || die "archive has no jkbase binary"
-chmod 755 "$tmp/jkbase"
-"$tmp/jkbase" --version >/dev/null 2>&1 || die "the downloaded binary doesn't run here"
 
+# Stage beside the destination, then rename: same filesystem, so the swap is atomic and an
+# interrupted install never leaves a missing or truncated jkbase. (Also sidesteps a noexec /tmp
+# for the run check below.)
 mkdir -p "$DIR"
-mv -f "$tmp/jkbase" "$DIR/jkbase"
+staged="$(mktemp "$DIR/.jkbase.XXXXXX")"
+cp "$tmp/jkbase" "$staged"
+chmod 755 "$staged"
+"$staged" --version >/dev/null 2>&1 || die "the downloaded binary doesn't run here"
+mv -f "$staged" "$DIR/jkbase"
+staged=""
 say "installed $("$DIR/jkbase" --version) to $DIR/jkbase"
 
 case ":$PATH:" in
