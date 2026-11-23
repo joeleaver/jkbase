@@ -1,3 +1,5 @@
+/// The CLI ⇄ API version contract (`GET /cli`, `jkbase upgrade`).
+pub mod cli_version;
 pub mod config;
 /// Shared wire contract for the managed-DB reach-plane connection preamble — the ONE
 /// definition used by both the `jkbase db proxy` sidecar (encode) and the edge (parse),
@@ -14,6 +16,9 @@ pub mod source_globs;
 /// unchanged so every existing `jkbase_common::sigv4::…` call site still resolves
 /// and there remains exactly ONE implementation (byte-identical, no divergence).
 pub use jkbase_sigv4 as sigv4;
+/// Host-side disk accounting (allocated blocks, dev/ino hardlink dedup) — Unix-only, and only the
+/// server uses it; gated so the CLI still builds for Windows.
+#[cfg(unix)]
 pub mod storage;
 
 /// In-VM agent ⇄ host control-plane protocol version, echoed by the agent on

@@ -28,9 +28,18 @@ There are two ways to read this README:
 ### Install the CLI
 
 ```bash
-git clone https://github.com/joeleaver/jkbase && cd jkbase
-cargo install --path crates/jkbase-cli   # installs the `jkbase` binary
+curl -fsSL https://jkbase.app/install.sh | sh    # Linux / macOS (x86_64 + arm64)
 ```
+
+On Windows (PowerShell): `irm https://jkbase.app/install.ps1 | iex`. Both install a prebuilt binary
+from [GitHub Releases](https://github.com/joeleaver/jkbase/releases) after checking its SHA-256;
+set `JKBASE_VERSION=0.2.0` to pin a version or `JKBASE_INSTALL_DIR` to choose where it goes
+(default `~/.local/bin`). From source instead: `cargo install --path crates/jkbase-cli`.
+
+**Staying current:** `jkbase upgrade` replaces the binary with the latest release (`--check` only
+reports). The platform advertises the CLI version that matches it, so after a command the CLI
+mentions, at most once a day, when a newer one exists, and warns on every run if yours is too old
+for the platform's API. `JKBASE_NO_UPDATE_CHECK=1` turns that off.
 
 By default the CLI talks to `https://api.jkbase.app`. Running your own platform? Append
 `--api https://api.your-domain.com` to any command (or set `JKBASE_TOKEN` and pass `--api`). Every

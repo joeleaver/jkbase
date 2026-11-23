@@ -1,0 +1,138 @@
+name: Release CLI
+
+# A `cli-v<version>` tag publishes prebuilt `jkbase` binaries as a GitHub Release — what
+# `install.sh` / `install.ps1` (sites/www) and `jkbase upgrade` download. The tag must equal the
+# workspace version (Cargo.toml `[workspace.package] version`), which is also what the server
+# advertises at `GET /cli`; so tag + publish BEFORE deploying a server that advertises it.
+# Pull requests touching the CLI build every target (no release) so a break shows before merge.
+on:
+  push:
+    tags: ["cli-v*"]
+  pull_request:
+    paths:
+      - "crates/jkbase-cli/**"
+      - "crates/jkbase-common/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+      - "sites/www/install.sh"
+      - "sites/www/install.ps1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Once, on Linux (the Windows runner has no reliable python3): a tag must name the workspace
+  # version, or `jkbase upgrade` would install a binary reporting a different one (and refuse it).
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/cli-v')
+        run: |
+          want="${GITHUB_REF_NAME#cli-v}"
+          have="$(cargo pkgid -p jkbase-cli | sed 's/.*[#@]//')"
+          [ -n "$have" ] && [ "$want" = "$have" ] \
+            || { echo "::error::tag $GITHUB_REF_NAME != workspace version '$have'"; exit 1; }
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04, musl: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, musl: true }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, exe: .exe }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      # ring compiles C. For a -musl target on a -gnu host the cc crate looks for
+      # `<arch>-linux-musl-gcc`, which Ubuntu doesn't ship (musl-tools has only `musl-gcc`).
+      - name: musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+          t="$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "CC_$t=musl-gcc" >> "$GITHUB_ENV"
+          echo "AR_$t=ar" >> "$GITHUB_ENV"
+
+      # rust-toolchain.toml pins the compiler; add this job's target to it.
+      - name: Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build -p jkbase-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke (--version)
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          out="$(target/${{ matrix.target }}/release/jkbase${{ matrix.exe }} --version)"
+          echo "$out"
+          case "$out" in "jkbase "[0-9]*) ;; *) echo "::error::unexpected --version: $out"; exit 1 ;; esac
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/jkbase${{ matrix.exe }}" dist/
+          tar -C dist -czf "jkbase-${{ matrix.target }}.tar.gz" "jkbase${{ matrix.exe }}"
+          tar -tzf "jkbase-${{ matrix.target }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jkbase-${{ matrix.target }}
+          path: jkbase-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/cli-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum jkbase-*.tar.gz | tee SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#cli-v}"
+          cat > notes.md <<EOF
+          Install or update:
+
+          \`\`\`bash
+          curl -fsSL https://jkbase.app/install.sh | sh
+          \`\`\`
+
+          Windows (PowerShell): \`irm https://jkbase.app/install.ps1 | iex\`
+
+          Already installed? \`jkbase upgrade\`.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "jkbase CLI $ver" \
+            --notes-file notes.md \
+            --verify-tag

@@ -2,6 +2,7 @@ mod db_proxy;
 mod deploy;
 mod project;
 mod repo;
+mod upgrade;
 
 use anyhow::Context;
 use clap::Subcommand;
@@ -144,6 +145,8 @@ pub enum Command {
     /// Manage raw L4 (UDP/TCP) ingress ports (scale-to-zero) — e.g. a TeamSpeak server
     #[command(subcommand)]
     L4(L4Command),
+    /// Upgrade this CLI to the latest release (or `--version X`)
+    Upgrade(upgrade::UpgradeArgs),
 }
 
 #[derive(Subcommand)]
@@ -567,6 +570,7 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
         Command::Db(cmd) => run_db(cmd).await,
         Command::Auth(cmd) => run_auth(cmd).await,
         Command::L4(cmd) => run_l4(cmd).await,
+        Command::Upgrade(args) => upgrade::run(args).await,
     }
 }
 
