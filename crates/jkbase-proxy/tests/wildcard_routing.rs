@@ -59,6 +59,7 @@ fn config(proxy_port: u16, backend_port: u16) -> ProxyConfig {
         domains: None,
         activity_tracker: None,
         wake_callback: None,
+        db_wake_callback: None,
         backend_port,
         relay_idle_timeout: Duration::from_secs(600),
         max_concurrent_upgrades: 64,

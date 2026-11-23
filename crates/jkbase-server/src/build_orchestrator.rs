@@ -6245,6 +6245,7 @@ console.log("listening on " + port);
             domains: Some(domains),
             activity_tracker: Some(tracker.clone()),
             wake_callback: None,
+            db_wake_callback: None,
             backend_port: 80,
             relay_idle_timeout: Duration::from_secs(600),
             max_concurrent_upgrades: 64,
