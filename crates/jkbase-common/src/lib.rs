@@ -1,3 +1,5 @@
+/// The CLI ⇄ API version contract (`GET /cli`, `jkbase upgrade`).
+pub mod cli_version;
 pub mod config;
 /// Shared wire contract for the managed-DB reach-plane connection preamble — the ONE
 /// definition used by both the `jkbase db proxy` sidecar (encode) and the edge (parse),

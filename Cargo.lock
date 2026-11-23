@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "jkbase-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1836,7 +1836,7 @@ dependencies = [
 
 [[package]]
 name = "jkbase-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "globset",

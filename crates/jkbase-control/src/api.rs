@@ -672,7 +672,8 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/init", post(init_platform))
         .route("/register", post(register))
         .route("/login", post(login))
-        .route("/health", get(api_health));
+        .route("/health", get(api_health))
+        .route("/cli", get(cli_version));
 
     // Connected-repo build trigger (build · D). Self-authenticates via an HTTP
     // Basic per-project git-push token, so it must NOT sit behind the Bearer
@@ -728,6 +729,13 @@ pub struct LoginResponse {
 
 async fn api_health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// The CLI release matching this server, plus the oldest CLI its API still serves. Public: the
+/// CLI asks before it has (or regardless of) a token. Static, so it leaks nothing a release page
+/// doesn't. See [`jkbase_common::cli_version`].
+async fn cli_version() -> impl IntoResponse {
+    Json(jkbase_common::cli_version::CliVersionInfo::current())
 }
 
 async fn get_me(Extension(tenant): Extension<Tenant>) -> impl IntoResponse {
