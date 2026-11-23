@@ -196,7 +196,7 @@ fn install(exe: &Path, bin: &[u8], version: &str) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(200 << attempt));
             }
             let _ = std::fs::rename(&old, exe);
-            return Err(last.unwrap()).with_context(|| format!("replace {}", exe.display()));
+            Err(last.unwrap()).with_context(|| format!("replace {}", exe.display()))
         }
         #[cfg(not(windows))]
         {
