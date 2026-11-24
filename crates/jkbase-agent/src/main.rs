@@ -1491,7 +1491,6 @@ async fn proxy_to_server(
     }
 }
 
-
 /// Bound on concurrent in-flight relayed upgrades inside this agent (one tenant VM).
 /// A relay holds a permit for its lifetime, so a flood of cheap WebSocket holds can't
 /// pin unbounded fds + relay tasks. (Sanitization + the edge-wide cap live at the
