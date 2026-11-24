@@ -134,7 +134,7 @@ const DB_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30
 /// Send one PLAIN (non-upgrade) request to the agent's eth0 DB-proxy seam and read the bounded
 /// JSON response. The DB stays loopback-only; the agent forwards only to rhypedb's OPEN plane
 /// (`/query|/schema|/status`, never `/admin/*`). Returns the engine's verbatim status + body.
-async fn agent_db_request(
+pub(crate) async fn agent_db_request(
     vm_ip: &str,
     path: &str,
     method: &str,

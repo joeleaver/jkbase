@@ -8798,6 +8798,8 @@ console.log("listening on " + port);
         let mut backup_summary = String::new();
         let mut after_beta = String::new();
         let mut after_restore = String::new();
+        let mut rewrite_out = String::new();
+        let mut rewrite_wrong_secret = 0u16;
         if probe_out == "users=alpha count=1" {
             let backups =
                 crate::db_backup_store::BackupStore::new(&fx.data.join("dbreach-backups"));
@@ -8875,6 +8877,36 @@ console.log("listening on " + port);
                 }
                 Err(e) => eprintln!("[backup-e2e] restore failed: {e:#}"),
             }
+
+            // REWRITE-COVERS over the agent's eth0 admin seam (the server executor's request,
+            // minus the wake): the agent must authorize the real engine's
+            // `/admin/rewrite-covers` with the in-guest admin token and relay its stats.
+            match crate::db_ops::agent_db_request(
+                guest_ip,
+                "/_jkbase/db/rewrite-covers",
+                "POST",
+                splice_secret,
+                Vec::new(),
+            )
+            .await
+            {
+                Ok(res) => {
+                    rewrite_out = format!("{} {}", res.status, String::from_utf8_lossy(&res.body))
+                }
+                Err(e) => eprintln!("[rewrite-e2e] rewrite-covers failed: {e:#}"),
+            }
+            // The seam stays secret-gated against the real agent too.
+            if let Ok(res) = crate::db_ops::agent_db_request(
+                guest_ip,
+                "/_jkbase/db/rewrite-covers",
+                "POST",
+                "not-the-secret",
+                Vec::new(),
+            )
+            .await
+            {
+                rewrite_wrong_secret = res.status;
+            }
         }
 
         // ---- Cleanup BEFORE asserting (mirror the loopback test) so a failed assert can't
@@ -8919,6 +8951,20 @@ console.log("listening on " + port);
             "PASS: backup+restore e2e — {backup_summary:?}; post-mutation {after_beta:?}; \
              post-restore {after_restore:?}"
         );
+
+        // ---- rewrite-covers assertions (run against the restored, live DB) ----
+        let (status, body) = rewrite_out.split_once(' ').unwrap_or(("", ""));
+        let stats: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        assert!(
+            status == "200" && stats["ok"] == true && stats["cover_peers_sound"] == true,
+            "rewrite-covers must reach the real engine's /admin/rewrite-covers with the in-guest \
+             admin token and relay its stats; got {rewrite_out:?}"
+        );
+        assert_eq!(
+            rewrite_wrong_secret, 404,
+            "a wrong splice secret must not reach the admin seam"
+        );
+        println!("PASS: rewrite-covers e2e — {rewrite_out}");
     }
 
     /// The app→DB **in-guest leg** (P2 §7.6) end-to-end against real infra: a REAL host DB gateway
