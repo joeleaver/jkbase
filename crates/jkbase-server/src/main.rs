@@ -3,6 +3,7 @@ mod build_ca;
 mod build_cache;
 mod build_orchestrator;
 mod db_backup_store;
+mod db_admin;
 mod db_ops;
 use db_ops::{
     DB_BACKUP_MAX_CONCURRENT, DbBackupCtx, DbQueryCtx, db_backup_nightly_loop, do_db_query,
