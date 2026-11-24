@@ -134,15 +134,43 @@ async fn run_db_rewrite_covers(project: Option<String>, api: String) -> anyhow::
         .await
         .context("failed to connect to API")?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let text = resp
+        .text()
+        .await
+        .context("failed to read the API response")?;
     if !status.is_success() {
         anyhow::bail!(
             "rewrite-covers failed: {}",
-            body["error"].as_str().unwrap_or("unknown error")
+            describe_http_error(status, &text)
         );
     }
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("unexpected response from the API: {}", clip(&text)))?;
     println!("{}", describe_rewrite_covers(&body)?);
     Ok(())
+}
+
+/// A non-2xx answer as the operator should read it: the JSON `error` when there is one, else the
+/// raw (clipped) body — engine and agent errors are not always JSON — always with the status.
+fn describe_http_error(status: reqwest::StatusCode, text: &str) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v["error"].as_str().map(str::to_string))
+        .unwrap_or_else(|| clip(text).to_string());
+    if detail.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("{detail} (HTTP {status})")
+    }
+}
+
+/// At most 300 chars of `text`, trimmed, for an error line.
+fn clip(text: &str) -> &str {
+    let t = text.trim();
+    match t.char_indices().nth(300) {
+        Some((i, _)) => &t[..i],
+        None => t,
+    }
 }
 
 /// Render the engine's rewrite-covers stats, or the engine's own failure as an error.
@@ -508,7 +536,7 @@ async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::describe_rewrite_covers;
+    use super::{describe_http_error, describe_rewrite_covers};
     use serde_json::json;
 
     #[test]
@@ -538,5 +566,22 @@ mod tests {
             describe_rewrite_covers(&json!({})).is_err(),
             "no `ok` is not success"
         );
+    }
+
+    #[test]
+    fn http_errors_keep_the_status_and_a_non_json_body() {
+        let s = reqwest::StatusCode::CONFLICT;
+        assert_eq!(
+            describe_http_error(s, r#"{"error":"already running"}"#),
+            "already running (HTTP 409 Conflict)"
+        );
+        let s = reqwest::StatusCode::BAD_GATEWAY;
+        assert_eq!(
+            describe_http_error(s, "db not available\n"),
+            "db not available (HTTP 502 Bad Gateway)"
+        );
+        assert_eq!(describe_http_error(s, ""), "HTTP 502 Bad Gateway");
+        let long = "x".repeat(1000);
+        assert!(describe_http_error(s, &long).len() < 340);
     }
 }

@@ -22,6 +22,13 @@ struct Harness {
     /// Every (project id, op name) the transport was invoked with.
     calls: Arc<Mutex<Vec<(String, &'static str)>>>,
     store: Store,
+    base: std::path::PathBuf,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
 }
 
 fn add_tenant(store: &Store, id: &str) -> String {
@@ -121,6 +128,7 @@ async fn spawn(tag: &str, reply: Result<(u16, &'static str), &'static str>) -> H
         other_token,
         calls,
         store,
+        base,
     }
 }
 
@@ -171,6 +179,27 @@ async fn only_the_owner_can_run_it_and_only_on_their_own_project() {
     assert_eq!(
         *h.calls.lock().unwrap(),
         vec![("app".to_string(), "rewrite-covers")]
+    );
+
+    // A body, query and header naming another project are ignored: the path's id is the target.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/projects/app/db/rewrite-covers?project=theirs&id=theirs",
+            h.addr
+        ))
+        .bearer_auth(&h.token)
+        .header("x-jkbase-project", "theirs")
+        .json(&serde_json::json!({ "project": "theirs", "id": "theirs" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(
+        *h.calls.lock().unwrap(),
+        vec![
+            ("app".to_string(), "rewrite-covers"),
+            ("app".to_string(), "rewrite-covers")
+        ]
     );
 }
 
