@@ -52,6 +52,15 @@ pub enum DbCommand {
         #[arg(long, default_value = "https://api.jkbase.app")]
         api: String,
     },
+    /// Rewrite the database's stored covers to the current engine's rules. Repairs a store
+    /// written by an older engine (`cover_peers_sound: false` in its status). Safe to run on a
+    /// live database, to interrupt, and to rerun; it can take a while on a large store.
+    RewriteCovers {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, default_value = "https://api.jkbase.app")]
+        api: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,7 +113,60 @@ pub(super) async fn run_db(cmd: DbCommand) -> anyhow::Result<()> {
             project,
             api,
         } => run_db_restore(backup_id, force, project, api).await,
+        DbCommand::RewriteCovers { project, api } => run_db_rewrite_covers(project, api).await,
     }
+}
+
+/// Client-side ceiling on one rewrite-covers call: the server bounds the pass at 1h, so this only
+/// stops the CLI hanging past that on a dead connection.
+const REWRITE_COVERS_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(65 * 60);
+
+async fn run_db_rewrite_covers(project: Option<String>, api: String) -> anyhow::Result<()> {
+    let project_id = resolve_project_id(project)?;
+    let token =
+        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
+    let client = crate::credentials::authenticated_client(&token);
+    println!("Rewriting covers for project '{project_id}' (this can take a while)...");
+    let resp = client
+        .post(format!("{api}/projects/{project_id}/db/rewrite-covers"))
+        .timeout(REWRITE_COVERS_CLIENT_TIMEOUT)
+        .send()
+        .await
+        .context("failed to connect to API")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "rewrite-covers failed: {}",
+            body["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+    println!("{}", describe_rewrite_covers(&body)?);
+    Ok(())
+}
+
+/// Render the engine's rewrite-covers stats, or the engine's own failure as an error.
+fn describe_rewrite_covers(body: &serde_json::Value) -> anyhow::Result<String> {
+    if body["ok"].as_bool() != Some(true) {
+        anyhow::bail!(
+            "rewrite-covers failed in the database: {} (rerunning it is safe)",
+            body["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+    let n = |k: &str| body[k].as_u64().unwrap_or(0);
+    let sound = match body["cover_peers_sound"].as_bool() {
+        Some(true) => "yes",
+        Some(false) => "NO (rerun it)",
+        None => "unknown",
+    };
+    Ok(format!(
+        "Rewrite complete in {:.1}s: {} objects visited, {} reverse edges and {} index entries \
+         rewritten. Covers sound: {sound}.",
+        n("ms") as f64 / 1000.0,
+        n("objects"),
+        n("rev_edges_rewritten"),
+        n("index_entries_rewritten"),
+    ))
 }
 
 /// Format a unix-ms timestamp as a compact UTC string without pulling in chrono.
@@ -441,5 +503,40 @@ async fn run_db_key(cmd: DbKeyCommand) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_rewrite_covers;
+    use serde_json::json;
+
+    #[test]
+    fn rewrite_covers_stats_are_described() {
+        let out = describe_rewrite_covers(&json!({
+            "ok": true, "ms": 2500, "objects": 40, "rev_edges_rewritten": 7,
+            "index_entries_rewritten": 0, "cover_peers_sound": true
+        }))
+        .unwrap();
+        assert_eq!(
+            out,
+            "Rewrite complete in 2.5s: 40 objects visited, 7 reverse edges and 0 index entries \
+             rewritten. Covers sound: yes."
+        );
+        let out =
+            describe_rewrite_covers(&json!({ "ok": true, "cover_peers_sound": false })).unwrap();
+        assert!(out.ends_with("Covers sound: NO (rerun it)."));
+    }
+
+    #[test]
+    fn an_engine_failure_is_an_error() {
+        let err = describe_rewrite_covers(&json!({ "ok": false, "error": "write conflict" }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("write conflict") && err.contains("rerunning it is safe"));
+        assert!(
+            describe_rewrite_covers(&json!({})).is_err(),
+            "no `ok` is not success"
+        );
     }
 }
