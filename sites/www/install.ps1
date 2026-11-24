@@ -85,9 +85,11 @@ jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5A
             }
             throw "jkbase-install: release signature verification FAILED - not installing ($why)"
         }
-        $signed = (Get-Content "$tmp\SHA256SUMS" | ForEach-Object {
+        # [string]: no match yields AutomationNull, and `AutomationNull -notmatch x` is an empty
+        # (falsy) result rather than $true, which would skip the guard below.
+        $signed = [string]((Get-Content "$tmp\SHA256SUMS" | ForEach-Object {
             $f = $_.Trim() -split '\s+'; if ($f.Count -eq 3 -and $f[0] -eq '#' -and $f[1] -eq 'jkbase-cli') { $f[2] }
-        }) | Select-Object -First 1
+        }) | Select-Object -First 1)
         if ($signed -notmatch '^\d+\.\d+\.\d+$') { throw 'jkbase-install: the signed SHA256SUMS names no jkbase-cli version - not installing' }
         if ($env:JKBASE_VERSION) {
             if ($signed -ne $v) { throw "jkbase-install: asked for $v but the release is signed as $signed - not installing" }
@@ -97,7 +99,7 @@ jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5A
             try { Invoke-WebRequest -UseBasicParsing $cliInfo -OutFile "$tmp\cli" } catch {
                 throw "jkbase-install: can't reach $cliInfo to confirm the latest version"
             }
-            $latest = (Get-Content -Raw "$tmp\cli" | ConvertFrom-Json).latest
+            $latest = [string](Get-Content -Raw "$tmp\cli" | ConvertFrom-Json).latest
             if ($latest -notmatch '^\d+\.\d+\.\d+$') { throw "jkbase-install: unexpected answer from $cliInfo" }
             if ([version]$signed -lt [version]$latest) {
                 throw "jkbase-install: the release is $signed but $latest is current - refusing an old release"
