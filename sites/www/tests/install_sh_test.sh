@@ -29,8 +29,9 @@ signer() { printf 'jkbase-release namespaces="jkbase-cli-release" %s\n' "$(cat "
 
 # install.sh with its key block replaced by the given allowed_signers lines.
 script_with() { # <out> <lines>
-    awk -v keys="$2" '
-        $0 == "ALLOWED_SIGNERS='\''" { print; if (keys != "") print keys; skip = 1; next }
+    # Keys via the environment: BSD awk rejects a newline in a -v value.
+    KEYS="$2" awk '
+        $0 == "ALLOWED_SIGNERS='\''" { print; if (ENVIRON["KEYS"] != "") print ENVIRON["KEYS"]; skip = 1; next }
         skip && $0 == "'\''" { skip = 0 }
         !skip { print }
     ' "$script" >"$1"
