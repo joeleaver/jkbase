@@ -185,23 +185,28 @@ echo ""
 echo "Waiting for API (idle limit ${API_IDLE_LIMIT}s, hard cap ${API_HARD_CAP}s)..."
 start=$(date +%s)
 last_progress=$start
-last_line=$(sudo journalctl -u jkbase -n 1 --no-pager -o cat 2>/dev/null || true)
+# Progress = the count of journal lines since the restart changed (a last-line compare would
+# miss repeated identical lines).
+last_count=0
+last_line=""
 while :; do
-    if curl -sf http://127.0.0.1:9090/health > /dev/null 2>&1; then
+    if curl -sf --max-time 3 http://127.0.0.1:9090/health > /dev/null 2>&1; then
         echo "API ready after $(( $(date +%s) - start ))s."
         break
     fi
     now=$(date +%s)
+    # Also trips on a crash-restart loop ("activating (auto-restart)"): failing loudly is intended.
     if ! sudo systemctl is-active --quiet jkbase; then
         echo "ERROR: jkbase service is not active; API will not come up." >&2
         sudo journalctl -u jkbase -n 30 --no-pager >&2 || true
         exit 1
     fi
-    line=$(sudo journalctl -u jkbase -n 1 --no-pager -o cat 2>/dev/null || true)
-    if [ "$line" != "$last_line" ]; then
-        last_line=$line
+    count=$(sudo journalctl -u jkbase --since "@$start" --no-pager -o cat 2>/dev/null | wc -l || true)
+    if [ "$count" != "$last_count" ]; then
+        last_count=$count
         last_progress=$now
     fi
+    last_line=$(sudo journalctl -u jkbase -n 1 --no-pager -o cat 2>/dev/null || true)
     if [ $(( now - last_progress )) -ge "$API_IDLE_LIMIT" ] || [ $(( now - start )) -ge "$API_HARD_CAP" ]; then
         echo "ERROR: API did not come up on :9090 after $(( now - start ))s (no log progress for $(( now - last_progress ))s)." >&2
         sudo journalctl -u jkbase -n 30 --no-pager >&2 || true
