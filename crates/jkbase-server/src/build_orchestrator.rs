@@ -8806,7 +8806,7 @@ console.log("listening on " + port);
 
             // BACKUP: pull the tar off the agent, then validate + commit it.
             match async {
-                let mut up = crate::connect_agent_db_upgrade(
+                let mut up = crate::db_ops::connect_agent_db_upgrade(
                     guest_ip,
                     "/_jkbase/db/backup",
                     splice_secret,
@@ -8839,7 +8839,7 @@ console.log("listening on " + port);
             let restore_status = async {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut tar = backups.open_read("testproj", backup_id).await?;
-                let mut up = crate::connect_agent_db_upgrade(
+                let mut up = crate::db_ops::connect_agent_db_upgrade(
                     guest_ip,
                     "/_jkbase/db/restore",
                     splice_secret,
