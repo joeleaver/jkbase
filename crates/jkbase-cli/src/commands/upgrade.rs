@@ -1,12 +1,13 @@
 //! `jkbase upgrade` — replace this binary with a published CLI release.
 //!
 //! Releases are GitHub Releases tagged `cli-v<semver>` (`.github/workflows/release.yml`), one
-//! `jkbase-<target>.tar.gz` per target plus a `SHA256SUMS`. Trust is the same as
-//! `install.sh`: TLS to github.com, then the archive must hash to its `SHA256SUMS` line (integrity
-//! against a truncated/corrupted download, NOT a signature — anyone who can publish a release on
-//! the repo can ship a binary). The new binary must report the expected version from `--version`
+//! `jkbase-<target>.tar.gz` per target plus `SHA256SUMS` and its signature `SHA256SUMS.sig`.
+//! Trust, same as `install.sh`: `SHA256SUMS.sig` must verify against a release key compiled into
+//! this binary (`release_sig`, fail-closed), THEN the archive must hash to its line in those exact
+//! signed bytes. So a release someone uploads without the CI signing key is refused, not just a
+//! corrupted download. The new binary must also report the expected version from `--version`
 //! before it is renamed over the running one, so a wrong-arch or broken build never replaces a
-//! working CLI.
+//! working CLI, and an old signed release re-uploaded under a newer tag is refused.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use jkbase_common::cli_version::{self, CLI_VERSION};
 use sha2::{Digest, Sha256};
+
+use super::release_sig;
 
 /// This binary's target triple (build.rs), naming its release asset.
 pub const TARGET: &str = env!("JKBASE_TARGET");
@@ -38,7 +41,9 @@ pub struct UpgradeArgs {
     force: bool,
 }
 
-/// `owner/name`, from `JKBASE_UPDATE_REPO` (forks, self-hosters) or ours.
+/// `owner/name`, from `JKBASE_UPDATE_REPO` (forks, self-hosters) or ours. Its releases must still be
+/// signed by a key in this binary's trust root: a fork ships a CLI built with its own
+/// `release-keys/allowed_signers`.
 fn repo() -> Result<String> {
     let r = std::env::var("JKBASE_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
     let ok = |s: &str| {
@@ -124,6 +129,34 @@ fn expected_sha256(sums: &str, asset: &str) -> Result<String> {
         }
     }
     bail!("SHA256SUMS has no entry for {asset}")
+}
+
+/// The digest a release's signed `SHA256SUMS` lists for `asset`. The signature is checked before a
+/// line of `sums` is read, and the lookup reads those same bytes. Those bytes must also name
+/// `version` (`# jkbase-cli <version>`, written by CI), so an older signed release served under
+/// this tag is refused before anything is downloaded.
+fn signed_sha256(
+    keys: &[ssh_key::PublicKey],
+    sums: &[u8],
+    sig: &[u8],
+    version: &str,
+    asset: &str,
+) -> Result<String> {
+    release_sig::verify_with(keys, sums, sig).context(
+        "if you haven't upgraded jkbase in a long time (it may predate a key rotation), reinstall: \
+         curl -fsSL https://jkbase.app/install.sh | sh (Windows: irm https://jkbase.app/install.ps1 | iex)",
+    )?;
+    let sums = std::str::from_utf8(sums).context("SHA256SUMS is not text")?;
+    let signed = sums.lines().find_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        (f.len() == 3 && f[0] == "#" && f[1] == "jkbase-cli").then(|| f[2])
+    });
+    ensure!(
+        signed == Some(version),
+        "the release is signed as jkbase {}, not {version}",
+        signed.unwrap_or("<no version>")
+    );
+    expected_sha256(sums, asset).with_context(|| format!("no {TARGET} build in this release"))
 }
 
 /// The `jkbase` binary at the archive root. Anything else (paths, links, devices) is ignored, so
@@ -241,11 +274,13 @@ pub async fn run(args: UpgradeArgs) -> Result<()> {
     let asset = format!("jkbase-{TARGET}.tar.gz");
     let base = format!("https://github.com/{repo}/releases/download/{TAG_PREFIX}{version}");
     println!("Downloading jkbase {version} for {TARGET}...");
-    let sums = String::from_utf8(fetch(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?)
-        .context("SHA256SUMS is not text")?;
-    let want = expected_sha256(&sums, &asset).with_context(|| {
-        format!("no {TARGET} build in release {TAG_PREFIX}{version}")
-    })?;
+    let sums = fetch(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
+    let sig = fetch(&client, &format!("{base}/SHA256SUMS.sig"), release_sig::MAX_SIG)
+        .await
+        .with_context(|| format!("release {TAG_PREFIX}{version} has no signature"))?;
+    let keys = release_sig::parse_allowed_signers(release_sig::ALLOWED_SIGNERS)?;
+    let want = signed_sha256(&keys, &sums, &sig, &version, &asset)
+        .with_context(|| format!("release {TAG_PREFIX}{version} refused"))?;
     let archive = fetch(&client, &format!("{base}/{asset}"), MAX_ARCHIVE).await?;
     let got = hex(&Sha256::digest(&archive));
     ensure!(got == want, "checksum mismatch for {asset}: expected {want}, got {got}");
@@ -307,6 +342,43 @@ mod tests {
         assert_eq!(extract_binary(&a).unwrap(), b"real");
         let none = targz(&[("sub/jkbase", b"nested", tar::EntryType::Regular)]);
         assert!(extract_binary(&none).is_err());
+    }
+
+    /// The upgrade path's own sequence: nothing is looked up from an unsigned, mis-signed or
+    /// altered SHA256SUMS.
+    #[test]
+    fn digest_comes_only_from_signed_sums() {
+        use ssh_key::private::{Ed25519Keypair, PrivateKey};
+        let k = PrivateKey::from(Ed25519Keypair::from_seed(&[5; 32]));
+        let rogue = PrivateKey::from(Ed25519Keypair::from_seed(&[6; 32]));
+        let keys = vec![k.public_key().clone()];
+        let sign = |key: &PrivateKey, msg: &[u8]| {
+            ssh_key::SshSig::sign(key, release_sig::NAMESPACE, ssh_key::HashAlg::Sha512, msg)
+                .unwrap()
+                .to_pem(ssh_key::LineEnding::LF)
+                .unwrap()
+                .into_bytes()
+        };
+        let asset = "jkbase-x86_64-unknown-linux-musl.tar.gz";
+        let sums = format!("# jkbase-cli 1.2.3\n{}  {asset}\n", "c".repeat(64)).into_bytes();
+        let sig = sign(&k, &sums);
+        let check = |keys: &[ssh_key::PublicKey], sums: &[u8], sig: &[u8], ver: &str, asset: &str| {
+            signed_sha256(keys, sums, sig, ver, asset)
+        };
+        assert_eq!(check(&keys, &sums, &sig, "1.2.3", asset).unwrap(), "c".repeat(64));
+        assert!(check(&keys, &sums, b"", "1.2.3", asset).is_err());
+        assert!(check(&keys, &sums, &sign(&rogue, &sums), "1.2.3", asset).is_err());
+        let evil = format!("# jkbase-cli 1.2.3\n{}  {asset}\n", "d".repeat(64)).into_bytes();
+        assert!(check(&keys, &evil, &sig, "1.2.3", asset).is_err());
+        assert!(check(&[], &sums, &sig, "1.2.3", asset).is_err());
+        // Signed, but no line for this target.
+        assert!(check(&keys, &sums, &sig, "1.2.3", "jkbase-other.tar.gz").is_err());
+        // Rollback: a genuinely signed 1.2.3 served when 1.3.0 was asked for.
+        let err = check(&keys, &sums, &sig, "1.3.0", asset).unwrap_err();
+        assert!(format!("{err:#}").contains("signed as jkbase 1.2.3"), "{err:#}");
+        // Signed but names no version at all.
+        let nover = format!("{}  {asset}\n", "c".repeat(64)).into_bytes();
+        assert!(check(&keys, &nover, &sign(&k, &nover), "1.2.3", asset).is_err());
     }
 
     #[test]

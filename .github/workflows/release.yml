@@ -17,6 +17,7 @@ on:
       - ".github/workflows/release.yml"
       - "sites/www/install.sh"
       - "sites/www/install.ps1"
+      - "sites/www/tests/**"
 
 permissions:
   contents: read
@@ -99,21 +100,73 @@ jobs:
           path: jkbase-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  # The install scripts' signature checks, against a fake release signed with throwaway keys.
+  install-sh:
+    name: install.sh (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: sh sites/www/tests/install_sh_test.sh
+
+  install-ps1:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: jkbase-x86_64-pc-windows-msvc
+          path: dist
+      - name: install.ps1 tests
+        shell: pwsh
+        run: |
+          tar -xzf dist/jkbase-x86_64-pc-windows-msvc.tar.gz -C dist jkbase.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./sites/www/tests/install_ps1_test.ps1 -Exe (Resolve-Path dist/jkbase.exe).Path
+
   release:
     if: startsWith(github.ref, 'refs/tags/cli-v')
-    needs: build
+    needs: [build, install-sh, install-ps1]
     runs-on: ubuntu-24.04
+    # Holds the CLI_SIGNING_KEY secret. The environment admits only `cli-v*` tags AND needs a
+    # maintainer's approval per run: a tag runs the workflow file AT that tag, so the tag pattern
+    # alone wouldn't stop someone with push rights. Setup + rotation: docs/cli-release-signing.md.
+    environment: cli-release
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      # This job holds the signing key: its actions are pinned to commits, not movable tags.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5, for release-keys/allowed_signers at the tagged commit
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: dist
           merge-multiple: true
 
+      # The version line is inside the signed bytes, so an older signed release served in place
+      # of a newer one is detectable (installers compare it; `sha256sum -c` skips `#` lines).
       - name: Checksums
         working-directory: dist
-        run: sha256sum jkbase-*.tar.gz | tee SHA256SUMS
+        run: |
+          { echo "# jkbase-cli ${GITHUB_REF_NAME#cli-v}"; sha256sum jkbase-*.tar.gz; } | tee SHA256SUMS
+
+      # SHA256SUMS.sig: what install.sh, install.ps1 and `jkbase upgrade` verify (fail-closed)
+      # before trusting SHA256SUMS. Then check it with the tagged commit's trust root, so a key
+      # that doesn't match what this release's CLI/scripts trust fails here, not on users.
+      - name: Sign
+        env:
+          CLI_SIGNING_KEY: ${{ secrets.CLI_SIGNING_KEY }}
+        run: |
+          [ -n "$CLI_SIGNING_KEY" ] || { echo "::error::CLI_SIGNING_KEY secret is not set in the cli-release environment"; exit 1; }
+          key="$RUNNER_TEMP/release-key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$CLI_SIGNING_KEY" >"$key")
+          ssh-keygen -q -Y sign -f "$key" -n jkbase-cli-release dist/SHA256SUMS </dev/null
+          ssh-keygen -Y verify -f crates/jkbase-cli/release-keys/allowed_signers \
+            -I jkbase-release -n jkbase-cli-release -s dist/SHA256SUMS.sig <dist/SHA256SUMS
 
       - name: Publish
         env:

@@ -2,6 +2,7 @@ mod db;
 mod db_proxy;
 mod deploy;
 mod project;
+mod release_sig;
 mod repo;
 mod upgrade;
 
