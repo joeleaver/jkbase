@@ -10,6 +10,8 @@ pub mod go;
 pub mod node;
 pub mod python;
 pub mod rust;
+mod rust_native_libs;
+mod rust_toolchain;
 pub mod trunk;
 
 use crate::buildpack::Buildpack;

@@ -31,6 +31,10 @@ contents:
     # The Rust toolchain (rustc + cargo + std). Wolfi versions rust as `rust-N.M`;
     # pin the major.minor and bump deliberately. cargo is bundled in this package.
     - rust-1.95
+    # rustup: installs an app's OWN `rust-toolchain.toml` pin (official dist server,
+    # sha256-verified) in the network-up fetch phase; the baked rust-1.95 above stays the
+    # default for apps that pin nothing. See jkbuild buildpacks/rust_toolchain.rs.
+    - rustup=1.29.1-r1 # last rustup on OpenSSL 3 (matches the locked libssl3)
     # C toolchain + linker: cargo links the final binary with `cc`, and crates with
     # build scripts (cc/bindgen/native-sys) need a working C compiler.
     - build-base

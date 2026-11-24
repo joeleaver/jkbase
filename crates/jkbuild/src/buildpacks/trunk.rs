@@ -32,6 +32,7 @@
 use crate::buildpack::{
     BuildContext, BuildOutput, Buildpack, Decision, DetectContext, Layer, LayerTypes,
 };
+use super::rust_toolchain::{self, Toolchain};
 use anyhow::{Context, Result};
 use jkbuild_types::LayerRole;
 use std::path::Path;
@@ -46,6 +47,9 @@ const BUILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbi
 /// The directory `trunk build` writes its static bundle to (the default; a project
 /// can override it in `Trunk.toml`, which `dist_dir` reads).
 const DEFAULT_DIST: &str = "dist";
+
+/// The target trunk compiles to; an app-pinned toolchain must carry its std too.
+const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 pub struct TrunkBuildpack;
 
@@ -74,11 +78,14 @@ impl Buildpack for TrunkBuildpack {
         // WORKSPACE ROOT, not the member — so a committed lock and the wasm-bindgen
         // version below are both read from the root (== app_dir for a normal app).
         let has_lock = ctx.root_dir().join("Cargo.lock").exists();
+        // The app's own `rust-toolchain.toml` pin (+ the wasm target std), installed now
+        // while the network is up; `None` = no pin, use the baked /opt/rust toolchain.
+        let toolchain = rust_toolchain::for_fetch(ctx, &[WASM_TARGET])?;
 
         // 1. Resolve + download every crate dependency through the proxy. Same registry
         //    + git egress as the rust server buildpack (index.crates.io / static.crates.io
         //    / github are allow-listed).
-        let mut cmd = cargo_command("cargo", &cargo_home, &trunk_cache);
+        let mut cmd = cargo_command(toolchain.as_ref(), &cargo_home, &trunk_cache);
         cmd.arg("fetch");
         if has_lock {
             cmd.arg("--locked");
@@ -115,12 +122,13 @@ impl Buildpack for TrunkBuildpack {
     fn compile(&self, ctx: &mut BuildContext) -> Result<BuildOutput> {
         let cargo_home = ctx.cache_dir.join("cargo");
         let trunk_cache = ctx.cache_dir.join("trunk");
+        let toolchain = rust_toolchain::for_compile(ctx, &[WASM_TARGET])?;
 
         // Offline (post-seal) release build. `--offline` makes cargo fail rather than
         // touch the network (every crate was fetched above); the exact `wasm-bindgen` was
         // provisioned on PATH in fetch and `wasm-opt` is baked (binaryen), so trunk needs
         // no network. A build that still tries the network fails here by design.
-        let mut cmd = trunk_command(&cargo_home, &trunk_cache);
+        let mut cmd = trunk_command(toolchain.as_ref(), &cargo_home, &trunk_cache);
         cmd.arg("build").arg("--release").arg("--offline");
         cmd.current_dir(ctx.app_dir);
         run(cmd, "trunk build --release --offline")?;
@@ -326,18 +334,18 @@ fn extract_named(tgz: &Path, filename: &str, dest: &Path) -> Result<()> {
 
 /// A cargo `Command` with a deterministic build `PATH`, `CARGO_HOME` on the cache
 /// drive, and the same git-CLI/sparse-registry settings the rust buildpack uses.
-fn cargo_command(bin: &str, cargo_home: &Path, trunk_cache: &Path) -> Command {
-    let mut cmd = Command::new(bin);
-    apply_common_env(&mut cmd, cargo_home, trunk_cache);
+fn cargo_command(toolchain: Option<&Toolchain>, cargo_home: &Path, trunk_cache: &Path) -> Command {
+    let mut cmd = Command::new(toolchain.map_or("cargo".into(), Toolchain::cargo));
+    apply_common_env(&mut cmd, toolchain, cargo_home, trunk_cache);
     cmd
 }
 
 /// A `trunk` `Command` with the same env as cargo plus trunk's cache pointed at the
 /// persistent cache drive. The exact `wasm-bindgen` is provided on PATH (see
 /// `apply_common_env` + `provision_wasm_bindgen`) and `wasm-opt` is baked (binaryen).
-fn trunk_command(cargo_home: &Path, trunk_cache: &Path) -> Command {
+fn trunk_command(toolchain: Option<&Toolchain>, cargo_home: &Path, trunk_cache: &Path) -> Command {
     let mut cmd = Command::new("trunk");
-    apply_common_env(&mut cmd, cargo_home, trunk_cache);
+    apply_common_env(&mut cmd, toolchain, cargo_home, trunk_cache);
     cmd
 }
 
@@ -345,10 +353,23 @@ fn trunk_command(cargo_home: &Path, trunk_cache: &Path) -> Command {
 /// fetch, and the XDG/trunk cache dirs on the persistent cache drive. The cache `bin`
 /// dir is prepended to PATH: fetch provisions the exact-version `wasm-bindgen` there,
 /// and trunk (which resolves tools via PATH) picks it up during the offline compile.
-fn apply_common_env(cmd: &mut Command, cargo_home: &Path, trunk_cache: &Path) {
+/// An app-pinned `toolchain` goes first on PATH (trunk runs `cargo` off PATH) with
+/// `RUSTC`/`RUSTDOC` pointed at it; `None` leaves the baked /opt/rust toolchain.
+fn apply_common_env(
+    cmd: &mut Command,
+    toolchain: Option<&Toolchain>,
+    cargo_home: &Path,
+    trunk_cache: &Path,
+) {
     let bin = trunk_cache.parent().unwrap_or(trunk_cache).join("bin");
-    cmd.env("PATH", format!("{}:{BUILD_PATH}", bin.display()))
-        .env("CARGO_HOME", cargo_home)
+    let path = format!("{}:{BUILD_PATH}", bin.display());
+    match toolchain {
+        Some(tc) => tc.apply(cmd, &path),
+        None => {
+            cmd.env("PATH", path);
+        }
+    }
+    cmd.env("CARGO_HOME", cargo_home)
         .env("CARGO_NET_GIT_FETCH_WITH_CLI", "true")
         .env("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse")
         // trunk reads XDG_CACHE_HOME for its tool cache; point it at the persistent

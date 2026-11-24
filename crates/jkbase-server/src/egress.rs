@@ -51,6 +51,11 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
     "crates.io",
     "static.crates.io",
     "index.crates.io",
+    // The official Rust dist server: the rust + trunk buildpacks install an app's own
+    // `rust-toolchain.toml` pin via rustup in the fetch phase (jkbuild rust_toolchain.rs).
+    // Blind-tunnelled (not mirrored): rustup checks the real cert and sha256-verifies each
+    // component against the channel manifest.
+    "static.rust-lang.org",
     // Node
     "registry.npmjs.org",
     // Python
@@ -403,6 +408,8 @@ mod tests {
         assert!(should_mirror(&narrow, "static.crates.io", 443));
         // Not a registry -> blind tunnel (git, etc.).
         assert!(!should_mirror(&narrow, "github.com", 443));
+        // The Rust dist server stays a blind tunnel (rustup verifies against the real cert).
+        assert!(!should_mirror(&narrow, "static.rust-lang.org", 443));
         // Wrong port -> never MITM.
         assert!(!should_mirror(&narrow, "registry.npmjs.org", 80));
         // No mirror attached -> blind tunnel.
@@ -479,6 +486,10 @@ mod tests {
         assert!(host_allowed("crates.io.", &al)); // trailing dot
         assert!(host_allowed("static.crates.io", &al));
         assert!(host_allowed("registry.npmjs.org", &al));
+        // The Rust dist server (app-pinned toolchains) — and only it, not the whole zone.
+        assert!(host_allowed("static.rust-lang.org", &al));
+        assert!(!host_allowed("rust-lang.org", &al));
+        assert!(!host_allowed("forge.rust-lang.org", &al));
         // Spoofing / rebind hostnames must NOT pass.
         assert!(!host_allowed("crates.io.evil.com", &al));
         assert!(!host_allowed("evilcrates.io", &al));
