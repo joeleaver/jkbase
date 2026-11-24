@@ -1,10 +1,10 @@
-//! The host→agent managed-DB reach seam ([R3]/[RB*]): every `/_jkbase/db*` endpoint the HOST
-//! drives over the VM's eth0 (reach-plane splice, backup pull, restore push, console query /
-//! schema / status, the admin `rewrite-covers` pass) plus the dedicated tier's in-guest app→DB
-//! loopback leg. The DB itself stays loopback-only: this module is the sole in-VM path to it,
-//! and every host-facing endpoint is gated on the per-deploy splice secret (fail-closed 404).
-//! `/admin/*` is reached ONLY on hard-coded paths with the in-guest admin token, which never
-//! leaves the guest.
+//! The host→agent managed-DB reach seam ([R3]/[RB*]): the `/_jkbase/db*` endpoints the HOST
+//! drives over the VM's eth0 (reach-plane splice, backup pull, restore push) plus the dedicated
+//! tier's in-guest app→DB loopback leg, and the shared secret gate / permit helpers the engine
+//! HTTP ops (console query, admin `rewrite-covers` — [`crate::db_engine`]) use too. The DB itself
+//! stays loopback-only: this seam is the sole in-VM path to it, and every host-facing endpoint is
+//! gated on the per-deploy splice secret (fail-closed 404). `/admin/*` is reached ONLY on
+//! hard-coded paths with the in-guest admin token, which never leaves the guest.
 
 use crate::container_supervisor::{self, ContainerSupervisor};
 use crate::{AgentState, not_found_response, upgrade_permits};
@@ -13,7 +13,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -123,7 +122,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Verify the host→agent reach-plane secret ([R3]/[RB2]). No secret configured (no managed DB
 /// / not baked) OR a mismatch ⇒ false, so every gated endpoint fails closed to 404 (never
 /// confirming the endpoint or the DB's existence). Constant-time compare.
-fn db_secret_ok(state: &AgentState, req: &Request<hyper::body::Incoming>) -> bool {
+pub(crate) fn db_secret_ok(state: &AgentState, req: &Request<hyper::body::Incoming>) -> bool {
     let Some(expected) = state.db_splice_secret.as_deref() else {
         return false;
     };
@@ -222,218 +221,7 @@ pub(crate) async fn handle_db_splice(
 /// rhypedb's loopback HTTP admin port inside the guest (see `db_manifest`).
 pub(crate) const RHYPEDB_HTTP_PORT: u16 = 4200;
 
-/// A console DB tools op → the target route on rhypedb's OPEN loopback HTTP plane. The rhypedb
-/// path is HARD-CODED per variant (never derived from the host request), so `/admin/*` — which
-/// would need the admin token anyway — is unreachable through this seam.
-#[derive(Clone, Copy)]
-pub(crate) enum DbHttpOp {
-    Query,
-    Schema,
-    Status,
-}
-
-impl DbHttpOp {
-    fn method(self) -> &'static str {
-        match self {
-            DbHttpOp::Query => "POST",
-            DbHttpOp::Schema | DbHttpOp::Status => "GET",
-        }
-    }
-    fn rhypedb_path(self) -> &'static str {
-        match self {
-            DbHttpOp::Query => "/query",
-            DbHttpOp::Schema => "/schema",
-            DbHttpOp::Status => "/status",
-        }
-    }
-    fn forwards_body(self) -> bool {
-        matches!(self, DbHttpOp::Query)
-    }
-}
-
-/// Max inbound query body the agent accepts before forwarding to the engine.
-const MAX_DB_QUERY_IN_BYTES: usize = 256 * 1024;
-/// Max engine response the agent buffers before relaying to the host (result rows are
-/// governor-bounded engine-side; this caps a pathological payload).
-const MAX_DB_QUERY_OUT_BYTES: usize = 16 * 1024 * 1024;
-
-/// Console DB proxy ([managed-rhypedb studio]). Forward a secret-gated host request to rhypedb's
-/// OPEN loopback HTTP plane (`/query` | `/schema` | `/status`; NEVER `/admin/*`) and relay the
-/// engine's status + JSON body back. Bounded in + out; concurrency-capped by the shared upgrade
-/// permit pool. Lets the console query/introspect the DB without ever exposing it off-loopback.
-pub(crate) async fn handle_db_query(
-    state: Arc<AgentState>,
-    req: Request<hyper::body::Incoming>,
-    op: DbHttpOp,
-) -> Response<Full<Bytes>> {
-    use http_body_util::Limited;
-    if !db_secret_ok(&state, &req) {
-        return not_found_response();
-    }
-    let Ok(_permit) = upgrade_permits().clone().try_acquire_owned() else {
-        return too_many_db_connections();
-    };
-
-    // Read the (bounded) inbound body only for the write/query op; schema/status are GET.
-    let body = if op.forwards_body() {
-        match Limited::new(req.into_body(), MAX_DB_QUERY_IN_BYTES)
-            .collect()
-            .await
-        {
-            Ok(c) => c.to_bytes(),
-            Err(_) => {
-                return Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(Full::new(Bytes::from("query too large")))
-                    .unwrap();
-            }
-        }
-    } else {
-        Bytes::new()
-    };
-
-    match engine_request(
-        ENGINE_HTTP,
-        op.method(),
-        op.rhypedb_path(),
-        None,
-        body,
-        MAX_DB_QUERY_OUT_BYTES,
-        "db query",
-    )
-    .await
-    {
-        Ok((status, out)) => json_response(status, out),
-        Err(resp) => resp,
-    }
-}
-
-/// Max engine response to a `rewrite-covers` pass (a handful of counters — anything bigger is not
-/// the engine's answer).
-const MAX_DB_ADMIN_OUT_BYTES: usize = 64 * 1024;
-
-/// Owner-driven `rewrite-covers` pass ([RB1] admin plane). The host POSTs `/_jkbase/db/rewrite-covers`
-/// presenting the splice secret; the agent authorizes rhypedb's loopback
-/// `POST /admin/rewrite-covers` with the in-guest admin token and relays the engine's JSON stats
-/// (`ok`, `objects`, `rev_edges_rewritten`, `index_entries_rewritten`, `cover_peers_sound`).
-///
-/// The engine path is HARD-CODED and no inbound body or header is forwarded, so this seam reaches
-/// exactly one admin route — never a host- or console-chosen one — and the admin token never
-/// leaves the guest. The pass runs in engine-side batches and is safe to interrupt and rerun, so
-/// the host bounds it with a deadline and simply drops the connection on expiry (the engine
-/// finishes or stops on its own; a rerun redoes only what is still stale). POST-only so a stray GET
-/// can never start a mutating pass. Holds one upgrade permit for the pass's lifetime.
-pub(crate) async fn handle_db_rewrite_covers(
-    state: Arc<AgentState>,
-    req: Request<hyper::body::Incoming>,
-) -> Response<Full<Bytes>> {
-    if !db_secret_ok(&state, &req) {
-        return not_found_response();
-    }
-    // No admin token baked ⇒ no managed DB (or one deployed before the admin plane existed):
-    // fail closed exactly like an unknown endpoint.
-    let Some(admin_token) = state.db_admin_token.clone() else {
-        return not_found_response();
-    };
-    if req.method() != hyper::Method::POST {
-        return Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header("allow", "POST")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-    }
-    let Ok(_permit) = upgrade_permits().clone().try_acquire_owned() else {
-        return too_many_db_connections();
-    };
-    drop(req); // nothing from the host request reaches the engine
-    match engine_request(
-        ENGINE_HTTP,
-        "POST",
-        "/admin/rewrite-covers",
-        Some(&admin_token),
-        Bytes::new(),
-        MAX_DB_ADMIN_OUT_BYTES,
-        "db rewrite-covers",
-    )
-    .await
-    {
-        Ok((status, out)) => json_response(status, out),
-        Err(resp) => resp,
-    }
-}
-
-/// rhypedb's loopback HTTP plane, the only engine address the host-facing handlers dial.
-const ENGINE_HTTP: SocketAddr = SocketAddr::new(
-    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-    RHYPEDB_HTTP_PORT,
-);
-
-/// One request to rhypedb's loopback HTTP plane (`engine`: always [`ENGINE_HTTP`] outside tests): send `method path`
-/// (with `Authorization: Bearer <admin>` only when `admin_bearer` is set), and read the response
-/// body bounded by `out_cap`. `Err` is the ready-made 502 for the host (engine down / handshake /
-/// send failure / oversized body); `label` names the op in the guest log.
-async fn engine_request(
-    engine: SocketAddr,
-    method: &str,
-    path: &'static str,
-    admin_bearer: Option<&str>,
-    body: Bytes,
-    out_cap: usize,
-    label: &'static str,
-) -> std::result::Result<(StatusCode, Bytes), Response<Full<Bytes>>> {
-    use http_body_util::Limited;
-    let backend = match tokio::net::TcpStream::connect(engine).await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(error = %e, op = label, "rhypedb loopback http not available");
-            return Err(bad_gateway("db not available"));
-        }
-    };
-    let (mut sender, conn) =
-        match hyper::client::conn::http1::handshake(TokioIo::new(backend)).await {
-            Ok(p) => p,
-            Err(e) => {
-                error!(error = %e, op = label, "loopback handshake failed");
-                return Err(bad_gateway("db handshake failed"));
-            }
-        };
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let mut rreq = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("host", "127.0.0.1")
-        .header("content-type", "application/json");
-    if let Some(token) = admin_bearer {
-        rreq = rreq.header("authorization", format!("Bearer {token}"));
-    }
-    let resp = match sender
-        .send_request(rreq.body(Full::new(body)).unwrap())
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, op = label, "engine request failed");
-            return Err(bad_gateway("db request failed"));
-        }
-    };
-    let status = resp.status();
-    match Limited::new(resp.into_body(), out_cap).collect().await {
-        Ok(c) => Ok((status, c.to_bytes())),
-        Err(_) => Err(bad_gateway("db response too large")),
-    }
-}
-
-fn json_response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(body))
-        .unwrap()
-}
-
-fn too_many_db_connections() -> Response<Full<Bytes>> {
+pub(crate) fn too_many_db_connections() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .header("retry-after", "5")
@@ -752,7 +540,7 @@ async fn db_health_probe() -> bool {
     matches!(sender.send_request(req).await, Ok(r) if r.status() == StatusCode::OK)
 }
 
-fn bad_gateway(msg: &'static str) -> Response<Full<Bytes>> {
+pub(crate) fn bad_gateway(msg: &'static str) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::BAD_GATEWAY)
         .body(Full::new(Bytes::from(msg)))
@@ -776,122 +564,5 @@ mod tests {
         assert_eq!(db_splice_target_port(""), None);
         assert_eq!(db_splice_target_port("4201 "), None);
         assert_eq!(db_splice_target_port("04201"), None);
-    }
-
-    /// A fake engine on an ephemeral port: records each request's method, path, authorization
-    /// and body, and answers `reply`.
-    async fn fake_engine(
-        reply: &'static str,
-    ) -> (
-        SocketAddr,
-        tokio::sync::mpsc::UnboundedReceiver<(String, String, Option<String>, Bytes)>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let svc =
-                        hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                            let tx = tx.clone();
-                            async move {
-                                let method = req.method().to_string();
-                                let path = req.uri().path().to_string();
-                                let auth = req
-                                    .headers()
-                                    .get("authorization")
-                                    .map(|v| v.to_str().unwrap().to_string());
-                                let body = req.into_body().collect().await.unwrap().to_bytes();
-                                tx.send((method, path, auth, body)).unwrap();
-                                Ok::<_, std::convert::Infallible>(Response::new(Full::new(
-                                    Bytes::from(reply),
-                                )))
-                            }
-                        });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
-            }
-        });
-        (addr, rx)
-    }
-
-    /// The admin op reaches exactly `POST /admin/rewrite-covers` with the in-guest bearer and an
-    /// empty body, and relays the engine's status + JSON.
-    #[tokio::test]
-    async fn rewrite_covers_engine_request_is_the_hard_coded_admin_call() {
-        let (engine, mut seen) = fake_engine(r#"{"ok":true,"cover_peers_sound":true}"#).await;
-        let (status, body) = engine_request(
-            engine,
-            "POST",
-            "/admin/rewrite-covers",
-            Some("adm-tok"),
-            Bytes::new(),
-            MAX_DB_ADMIN_OUT_BYTES,
-            "test",
-        )
-        .await
-        .unwrap();
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(&body[..], br#"{"ok":true,"cover_peers_sound":true}"#);
-        let (method, path, auth, sent) = seen.recv().await.unwrap();
-        assert_eq!(method, "POST");
-        assert_eq!(path, "/admin/rewrite-covers");
-        assert_eq!(auth.as_deref(), Some("Bearer adm-tok"));
-        assert!(sent.is_empty());
-    }
-
-    /// The open-plane console ops never carry the admin bearer.
-    #[tokio::test]
-    async fn open_plane_engine_request_sends_no_bearer() {
-        let (engine, mut seen) = fake_engine("{}").await;
-        engine_request(engine, "GET", "/status", None, Bytes::new(), 1024, "test")
-            .await
-            .unwrap();
-        let (_, path, auth, _) = seen.recv().await.unwrap();
-        assert_eq!(path, "/status");
-        assert_eq!(auth, None);
-    }
-
-    /// An engine answer over the cap is a 502, never a truncated relay.
-    #[tokio::test]
-    async fn engine_request_bounds_the_response() {
-        let (engine, _seen) = fake_engine(r#"{"ok":true,"padding":"xxxxxxxxxxxxxxxx"}"#).await;
-        let err = engine_request(
-            engine,
-            "POST",
-            "/admin/rewrite-covers",
-            Some("t"),
-            Bytes::new(),
-            8,
-            "test",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
-    }
-
-    /// Nothing listening ⇒ a clean 502 (rhypedb down), not a hang or panic.
-    #[tokio::test]
-    async fn engine_request_engine_down_is_bad_gateway() {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead = l.local_addr().unwrap();
-        drop(l);
-        let err = engine_request(
-            dead,
-            "POST",
-            "/admin/rewrite-covers",
-            Some("t"),
-            Bytes::new(),
-            64,
-            "test",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     }
 }

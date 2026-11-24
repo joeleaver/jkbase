@@ -1,9 +1,10 @@
 mod clock;
+mod db_engine;
 mod db_reach;
+use db_engine::{DbHttpOp, handle_db_query, handle_db_rewrite_covers};
 use db_reach::{
-    DB_LEG_MAX_CONNS, DbHttpOp, RHYPEDB_HTTP_PORT, RHYPEDB_TCP_PORT, db_leg_loopback_proxy,
-    handle_db_backup, handle_db_query, handle_db_restore, handle_db_rewrite_covers,
-    handle_db_splice,
+    DB_LEG_MAX_CONNS, RHYPEDB_HTTP_PORT, RHYPEDB_TCP_PORT, db_leg_loopback_proxy,
+    handle_db_backup, handle_db_restore, handle_db_splice,
 };
 mod container_supervisor;
 mod dmverity;
@@ -1946,7 +1947,7 @@ mod tests {
     /// The rewrite-covers seam fails closed before it ever dials the engine: a tenant on guest
     /// loopback, a missing or wrong splice secret, and a VM with no admin token baked all get the
     /// same 404 as an unknown path; a GET with the right secret can't start a mutating pass.
-    /// (The engine leg itself is covered in `db_reach::tests`.)
+    /// (The engine leg itself is covered in `db_engine::tests`.)
     #[tokio::test]
     async fn rewrite_covers_is_host_only_secret_gated_and_post_only() {
         let dir = std::env::temp_dir().join(format!("jkagent-rwc-{}", std::process::id()));
