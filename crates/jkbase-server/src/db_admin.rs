@@ -59,11 +59,16 @@ async fn rewrite_covers_pass(
     let (_hold, cancel) = match hold_db_vm_warm(&ctx.relays, project_id, charge.as_ref()) {
         Ok(h) => h,
         Err(r) => {
+            use jkbase_proxy::db_relay::RelayRejected;
+            let which = match r {
+                RelayRejected::PerTenantRelays => "database connection quota",
+                RelayRejected::PerTenant | RelayRejected::PerProject => "warm database VM quota",
+            };
             return Ok(json_result(
                 429,
                 &format!(
-                    "the owner's warm database quota is in use ({r:?}); close other database \
-                     connections or raise the quota, then retry"
+                    "the owner's {which} is in use; close other database connections or raise \
+                     the quota, then retry"
                 ),
             ));
         }

@@ -54,10 +54,7 @@ pub(crate) async fn connect_agent_db_upgrade(
 ) -> Result<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>> {
     use http_body_util::Full;
     use hyper::body::Bytes;
-    let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
-        .await
-        .context("connect agent")?;
-    keepalive_agent_socket(&stream)?;
+    let stream = connect_agent_socket((vm_ip, 80u16)).await?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -149,10 +146,7 @@ pub(crate) async fn agent_db_request(
 ) -> Result<jkbase_control::api::DbQueryResult> {
     use http_body_util::{BodyExt, Full, Limited};
     use hyper::body::Bytes;
-    let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
-        .await
-        .context("connect agent")?;
-    keepalive_agent_socket(&stream)?;
+    let stream = connect_agent_socket((vm_ip, 80u16)).await?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -190,11 +184,18 @@ const AGENT_KEEPALIVE: socket2::TcpKeepalive = socket2::TcpKeepalive::new()
     .with_interval(Duration::from_secs(10))
     .with_retries(3);
 
-/// Arm [`AGENT_KEEPALIVE`] on a host→agent DB socket (every DB call the host makes to an agent).
-fn keepalive_agent_socket(stream: &tokio::net::TcpStream) -> Result<()> {
-    socket2::SockRef::from(stream)
+/// The ONE way the host opens a DB socket to an agent: connect, then arm [`AGENT_KEEPALIVE`], so no
+/// host→agent DB path can forget it.
+async fn connect_agent_socket(
+    addr: impl tokio::net::ToSocketAddrs,
+) -> Result<tokio::net::TcpStream> {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .context("connect agent")?;
+    socket2::SockRef::from(&stream)
         .set_tcp_keepalive(&AGENT_KEEPALIVE)
-        .context("agent keepalive")
+        .context("agent keepalive")?;
+    Ok(stream)
 }
 
 /// Everything the synchronous console DB ops need (wired to `state.db_query_callback`). All
@@ -502,14 +503,12 @@ pub(crate) async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
 mod tests {
     use super::*;
 
-    /// The keepalive actually lands on the socket with the intended timing.
+    /// A socket from the shared connect helper (what both host→agent DB paths use) carries the
+    /// keepalive with the intended timing.
     #[tokio::test]
     async fn agent_sockets_carry_keepalive() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let s = tokio::net::TcpStream::connect(l.local_addr().unwrap())
-            .await
-            .unwrap();
-        keepalive_agent_socket(&s).unwrap();
+        let s = connect_agent_socket(l.local_addr().unwrap()).await.unwrap();
         let r = socket2::SockRef::from(&s);
         assert!(r.keepalive().unwrap());
         assert_eq!(r.tcp_keepalive_time().unwrap(), Duration::from_secs(30));
