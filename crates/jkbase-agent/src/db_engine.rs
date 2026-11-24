@@ -144,7 +144,9 @@ impl Drop for PassClaim {
 /// exactly one admin route — never a host- or console-chosen one — and the admin token never
 /// leaves the guest. POST-only so a stray GET can never start a mutating pass. Single-flight per
 /// VM ([`REWRITE_RUNNING`]): a second call while a pass runs — including one whose host request
-/// is long gone — is a 409, so reruns can never stack concurrent passes on the engine.
+/// is long gone — is a 409, so reruns can't stack concurrent passes on the engine. (The one gap:
+/// after [`REWRITE_PASS_MAX`] the claim is released even if a wedged engine is still working —
+/// a deliberate bound, so a hung engine can't refuse the owner forever.)
 pub(crate) async fn handle_db_rewrite_covers(
     state: Arc<AgentState>,
     req: Request<hyper::body::Incoming>,

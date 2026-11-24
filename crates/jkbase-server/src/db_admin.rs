@@ -55,7 +55,19 @@ async fn rewrite_covers_pass(
         ));
     };
     let secret = db_splice_secret(&ctx.store, project_id)?;
-    let (_hold, cancel) = hold_db_vm_warm(&ctx.relays, project_id)?;
+    let charge = owner_charge(&ctx.store, project_id)?;
+    let (_hold, cancel) = match hold_db_vm_warm(&ctx.relays, project_id, charge.as_ref()) {
+        Ok(h) => h,
+        Err(r) => {
+            return Ok(json_result(
+                429,
+                &format!(
+                    "the owner's warm database quota is in use ({r:?}); close other database \
+                     connections or raise the quota, then retry"
+                ),
+            ));
+        }
+    };
     let run = async {
         let ip = wake_db_reach(
             project_id,
@@ -117,23 +129,61 @@ fn json_result(status: u16, error: &str) -> jkbase_control::api::DbQueryResult {
     }
 }
 
+/// Who pays for an admin hold: the project's owner, with their effective warm caps.
+struct HoldCharge {
+    tenant_id: String,
+    quota: jkbase_control::store::TenantQuotaLimits,
+}
+
+/// The owner's charge for `project_id`'s hold, resolved the way the reach edge does (a quota
+/// store error falls back to the conservative platform default, never an unbounded cap). `None`
+/// only for an ownerless platform project, which no tenant can drive through the owner route.
+fn owner_charge(store: &Store, project_id: &str) -> Result<Option<HoldCharge>, String> {
+    let project = store
+        .get_project(project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "project not found".to_string())?;
+    Ok(project.tenant_id.map(|tenant_id| HoldCharge {
+        quota: store
+            .get_tenant_quota(&tenant_id)
+            .unwrap_or(jkbase_control::store::DEFAULT_TENANT_QUOTA),
+        tenant_id,
+    }))
+}
+
 /// Register the keep-warm hold for an admin op on `project_id`'s DB (keyed by the BASE project, so
-/// it keeps a dedicated `{id}.db` VM warm too). No tenant (an owner-driven maintenance op must not
-/// be refused by — or count against — the external reach warm-VM quota) and no per-project cap:
-/// the hold is already bounded to one per project by the single-flight guard.
+/// it keeps a dedicated `{id}.db` VM warm too). CHARGED to the owner exactly like one of their
+/// reach relays — the warm-VM and relay quotas protect host capacity, and how long a pass holds
+/// the VM is decided by the (untrusted) guest's engine, so an owner must not be able to pin more
+/// warm VMs through admin passes than through connections. No per-project cap: the hold is
+/// already one per project by the single-flight guard.
 fn hold_db_vm_warm(
     relays: &Arc<jkbase_proxy::db_relay::DbRelayRegistry>,
     project_id: &str,
+    charge: Option<&HoldCharge>,
 ) -> Result<
     (
         jkbase_proxy::db_relay::RelayGuard,
         tokio_util::sync::CancellationToken,
     ),
-    String,
+    jkbase_proxy::db_relay::RelayRejected,
 > {
-    relays
-        .try_register(project_id, None, DB_ADMIN_HOLD_AKID, usize::MAX, 0, 0)
-        .map_err(|r| format!("could not hold the database VM warm: {r:?}"))
+    let (tenant, vm_max, relay_max) = match charge {
+        Some(c) => (
+            Some(c.tenant_id.as_str()),
+            c.quota.warm_vm_max as usize,
+            c.quota.warm_relay_max as usize,
+        ),
+        None => (None, 0, 0),
+    };
+    relays.try_register(
+        project_id,
+        tenant,
+        DB_ADMIN_HOLD_AKID,
+        usize::MAX,
+        vm_max,
+        relay_max,
+    )
 }
 
 /// RAII per-project single-flight slot for `rewrite-covers`; released on drop (any exit path).
@@ -189,7 +239,7 @@ mod tests {
     #[test]
     fn admin_hold_keeps_the_db_vm_warm_and_is_cancellable() {
         let relays = jkbase_proxy::db_relay::DbRelayRegistry::new();
-        let (hold, cancel) = hold_db_vm_warm(&relays, "proj").unwrap();
+        let (hold, cancel) = hold_db_vm_warm(&relays, "proj", None).unwrap();
         assert_eq!(relays.conn_count("proj"), 1);
         assert_eq!(
             relays.cancel_key("some-real-akid"),
@@ -227,5 +277,39 @@ mod tests {
         assert_eq!(r.status, 409);
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("restart or redeploy"));
+    }
+
+    fn charge(tenant: &str, warm_vm_max: u32) -> HoldCharge {
+        HoldCharge {
+            tenant_id: tenant.to_string(),
+            quota: jkbase_control::store::TenantQuotaLimits {
+                warm_vm_max,
+                ..jkbase_control::store::DEFAULT_TENANT_QUOTA
+            },
+        }
+    }
+
+    /// The hold counts against the owner's warm-VM quota like a reach relay: an owner already at
+    /// their cap can't keep one more VM warm through an admin pass, and the hold's own slot is
+    /// returned the moment it ends.
+    #[test]
+    fn admin_hold_is_charged_to_the_owners_warm_vm_quota() {
+        let relays = jkbase_proxy::db_relay::DbRelayRegistry::new();
+        let c = charge("t", 1);
+        let (_relay, _) = relays
+            .try_register("a", Some("t"), "k", usize::MAX, 1, 64)
+            .unwrap();
+        assert_eq!(
+            hold_db_vm_warm(&relays, "b", Some(&c)).err(),
+            Some(jkbase_proxy::db_relay::RelayRejected::PerTenant)
+        );
+        // On the project the owner already holds warm, the hold rides the same slot.
+        let (hold, _) = hold_db_vm_warm(&relays, "a", Some(&c)).unwrap();
+        assert_eq!(relays.warm_projects_for_tenant("t"), 1);
+        drop(hold);
+        drop(_relay);
+        assert_eq!(relays.warm_projects_for_tenant("t"), 0);
+        let (_hold, _) = hold_db_vm_warm(&relays, "b", Some(&c)).unwrap();
+        assert_eq!(relays.warm_projects_for_tenant("t"), 1);
     }
 }

@@ -45,7 +45,7 @@ pub(crate) struct DbBackupCtx {
 /// Client-side HTTP/1.1 `Upgrade` to `<vm_ip>:80{path}` presenting the reach-plane splice
 /// secret (mirrors the proxy edge's `connect_agent`). On `101` returns the raw upgraded stream.
 /// Used by the backup PULL and restore PUSH executors — the DB stays loopback-only, the agent
-/// is the sole mediator.
+/// is the sole mediator. Keepalive-armed like every host→agent DB socket.
 pub(crate) async fn connect_agent_db_upgrade(
     vm_ip: &str,
     path: &str,
@@ -57,9 +57,7 @@ pub(crate) async fn connect_agent_db_upgrade(
     let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
         .await
         .context("connect agent")?;
-    socket2::SockRef::from(&stream)
-        .set_tcp_keepalive(&AGENT_KEEPALIVE)
-        .context("agent keepalive")?;
+    keepalive_agent_socket(&stream)?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -154,6 +152,7 @@ pub(crate) async fn agent_db_request(
     let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
         .await
         .context("connect agent")?;
+    keepalive_agent_socket(&stream)?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -191,6 +190,13 @@ const AGENT_KEEPALIVE: socket2::TcpKeepalive = socket2::TcpKeepalive::new()
     .with_interval(Duration::from_secs(10))
     .with_retries(3);
 
+/// Arm [`AGENT_KEEPALIVE`] on a host→agent DB socket (every DB call the host makes to an agent).
+fn keepalive_agent_socket(stream: &tokio::net::TcpStream) -> Result<()> {
+    socket2::SockRef::from(stream)
+        .set_tcp_keepalive(&AGENT_KEEPALIVE)
+        .context("agent keepalive")
+}
+
 /// Everything the synchronous console DB ops need (wired to `state.db_query_callback`). All
 /// handles are cheap Arc clones.
 #[derive(Clone)]
@@ -227,7 +233,9 @@ pub(crate) async fn do_db_query(
         ),
         DbQueryOp::Schema => ("/_jkbase/db/schema", "GET", Vec::new()),
         DbQueryOp::Status => ("/_jkbase/db/status", "GET", Vec::new()),
-        DbQueryOp::RewriteCovers => return crate::db_admin::do_db_rewrite_covers(&ctx, &project_id).await,
+        DbQueryOp::RewriteCovers => {
+            return crate::db_admin::do_db_rewrite_covers(&ctx, &project_id).await;
+        }
     };
     let secret = db_splice_secret(&ctx.store, &project_id)?;
     let ip = wake_db_reach(
@@ -487,5 +495,25 @@ pub(crate) async fn db_backup_nightly_loop(ctx: DbBackupCtx) {
             // run_db_backup acquires the shared concurrency permit itself; spawn and move on.
             tokio::spawn(run_db_backup(ctx.clone(), pid, row.backup_id.clone()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The keepalive actually lands on the socket with the intended timing.
+    #[tokio::test]
+    async fn agent_sockets_carry_keepalive() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s = tokio::net::TcpStream::connect(l.local_addr().unwrap())
+            .await
+            .unwrap();
+        keepalive_agent_socket(&s).unwrap();
+        let r = socket2::SockRef::from(&s);
+        assert!(r.keepalive().unwrap());
+        assert_eq!(r.tcp_keepalive_time().unwrap(), Duration::from_secs(30));
+        assert_eq!(r.tcp_keepalive_interval().unwrap(), Duration::from_secs(10));
+        assert_eq!(r.tcp_keepalive_retries().unwrap(), 3);
     }
 }
