@@ -12,6 +12,8 @@ $script = Get-Content -Raw (Join-Path $PSScriptRoot '..\install.ps1')
 $work = Join-Path ([IO.Path]::GetTempPath()) ("jkbase-ps1-test-" + [Guid]::NewGuid())
 New-Item -ItemType Directory $work | Out-Null
 $asset = 'jkbase-x86_64-pc-windows-msvc.tar.gz'
+$exeVer = ("$(& $Exe --version)".Trim() -split ' ')[1]
+if ($exeVer -notmatch '^\d+\.\d+\.\d+$') { throw "test setup: $Exe --version gave '$exeVer'" }
 $fails = 0
 
 function Keygen([string]$cmdline) {
@@ -43,7 +45,10 @@ function Invoke-WebRequest {
     Copy-Item $src $OutFile
 }
 
-function MakeRelease([string]$dir, [string]$key, [string]$ns = 'jkbase-cli-release', [switch]$Extra) {
+# A release of the real exe: SHA256SUMS naming $ver (none with -NoVersion), signed by $key under
+# $ns; plus the /cli answer advertising $latest.
+function MakeRelease([string]$dir, [string]$key, [string]$ns = 'jkbase-cli-release', [string]$ver = $exeVer,
+    [string]$latest = $exeVer, [switch]$Extra, [switch]$NoVersion) {
     $stage = "$dir\stage"
     New-Item -ItemType Directory -Force $stage | Out-Null
     Copy-Item $Exe "$stage\jkbase.exe"
@@ -53,17 +58,21 @@ function MakeRelease([string]$dir, [string]$key, [string]$ns = 'jkbase-cli-relea
     if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
     Remove-Item -Recurse -Force $stage
     $h = (Get-FileHash -Algorithm SHA256 "$dir\$asset").Hash.ToLowerInvariant()
-    [IO.File]::WriteAllText("$dir\SHA256SUMS", "$h  $asset`n")
+    $head = if ($NoVersion) { '' } else { "# jkbase-cli $ver`n" }
+    [IO.File]::WriteAllText("$dir\SHA256SUMS", "$head$h  $asset`n")
+    [IO.File]::WriteAllText("$dir\cli", "{`"latest`":`"$latest`",`"minimum`":`"0.1.0`"}")
     Remove-Item -Force "$dir\SHA256SUMS.sig" -ErrorAction SilentlyContinue
     Keygen "-q -Y sign -f `"$work\$key`" -n $ns `"$dir\SHA256SUMS`""
 }
 
-function Run([string]$name, [string]$expect, [string]$rel, $sb = $trusted, [string]$path = $env:PATH, [string]$want = '') {
+function Run([string]$name, [string]$expect, [string]$rel, $sb = $trusted, [string]$path = $env:PATH, [string]$want = '',
+    [string]$pin = '') {
     $dir = "$work\dest-$name"
     New-Item -ItemType Directory -Force $dir | Out-Null
     Set-Content "$dir\jkbase.exe" 'old'
     $global:FakeRelease = $rel
     $env:JKBASE_INSTALL_DIR = $dir
+    $env:JKBASE_VERSION = $pin
     $savedPath = $env:PATH
     $env:PATH = $path
     try { $out = (& $sb *>&1 | Out-String); $got = 'ok' }
@@ -85,6 +94,7 @@ function Run([string]$name, [string]$expect, [string]$rel, $sb = $trusted, [stri
 try {
     $r = "$work\rel-good"; MakeRelease $r 'primary'
     Run 'good' 'ok' $r
+    Run 'pinned-version' 'ok' $r -pin $exeVer
 
     $r = "$work\rel-standby"; MakeRelease $r 'standby'
     Run 'signed-by-standby-key' 'ok' $r
@@ -111,12 +121,35 @@ try {
     tar -C "$r\x" -czf "$r\$asset" jkbase.exe
     Run 'tampered-archive' 'fail' $r -want 'checksum mismatch'
 
+    # Rollback: an old, genuinely signed release served as the latest / as a pinned newer version.
+    $r = "$work\rel-old"; MakeRelease $r 'primary' -latest '99.0.0'
+    Run 'rollback-latest' 'fail' $r -want 'refusing an old release'
+    Run 'rollback-pinned' 'fail' $r -pin '99.0.0' -want "signed as $exeVer"
+
+    # Released but jkbase.app not redeployed yet: newer than advertised is fine.
+    $r = "$work\rel-ahead"; MakeRelease $r 'primary' -latest '0.0.1'
+    Run 'newer-than-advertised' 'ok' $r
+
+    $r = "$work\rel-nover"; MakeRelease $r 'primary' -NoVersion
+    Run 'no-version-line' 'fail' $r -want 'names no jkbase-cli version'
+
+    $r = "$work\rel-binver"; MakeRelease $r 'primary' -ver '99.0.0' -latest '99.0.0'
+    Run 'binary-version-mismatch' 'fail' $r -want 'expected jkbase 99.0.0'
+
+    $r = "$work\rel-noapi"; MakeRelease $r 'primary'; Remove-Item "$r\cli"
+    Run 'cli-info-unreachable' 'fail' $r -want "can't reach"
+
     Run 'no-trusted-keys' 'fail' "$work\rel-good" $noKeys -want 'signature verification FAILED'
 
     # System32 has tar.exe but not ssh-keygen (that lives in System32\OpenSSH).
     $sys = [Environment]::SystemDirectory
     if (Test-Path "$sys\ssh-keygen.exe") { throw "test setup: ssh-keygen in $sys" }
     Run 'no-ssh-keygen' 'fail' "$work\rel-good" $trusted "$sys;$PSHOME" -want 'needs ssh-keygen'
+
+    # OpenSSH < 8.1 (Server 2019's inbox 7.7): no -Y.
+    New-Item -ItemType Directory "$work\oldkg" | Out-Null
+    Set-Content "$work\oldkg\ssh-keygen.cmd" "@echo unknown option -- Y 1>&2`r`n@exit /b 1"
+    Run 'old-ssh-keygen' 'fail' "$work\rel-good" $trusted "$work\oldkg;$sys;$PSHOME" -want 'too old'
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 }

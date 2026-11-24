@@ -5,7 +5,9 @@
 # Env: JKBASE_VERSION (e.g. 0.2.0), JKBASE_INSTALL_DIR (default: %LOCALAPPDATA%\jkbase\bin).
 # Before installing, verifies the release's SHA256SUMS.sig (an SSH signature by a jkbase release key,
 # checked with Windows' built-in `ssh-keygen -Y verify`), then the archive against those signed
-# SHA256SUMS; any failure stops the install. Afterwards `jkbase upgrade` updates in place.
+# SHA256SUMS. The version they're signed for must be the one asked for, or (for the latest) no
+# older than what jkbase.app advertises, so an old signed release can't pass as current. Any
+# failure stops the install. Afterwards `jkbase upgrade` updates in place.
 # Wrapped in a script block so nothing (variables, ErrorActionPreference) leaks into the caller's
 # session under `iex`.
 & {
@@ -15,6 +17,7 @@
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
     $repo = 'joeleaver/jkbase'
+    $cliInfo = 'https://api.jkbase.app/cli'
     # Release-signing keys, ssh-keygen allowed_signers format. MUST equal
     # crates/jkbase-cli/release-keys/allowed_signers (jkbase-cli's tests fail if they drift).
     # Rotation: docs/cli-release-signing.md.
@@ -71,17 +74,36 @@ jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5A
         $errTask = $p.StandardError.ReadToEndAsync()
         $outTask = $p.StandardOutput.ReadToEndAsync()
         $sums = [IO.File]::ReadAllBytes("$tmp\SHA256SUMS")
-        $p.StandardInput.BaseStream.Write($sums, 0, $sums.Length)
-        $p.StandardInput.Close()
+        # An ssh-keygen without -Y exits before reading stdin; the exit code below reports that.
+        try { $p.StandardInput.BaseStream.Write($sums, 0, $sums.Length); $p.StandardInput.Close() } catch { }
         $p.WaitForExit()
         $why = ($outTask.Result + $errTask.Result).Trim()
         if ($p.ExitCode -ne 0) {
             if ($why -match 'unknown option|illegal option|usage:') {
-                throw 'jkbase-install: your ssh-keygen is too old to verify signatures (needs OpenSSH 8.1+)'
+                throw ('jkbase-install: your ssh-keygen is too old to verify signatures (needs OpenSSH 8.1+). ' +
+                    'Update it with: winget install Microsoft.OpenSSH.Preview -- or put Git for Windows ssh-keygen first on PATH')
             }
             throw "jkbase-install: release signature verification FAILED - not installing ($why)"
         }
-        Write-Host 'jkbase-install: release signature OK'
+        $signed = (Get-Content "$tmp\SHA256SUMS" | ForEach-Object {
+            $f = $_.Trim() -split '\s+'; if ($f.Count -eq 3 -and $f[0] -eq '#' -and $f[1] -eq 'jkbase-cli') { $f[2] }
+        }) | Select-Object -First 1
+        if ($signed -notmatch '^\d+\.\d+\.\d+$') { throw 'jkbase-install: the signed SHA256SUMS names no jkbase-cli version - not installing' }
+        if ($env:JKBASE_VERSION) {
+            if ($signed -ne $v) { throw "jkbase-install: asked for $v but the release is signed as $signed - not installing" }
+        } else {
+            # Rollback guard, from a second origin: the release host can't make an old (genuinely
+            # signed) build look current unless jkbase.app agrees.
+            try { Invoke-WebRequest -UseBasicParsing $cliInfo -OutFile "$tmp\cli" } catch {
+                throw "jkbase-install: can't reach $cliInfo to confirm the latest version"
+            }
+            $latest = (Get-Content -Raw "$tmp\cli" | ConvertFrom-Json).latest
+            if ($latest -notmatch '^\d+\.\d+\.\d+$') { throw "jkbase-install: unexpected answer from $cliInfo" }
+            if ([version]$signed -lt [version]$latest) {
+                throw "jkbase-install: the release is $signed but $latest is current - refusing an old release"
+            }
+        }
+        Write-Host "jkbase-install: release signature OK (jkbase $signed)"
         Invoke-WebRequest -UseBasicParsing "$base/$asset" -OutFile "$tmp\$asset"
         $want = (Get-Content "$tmp\SHA256SUMS" | ForEach-Object {
             $f = $_.Trim() -split '\s+'; if ($f.Count -eq 2 -and $f[1].TrimStart('*') -eq $asset) { $f[0] }
@@ -93,8 +115,9 @@ jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5A
         # Native commands don't throw on failure under PS 5.1: check exit codes explicitly.
         tar -xzf "$tmp\$asset" -C $tmp jkbase.exe
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$tmp\jkbase.exe")) { throw 'jkbase-install: could not extract jkbase.exe' }
-        & "$tmp\jkbase.exe" --version | Out-Null
+        $got = & "$tmp\jkbase.exe" --version
         if ($LASTEXITCODE -ne 0) { throw "jkbase-install: the downloaded binary doesn't run here" }
+        if ("$got".Trim() -ne "jkbase $signed") { throw "jkbase-install: the downloaded binary reports '$got', expected jkbase $signed" }
 
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         $dest = Join-Path $dir 'jkbase.exe'

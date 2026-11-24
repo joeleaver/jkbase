@@ -60,11 +60,6 @@ pub fn verify_with(keys: &[PublicKey], msg: &[u8], sig: &[u8]) -> Result<()> {
     bail!("SHA256SUMS.sig is not a valid signature by a jkbase release key — refusing this release")
 }
 
-/// Verify a release's `SHA256SUMS` against the compiled-in keys.
-pub fn verify_sums(sums: &[u8], sig: &[u8]) -> Result<()> {
-    verify_with(&parse_allowed_signers(ALLOWED_SIGNERS)?, sums, sig)
-}
-
 #[cfg(test)]
 #[path = "release_sig_tests.rs"]
 mod tests;

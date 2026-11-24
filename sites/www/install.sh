@@ -8,11 +8,14 @@
 #   JKBASE_INSTALL_DIR  where to put `jkbase` (default: ~/.local/bin)
 #
 # Before installing, verifies the release's SHA256SUMS.sig (an SSH signature by a jkbase release
-# key, checked with `ssh-keygen -Y verify`), then the archive against those signed SHA256SUMS.
-# Any failure stops the install. Once installed, `jkbase upgrade` updates in place.
+# key, checked with `ssh-keygen -Y verify`), then the archive against those signed SHA256SUMS. The
+# version they're signed for must be the one asked for, or (for the latest) no older than what
+# jkbase.app advertises, so an old signed release can't be passed off as current. Any failure
+# stops the install. Once installed, `jkbase upgrade` updates in place.
 set -eu
 
 REPO="joeleaver/jkbase"
+CLI_INFO="https://api.jkbase.app/cli"
 # Release-signing keys, ssh-keygen allowed_signers format. MUST equal
 # crates/jkbase-cli/release-keys/allowed_signers (jkbase-cli's tests fail if they drift).
 # Rotation: docs/cli-release-signing.md.
@@ -25,8 +28,15 @@ DIR="${JKBASE_INSTALL_DIR:-$HOME/.local/bin}"
 say() { printf 'jkbase-install: %s\n' "$*"; }
 die() { printf 'jkbase-install: error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "needs '$1'"; }
+# ver_ge A B: dotted version A >= B.
+ver_ge() {
+    awk -v a="$1" -v b="$2" 'BEGIN { split(a, x, "."); split(b, y, ".")
+        for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+        exit 0 }'
+}
+isver() { case "$1" in "" | *[!0-9.]* | *..* | .* | *.) return 1 ;; *.*.*.*) return 1 ;; *.*.*) return 0 ;; *) return 1 ;; esac; }
 
-need uname; need tar; need mkdir; need mktemp
+need uname; need tar; need mkdir; need mktemp; need awk; need sed
 command -v ssh-keygen >/dev/null 2>&1 || die "needs ssh-keygen (OpenSSH 8.1+) to verify the release \
 signature — install it (Debian/Ubuntu: apt-get install openssh-client; Alpine: apk add openssh-keygen; \
 Fedora: dnf install openssh) and re-run"
@@ -94,7 +104,19 @@ if ! out="$(ssh-keygen -Y verify -f "$tmp/allowed_signers" -I jkbase-release -n 
     esac
     die "release signature verification FAILED — not installing ($out)"
 fi
-say "release signature OK"
+signed="$(awk '$1 == "#" && $2 == "jkbase-cli" { print $3; exit }' "$tmp/SHA256SUMS")"
+isver "$signed" || die "the signed SHA256SUMS names no jkbase-cli version — not installing"
+if [ -n "${JKBASE_VERSION:-}" ]; then
+    [ "$signed" = "$v" ] || die "asked for $v but the release is signed as $signed — not installing"
+else
+    # Rollback guard, from a second origin: the release host can't make an old (genuinely
+    # signed) build look current unless jkbase.app agrees.
+    get "$CLI_INFO" "$tmp/cli" || die "can't reach $CLI_INFO to confirm the latest version"
+    latest="$(sed -n 's/.*"latest"[[:space:]]*:[[:space:]]*"\([0-9.]*\)".*/\1/p' "$tmp/cli")"
+    isver "$latest" || die "unexpected answer from $CLI_INFO"
+    ver_ge "$signed" "$latest" || die "the release is $signed but $latest is current — refusing an old release"
+fi
+say "release signature OK (jkbase $signed)"
 get "$base/$asset" "$tmp/$asset" || die "no $target build in that release"
 want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp/SHA256SUMS")"
 [ -n "$want" ] || die "SHA256SUMS has no entry for $asset"
@@ -110,7 +132,8 @@ mkdir -p "$DIR"
 staged="$(mktemp "$DIR/.jkbase.XXXXXX")"
 cp "$tmp/jkbase" "$staged"
 chmod 755 "$staged"
-"$staged" --version >/dev/null 2>&1 || die "the downloaded binary doesn't run here"
+got="$("$staged" --version 2>/dev/null)" || die "the downloaded binary doesn't run here"
+[ "$got" = "jkbase $signed" ] || die "the downloaded binary reports '$got', expected jkbase $signed"
 mv -f "$staged" "$DIR/jkbase"
 staged=""
 say "installed $("$DIR/jkbase" --version) to $DIR/jkbase"

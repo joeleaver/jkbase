@@ -1,9 +1,10 @@
 # CLI release signing
 
 Every `cli-v*` GitHub Release carries `SHA256SUMS.sig`, an **SSH signature** (`ssh-keygen -Y
-sign`, Ed25519, namespace `jkbase-cli-release`) over the release's `SHA256SUMS`. All three
-installers verify it **fail-closed**, before reading a line of `SHA256SUMS`, and then check the
-archive against those signed bytes:
+sign`, Ed25519, namespace `jkbase-cli-release`) over the release's `SHA256SUMS`. That file's first
+line, `# jkbase-cli <version>`, is part of the signed bytes (`sha256sum -c` skips it). All three
+installers verify the signature **fail-closed**, before reading a line of `SHA256SUMS`. They then
+check the signed version, then the archive against those signed bytes:
 
 | Installer | Verifier | Trust root |
 |---|---|---|
@@ -23,13 +24,30 @@ has to verify with a tool the user already has, and minisign is installed almost
 **What it protects.** Before this, `SHA256SUMS` came from the same place as the archives, so
 anyone able to publish a release on the repo (a leaked token, a compromised workflow or account)
 could ship a binary. Now that person also needs the signing key, which lives only in the
-`cli-release` environment's `CLI_SIGNING_KEY` secret. That environment's deployment policy admits
-only `cli-v*` tags, so branch and PR workflows can't read the key.
+`cli-release` environment's `CLI_SIGNING_KEY` secret.
 
-**What it doesn't.**
-- *Rollback.* An old, genuinely signed release re-uploaded under a newer tag passes signature
-  checks. `jkbase upgrade` still refuses it, because the binary must report the version it asked
-  for. `install.sh` with no pinned version would install that older genuine build.
+Two gates guard that environment:
+- **Deployment policy:** only `cli-v*` tags may deploy to it, so branch and PR runs never see the
+  key.
+- **Required reviewer:** a person must approve every run that would read it.
+
+The second gate is load-bearing. A tag runs the workflow file *at that tag*, so anyone who can
+push a commit and a `cli-v*` tag controls the job that reads the key. The tag pattern alone
+doesn't stop them; an approval click does, because an attacker's run sits waiting for one. A tag
+ruleset narrows who can create `cli-v*` tags at all. The signing job pins its actions to commit
+SHAs, so a moved action tag can't run code beside the key.
+
+**Rollback.** An old, genuinely signed release served in place of a newer one also passes the
+signature check, so the signed version line is checked as well:
+- *A pinned version* (`JKBASE_VERSION`, `jkbase upgrade` with or without `--version`): it must
+  equal the signed version.
+- *Latest* (install scripts): the signed version must be no older than `latest` from
+  `https://api.jkbase.app/cli`, a second origin that a release-host attacker doesn't control. If
+  that endpoint can't be reached, the install fails closed. "No older" rather than "equal"
+  because a release is published before the server that advertises it is deployed.
+- *Every installer* also requires the new binary's `--version` to match the signed version.
+
+**What it doesn't protect.**
 - *Releases before 0.2.1* have no signature, so the scripts and `jkbase upgrade` refuse them
   (`JKBASE_VERSION=0.2.0` / `--version 0.2.0` no longer work).
 - *Forks.* `JKBASE_UPDATE_REPO` still picks the repo, but its releases must be signed by a key in
@@ -42,8 +60,9 @@ Two keys are trusted:
 - **primary**: signs releases. Its private half exists only in the `CLI_SIGNING_KEY` secret
   (unencrypted, since CI can't type a passphrase).
 - **standby**: never used until a rotation. Its private half is kept offline, passphrase-
-  protected (password manager). Because every shipped CLI and script already trusts it, a
-  rotation never strands an installed CLI.
+  protected (password manager). Every shipped CLI and script already trusts it, so a single
+  rotation never strands an installed CLI. A CLI that skipped a whole rotation can be stranded;
+  see the caveat under Rotation.
 
 Every line of `allowed_signers` has exactly this shape (the CLI rejects anything else):
 
@@ -64,6 +83,25 @@ d="$(mktemp -d)" && cd "$d" \
 && gh secret set CLI_SIGNING_KEY --repo joeleaver/jkbase --env cli-release < primary \
 && cat primary.pub standby.pub
 ```
+
+Then lock the environment down: add a required reviewer, and limit who can create `cli-v*` tags.
+
+```bash
+gh api -X PUT repos/joeleaver/jkbase/environments/cli-release \
+  -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true' \
+  -F 'reviewers[][type]=User' -F "reviewers[][id]=$(gh api user --jq .id)"
+gh api -X POST repos/joeleaver/jkbase/rulesets --input - <<'JSON'
+{"name": "cli-release tags", "target": "tag", "enforcement": "active",
+ "conditions": {"ref_name": {"include": ["refs/tags/cli-v*"], "exclude": []}},
+ "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}],
+ "bypass_actors": [{"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}]}
+JSON
+```
+
+Each release run then waits for **Review deployments → Approve** on the Actions run page. Only
+approve runs you started yourself. A token that can itself approve deployments (an admin-scoped token, via the
+API) could also clear this gate, so keep long-lived admin tokens out of CI and off shared
+machines.
 
 Then:
 
@@ -96,6 +134,13 @@ that trusts it has shipped.** The standby key satisfies this by construction.
 - Installed CLIs keep trusting the compromised key until they upgrade. There is no revocation
   channel, so say so in the release notes and ask users to `jkbase upgrade`.
 
+**Caveat: skipped rotations.** A CLI trusts only the keys of the release it came from. Take a CLI
+from before rotation 1 (trusting P0 + S0). Once rotation 2 has dropped S0, `jkbase upgrade` to
+the latest fails closed for that CLI. Its signature error says to reinstall with the install
+script, which always carries the current keys. Alternatively, `jkbase upgrade --version <a
+release signed between the rotations>` steps through. So keep rotations rare, and name the last
+release of each key era in its release notes.
+
 **Both keys are compromised or lost:** generate a new pair and replace both lines. Installed
 CLIs can't verify anything signed by the new keys, so `jkbase upgrade` fails closed for them and
 users must reinstall with `install.sh` / `install.ps1`. Say this in the release notes.
@@ -111,10 +156,15 @@ ssh-keygen -Y verify -f crates/jkbase-cli/release-keys/allowed_signers \
 
 ## Tests
 
-- `cargo test -p jkbase-cli release_sig` covers accept/reject (tampered, wrong key, wrong
-  namespace, garbage, no keys), strict `allowed_signers` parsing, interop with real
-  `ssh-keygen` in both directions, and the scripts embedding the same keys.
-- `sh sites/www/tests/install_sh_test.sh` runs `install.sh` against a fake signed release (Linux
-  and macOS in CI).
+- `cargo test -p jkbase-cli` covers:
+  - accept/reject: tampered, wrong key, wrong namespace, garbage, no keys;
+  - strict `allowed_signers` parsing;
+  - interop with real `ssh-keygen`, both directions;
+  - the scripts embedding the same keys;
+  - `upgrade`'s signed-digest path, including the version binding.
+- `sh sites/www/tests/install_sh_test.sh` runs `install.sh` against a fake signed release, in CI on
+  Linux and macOS. On top of the signature cases it covers rollback, a missing version line, a
+  binary version mismatch, an unreachable `/cli`, missing or too-old `ssh-keygen`, and the
+  `wget` path.
 - `sites/www/tests/install_ps1_test.ps1 -Exe <jkbase.exe>` runs the same cases for `install.ps1`
   (Windows CI).
