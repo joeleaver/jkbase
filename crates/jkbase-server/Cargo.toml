@@ -43,6 +43,8 @@ globset = "0.4"
 tower = { workspace = true, features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = { workspace = true }
+# TCP keepalive on the host→agent DB socket (a dead VM must not pin a long admin pass).
+socket2 = "0.6"
 futures-util = { workspace = true }
 # SO_PEERCRED on the Firecracker api-sock at VM re-adoption time (binds the socket probe to fc_pid).
 libc = "0.2"
