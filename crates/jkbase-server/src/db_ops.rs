@@ -57,6 +57,9 @@ pub(crate) async fn connect_agent_db_upgrade(
     let stream = tokio::net::TcpStream::connect((vm_ip, 80u16))
         .await
         .context("connect agent")?;
+    socket2::SockRef::from(&stream)
+        .set_tcp_keepalive(&AGENT_KEEPALIVE)
+        .context("agent keepalive")?;
     let io = hyper_util::rt::TokioIo::new(stream);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -132,8 +135,13 @@ const MAX_DB_QUERY_RESP_BYTES: usize = 16 * 1024 * 1024;
 const DB_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Send one PLAIN (non-upgrade) request to the agent's eth0 DB-proxy seam and read the bounded
-/// JSON response. The DB stays loopback-only; the agent forwards only to rhypedb's OPEN plane
-/// (`/query|/schema|/status`, never `/admin/*`). Returns the engine's verbatim status + body.
+/// JSON response. The DB stays loopback-only; the agent forwards only on its own hard-coded engine
+/// paths (the open `/query|/schema|/status` plane, plus the single admin `rewrite-covers` route it
+/// authorizes itself). Returns the agent's status + body.
+///
+/// The socket carries TCP keepalive ([`AGENT_KEEPALIVE`]): a VM that dies or is torn down without
+/// a FIN/RST surfaces as an error within about a minute instead of pinning the caller (and, for a
+/// long admin pass, its keep-warm hold and single-flight claim) until the outer deadline.
 pub(crate) async fn agent_db_request(
     vm_ip: &str,
     path: &str,
@@ -174,6 +182,14 @@ pub(crate) async fn agent_db_request(
         body: collected.to_bytes().to_vec(),
     })
 }
+
+/// Keepalive on the host→agent socket: first probe after 30s idle, then every 10s, dead after 3
+/// misses. A live agent answers probes in-kernel even while the engine is busy for minutes, so
+/// this never cuts a slow pass short — only a dead peer.
+const AGENT_KEEPALIVE: socket2::TcpKeepalive = socket2::TcpKeepalive::new()
+    .with_time(Duration::from_secs(30))
+    .with_interval(Duration::from_secs(10))
+    .with_retries(3);
 
 /// Everything the synchronous console DB ops need (wired to `state.db_query_callback`). All
 /// handles are cheap Arc clones.
@@ -240,23 +256,42 @@ fn db_splice_secret(store: &Store, project_id: &str) -> Result<String, String> {
 }
 
 /// Outer deadline on one `rewrite-covers` pass (wake + the whole engine pass). The engine works in
-/// batches and is safe to interrupt, so on expiry the host just drops the agent connection: the
-/// engine finishes or stops on its own and a rerun redoes only what is still stale. Long enough
-/// for a large store, bounded so a wedged engine can't pin the keep-warm hold forever.
+/// batches and is safe to interrupt, and keeps working after the host drops the connection — so
+/// on expiry the host only stops WAITING: the agent's own single-flight still refuses a rerun
+/// until the engine answers, and a later rerun redoes only what is still stale. Long enough for
+/// a large store, bounded so a wedged engine can't pin the keep-warm hold forever.
 const DB_REWRITE_COVERS_DEADLINE: Duration = Duration::from_secs(60 * 60);
 /// Synthetic akid for the keep-warm hold in the relay registry. Never a real DB key, so a key
 /// revocation (`cancel_key`) never targets it; `cancel_project` / `cancel_all` still do.
 const DB_ADMIN_HOLD_AKID: &str = "__db_admin_op__";
 
 /// The owner's `rewrite-covers` pass ([`DbQueryOp::RewriteCovers`]). Bounded on every axis:
-/// single-flight per project (a second call while one runs is a 409, before any wake), one
-/// keep-warm hold in the relay registry registered BEFORE the wake (so a project delete during
-/// the wake aborts it — [R5]), and [`DB_REWRITE_COVERS_DEADLINE`] over the whole thing. The
-/// project's OWN splice secret + VM are the only target; the agent authorizes the hard-coded
-/// admin call with the in-guest token.
+/// single-flight per project (a second call while one runs is a 409, before any wake; the agent
+/// enforces the same per VM, covering a pass the host stopped waiting for), one keep-warm hold in
+/// the relay registry registered BEFORE the wake (so a project delete during the wake aborts it —
+/// [R5]), and [`DB_REWRITE_COVERS_DEADLINE`] over the whole thing. The project's OWN splice
+/// secret + VM are the only target; the agent authorizes the hard-coded admin call with the
+/// in-guest token.
+///
+/// The pass runs in a DETACHED task: the caller hanging up (Ctrl-C, a dropped console tab) must
+/// not release the hold — the VM would hibernate mid-pass — or the guard, while the engine is
+/// still working. Both last until the agent answers, the deadline passes, or the project is
+/// cancelled. The hold keeps the DB VM warm, so its warm time bills to the tenant like any other
+/// DB connection: the owner asked for the work.
 ///
 /// [`DbQueryOp::RewriteCovers`]: jkbase_control::api::DbQueryOp::RewriteCovers
 async fn do_db_rewrite_covers(
+    ctx: &DbQueryCtx,
+    project_id: &str,
+) -> Result<jkbase_control::api::DbQueryResult, String> {
+    let (ctx, project_id) = (ctx.clone(), project_id.to_string());
+    tokio::spawn(async move { rewrite_covers_pass(&ctx, &project_id).await })
+        .await
+        .map_err(|e| format!("rewrite-covers task failed: {e}"))?
+}
+
+/// The body of [`do_db_rewrite_covers`], run detached from the caller.
+async fn rewrite_covers_pass(
     ctx: &DbQueryCtx,
     project_id: &str,
 ) -> Result<jkbase_control::api::DbQueryResult, String> {
@@ -305,9 +340,10 @@ async fn do_db_rewrite_covers(
 }
 
 /// Map the agent's answer for the operator. The engine's own answer (200 with `ok` true/false +
-/// its counters, or its error status) passes through verbatim. A 404 can only mean the VM's agent
-/// has no such endpoint (a VM booted before this shipped) or no admin token baked — the host
-/// presented the project's current splice secret — so say how to fix it instead of a bare 404.
+/// its counters, or its error status) passes through verbatim, as do the agent's own refusals
+/// (409 while a pass runs, 501 for an engine without the route). A 404 can only come from the
+/// agent itself — no such endpoint (a VM booted before this shipped) or no admin token baked; the
+/// host presented the project's current splice secret — so say how to fix it.
 fn rewrite_covers_result(
     res: jkbase_control::api::DbQueryResult,
 ) -> jkbase_control::api::DbQueryResult {
