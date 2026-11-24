@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = { workspace = true }
 rustls-pemfile = { workspace = true }
+# `jkbase upgrade`: verify SHA256SUMS.sig (SSH signature, Ed25519) — see commands/release_sig.rs.
+ssh-key = { version = "0.6.7", default-features = false, features = ["ed25519", "std"] }
 
 [dev-dependencies]
 # The reach-plane sidecar's integration test stands up a real local rustls server

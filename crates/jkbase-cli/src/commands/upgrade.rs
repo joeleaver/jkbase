@@ -1,12 +1,13 @@
 //! `jkbase upgrade` — replace this binary with a published CLI release.
 //!
 //! Releases are GitHub Releases tagged `cli-v<semver>` (`.github/workflows/release.yml`), one
-//! `jkbase-<target>.tar.gz` per target plus a `SHA256SUMS`. Trust is the same as
-//! `install.sh`: TLS to github.com, then the archive must hash to its `SHA256SUMS` line (integrity
-//! against a truncated/corrupted download, NOT a signature — anyone who can publish a release on
-//! the repo can ship a binary). The new binary must report the expected version from `--version`
+//! `jkbase-<target>.tar.gz` per target plus `SHA256SUMS` and its signature `SHA256SUMS.sig`.
+//! Trust, same as `install.sh`: `SHA256SUMS.sig` must verify against a release key compiled into
+//! this binary (`release_sig`, fail-closed), THEN the archive must hash to its line in those exact
+//! signed bytes. So a release someone uploads without the CI signing key is refused, not just a
+//! corrupted download. The new binary must also report the expected version from `--version`
 //! before it is renamed over the running one, so a wrong-arch or broken build never replaces a
-//! working CLI.
+//! working CLI, and an old signed release re-uploaded under a newer tag is refused.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use jkbase_common::cli_version::{self, CLI_VERSION};
 use sha2::{Digest, Sha256};
+
+use super::release_sig;
 
 /// This binary's target triple (build.rs), naming its release asset.
 pub const TARGET: &str = env!("JKBASE_TARGET");
@@ -38,7 +41,9 @@ pub struct UpgradeArgs {
     force: bool,
 }
 
-/// `owner/name`, from `JKBASE_UPDATE_REPO` (forks, self-hosters) or ours.
+/// `owner/name`, from `JKBASE_UPDATE_REPO` (forks, self-hosters) or ours. Its releases must still be
+/// signed by a key in this binary's trust root: a fork ships a CLI built with its own
+/// `release-keys/allowed_signers`.
 fn repo() -> Result<String> {
     let r = std::env::var("JKBASE_UPDATE_REPO").unwrap_or_else(|_| DEFAULT_REPO.to_string());
     let ok = |s: &str| {
@@ -241,8 +246,14 @@ pub async fn run(args: UpgradeArgs) -> Result<()> {
     let asset = format!("jkbase-{TARGET}.tar.gz");
     let base = format!("https://github.com/{repo}/releases/download/{TAG_PREFIX}{version}");
     println!("Downloading jkbase {version} for {TARGET}...");
-    let sums = String::from_utf8(fetch(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?)
-        .context("SHA256SUMS is not text")?;
+    let sums = fetch(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
+    let sig = fetch(&client, &format!("{base}/SHA256SUMS.sig"), release_sig::MAX_SIG)
+        .await
+        .with_context(|| format!("release {TAG_PREFIX}{version} has no signature"))?;
+    // Verify before reading a single line of it: everything below trusts only these signed bytes.
+    release_sig::verify_sums(&sums, &sig)
+        .with_context(|| format!("release {TAG_PREFIX}{version} failed signature verification"))?;
+    let sums = String::from_utf8(sums).context("SHA256SUMS is not text")?;
     let want = expected_sha256(&sums, &asset).with_context(|| {
         format!("no {TARGET} build in release {TAG_PREFIX}{version}")
     })?;
