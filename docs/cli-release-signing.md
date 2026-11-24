@@ -26,16 +26,26 @@ anyone able to publish a release on the repo (a leaked token, a compromised work
 could ship a binary. Now that person also needs the signing key, which lives only in the
 `cli-release` environment's `CLI_SIGNING_KEY` secret.
 
-Two gates guard that environment:
-- **Deployment policy:** only `cli-v*` tags may deploy to it, so branch and PR runs never see the
-  key.
-- **Required reviewer:** a person must approve every run that would read it.
+Only `cli-v*` tags may deploy to that environment, so branch and PR runs never see the key. The
+signing job pins its actions to commit SHAs, so a moved action tag can't run code beside the key.
 
-The second gate is load-bearing. A tag runs the workflow file *at that tag*, so anyone who can
-push a commit and a `cli-v*` tag controls the job that reads the key. The tag pattern alone
-doesn't stop them; an approval click does, because an attacker's run sits waiting for one. A tag
-ruleset narrows who can create `cli-v*` tags at all. The signing job pins its actions to commit
-SHAs, so a moved action tag can't run code beside the key.
+**Accepted trust decision (2026-11-24): anyone with write access can obtain the signing key.** A
+tag runs the workflow file *at that tag*. Anyone who can push a commit and a `cli-v*` tag
+controls the job that reads `CLI_SIGNING_KEY`, so they can exfiltrate it or sign whatever they
+like. The tag pattern doesn't prevent this.
+
+The way to close the gap is a required reviewer on the environment plus a `cli-v*` tag ruleset
+(commands below). Joe chose not to add them. The repo's write collaborators (Joe and lost-conn)
+are trusted to push releases, and on a free-tier personal repo a non-owner can't be made an admin
+or a ruleset bypass, so a ruleset would lock lost-conn out of releasing.
+
+So the signature protects against anyone who can upload release assets but can't push to the
+repo, and against the download path. It does not protect against a write collaborator, or a
+leaked token carrying write access.
+
+**Revisit this whenever the collaborator set changes** (someone gains or loses write access, or a
+write token may have leaked). Either apply the lockdown below, or treat the key as exposed and
+rotate to the standby (see Rotation).
 
 **Rollback.** An old, genuinely signed release served in place of a newer one also passes the
 signature check, so the signed version line is checked as well:
@@ -84,7 +94,8 @@ d="$(mktemp -d)" && cd "$d" \
 && cat primary.pub standby.pub
 ```
 
-Then lock the environment down: add a required reviewer, and limit who can create `cli-v*` tags.
+*Not applied (see the accepted trust decision above).* To close the write-access gap, add a
+required reviewer to the environment and limit who can create `cli-v*` tags:
 
 ```bash
 gh api -X PUT repos/joeleaver/jkbase/environments/cli-release \
