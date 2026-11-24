@@ -52,6 +52,10 @@ struct Entry {
     id: u64,
     /// Which DB key authorized this relay — so a key revocation drops exactly its relays.
     akid: String,
+    /// The owning tenant this relay is charged to (`None` = an internal / maintenance
+    /// registration: the app→DB leg, an owner's admin op). Kept per entry so the warm-VM
+    /// gauge is exact when charged and uncharged relays share a project.
+    tenant: Option<String>,
     cancel: CancellationToken,
 }
 
@@ -127,15 +131,16 @@ impl DbRelayRegistry {
             if count >= per_project_max {
                 return Err(RelayRejected::PerProject);
             }
-            // Per-tenant warm-VM cap — only when this is the project's FIRST relay
-            // (count == 0), i.e. it's about to become warm. An owned project already
-            // warm (count > 0) is already in `by_tenant` and adds no VM.
-            let makes_project_warm = count == 0;
-            if let Some(tid) = tenant_id
-                && makes_project_warm
-            {
-                let warm = inner.by_tenant.get(tid).map(|s| s.len()).unwrap_or(0);
-                if warm >= per_tenant_max {
+            // Per-tenant warm-VM cap — only when this relay would newly CHARGE the project to
+            // the tenant, i.e. the project isn't already in the tenant's warm set. Keyed on the
+            // tenant's own set, NOT on "the project's first relay": an uncharged registration
+            // (`tenant_id == None` — the app→DB leg, an admin op's keep-warm hold) can be the
+            // first entry, and keying on `count == 0` would let a tenant relay ride in behind it
+            // uncounted and then hold the VM warm past it (a warm-VM quota bypass).
+            if let Some(tid) = tenant_id {
+                let charged = inner.by_tenant.get(tid);
+                let already_charged = charged.is_some_and(|s| s.contains(project_id));
+                if !already_charged && charged.map(|s| s.len()).unwrap_or(0) >= per_tenant_max {
                     return Err(RelayRejected::PerTenant);
                 }
             }
@@ -159,6 +164,7 @@ impl DbRelayRegistry {
                 .push(Entry {
                     id,
                     akid: akid.to_string(),
+                    tenant: tenant_id.map(str::to_string),
                     cancel: cancel.clone(),
                 });
             // Track the newly-warm project against its tenant (idempotent for a second
@@ -297,17 +303,23 @@ pub struct RelayGuard {
 impl Drop for RelayGuard {
     fn drop(&mut self) {
         let mut inner = self.registry.inner.lock().unwrap();
-        let mut project_went_cold = false;
+        // Does the tenant still have a relay CHARGED to it on this project? Uncharged entries
+        // (leg / admin hold) don't count: they never put the project in the tenant's set, so
+        // they must not keep it there either (else it would stay charged after the tenant's
+        // last relay, until the uncharged one ended — or forever, since its own drop carries
+        // no tenant to clean up with).
+        let mut tenant_still_charged = false;
         if let Some(entries) = inner.by_project.get_mut(&self.project_id) {
             entries.retain(|e| e.id != self.id);
+            tenant_still_charged = self.tenant_id.is_some()
+                && entries.iter().any(|e| e.tenant == self.tenant_id);
             if entries.is_empty() {
                 inner.by_project.remove(&self.project_id);
-                project_went_cold = true;
             }
         }
-        // Only when the project lost its LAST relay does it leave the tenant's warm
-        // set (the VM may then hibernate); a still-live sibling relay keeps it warm.
-        if project_went_cold
+        // Only when the tenant lost its LAST charged relay on the project does the project
+        // leave the tenant's warm set; a still-live sibling relay of theirs keeps it counted.
+        if !tenant_still_charged
             && let Some(tid) = self.tenant_id.as_deref()
             && let Some(set) = inner.by_tenant.get_mut(tid)
         {
@@ -356,6 +368,40 @@ mod tests {
         // Empty project key is pruned, and the tenant frees its warm slot.
         assert_eq!(reg.total(), 0);
         assert_eq!(reg.warm_projects_for_tenant("t"), 0);
+    }
+
+    /// An uncharged registration (app→DB leg / admin keep-warm hold) taking a project's first
+    /// slot must not let a tenant relay ride in behind it past the warm-VM quota.
+    #[test]
+    fn uncharged_first_entry_does_not_bypass_the_warm_vm_quota() {
+        let reg = DbRelayRegistry::new();
+        let (_a, _) = reg.try_register("a", Some("t"), "k", MAX, 1, RMAX).unwrap();
+        let (_hold, _) = reg.try_register("b", None, "__hold__", MAX, 0, 0).unwrap();
+        assert_eq!(
+            reg.try_register("b", Some("t"), "k", MAX, 1, RMAX).err(),
+            Some(RelayRejected::PerTenant),
+            "the tenant already holds its 1 warm VM; `b` would be a second"
+        );
+        assert_eq!(reg.warm_projects_for_tenant("t"), 1);
+    }
+
+    /// The tenant's warm set tracks ITS charged relays exactly: it is released when the tenant's
+    /// last relay on a project ends, even while an uncharged entry keeps the project's
+    /// `conn_count` up — and never leaks when the uncharged entry ends last.
+    #[test]
+    fn warm_set_is_exact_when_charged_and_uncharged_relays_share_a_project() {
+        let reg = DbRelayRegistry::new();
+        let (hold, _) = reg.try_register("p", None, "__hold__", MAX, 0, 0).unwrap();
+        let (relay, _) = reg.try_register("p", Some("t"), "k", MAX, 1, RMAX).unwrap();
+        assert_eq!(reg.warm_projects_for_tenant("t"), 1);
+        drop(relay);
+        assert_eq!(reg.conn_count("p"), 1, "the hold still keeps the VM warm");
+        assert_eq!(reg.warm_projects_for_tenant("t"), 0, "but no longer charges the tenant");
+        // So the tenant's quota slot is free for another project.
+        let (_other, _) = reg.try_register("q", Some("t"), "k", MAX, 1, RMAX).unwrap();
+        drop(hold);
+        assert_eq!(reg.conn_count("p"), 0);
+        assert_eq!(reg.warm_projects_for_tenant("t"), 1, "only `q` is charged");
     }
 
     #[test]
