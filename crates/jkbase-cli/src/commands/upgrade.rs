@@ -143,7 +143,7 @@ fn signed_sha256(
     asset: &str,
 ) -> Result<String> {
     release_sig::verify_with(keys, sums, sig).context(
-        "if this CLI is several key rotations old, reinstall: \
+        "if you haven't upgraded jkbase in a long time (it may predate a key rotation), reinstall: \
          curl -fsSL https://jkbase.app/install.sh | sh (Windows: irm https://jkbase.app/install.ps1 | iex)",
     )?;
     let sums = std::str::from_utf8(sums).context("SHA256SUMS is not text")?;

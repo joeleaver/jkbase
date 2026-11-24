@@ -77,7 +77,7 @@ function Run([string]$name, [string]$expect, [string]$rel, $sb = $trusted, [stri
     $env:PATH = $path
     try { $out = (& $sb *>&1 | Out-String); $got = 'ok' }
     catch { $out = $_.Exception.Message; $got = 'fail' }
-    finally { $env:PATH = $savedPath }
+    finally { $env:PATH = $savedPath; Remove-Item Env:JKBASE_VERSION, Env:JKBASE_INSTALL_DIR -ErrorAction SilentlyContinue }
     $problem = $null
     if ($got -ne $expect) { $problem = "expected $expect, got $got" }
     elseif ($expect -eq 'ok') {
