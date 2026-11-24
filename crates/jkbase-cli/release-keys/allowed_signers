@@ -3,3 +3,5 @@
 # allowed_signers format, one Ed25519 key per line, every line exactly:
 #   jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 <base64> <comment>
 # A release verifies if ANY listed key signed its SHA256SUMS. Rotation: docs/cli-release-signing.md.
+jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIltN+xCwUnnTEwHjfpSXksIoOKqAq/mvXsuR79EMiG5 jkbase-cli-release-primary
+jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGXxp2r84eJ1MlJHvBoyE9/FMFR9U71zYXqP63fpcBW0 jkbase-cli-release-standby

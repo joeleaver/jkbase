@@ -17,6 +17,8 @@ REPO="joeleaver/jkbase"
 # crates/jkbase-cli/release-keys/allowed_signers (jkbase-cli's tests fail if they drift).
 # Rotation: docs/cli-release-signing.md.
 ALLOWED_SIGNERS='
+jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIltN+xCwUnnTEwHjfpSXksIoOKqAq/mvXsuR79EMiG5 jkbase-cli-release-primary
+jkbase-release namespaces="jkbase-cli-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGXxp2r84eJ1MlJHvBoyE9/FMFR9U71zYXqP63fpcBW0 jkbase-cli-release-standby
 '
 DIR="${JKBASE_INSTALL_DIR:-$HOME/.local/bin}"
 
