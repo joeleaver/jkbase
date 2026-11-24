@@ -174,13 +174,41 @@ sleep 3
 sudo systemctl status jkbase --no-pager | head -10
 
 echo ""
-echo "Waiting for API..."
-for i in $(seq 1 30); do
+# The control API on :9090 opens only AFTER VM re-adoption finishes (~10 s per surviving
+# tenant VM; 7 VMs ≈ 60-90 s on prod), so a fixed 30 s wait gave up too early and the site
+# deploys below ran against a dead API. Wait scaled by progress: the deadline slides while the
+# journal keeps producing new lines (re-adoption logs as it goes), bounded by an idle limit
+# and a hard cap. A dead service or an expired wait aborts the deploy — never fall through.
+API_IDLE_LIMIT=180   # seconds with no new journal output before giving up
+API_HARD_CAP=600     # absolute ceiling, whatever the journal says
+echo ""
+echo "Waiting for API (idle limit ${API_IDLE_LIMIT}s, hard cap ${API_HARD_CAP}s)..."
+start=$(date +%s)
+last_progress=$start
+last_line=$(sudo journalctl -u jkbase -n 1 --no-pager -o cat 2>/dev/null || true)
+while :; do
     if curl -sf http://127.0.0.1:9090/health > /dev/null 2>&1; then
-        echo "API ready."
+        echo "API ready after $(( $(date +%s) - start ))s."
         break
     fi
-    sleep 1
+    now=$(date +%s)
+    if ! sudo systemctl is-active --quiet jkbase; then
+        echo "ERROR: jkbase service is not active; API will not come up." >&2
+        sudo journalctl -u jkbase -n 30 --no-pager >&2 || true
+        exit 1
+    fi
+    line=$(sudo journalctl -u jkbase -n 1 --no-pager -o cat 2>/dev/null || true)
+    if [ "$line" != "$last_line" ]; then
+        last_line=$line
+        last_progress=$now
+    fi
+    if [ $(( now - last_progress )) -ge "$API_IDLE_LIMIT" ] || [ $(( now - start )) -ge "$API_HARD_CAP" ]; then
+        echo "ERROR: API did not come up on :9090 after $(( now - start ))s (no log progress for $(( now - last_progress ))s)." >&2
+        sudo journalctl -u jkbase -n 30 --no-pager >&2 || true
+        exit 1
+    fi
+    echo "  ...waiting ($(( now - start ))s): ${last_line:0:120}"
+    sleep 5
 done
 
 # Deploy www and console if credentials exist
