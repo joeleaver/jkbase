@@ -224,7 +224,10 @@ targets = ["wasm32-unknown-unknown"]
 It's installed from the official Rust dist server during the build's network-up fetch phase and
 cached per project (the first build on a new version downloads it once). `channel`, `targets` and
 `components` are honoured (the `minimal` profile is always used); a custom `path` toolchain is
-refused. With no pin, the builder's baked toolchain is used.
+refused, as is anything older than Rust 1.70. A `-x86_64-unknown-linux-gnu` host suffix is
+accepted. With no pin, the builder's baked toolchain is used. A floating channel (`stable`, `beta`,
+`nightly`) resolves at build time, but a new upstream release alone doesn't trigger a rebuild:
+unchanged source is reused as-is. Pin an exact release for reproducible builds.
 
 ### Monorepos & workspaces
 

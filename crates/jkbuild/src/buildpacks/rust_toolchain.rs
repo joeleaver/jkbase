@@ -44,6 +44,14 @@ const MAX_EXTRAS: usize = 16;
 const MAX_NAME_LEN: usize = 64;
 /// The pin files rustup reads, in its precedence order within one directory.
 const PIN_FILES: &[&str] = &["rust-toolchain", "rust-toolchain.toml"];
+/// The oldest release a pin may name (and its release date, for dated channels): cargo
+/// 1.70 defaults to the sparse registry the egress proxy serves and carries the
+/// CVE-2022-36113/36114 crate-extraction fixes, which matter because `cargo fetch`
+/// unpacks untrusted crates with the network up.
+const MIN_RELEASE: (u32, u32) = (1, 70);
+const MIN_RELEASE_DATE: &str = "2023-06-01";
+/// `statfs` magic for tmpfs: the guest's fallback `/cache` when no cache drive is attached.
+const TMPFS_MAGIC: i64 = 0x0102_1994;
 
 /// An app's validated toolchain pin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,8 +93,21 @@ impl Toolchain {
 /// `None` when the app pins nothing and the baked toolchain applies.
 pub(super) fn for_fetch(ctx: &BuildContext, extra_targets: &[&str]) -> Result<Option<Toolchain>> {
     match find_pin(ctx.app_dir, ctx.root_dir())? {
-        Some(pin) => provision(&pin, extra_targets, &rustup_home(ctx), ctx.proxy.as_deref()).map(Some),
-        None => Ok(None),
+        Some(pin) => {
+            require_real_cache_drive(ctx.cache_dir)?;
+            provision(&pin, extra_targets, &rustup_home(ctx), ctx.proxy.as_deref()).map(Some)
+        }
+        None => {
+            // An app that dropped its pin builds with the baked toolchain; drop whatever an
+            // earlier pinned build installed so it doesn't sit in the cache forever.
+            let home = rustup_home(ctx);
+            if home.exists() {
+                std::fs::remove_dir_all(&home)
+                    .with_context(|| format!("removing unpinned toolchains in {}", home.display()))?;
+                eprintln!("jkbuild: no Rust toolchain pin — removed previously installed toolchains");
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -97,6 +118,27 @@ pub(super) fn for_compile(ctx: &BuildContext, extra_targets: &[&str]) -> Result<
         Some(pin) => installed(&pin, extra_targets, &rustup_home(ctx)).map(Some),
         None => Ok(None),
     }
+}
+
+/// A pinned toolchain is ~0.5–1 GB unpacked. If the host couldn't attach the project's
+/// cache drive, the guest's `/cache` is a tmpfs — installing there would eat the build
+/// VM's RAM (OOM / ENOSPC mid-unpack), so fail with the real reason instead.
+fn require_real_cache_drive(cache_dir: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(cache_dir.as_os_str().as_bytes()).context("cache path")?;
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a properly sized out-param.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statfs {}", cache_dir.display()));
+    }
+    if st.f_type as i64 == TMPFS_MAGIC {
+        bail!(
+            "no build cache drive is attached for this project, so a pinned Rust toolchain \
+             has nowhere to install (it would fill the build VM's memory) — retry the deploy"
+        );
+    }
+    Ok(())
 }
 
 fn rustup_home(ctx: &BuildContext) -> PathBuf {
@@ -113,8 +155,11 @@ pub(super) fn find_pin(app_dir: &Path, root: &Path) -> Result<Option<Pin>> {
             let file = d.join(name);
             // symlink_metadata: a pin file that is a symlink could point anywhere in the
             // build VM; the tree is the tenant's own, but there's no reason to follow it.
-            let Ok(meta) = std::fs::symlink_metadata(&file) else {
-                continue;
+            let meta = match std::fs::symlink_metadata(&file) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Anything else (EACCES, …) must not silently fall back to the baked compiler.
+                Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
             };
             if !meta.is_file() {
                 bail!("{} must be a regular file", file.display());
@@ -181,11 +226,27 @@ fn parse_pin(text: &str, file: &Path, legacy_allowed: bool) -> Result<Option<Pin
         );
         return Ok(None);
     };
+    // `<channel>-<host>` is a common way to spell a pin; the builder's host is fixed, so
+    // accept exactly that host and drop it (any other triple is refused below).
+    let channel = channel
+        .strip_suffix(&format!("-{HOST}"))
+        .map(str::to_string)
+        .unwrap_or(channel);
     if !valid_channel(&channel) {
         bail!(
             "{}: unsupported toolchain channel {channel:?} — use stable, beta, nightly \
-             (optionally -YYYY-MM-DD), or a release like \"1.99.0\" (no host triple)",
+             (optionally -YYYY-MM-DD), or a release like \"1.99.0\"",
             file.display()
+        );
+    }
+    if below_floor(&channel) {
+        bail!(
+            "{}: Rust {channel} is older than the builder's minimum ({}.{}) — its cargo \
+             predates the sparse registry protocol and the crate-extraction fixes the build \
+             sandbox relies on; pin a newer toolchain",
+            file.display(),
+            MIN_RELEASE.0,
+            MIN_RELEASE.1
         );
     }
     Ok(Some(Pin {
@@ -257,6 +318,21 @@ fn valid_channel(c: &str) -> bool {
     ver_ok && pre_ok
 }
 
+/// Whether a (grammar-valid) channel names a toolchain older than [`MIN_RELEASE`]: a
+/// release `X.Y…` below it, or a dated channel from before that release shipped.
+/// Undated `stable`/`beta`/`nightly` always resolve to a current toolchain.
+fn below_floor(c: &str) -> bool {
+    for named in ["stable", "beta", "nightly"] {
+        if let Some(rest) = c.strip_prefix(named) {
+            return rest.strip_prefix('-').is_some_and(|date| date < MIN_RELEASE_DATE);
+        }
+    }
+    let ver = c.split('-').next().unwrap_or(c);
+    let mut it = ver.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (it.next().unwrap_or(0), it.next().unwrap_or(0));
+    (major, minor) < MIN_RELEASE
+}
+
 /// A rustup target/component name: lowercase alnum plus `-_.` (e.g.
 /// `wasm32-unknown-unknown`, `rust-src`, `llvm-tools-preview`).
 fn valid_name(s: &str) -> bool {
@@ -284,9 +360,12 @@ fn wanted_targets(pin: &Pin, extra_targets: &[&str]) -> Vec<String> {
     t
 }
 
-/// FETCH phase (network up): install the pinned toolchain via the baked rustup into
-/// `rustup_home` (on the cache drive), then uninstall any toolchain the app no longer
-/// pins. An already-installed release channel is a fast no-op re-verify.
+/// FETCH phase (network up): uninstall any toolchain the app no longer pins, then
+/// install the pinned one via the baked rustup into `rustup_home` (on the cache drive).
+/// Pruning FIRST bounds the peak footprint to one toolchain: were the old one still on
+/// disk while the new one unpacks, a big-to-big pin change could fill the drive, and the
+/// (seal-captured) full drive would then fail every later build too. An
+/// already-installed release channel is a fast no-op re-verify.
 pub(super) fn provision(
     pin: &Pin,
     extra_targets: &[&str],
@@ -305,6 +384,7 @@ pub(super) fn provision(
     for scratch in ["downloads", "tmp"] {
         let _ = std::fs::remove_dir_all(rustup_home.join(scratch));
     }
+    prune_other_toolchains(pin, rustup_home);
     let mut cmd = rustup_command(rustup_home);
     cmd.args(["toolchain", "install", &pin.channel])
         .args(["--profile", "minimal", "--no-self-update"]);
@@ -321,9 +401,7 @@ pub(super) fn provision(
             .env("http_proxy", p);
     }
     super::rust::run(cmd, &format!("rustup toolchain install {}", pin.channel))?;
-    let tc = installed(pin, extra_targets, rustup_home)?;
-    prune_other_toolchains(pin, rustup_home);
-    Ok(tc)
+    installed(pin, extra_targets, rustup_home)
 }
 
 /// COMPILE phase (sealed): the toolchain `provision` installed. Never runs rustup —
@@ -431,7 +509,10 @@ mod tests {
     fn refuses_path_toolchains_and_bad_channels() {
         assert!(pin_of("[toolchain]\npath = \"/src/evil\"\n").is_err());
         for bad in [
-            "1.99.0-x86_64-unknown-linux-gnu",
+            "1.99.0-aarch64-unknown-linux-gnu",
+            "1.69.0",
+            "1.42",
+            "nightly-2023-05-31",
             "my-custom",
             "../../etc",
             "1.99.0;rm",
@@ -445,6 +526,25 @@ mod tests {
         }
         assert!(pin_of("[toolchain]\nchannel = \"1.99\"\ntargets = [\"--evil\"]\n").is_err());
         assert!(pin_of("[toolchain]\nchannel = \"1.99\"\ncomponents = [\"A\"]\n").is_err());
+    }
+
+    #[test]
+    fn strips_only_the_builder_host_suffix() {
+        let p = pin_of("[toolchain]\nchannel = \"1.99.0-x86_64-unknown-linux-gnu\"\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.channel, "1.99.0");
+        let p = pin_of("[toolchain]\nchannel = \"stable-x86_64-unknown-linux-gnu\"\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.channel, "stable");
+    }
+
+    #[test]
+    fn floor_admits_current_and_undated_channels() {
+        for ok in ["1.70", "1.70.0", "1.99.0", "2.0", "stable", "nightly", "nightly-2023-06-01"] {
+            assert!(!below_floor(ok), "{ok:?} must be at/above the floor");
+        }
     }
 
     #[test]
