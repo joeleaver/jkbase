@@ -210,6 +210,22 @@ port = 8080
 
 Volumes persist across deploys. Build output does not — that's the point.
 
+**Rust toolchain.** Rust servers and `build = "trunk"` sites build with the compiler your repo pins:
+a `rust-toolchain.toml` (or legacy `rust-toolchain`) in the build dir or any parent up to `context`
+is honoured, so the builder runs the same toolchain as your dev box and CI:
+
+```toml
+# rust-toolchain.toml
+[toolchain]
+channel = "1.99.0"            # stable | beta | nightly[-YYYY-MM-DD] | a release like "1.99.0"
+targets = ["wasm32-unknown-unknown"]
+```
+
+It's installed from the official Rust dist server during the build's network-up fetch phase and
+cached per project (the first build on a new version downloads it once). `channel`, `targets` and
+`components` are honoured (the `minimal` profile is always used); a custom `path` toolchain is
+refused. With no pin, the builder's baked toolchain is used.
+
 ### Monorepos & workspaces
 
 By default a target is built from **just its `source` subdir** — that subdir is all that's mounted

@@ -51,6 +51,10 @@ contents:
     # release (through the egress proxy) so the offline compile can run it — see
     # buildpacks/trunk.rs `provision_wasm_bindgen`.
     - curl
+    # rustup: installs an app's OWN `rust-toolchain.toml` pin (+ the wasm32 target std)
+    # in the network-up fetch phase; the injected /opt/rust toolchain stays the default
+    # for apps that pin nothing. See jkbuild buildpacks/rust_toolchain.rs.
+    - rustup=1.29.1-r1 # last rustup on OpenSSL 3 (matches the locked libssl3)
 
 archs:
   - x86_64

@@ -2,7 +2,7 @@
   "version": "v1",
   "config": {
     "name": "images/apko/build-trunk.apko.yaml",
-    "checksum": "sha256-dp0ApwsNYzMxpeNabxCyOSD/4H+fprZMVlBLmjlxD6s="
+    "checksum": "sha256-B6hWFoPt6wdyawzuAqA5xd+fdnc0D1brStjTBt+mfBs="
   },
   "contents": {
     "keyring": [
@@ -1255,6 +1255,25 @@
           "checksum": "sha256-Ur6ITPMaX3cot0jCgmDHBGOsx9DIjsfMrq07ciRfkgw="
         },
         "checksum": "Q1xMbaAqRKwa/Tx0fRXhz88d+0V3M="
+      },
+      {
+        "name": "rustup",
+        "url": "https://packages.wolfi.dev/os/x86_64/rustup-1.29.1-r1.apk",
+        "version": "1.29.1-r1",
+        "architecture": "x86_64",
+        "signature": {
+          "range": "",
+          "checksum": ""
+        },
+        "control": {
+          "range": "bytes=0-7216",
+          "checksum": "sha1-6j7BmLjeeF4N4SElxMKYPaFs4kE="
+        },
+        "data": {
+          "range": "bytes=7217-6403206",
+          "checksum": "sha256-Di31MV2kxuFDZwXeHmzZpl+G/xam9/wfAiGO0rC3Oo4="
+        },
+        "checksum": "Q16j7BmLjeeF4N4SElxMKYPaFs4kE="
       }
     ]
   }
