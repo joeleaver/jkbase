@@ -5,8 +5,8 @@ mod build_orchestrator;
 mod db_backup_store;
 mod db_ops;
 use db_ops::{
-    DB_BACKUP_MAX_CONCURRENT, DbBackupCtx, db_backup_nightly_loop, do_db_query, run_db_backup,
-    run_db_restore,
+    DB_BACKUP_MAX_CONCURRENT, DbBackupCtx, DbQueryCtx, db_backup_nightly_loop, do_db_query,
+    run_db_backup, run_db_restore,
 };
 mod db_gateway;
 mod dns_forwarder;
@@ -2055,24 +2055,23 @@ async fn async_main() -> Result<()> {
         }));
     }
     {
-        // Console DB tools (query / schema / status) — a SYNCHRONOUS proxy (the console blocks
-        // on the result), unlike the fire-and-forget backup/restore callbacks. Captures the wake
-        // inputs + store directly (no need for the backup ctx's store/sem/restoring).
-        let platform = platform.clone();
-        let routing = routing_table.clone();
-        let domains = domain_map.clone();
-        let shipper = log_shipper.clone();
-        let store = state.store.clone();
+        // Console DB tools (query / schema / status / rewrite-covers) — a SYNCHRONOUS proxy (the
+        // caller blocks on the result), unlike the fire-and-forget backup/restore callbacks.
+        // Captures the wake inputs + store directly, plus the relay registry the rewrite pass
+        // holds the DB VM warm through.
+        let ctx = DbQueryCtx {
+            platform: platform.clone(),
+            routing: routing_table.clone(),
+            domains: domain_map.clone(),
+            shipper: log_shipper.clone(),
+            store: state.store.clone(),
+            relays: db_relay_registry.clone(),
+            rewriting: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        };
         let cb: jkbase_control::api::DbQueryCallback = Arc::new(
             move |project_id: String, op: jkbase_control::api::DbQueryOp| {
-                let platform = platform.clone();
-                let routing = routing.clone();
-                let domains = domains.clone();
-                let shipper = shipper.clone();
-                let store = store.clone();
-                Box::pin(async move {
-                    do_db_query(platform, routing, domains, shipper, store, project_id, op).await
-                })
+                let ctx = ctx.clone();
+                Box::pin(async move { do_db_query(ctx, project_id, op).await })
             },
         );
         state.db_query_callback = Some(cb);

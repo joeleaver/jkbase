@@ -365,6 +365,48 @@ pub(super) async fn db_status(
     db_query_dispatch(&state, id, DbQueryOp::Status).await
 }
 
+/// `POST /projects/{id}/db/rewrite-covers` — run rhypedb's `rewrite-covers` pass on the
+/// project's managed DB and return the engine's stats verbatim (`ok`, `objects`,
+/// `rev_edges_rewritten`, `index_entries_rewritten`, `cover_peers_sound`). Owner-scoped, and the
+/// project id from the path is the ONLY target — the server resolves that project's own splice
+/// secret + VM, so no request can reach another project's DB. SYNCHRONOUS: the call returns when
+/// the pass does (the server single-flights it per project → 409 while one is running, and bounds
+/// it with its own deadline). 400 if the project has no managed DB with an admin plane yet (the
+/// same precondition as backups: the agent authorizes the admin call with that token).
+pub(super) async fn db_rewrite_covers(
+    State(state): State<Arc<AppState>>,
+    Extension(tenant): Extension<Tenant>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_project_owner(&state, &tenant, &id) {
+        return e.into_response();
+    }
+    match state.store.get_db_admin_token(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "project has no managed database, or it has not been redeployed since \
+                            the database admin plane was enabled (redeploy first)"
+                        .to_string(),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
+    }
+    db_query_dispatch(&state, id, DbQueryOp::RewriteCovers).await
+}
+
 /// Max SDL the schema editor accepts.
 const MAX_SDL_BYTES: usize = 512 * 1024;
 

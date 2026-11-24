@@ -24,8 +24,8 @@ use tracing::info;
 
 mod db;
 use db::{
-    db_query, db_schema, db_schema_apply, db_status, drop_dedicated_db, list_db_backups,
-    restore_db_backup, trigger_db_backup,
+    db_query, db_rewrite_covers, db_schema, db_schema_apply, db_status, drop_dedicated_db,
+    list_db_backups, restore_db_backup, trigger_db_backup,
 };
 
 pub type DeployCallback = Box<
@@ -97,10 +97,12 @@ pub enum DbDropOutcome {
     Busy,
 }
 
-/// A read/write op the console DB tools forward to the project's managed DB. Each maps to
-/// exactly ONE route on rhypedb's OPEN loopback HTTP plane (`/query`, `/schema`, `/status`);
-/// `/admin/*` is never reachable through this seam (the agent hard-codes the target path per
-/// variant — no host- or console-controlled path passthrough). See `docs/managed-rhypedb-*`.
+/// An op the owner's DB tools forward to the project's managed DB. Each maps to exactly ONE
+/// hard-coded rhypedb route — the agent picks the path per variant, so there is no host- or
+/// console-controlled path passthrough. Three are on rhypedb's OPEN loopback plane (`/query`,
+/// `/schema`, `/status`); [`DbQueryOp::RewriteCovers`] is the single `/admin/*` route reachable
+/// here, and the agent authorizes it with the in-guest admin token (never seen by the host or the
+/// owner). See `docs/managed-rhypedb-*`.
 pub enum DbQueryOp {
     /// `POST /query` — the path query language (filter/traverse/limit/create/update/…).
     Query(String),
@@ -108,6 +110,12 @@ pub enum DbQueryOp {
     Schema,
     /// `GET /status` — metering counts (objects/edges/vectors/queries).
     Status,
+    /// `POST /admin/rewrite-covers` — bring every stored cover up to the current engine's rules
+    /// (repairs an old-engine store whose `/status` reports `cover_peers_sound: false`). Mutating
+    /// and long-running but idempotent + interruptible: a rerun redoes only what is still stale.
+    /// The server single-flights it per project, holds the DB VM warm, and bounds it with a long
+    /// deadline of its own.
+    RewriteCovers,
 }
 
 /// The verbatim engine result of a [`DbQueryOp`]: rhypedb's own HTTP status + JSON body,
@@ -634,6 +642,7 @@ pub fn router(state: Arc<AppState>, platform_domain: String) -> Router {
         .route("/projects/{id}/db/query", post(db_query))
         .route("/projects/{id}/db/schema", get(db_schema).post(db_schema_apply))
         .route("/projects/{id}/db/status", get(db_status))
+        .route("/projects/{id}/db/rewrite-covers", post(db_rewrite_covers))
         .route("/projects/{id}/db/dedicated", delete(drop_dedicated_db))
         .route("/projects/{id}/repo", get(get_repo_trigger_status))
         .route(
