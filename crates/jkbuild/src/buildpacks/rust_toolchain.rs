@@ -134,8 +134,9 @@ fn require_real_cache_drive(cache_dir: &Path) -> Result<()> {
     }
     if st.f_type as i64 == TMPFS_MAGIC {
         bail!(
-            "no build cache drive is attached for this project, so a pinned Rust toolchain \
-             has nowhere to install (it would fill the build VM's memory) — retry the deploy"
+            "the build cache drive for this project could not be provisioned, so the pinned \
+             Rust toolchain has nowhere to install (it would fill the build VM's memory); \
+             this is a host-side problem, contact the operator if it persists"
         );
     }
     Ok(())
@@ -439,11 +440,24 @@ fn prune_other_toolchains(pin: &Pin, rustup_home: &Path) {
         if name == keep {
             continue;
         }
+        // `--`: the entry name comes from a cache earlier tenant code could write to.
         let mut cmd = rustup_command(rustup_home);
-        cmd.args(["toolchain", "uninstall", &name]);
-        match cmd.output() {
-            Ok(o) if o.status.success() => eprintln!("jkbuild: removed unpinned toolchain {name}"),
-            _ => eprintln!("jkbuild: could not remove unpinned toolchain {name} (left in cache)"),
+        cmd.args(["toolchain", "uninstall", "--", &name]);
+        if matches!(cmd.output(), Ok(o) if o.status.success()) {
+            eprintln!("jkbuild: removed unpinned toolchain {name}");
+            continue;
+        }
+        // rustup didn't recognise it (planted or half-installed): delete it directly so the
+        // one-toolchain disk bound holds. `remove_dir_all` unlinks symlinks, never follows.
+        let path = e.path();
+        let gone = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&path),
+            Ok(_) => std::fs::remove_file(&path),
+            Err(err) => Err(err),
+        };
+        match gone {
+            Ok(()) => eprintln!("jkbuild: deleted stray toolchain dir {name}"),
+            Err(err) => eprintln!("jkbuild: could not remove toolchain dir {name}: {err}"),
         }
     }
 }
