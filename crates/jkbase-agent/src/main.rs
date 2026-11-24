@@ -2,7 +2,8 @@ mod clock;
 mod db_reach;
 use db_reach::{
     DB_LEG_MAX_CONNS, DbHttpOp, RHYPEDB_HTTP_PORT, RHYPEDB_TCP_PORT, db_leg_loopback_proxy,
-    handle_db_backup, handle_db_query, handle_db_restore, handle_db_splice,
+    handle_db_backup, handle_db_query, handle_db_restore, handle_db_rewrite_covers,
+    handle_db_splice,
 };
 mod container_supervisor;
 mod dmverity;
@@ -581,8 +582,9 @@ struct AgentState {
     /// handler verifies it before splicing (a `None`/mismatch fails closed).
     db_splice_secret: Option<String>,
     /// The per-deploy rhypedb admin bearer ([RB1]), read from the same host-only
-    /// `_db_reach.json`. Used ONLY by the `/_jkbase/db-backup` pull handler to authorize the
-    /// loopback `/admin/backup/stream` call — never served, never handed to a tenant process.
+    /// `_db_reach.json`. Used ONLY to authorize the agent's own hard-coded loopback admin calls
+    /// (`/admin/backup/stream` for a backup pull, `/admin/rewrite-covers` for the owner's
+    /// rewrite pass) and the restore respawn — never served, never handed to a tenant process.
     db_admin_token: Option<String>,
 }
 
@@ -1152,6 +1154,10 @@ async fn handle_request(
 
     if path == "/_jkbase/db/status" {
         return Ok(box_full(handle_db_query(state, req, DbHttpOp::Status).await));
+    }
+
+    if path == "/_jkbase/db/rewrite-covers" {
+        return Ok(box_full(handle_db_rewrite_covers(state, req).await));
     }
 
     if path == "/_jkbase/sync" {
@@ -1847,6 +1853,17 @@ mod tests {
 
     /// Serve `serve_dir` through the agent's real request handler on a loopback port.
     async fn serve_agent(serve_dir: &Path) -> SocketAddr {
+        serve_agent_with(serve_dir, None, None, true).await
+    }
+
+    /// [`serve_agent`] with the host-only DB secrets baked and the arrival plane chosen
+    /// (`on_loopback == false` ⇒ as if the request came in over eth0 from the host).
+    async fn serve_agent_with(
+        serve_dir: &Path,
+        db_splice_secret: Option<&str>,
+        db_admin_token: Option<&str>,
+        on_loopback: bool,
+    ) -> SocketAddr {
         let log_sink = Arc::new(LogSink::new());
         let egress = function_egress::EgressContext::new(
             &jkbase_common::config::PlatformEgress::default(),
@@ -1865,8 +1882,8 @@ mod tests {
             log_sink,
             route_config: load_route_config(serve_dir),
             sites: load_sites_config(serve_dir),
-            db_splice_secret: None,
-            db_admin_token: None,
+            db_splice_secret: db_splice_secret.map(str::to_string),
+            db_admin_token: db_admin_token.map(str::to_string),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1875,7 +1892,8 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let state = state.clone();
                 tokio::spawn(async move {
-                    let svc = service_fn(move |req| handle_request(state.clone(), req, true));
+                    let svc =
+                        service_fn(move |req| handle_request(state.clone(), req, on_loopback));
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), svc)
                         .await;
@@ -1903,6 +1921,53 @@ mod tests {
         let status = resp.status().as_u16();
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// `method path` carrying `x-jkbase-db-secret: secret` (when given) → status.
+    async fn db_call(addr: SocketAddr, method: &str, path: &str, secret: Option<&str>) -> u16 {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        let mut req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "10.0.0.2");
+        if let Some(s) = secret {
+            req = req.header("x-jkbase-db-secret", s);
+        }
+        let resp = sender
+            .send_request(req.body(http_body_util::Empty::<Bytes>::new()).unwrap())
+            .await
+            .unwrap();
+        resp.status().as_u16()
+    }
+
+    /// The rewrite-covers seam fails closed before it ever dials the engine: a tenant on guest
+    /// loopback, a missing or wrong splice secret, and a VM with no admin token baked all get the
+    /// same 404 as an unknown path; a GET with the right secret can't start a mutating pass.
+    /// (The engine leg itself is covered in `db_reach::tests`.)
+    #[tokio::test]
+    async fn rewrite_covers_is_host_only_secret_gated_and_post_only() {
+        let dir = std::env::temp_dir().join(format!("jkagent-rwc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = "/_jkbase/db/rewrite-covers";
+
+        let from_tenant = serve_agent_with(&dir, Some("s3cret"), Some("adm"), true).await;
+        assert_eq!(db_call(from_tenant, "POST", p, Some("s3cret")).await, 404);
+
+        let host = serve_agent_with(&dir, Some("s3cret"), Some("adm"), false).await;
+        assert_eq!(db_call(host, "POST", p, None).await, 404);
+        assert_eq!(db_call(host, "POST", p, Some("wrong")).await, 404);
+        assert_eq!(db_call(host, "POST", p, Some("s3cre")).await, 404);
+        assert_eq!(db_call(host, "GET", p, Some("s3cret")).await, 405);
+
+        let no_db = serve_agent_with(&dir, None, None, false).await;
+        assert_eq!(db_call(no_db, "POST", p, Some("s3cret")).await, 404);
+        let no_admin = serve_agent_with(&dir, Some("s3cret"), None, false).await;
+        assert_eq!(db_call(no_admin, "POST", p, Some("s3cret")).await, 404);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End to end through the real handler: the Playweft layout — a domain-bound SPA at
