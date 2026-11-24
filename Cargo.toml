@@ -22,7 +22,7 @@ members = [
 license = "MIT OR Apache-2.0"
 # The CLI release version, shared with jkbase-common so the server advertises (GET /cli) the CLI
 # that matches it. A `cli-v<version>` tag publishes this exact version (.github/workflows/release.yml).
-version = "0.2.0"
+version = "0.2.1"
 
 [workspace.dependencies]
 jkbase-common = { path = "crates/jkbase-common" }

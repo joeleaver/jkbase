@@ -83,9 +83,11 @@ Users install prebuilt binaries (`sites/www/install.sh` / `install.ps1`, served 
 update with `jkbase upgrade`; both pull GitHub Releases tagged `cli-v<version>`. The CLI and
 `jkbase-common` share `[workspace.package] version`, which the server advertises at `GET /cli`. To
 release: bump that version, merge, push tag `cli-v<version>` on main (`.github/workflows/release.yml`
-builds linux/macOS/windows and publishes), and only then deploy the server — otherwise it advertises
+builds linux/macOS/windows, signs `SHA256SUMS` in the `cli-release` environment and publishes),
+and only then deploy the server — otherwise it advertises
 a release that doesn't exist yet. Bump `MIN_CLI_VERSION` (`jkbase-common/src/cli_version.rs`) only
-for a breaking API change.
+for a breaking API change. All installers verify the release signature fail-closed; keys,
+setup and rotation are in `docs/cli-release-signing.md`.
 
 Toolchain is pinned in `rust-toolchain.toml`. `.github/workflows/ci.yml` is the source of truth for
 what must pass.

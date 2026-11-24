@@ -7,11 +7,17 @@
 #   JKBASE_VERSION      install this version (e.g. 0.2.0) instead of the latest
 #   JKBASE_INSTALL_DIR  where to put `jkbase` (default: ~/.local/bin)
 #
-# Verifies the archive against the release's SHA256SUMS before installing. Once installed,
-# `jkbase upgrade` updates in place.
+# Before installing, verifies the release's SHA256SUMS.sig (an SSH signature by a jkbase release
+# key, checked with `ssh-keygen -Y verify`), then the archive against those signed SHA256SUMS.
+# Any failure stops the install. Once installed, `jkbase upgrade` updates in place.
 set -eu
 
 REPO="joeleaver/jkbase"
+# Release-signing keys, ssh-keygen allowed_signers format. MUST equal
+# crates/jkbase-cli/release-keys/allowed_signers (jkbase-cli's tests fail if they drift).
+# Rotation: docs/cli-release-signing.md.
+ALLOWED_SIGNERS='
+'
 DIR="${JKBASE_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf 'jkbase-install: %s\n' "$*"; }
@@ -19,6 +25,9 @@ die() { printf 'jkbase-install: error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "needs '$1'"; }
 
 need uname; need tar; need mkdir; need mktemp
+command -v ssh-keygen >/dev/null 2>&1 || die "needs ssh-keygen (OpenSSH 8.1+) to verify the release \
+signature — install it (Debian/Ubuntu: apt-get install openssh-client; Alpine: apk add openssh-keygen; \
+Fedora: dnf install openssh) and re-run"
 if command -v curl >/dev/null 2>&1; then
     get() { curl -fsSL --proto '=https' --tlsv1.2 "$1" -o "$2"; }
 elif command -v wget >/dev/null 2>&1; then
@@ -72,6 +81,18 @@ trap 'exit 130' INT TERM
 
 say "downloading $asset"
 get "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "no release found at $base"
+get "$base/SHA256SUMS.sig" "$tmp/SHA256SUMS.sig" || die "the release has no SHA256SUMS.sig (signed releases start at 0.2.1)"
+# Verify before reading a line of SHA256SUMS: everything below trusts only these signed bytes.
+printf '%s\n' "$ALLOWED_SIGNERS" >"$tmp/allowed_signers"
+if ! out="$(ssh-keygen -Y verify -f "$tmp/allowed_signers" -I jkbase-release -n jkbase-cli-release \
+    -s "$tmp/SHA256SUMS.sig" <"$tmp/SHA256SUMS" 2>&1)"; then
+    case "$out" in
+        *"unknown option"* | *"illegal option"* | *"usage:"*)
+            die "your ssh-keygen is too old to verify signatures (needs OpenSSH 8.1+)" ;;
+    esac
+    die "release signature verification FAILED — not installing ($out)"
+fi
+say "release signature OK"
 get "$base/$asset" "$tmp/$asset" || die "no $target build in that release"
 want="$(awk -v a="$asset" '$2 == a || $2 == "*" a { print $1 }' "$tmp/SHA256SUMS")"
 [ -n "$want" ] || die "SHA256SUMS has no entry for $asset"
