@@ -3,18 +3,24 @@
 //! host if their sum is bounded).
 //!
 //! The budget is itself a cross-tenant resource, and accounts are free, so its admission policy
-//! is the isolation boundary: **max-min fair across tenants, strict at the head.**
-//! - When memory frees, the waiter whose tenant holds the LEAST right now goes first; among
-//!   equals, the tenant served longest ago (round-robin), then arrival order. A tenant with
-//!   nothing running is therefore never queued behind another tenant's backlog, however many
-//!   targets or projects that tenant floods in — not even behind one whose VM just exited. A fixed per-tenant share
-//!   can't give that: two (free) accounts at half each still own the whole host.
-//! - The head is never overtaken, even by a smaller request that would fit: a big (admin-
-//!   granted) VM can't be starved by a stream of small ones. Since nothing is admitted past it,
-//!   the head waits at most until the VMs already running exit — one build-VM timeout. So
-//!   `max_wait` (set above that timeout) only expires for a tenant queued behind OTHER waiters,
-//!   e.g. its own backlog, and the error says which.
+//! is the isolation boundary: **max-min fair across tenants, with a pinned head.**
+//! - Each tenant's waiters queue FIFO. When memory frees, the tenant holding the LEAST right
+//!   now goes next; among equals, the tenant served longest ago (round-robin), then the one
+//!   whose front waiter arrived first. A tenant with nothing running is therefore never queued
+//!   behind another tenant's backlog, however many targets or projects that tenant floods in —
+//!   not even behind one whose VM just exited. A fixed per-tenant share can't give that: two
+//!   (free) accounts at half each still own the whole host.
+//! - Once memory frees but not enough for the fairest waiter, it is PINNED as the head: nothing
+//!   else is admitted until it fits or gives up, even a smaller request that would fit, or a
+//!   tenant that turns fairer meanwhile (re-choosing the head on every release would let tenants cycling small
+//!   builds starve a big — admin-granted — VM forever). So the head waits at most until the VMs
+//!   already running exit: one build-VM lifetime. `max_wait` (twice that) therefore only
+//!   expires for a waiter queued behind OTHER waiters, e.g. its own tenant's backlog, and the
+//!   error says which.
 //! - Work-conserving: with no contention, one tenant may use the whole budget.
+//!
+//! Work under the lock is O(tenants waiting) per admission (plus a leaving waiter's own tenant
+//! queue), never O(all waiters): a tenant queueing many targets only lengthens its own queue.
 //!
 //! Residual (not this module's to fix): a tenant with many accounts gets one fair slot per
 //! account. Per-tenant fairness is the strongest policy available without a non-free identity.
@@ -44,7 +50,11 @@ struct State {
     free_mib: u32,
     /// MiB currently held, per tenant. A tenant holding nothing has no entry.
     held: HashMap<String, u32>,
-    waiters: VecDeque<Waiter>,
+    /// Each waiting tenant's FIFO queue. A tenant with no waiters has no entry.
+    queues: HashMap<String, VecDeque<Waiter>>,
+    /// The tenant whose FRONT waiter is the pinned head: chosen as fairest when memory freed, but
+    /// too big for what was free. Only it may be admitted until it fits or leaves.
+    pinned: Option<String>,
     next_id: u64,
     /// When each tenant with holdings or waiters was last admitted (`grant_seq` order): the
     /// round-robin tie-break. Idle tenants are forgotten (they come back first, as they should).
@@ -55,7 +65,6 @@ struct State {
 #[derive(Debug)]
 struct Waiter {
     id: u64,
-    tenant: String,
     mib: u32,
     grant: oneshot::Sender<MemReservation>,
 }
@@ -94,38 +103,54 @@ impl Inner {
     }
 }
 
-/// The waiter to admit next: its tenant holds least, then was served longest ago, then it
-/// arrived first.
-fn fairest(st: &State) -> Option<usize> {
-    st.waiters
+/// The tenant to serve next: the pinned one if any, else the one holding least, then served
+/// longest ago, then whose front waiter arrived first. O(tenants waiting).
+fn next_tenant(st: &State) -> Option<String> {
+    if let Some(t) = &st.pinned {
+        return Some(t.clone());
+    }
+    st.queues
         .iter()
-        .enumerate()
-        .min_by_key(|(i, w)| {
-            let held = st.held.get(&w.tenant).copied().unwrap_or(0);
-            let last = st.last_grant.get(&w.tenant).copied().unwrap_or(0);
-            (held, last, *i)
+        .filter_map(|(t, q)| q.front().map(|w| (t, w.id)))
+        .min_by_key(|(t, front_id)| {
+            let held = st.held.get(*t).copied().unwrap_or(0);
+            let last = st.last_grant.get(*t).copied().unwrap_or(0);
+            (held, last, *front_id)
         })
-        .map(|(i, _)| i)
+        .map(|(t, _)| t.clone())
 }
 
-/// Admit waiters while the fairest one fits. Returns the reservations whose waiter had already
-/// dropped its receiver, for the caller to drop after unlocking.
+/// Admit waiters while the next one fits; pin it as the head when it doesn't. Returns the
+/// reservations whose waiter had already dropped its receiver, for the caller to drop after
+/// unlocking.
 fn dispatch(budget: &Arc<Inner>, st: &mut State) -> Vec<MemReservation> {
     let mut undelivered = Vec::new();
-    while let Some(pos) = fairest(st) {
-        if st.waiters[pos].mib > st.free_mib {
-            break; // strict: nobody overtakes the fairest waiter
+    while let Some(tenant) = next_tenant(st) {
+        let queue = st.queues.get_mut(&tenant).expect("next_tenant has a queue");
+        let mib = queue.front().expect("queues are never left empty").mib;
+        if mib > st.free_mib {
+            // Memory is now accumulating for this waiter: pin it, so nobody takes that memory
+            // past it until it fits or leaves. With NOTHING free there is nothing to protect, and
+            // pinning would keep a tenant arriving fairer (nothing running) behind it.
+            if st.free_mib > 0 {
+                st.pinned = Some(tenant);
+            }
+            break;
         }
-        let w = st.waiters.remove(pos).expect("index from iter");
-        st.free_mib -= w.mib;
-        *st.held.entry(w.tenant.clone()).or_default() += w.mib;
+        let w = queue.pop_front().expect("checked above");
+        if queue.is_empty() {
+            st.queues.remove(&tenant);
+        }
+        st.pinned = None;
+        st.free_mib -= mib;
+        *st.held.entry(tenant.clone()).or_default() += mib;
         st.grant_seq += 1;
         let seq = st.grant_seq;
-        st.last_grant.insert(w.tenant.clone(), seq);
+        st.last_grant.insert(tenant.clone(), seq);
         let r = MemReservation {
             budget: budget.clone(),
-            tenant: w.tenant,
-            mib: w.mib,
+            tenant,
+            mib,
         };
         if let Err(r) = w.grant.send(r) {
             undelivered.push(r);
@@ -133,11 +158,11 @@ fn dispatch(budget: &Arc<Inner>, st: &mut State) -> Vec<MemReservation> {
     }
     let State {
         held,
-        waiters,
+        queues,
         last_grant,
         ..
     } = st;
-    last_grant.retain(|t, _| held.contains_key(t) || waiters.iter().any(|w| &w.tenant == t));
+    last_grant.retain(|t, _| held.contains_key(t) || queues.contains_key(t));
     undelivered
 }
 
@@ -145,6 +170,7 @@ fn dispatch(budget: &Arc<Inner>, st: &mut State) -> Vec<MemReservation> {
 /// that gave up never blocks the head.
 struct QueueSlot<'a> {
     budget: &'a Arc<Inner>,
+    tenant: String,
     id: u64,
 }
 
@@ -154,12 +180,23 @@ impl QueueSlot<'_> {
         let undelivered;
         let was_queued = {
             let mut st = self.budget.lock();
-            let before = st.waiters.len();
-            st.waiters.retain(|w| w.id != self.id);
-            let was_queued = st.waiters.len() != before;
+            let Some(queue) = st.queues.get_mut(&self.tenant) else {
+                return false;
+            };
+            let Some(pos) = queue.iter().position(|w| w.id == self.id) else {
+                return false;
+            };
+            queue.remove(pos);
+            if queue.is_empty() {
+                st.queues.remove(&self.tenant);
+            }
+            // The pinned head is its tenant's FRONT waiter; if that was us, unpin.
+            if pos == 0 && st.pinned.as_deref() == Some(self.tenant.as_str()) {
+                st.pinned = None;
+            }
             // Removing the head may let the next waiter in.
             undelivered = dispatch(self.budget, &mut st);
-            was_queued
+            true
         };
         drop(undelivered);
         was_queued
@@ -212,14 +249,13 @@ impl BuildMemBudget {
             let mut st = self.inner.lock();
             let id = st.next_id;
             st.next_id += 1;
-            st.waiters.push_back(Waiter {
-                id,
-                tenant: tenant.to_string(),
-                mib,
-                grant: tx,
-            });
+            st.queues
+                .entry(tenant.to_string())
+                .or_default()
+                .push_back(Waiter { id, mib, grant: tx });
             let slot = QueueSlot {
                 budget: &self.inner,
+                tenant: tenant.to_string(),
                 id,
             };
             (slot, dispatch(&self.inner, &mut st))
@@ -269,7 +305,7 @@ mod tests {
     }
 
     fn queued(b: &BuildMemBudget) -> usize {
-        b.inner.lock().waiters.len()
+        b.inner.lock().queues.values().map(VecDeque::len).sum()
     }
 
     #[tokio::test]
@@ -361,6 +397,35 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(r);
+    }
+
+    // Review round 3: with the head re-chosen on every release, tenants cycling small builds
+    // (each coming back idle, so "fairer" than the waiting big VM) overtook it forever.
+    #[tokio::test]
+    async fn a_pinned_head_is_not_overtaken_by_tenants_cycling_small_builds() {
+        let b = Arc::new(BuildMemBudget::new(8192, Duration::from_secs(5)));
+        let a = b.reserve("cycler-a", 4096).await.unwrap();
+        let c = b.reserve("cycler-b", 4096).await.unwrap();
+        let big = {
+            let b = b.clone();
+            tokio::spawn(async move { b.reserve("big", 8192).await })
+        };
+        while queued(&b) < 1 {
+            tokio::task::yield_now().await;
+        }
+        // A's build exits; `big` still doesn't fit (B holds 4096), so it is pinned...
+        drop(a);
+        // ...and A, back idle and holding nothing, can't take the freed memory past it.
+        assert!(not_admitted(&b, "cycler-a", 4096).await);
+        drop(c);
+        let r = tokio::time::timeout(Duration::from_secs(1), big)
+            .await
+            .expect("the pinned head is admitted once the running VMs exit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued(&b), 0);
+        drop(r);
+        b.reserve("cycler-a", 4096).await.expect("budget intact");
     }
 
     #[tokio::test]

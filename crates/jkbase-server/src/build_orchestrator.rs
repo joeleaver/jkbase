@@ -1620,14 +1620,17 @@ async fn build_one_target_inner(
         }
     };
     // The fairness key: the owning tenant, so many projects of one tenant count as one. A
-    // project without an owner (or an unreadable one) is its own key.
-    let tenant_key = deps
+    // project with no owner is its own key (namespaced, so it can never alias a tenant id). An
+    // unreadable project FAILS the target rather than falling back to a per-project key, which
+    // would hand a many-project tenant one fair slot per project for as long as the store errs.
+    let project = deps
         .store
         .get_project(project_id)
-        .ok()
-        .flatten()
-        .and_then(|p| p.tenant_id)
-        .unwrap_or_else(|| project_id.to_string());
+        .with_context(|| format!("read project '{project_id}' for its build-memory turn"))?;
+    let tenant_key = match project.and_then(|p| p.tenant_id) {
+        Some(tenant) => format!("tenant:{tenant}"),
+        None => format!("project:{project_id}"),
+    };
     let size =
         crate::build_sizing::size_for(deps.mem_size_mib, deps.cgroup_mem_max_bytes, mem_override);
     let mem_reservation = deps
