@@ -154,10 +154,25 @@ pub fn run() -> Result<i32> {
     };
 
     if is_pid1() {
+        // The guest kernel's OOM-kill count: a compiler the OOM killer SIGKILLs surfaces only
+        // as a failed build, so the host reads this to name the failure an OOM (with the VM's
+        // size). Written before `status`, which the host treats as "the build finished".
+        let vmstat = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+        if let Some(kills) = oom_kills(&vmstat) {
+            let _ = std::fs::write(format!("{OUT}/oom_kills"), kills.to_string());
+        }
         let _ = std::fs::write(format!("{OUT}/status"), code.to_string());
         reboot();
     }
     Ok(code)
+}
+
+/// The `oom_kill` counter from `/proc/vmstat` text (Linux ≥ 4.13; the build kernel is newer).
+fn oom_kills(vmstat: &str) -> Option<u64> {
+    vmstat
+        .lines()
+        .find_map(|l| l.strip_prefix("oom_kill "))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// The phase machine, independent of PID1/reboot scaffolding so it can be reasoned
@@ -656,5 +671,17 @@ mod tests {
                 .is_symlink()
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn oom_kills_reads_only_the_exact_counter() {
+        let vmstat = "nr_free_pages 1\noom_kill_extra 9\noom_kill 2\npgfault 7\n";
+        assert_eq!(oom_kills(vmstat), Some(2));
+        assert_eq!(
+            oom_kills("nr_free_pages 1\n"),
+            None,
+            "old kernel: no counter"
+        );
+        assert_eq!(oom_kills("oom_kill x\n"), None);
     }
 }

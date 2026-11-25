@@ -106,15 +106,22 @@ pub struct BuildDeps {
     pub gid: u32,
     pub timeout: Duration,
     pub vcpu_count: u32,
+    /// DEFAULT build-VM guest RAM; a project's admin-granted `QuotaLimits::build_mem_mib`
+    /// replaces it (see [`crate::build_sizing`]).
     pub mem_size_mib: u32,
     pub cgroup_pids_max: u32,
+    /// DEFAULT build-VM cgroup `memory.max`. Its headroom over `mem_size_mib` is kept for a
+    /// project with a build-memory override.
     pub cgroup_mem_max_bytes: u64,
     pub cgroup_cpu_max: String,
     pub scratch_size_bytes: u64,
     pub output_size_bytes: u64,
     pub console_log_max_bytes: u64,
-    /// Max build VMs booting concurrently across all jobs.
+    /// Max build VMs one build job runs at once (its targets fan out under this). Per JOB,
+    /// not per host — the host-wide bound is `mem_budget`.
     pub max_concurrent: usize,
+    /// Host-wide guest-RAM budget every build VM of every job reserves from before booting.
+    pub mem_budget: Arc<crate::build_mem_budget::BuildMemBudget>,
     /// Isolated build network for dependency fetches; `None` → offline builds.
     pub net: Option<Arc<BuildNet>>,
     /// Max time the FETCH phase may hold the network before the host force-seals.
@@ -1553,29 +1560,6 @@ async fn build_one_target_inner(
         );
     }
 
-    // Lease an isolated TAP when a build network is configured, so this VM can
-    // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
-    let lease = match &deps.net {
-        Some(net) => Some(
-            net.acquire(is_dockerfile)
-                .await
-                .context("acquire build network")?,
-        ),
-        None => None,
-    };
-    let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
-        match (&deps.net, &lease) {
-            (Some(net), Some(l)) => (
-                Some(l.tap.clone()),
-                Some(l.mac.clone()),
-                Some(l.guest_ip.clone()),
-                Some(net.gateway.clone()),
-                Some(net.proxy_url_for(is_dockerfile)),
-                Some(make_seal(l.tap.clone())),
-            ),
-            _ => (None, None, None, None, None, None),
-        };
-
     // Per-`(project,language)` persistent warm cache (the `vde` drive): cargo
     // registry/git, npm/pnpm/yarn stores, etc. survive across builds for fast
     // rebuilds. Skipped for dockerfile builds (the image carries its own cache) and
@@ -1621,6 +1605,63 @@ async fn build_one_target_inner(
         None
     };
 
+    // Size the VM (host default, or the project's admin-granted build memory) and reserve its
+    // memory from the host-wide budget, admitted fairly per TENANT (so one tenant's backlog
+    // can't stall everyone's builds). Taken AFTER the per-language cache lock (a
+    // target queued on that lock holds nothing) and BEFORE the network lease (a target queued
+    // for memory holds no TAP); dropped as soon as the VM exits. A store read error falls back
+    // to the default size — never larger than intended.
+    let mem_override = match deps.store.get_quota(project_id) {
+        Ok(q) => q.build_mem_mib,
+        Err(e) => {
+            warn!(project = %project_id, target = %spec.name, error = %e,
+                  "could not read build-memory quota; using the default build VM size");
+            None
+        }
+    };
+    // The fairness key: the owning tenant, so many projects of one tenant count as one. A
+    // project with no owner is its own key (namespaced, so it can never alias a tenant id). An
+    // unreadable project FAILS the target rather than falling back to a per-project key, which
+    // would hand a many-project tenant one fair slot per project for as long as the store errs.
+    let project = deps
+        .store
+        .get_project(project_id)
+        .with_context(|| format!("read project '{project_id}' for its build-memory turn"))?;
+    let tenant_key = match project.and_then(|p| p.tenant_id) {
+        Some(tenant) => format!("tenant:{tenant}"),
+        None => format!("project:{project_id}"),
+    };
+    let size =
+        crate::build_sizing::size_for(deps.mem_size_mib, deps.cgroup_mem_max_bytes, mem_override);
+    let mem_reservation = deps
+        .mem_budget
+        .reserve(&tenant_key, size.reserve_mib())
+        .await
+        .with_context(|| format!("reserve build memory for '{}'", spec.name))?;
+
+    // Lease an isolated TAP when a build network is configured, so this VM can
+    // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
+    let lease = match &deps.net {
+        Some(net) => Some(
+            net.acquire(is_dockerfile)
+                .await
+                .context("acquire build network")?,
+        ),
+        None => None,
+    };
+    let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
+        match (&deps.net, &lease) {
+            (Some(net), Some(l)) => (
+                Some(l.tap.clone()),
+                Some(l.mac.clone()),
+                Some(l.guest_ip.clone()),
+                Some(net.gateway.clone()),
+                Some(net.proxy_url_for(is_dockerfile)),
+                Some(make_seal(l.tap.clone())),
+            ),
+            _ => (None, None, None, None, None, None),
+        };
+
     let cfg = BuildVmConfig {
         jailer_bin: deps.jailer_bin.clone(),
         firecracker_bin: deps.firecracker_bin.clone(),
@@ -1635,7 +1676,7 @@ async fn build_one_target_inner(
         cache_drive: cache_drive.clone(),
         persist_cache_from_seal: seal_captured,
         vcpu_count: deps.vcpu_count,
-        mem_size_mib: deps.mem_size_mib,
+        mem_size_mib: size.mem_size_mib,
         vsock_cid: None,
         timeout: deps.timeout,
         chroot_base: deps.chroot_base.clone(),
@@ -1644,7 +1685,7 @@ async fn build_one_target_inner(
         gid: deps.gid,
         parent_cgroup: deps.parent_cgroup.clone(),
         cgroup_pids_max: deps.cgroup_pids_max,
-        cgroup_mem_max_bytes: deps.cgroup_mem_max_bytes,
+        cgroup_mem_max_bytes: size.cgroup_mem_max_bytes,
         cgroup_cpu_max: deps.cgroup_cpu_max.clone(),
         // RLIMIT_FSIZE is process-wide on Firecracker, so it must cover the
         // LARGEST RW backing file it writes — the scratch drive, not just output
@@ -1692,6 +1733,9 @@ async fn build_one_target_inner(
 
     let runtime_dir = workspace.join("run");
     let run_res = BuildVm::run(&vm_id, &cfg, &runtime_dir).await;
+    // The VM has exited (or never booted): its memory is free for the next build now, not
+    // after this target's post-run collection.
+    drop(mem_reservation);
     // Always return the network lease (delete TAP + free slot), even on error.
     if let (Some(net), Some(l)) = (&deps.net, lease) {
         net.release(l).await;
@@ -1783,6 +1827,21 @@ async fn build_one_target_inner(
 
     let status = build_output::read_status(&output_img)?;
     if status != Some(0) {
+        // jkbuild records the guest's OOM-kill count; a failure with kills is an OOM, named
+        // as one (with the VM's size) rather than a bare exit status. Absent on toolchain
+        // images baked before jkbuild wrote it — then the plain message stands.
+        let oom_kills = build_output::read_small(&output_img, "/oom_kills", 32)
+            .ok()
+            .flatten()
+            .and_then(|b| crate::build_sizing::parse_oom_kills(&b))
+            .filter(|&n| n > 0);
+        if let Some(kills) = oom_kills {
+            bail!(crate::build_sizing::oom_failure(
+                size.mem_size_mib,
+                kills,
+                &log_str()
+            ));
+        }
         bail!("build script exited with status {status:?}\n{}", log_str());
     }
 
@@ -3804,6 +3863,7 @@ mod tests {
             output_size_bytes: 0,
             console_log_max_bytes: 0,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net: None,
             fetch_deadline: Duration::from_secs(1),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3834,7 +3894,7 @@ mod tests {
 /// Expects `$JKB_DATA/vmlinux.bin` and `$JKB_DATA/toolchains/default.ext4`
 /// (same filesystem as `$JKB_DATA`), and the cgroup provisioned by the harness.
 #[cfg(test)]
-mod onbox {
+pub(crate) mod onbox {
     use super::*;
     use jkbase_control::store::{BuildPhase, BuildRecord, Store};
 
@@ -3842,7 +3902,7 @@ mod onbox {
         "#!/bin/sh\nprintf '\\000asm\\001\\000\\000\\000' > \"$OUT/function.wasm\"\necho ok\n";
     const SERVER_BUILD: &str = "#!/bin/sh\nmkdir -p /tmp/rf/srv\necho hi > /tmp/rf/srv/index.html\ntar -czf \"$OUT/rootfs.tar.gz\" -C /tmp/rf .\nprintf '{\"cmd\":[\"/srv/app\"],\"working_dir\":\"/srv\",\"env\":{\"K\":\"V\"}}' > \"$OUT/manifest.json\"\n";
 
-    fn write(p: std::path::PathBuf, c: &str) {
+    pub(crate) fn write(p: std::path::PathBuf, c: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, c).unwrap();
     }
@@ -3935,6 +3995,7 @@ public = "./public"
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 2,
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net: None,
             fetch_deadline: Duration::from_secs(60),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4737,12 +4798,12 @@ fn main() {
     }
 
     /// Everything the on-box pipeline tests share after a successful build.
-    struct BuildFixture {
+    pub(crate) struct BuildFixture {
         data: PathBuf,
         fc_release: PathBuf,
         kernel: PathBuf,
         store: Store,
-        staged: PathBuf,
+        pub(crate) staged: PathBuf,
     }
 
     /// Which fixture + network wiring `bun_pipeline_build` drives.
@@ -5174,6 +5235,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net,
             // Real `bun install` over the network needs more headroom than the
             // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
@@ -5198,15 +5260,15 @@ console.log("listening on " + port);
     }
 
     /// Per-language build VM tuning (cargo wants more than `npm install`).
-    struct BuildTuning {
-        vcpu: u32,
-        guest_mem_mib: u32,
-        cgroup_mem_mib: u64,
-        cgroup_cpu_max: &'static str,
-        scratch_mib: u64,
-        output_mib: u64,
-        timeout_secs: u64,
-        fetch_deadline_secs: u64,
+    pub(crate) struct BuildTuning {
+        pub(crate) vcpu: u32,
+        pub(crate) guest_mem_mib: u32,
+        pub(crate) cgroup_mem_mib: u64,
+        pub(crate) cgroup_cpu_max: &'static str,
+        pub(crate) scratch_mib: u64,
+        pub(crate) output_mib: u64,
+        pub(crate) timeout_secs: u64,
+        pub(crate) fetch_deadline_secs: u64,
     }
 
     /// Generic NETWORKED pipeline build for the language buildpacks: tar `src`, run
@@ -5230,7 +5292,7 @@ console.log("listening on " + port);
     /// Like [`networked_lang_build`] but hands back the raw `run_project_build`
     /// RESULT instead of unwrapping it — so a NEGATIVE test (e.g. a monorepo build
     /// with the `context` widening OMITTED) can assert the build *fails*.
-    async fn networked_lang_build_try(
+    pub(crate) async fn networked_lang_build_try(
         project_id: &str,
         redb: &str,
         toolchain: &str,
@@ -5242,7 +5304,7 @@ console.log("listening on " + port);
     }
 
     /// [`networked_lang_build_try`] with the `rebuild` flag exposed (per-target build reuse).
-    async fn networked_lang_build_opts(
+    pub(crate) async fn networked_lang_build_opts(
         project_id: &str,
         redb: &str,
         toolchain: &str,
@@ -5346,6 +5408,7 @@ console.log("listening on " + port);
             output_size_bytes: t.output_mib * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net,
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -5367,7 +5430,7 @@ console.log("listening on " + port);
     /// Write the shared single-`api`-server jkbase.toml the boot helper expects
     /// (it asserts a layered `api` server + routes `/`). `language` selects the
     /// toolchain + the stamped runtime layer.
-    fn write_lang_manifest(src: &Path, name: &str, language: &str) {
+    pub(crate) fn write_lang_manifest(src: &Path, name: &str, language: &str) {
         write(
             src.join("jkbase.toml"),
             &format!(
@@ -9715,6 +9778,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net,
             fetch_deadline: Duration::from_secs(300),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

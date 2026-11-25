@@ -713,7 +713,23 @@ pub struct QuotaLimits {
     /// Maximum number of buckets for this project.
     #[serde(default = "default_max_buckets")]
     pub max_buckets: u64,
+    /// Guest RAM (MiB) for this project's build VMs. `None` = the host's default
+    /// (`BuildDeps::mem_size_mib`, box-tunable), which is why this is an `Option` and not a
+    /// value clamped to a default here: the control plane doesn't know the host's size.
+    /// Platform-admin-only to raise or set (a tenant write carrying it is refused), because
+    /// it spends shared host RAM; bounded by [`BUILD_MEM_MIB_MIN`]..=[`BUILD_MEM_MIB_MAX`]
+    /// at the API and by the host's build-memory budget at build time. `#[serde(default)]`
+    /// so overrides stored before this field existed deserialize as "host default".
+    #[serde(default)]
+    pub build_mem_mib: Option<u32>,
 }
+
+/// Smallest build-VM RAM an override may set: below this the build kernel + jkbuild +
+/// any real toolchain can't run, so a lower value is a typo, not a choice.
+pub const BUILD_MEM_MIB_MIN: u32 = 1024;
+/// Largest build-VM RAM an override may set — a sanity ceiling against a typo'd extra
+/// digit. The host additionally refuses a size above its own build-memory budget.
+pub const BUILD_MEM_MIB_MAX: u32 = 32768;
 
 const DEFAULT_BUILD_SECONDS_PER_MONTH: u64 = 200 * 60; // 200 build-minutes/month
 fn default_build_seconds_per_month() -> u64 {
@@ -736,6 +752,7 @@ pub const DEFAULT_QUOTA: QuotaLimits = QuotaLimits {
     build_seconds_per_month: DEFAULT_BUILD_SECONDS_PER_MONTH,
     max_objects: DEFAULT_MAX_OBJECTS,
     max_buckets: DEFAULT_MAX_BUCKETS,
+    build_mem_mib: None,
 };
 
 /// Enforcement state for a project. Source of truth for the wake gate, so a
@@ -4787,10 +4804,12 @@ mod tests {
                     build_seconds_per_month: 789,
                     max_objects: DEFAULT_MAX_OBJECTS,
                     max_buckets: DEFAULT_MAX_BUCKETS,
+                    build_mem_mib: Some(8192),
                 },
             )
             .unwrap();
         assert_eq!(store.get_quota("p").unwrap().storage_bytes_max, 123);
+        assert_eq!(store.get_quota("p").unwrap().build_mem_mib, Some(8192));
         assert_eq!(store.get_quota("p").unwrap().build_seconds_per_month, 789);
         assert!(store.get_quota_override("p").unwrap().is_some());
         assert!(store.remove_quota("p").unwrap());

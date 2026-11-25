@@ -2,6 +2,8 @@ mod auth_service;
 mod build_ca;
 mod build_cache;
 mod build_orchestrator;
+mod build_mem_budget;
+mod build_sizing;
 mod db_backup_store;
 mod db_admin;
 mod db_ops;
@@ -219,6 +221,17 @@ struct Args {
     /// --build-net (the mirror rides the narrow proxy).
     #[arg(long)]
     build_mirror: bool,
+
+    /// Host-wide build-memory budget (MiB) shared by EVERY build VM of every tenant: a VM
+    /// reserves its cgroup cap (guest RAM + VMM headroom; 4608 MiB for a default 4096 MiB VM)
+    /// before booting; builds that don't fit queue, admitted fairly across tenants (the tenant
+    /// holding least goes first, so one tenant's backlog can't stall others), for at most twice
+    /// the build-VM timeout before failing "capacity busy". This is what makes an admin-granted bigger build
+    /// VM (`jkbase quota --set-build-mem-mib`) safe on a shared host. The default admits four
+    /// default-size VMs at once; size it to the RAM the box can give builds alongside its
+    /// tenant VMs. The server refuses to start with a budget too small for one default VM.
+    #[arg(long, default_value = "18432")]
+    build_mem_budget_mib: u32,
 
     /// Ceiling (bytes) on the package mirror's content store. Once the cached blobs
     /// exceed this, the mirror evicts least-recently-used artifacts (via the substrate
@@ -1955,6 +1968,31 @@ async fn async_main() -> Result<()> {
         let _g = runtime_ebtables_lock().lock().await;
         ensure_runtime_source_guard_chain().await?;
     }
+    // The default build VM (see the sizing note on `BuildDeps` below) and the host-wide budget
+    // every build VM reserves from. A budget that can't fit even one default VM would fail
+    // every build at runtime, so it is refused here instead.
+    const BUILD_VM_MEM_MIB: u32 = 4096;
+    const BUILD_VM_CGROUP_MEM_BYTES: u64 = 4608 * 1024 * 1024;
+    const BUILD_VM_TIMEOUT: Duration = Duration::from_secs(900);
+    let default_build_vm =
+        build_sizing::size_for(BUILD_VM_MEM_MIB, BUILD_VM_CGROUP_MEM_BYTES, None);
+    if args.build_mem_budget_mib < default_build_vm.reserve_mib() {
+        anyhow::bail!(
+            "--build-mem-budget-mib {} is smaller than one default build VM ({} MiB)",
+            args.build_mem_budget_mib,
+            default_build_vm.reserve_mib()
+        );
+    }
+    // The fairest waiter waits at most for the running VMs to exit (one build-VM timeout), so
+    // a wait of twice that only expires behind a real backlog.
+    let build_mem_budget = Arc::new(build_mem_budget::BuildMemBudget::new(
+        args.build_mem_budget_mib,
+        2 * BUILD_VM_TIMEOUT,
+    ));
+    info!(
+        budget_mib = build_mem_budget.total_mib(),
+        "build-memory budget"
+    );
     let build_deps = Arc::new(build_orchestrator::BuildDeps {
         jailer_bin: fc_release.join("jailer-v1.15.1-x86_64"),
         firecracker_bin: fc_release.join("firecracker-v1.15.1-x86_64"),
@@ -1975,16 +2013,17 @@ async fn async_main() -> Result<()> {
         // install + source + build output needs GiB of scratch, and the app erofs blob
         // needs room in the output drive even after the production prune. The cgroup
         // memory cap (> guest RAM) keeps a hostile build from host-OOM. Tunable per box.
-        timeout: Duration::from_secs(900),
+        timeout: BUILD_VM_TIMEOUT,
         vcpu_count: 4,
-        mem_size_mib: 4096,
+        mem_size_mib: BUILD_VM_MEM_MIB,
         cgroup_pids_max: 1024,
-        cgroup_mem_max_bytes: 4608 * 1024 * 1024,
+        cgroup_mem_max_bytes: BUILD_VM_CGROUP_MEM_BYTES,
         cgroup_cpu_max: "400000 100000".to_string(),
         scratch_size_bytes: 4096 * 1024 * 1024,
         output_size_bytes: 1024 * 1024 * 1024,
         console_log_max_bytes: 1024 * 1024,
         max_concurrent: 4,
+        mem_budget: build_mem_budget.clone(),
         net: build_net,
         fetch_deadline: Duration::from_secs(600),
         cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

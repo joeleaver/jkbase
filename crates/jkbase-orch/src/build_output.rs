@@ -102,7 +102,11 @@ pub fn dump_file(image: &Path, guest_path: &str, dest: &Path) -> Result<bool> {
 /// Read a known file out of the untrusted `image`, capped at `max_bytes` (keeping
 /// the *tail* when larger, since logs are most useful at the end). Returns `None`
 /// if the file is absent. Uses a temp file alongside `image` (same dir, so same
-/// filesystem) for the debugfs dump, then reads + removes it.
+/// filesystem) for the debugfs dump, then reads ONLY the tail + removes it: the guest
+/// sizes the file (up to the whole output drive), so it is never read into host memory
+/// whole. The transient dump is bounded by the output drive the host already holds. For
+/// a file that should only ever be tiny, use [`read_small`], which never dumps an
+/// oversized one at all.
 pub fn read_capped(image: &Path, guest_path: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
     let stem = guest_path.trim_matches('/').replace('/', "_");
     let tmp = image.with_file_name(format!(
@@ -113,20 +117,70 @@ pub fn read_capped(image: &Path, guest_path: &str, max_bytes: usize) -> Result<O
     if !present {
         return Ok(None);
     }
-    let bytes = std::fs::read(&tmp).with_context(|| format!("read dumped {}", tmp.display()))?;
+    let tail = read_tail(&tmp, max_bytes);
     let _ = std::fs::remove_file(&tmp);
-    let bytes = if bytes.len() > max_bytes {
-        bytes[bytes.len() - max_bytes..].to_vec()
-    } else {
-        bytes
-    };
-    Ok(Some(bytes))
+    Ok(Some(tail.with_context(|| {
+        format!("read dumped {}", tmp.display())
+    })?))
+}
+
+/// The last `max_bytes` of `path`, reading nothing before them.
+fn read_tail(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max_bytes as u64)))?;
+    let mut buf = Vec::with_capacity(len.min(max_bytes as u64) as usize);
+    f.take(max_bytes as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// The size the image's inode for `guest_path` claims, via `debugfs -R "stat …"` (no mount,
+/// nothing dumped). `None` if the file is absent. `guest_path` must be whitespace-free.
+fn inode_size(image: &Path, guest_path: &str) -> Result<Option<u64>> {
+    if guest_path.contains(char::is_whitespace) {
+        bail!("debugfs stat path must be whitespace-free: {guest_path:?}");
+    }
+    let out = std::process::Command::new("debugfs")
+        .arg("-R")
+        .arg(format!("stat {guest_path}"))
+        .arg(image)
+        .output()
+        .with_context(|| format!("run debugfs stat {guest_path} on {}", image.display()))?;
+    if String::from_utf8_lossy(&out.stderr).contains("File not found") {
+        return Ok(None);
+    }
+    // `stat` prints e.g. `User:     0   Group:     0   Project: 0   Size: 2`.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let size = stdout
+        .split_whitespace()
+        .skip_while(|t| *t != "Size:")
+        .nth(1)
+        .and_then(|v| v.parse().ok());
+    match size {
+        Some(n) => Ok(Some(n)),
+        None => bail!(
+            "debugfs could not stat {guest_path} in {} (unreadable/corrupt image?)",
+            image.display()
+        ),
+    }
+}
+
+/// Read a file that the output contract says is tiny (`/status`, `/oom_kills`). One whose
+/// inode claims more than `max_bytes` is treated as absent WITHOUT being dumped, so a
+/// hostile guest can't make the host copy a drive-sized file to read 32 bytes of it; the
+/// guest only loses its own status. Never mounts (`stat` + `dump`, both debugfs).
+pub fn read_small(image: &Path, guest_path: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
+    match inode_size(image, guest_path)? {
+        Some(n) if n <= max_bytes as u64 => read_capped(image, guest_path, max_bytes),
+        _ => Ok(None),
+    }
 }
 
 /// Read and parse the build-runner's `/status` file (the build's exit code).
 /// `None` if absent (e.g. the guest crashed before writing it) or unparseable.
 pub fn read_status(image: &Path) -> Result<Option<i32>> {
-    let Some(bytes) = read_capped(image, "/status", 32)? else {
+    let Some(bytes) = read_small(image, "/status", 32)? else {
         return Ok(None);
     };
     Ok(String::from_utf8_lossy(&bytes).trim().parse::<i32>().ok())
@@ -198,6 +252,14 @@ mod tests {
         // oversized log is tail-capped
         let log = read_capped(&img, "/build.log", 16 * 1024).unwrap().unwrap();
         assert_eq!(log.len(), 16 * 1024);
+        // a should-be-tiny file that isn't is refused without being dumped; absent is None
+        assert_eq!(
+            read_small(&img, "/status", 32).unwrap(),
+            Some(b"0\n".to_vec())
+        );
+        assert_eq!(read_small(&img, "/build.log", 32).unwrap(), None);
+        assert_eq!(read_small(&img, "/does-not-exist", 32).unwrap(), None);
+        assert_eq!(inode_size(&img, "/build.log").unwrap(), Some(100_000));
 
         // A CORRUPT/unreadable image must ERROR, not read as "file absent" — the
         // load-bearing distinction the baselayers GC relies on to fail safe.
