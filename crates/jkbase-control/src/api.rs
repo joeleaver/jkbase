@@ -2082,6 +2082,16 @@ async fn run_build_job(
     let staged = match cb(ctx).await {
         Ok(p) => p,
         Err(e) => {
+            // The full error (with the build log tail) goes to the build record the CLI
+            // polls; the journal gets its first line, so an operator reading the server log
+            // sees WHY a build failed instead of only "build VM exited cleanly".
+            let summary = format!("{e:#}");
+            tracing::warn!(
+                project_id,
+                build_id,
+                error = %summary.lines().next().unwrap_or_default(),
+                "build failed"
+            );
             update_build(&state, project_id, build_id, |r| {
                 r.phase = BuildPhase::Failed;
                 r.error = Some(format!("build failed: {e:#}"));
@@ -2609,6 +2619,8 @@ pub struct QuotaResponse {
     pub build_seconds_per_month: u64,
     pub max_objects: u64,
     pub max_buckets: u64,
+    /// Build-VM guest RAM override in MiB; `null` = the host's default build size.
+    pub build_mem_mib: Option<u32>,
     /// True if this project has a per-project override (vs platform defaults).
     pub overridden: bool,
     pub bandwidth_blocked: bool,
@@ -2637,6 +2649,11 @@ pub struct SetQuotaRequest {
     pub max_objects: Option<u64>,
     #[serde(default)]
     pub max_buckets: Option<u64>,
+    /// Build-VM guest RAM in MiB, platform-admin only (see [`check_build_mem`]). `0` clears
+    /// the override back to the host default; any other value must lie within
+    /// `BUILD_MEM_MIB_MIN..=BUILD_MEM_MIB_MAX`.
+    #[serde(default)]
+    pub build_mem_mib: Option<u32>,
 }
 
 impl SetQuotaRequest {
@@ -2649,6 +2666,32 @@ impl SetQuotaRequest {
             && self.build_seconds_per_month.is_none()
             && self.max_objects.is_none()
             && self.max_buckets.is_none()
+            && self.build_mem_mib.is_none()
+    }
+}
+
+/// Gate the build-memory field of a quota write. Unlike the other caps it is never
+/// "clamped to default" for a tenant: the default is the host's, and a bigger build VM
+/// spends RAM shared by every tenant, so only a platform admin may touch it at all (a
+/// tenant body carrying it is refused outright rather than silently dropped, so the CLI
+/// can't report a success that didn't happen). The range check is a typo guard; the host
+/// also refuses a size above its build-memory budget when the build runs.
+fn check_build_mem(req: &SetQuotaRequest, is_admin: bool) -> Result<(), (StatusCode, String)> {
+    use crate::store::{BUILD_MEM_MIB_MAX, BUILD_MEM_MIB_MIN};
+    match req.build_mem_mib {
+        None => Ok(()),
+        Some(_) if !is_admin => Err((
+            StatusCode::FORBIDDEN,
+            "build_mem_mib can only be set by the platform operator".into(),
+        )),
+        Some(0) => Ok(()),
+        Some(v) if (BUILD_MEM_MIB_MIN..=BUILD_MEM_MIB_MAX).contains(&v) => Ok(()),
+        Some(v) => Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "build_mem_mib {v} is out of range ({BUILD_MEM_MIB_MIN}..={BUILD_MEM_MIB_MAX}, or 0 to clear)"
+            ),
+        )),
     }
 }
 
@@ -2685,6 +2728,12 @@ fn resolve_quota(
         ),
         max_objects: field(req.max_objects, current.max_objects, d.max_objects),
         max_buckets: field(req.max_buckets, current.max_buckets, d.max_buckets),
+        // Admin-gated by `check_build_mem` before this runs; `0` clears the override.
+        build_mem_mib: match req.build_mem_mib {
+            None => current.build_mem_mib,
+            Some(0) => None,
+            Some(v) => Some(v),
+        },
     }
 }
 
@@ -2806,6 +2855,7 @@ async fn get_project_quota(
         build_seconds_per_month: limits.build_seconds_per_month,
         max_objects: limits.max_objects,
         max_buckets: limits.max_buckets,
+        build_mem_mib: limits.build_mem_mib,
         overridden,
         bandwidth_blocked: status
             .as_ref()
@@ -2877,6 +2927,9 @@ async fn set_project_quota(
                 .into_response();
         }
     };
+    if let Err((status, error)) = check_build_mem(&req, is_admin) {
+        return (status, Json(ErrorResponse { error })).into_response();
+    }
     let limits = resolve_quota(&req, &current, is_admin);
     match state.store.set_quota(&id, &limits) {
         Ok(()) => Json(QuotaResponse {
@@ -2885,6 +2938,7 @@ async fn set_project_quota(
             build_seconds_per_month: limits.build_seconds_per_month,
             max_objects: limits.max_objects,
             max_buckets: limits.max_buckets,
+            build_mem_mib: limits.build_mem_mib,
             overridden: true,
             bandwidth_blocked: false,
             blocked_reason: None,
@@ -5675,7 +5729,8 @@ fn to_response(p: &Project) -> ProjectResponse {
 #[cfg(test)]
 mod tests {
     use super::db::hardlink_clone_dir;
-    use super::{ct_eq, resolve_quota, SetQuotaRequest};
+    use super::{check_build_mem, ct_eq, resolve_quota, SetQuotaRequest};
+    use axum::http::StatusCode;
     use crate::store::{QuotaLimits, DEFAULT_QUOTA};
 
     const GIB: u64 = 1 << 30;
@@ -5692,6 +5747,7 @@ mod tests {
             build_seconds_per_month: 4242,
             max_objects: 5000,
             max_buckets: 9,
+            build_mem_mib: Some(8192),
         };
 
         // Admin raises ONLY bandwidth (above default); every other cap omitted.
@@ -5706,6 +5762,7 @@ mod tests {
         assert_eq!(out.build_seconds_per_month, current.build_seconds_per_month);
         assert_eq!(out.max_objects, current.max_objects);
         assert_eq!(out.max_buckets, current.max_buckets);
+        assert_eq!(out.build_mem_mib, current.build_mem_mib);
 
         // A non-admin tenant partial set: the omitted (admin-granted, above-default)
         // storage cap is preserved, NOT clawed back to the default; the passed cap clamps.
@@ -5743,6 +5800,57 @@ mod tests {
         let out = resolve_quota(&req, &current, true);
         assert_eq!(out.storage_bytes_max, 100 * GIB, "untouched cap preserved");
         assert_eq!(out.bandwidth_bytes_per_month, 1099511627776);
+    }
+
+    // Build memory spends shared host RAM: a tenant can't touch it (refused, not dropped);
+    // an admin may set it within the typo-guard range or clear it with 0.
+    #[test]
+    fn build_mem_is_admin_only_range_checked_and_clearable() {
+        use crate::store::{BUILD_MEM_MIB_MAX, BUILD_MEM_MIB_MIN};
+        let req = |v| SetQuotaRequest {
+            build_mem_mib: Some(v),
+            ..Default::default()
+        };
+        assert!(!req(8192).is_empty(), "a build-mem-only body is not a no-op");
+        assert_eq!(
+            check_build_mem(&req(8192), false).unwrap_err().0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            check_build_mem(&req(0), false).unwrap_err().0,
+            StatusCode::FORBIDDEN,
+            "a tenant can't clear an admin grant either"
+        );
+        for ok in [0, BUILD_MEM_MIB_MIN, 8192, BUILD_MEM_MIB_MAX] {
+            assert!(check_build_mem(&req(ok), true).is_ok(), "{ok}");
+        }
+        for bad in [1, BUILD_MEM_MIB_MIN - 1, BUILD_MEM_MIB_MAX + 1] {
+            assert_eq!(
+                check_build_mem(&req(bad), true).unwrap_err().0,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad}"
+            );
+        }
+        assert!(check_build_mem(&SetQuotaRequest::default(), false).is_ok());
+
+        let granted = QuotaLimits {
+            build_mem_mib: Some(8192),
+            ..DEFAULT_QUOTA
+        };
+        assert_eq!(resolve_quota(&req(12288), &DEFAULT_QUOTA, true).build_mem_mib, Some(12288));
+        assert_eq!(resolve_quota(&req(0), &granted, true).build_mem_mib, None, "0 clears");
+        // A tenant's write of OTHER caps leaves the admin grant alone.
+        let other = SetQuotaRequest {
+            max_buckets: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(resolve_quota(&other, &granted, false).build_mem_mib, Some(8192));
+        // Overrides stored before the field existed read back as "host default".
+        let old: QuotaLimits = serde_json::from_str(
+            r#"{"storage_bytes_max":1,"bandwidth_bytes_per_month":2}"#,
+        )
+        .unwrap();
+        assert_eq!(old.build_mem_mib, None);
     }
 
     // A restart relaunches the CURRENT live version (to re-inject secrets) and
