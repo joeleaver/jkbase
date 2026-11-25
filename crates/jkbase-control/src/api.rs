@@ -2083,13 +2083,15 @@ async fn run_build_job(
         Ok(p) => p,
         Err(e) => {
             // The full error (with the build log tail) goes to the build record the CLI
-            // polls; the journal gets its first line, so an operator reading the server log
-            // sees WHY a build failed instead of only "build VM exited cleanly".
+            // polls; the journal gets a short summary, so an operator reading the server log
+            // sees WHY a build failed instead of only "build VM exited cleanly". Parts of it
+            // are guest-written (artifact names, digests), so it is bounded and logged with
+            // `?` (quoted + escaped): a hostile build can't forge fields or lines.
             let summary = format!("{e:#}");
             tracing::warn!(
                 project_id,
                 build_id,
-                error = %summary.lines().next().unwrap_or_default(),
+                error = ?log_summary(&summary),
                 "build failed"
             );
             update_build(&state, project_id, build_id, |r| {
@@ -2669,6 +2671,17 @@ impl SetQuotaRequest {
             && self.build_mem_mib.is_none()
     }
 }
+
+/// The first line of a build error, cut to [`LOG_SUMMARY_MAX`] chars, for the journal.
+fn log_summary(error: &str) -> String {
+    let line = error.lines().next().unwrap_or_default();
+    let mut out: String = line.chars().take(LOG_SUMMARY_MAX).collect();
+    if line.chars().count() > LOG_SUMMARY_MAX {
+        out.push('…');
+    }
+    out
+}
+const LOG_SUMMARY_MAX: usize = 256;
 
 /// Gate the build-memory field of a quota write. Unlike the other caps it is never
 /// "clamped to default" for a tenant: the default is the host's, and a bigger build VM
@@ -5800,6 +5813,16 @@ mod tests {
         let out = resolve_quota(&req, &current, true);
         assert_eq!(out.storage_bytes_max, 100 * GIB, "untouched cap preserved");
         assert_eq!(out.bandwidth_bytes_per_month, 1099511627776);
+    }
+
+    #[test]
+    fn build_failure_log_summary_is_one_bounded_line() {
+        assert_eq!(super::log_summary("a: b\nlog tail"), "a: b");
+        let long = "x".repeat(1000);
+        let s = super::log_summary(&long);
+        assert_eq!(s.chars().count(), super::LOG_SUMMARY_MAX + 1);
+        assert!(s.ends_with('…'));
+        assert_eq!(super::log_summary(""), "");
     }
 
     // Build memory spends shared host RAM: a tenant can't touch it (refused, not dropped);

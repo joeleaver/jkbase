@@ -3,17 +3,27 @@
 //! A build VM's guest RAM is the host default (`BuildDeps::mem_size_mib`) unless the platform
 //! operator granted the project more (`QuotaLimits::build_mem_mib`, admin-only — a tenant can
 //! never size its own VM). Raising one project's VM is only safe because every build VM, of
-//! every tenant, first reserves its RAM from ONE [`BuildMemBudget`]: the per-job
+//! every tenant, first reserves its memory from ONE [`BuildMemBudget`]: the per-job
 //! `max_concurrent` semaphore bounds VMs per build, not per host, so without the budget N
-//! concurrent tenants × 4 targets × an enlarged VM could commit more guest RAM than the host
-//! has and host-OOM everyone (threat model: all tenants untrusted, the host is shared).
+//! concurrent tenants × 4 targets × an enlarged VM could commit more RAM than the host has and
+//! host-OOM everyone (threat model: all tenants untrusted, the host is shared).
+//!
+//! A shared budget is itself a cross-tenant resource, so it is fenced two ways: one tenant may
+//! hold at most HALF of it at once (a single many-target deploy, or many projects of one
+//! tenant, can't stall everyone else's builds), and a reservation waits at most `max_wait`
+//! before the target fails with "capacity busy" rather than queueing unboundedly. A VM
+//! reserves its cgroup cap (guest RAM + VMM headroom), the most it can actually commit.
+//! The orchestrator takes a reservation only once the VM is about to boot (after the
+//! per-language cache lock) and drops it as soon as the VM exits, so it is never held idle.
 //!
 //! A guest that exhausts its RAM is OOM-killed INSIDE the guest (the cgroup cap sits above guest
 //! RAM, so the host never sees it): the compiler dies of SIGKILL and the build script exits 1.
 //! jkbuild records the guest's `oom_kill` counter in `/out/oom_kills`; [`oom_failure`] turns that
 //! into an error that names the cause and the size, instead of an opaque "status Some(1)".
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -26,6 +36,14 @@ pub struct BuildVmSize {
     pub mem_size_mib: u32,
     /// The VM's cgroup `memory.max`: guest RAM plus the host's VMM headroom.
     pub cgroup_mem_max_bytes: u64,
+}
+
+impl BuildVmSize {
+    /// What the VM reserves from the budget: its cgroup cap in MiB (rounded up) — the most host
+    /// memory it can commit, not just its guest RAM.
+    pub fn reserve_mib(&self) -> u32 {
+        u32::try_from(self.cgroup_mem_max_bytes.div_ceil(MIB)).unwrap_or(u32::MAX)
+    }
 }
 
 /// Size a project's build VM. With no override it is exactly the host default (byte-identical to
@@ -53,34 +71,87 @@ pub fn size_for(
     }
 }
 
-/// Host-wide guest-RAM budget (MiB) shared by every build VM of every tenant. A VM holds its
-/// reservation for its whole run; builds that don't fit wait (FIFO — tokio's semaphore is fair,
-/// so a big VM isn't starved by a stream of small ones).
+/// Host-wide build-memory budget (MiB) shared by every build VM of every tenant, with a per-tenant
+/// share of half of it. Builds that don't fit wait, FIFO (tokio's semaphore is fair, so a big VM
+/// isn't starved by a stream of small ones), for at most `max_wait`.
 #[derive(Debug)]
 pub struct BuildMemBudget {
-    sem: Arc<Semaphore>,
+    global: Arc<Semaphore>,
     total_mib: u32,
+    share_mib: u32,
+    max_wait: Duration,
+    /// Per-tenant share semaphores, created on first use. An entry nobody holds or waits on
+    /// (only the map's own `Arc`) is pruned on the next reservation, so the map tracks active
+    /// tenants, not every tenant ever seen.
+    shares: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+/// One build VM's hold on the budget; dropping it returns the memory (both the tenant's share
+/// and the host-wide budget).
+#[derive(Debug)]
+pub struct MemReservation {
+    _share: OwnedSemaphorePermit,
+    _global: OwnedSemaphorePermit,
 }
 
 impl BuildMemBudget {
-    pub fn new(total_mib: u32) -> Self {
+    pub fn new(total_mib: u32, max_wait: Duration) -> Self {
         Self {
-            sem: Arc::new(Semaphore::new(total_mib as usize)),
+            global: Arc::new(Semaphore::new(total_mib as usize)),
             total_mib,
+            share_mib: (total_mib / 2).max(1),
+            max_wait,
+            shares: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Reserve `mib` for one build VM, waiting until it fits. A VM larger than the whole budget
-    /// could never fit — refused with an operator-facing reason instead of waiting forever.
-    pub async fn reserve(&self, mib: u32) -> Result<OwnedSemaphorePermit> {
+    /// A budget no test build can exhaust (1 TiB, waits up to an hour), for harnesses that
+    /// exercise everything but the budget itself.
+    #[cfg(test)]
+    pub fn unlimited() -> Self {
+        Self::new(1 << 20, Duration::from_secs(3600))
+    }
+
+    pub fn total_mib(&self) -> u32 {
+        self.total_mib
+    }
+
+    /// Reserve `mib` for one build VM of `tenant`, waiting (up to `max_wait`) until it fits in
+    /// both the tenant's share and the host budget. A VM larger than the whole budget could never
+    /// fit, so it's refused at once instead of waiting forever. A VM larger than the share still
+    /// runs, alone among its tenant's VMs (its share claim is clamped to the whole share).
+    pub async fn reserve(&self, tenant: &str, mib: u32) -> Result<MemReservation> {
         if mib > self.total_mib {
             bail!(
-                "build VM needs {mib} MiB but the host's build-memory budget is {} MiB; \
-                 lower the project's build memory or raise --build-mem-budget-mib",
+                "build VM needs {mib} MiB but the host's whole build-memory budget is {} MiB; \
+                 the platform operator must lower this project's build memory",
                 self.total_mib
             );
         }
-        Ok(self.sem.clone().acquire_many_owned(mib).await?)
+        let share = {
+            let mut shares = self.shares.lock().unwrap_or_else(|p| p.into_inner());
+            shares.retain(|_, s| Arc::strong_count(s) > 1);
+            shares
+                .entry(tenant.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(self.share_mib as usize)))
+                .clone()
+        };
+        let acquire = async {
+            let share = share.acquire_many_owned(mib.min(self.share_mib)).await?;
+            let global = self.global.clone().acquire_many_owned(mib).await?;
+            anyhow::Ok(MemReservation {
+                _share: share,
+                _global: global,
+            })
+        };
+        match tokio::time::timeout(self.max_wait, acquire).await {
+            Ok(r) => r,
+            Err(_) => bail!(
+                "the host's build capacity stayed busy for {}s (this build VM needs {mib} MiB); \
+                 retry the deploy",
+                self.max_wait.as_secs()
+            ),
+        }
     }
 }
 
@@ -134,25 +205,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_vm_reserves_its_cgroup_cap_not_just_guest_ram() {
+        assert_eq!(size_for(4096, 4608 * MIB, None).reserve_mib(), 4608);
+        assert_eq!(size_for(4096, 4608 * MIB, Some(8192)).reserve_mib(), 8704);
+        let odd = BuildVmSize {
+            mem_size_mib: 1,
+            cgroup_mem_max_bytes: MIB + 1,
+        };
+        assert_eq!(odd.reserve_mib(), 2, "rounded up, never under-reserved");
+    }
+
     #[tokio::test]
     async fn budget_admits_what_fits_and_refuses_what_never_can() {
-        let b = BuildMemBudget::new(8192);
-        let a = b.reserve(4096).await.unwrap();
-        let c = b.reserve(4096).await.unwrap();
+        let b = BuildMemBudget::new(8192, Duration::from_secs(5));
+        let a = b.reserve("t1", 4096).await.unwrap();
+        let c = b.reserve("t2", 4096).await.unwrap();
         // Full: a third reservation waits until one is released.
-        let waiting = tokio::time::timeout(std::time::Duration::from_millis(50), b.reserve(1024));
+        let waiting = tokio::time::timeout(Duration::from_millis(50), b.reserve("t3", 1024));
         assert!(waiting.await.is_err(), "budget exhausted, must wait");
         drop(a);
-        let d = tokio::time::timeout(std::time::Duration::from_secs(1), b.reserve(4096))
+        let d = tokio::time::timeout(Duration::from_secs(1), b.reserve("t3", 4096))
             .await
-            .expect("released RAM is reusable")
+            .expect("released memory is reusable")
             .unwrap();
         drop((c, d));
-        let err = b.reserve(8193).await.unwrap_err().to_string();
+        let err = b.reserve("t1", 8193).await.unwrap_err().to_string();
         assert!(
             err.contains("8193 MiB") && err.contains("8192 MiB"),
             "{err}"
         );
+    }
+
+    // The cross-tenant DoS the review found: one tenant's many-target deploy must not be able
+    // to take the whole host budget and stall everyone else.
+    #[tokio::test]
+    async fn one_tenant_holds_at_most_half_and_others_still_build() {
+        let b = BuildMemBudget::new(16384, Duration::from_secs(5));
+        let h1 = b.reserve("greedy", 4096).await.unwrap();
+        let h2 = b.reserve("greedy", 4096).await.unwrap();
+        // The greedy tenant's third VM waits on its share although the host has room...
+        let third = tokio::time::timeout(Duration::from_millis(50), b.reserve("greedy", 4096));
+        assert!(
+            third.await.is_err(),
+            "a tenant is capped at half the budget"
+        );
+        // ...which is left for everyone else.
+        let other = tokio::time::timeout(Duration::from_millis(200), b.reserve("other", 8192))
+            .await
+            .expect("another tenant isn't blocked by the greedy one")
+            .unwrap();
+        drop((h1, h2, other));
+        // A VM bigger than the share still runs, alone for its tenant.
+        let big = b.reserve("big", 12288).await.unwrap();
+        let next = tokio::time::timeout(Duration::from_millis(50), b.reserve("big", 1024));
+        assert!(next.await.is_err());
+        drop(big);
+        // Idle tenants' share entries are pruned.
+        let _ = b.reserve("later", 1024).await.unwrap();
+        assert_eq!(b.shares.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_is_bounded() {
+        let b = BuildMemBudget::new(4096, Duration::from_millis(50));
+        let _held = b.reserve("t1", 4096).await.unwrap();
+        let err = b.reserve("t2", 4096).await.unwrap_err().to_string();
+        assert!(err.contains("stayed busy"), "{err}");
     }
 
     #[test]

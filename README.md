@@ -909,9 +909,10 @@ after the subcommand; the token can also come from `$JKBASE_TOKEN`. (`jkbase aut
 `jkbase l4 pin <name> <port>` and raising quotas above defaults via `--admin-token`
 (`$JKBASE_ADMIN_TOKEN`) — both no-ops on a server started without an admin token. With the admin
 token, `jkbase quota --set-build-mem-mib N` sizes a project's build VMs (1024–32768 MiB; `0` returns
-it to the server default). Every build VM on the host reserves its RAM from one shared budget
-(`jkbase-server --build-mem-budget-mib`, default 16384), so a bigger VM queues instead of
-overcommitting the box.
+it to the server default). Every build VM on the host reserves its memory (guest RAM plus VMM
+headroom) from one shared budget (`jkbase-server --build-mem-budget-mib`, default 18432 — four
+default VMs), one tenant may hold at most half of it, and a build that can't get memory within 15
+minutes fails as "capacity busy" — so a bigger VM queues instead of overcommitting the box.
 
 ---
 

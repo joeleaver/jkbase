@@ -1560,49 +1560,6 @@ async fn build_one_target_inner(
         );
     }
 
-    // Size the VM (host default, or the project's admin-granted build memory) and reserve
-    // that RAM from the host-wide budget BEFORE leasing a network slot, so a VM queued for
-    // memory never sits on a TAP another build could use. Held until this target returns.
-    // A store read error falls back to the default size — never larger than intended.
-    let mem_override = match deps.store.get_quota(project_id) {
-        Ok(q) => q.build_mem_mib,
-        Err(e) => {
-            warn!(project = %project_id, target = %spec.name, error = %e,
-                  "could not read build-memory quota; using the default build VM size");
-            None
-        }
-    };
-    let size =
-        crate::build_sizing::size_for(deps.mem_size_mib, deps.cgroup_mem_max_bytes, mem_override);
-    let _mem_reservation = deps
-        .mem_budget
-        .reserve(size.mem_size_mib)
-        .await
-        .with_context(|| format!("reserve build memory for '{}'", spec.name))?;
-
-    // Lease an isolated TAP when a build network is configured, so this VM can
-    // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
-    let lease = match &deps.net {
-        Some(net) => Some(
-            net.acquire(is_dockerfile)
-                .await
-                .context("acquire build network")?,
-        ),
-        None => None,
-    };
-    let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
-        match (&deps.net, &lease) {
-            (Some(net), Some(l)) => (
-                Some(l.tap.clone()),
-                Some(l.mac.clone()),
-                Some(l.guest_ip.clone()),
-                Some(net.gateway.clone()),
-                Some(net.proxy_url_for(is_dockerfile)),
-                Some(make_seal(l.tap.clone())),
-            ),
-            _ => (None, None, None, None, None, None),
-        };
-
     // Per-`(project,language)` persistent warm cache (the `vde` drive): cargo
     // registry/git, npm/pnpm/yarn stores, etc. survive across builds for fast
     // rebuilds. Skipped for dockerfile builds (the image carries its own cache) and
@@ -1647,6 +1604,60 @@ async fn build_one_target_inner(
     } else {
         None
     };
+
+    // Size the VM (host default, or the project's admin-granted build memory) and reserve its
+    // memory from the host-wide budget, under its TENANT's share (half the budget at most, so
+    // one tenant can't stall everyone's builds). Taken AFTER the per-language cache lock (a
+    // target queued on that lock holds nothing) and BEFORE the network lease (a target queued
+    // for memory holds no TAP); dropped as soon as the VM exits. A store read error falls back
+    // to the default size — never larger than intended.
+    let mem_override = match deps.store.get_quota(project_id) {
+        Ok(q) => q.build_mem_mib,
+        Err(e) => {
+            warn!(project = %project_id, target = %spec.name, error = %e,
+                  "could not read build-memory quota; using the default build VM size");
+            None
+        }
+    };
+    // The share key: the owning tenant, so many projects of one tenant share one share. A
+    // project without an owner (or an unreadable one) is its own key.
+    let share_key = deps
+        .store
+        .get_project(project_id)
+        .ok()
+        .flatten()
+        .and_then(|p| p.tenant_id)
+        .unwrap_or_else(|| project_id.to_string());
+    let size =
+        crate::build_sizing::size_for(deps.mem_size_mib, deps.cgroup_mem_max_bytes, mem_override);
+    let mem_reservation = deps
+        .mem_budget
+        .reserve(&share_key, size.reserve_mib())
+        .await
+        .with_context(|| format!("reserve build memory for '{}'", spec.name))?;
+
+    // Lease an isolated TAP when a build network is configured, so this VM can
+    // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
+    let lease = match &deps.net {
+        Some(net) => Some(
+            net.acquire(is_dockerfile)
+                .await
+                .context("acquire build network")?,
+        ),
+        None => None,
+    };
+    let (tap_device, guest_mac, guest_ip, gateway_ip, egress_proxy, seal) =
+        match (&deps.net, &lease) {
+            (Some(net), Some(l)) => (
+                Some(l.tap.clone()),
+                Some(l.mac.clone()),
+                Some(l.guest_ip.clone()),
+                Some(net.gateway.clone()),
+                Some(net.proxy_url_for(is_dockerfile)),
+                Some(make_seal(l.tap.clone())),
+            ),
+            _ => (None, None, None, None, None, None),
+        };
 
     let cfg = BuildVmConfig {
         jailer_bin: deps.jailer_bin.clone(),
@@ -1719,6 +1730,9 @@ async fn build_one_target_inner(
 
     let runtime_dir = workspace.join("run");
     let run_res = BuildVm::run(&vm_id, &cfg, &runtime_dir).await;
+    // The VM has exited (or never booted): its memory is free for the next build now, not
+    // after this target's post-run collection.
+    drop(mem_reservation);
     // Always return the network lease (delete TAP + free slot), even on error.
     if let (Some(net), Some(l)) = (&deps.net, lease) {
         net.release(l).await;
@@ -1813,7 +1827,7 @@ async fn build_one_target_inner(
         // jkbuild records the guest's OOM-kill count; a failure with kills is an OOM, named
         // as one (with the VM's size) rather than a bare exit status. Absent on toolchain
         // images baked before jkbuild wrote it — then the plain message stands.
-        let oom_kills = build_output::read_capped(&output_img, "/oom_kills", 32)
+        let oom_kills = build_output::read_small(&output_img, "/oom_kills", 32)
             .ok()
             .flatten()
             .and_then(|b| crate::build_sizing::parse_oom_kills(&b))
@@ -3846,7 +3860,7 @@ mod tests {
             output_size_bytes: 0,
             console_log_max_bytes: 0,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
             net: None,
             fetch_deadline: Duration::from_secs(1),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3978,7 +3992,7 @@ public = "./public"
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 2,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
             net: None,
             fetch_deadline: Duration::from_secs(60),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -5218,7 +5232,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
             net,
             // Real `bun install` over the network needs more headroom than the
             // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
@@ -5391,7 +5405,7 @@ console.log("listening on " + port);
             output_size_bytes: t.output_mib * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
             net,
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -9761,7 +9775,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
             net,
             fetch_deadline: Duration::from_secs(300),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
