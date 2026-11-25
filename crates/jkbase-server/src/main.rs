@@ -2,6 +2,7 @@ mod auth_service;
 mod build_ca;
 mod build_cache;
 mod build_orchestrator;
+mod build_mem_budget;
 mod build_sizing;
 mod db_backup_store;
 mod db_admin;
@@ -223,8 +224,9 @@ struct Args {
 
     /// Host-wide build-memory budget (MiB) shared by EVERY build VM of every tenant: a VM
     /// reserves its cgroup cap (guest RAM + VMM headroom; 4608 MiB for a default 4096 MiB VM)
-    /// before booting, builds that don't fit queue (up to 15 min, then fail "capacity busy"),
-    /// and one tenant may hold at most half. This is what makes an admin-granted bigger build
+    /// before booting; builds that don't fit queue, admitted fairly across tenants (the tenant
+    /// holding least goes first, so one tenant's backlog can't stall others), for at most twice
+    /// the build-VM timeout before failing "capacity busy". This is what makes an admin-granted bigger build
     /// VM (`jkbase quota --set-build-mem-mib`) safe on a shared host. The default admits four
     /// default-size VMs at once; size it to the RAM the box can give builds alongside its
     /// tenant VMs. The server refuses to start with a budget too small for one default VM.
@@ -1971,6 +1973,7 @@ async fn async_main() -> Result<()> {
     // every build at runtime, so it is refused here instead.
     const BUILD_VM_MEM_MIB: u32 = 4096;
     const BUILD_VM_CGROUP_MEM_BYTES: u64 = 4608 * 1024 * 1024;
+    const BUILD_VM_TIMEOUT: Duration = Duration::from_secs(900);
     let default_build_vm =
         build_sizing::size_for(BUILD_VM_MEM_MIB, BUILD_VM_CGROUP_MEM_BYTES, None);
     if args.build_mem_budget_mib < default_build_vm.reserve_mib() {
@@ -1980,9 +1983,11 @@ async fn async_main() -> Result<()> {
             default_build_vm.reserve_mib()
         );
     }
-    let build_mem_budget = Arc::new(build_sizing::BuildMemBudget::new(
+    // The fairest waiter waits at most for the running VMs to exit (one build-VM timeout), so
+    // a wait of twice that only expires behind a real backlog.
+    let build_mem_budget = Arc::new(build_mem_budget::BuildMemBudget::new(
         args.build_mem_budget_mib,
-        Duration::from_secs(900),
+        2 * BUILD_VM_TIMEOUT,
     ));
     info!(
         budget_mib = build_mem_budget.total_mib(),
@@ -2008,7 +2013,7 @@ async fn async_main() -> Result<()> {
         // install + source + build output needs GiB of scratch, and the app erofs blob
         // needs room in the output drive even after the production prune. The cgroup
         // memory cap (> guest RAM) keeps a hostile build from host-OOM. Tunable per box.
-        timeout: Duration::from_secs(900),
+        timeout: BUILD_VM_TIMEOUT,
         vcpu_count: 4,
         mem_size_mib: BUILD_VM_MEM_MIB,
         cgroup_pids_max: 1024,

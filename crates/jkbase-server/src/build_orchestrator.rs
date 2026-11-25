@@ -121,7 +121,7 @@ pub struct BuildDeps {
     /// not per host — the host-wide bound is `mem_budget`.
     pub max_concurrent: usize,
     /// Host-wide guest-RAM budget every build VM of every job reserves from before booting.
-    pub mem_budget: Arc<crate::build_sizing::BuildMemBudget>,
+    pub mem_budget: Arc<crate::build_mem_budget::BuildMemBudget>,
     /// Isolated build network for dependency fetches; `None` → offline builds.
     pub net: Option<Arc<BuildNet>>,
     /// Max time the FETCH phase may hold the network before the host force-seals.
@@ -1606,8 +1606,8 @@ async fn build_one_target_inner(
     };
 
     // Size the VM (host default, or the project's admin-granted build memory) and reserve its
-    // memory from the host-wide budget, under its TENANT's share (half the budget at most, so
-    // one tenant can't stall everyone's builds). Taken AFTER the per-language cache lock (a
+    // memory from the host-wide budget, admitted fairly per TENANT (so one tenant's backlog
+    // can't stall everyone's builds). Taken AFTER the per-language cache lock (a
     // target queued on that lock holds nothing) and BEFORE the network lease (a target queued
     // for memory holds no TAP); dropped as soon as the VM exits. A store read error falls back
     // to the default size — never larger than intended.
@@ -1619,9 +1619,9 @@ async fn build_one_target_inner(
             None
         }
     };
-    // The share key: the owning tenant, so many projects of one tenant share one share. A
+    // The fairness key: the owning tenant, so many projects of one tenant count as one. A
     // project without an owner (or an unreadable one) is its own key.
-    let share_key = deps
+    let tenant_key = deps
         .store
         .get_project(project_id)
         .ok()
@@ -1632,7 +1632,7 @@ async fn build_one_target_inner(
         crate::build_sizing::size_for(deps.mem_size_mib, deps.cgroup_mem_max_bytes, mem_override);
     let mem_reservation = deps
         .mem_budget
-        .reserve(&share_key, size.reserve_mib())
+        .reserve(&tenant_key, size.reserve_mib())
         .await
         .with_context(|| format!("reserve build memory for '{}'", spec.name))?;
 
@@ -3860,7 +3860,7 @@ mod tests {
             output_size_bytes: 0,
             console_log_max_bytes: 0,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net: None,
             fetch_deadline: Duration::from_secs(1),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3992,7 +3992,7 @@ public = "./public"
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 2,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net: None,
             fetch_deadline: Duration::from_secs(60),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -5232,7 +5232,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net,
             // Real `bun install` over the network needs more headroom than the
             // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
@@ -5301,7 +5301,7 @@ console.log("listening on " + port);
     }
 
     /// [`networked_lang_build_try`] with the `rebuild` flag exposed (per-target build reuse).
-    async fn networked_lang_build_opts(
+    pub(crate) async fn networked_lang_build_opts(
         project_id: &str,
         redb: &str,
         toolchain: &str,
@@ -5405,7 +5405,7 @@ console.log("listening on " + port);
             output_size_bytes: t.output_mib * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net,
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -9775,7 +9775,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
-            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::unlimited()),
+            mem_budget: Arc::new(crate::build_mem_budget::BuildMemBudget::unlimited()),
             net,
             fetch_deadline: Duration::from_secs(300),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

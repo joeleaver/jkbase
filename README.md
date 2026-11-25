@@ -911,8 +911,10 @@ after the subcommand; the token can also come from `$JKBASE_TOKEN`. (`jkbase aut
 token, `jkbase quota --set-build-mem-mib N` sizes a project's build VMs (1024–32768 MiB; `0` returns
 it to the server default). Every build VM on the host reserves its memory (guest RAM plus VMM
 headroom) from one shared budget (`jkbase-server --build-mem-budget-mib`, default 18432 — four
-default VMs), one tenant may hold at most half of it, and a build that can't get memory within 15
-minutes fails as "capacity busy" — so a bigger VM queues instead of overcommitting the box.
+default VMs). Waiting builds are admitted fairly across tenants — the tenant holding the least goes
+first, so one account's backlog never stalls another's — and a build that can't get memory within
+30 minutes (twice the build-VM timeout) fails as "capacity busy", so a bigger VM queues instead of
+overcommitting the box.
 
 ---
 
