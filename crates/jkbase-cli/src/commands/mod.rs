@@ -2,6 +2,7 @@ mod db;
 mod db_proxy;
 mod deploy;
 mod project;
+mod quota;
 mod release_sig;
 mod repo;
 mod upgrade;
@@ -68,7 +69,7 @@ pub enum Command {
         api: String,
     },
     /// Show or set per-project resource quotas. Set values can only restrict
-    /// (never raise above platform defaults).
+    /// (never raise above platform defaults); build memory is operator-only.
     Quota {
         /// Project name (inferred from jkbase.toml if not specified)
         #[arg(long)]
@@ -83,6 +84,10 @@ pub enum Command {
         /// platform default unless a valid --admin-token raises it).
         #[arg(long)]
         set_build_minutes: Option<f64>,
+        /// Set this project's build-VM RAM, in MiB (platform operator only: needs
+        /// --admin-token). `0` returns it to the server's default build-VM size.
+        #[arg(long)]
+        set_build_mem_mib: Option<u32>,
         /// Platform-operator admin token. With a valid token the server allows
         /// raising limits above the platform defaults (operator-only; ignored by a
         /// server started without --admin-token). Falls back to $JKBASE_ADMIN_TOKEN.
@@ -419,18 +424,17 @@ pub async fn run(command: Command) -> anyhow::Result<()> {
             set_storage_gib,
             set_bandwidth_gib,
             set_build_minutes,
+            set_build_mem_mib,
             admin_token,
             api,
         } => {
-            run_quota(
-                project,
-                set_storage_gib,
-                set_bandwidth_gib,
-                set_build_minutes,
-                admin_token,
-                api,
-            )
-            .await
+            let set = quota::QuotaSet {
+                storage_gib: set_storage_gib,
+                bandwidth_gib: set_bandwidth_gib,
+                build_minutes: set_build_minutes,
+                build_mem_mib: set_build_mem_mib,
+            };
+            quota::run_quota(project, set, admin_token, api).await
         }
         Command::Init { email, api } => {
             let client = reqwest::Client::new();
@@ -753,95 +757,6 @@ async fn run_usage(project: Option<String>, api: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_quota(
-    project: Option<String>,
-    set_storage_gib: Option<f64>,
-    set_bandwidth_gib: Option<f64>,
-    set_build_minutes: Option<f64>,
-    admin_token: Option<String>,
-    api: String,
-) -> anyhow::Result<()> {
-    let project_id = resolve_project_id(project)?;
-    let token =
-        crate::credentials::load_token()?.ok_or_else(|| anyhow::anyhow!("not authenticated"))?;
-    let client = crate::credentials::authenticated_client(&token);
-    let url = format!("{api}/projects/{project_id}/quota");
-
-    if set_storage_gib.is_some() || set_bandwidth_gib.is_some() || set_build_minutes.is_some() {
-        // Send ONLY the caps the operator actually passed; the server merges them onto the
-        // project's current values (an omitted cap is preserved, never zeroed). Sending a
-        // full body with defaulted-to-0 caps used to silently zero an untouched cap under
-        // --admin-token (the clamp that would have masked it is skipped for admins).
-        let mut body = serde_json::Map::new();
-        if let Some(g) = set_storage_gib {
-            body.insert("storage_bytes_max".into(), ((g * GIB) as u64).into());
-        }
-        if let Some(g) = set_bandwidth_gib {
-            body.insert("bandwidth_bytes_per_month".into(), ((g * GIB) as u64).into());
-        }
-        if let Some(m) = set_build_minutes {
-            // Quota is stored in build-SECONDS; the CLI takes minutes for parity with the
-            // 200-build-minute default. Non-admin sets are clamped to that default server-side.
-            body.insert("build_seconds_per_month".into(), ((m * 60.0) as u64).into());
-        }
-        let mut post = client.post(&url).json(&serde_json::Value::Object(body));
-        if let Some(tok) = &admin_token {
-            post = post.header("X-Admin-Token", tok);
-        }
-        let resp = post.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("failed to set quota ({})", resp.status());
-        }
-        println!(
-            "{}",
-            if admin_token.is_some() {
-                "Quota updated (admin override)."
-            } else {
-                "Quota updated (values are clamped to platform defaults)."
-            }
-        );
-    }
-
-    // Pass the admin token on the read too, so an operator setting a quota on a tenant's
-    // project sees the real values back (the GET is owner-scoped otherwise → 404→default).
-    let mut get = client.get(&url);
-    if let Some(tok) = &admin_token {
-        get = get.header("X-Admin-Token", tok);
-    }
-    let resp = get.send().await?;
-    if !resp.status().is_success() {
-        // Don't parse an error body as a quota — its missing fields would print as an
-        // all-zero "platform default" quota, hiding the not-found/authorization failure.
-        anyhow::bail!("failed to read quota ({})", resp.status());
-    }
-    let v: serde_json::Value = resp.json().await?;
-    println!("Quota for '{project_id}':");
-    println!(
-        "  Storage cap:   {}",
-        fmt_bytes(v["storage_bytes_max"].as_u64().unwrap_or(0))
-    );
-    println!(
-        "  Bandwidth cap: {} / month",
-        fmt_bytes(v["bandwidth_bytes_per_month"].as_u64().unwrap_or(0))
-    );
-    println!(
-        "  Build cap:     {:.0} build-minutes / month",
-        v["build_seconds_per_month"].as_u64().unwrap_or(0) as f64 / 60.0
-    );
-    println!(
-        "  Source:        {}",
-        if v["overridden"].as_bool().unwrap_or(false) {
-            "per-project override"
-        } else {
-            "platform default"
-        }
-    );
-    if v["bandwidth_blocked"].as_bool().unwrap_or(false) {
-        let reason = v["blocked_reason"].as_str().unwrap_or("over quota");
-        println!("  STATUS:        BLOCKED — {reason}");
-    }
-    Ok(())
-}
 
 async fn run_rollback(
     version: Option<u64>,
