@@ -2,6 +2,7 @@ mod auth_service;
 mod build_ca;
 mod build_cache;
 mod build_orchestrator;
+mod build_sizing;
 mod db_backup_store;
 mod db_admin;
 mod db_ops;
@@ -219,6 +220,14 @@ struct Args {
     /// --build-net (the mirror rides the narrow proxy).
     #[arg(long)]
     build_mirror: bool,
+
+    /// Host-wide guest-RAM budget (MiB) shared by EVERY build VM of every tenant: a VM
+    /// reserves its size before booting and builds that don't fit queue. This is what makes
+    /// an admin-granted bigger build VM (`jkbase quota --set-build-mem-mib`) safe on a shared
+    /// host. The default admits four default-size (4096 MiB) VMs at once; size it to the RAM
+    /// the box can give builds alongside its tenant VMs. No single VM may exceed it.
+    #[arg(long, default_value = "16384")]
+    build_mem_budget_mib: u32,
 
     /// Ceiling (bytes) on the package mirror's content store. Once the cached blobs
     /// exceed this, the mirror evicts least-recently-used artifacts (via the substrate
@@ -1985,6 +1994,7 @@ async fn async_main() -> Result<()> {
         output_size_bytes: 1024 * 1024 * 1024,
         console_log_max_bytes: 1024 * 1024,
         max_concurrent: 4,
+        mem_budget: Arc::new(build_sizing::BuildMemBudget::new(args.build_mem_budget_mib)),
         net: build_net,
         fetch_deadline: Duration::from_secs(600),
         cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),

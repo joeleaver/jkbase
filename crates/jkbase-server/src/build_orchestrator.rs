@@ -106,15 +106,22 @@ pub struct BuildDeps {
     pub gid: u32,
     pub timeout: Duration,
     pub vcpu_count: u32,
+    /// DEFAULT build-VM guest RAM; a project's admin-granted `QuotaLimits::build_mem_mib`
+    /// replaces it (see [`crate::build_sizing`]).
     pub mem_size_mib: u32,
     pub cgroup_pids_max: u32,
+    /// DEFAULT build-VM cgroup `memory.max`. Its headroom over `mem_size_mib` is kept for a
+    /// project with a build-memory override.
     pub cgroup_mem_max_bytes: u64,
     pub cgroup_cpu_max: String,
     pub scratch_size_bytes: u64,
     pub output_size_bytes: u64,
     pub console_log_max_bytes: u64,
-    /// Max build VMs booting concurrently across all jobs.
+    /// Max build VMs one build job runs at once (its targets fan out under this). Per JOB,
+    /// not per host — the host-wide bound is `mem_budget`.
     pub max_concurrent: usize,
+    /// Host-wide guest-RAM budget every build VM of every job reserves from before booting.
+    pub mem_budget: Arc<crate::build_sizing::BuildMemBudget>,
     /// Isolated build network for dependency fetches; `None` → offline builds.
     pub net: Option<Arc<BuildNet>>,
     /// Max time the FETCH phase may hold the network before the host force-seals.
@@ -1553,6 +1560,26 @@ async fn build_one_target_inner(
         );
     }
 
+    // Size the VM (host default, or the project's admin-granted build memory) and reserve
+    // that RAM from the host-wide budget BEFORE leasing a network slot, so a VM queued for
+    // memory never sits on a TAP another build could use. Held until this target returns.
+    // A store read error falls back to the default size — never larger than intended.
+    let mem_override = match deps.store.get_quota(project_id) {
+        Ok(q) => q.build_mem_mib,
+        Err(e) => {
+            warn!(project = %project_id, target = %spec.name, error = %e,
+                  "could not read build-memory quota; using the default build VM size");
+            None
+        }
+    };
+    let size =
+        crate::build_sizing::size_for(deps.mem_size_mib, deps.cgroup_mem_max_bytes, mem_override);
+    let _mem_reservation = deps
+        .mem_budget
+        .reserve(size.mem_size_mib)
+        .await
+        .with_context(|| format!("reserve build memory for '{}'", spec.name))?;
+
     // Lease an isolated TAP when a build network is configured, so this VM can
     // fetch deps through the egress proxy during FETCH and is sealed for COMPILE.
     let lease = match &deps.net {
@@ -1635,7 +1662,7 @@ async fn build_one_target_inner(
         cache_drive: cache_drive.clone(),
         persist_cache_from_seal: seal_captured,
         vcpu_count: deps.vcpu_count,
-        mem_size_mib: deps.mem_size_mib,
+        mem_size_mib: size.mem_size_mib,
         vsock_cid: None,
         timeout: deps.timeout,
         chroot_base: deps.chroot_base.clone(),
@@ -1644,7 +1671,7 @@ async fn build_one_target_inner(
         gid: deps.gid,
         parent_cgroup: deps.parent_cgroup.clone(),
         cgroup_pids_max: deps.cgroup_pids_max,
-        cgroup_mem_max_bytes: deps.cgroup_mem_max_bytes,
+        cgroup_mem_max_bytes: size.cgroup_mem_max_bytes,
         cgroup_cpu_max: deps.cgroup_cpu_max.clone(),
         // RLIMIT_FSIZE is process-wide on Firecracker, so it must cover the
         // LARGEST RW backing file it writes — the scratch drive, not just output
@@ -1783,6 +1810,21 @@ async fn build_one_target_inner(
 
     let status = build_output::read_status(&output_img)?;
     if status != Some(0) {
+        // jkbuild records the guest's OOM-kill count; a failure with kills is an OOM, named
+        // as one (with the VM's size) rather than a bare exit status. Absent on toolchain
+        // images baked before jkbuild wrote it — then the plain message stands.
+        let oom_kills = build_output::read_capped(&output_img, "/oom_kills", 32)
+            .ok()
+            .flatten()
+            .and_then(|b| crate::build_sizing::parse_oom_kills(&b))
+            .filter(|&n| n > 0);
+        if let Some(kills) = oom_kills {
+            bail!(crate::build_sizing::oom_failure(
+                size.mem_size_mib,
+                kills,
+                &log_str()
+            ));
+        }
         bail!("build script exited with status {status:?}\n{}", log_str());
     }
 
@@ -3804,6 +3846,7 @@ mod tests {
             output_size_bytes: 0,
             console_log_max_bytes: 0,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
             net: None,
             fetch_deadline: Duration::from_secs(1),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3935,6 +3978,7 @@ public = "./public"
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 2,
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
             net: None,
             fetch_deadline: Duration::from_secs(60),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -5174,6 +5218,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
             net,
             // Real `bun install` over the network needs more headroom than the
             // offline rung's compile; the seal fires on FETCH-COMPLETE before this.
@@ -5346,6 +5391,7 @@ console.log("listening on " + port);
             output_size_bytes: t.output_mib * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
             net,
             fetch_deadline: Duration::from_secs(t.fetch_deadline_secs),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -9715,6 +9761,7 @@ console.log("listening on " + port);
             output_size_bytes: 64 * 1024 * 1024,
             console_log_max_bytes: 1024 * 1024,
             max_concurrent: 1,
+            mem_budget: Arc::new(crate::build_sizing::BuildMemBudget::new(1 << 20)),
             net,
             fetch_deadline: Duration::from_secs(300),
             cache_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
