@@ -3877,7 +3877,7 @@ mod tests {
 /// Expects `$JKB_DATA/vmlinux.bin` and `$JKB_DATA/toolchains/default.ext4`
 /// (same filesystem as `$JKB_DATA`), and the cgroup provisioned by the harness.
 #[cfg(test)]
-mod onbox {
+pub(crate) mod onbox {
     use super::*;
     use jkbase_control::store::{BuildPhase, BuildRecord, Store};
 
@@ -3885,7 +3885,7 @@ mod onbox {
         "#!/bin/sh\nprintf '\\000asm\\001\\000\\000\\000' > \"$OUT/function.wasm\"\necho ok\n";
     const SERVER_BUILD: &str = "#!/bin/sh\nmkdir -p /tmp/rf/srv\necho hi > /tmp/rf/srv/index.html\ntar -czf \"$OUT/rootfs.tar.gz\" -C /tmp/rf .\nprintf '{\"cmd\":[\"/srv/app\"],\"working_dir\":\"/srv\",\"env\":{\"K\":\"V\"}}' > \"$OUT/manifest.json\"\n";
 
-    fn write(p: std::path::PathBuf, c: &str) {
+    pub(crate) fn write(p: std::path::PathBuf, c: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, c).unwrap();
     }
@@ -4781,12 +4781,12 @@ fn main() {
     }
 
     /// Everything the on-box pipeline tests share after a successful build.
-    struct BuildFixture {
+    pub(crate) struct BuildFixture {
         data: PathBuf,
         fc_release: PathBuf,
         kernel: PathBuf,
         store: Store,
-        staged: PathBuf,
+        pub(crate) staged: PathBuf,
     }
 
     /// Which fixture + network wiring `bun_pipeline_build` drives.
@@ -5243,15 +5243,15 @@ console.log("listening on " + port);
     }
 
     /// Per-language build VM tuning (cargo wants more than `npm install`).
-    struct BuildTuning {
-        vcpu: u32,
-        guest_mem_mib: u32,
-        cgroup_mem_mib: u64,
-        cgroup_cpu_max: &'static str,
-        scratch_mib: u64,
-        output_mib: u64,
-        timeout_secs: u64,
-        fetch_deadline_secs: u64,
+    pub(crate) struct BuildTuning {
+        pub(crate) vcpu: u32,
+        pub(crate) guest_mem_mib: u32,
+        pub(crate) cgroup_mem_mib: u64,
+        pub(crate) cgroup_cpu_max: &'static str,
+        pub(crate) scratch_mib: u64,
+        pub(crate) output_mib: u64,
+        pub(crate) timeout_secs: u64,
+        pub(crate) fetch_deadline_secs: u64,
     }
 
     /// Generic NETWORKED pipeline build for the language buildpacks: tar `src`, run
@@ -5275,7 +5275,7 @@ console.log("listening on " + port);
     /// Like [`networked_lang_build`] but hands back the raw `run_project_build`
     /// RESULT instead of unwrapping it — so a NEGATIVE test (e.g. a monorepo build
     /// with the `context` widening OMITTED) can assert the build *fails*.
-    async fn networked_lang_build_try(
+    pub(crate) async fn networked_lang_build_try(
         project_id: &str,
         redb: &str,
         toolchain: &str,
@@ -5413,7 +5413,7 @@ console.log("listening on " + port);
     /// Write the shared single-`api`-server jkbase.toml the boot helper expects
     /// (it asserts a layered `api` server + routes `/`). `language` selects the
     /// toolchain + the stamped runtime layer.
-    fn write_lang_manifest(src: &Path, name: &str, language: &str) {
+    pub(crate) fn write_lang_manifest(src: &Path, name: &str, language: &str) {
         write(
             src.join("jkbase.toml"),
             &format!(

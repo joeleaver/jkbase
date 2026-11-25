@@ -173,4 +173,87 @@ mod tests {
         assert!(m.ends_with("(signal: 9, SIGKILL: kill)"));
         assert!(oom_failure(4096, 2, "").contains("2 processes"));
     }
+
+    /// On-box proof of the whole path: a node build whose `npm run build` holds ~1.2 GiB of
+    /// RSS is OOM-killed in the default 1024 MiB VM and reported AS an OOM with the size
+    /// (jkbuild's `/out/oom_kills` → host message); the SAME source then builds once the
+    /// project's admin-granted `build_mem_mib` (read from the store per target) is 2048.
+    ///
+    ///   sudo env JKB_DATA=… JKB_FC_RELEASE=… <test-bin> --ignored --nocapture \
+    ///       build_mem_override_sizes_the_vm_and_oom_is_named
+    #[tokio::test]
+    #[ignore = "needs KVM + root + a node.ext4 baked with this jkbuild + the build bridge"]
+    async fn build_mem_override_sizes_the_vm_and_oom_is_named() {
+        use crate::build_orchestrator::onbox::{
+            BuildTuning, networked_lang_build_try, write, write_lang_manifest,
+        };
+        use jkbase_control::store::{DEFAULT_QUOTA, QuotaLimits, Store};
+
+        let Ok(data) = std::env::var("JKB_DATA").map(std::path::PathBuf::from) else {
+            eprintln!("skip: set JKB_DATA");
+            return;
+        };
+        let src = data.join("oom-fixture-src");
+        let _ = std::fs::remove_dir_all(&src);
+        write_lang_manifest(&src, "oomfix", "node");
+        write(
+            src.join("server/package.json"),
+            "{\n  \"name\": \"oomfix\",\n  \"private\": true,\n  \"scripts\": { \"build\": \"node build.js\", \"start\": \"node server.js\" }\n}\n",
+        );
+        // Off-heap Buffers, touched so the pages are really resident (not V8's heap cap).
+        write(
+            src.join("server/build.js"),
+            "const held = [];\nfor (let i = 0; i < 19; i++) held.push(Buffer.alloc(64 << 20, 1));\nconsole.log('held ' + held.length * 64 + ' MiB');\n",
+        );
+        write(
+            src.join("server/server.js"),
+            "require('http').createServer((_q, r) => r.end('ok\\n')).listen(Number(process.env.PORT) || 3000);\n",
+        );
+        let redb = "onbox-oom.redb";
+        let _ = std::fs::remove_file(data.join(redb));
+        let tuning = || BuildTuning {
+            vcpu: 2,
+            guest_mem_mib: 1024,
+            cgroup_mem_mib: 1536,
+            cgroup_cpu_max: "200000 100000",
+            scratch_mib: 512,
+            output_mib: 64,
+            timeout_secs: 300,
+            fetch_deadline_secs: 180,
+        };
+
+        let Some(first) =
+            networked_lang_build_try("oomfix", redb, "node.ext4", &src, tuning(), 1).await
+        else {
+            return;
+        };
+        let err = match first {
+            Ok(_) => panic!("a 1.2 GiB build must not fit the 1024 MiB default VM"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("build ran out of memory: the 1024 MiB build VM OOM-killed"),
+            "an OOM must be named as one, with the VM size: {err}"
+        );
+
+        // The operator grants 2048 MiB; the next build reads it from the store per target.
+        {
+            let store = Store::open(&data.join(redb)).unwrap();
+            store
+                .set_quota(
+                    "oomfix",
+                    &QuotaLimits {
+                        build_mem_mib: Some(2048),
+                        ..DEFAULT_QUOTA
+                    },
+                )
+                .unwrap();
+        }
+        let fx = networked_lang_build_try("oomfix", redb, "node.ext4", &src, tuning(), 2)
+            .await
+            .expect("env checked above")
+            .expect("the same build fits once the project's build VM is 2048 MiB");
+        let _ = std::fs::remove_dir_all(&fx.staged);
+        println!("PASS: 1024 MiB → OOM named with size; 2048 MiB override → build succeeded");
+    }
 }

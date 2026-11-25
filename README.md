@@ -254,6 +254,14 @@ Rules: `context` defaults to `source`, so **omitting it changes nothing**. `sour
 `context` no wider than the path-deps require — a wide context mounts more of your repo into the
 build (bigger build, weaker reproducibility), so prefer `apps/` over `.` when that's enough.
 
+### Build memory
+
+Each target builds in its own VM with **4 GiB of RAM** by default. A build that needs more is
+OOM-killed inside that VM, and the deploy says so — `build ran out of memory: the 4096 MiB build VM
+OOM-killed 1 process` — rather than failing with a bare exit status. Fat LTO, `codegen-units = 1`
+and several large wasm crates linking at once are the usual culprits; trim those, or ask the
+platform operator to raise the project's build memory.
+
 ### Only what changed gets rebuilt
 
 Each target is keyed by exactly what goes into it: the tree mounted in its build VM, its
@@ -899,7 +907,11 @@ Every command that hits the control API takes `--api URL` (default `https://api.
 after the subcommand; the token can also come from `$JKBASE_TOKEN`. (`jkbase auth jwks`/`mint` use
 `--issuer` instead, default `https://auth.jkbase.app`.) Platform operators have two more:
 `jkbase l4 pin <name> <port>` and raising quotas above defaults via `--admin-token`
-(`$JKBASE_ADMIN_TOKEN`) — both no-ops on a server started without an admin token.
+(`$JKBASE_ADMIN_TOKEN`) — both no-ops on a server started without an admin token. With the admin
+token, `jkbase quota --set-build-mem-mib N` sizes a project's build VMs (1024–32768 MiB; `0` returns
+it to the server default). Every build VM on the host reserves its RAM from one shared budget
+(`jkbase-server --build-mem-budget-mib`, default 16384), so a bigger VM queues instead of
+overcommitting the box.
 
 ---
 
