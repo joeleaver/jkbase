@@ -14,8 +14,8 @@ use jkbase_proxy::DomainMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Keep a `store` handle after this move: the managed-DB reach-plane auth callback
-/// (built below) closes over a clone.
+/// The control app's state over a clone of `store` (the caller keeps its own handle for the
+/// managed-DB reach-plane auth callback and the data planes).
 pub(crate) fn app_state(
     args: &Args,
     store: &Store,
