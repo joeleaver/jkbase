@@ -531,7 +531,7 @@ fn resolve_spec(
     // found (e.g. an in-flight redeploy that already removed it — the port is being torn down
     // anyway). The `0` fallback MUST match `L4PortConfig::amp_k()`'s clamp-off default: a stale `1`
     // here would re-arm the retired ratio clamp on any port whose decl momentarily can't be read.
-    let (idle_timeout_secs, amp_k) = crate::read_l4_port_decls(data_dir, &alloc.project_id)
+    let (idle_timeout_secs, amp_k) = crate::l4_ports::read_l4_port_decls(data_dir, &alloc.project_id)
         .into_iter()
         .find(|d| d.name == alloc.name)
         .map(|d| (d.idle_timeout_secs, d.amp_k))

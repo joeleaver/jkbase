@@ -2,10 +2,8 @@
 //! disk-lease token, plus the host facts each VM is booted from) and the small pure helpers that
 //! read or allocate from it.
 
-use crate::{
-    L4_PORT_RANGE, l4_bind_probe, l4_port_candidates, next_agent_udp_port, slot_identity,
-    validate_l4_port_range,
-};
+use crate::{slot_identity};
+use crate::l4_ports::{L4_PORT_RANGE, l4_bind_probe, l4_port_candidates, next_agent_udp_port, validate_l4_port_range};
 use anyhow::{Context, Result};
 use jkbase_common::config::{L4Proto, PlatformEgress};
 use jkbase_control::store::{PortAllocation, Store, VmAllocation};
