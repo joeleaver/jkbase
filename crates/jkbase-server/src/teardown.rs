@@ -1,5 +1,6 @@
 //! Tearing VMs and projects down: orphan cleanup at boot, full project teardown, dropping a
-//! dedicated DB (and its sibling VM), and the force-stop path every failed lifecycle step falls back to.
+//! dedicated DB (and its sibling VM), and the force-stop path every failed lifecycle step falls
+//! back to.
 
 use crate::data_disk::release_data_disk;
 use crate::ha_lease::DISK_LEASE_TTL;

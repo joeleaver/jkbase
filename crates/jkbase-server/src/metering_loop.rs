@@ -1,6 +1,6 @@
-//! The metering + quota-enforcement loop: samples per-project CPU, bandwidth and storage into hourly
-//! rollup buckets (host-side reads only, see [`crate::metering`]) and hibernates + blocks projects
-//! that exceed their monthly caps.
+//! The metering + quota-enforcement loop: samples per-project CPU, bandwidth and storage into
+//! hourly rollup buckets (host-side reads only, see [`crate::metering`]) and hibernates + blocks
+//! projects that exceed their monthly caps.
 
 use crate::hibernate::hibernate_project;
 use crate::log_shipper::LogShipper;

@@ -1,6 +1,6 @@
-//! Hibernation: snapshot a running VM (or stop it when a snapshot is not viable), release its data
-//! disk and routes, and leave it wakeable. Races with a concurrent redeploy are settled through the
-//! VM incarnation marker.
+//! Hibernation: drop a running VM's routes, snapshot it (or force-stop it when its agent is wedged
+//! or the snapshot fails), release its data disk, and leave it wakeable. Races with a concurrent
+//! redeploy, teardown or self-fence are settled through the VM incarnation marker.
 
 use crate::agent_client::agent_alive;
 use crate::data_disk::release_data_disk;

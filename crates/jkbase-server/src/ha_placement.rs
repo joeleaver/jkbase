@@ -1,5 +1,6 @@
 //! HA fleet plane: this host's heartbeat in the HOSTS registry, peer liveness, project placement
-//! and orphan reassignment, the leader's desired-vs-running reconciler, and where a deploy must run.
+//! and orphan reassignment, the leader's desired-vs-running reconciler, and where a deploy must
+//! run.
 
 use crate::platform::PlatformState;
 use jkbase_control::store::{HostRecord, Project, ProjectState, Store, VmAllocation};

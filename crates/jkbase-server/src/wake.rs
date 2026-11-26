@@ -1,5 +1,5 @@
-//! Waking a project on demand: the single-flight wake entry points, the guard that resets a
-//! failed `Waking`, the proxy's two wake seams (app VM / DB reach plane), and the restore-vs-cold-boot
+//! Waking a project on demand: the single-flight wake entry points, the guard that resets a failed
+//! `Waking`, the proxy's two wake seams (app VM / DB reach plane), and the restore-vs-cold-boot
 //! decision.
 
 use crate::boot_reconcile::project_can_wake;

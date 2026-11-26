@@ -1,5 +1,6 @@
 //! The body of a wake, run by the task that won the single-flight election in [`crate::wake`]:
-//! restore the VM from its snapshot when that is viable, else cold-boot it, then commit it to Running.
+//! restore the VM from its snapshot when that is viable, else cold-boot it, then commit it to
+//! Running.
 
 use crate::agent_client::{resync_clock_agent, wait_for_agent};
 use crate::data_disk::{data_disk_mib, disk_cap_bytes, fence_data_disk};

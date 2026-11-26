@@ -1,5 +1,6 @@
 //! The dedicated managed-DB VM (`{project_id}.db`, P2): booting or replacing it on deploy, the
-//! guard that serialises its boots, and waiting for it to come up.
+//! guard that counts its in-flight boots (so a concurrent DB drop answers Busy), and waiting for
+//! it to come up.
 
 use crate::agent_client::wait_for_agent;
 use crate::data_disk::{data_disk_mib, disk_cap_bytes, fence_data_disk, release_data_disk};

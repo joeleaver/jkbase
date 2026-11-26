@@ -1,6 +1,6 @@
 //! VM re-adoption (zero-bounce §6b): on boot, verify every runtime Firecracker that survived the
-//! previous process, re-adopt the live ones (fresh disk fence, no detach, rebuilt routing) and reap the
-//! rest. A survivor is trusted only when its pid, start time and API-socket peer all agree.
+//! previous process, re-adopt the live ones (fresh disk fence, no detach, rebuilt routing) and reap
+//! the rest. A survivor is trusted only when its pid, start time and API-socket peer all agree.
 
 use crate::agent_client::{agent_alive, agent_protocol_version};
 use crate::ha_lease::DISK_LEASE_TTL;

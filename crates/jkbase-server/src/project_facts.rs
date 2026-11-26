@@ -1,6 +1,7 @@
 //! Facts read from a project's live deployment tree: whether it declares volumes or a managed
-//! database, its DB tier (co-located vs dedicated) and rules opt-in, and which VM serves its DB reach
-//! plane. Every parser is fail-safe: a missing or malformed sidecar reads as the conservative default.
+//! database, its DB tier (co-located vs dedicated) and rules opt-in, and which VM serves its DB
+//! reach plane. Every parser is fail-safe: a missing or malformed sidecar reads as the conservative
+//! default.
 
 use crate::vm_identity;
 

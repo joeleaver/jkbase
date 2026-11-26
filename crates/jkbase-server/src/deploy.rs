@@ -1,5 +1,6 @@
-//! The deploy handler behind `POST /projects/{id}/deploy`: swap the new tree live, (re)boot the
-//! project's VM(s) on it and commit them to Running, undoing the swap if the deploy is refused.
+//! The deploy handler behind `POST /projects/{id}/deploy`: (re)boot the project's VM(s) on the
+//! tree the control plane just swapped live and commit them to Running. A refusal is returned
+//! typed, before anything is torn down, so the control plane can undo the `live` swap.
 
 use crate::agent_client::{sync_agent, wait_for_agent};
 use crate::data_disk::{data_disk_mib, disk_cap_bytes, fence_data_disk, release_data_disk};
