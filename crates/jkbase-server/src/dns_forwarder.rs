@@ -51,10 +51,9 @@
 //! * Response cache keyed on the RAW wire question bytes (lowercased) — never a lossy dotted string,
 //!   so a label containing a dot cannot collide with a multi-label name (anti cross-tenant poison).
 
-use crate::Store;
+use jkbase_control::store::{Store, VmAllocation};
 use crate::db_gateway::{IpRateLimiter, project_for_ip_in};
 use jkbase_common::config::DB_GATEWAY_IP;
-use jkbase_control::store::VmAllocation;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1056,7 +1055,7 @@ mod tests {
 
         // The real forwarder: bind 10.77.0.1:53, relay to the host's own resolver (127.0.0.53).
         let store =
-            crate::Store::open(&std::env::temp_dir().join("jkdns-e2e.redb")).expect("open store");
+            Store::open(&std::env::temp_dir().join("jkdns-e2e.redb")).expect("open store");
         let _ = store.save_vm_allocation(&jkbase_control::store::VmAllocation {
             project_id: "dnse2e".into(),
             ip: guest_ip.into(),

@@ -10248,7 +10248,7 @@ console.log("listening on " + port);
             .unwrap();
         sh("ip", &["link", "set", tap, "up"]).await.unwrap();
 
-        let parent = PathBuf::from(crate::RUNTIME_CGROUP_PARENT);
+        let parent = PathBuf::from(crate::platform::RUNTIME_CGROUP_PARENT);
         let cfg = VmConfig {
             firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
             kernel_path: fx.kernel.clone(),
@@ -10276,7 +10276,7 @@ console.log("listening on " + port);
             "the booted VM must serve HTTP 200"
         );
         let fc_pid = vm.pid().expect("fc pid");
-        let starttime = crate::proc_starttime(fc_pid).expect("fc starttime");
+        let starttime = crate::adoption::proc_starttime(fc_pid).expect("fc starttime");
 
         // (1) cgroup ESCAPE: the FC was migrated into jkbase-runtime/<id> (a sibling of
         //     jkbase.service), the precondition for surviving KillMode=mixed.
@@ -10292,7 +10292,7 @@ console.log("listening on " + port);
         // (2) SO_PEERCRED binds the api-sock probe to fc_pid.
         let sock = runtime_dir.join(id).join("firecracker.sock");
         assert_eq!(
-            crate::socket_peer_pid(&sock),
+            crate::adoption::socket_peer_pid(&sock),
             Some(fc_pid),
             "api-sock SO_PEERCRED peer must equal fc_pid"
         );
@@ -10327,12 +10327,12 @@ console.log("listening on " + port);
         let adopted = VmInstance::adopt(id, &runtime_dir, fc_pid, starttime, Some(&parent));
         assert_eq!(adopted.pid(), Some(fc_pid), "adopted pid() must be fc_pid");
         assert!(
-            crate::agent_alive(guest_ip).await,
+            crate::agent_client::agent_alive(guest_ip).await,
             "the agent must answer through the adopted survivor"
         );
         drop(adopted);
         assert!(
-            crate::proc_alive_at(fc_pid, starttime),
+            crate::adoption::proc_alive_at(fc_pid, starttime),
             "dropping the adopted handle must NOT kill the survivor (no-op Drop)"
         );
         assert!(
@@ -10346,7 +10346,7 @@ console.log("listening on " + port);
         // Clean teardown via the Owned handle: reaps the child cleanly (no zombie) + rmdir's the leaf.
         vm.stop().await.expect("stop");
         assert!(
-            !crate::proc_alive_at(fc_pid, starttime),
+            !crate::adoption::proc_alive_at(fc_pid, starttime),
             "stop() must kill the FC"
         );
         assert!(
