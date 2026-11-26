@@ -1055,7 +1055,7 @@ mod tests {
 
         // The real forwarder: bind 10.77.0.1:53, relay to the host's own resolver (127.0.0.53).
         let store =
-            jkbase_control::store::Store::open(&std::env::temp_dir().join("jkdns-e2e.redb")).expect("open store");
+            Store::open(&std::env::temp_dir().join("jkdns-e2e.redb")).expect("open store");
         let _ = store.save_vm_allocation(&jkbase_control::store::VmAllocation {
             project_id: "dnse2e".into(),
             ip: guest_ip.into(),

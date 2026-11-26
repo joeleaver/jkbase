@@ -5,9 +5,14 @@
 //! the one hard-coded engine admin route itself; the host only ever presents the project's own
 //! splice secret to the project's own VM.
 
-use crate::wake::wake_db_reach;
-use super::*;
 use crate::db_ops::{DbQueryCtx, agent_db_request, db_splice_secret};
+use crate::wake::wake_db_reach;
+use anyhow::Result;
+use jkbase_control::store::Store;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::info;
 
 /// Outer deadline on one `rewrite-covers` pass (wake + the whole engine pass). The engine works in
 /// batches and is safe to interrupt, and keeps working after the host drops the connection — so

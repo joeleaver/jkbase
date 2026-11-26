@@ -13,6 +13,7 @@
 //! bind (NOT socket-activation — D8; the L4 port set is dynamic). A freed port's quarantine
 //! (control plane) covers the reuse window that the ≤tick teardown lag opens.
 
+use crate::l4_ports::read_l4_port_decls;
 use crate::vm_identity;
 use jkbase_control::store::{PortAllocation, Store};
 use jkbase_proxy::l4_ingress::{L4Ingress, L4PortSpec, ResolveVmIp};
@@ -531,7 +532,7 @@ fn resolve_spec(
     // found (e.g. an in-flight redeploy that already removed it — the port is being torn down
     // anyway). The `0` fallback MUST match `L4PortConfig::amp_k()`'s clamp-off default: a stale `1`
     // here would re-arm the retired ratio clamp on any port whose decl momentarily can't be read.
-    let (idle_timeout_secs, amp_k) = crate::l4_ports::read_l4_port_decls(data_dir, &alloc.project_id)
+    let (idle_timeout_secs, amp_k) = read_l4_port_decls(data_dir, &alloc.project_id)
         .into_iter()
         .find(|d| d.name == alloc.name)
         .map(|d| (d.idle_timeout_secs, d.amp_k))

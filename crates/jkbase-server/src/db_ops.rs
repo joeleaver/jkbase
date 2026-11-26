@@ -5,9 +5,18 @@
 //! VM serving it, then talk to its agent's eth0 `/_jkbase/db/*` seam with the per-deploy splice
 //! secret. The DB stays loopback-only and the admin token never leaves the guest.
 
-use crate::wake::wake_db_reach;
+use crate::db_backup_store;
+use crate::log_shipper::LogShipper;
 use crate::platform::PlatformState;
-use super::*;
+use crate::wake::wake_db_reach;
+use anyhow::{Context, Result};
+use jkbase_control::store::Store;
+use jkbase_proxy::DomainMap;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 /// Hard cap on a backup tar the agent may relay + the host stages ([RB3]). The tar is roughly
 /// the DB's on-disk size (bounded by the RWO data disk); this ceiling fails a runaway/garbage
