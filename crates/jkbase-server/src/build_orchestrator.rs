@@ -10248,7 +10248,7 @@ console.log("listening on " + port);
             .unwrap();
         sh("ip", &["link", "set", tap, "up"]).await.unwrap();
 
-        let parent = PathBuf::from(crate::RUNTIME_CGROUP_PARENT);
+        let parent = PathBuf::from(crate::platform::RUNTIME_CGROUP_PARENT);
         let cfg = VmConfig {
             firecracker_bin: fx.fc_release.join("firecracker-v1.15.1-x86_64"),
             kernel_path: fx.kernel.clone(),
