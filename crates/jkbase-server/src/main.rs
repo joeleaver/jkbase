@@ -8,6 +8,7 @@ mod build_sizing;
 mod db_backup_store;
 mod db_admin;
 mod db_ops;
+use crate::agent_client::{agent_alive, agent_protocol_version, resync_clock_agent, sync_agent, wait_for_agent};
 use crate::idle::idle_detection_loop;
 use crate::metering_loop::metering_loop;
 use crate::scheduler::scheduler_loop;
@@ -38,6 +39,7 @@ mod objectstore_service;
 mod rootfs_cas;
 mod socket_activation;
 mod vm_identity;
+mod agent_client;
 mod idle;
 mod metering_loop;
 mod scheduler;
@@ -3988,31 +3990,6 @@ async fn reap_firecracker(project_id: &str) {
         .await;
 }
 
-/// Application-level liveness probe. Returns true only if the agent answers HTTP
-/// within the budget. A wedged agent (kernel up, userspace stuck) completes the
-/// TCP handshake but never answers, so a bare TCP connect is NOT sufficient — we
-/// must hit `/_jkbase/health` and bound it with a timeout.
-async fn agent_alive(ip: &str) -> bool {
-    let probe = async {
-        let stream = tokio::net::TcpStream::connect(format!("{ip}:80"))
-            .await
-            .ok()?;
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
-        tokio::spawn(conn);
-        let req = hyper::Request::builder()
-            .uri(format!("http://{ip}:80/_jkbase/health"))
-            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
-            .ok()?;
-        let resp = sender.send_request(req).await.ok()?;
-        Some(resp.status().is_success())
-    };
-    matches!(
-        tokio::time::timeout(Duration::from_secs(2), probe).await,
-        Ok(Some(true))
-    )
-}
-
 /// Process start time (jiffies since boot) from field 22 of `/proc/<pid>/stat`, or `None` if
 /// gone/unparseable. (Mirrors the substrate/orch helpers; main can't reach those privates.)
 fn proc_starttime(pid: u32) -> Option<u64> {
@@ -4054,34 +4031,6 @@ fn socket_peer_pid(socket_path: &Path) -> Option<u32> {
         return None;
     }
     Some(cred.pid as u32)
-}
-
-/// The agent's reported protocol version from the `X-Jkbase-Agent-Proto` header on
-/// `/_jkbase/health`. `None` if unreachable OR the header is absent/unparseable — a
-/// pre-versioning agent (every survivor during this rollout), which the caller treats as
-/// compatible. See [`jkbase_common::AGENT_PROTOCOL_VERSION`].
-async fn agent_protocol_version(ip: &str) -> Option<u32> {
-    let probe = async {
-        let stream = tokio::net::TcpStream::connect(format!("{ip}:80"))
-            .await
-            .ok()?;
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
-        tokio::spawn(conn);
-        let req = hyper::Request::builder()
-            .uri(format!("http://{ip}:80/_jkbase/health"))
-            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
-            .ok()?;
-        let resp = sender.send_request(req).await.ok()?;
-        resp.headers()
-            .get(jkbase_common::AGENT_PROTOCOL_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u32>().ok())
-    };
-    tokio::time::timeout(Duration::from_secs(2), probe)
-        .await
-        .ok()
-        .flatten()
 }
 
 /// SIGKILL a non-survivor runtime Firecracker by exact pid and confirm its death (bounded).
@@ -4473,55 +4422,6 @@ async fn force_stop_and_cleanup(
     // make wake_project spin and bail on every subsequent request).
     plat.vm_states
         .insert(project_id.to_string(), VmLifecycle::Hibernated);
-}
-
-async fn sync_agent(ip: &str) -> Result<()> {
-    if let Ok(stream) = tokio::net::TcpStream::connect(format!("{ip}:80")).await {
-        let io = hyper_util::rt::TokioIo::new(stream);
-        if let Ok((mut sender, conn)) = hyper::client::conn::http1::handshake(io).await {
-            tokio::spawn(conn);
-            let req = hyper::Request::builder()
-                .uri(format!("http://{ip}:80/_jkbase/sync"))
-                .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
-            let _ = sender.send_request(req).await;
-        }
-    }
-    Ok(())
-}
-
-/// Ask the agent to step the guest wall clock to its PTP reference now (the agent
-/// runs `chronyc makestep`). Used after wake/restore so a restored snapshot — whose
-/// clock is frozen at snapshot time — corrects instantly instead of on chrony's
-/// next poll. Best-effort and bounded: a clock nudge must never block a wake.
-async fn resync_clock_agent(ip: &str) {
-    let send = async {
-        let stream = tokio::net::TcpStream::connect(format!("{ip}:80"))
-            .await
-            .ok()?;
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.ok()?;
-        tokio::spawn(conn);
-        let req = hyper::Request::builder()
-            .method("POST")
-            .uri(format!("http://{ip}:80/_jkbase/resync-clock"))
-            .body(http_body_util::Empty::<hyper::body::Bytes>::new())
-            .ok()?;
-        let _ = sender.send_request(req).await;
-        Some(())
-    };
-    let _ = tokio::time::timeout(Duration::from_secs(3), send).await;
-}
-
-async fn wait_for_agent(ip: &str) -> Result<()> {
-    for i in 0..50 {
-        if let Ok(stream) = tokio::net::TcpStream::connect(format!("{ip}:80")).await {
-            drop(stream);
-            info!(ip, attempts = i + 1, "agent is ready");
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    anyhow::bail!("agent at {ip} did not become ready within 10 seconds");
 }
 
 #[cfg(test)]

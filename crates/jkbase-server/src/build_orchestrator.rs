@@ -10327,7 +10327,7 @@ console.log("listening on " + port);
         let adopted = VmInstance::adopt(id, &runtime_dir, fc_pid, starttime, Some(&parent));
         assert_eq!(adopted.pid(), Some(fc_pid), "adopted pid() must be fc_pid");
         assert!(
-            crate::agent_alive(guest_ip).await,
+            crate::agent_client::agent_alive(guest_ip).await,
             "the agent must answer through the adopted survivor"
         );
         drop(adopted);
