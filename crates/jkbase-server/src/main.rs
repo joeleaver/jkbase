@@ -2,6 +2,7 @@ mod auth_service;
 mod build_ca;
 mod build_cache;
 mod build_orchestrator;
+mod build_reaper;
 mod build_mem_budget;
 mod build_sizing;
 mod db_backup_store;
@@ -1917,6 +1918,16 @@ async fn async_main() -> Result<()> {
     // Isolated build network (per-build TAP pool on the build bridge). Build VMs
     // reach only the egress proxy on the gateway; the firewall from
     // tools/setup-build-net.sh enforces it. `None` → offline builds.
+    // Reap build VMs a previous process left running (an upgrade restart keeps VMs up for
+    // zero-bounce, and nothing re-adopts a build): kill, un-TAP and un-jail them BEFORE any
+    // egress proxy binds or the memory budget admits a build, so an orphan can neither reach
+    // the new proxies nor hold memory the fresh budget doesn't count. Runtime VMs untouched.
+    build_reaper::reap_orphan_builds(&build_reaper::ReapPaths::host(
+        Path::new("/sys/fs/cgroup"),
+        "jkbase-build",
+        &data_dir.join("bj"),
+    ))
+    .await;
     let build_uid = 100_000u32;
     // Bind the public-any (:3129) egress proxy listener BEFORE arming the firewall
     // scoping, so the per-VM :3129 grant is never opened toward a port nothing is

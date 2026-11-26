@@ -52,3 +52,5 @@ libc = "0.2"
 [dev-dependencies]
 toml = { workspace = true }
 rustls-pemfile = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
