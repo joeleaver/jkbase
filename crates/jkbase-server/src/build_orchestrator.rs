@@ -10276,7 +10276,7 @@ console.log("listening on " + port);
             "the booted VM must serve HTTP 200"
         );
         let fc_pid = vm.pid().expect("fc pid");
-        let starttime = crate::proc_starttime(fc_pid).expect("fc starttime");
+        let starttime = crate::adoption::proc_starttime(fc_pid).expect("fc starttime");
 
         // (1) cgroup ESCAPE: the FC was migrated into jkbase-runtime/<id> (a sibling of
         //     jkbase.service), the precondition for surviving KillMode=mixed.
@@ -10292,7 +10292,7 @@ console.log("listening on " + port);
         // (2) SO_PEERCRED binds the api-sock probe to fc_pid.
         let sock = runtime_dir.join(id).join("firecracker.sock");
         assert_eq!(
-            crate::socket_peer_pid(&sock),
+            crate::adoption::socket_peer_pid(&sock),
             Some(fc_pid),
             "api-sock SO_PEERCRED peer must equal fc_pid"
         );
@@ -10332,7 +10332,7 @@ console.log("listening on " + port);
         );
         drop(adopted);
         assert!(
-            crate::proc_alive_at(fc_pid, starttime),
+            crate::adoption::proc_alive_at(fc_pid, starttime),
             "dropping the adopted handle must NOT kill the survivor (no-op Drop)"
         );
         assert!(
@@ -10346,7 +10346,7 @@ console.log("listening on " + port);
         // Clean teardown via the Owned handle: reaps the child cleanly (no zombie) + rmdir's the leaf.
         vm.stop().await.expect("stop");
         assert!(
-            !crate::proc_alive_at(fc_pid, starttime),
+            !crate::adoption::proc_alive_at(fc_pid, starttime),
             "stop() must kill the FC"
         );
         assert!(
