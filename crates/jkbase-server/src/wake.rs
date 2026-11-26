@@ -2,8 +2,12 @@
 //! failed `Waking`, the proxy's two wake seams (app VM / DB reach plane), and the restore-vs-cold-boot
 //! decision.
 
-use crate::{LogShipper, PlatformState, VmLifecycle, db_reach_target_vm, project_can_wake, rootfs_cas, vm_identity};
-use crate::wake_vm::{wake_project_inner};
+use crate::boot_reconcile::project_can_wake;
+use crate::log_shipper::LogShipper;
+use crate::platform::{PlatformState, VmLifecycle};
+use crate::project_facts::db_reach_target_vm;
+use crate::wake_vm::wake_project_inner;
+use crate::{rootfs_cas, vm_identity};
 use anyhow::Result;
 use jkbase_control::store::{ProjectState, SnapshotMeta};
 use jkbase_proxy::DomainMap;

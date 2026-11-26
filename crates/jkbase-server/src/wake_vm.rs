@@ -1,13 +1,19 @@
 //! The body of a wake, run by the task that won the single-flight election in [`crate::wake`]:
 //! restore the VM from its snapshot when that is viable, else cold-boot it, then commit it to Running.
 
-use crate::{
-    LogShipper, PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, WAKE_BACKOFF, WakingGuard,
-    check_project_has_database, check_project_has_volumes, data_disk_mib, disk_cap_bytes,
-    fence_data_disk, handle_deploy, handoff, layer_plan, project_is_dedicated,
-    register_active_routes, resync_clock_agent, setup_tap, snapshot_restore_decision, vm_identity,
-    wait_for_agent, wait_for_db_vm_running, wait_for_route, write_handoff_record,
+use crate::agent_client::{resync_clock_agent, wait_for_agent};
+use crate::data_disk::{data_disk_mib, disk_cap_bytes, fence_data_disk};
+use crate::db_vm::wait_for_db_vm_running;
+use crate::deploy::handle_deploy;
+use crate::log_shipper::LogShipper;
+use crate::platform::{PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle};
+use crate::project_facts::{
+    check_project_has_database, check_project_has_volumes, project_is_dedicated,
 };
+use crate::tap::setup_tap;
+use crate::vm_runtime::{register_active_routes, write_handoff_record};
+use crate::wake::{WAKE_BACKOFF, WakingGuard, snapshot_restore_decision, wait_for_route};
+use crate::{handoff, layer_plan, vm_identity};
 use anyhow::Result;
 use jkbase_control::store::ProjectState;
 use jkbase_orch::vm::{VmConfig, VmInstance};

@@ -2,8 +2,11 @@
 //! rollup buckets (host-side reads only, see [`crate::metering`]) and hibernates + blocks projects
 //! that exceed their monthly caps.
 
-use crate::{LogShipper, PlatformState, VmLifecycle, db_reach_target_vm, metering, vm_identity};
-use crate::hibernate::{hibernate_project};
+use crate::hibernate::hibernate_project;
+use crate::log_shipper::LogShipper;
+use crate::platform::{PlatformState, VmLifecycle};
+use crate::project_facts::db_reach_target_vm;
+use crate::{metering, vm_identity};
 use jkbase_control::store::{QuotaStatus, month_start_epoch};
 use std::collections::HashMap;
 use std::sync::Arc;

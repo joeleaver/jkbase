@@ -2,7 +2,8 @@
 //! the previous process, drop base layers no live or restorable VM references, and backfill the
 //! domain map so apex/www/console never 404 in the gap.
 
-use crate::{PlatformState, VmLifecycle, layer_plan, vm_identity};
+use crate::platform::{PlatformState, VmLifecycle};
+use crate::{layer_plan, vm_identity};
 use anyhow::Result;
 use jkbase_control::store::{DomainKind, DomainRecord, DomainStatus, ProjectState, Store};
 use jkbase_proxy::DomainMap;

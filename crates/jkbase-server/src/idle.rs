@@ -1,8 +1,10 @@
 //! Idle hibernation: the loop that hibernates a project once neither HTTP activity, a live
 //! managed-DB relay nor an established L4 flow has touched it for the idle timeout.
 
-use crate::{LogShipper, PlatformState, VmLifecycle, vm_identity};
-use crate::hibernate::{hibernate_project};
+use crate::hibernate::hibernate_project;
+use crate::log_shipper::LogShipper;
+use crate::platform::{PlatformState, VmLifecycle};
+use crate::vm_identity;
 use jkbase_proxy::ActivityTracker;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

@@ -2,10 +2,12 @@
 //! disk and routes, and leave it wakeable. Races with a concurrent redeploy are settled through the
 //! VM incarnation marker.
 
-use crate::{
-    LogShipper, PlatformState, VmLifecycle, agent_alive, force_stop_and_cleanup, handoff,
-    release_data_disk, settle_superseded_hibernate, vm_identity,
-};
+use crate::agent_client::agent_alive;
+use crate::data_disk::release_data_disk;
+use crate::log_shipper::LogShipper;
+use crate::platform::{PlatformState, VmLifecycle, settle_superseded_hibernate};
+use crate::teardown::force_stop_and_cleanup;
+use crate::{handoff, vm_identity};
 use anyhow::Result;
 use jkbase_control::store::{ProjectState, SnapshotMeta};
 use std::sync::Arc;
@@ -236,9 +238,12 @@ pub(crate) async fn hibernate_project(
 #[cfg(test)]
 mod tests {
     use crate::db_vm::boot_db_vm;
+    use crate::ha_lease::DISK_LEASE_TTL;
+    use crate::platform::Incarnations;
+    use crate::rootfs_cas;
+    use crate::tap::teardown_tap;
     use crate::vm_runtime::reap_firecracker;
-    use crate::{DISK_LEASE_TTL, Incarnations, rootfs_cas, teardown_tap};
-    use crate::wake_vm::{wake_project_inner};
+    use crate::wake_vm::wake_project_inner;
     use jkbase_common::config::PlatformEgress;
     use jkbase_control::logstore::LogStore;
     use jkbase_control::store::{ProjectState, Store};

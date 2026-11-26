@@ -1,7 +1,8 @@
 //! Steps shared by every path that commits a VM to Running (deploy, wake, adoption) or reaps one:
 //! the re-adoption handoff record, the fast-path route registration, and the per-project FC reaper.
 
-use crate::{handoff, proc_starttime, vm_identity};
+use crate::adoption::proc_starttime;
+use crate::{handoff, vm_identity};
 use jkbase_control::store::{DomainRecord, VmAllocation};
 use jkbase_proxy::{DomainMap, DomainTarget};
 use std::path::Path;

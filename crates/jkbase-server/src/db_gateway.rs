@@ -37,8 +37,7 @@
 //! secret + the DB port) → splice. Registering under the BASE project keeps BOTH VMs warm while a
 //! (possibly byte-silent subscription) relay is live — the idle loop reads the same `conn_count`.
 
-use crate::Store;
-use jkbase_control::store::VmAllocation;
+use jkbase_control::store::{Store, VmAllocation};
 use jkbase_proxy::db_relay::DbRelayRegistry;
 use jkbase_proxy::{WakeCallback, WakeError};
 use std::collections::HashMap;

@@ -2,7 +2,8 @@
 //! write-boundary self-fence that renews every held disk lease and stops this host's VM for any
 //! project whose lease it loses, before a survivor can attach.
 
-use crate::{PlatformState, VmLifecycle, handoff};
+use crate::handoff;
+use crate::platform::{PlatformState, VmLifecycle};
 use anyhow::Result;
 use jkbase_substrate::{FenceToken, Lease, SubstrateError};
 use std::collections::{HashMap, HashSet};

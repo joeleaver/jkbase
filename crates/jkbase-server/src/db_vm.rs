@@ -1,11 +1,12 @@
 //! The dedicated managed-DB VM (`{project_id}.db`, P2): booting or replacing it on deploy, the
 //! guard that serialises its boots, and waiting for it to come up.
 
-use crate::{
-    PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, data_disk_mib, disk_cap_bytes,
-    fence_data_disk, handoff, layer_plan, lifecycle_in_flight, release_data_disk, setup_tap,
-    vm_identity, wait_for_agent, write_handoff_record,
-};
+use crate::agent_client::wait_for_agent;
+use crate::data_disk::{data_disk_mib, disk_cap_bytes, fence_data_disk, release_data_disk};
+use crate::platform::{PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, lifecycle_in_flight};
+use crate::tap::setup_tap;
+use crate::vm_runtime::write_handoff_record;
+use crate::{handoff, layer_plan, vm_identity};
 use anyhow::{Context, Result};
 use jkbase_control::store::VmAllocation;
 use jkbase_orch::vm::{VmConfig, VmInstance};

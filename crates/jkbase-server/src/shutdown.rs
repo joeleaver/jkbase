@@ -1,9 +1,11 @@
 //! Process shutdown. An UPGRADE restart (fresh `.upgrading` flag) drains HTTP and leaves tenant
 //! VMs running for the successor to re-adopt; a real shutdown hibernates every running VM.
 
-use crate::{
-    LogShipper, PlatformState, VmLifecycle, force_stop_and_cleanup, hibernate_project, l4_runtime,
-};
+use crate::hibernate::hibernate_project;
+use crate::l4_runtime;
+use crate::log_shipper::LogShipper;
+use crate::platform::{PlatformState, VmLifecycle};
+use crate::teardown::force_stop_and_cleanup;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;

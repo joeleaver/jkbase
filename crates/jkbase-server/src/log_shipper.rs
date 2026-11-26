@@ -12,7 +12,7 @@
 //! refetch the full buffer. Cursors are persisted to disk so a server restart
 //! doesn't re-ship (and thus duplicate) a snapshot-restored agent's buffer.
 
-use crate::{PlatformState, VmLifecycle};
+use crate::platform::{PlatformState, VmLifecycle};
 use anyhow::Result;
 use jkbase_common::logs::LogsResponse;
 use jkbase_control::logstore::LogStore;

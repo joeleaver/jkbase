@@ -1,8 +1,12 @@
 //! Tearing VMs and projects down: orphan cleanup at boot, full project teardown, dropping a
 //! dedicated DB (and its sibling VM), and the force-stop path every failed lifecycle step falls back to.
 
-use crate::{DISK_LEASE_TTL, PlatformState, VmLifecycle, handoff, release_data_disk, settle_superseded_hibernate, teardown_tap, unix_now, vm_identity};
-use crate::vm_runtime::{reap_firecracker};
+use crate::data_disk::release_data_disk;
+use crate::ha_lease::DISK_LEASE_TTL;
+use crate::platform::{PlatformState, VmLifecycle, settle_superseded_hibernate, unix_now};
+use crate::tap::teardown_tap;
+use crate::vm_runtime::reap_firecracker;
+use crate::{handoff, vm_identity};
 use anyhow::Result;
 use jkbase_control::store::{ProjectState, VmAllocation};
 use jkbase_substrate::SubstrateError;

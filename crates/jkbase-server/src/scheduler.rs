@@ -1,8 +1,9 @@
 //! Host-driven cron for scheduled functions: each tick reads the durable SCHEDULES registry and
 //! wakes + invokes every function that is due, with a bounded catch-up after downtime.
 
-use crate::{LogShipper, PlatformState};
-use crate::wake::{wake_project};
+use crate::log_shipper::LogShipper;
+use crate::platform::PlatformState;
+use crate::wake::wake_project;
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use cron::Schedule as CronSchedule;

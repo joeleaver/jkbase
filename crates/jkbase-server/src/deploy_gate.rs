@@ -2,10 +2,10 @@
 //! refused deploy keeps the old one serving), including the DB tier-flip rule, and the record of
 //! which tier a project was last deployed at.
 
-use crate::{
-    DEAD_HOST_THRESHOLD, DeployTarget, PlatformState, deploy_target, deployment_has_database,
-    deployment_is_dedicated, vm_identity,
-};
+use crate::ha_placement::{DEAD_HOST_THRESHOLD, DeployTarget, deploy_target};
+use crate::platform::PlatformState;
+use crate::project_facts::{deployment_has_database, deployment_is_dedicated};
+use crate::vm_identity;
 use anyhow::Result;
 use jkbase_control::store::Store;
 use std::path::Path;
@@ -151,7 +151,7 @@ pub(crate) fn deployment_db_tier(deployment_dir: &Path) -> Option<&'static str> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_is_dedicated;
+    use crate::project_facts::project_is_dedicated;
     use jkbase_control::store::Store;
 
     /// [R4] The tier-flip refusal judges the tree being ACTIVATED, not `live`: the control plane
