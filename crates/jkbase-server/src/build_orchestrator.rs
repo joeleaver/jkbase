@@ -242,7 +242,8 @@ pub fn build_callback(deps: Arc<BuildDeps>) -> jkbase_control::api::BuildCallbac
 /// Boot-time reconciliation: nothing is in-flight at startup, so fail any build
 /// record left Queued/Building by a previous crash/restart (otherwise it shows
 /// "building" forever and the CLI poll loop never terminates), and reap orphaned
-/// build workspaces + staging dirs that a crash left behind.
+/// build workspaces + staging dirs that a crash left behind. The build VMs
+/// themselves are killed earlier in boot by `build_reaper::reap_orphan_builds`.
 pub fn reconcile_on_boot(store: &jkbase_control::store::Store, data_dir: &Path, deploy_dir: &Path) {
     use jkbase_control::store::BuildRecord;
     if let Ok(projects) = store.list_projects() {
