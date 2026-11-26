@@ -12,6 +12,7 @@
 //! refetch the full buffer. Cursors are persisted to disk so a server restart
 //! doesn't re-ship (and thus duplicate) a snapshot-restored agent's buffer.
 
+use crate::{PlatformState, VmLifecycle};
 use anyhow::Result;
 use jkbase_common::logs::LogsResponse;
 use jkbase_control::logstore::LogStore;
@@ -164,4 +165,34 @@ async fn fetch_logs(ip: &str, since: u64) -> Result<LogsResponse> {
     })
     .await
     .map_err(|_| anyhow::anyhow!("fetch_logs timed out"))?
+}
+
+/// Periodically pull new guest logs from every running VM into the persistent
+/// log store so they survive hibernation, restart, and crashes.
+pub(crate) async fn log_shipper_loop(
+    platform: Arc<Mutex<PlatformState>>,
+    shipper: Arc<LogShipper>,
+) {
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let targets: Vec<(String, String)> = {
+            let plat = platform.lock().await;
+            plat.vm_states
+                .iter()
+                .filter(|(_, s)| **s == VmLifecycle::Running)
+                .filter_map(|(id, _)| {
+                    plat.store
+                        .get_vm_allocation(id)
+                        .ok()
+                        .flatten()
+                        .map(|a| (id.clone(), a.ip))
+                })
+                .collect()
+        };
+
+        for (project_id, ip) in targets {
+            shipper.ship(&project_id, &ip).await;
+        }
+    }
 }
