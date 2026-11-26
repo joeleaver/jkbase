@@ -237,7 +237,8 @@ pub(crate) async fn hibernate_project(
 mod tests {
     use crate::db_vm::boot_db_vm;
     use crate::vm_runtime::reap_firecracker;
-    use crate::{DISK_LEASE_TTL, Incarnations, rootfs_cas, teardown_tap, wake_project_inner};
+    use crate::{DISK_LEASE_TTL, Incarnations, rootfs_cas, teardown_tap};
+    use crate::wake_vm::{wake_project_inner};
     use jkbase_common::config::PlatformEgress;
     use jkbase_control::logstore::LogStore;
     use jkbase_control::store::{ProjectState, Store};
