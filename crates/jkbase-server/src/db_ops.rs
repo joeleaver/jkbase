@@ -5,6 +5,7 @@
 //! VM serving it, then talk to its agent's eth0 `/_jkbase/db/*` seam with the per-deploy splice
 //! secret. The DB stays loopback-only and the admin token never leaves the guest.
 
+use crate::wake::wake_db_reach;
 use crate::platform::PlatformState;
 use super::*;
 

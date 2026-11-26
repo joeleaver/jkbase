@@ -5,6 +5,7 @@
 //! the one hard-coded engine admin route itself; the host only ever presents the project's own
 //! splice secret to the project's own VM.
 
+use crate::wake::wake_db_reach;
 use super::*;
 use crate::db_ops::{DbQueryCtx, agent_db_request, db_splice_secret};
 
