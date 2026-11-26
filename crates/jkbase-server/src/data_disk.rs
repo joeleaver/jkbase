@@ -1,7 +1,8 @@
 //! Per-project data disks (read-write-once): fenced attach under a disk lease, the RAII
 //! [`DiskLeaseGuard`] that releases it, and the quota-capped disk sizing.
 
-use crate::{DISK_LEASE_TTL, reap_firecracker, vm_identity};
+use crate::{DISK_LEASE_TTL, vm_identity};
+use crate::vm_runtime::{reap_firecracker};
 use crate::project_facts::{check_project_has_volumes};
 use anyhow::Result;
 use jkbase_substrate::{DataDiskProvider, Ensured, FenceToken, Lease, SubstrateError};

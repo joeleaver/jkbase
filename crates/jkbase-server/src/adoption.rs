@@ -2,10 +2,8 @@
 //! previous process, re-adopt the live ones (fresh disk fence, no detach, rebuilt routing) and reap the
 //! rest. A survivor is trusted only when its pid, start time and API-socket peer all agree.
 
-use crate::{
-    DISK_LEASE_TTL, PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, agent_alive,
-    agent_protocol_version, handoff, register_active_routes, rootfs_cas, vm_identity,
-};
+use crate::{DISK_LEASE_TTL, PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, agent_alive, agent_protocol_version, handoff, rootfs_cas, vm_identity};
+use crate::vm_runtime::{register_active_routes};
 use jkbase_orch::vm::VmInstance;
 use jkbase_proxy::DomainMap;
 use jkbase_substrate::{DataDiskProvider, Lease, SubstrateError};
