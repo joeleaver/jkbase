@@ -11,17 +11,17 @@ use tracing::{info, warn};
 
 /// Content-address the base rootfs so a redeploy that ships a new agent can never poison a
 /// pre-existing hibernation snapshot (incident: nlnwt, 2026-06-26). The staging artifact at
-/// `base-rootfs.ext4` is built by the deploy script in prod (apko may not be on the service's
-/// PATH) or the local-dev fallback; we hash it and pin it immutably at `base-rootfs/<hash>.ext4`.
-/// ORDER IS LOAD-BEARING (see docs/rootfs-cas-snapshot-durability.md): CAS-ize → GC, ALL
-/// synchronously here, before any loop that can boot/restore a VM is spawned (the HA
-/// reconciler/disk-fence, spawned after this returns) and before the proxy binds. VM re-adoption (§6) changes the
-/// premise that this used to depend on: runtime FCs now SURVIVE a restart (they live in the
-/// jkbase-runtime cgroup), so we do NOT reap them here — the old blunt pre-GC reaper is gone.
-/// Instead the survivors' rootfs blobs are kept out of the sweep (the keep-set scan below), and
-/// the full verify/adopt/reap of survivors happens after PlatformState is built (§6b). GC
-/// unlinking a still-mapped blob is non-destructive anyway (the FC holds the fd; bytes survive
-/// until it closes), and a true orphan is reaped in §6b.
+/// `base-rootfs.ext4` is built by the deploy script in prod (apko may not be on the service's PATH)
+/// or the local-dev fallback; we hash it and pin it immutably at `base-rootfs/<hash>.ext4`. ORDER
+/// IS LOAD-BEARING (see docs/rootfs-cas-snapshot-durability.md): CAS-ize → GC, ALL synchronously
+/// here, before any loop that can boot/restore a VM is spawned (the HA reconciler/disk-fence,
+/// spawned after this returns) and before the proxy binds. VM re-adoption (§6) changes the premise
+/// that this used to depend on: runtime FCs now SURVIVE a restart (they live in the jkbase-runtime
+/// cgroup), so we do NOT reap them here — the old blunt pre-GC reaper is gone. Instead the
+/// survivors' rootfs blobs are kept out of the sweep (the keep-set scan below), and the full
+/// verify/adopt/reap of survivors happens after PlatformState is built (§6b). GC unlinking a
+/// still-mapped blob is non-destructive anyway (the FC holds the fd; bytes survive until it
+/// closes), and a true orphan is reaped in §6b.
 pub(crate) async fn place_and_gc(
     args: &Args,
     data_dir: &Path,
