@@ -1,14 +1,8 @@
 //! The deploy handler behind `POST /projects/{id}/deploy`: swap the new tree live, (re)boot the
 //! project's VM(s) on it and commit them to Running, undoing the swap if the deploy is refused.
 
-use crate::{
-    LogShipper, PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, boot_db_vm,
-    check_project_has_database, check_project_has_volumes, data_disk_mib, deploy_refusal,
-    disk_cap_bytes, fence_data_disk, handoff, layer_plan, project_db_rules_enabled,
-    project_is_dedicated, read_l4_port_decls, record_deployed_tier, register_active_routes,
-    release_data_disk, setup_tap, sync_agent, unix_now, vm_identity, wait_for_agent,
-    write_handoff_record,
-};
+use crate::{LogShipper, PlatformState, RUNTIME_CGROUP_PARENT, VmLifecycle, check_project_has_database, check_project_has_volumes, data_disk_mib, deploy_refusal, disk_cap_bytes, fence_data_disk, handoff, layer_plan, project_db_rules_enabled, project_is_dedicated, read_l4_port_decls, record_deployed_tier, register_active_routes, release_data_disk, setup_tap, sync_agent, unix_now, vm_identity, wait_for_agent, write_handoff_record};
+use crate::db_vm::{boot_db_vm};
 use anyhow::{Context, Result};
 use jkbase_control::store::VmAllocation;
 use jkbase_orch::vm::{VmConfig, VmInstance};
